@@ -7,9 +7,7 @@ import asyncio
 import websockets
 import json
 from src.tool import *
-# from msgexec import *
 import src.data as data
-# from run import Bot
 import pickle
 import os
 
@@ -125,14 +123,16 @@ class Bot:
                 print(
                     f"私聊> {nickname}({user_id}): {raw_message} ({message_id})")
                 if event['raw_message'] == 'test':
-                    print('test')
-                    asyncio.to_thread(Bot.websocket.send, data.testmsg)
+                    try:
+                        Bot.websocket.send(data.testmsg).send(None)
+                    except StopIteration:
+                        pass
             elif event['message_type'] == "group":
                 group_id = event['group_id']
                 print(
                     f"群聊> {group_id} | {nickname}({user_id}): {raw_message} ({message_id})")
             if event['message'].startswith('.py'):
-                exec_msg(event['message'][4:], event)
+                exec_msg(event['message'][3:].strip(), event)
         elif 'meta_event_type' in keys and event['meta_event_type'] == 'heartbeat':
             return
         elif 'status' in keys:
