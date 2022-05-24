@@ -30,3 +30,9 @@ def async_to_thread(func):
         asyncio.run_coroutine_threadsafe(func(*args,**kargs),new_loop)
     return wrapper
 
+
+def merge_dic(dic0, dic1):
+    new_dic = {}
+    new_dic.update(dic0)
+    new_dic.update(dic1)
+    return new_dic
