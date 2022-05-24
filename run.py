@@ -4,6 +4,7 @@ from email import message
 from importlib import reload
 import sys
 import asyncio
+import time
 import websockets
 import json
 from src.tool import *
@@ -59,29 +60,27 @@ class Msg:
         Bot.recv_event(**dic)
 
 
+@to_thread
 def exec_msg(code: str, msg: dict):
-    Storage.msg_locals.update(msg)
     Storage.msg = msg  # 防止有sb命名了msg
-    dic = locals()
-    dic.update(Storage.msg_locals)
-    dic.update({'out':None})
+    Storage.msg_locals.update(msg)
+    Storage.msg_locals['out']=None
+    locals().update(Storage.msg_locals)
     try:
-        exec(code,globals(),dic)
-        Msg.send('执行成功，返回'+str(dic['out']))
+        exec(code)
+        Msg.send('执行成功，返回'+str(locals()['out']))
     except Exception as e:
         Msg.send(str(e))
         print(str(e))
-    Storage.msg_locals = dic
+    Storage.msg_locals = locals()
+    exit()
 
 
-def merge_dic(dic0, dic1):
-    new_dic = {}
-    new_dic.update(dic0)
-    new_dic.update(dic1)
-    return new_dic
 
 class Bot:
     websocket = None
+    commands = {}
+    exec_pool = []
 
     @staticmethod
     async def run():
@@ -132,13 +131,17 @@ class Bot:
                 print(
                     f"群聊> {group_id} | {nickname}({user_id}): {raw_message} ({message_id})")
             if event['message'].startswith('.py'):
-                exec_msg(event['message'][3:].strip(), event)
+                thread = exec_msg(event['message'][3:].strip(), event)
+                Bot.exec_pool.append(thread)
         elif 'meta_event_type' in keys and event['meta_event_type'] == 'heartbeat':
             return
         elif 'status' in keys:
             return
         else:
             print(f"其它> {event}")
+    @staticmethod
+    def _register_command(name:str,func):
+        Bot.commands[name]=func
 
 
 if __name__ == "__main__":
