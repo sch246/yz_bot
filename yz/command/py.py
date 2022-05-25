@@ -32,10 +32,10 @@ class Create_Msg:
         kargs['message'] = s
         if 'group_id' in self.bot.storage.msg.keys():
             kargs['group_id'] = self.bot.storage.msg['group_id']
-            self.bot.use_api('send_msg', None, **kargs)
+            self.bot.use_api('send_msg', **kargs)
         elif 'user_id' in self.bot.storage.msg.keys():
             kargs['user_id'] = self.bot.storage.msg['user_id']
-            self.bot.use_api('send_msg', None, **kargs)
+            self.bot.use_api('send_msg', **kargs)
     
     def recv(self,s, **kargs):
         s = str(s)

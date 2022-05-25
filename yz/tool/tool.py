@@ -83,3 +83,16 @@ class dicts:
 
 def cutstart(s:str, start:str):
     return s[len(start):]
+
+def arun(coroutine):
+    try:
+        coroutine.send(None)
+    except StopIteration as e:
+        return e.value
+
+import re
+ 
+def validateTitle(title):
+    rstr = r"[\/\\\:\*\?\"\<\>\|]"  # '/ \ : * ? " < > |'
+    new_title = re.sub(rstr, "_", title).strip()  # 替换为下划线
+    return new_title

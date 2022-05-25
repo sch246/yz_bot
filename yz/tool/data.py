@@ -69,3 +69,5 @@ example_log = {
 
 
 default_head = '\n'*3 + '[HEAD] ' +'\n'
+
+
