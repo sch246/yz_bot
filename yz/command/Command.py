@@ -32,7 +32,8 @@ class Manager:
         if name not in Manager.cmds.keys():
             return False
         Manager.cmds[name](bot, body, msg)
-        
+        return True
+    
     @staticmethod
     def register(name,func):
         Manager.cmds[name]=func

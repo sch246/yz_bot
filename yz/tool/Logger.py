@@ -1,7 +1,11 @@
+from json import tool
 import os
-from yz.tool.tool import mkdirs
+from yz.tool.tool import mkdirs, validateTitle
 import time
 import yz.tool.data as data
+
+def group_or_private(d:dict):
+    return {k: d[k] for k in ['group_id','user_id'] if k in d.keys()}
 
 class Logger():
     base_path = './log/'
@@ -11,6 +15,8 @@ class Logger():
             'private':{}
         }
 
+    def setbot(self,bot):
+        self.bot = bot
 
     def _save_lines(self,dirpath, str_list, head=data.default_head):
         dirpath = os.path.join(self.base_path, dirpath)
@@ -19,30 +25,80 @@ class Logger():
         with open(os.path.join(dirpath, filepath),'a',encoding='utf-8') as f:
             f.write(head)
             f.writelines(str_list)
-    
-    def write(self, type, uid, s):
-        if not uid in self.log[type].keys():
-            self.log[type][uid] = []
-        self.log[type][uid].append(s+'\n')
 
 
     def save(self):
         for group_id, lines in self.log['group'].items():
-            self._save_lines(str(group_id), lines)
+            self._save_lines(os.path.join('group', str(group_id)), lines)
         for user_id, lines in self.log['private'].items():
-            self._save_lines(str(user_id), lines)
-
-
-    def put(self, msg:dict[str,any]):
-        time_head = time.strftime("[%H:%M:%S] ", time.localtime(msg['time'])) 
-        s = f"{msg['sender']['nickname']}({msg['user_id']}): {msg['raw_message']} ({msg['message_id']})"
-        if 'group_id' in msg.keys():
+            self._save_lines(os.path.join('private', str(user_id)), lines)
+    
+    def write(self, type, name, s):
+        name = validateTitle(name)
+        if not name in self.log[type].keys():
+            self.log[type][name] = []
+        self.log[type][name].append(s+'\n')
+        
+        
+    def put(self, s, **kargs):
+        '''[time], [group_id], [user_id], [pre]'''
+        if 'time' in kargs.keys():
+            t = kargs['time']
+        else:
+            t = time.time()
+        time_head = time.strftime("[%H:%M:%S] ", time.localtime(t)) 
+        if 'group_id' in kargs.keys():
             type='group'
-            type_head = f"群聊> {msg['group_id']} | "
-            key = 'group_id'
-        elif 'user_id' in msg.keys():
+            type_head = f"群聊> {kargs['group_id']} | "
+            name = str(kargs['group_id']) + f"({self.bot.get_groupname(kargs['group_id'])})"
+        elif 'user_id' in kargs.keys():
             type='private'
             type_head='私聊> '
-            key = 'user_id'
+            name= str(kargs['user_id']) + f"({self.bot.get_nickname(kargs['user_id'])})"
+        else:
+            type='other'
+            type_head='其它>'
+            name='0'
+        if 'pre' in kargs.keys():
+            s = kargs['pre'] + s
         print(type_head + s)
-        self.write(type, msg[key], time_head + s)
+        self.write(type, name, time_head + s)
+
+
+    def put_message(self, msg:dict[str,any]):
+        '''[time], [group_id], [user_id], [pre], sender{nickname,user_id}, raw_message, message_id'''
+        s = f"{msg['sender']['nickname']}({msg['sender']['user_id']}): {msg['raw_message']} ({msg['message_id']})"
+        self.put(s,**msg)
+    
+
+    def put_action_before(self, action,params):
+        if action in ['send_private_msg','send_group_msg','send_msg']:
+            msg = {}
+            msg['time']=time.time()
+            if 'group_id' in params.keys():
+                msg['group_id'] = params['group_id']
+            if 'user_id' in params.keys():
+                msg['user_id'] = params['user_id']
+            s = f"{params['message']}"
+            
+    
+    def put_action(self, action,params,event):
+        '''action和params是调用api发出的, event是接收到的'''
+        # 若消息是发出的，则通过id获取消息信息
+        
+        if action in ['send_private_msg','send_group_msg','send_msg']:
+            # 此时event仅包含message_id
+            def put_msg(evt):
+                '''以发送出去的信息的id查询所返回的信息'''
+                msg={}
+                msg.update(evt['data']) # 包含message, message_id, message_type, sender{nickname,user_id}, time
+                s = f"{params['message']}({evt['data']['message_id']})"
+                
+                if 'group_id' in params.keys():
+                    msg['group_id'] = params['group_id']
+                    s = f"{self.bot.nickname}({self.bot.user_id}): " + s
+                if 'user_id' in params.keys():
+                    msg['user_id'] = params['user_id']
+                    s = f"{self.bot.nickname}({self.bot.user_id}) >> {self.bot.get_nickname(params['user_id'])}({params['user_id']}): " + s
+                self.put(s,**msg)
+            self.bot.use_api('get_msg',echofunc=put_msg,log=False,message_id=event['data']['message_id'])
