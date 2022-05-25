@@ -72,14 +72,7 @@ class Logger():
     
 
     def put_action_before(self, action,params):
-        if action in ['send_private_msg','send_group_msg','send_msg']:
-            msg = {}
-            msg['time']=time.time()
-            if 'group_id' in params.keys():
-                msg['group_id'] = params['group_id']
-            if 'user_id' in params.keys():
-                msg['user_id'] = params['user_id']
-            s = f"{params['message']}"
+        pass
             
     
     def put_action(self, action,params,event):
