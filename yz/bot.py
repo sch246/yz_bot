@@ -1,19 +1,25 @@
 import asyncio
 from json import tool
-from yz.tool.tool import delay, stop_thread, arun
+from yz.tool.tool import delay, stop_thread, arun, fmt, fms
 import yz.tool.data as data
 import json
 from yz.tool.Logger import Logger
 from yz.tool.Storage import Storage
 import websockets
-from yz.tool.config import load_config,save_config,default_or_load_config
+from yz.tool.config import load_config,save_config,init_or_load_config,config_file
+import yz.tool.api as api
 from yz.command.Command import Manager as CommandManager
 
 class Bot:
     def __init__(self, storage:Storage, logger:Logger) -> None:
+        # bot下主要是storage和logger
+        # tool是工具, data是一些数据, config用来存取Config.json
+        # api用来调用api(废话)
+        # command是用来解析聊天发送的命令的，一般聊天不是命令
         self.storage=storage
         self.logger=logger
-        self.logger.setbot(self)
+        self.CommandManager=CommandManager
+        self.api = api
         self.websocket = None
         self.load_config()
         self._api_wait={}
@@ -22,6 +28,14 @@ class Bot:
         self.nickname = None
         self.friends = {}
         self.groups = {}
+        
+        self.initfuncs=[
+            self.load_login_info,
+            self.load_friend_list,
+            self.load_group_list
+        ]
+        self.storage.load_storage(self)
+        self.logger.setbot(self)
     
     def get_nickname(self,user_id):
         return self.friends[user_id]['nickname']
@@ -34,17 +48,18 @@ class Bot:
             try:
                 async with websockets.connect(data.uri) as websocket:
                     self.websocket = websocket
-                    self.load_login_info()
-                    self.load_friend_list()
-                    self.load_group_list()
-                    # try:
-                        # async for event in websocket:
-                            # self.recv_event(**json.loads(event))
-                    # except websockets.ConnectionClosed:
-                    #     print('连接关闭', end=' > ')
-                    #     continue
-                    while True:
-                        self.recv_event(**json.loads(await websocket.recv()))
+                    print(fms('initfunc> 运行初始化函数','gb'))
+                    for func in self.initfuncs:
+                        func(self)
+                    print(fms('initfunc> 初始化完成','gb'))
+                    try:
+                        async for event in websocket:
+                            self.recv_event(**json.loads(event))
+                    except websockets.ConnectionClosed:
+                        print('连接关闭', end=' > ')
+                        continue
+                    # while True:
+                    #     self.recv_event(**json.loads(await websocket.recv()))
             except ConnectionRefusedError:
                 print('连接被拒绝', end=' > ')
                 continue
@@ -52,9 +67,10 @@ class Bot:
 
     def on_exit(self):
         self.logger.save()
-        self.storage.save_msg_locals()
+        self.storage.save_storage()
         
     def load_config(self):
+        print('加载 '+fms(config_file,'rg'),' : Bot')
         init = {
             'Bot':{
                 'owner_id':'所有者的QQ号',
@@ -62,25 +78,26 @@ class Bot:
                 'name':'柚子'
             }
         }
-        dic = default_or_load_config(init)
+        dic = init_or_load_config(init)
         for key in dic['Bot'].keys():
             self.__dict__[key] = dic['Bot'][key]
 
-    def load_friend_list(self):
+
+    def load_friend_list(self,bot):
         def f(evt):
             self.friends = {user['user_id']: user for user in evt['data']}
             print(f'好友列表获取完成,共{len(evt["data"])}个')
         print('正在获取好友列表..')
         self.use_api('get_friend_list',f,False)
 
-    def load_group_list(self):
+    def load_group_list(self,bot):
         def f(evt):
             self.groups = {group['group_id']: group for group in evt['data']}
             print(f'群列表获取完成,共{len(evt["data"])}个')
         print('正在获取群列表..')
         self.use_api('get_group_list',f,False)
 
-    def load_login_info(self):
+    def load_login_info(self,bot):
         def f(evt):
             self.user_id=evt['data']['user_id']
             self.nickname=evt['data']['nickname']
@@ -89,8 +106,9 @@ class Bot:
         self.use_api('get_login_info',f,False)
     
     def use_api(self, action, echofunc=lambda evt:None, log=True, **kargs):
-        # TODO: 把执行的操作写进log
-        '''执行操作,正常情况下将记录操作并且不执行什么'''
+        '''执行操作,正常情况下将记录操作并且不执行什么
+        echofunc会在消息返回时调用
+        '''
         if log:
             self.logger.put_action_before(action,kargs)
         def ef2(event):

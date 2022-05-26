@@ -2,7 +2,7 @@ import os
 import sys
 import re
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),os.pardir)))
-from tool.config import default_or_load_config
+from tool.config import init_or_load_config
 
 class Manager:
     init={
@@ -10,9 +10,12 @@ class Manager:
             'start':['.']
         }
     }
-    _dic = default_or_load_config(init)
+    _dic = init_or_load_config(init)
     start = _dic['Command']['start']
-    _cp = re.compile('([^\n ]+)[\n ]([\s\S]*)')
+    
+    
+    _cp = re.compile('([\S]+)([\s\S]*)')
+    _cp2 = re.compile('([\S]+)[\s]([\s\S]*)')
     cmds={}
 
     @staticmethod
@@ -31,9 +34,25 @@ class Manager:
     def execute(bot,name,body,msg):
         if name not in Manager.cmds.keys():
             return False
-        Manager.cmds[name](bot, body, msg)
+        Manager.cmds[name].run(bot, body, msg)
         return True
     
     @staticmethod
     def register(name,func):
         Manager.cmds[name]=func
+    
+    @staticmethod
+    def cut_s(s:str):
+        match = Manager._cp.match(s)
+        if match:
+            return match.group(1), match.group(2)
+        else:
+            return False
+    
+    @staticmethod
+    def cut_s2(s:str):
+        match = Manager._cp2.match(s)
+        if match:
+            return match.group(1), match.group(2)
+        else:
+            return False
