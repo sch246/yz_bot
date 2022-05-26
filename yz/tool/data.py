@@ -68,6 +68,6 @@ example_log = {
     }
 
 
-default_head = '\n'*3 + '[HEAD] ' +'\n'
+default_head = '\n'*3 + '[HEAD $start to $end] ' +'\n'
 
 

@@ -1,6 +1,6 @@
 from json import tool
 import os
-from yz.tool.tool import mkdirs, validateTitle
+from yz.tool.tool import mkdirs, validateTitle,fmt
 import time
 import yz.tool.data as data
 
@@ -14,11 +14,20 @@ class Logger():
             'group':{},
             'private':{}
         }
+        self.starttime=time.strftime("%H:%M:%S", time.localtime(time.time()))
+        self.fmt = fmt('rb')+'storage> '
+    
+    def prn(self,text):
+        print(self.fmt+text+fmt())
 
     def setbot(self,bot):
         self.bot = bot
 
     def _save_lines(self,dirpath, str_list, head=data.default_head):
+        
+        endtime = time.strftime("%H:%M:%S", time.localtime(time.time()))
+        head = head.replace('$start',self.starttime).replace('$end',endtime)
+        
         dirpath = os.path.join(self.base_path, dirpath)
         mkdirs(dirpath)
         filepath =time.strftime("%Y-%m-%d.log", time.localtime())
@@ -28,6 +37,7 @@ class Logger():
 
 
     def save(self):
+        self.prn('logger> 保存中')
         for group_id, lines in self.log['group'].items():
             self._save_lines(os.path.join('group', str(group_id)), lines)
         for user_id, lines in self.log['private'].items():
