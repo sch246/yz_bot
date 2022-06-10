@@ -4,7 +4,12 @@ import yz.tool.tool as tool
 
 
 class Create_Msg:
-    '''里面是用于在exec_msg的exec运行的函数'''
+    '''里面是用于在exec_msg的exec运行的函数
+    
+    Msg.send(s:obj)
+    用于让bot发送消息
+    Msg.recv(s:obj, **kargs)
+    用于让bot接收消息，其中**kargs会被作为msg的键解析'''
     def __init__(self,bot,**msg) -> None:
         self.bot=bot
         self.msg=msg

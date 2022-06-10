@@ -15,6 +15,8 @@ def is_op(bot,user_id):
     user_id in bot.op_list
 
 class op:
+    '''格式: op QQ号|@某人 [@某人 ...]
+    用途: 添加管理员'''
     level=4
     def run(bot, body: str, msg: dict):
         Msg=bot.api.Create_Msg(bot,**msg)
@@ -38,9 +40,11 @@ class op:
             else:
                 Msg.send('目标已是管理员，无需增加')
         else:
-            Msg.send('格式: op QQ号|@某人 [@某人 ...]')
+            Msg.send(op.__doc__)
 
 class deop:
+    '''格式: deop QQ号|@某人 [@某人 ...]
+    用途: 移除管理员'''
     level=4
     def run(bot, body: str, msg: dict):
         Msg=bot.api.Create_Msg(bot,**msg)
@@ -64,6 +68,6 @@ class deop:
             else:
                 Msg.send('目标中没有管理员')
         else:
-            Msg.send('格式: deop QQ号|@某人 [@某人 ...]')
+            Msg.send(deop.__doc__)
 
 

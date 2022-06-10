@@ -23,11 +23,17 @@ init = {
 # 替换字符串的部分在rep_str
 
 class link:
+    '''格式: .link\\n...\\nto\\n...\n.link [reload | list | get <num> | del <num>]
+    用途: 建立输入映射，可以使输入A等价于输入B
+    例子: .link\\n运行{A}\\nto\\n.py{A}
+    支持正则表达式，输入输出可填入替换符
+    替换符:用大括号括起来的允许数字字母下划线作为命名的内容{\w+}，同时输入在输入输出时，将会匹配内容并替换，若命名开头为大写字母，则匹配包括空白符(包括换行符)在内的所有字符，否则仅匹配非空白符\ n输入输出可以包含同名替换符'''
     level=4
     links = init_or_load_config(init)["Command"]["links"]
     link_pattern = re.compile("\s*\n([\S\s]+?)\nto[\s]*\n([\S\s]+)")
     def run(bot, body: str, msg: dict):
         Msg=bot.api.Create_Msg(bot,**msg)
+        body = load_cq(body).replace('\r\n','\n')
 
         link_args={
             ' reload':link.reload_link,
@@ -43,7 +49,7 @@ class link:
                 return
         
         try:
-            body_match = link.link_pattern.match(load_cq(body).replace('\r\n','\n'))
+            body_match = link.link_pattern.match(body)
             if body_match:
                 link.add_link(body_match.group(1),body_match.group(2))
                 Msg.send("设置成功")
@@ -52,7 +58,7 @@ class link:
             Msg.send(str(e))
             print(e)
             return
-        Msg.send('格式: .link\\n...\\nto\\n...\n.link [reload | list | get <num> | del <num>]\n支持正则表达式，输入输出可填入替换符\n替换符:用大括号括起来的允许数字字母下划线作为命名的内容{\w+}，同时输入在输入输出时，将会匹配内容并替换，若命名开头为大写字母，则匹配包括空白符(包括换行符)在内的所有字符，否则仅匹配非空白符\ n输入输出可以包含同名替换符\n例子:\n.link\\n运行{A}\\nto\\n.py{A}')
+        Msg.send(link.__doc__)
     
     def add_link(rep,tar):
         link.links[rep]=tar
