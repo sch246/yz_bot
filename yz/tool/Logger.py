@@ -1,5 +1,6 @@
 from json import tool
 import os
+from atexit import register as on_exit
 from yz.tool.tool import mkdirs, validateTitle,fmt,load_cq
 import time
 import yz.tool.data as data
@@ -37,7 +38,7 @@ class Logger():
             f.write(head)
             f.writelines(str_list)
 
-
+    @on_exit
     def save(self):
         self.prn('logger> 保存中')
         endtime = time.strftime("%H:%M:%S", time.localtime(time.time()))

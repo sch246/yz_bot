@@ -66,10 +66,6 @@ class Bot:
                 print('连接被拒绝', end=' > ')
                 continue
 
-
-    def on_exit(self):
-        self.logger.save()
-        self.storage.save_storage()
         
     def load_config(self):
         print('加载 '+fms(config.config_file,'rg'),' : Bot')
