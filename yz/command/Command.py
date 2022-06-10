@@ -10,8 +10,7 @@ class Manager:
             'start':['.']
         }
     }
-    _dic = init_or_load_config(init)
-    start = _dic['Command']['start']
+    start = init_or_load_config(init)['Command']['start']
     
     
     _cp = re.compile('([\S]+)([\s\S]*)')

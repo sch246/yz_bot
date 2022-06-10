@@ -71,3 +71,12 @@ example_log = {
 default_head = '\n'*3 + '[HEAD $start to $end] ' +'\n'
 
 
+
+
+cq_trans_dic={
+    '&':'&amp;',
+    '[':'&#91;',
+    ']':'&#93;',
+    ',':'&#44;'
+}
+cq_load_dic = {v:k for k,v in cq_trans_dic.items()}

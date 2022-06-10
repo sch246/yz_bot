@@ -3,6 +3,10 @@ import asyncio
 import time
 import os
 
+from yz.tool.data import cq_load_dic,cq_trans_dic
+
+from numpy import mat
+
 def mkdirs(path):
     if not os.path.exists(path):
         os.makedirs(path)
@@ -149,4 +153,42 @@ def load_CQ(CQ:str):
     else:
         data={}
     return {'type':type,'data':data}
-    
+
+def trans_rep(src_rep:str):
+    src_ = re.compile('{(\w+?)}')
+    keys = set()
+    def f(match:re.Match):
+        key = match.group(1)
+        if key in keys:
+            rtn = f'(?P={key})'
+        else:
+            if key[0].isupper():
+                rtn= f'(?P<{key}>[\S\s]+)'
+            else:
+                rtn= f'(?P<{key}>\S+)'
+        keys.add(key)
+        return rtn
+    # 得检测重复的group并替换成引用，然而并没有成功
+    return src_.sub(f,src_rep)
+
+def rep_str(rep:str, tar:str, src:str):
+    re_rep = re.compile(trans_rep(rep))
+    match = re_rep.match(src)
+    if not match:
+        return False
+    else:
+        for key, value in match.groupdict().items():
+            tar = tar.replace(f'{{{key}}}',value)
+        return tar
+
+def set_rep(rep:str, tar:str):
+    return lambda src:rep_str(rep,tar,src)
+
+def trans_cq(s:str):
+    for k,v in cq_trans_dic.items():
+        s = s.replace(k,v)
+    return s
+def load_cq(s:str):
+    for k,v in cq_load_dic.items():
+        s = s.replace(k,v)
+    return s

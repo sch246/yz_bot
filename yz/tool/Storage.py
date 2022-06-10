@@ -14,6 +14,8 @@ class Storage:
         self.msg_locals = {}
         self.msg = {}
         
+        self.links = {}
+        
         self.initfunc={}
     
     def prn(self,text):
