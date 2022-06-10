@@ -37,8 +37,8 @@ class Manager:
         return True
     
     @staticmethod
-    def register(name,func):
-        Manager.cmds[name]=func
+    def register(name,module):
+        Manager.cmds[name]=module
     
     @staticmethod
     def cut_s(s:str):

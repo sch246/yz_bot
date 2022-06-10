@@ -3,6 +3,8 @@ import os
 
 
 class reboot:
+    '''格式: .reboot
+    用途: 重启bot'''
     level=4
     def run(bot, body: str, msg: dict):
         print('重启中')
