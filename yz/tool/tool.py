@@ -192,3 +192,15 @@ def load_cq(s:str):
     for k,v in cq_load_dic.items():
         s = s.replace(k,v)
     return s
+
+def cut_head(s:str,*h):
+    for h_ in h:
+        if s.startswith(h_):
+            return s[len(h_):]
+    return s
+
+def cut_tab(s):
+    s = cut_head(s,'    ','\t')
+    s.replace('\n    \t','\n    \t\t')
+    s.replace('\n    ','\n')
+    s.replace('\n\t','\n')
