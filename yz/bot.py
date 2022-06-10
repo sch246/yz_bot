@@ -6,9 +6,10 @@ import json
 from yz.tool.Logger import Logger
 from yz.tool.Storage import Storage
 import websockets
-from yz.tool.config import load_config,save_config,init_or_load_config,config_file
+import yz.tool.config as config
 import yz.tool.api as api
 from yz.command.Command import Manager as CommandManager
+from yz.command.link import match as link_match
 
 class Bot:
     def __init__(self, storage:Storage, logger:Logger) -> None:
@@ -22,6 +23,7 @@ class Bot:
         self.api = api
         self.websocket = None
         self.load_config()
+        self.config = config
         self._api_wait={}
         
         self.user_id = None
@@ -70,7 +72,7 @@ class Bot:
         self.storage.save_storage()
         
     def load_config(self):
-        print('加载 '+fms(config_file,'rg'),' : Bot')
+        print('加载 '+fms(config.config_file,'rg'),' : Bot')
         init = {
             'Bot':{
                 'owner_id':'所有者的QQ号',
@@ -78,7 +80,7 @@ class Bot:
                 'name':'柚子'
             }
         }
-        dic = init_or_load_config(init)
+        dic = config.init_or_load_config(init)
         for key in dic['Bot'].keys():
             self.__dict__[key] = dic['Bot'][key]
 
@@ -132,6 +134,10 @@ class Bot:
         keys = event.keys()
         if 'post_type' in keys and event['post_type'] == 'message':
             self.logger.put_message(event)
+            new_msg = link_match(event['raw_message'])
+            if new_msg:
+                event['raw_message']=new_msg
+                event['message']=new_msg
             if CommandManager.execute_if(self,event):
                 return
         elif 'meta_event_type' in keys and event['meta_event_type'] == 'heartbeat':

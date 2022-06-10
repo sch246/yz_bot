@@ -20,6 +20,11 @@ def save_config(value, *args):
     dicts.set(J, value, *args)
     with open(config_file,'w',encoding='utf-8') as f:
         f.write(json.dumps(J, indent=4,ensure_ascii=False))
+def del_config(*args):
+    with open(config_file,encoding='utf-8') as f:
+        dic = dicts.get(json.loads(f.read()),*(list(args)[:-1]))
+    del dic[args[-1]]
+    save_config(dic,*(list(args)[:-1]))
 
 def init_or_load_config(init_dic:dict):
     if not os.path.exists(config_file):
@@ -39,7 +44,7 @@ def dict_save_config(dic:dict):
     dic = dicts.update(J, dic)
     with open(config_file,'w',encoding='utf-8') as f:
         f.write(json.dumps(dic, indent=4,ensure_ascii=False))
-    
+
 
 
 def test():

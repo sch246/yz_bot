@@ -3,7 +3,7 @@ import os
 
 
 class reboot:
-    level=6
+    level=4
     def run(bot, body: str, msg: dict):
         print('重启中')
         bot.api.Create_Msg(bot,**msg).send('重启中')

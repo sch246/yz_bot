@@ -1,6 +1,6 @@
 from json import tool
 import os
-from yz.tool.tool import mkdirs, validateTitle,fmt
+from yz.tool.tool import mkdirs, validateTitle,fmt,load_cq
 import time
 import yz.tool.data as data
 
@@ -14,7 +14,7 @@ class Logger():
             'group':{},
             'private':{}
         }
-        self.starttime=time.strftime("%H:%M:%S", time.localtime(time.time()))
+        self.refresh_starttime()
         self.fmt = fmt('rb')+'storage> '
     
     def prn(self,text):
@@ -22,10 +22,12 @@ class Logger():
 
     def setbot(self,bot):
         self.bot = bot
+    
+    def refresh_starttime(self):
+        self.starttime=time.strftime("%H:%M:%S", time.localtime(time.time()))
 
-    def _save_lines(self,dirpath, str_list, head=data.default_head):
+    def _save_lines(self,dirpath, str_list, endtime, head=data.default_head):
         
-        endtime = time.strftime("%H:%M:%S", time.localtime(time.time()))
         head = head.replace('$start',self.starttime).replace('$end',endtime)
         
         dirpath = os.path.join(self.base_path, dirpath)
@@ -38,10 +40,12 @@ class Logger():
 
     def save(self):
         self.prn('logger> 保存中')
+        endtime = time.strftime("%H:%M:%S", time.localtime(time.time()))
         for group_id, lines in self.log['group'].items():
-            self._save_lines(os.path.join('group', str(group_id)), lines)
+            self._save_lines(os.path.join('group', str(group_id)), lines, endtime)
         for user_id, lines in self.log['private'].items():
-            self._save_lines(os.path.join('private', str(user_id)), lines)
+            self._save_lines(os.path.join('private', str(user_id)), lines, endtime)
+        self.refresh_starttime()
     
     def write(self, type, name, s):
         name = validateTitle(name)
@@ -77,7 +81,7 @@ class Logger():
 
     def put_message(self, msg:dict[str,any]):
         '''[time], [group_id], [user_id], [pre], sender{nickname,user_id}, raw_message, message_id'''
-        s = f"{msg['sender']['nickname']}({msg['sender']['user_id']}): {msg['raw_message']} ({msg['message_id']})"
+        s = f"{msg['sender']['nickname']}({msg['sender']['user_id']}): {load_cq(msg['raw_message'])} ({msg['message_id']})"
         self.put(s,**msg)
     
 
