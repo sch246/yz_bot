@@ -13,7 +13,8 @@ class Logger():
     def __init__(self) -> None:
         self.log = {
             'group':{},
-            'private':{}
+            'private':{},
+            'other':{}
         }
         self.refresh_starttime()
         self.fmt = fmt('rb')+'storage> '
