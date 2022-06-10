@@ -204,3 +204,4 @@ def cut_tab(s):
     s.replace('\n    \t','\n    \t\t')
     s.replace('\n    ','\n')
     s.replace('\n\t','\n')
+    return s

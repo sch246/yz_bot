@@ -11,7 +11,6 @@ class cmd:
     用途: 编辑和查看命令'''
     level=0
     def run(bot, body: str, msg: dict):
-        body = body.strip()
         Msg = Create_Msg(bot,**msg)
         
         link_args={
@@ -26,5 +25,5 @@ class cmd:
         Msg.send(cmd.__doc__)
         
     def list_cmd(bot,cp):
-        s = '\n'.join(Manager.cmds.keys())
+        s = '\n'.join(['● '+k+'\n'+v.__doc__.splitlines()[0] for k, v in Manager.cmds.items()])
         return '[---命令列表---]\n'+s
