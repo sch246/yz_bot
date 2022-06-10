@@ -168,7 +168,7 @@ def trans_rep(src_rep:str):
                 rtn= f'(?P<{key}>\S+)'
         keys.add(key)
         return rtn
-    # 得检测重复的group并替换成引用，然而并没有成功
+    # 得检测重复的group并替换成引用
     return src_.sub(f,src_rep)
 
 def rep_str(rep:str, tar:str, src:str):

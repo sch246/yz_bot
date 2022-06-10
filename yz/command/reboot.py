@@ -1,6 +1,6 @@
 import sys
 import os
-
+import atexit
 
 class reboot:
     '''格式: .reboot
@@ -12,6 +12,6 @@ class reboot:
         def reboot_hello(bot):
             bot.api.Create_Msg(bot,**msg).send('重启完成')
         bot.storage.add_initfunc('reboot_hello',reboot_hello)
-        bot.storage.save_storage()
+        atexit._run_exitfuncs()
         python = sys.executable
         os.execl(python, python, *sys.argv)

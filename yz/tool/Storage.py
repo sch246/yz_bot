@@ -85,6 +85,6 @@ class Storage:
         self.prn(fmt('r')+f"删除initfunc {name}")
         del self.initfunc[name]
 
-        
+
 
 
