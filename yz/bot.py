@@ -130,7 +130,7 @@ class Bot:
         keys = event.keys()
         if 'post_type' in keys and event['post_type'] == 'message':
             self.logger.put_message(event)
-            new_msg = link_match(event['raw_message'])
+            new_msg = link_match(event)
             if new_msg:
                 event['raw_message']=new_msg
                 event['message']=new_msg
