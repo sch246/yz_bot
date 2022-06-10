@@ -5,7 +5,6 @@ import os
 
 from yz.tool.data import cq_load_dic,cq_trans_dic
 
-from numpy import mat
 
 def mkdirs(path):
     if not os.path.exists(path):
