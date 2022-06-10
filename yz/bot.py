@@ -145,5 +145,5 @@ class Bot:
             else:
                 print(f"echo> {event}")
         else:
-            print(f"其它> {event}")
+            self.logger.put(f'{event}',**event)
     
