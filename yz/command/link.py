@@ -3,7 +3,7 @@ import os
 import sys
 import re
 import json
-from atexit import register as on_exit
+import atexit
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),os.pardir)))
 from tool.tool import dicts,trans_rep,set_rep,load_cq,rep_str
 from tool.config import init_or_load_config, save_config
@@ -69,7 +69,7 @@ class link:
         link.links = init_or_load_config(init)["Command"]["links"]
         return f'重载了{len(link.links)}个link'
 
-    @on_exit
+
     def save_link():
         save_config(link.links,'Command','links')
         
@@ -103,7 +103,10 @@ def prn(index, k,v):
 
 
 def match(s):
-    for k,v in reversed(link.links.items()):
+    for k,v in reversed(list(link.links.items())):
         b = rep_str(k,v,s)        # 替换字符串的部分在rep_str
         if b:
             return b
+
+
+atexit.register(link.save_link)

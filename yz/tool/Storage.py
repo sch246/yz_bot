@@ -1,7 +1,7 @@
+import atexit
 import os
 import pickle
 import dill as pickle
-from atexit import register as on_exit
 
 from yz.tool.tool import mkdirs,fmt
 
@@ -18,11 +18,13 @@ class Storage:
         self.links = {}
         
         self.initfunc={}
+        
+        atexit.register(self.save_storage)
     
     def prn(self,text):
         print(self.fmt+text+fmt())
     
-    @on_exit
+
     def save_storage(self):
         self.prn('保存中')
         self.prn('保存msg_locals')

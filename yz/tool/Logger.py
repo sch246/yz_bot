@@ -1,6 +1,6 @@
+import atexit
 from json import tool
 import os
-from atexit import register as on_exit
 from yz.tool.tool import mkdirs, validateTitle,fmt,load_cq
 import time
 import yz.tool.data as data
@@ -17,7 +17,7 @@ class Logger():
         }
         self.refresh_starttime()
         self.fmt = fmt('rb')+'storage> '
-    
+        atexit.register(self.save)
     def prn(self,text):
         print(self.fmt+text+fmt())
 
@@ -38,7 +38,7 @@ class Logger():
             f.write(head)
             f.writelines(str_list)
 
-    @on_exit
+
     def save(self):
         self.prn('logger> 保存中')
         endtime = time.strftime("%H:%M:%S", time.localtime(time.time()))
@@ -80,7 +80,7 @@ class Logger():
         self.write(type, name, time_head + s)
 
 
-    def put_message(self, msg:dict[str,any]):
+    def put_message(self, msg):
         '''[time], [group_id], [user_id], [pre], sender{nickname,user_id}, raw_message, message_id'''
         s = f"{msg['sender']['nickname']}({msg['sender']['user_id']}): {load_cq(msg['raw_message'])} ({msg['message_id']})"
         self.put(s,**msg)
