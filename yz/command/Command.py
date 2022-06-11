@@ -3,6 +3,7 @@ import sys
 import re
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),os.pardir)))
 from tool.config import init_or_load_config
+from tool.tool import hasfunc
 
 class Manager:
     init={
@@ -30,10 +31,15 @@ class Manager:
         return False
     
     @staticmethod
+    def getcmds(bot):
+        return dict(filter(lambda a: hasfunc(a[1],bot.state[0]),Manager.cmds.items()))
+    
+    @staticmethod
     def execute(bot,name,body,msg):
-        if name not in Manager.cmds.keys():
+        if name in Manager.getcmds(bot).keys():
+            getattr(Manager.cmds[name], bot.state[0])(bot, body, msg)  # 若bot的状态为'run'则运行命令的run函数
+        else:
             return False
-        Manager.cmds[name].run(bot, body, msg)
         return True
     
     @staticmethod

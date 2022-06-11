@@ -1,13 +1,17 @@
 import asyncio
-from json import tool
-from yz.tool.tool import delay, stop_thread, arun, fmt, fms
-import yz.tool.data as data
+import traceback
 import json
+import websockets
+
+
+from yz.tool.tool import arun, fms
 from yz.tool.Logger import Logger
 from yz.tool.Storage import Storage
-import websockets
+
+import yz.tool.data as data
 import yz.tool.config as config
 import yz.tool.api as api
+
 from yz.command.Command import Manager as CommandManager
 from yz.command.link import match as link_match
 
@@ -38,6 +42,9 @@ class Bot:
         ]
         self.storage.load_storage(self)
         self.logger.setbot(self)
+        
+        self.ifcatch = self.config.init_or_load_config({'Bot':{'ifcatch':1}})['Bot']['ifcatch']
+        self.set_state(('init',))
     
     def get_nickname(self,user_id):
         return self.friends[user_id]['nickname']
@@ -55,6 +62,7 @@ class Bot:
                         func(self)
                     print(fms('initfunc> 初始化完成','gb'))
                     try:
+                        self.set_state(('run',))
                         async for event in websocket:
                             self.recv_event(**json.loads(event))
                     except websockets.ConnectionClosed:
@@ -65,6 +73,9 @@ class Bot:
             except ConnectionRefusedError:
                 print('连接被拒绝', end=' > ')
                 continue
+    
+    def set_state(self,state):
+        self.state = state
 
         
     def load_config(self):
@@ -127,23 +138,49 @@ class Bot:
     
     def recv_event(self, **event):
         # TODO: 把更多的事件写进log
-        keys = event.keys()
-        if 'post_type' in keys and event['post_type'] == 'message':
-            self.logger.put_message(event)
-            new_msg = link_match(event)
-            if new_msg:
-                event['raw_message']=new_msg
-                event['message']=new_msg
-            if CommandManager.execute_if(self,event):
+        try:
+            keys = event.keys()
+            Msg = self.api.Create_Msg(self,**event)
+            
+            # 收到的全部消息
+            if 'post_type' in keys and event['post_type'] == 'message':
+                if CommandManager.execute_if(self,event):
+                    self.logger.put_message(event, ' < cmd') # 记录命令消息
+                    return
+                link = link_match(self, event)  # 在err时不会link
+                if link:
+                    self.logger.put_message(event, '\n█ link') # 记录link消息
+                    Msg.recv(link)
+                    return
+                self.logger.put_message(event) # 记录其他消息
+
+            # 没啥用的heartbeat
+            elif 'meta_event_type' in keys and event['meta_event_type'] == 'heartbeat':
                 return
-        elif 'meta_event_type' in keys and event['meta_event_type'] == 'heartbeat':
-            return
-        elif 'status' in keys:
-            if 'echo' in keys and event['echo'] in self._api_wait.keys():
-                self._api_wait[event['echo']](event)
-                del self._api_wait[event['echo']]
+
+            # 调用api的返回，它保证了能记录bot自身通过Msg.send发出的发言
+            elif 'status' in keys: 
+                if 'echo' in keys and event['echo'] in self._api_wait.keys():
+                    self._api_wait[event['echo']](event)
+                    del self._api_wait[event['echo']]
+                else:
+                    print(f"echo> {event}") # 调用其它api时的返回
+                    self.logger.put(f'{event}',**event)
+
+            # 所有其他收到的信息
             else:
-                print(f"echo> {event}")
-        else:
-            self.logger.put(f'{event}',**event)
-    
+                self.logger.put(f'{event}',**event) # 记录
+
+
+        # 捕获全部异常
+        except Exception as e:
+            if isinstance(e,websockets.ConnectionClosed):
+                raise e
+            self.set_state(('err', traceback.format_exc()))
+            pre ='运行出现异常，没有异常时可使用.ifcatch <1 | 0>来<开启 | 关闭>自动捕获'
+            print(self.state[1])
+            if not self.ifcatch:
+                Msg.send(pre+'\n\n自动捕获未开启，bot将关闭')
+                raise e
+            else:
+                Msg.send(pre+'\n\n自动捕获被触发\n.help以查看帮助')
