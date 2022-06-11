@@ -177,6 +177,8 @@ def rep_str(rep:str, tar:str, src:str):
         return False
     else:
         for key, value in match.groupdict().items():
+            if value == None:
+                value = ''
             tar = tar.replace(f'{{{key}}}',value)
         return tar
 
@@ -204,3 +206,21 @@ def cut_tab(s):
     s.replace('\n    ','\n')
     s.replace('\n\t','\n')
     return s
+
+def add_tab(s):
+    s = '    '+s
+    s = s.replace('\n','\n    ')
+    return s
+
+def isint(s:str):
+    if s.startswith('+') or s.startswith('-'):
+        s = s[1:]
+    return s.isdigit()
+
+def isfunc(o:object):
+    return hasattr(o,'__call__')
+
+def hasfunc(o:object,s:str):
+    if isinstance(s,str) and hasattr(o,s):
+        return hasattr(getattr(o,s),'__call__')
+    return False

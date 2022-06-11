@@ -12,6 +12,9 @@ class py:
     让bot发送和接收消息可以用Msg.send(<msg>)和Msg.recv(<msg>)，具体可以使用.py out=Msg.__doc__来查看
     msg是当前被执行消息的msg字典
     可以使用locals()或globals()来查看局部或全局变量'''
+    docs={
+        'run':__doc__
+    }
     level=4
     @to_thread
     def run(bot, body: str, msg: dict):# 想实现，3秒没执行完就timeout异常并退出
@@ -33,3 +36,6 @@ class py:
             Msg.send(str(e))
             print(e)
         bot.storage.msg_locals = locals()
+    
+    def err(bot, body: str, msg: dict):
+        return py.run(bot, body, msg)

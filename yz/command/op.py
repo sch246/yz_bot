@@ -1,4 +1,3 @@
-from yz.command.Command import Manager
 import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),os.pardir)))
@@ -17,6 +16,9 @@ def is_op(bot,user_id):
 class op:
     '''格式: op QQ号|@某人 [@某人 ...]
     用途: 添加管理员'''
+    docs={
+        'run':__doc__
+    }
     level=4
     def run(bot, body: str, msg: dict):
         Msg=bot.api.Create_Msg(bot,**msg)
@@ -45,6 +47,9 @@ class op:
 class deop:
     '''格式: deop QQ号|@某人 [@某人 ...]
     用途: 移除管理员'''
+    docs={
+        'run':__doc__
+    }
     level=4
     def run(bot, body: str, msg: dict):
         Msg=bot.api.Create_Msg(bot,**msg)

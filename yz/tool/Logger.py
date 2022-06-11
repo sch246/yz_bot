@@ -56,7 +56,7 @@ class Logger():
         self.log[type][name].append(s+'\n')
         
         
-    def put(self, s, **kargs):
+    def put(self, s, end='', **kargs):
         '''[time], [group_id], [user_id], [pre]'''
         if 'time' in kargs.keys():
             t = kargs['time']
@@ -77,14 +77,14 @@ class Logger():
             name='0'
         if 'pre' in kargs.keys():
             s = kargs['pre'] + s
-        print(type_head + s)
-        self.write(type, name, time_head + s)
+        print(type_head + s + end)
+        self.write(type, name, time_head + s + end)
 
 
-    def put_message(self, msg):
+    def put_message(self, msg, end=''):
         '''[time], [group_id], [user_id], [pre], sender{nickname,user_id}, raw_message, message_id'''
         s = f"{msg['sender']['nickname']}({msg['sender']['user_id']}): {load_cq(msg['raw_message'])} ({msg['message_id']})"
-        self.put(s,**msg)
+        self.put(s, end, **msg)
     
 
     def put_action_before(self, action,params):

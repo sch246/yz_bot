@@ -5,6 +5,9 @@ import atexit
 class reboot:
     '''格式: .reboot
     用途: 重启bot'''
+    docs={
+        'run':__doc__
+    }
     level=4
     def run(bot, body: str, msg: dict):
         print('重启中')
@@ -15,3 +18,6 @@ class reboot:
         atexit._run_exitfuncs()
         python = sys.executable
         os.execl(python, python, *sys.argv)
+
+    def err(bot, body: str, msg: dict):
+        return reboot.run(bot, body, msg)
