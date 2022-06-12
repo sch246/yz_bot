@@ -1,9 +1,10 @@
+from functools import reduce
 from threading import Thread
 import asyncio
 import time
 import os
 
-from yz.tool.data import cq_load_dic,cq_trans_dic
+from yz.tool.data import cq_load_dic,cq_trans_dic,re_need_trans
 
 
 def mkdirs(path):
@@ -135,23 +136,30 @@ def fms(s,color=None, bg=None,type=None):
     return fmt(color,bg,type) + s + fmt()
 
 
-re_CQ = re.compile('\[CQ:[^,]+(?:,[^,=]+=[^,=]+)*\]')
-re_CQ2 = re.compile('\[CQ:([^,]+),([^\]]+)*\]')
+re_CQ = re.compile('\[CQ:(?P<type>[^,\]]+)(?P<data>(?:,[^,=]+=[^,\]]+)*)\]')
 
 def find_all_CQ(s:str):
     return re_CQ.findall(s)
 
 def load_CQ(CQ:str):
-    CQ = re.sub('[\s]','',CQ)
-    mt = re_CQ2.match(CQ)
-    type=mt.group(1)
-    if mt.group(2):
+    '''将字符串形式的单个CQ转化为字典，并且将其中乱七八糟的东东转化为正常'''
+    CQ = re.sub('\s','',CQ)  # 去掉空白符
+    mt = re_CQ.match(CQ)
+    stype=mt.group('type')
+    sdata=mt.group('data')
+    if sdata:
         # 若CQ有参数,分割并获取参数字符串,再次分割并转化为字典
-        str_list = mt.group(2).split(',')
-        data = dict(map(lambda s:s.split('=') ,str_list))
+        str_list = sdata.split(',')
+        data = dict(map(lambda s:load_cq(s).split('=') ,str_list))
     else:
         data={}
-    return {'type':type,'data':data}
+    return {'type':stype,'data':data}
+
+def make_CQ(d:dict):
+    '''将字典形式的CQ转化为字符串形式，并且将对应的字符转换为CQ的乱七八糟的东东'''
+    type=d['type']
+    data = ''.join(map(lambda x:','+trans_to_cq(f'{x[0]}={x[1]}'), d['data'].items()))
+    return f'[CQ:{type}{data}]'
 
 def trans_rep(src_rep:str):
     src_ = re.compile('{(\w+?)}')
@@ -185,11 +193,13 @@ def rep_str(rep:str, tar:str, src:str):
 def set_rep(rep:str, tar:str):
     return lambda src:rep_str(rep,tar,src)
 
-def trans_cq(s:str):
+def trans_to_cq(s:str):
+    '''将正常的符号转码为符合CQ转码的东东'''
     for k,v in cq_trans_dic.items():
         s = s.replace(k,v)
     return s
 def load_cq(s:str):
+    '''将接收的乱七八糟的转码为正常的东东'''
     for k,v in cq_load_dic.items():
         s = s.replace(k,v)
     return s
@@ -200,11 +210,14 @@ def cut_head(s:str,*h):
             return s[len(h_):]
     return s
 
+def tabbed(s:str):
+    return all(map(lambda x: x.startswith('    ') or x.startswith('\t'),s.splitlines()))
+
 def cut_tab(s):
     s = cut_head(s,'    ','\t')
-    s.replace('\n    \t','\n    \t\t')
-    s.replace('\n    ','\n')
-    s.replace('\n\t','\n')
+    s = s.replace('\n    \t','\n    \t\t')
+    s = s.replace('\n    ','\n')
+    s = s.replace('\n\t','\n')
     return s
 
 def add_tab(s):
@@ -224,3 +237,10 @@ def hasfunc(o:object,s:str):
     if isinstance(s,str) and hasattr(o,s):
         return hasattr(getattr(o,s),'__call__')
     return False
+
+def getlines(s:str, start=None, end=None):
+    return '\n'.join(s.splitlines()[start:end])
+
+def re_mark(s:str):
+    '''返回精准匹配s的正则表达式'''
+    return reduce(lambda x, y: x.replace(y,'\\'+y),re_need_trans,s)
