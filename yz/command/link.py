@@ -3,17 +3,25 @@ import os
 import sys
 import atexit
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),os.pardir)))
-from tool.tool import add_tab, find_all_CQ, load_CQ, make_CQ, re_mark, rep_str,cut_tab, tabbed
+from tool.tool import add_tab, find_all_CQ, insert_str, load_CQ, make_CQ, re_mark, rep_str,cut_tab, tabbed, re_CQdatas, _re_CQ
 from tool.config import init_or_load_config, save_config
 from tool.cmd import std_cmd
 from tool.data import re_need_trans
 
 link_file = "links.json"
-#TODO 输入匹配柚子，输出匹配对方
-#TODO 人能纠错对自己的称呼，这要求需要给每个人加上存储位置
-#TODO 记忆力增强
-#TODO 因果联系and(条件与层级) to or(并行与顺序执行)
-    # 用link实现的话，，
+#TODO 小豆想bot能更好地打招呼
+    # 输入匹配柚子，输出匹配对方, 运行函数生成
+    #TODO 人能纠错对自己的称呼
+        # 这要求需要给每个人加上存储位置
+        # 记忆力增强
+#TODO 雨弓有时会禁言bot
+    # 设置link disable和off，对特定群临时关闭的功能
+#TODO 调试需求
+    # try命令，debug用，返回语句匹配的是哪一句，以及link调用路径
+#TODO 每条命令都匹配一个池的分类是不科学的，而且目前还是列表中只运行一个的状态(设想中应该是所有的都尝试执行)，还是单线程
+    #  link数据包
+    # 因果联系(and to or)(条件与层级 to 并行与顺序执行)
+#TODO link reply分多句匹配，以及多句间隔的命令"匹配开始""匹配结束"
 init = {
     "Command":{
         "links":{
@@ -71,12 +79,10 @@ class link:  #TODO disable, off
         v = match.group(3)
         if tabbed(k): k=cut_tab(k)
         if tabbed(v): v=cut_tab(v)
+        
         # 如果key有CQ码，为正则表达式进行转码
-        CQ_list = find_all_CQ(k)
-        if CQ_list:
-            for CQ in CQ_list:
-                tar = reduce(lambda x, y: x.replace(y,'\\'+y),re_need_trans,CQ)
-                k = k.replace(CQ,tar)
+        k = _re_CQ.sub(lambda match:CQ2re(match.group()),k)
+                
         if k and isinstance(v,str):
             opr = match.group('opr').strip()
             if link.add(link.links, k, v, opr):
@@ -160,9 +166,14 @@ def CQ2re(CQ:str):
     if CQ.startswith('[CQ:image'):
         dCQ = load_CQ(CQ)
         dCQ['data'] = {'file':dCQ['data']['file']}
-        CQ = make_CQ(dCQ)
-    return re_mark(CQ)
+        reCQ = re_mark(make_CQ(dCQ))
+        return insert_str(reCQ,re_CQdatas,-2)
+    else:
+        return re_mark(CQ)
 
+def re2CQ(reCQ):
+    '''把CQ2re函数的结果转化回去\n注意: 不保证等价'''
+    
 
 # 猜猜为什么不用装饰器？因为python3.7.9使用装饰器就不能正常使用atexit._run_exitfuncs()了
 atexit.register(link._save_link)
