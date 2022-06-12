@@ -135,11 +135,13 @@ def fmt(color=None, bg=None,type=None):
 def fms(s,color=None, bg=None,type=None):
     return fmt(color,bg,type) + s + fmt()
 
+re_CQdatas = '(?:,[^,=]+=[^,\]]+)*'
 
-re_CQ = re.compile('\[CQ:(?P<type>[^,\]]+)(?P<data>(?:,[^,=]+=[^,\]]+)*)\]')
+_re_CQ = re.compile(f'\[CQ:[^,\]]+{re_CQdatas}\]')
+re_CQ = re.compile(f'\[CQ:(?P<type>[^,\]]+)(?P<data>{re_CQdatas})\]')
 
 def find_all_CQ(s:str):
-    return re_CQ.findall(s)
+    return _re_CQ.findall(s)
 
 def load_CQ(CQ:str):
     '''将字符串形式的单个CQ转化为字典，并且将其中乱七八糟的东东转化为正常'''
@@ -149,8 +151,12 @@ def load_CQ(CQ:str):
     sdata=mt.group('data')
     if sdata:
         # 若CQ有参数,分割并获取参数字符串,再次分割并转化为字典
-        str_list = sdata.split(',')
-        data = dict(map(lambda s:load_cq(s).split('=') ,str_list))
+        str_list = sdata[1:].split(',')
+        def f(s:str):
+            s = load_cq(s)
+            i = s.index('=')
+            return s[:i], s[i+1:]
+        data = dict(map(f ,str_list))
     else:
         data={}
     return {'type':stype,'data':data}
@@ -244,3 +250,8 @@ def getlines(s:str, start=None, end=None):
 def re_mark(s:str):
     '''返回精准匹配s的正则表达式'''
     return reduce(lambda x, y: x.replace(y,'\\'+y),re_need_trans,s)
+
+def insert_str(s:str,insert:str,start:int,end:int=None):
+    if end==None:
+        return s[:start] + insert +s[start:]
+    return s[:start] + insert +s[end:]
