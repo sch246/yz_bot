@@ -80,3 +80,5 @@ cq_trans_dic={
     ',':'&#44;'
 }
 cq_load_dic = {v:k for k,v in cq_trans_dic.items()}
+
+re_need_trans=['*', '.', '?', '+', '^', '$', '|', '\\', '/', '[', ']', '(', ')', '{', '}', ]

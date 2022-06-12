@@ -137,7 +137,6 @@ class Bot:
         })))
     
     def recv_event(self, **event):
-        # TODO: 把更多的事件写进log
         try:
             keys = event.keys()
             Msg = self.api.Create_Msg(self,**event)

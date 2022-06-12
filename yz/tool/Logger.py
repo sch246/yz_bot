@@ -47,7 +47,7 @@ class Logger():
             self._save_lines(os.path.join('group', str(group_id)), lines, endtime)
         for user_id, lines in self.log['private'].items():
             self._save_lines(os.path.join('private', str(user_id)), lines, endtime)
-        self.refresh_starttime()
+        self.__init__()
     
     def write(self, type, name, s):
         name = validateTitle(name)

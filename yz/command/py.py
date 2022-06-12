@@ -1,7 +1,8 @@
 import os
 import sys
+import traceback
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),os.pardir)))
-from tool.tool import to_thread,load_cq
+from tool.tool import getlines, to_thread,load_cq
 
 
 
@@ -33,8 +34,8 @@ class py:
             if locals()['back']:
                 Msg.send('执行成功，返回'+str(locals()['out']))
         except Exception as e:
-            Msg.send(str(e))
-            print(e)
+            Msg.send(getlines(traceback.format_exc(),3,None))
+            print(traceback.format_exc())
         bot.storage.msg_locals = locals()
     
     def err(bot, body: str, msg: dict):
