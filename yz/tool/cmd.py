@@ -17,6 +17,7 @@ def std_cmd(f):     # 偷懒用的装饰器，它包裹的函数会被CommandMan
     def cmd(cls, bot, body: str, msg: dict):
         dic = f(cls)
         # body = load_cq(body)
+        # print(list(map(repr,body)))
         Msg=bot.api.Create_Msg(bot,**msg)
         for cp, func in dic.items():
             match = re.match(cp,body)
