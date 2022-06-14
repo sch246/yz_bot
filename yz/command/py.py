@@ -2,7 +2,7 @@ import os
 import sys
 import traceback
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),os.pardir)))
-from tool.tool import getlines, to_thread,load_cq
+from tool.tool import getlines, to_thread,load_cq,trans_to_cq
 
 
 
