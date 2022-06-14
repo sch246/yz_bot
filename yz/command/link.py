@@ -32,7 +32,7 @@ init = {
             ".savelog": ".py back=0\nbot.logger.save()\nMsg.send('保存完成')",
             ".savestorage": ".py back=0\nbot.storage.save_storage()\nMsg.send('保存完成')",
             "柚子$": ".py back=0\ns = '''我在'''\nMsg.send(s)",
-            ".file read (?P<file>.*?)(?: (?P<from>\\-?[0-9]+) (?P<to>\\-?[0-9]+))?$": ".py back=0\ntry:\n    t=open({file}).read()\n    t='\\n'.join(t.splitlines()[{from}:{to}])\n    if isinstance(t,str):\n        if not t:\n            raise Exception('内容为空')\n        Msg.send('打开成功，内容如下:\\n'+t)\n    else:\n        raise Exception('不是字符串')\nexcept Exception as e:\n    Msg.send('打开失败，'+str(e))",
+            ".file read (?P<file>.*?)(?: (?P<from>\\-?[0-9]+) (?P<to>\\-?[0-9]+))?$": ".py back=0\ntry:\n    t=open({file}).read()\n    t='\\n'.join(t.splitlines()[{from}:{to}])\n    if isinstance(t,str):\n        if not t:\n            raise Exception('内容为空')\n        Msg.send('打开成功，内容如下:\\n'+trans_to_cq(t))\n    else:\n        raise Exception('不是字符串')\nexcept Exception as e:\n    Msg.send('打开失败，'+str(e))",
             ".file new (?P<File>.+)\n{Value}": ".py back=0\nif os.path.exists({File}):\n    Msg.send('文件已存在')\nelse:\n    open({File},'w',encoding='utf-8').write('''{Value}''')\n    Msg.send(f\"已创建文件'{ {File} }'\")",
             ".file write (?P<file>.*?)(?: (?P<from>\\-?[0-9]+) (?P<to>\\-?[0-9]+))?\r?\n{A}": ".py back=0\ntry:\n    if not os.path.exists({file}):\n        raise Exception('文件不存在')\n    elif not os.path.isfile({file}):\n        raise Exception('路径存在，但不是文件')\n    t=open({file}).read()\n    sl=t.splitlines()\n    tarl='''{A}'''.splitlines()\n    p='\\n'.join(sl[{from}:{to}])\n    sl[{from}:{to}]=tarl\n    open({file},'w',encoding='utf-8').write('\\n'.join(sl))\n    Msg.send('写入成功')\nexcept Exception as e:\n    Msg.send('写入失败，\\n'+str(e))",
         }
@@ -151,7 +151,6 @@ def prn(index, k,v):
 def match(bot, event):
     Msg=bot.api.Create_Msg(bot,**event)
     s = event['raw_message']
-    print('待匹配:',repr(s))
     for k,v in reversed(list(link.links.items())):
         if k:
             b = rep_str(k,v,s)        # 替换字符串的部分在rep_str
