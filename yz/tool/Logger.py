@@ -92,22 +92,27 @@ class Logger():
             
     
     def put_action(self, action,params,event):
-        '''action和params是调用api发出的, event是接收到的'''
+        '''action和params是调用api发出的, event是调用api的返回'''
         # 若消息是发出的，则通过id获取消息信息
+        print(event)
         
         if action in ['send_private_msg','send_group_msg','send_msg']:
             # 此时event仅包含message_id
-            def put_msg(evt):
-                '''以发送出去的信息的id查询所返回的信息'''
-                msg={}
-                msg.update(evt['data']) # 包含message, message_id, message_type, sender{nickname,user_id}, time
-                s = f"{params['message']}({evt['data']['message_id']})"
-                
-                if 'group_id' in params.keys():
-                    msg['group_id'] = params['group_id']
-                    s = f"{self.bot.nickname}({self.bot.user_id}): " + s
-                if 'user_id' in params.keys():
-                    msg['user_id'] = params['user_id']
-                    s = f"{self.bot.nickname}({self.bot.user_id}) >> {self.bot.get_nickname(params['user_id'])}({params['user_id']}): " + s
-                self.put(s,**msg)
-            self.bot.use_api('get_msg',echofunc=put_msg,log=False,message_id=event['data']['message_id'])
+            if event['status']=='ok':
+                def put_msg(evt):
+                    '''以发送出去的信息的id查询所返回的信息'''
+                    msg={}
+                    msg.update(evt['data']) # 包含message, message_id, message_type, sender{nickname,user_id}, time
+                    s = f"{params['message']}({evt['data']['message_id']})"
+                    
+                    if 'group_id' in params.keys():
+                        msg['group_id'] = params['group_id']
+                        s = f"{self.bot.nickname}({self.bot.user_id}): " + s
+                    if 'user_id' in params.keys():
+                        msg['user_id'] = params['user_id']
+                        s = f"{self.bot.nickname}({self.bot.user_id}) >> {self.bot.get_nickname(params['user_id'])}({params['user_id']}): " + s
+                    self.put(s,**msg)
+                self.bot.use_api('get_msg',echofunc=put_msg,log=False,message_id=event['data']['message_id'])
+            else:
+                Msg=self.bot.api.Create_Msg(self.bot,**params)
+                Msg.send(f"消息发送失败: \n{event['msg']}\n{event['wording']}")
