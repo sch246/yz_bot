@@ -1,9 +1,10 @@
 import os
 import sys
 import traceback
+import time as Time
+from inspect import getsource as getdef
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),os.pardir)))
-from tool.tool import getlines, to_thread,load_cq,trans_to_cq
-
+from tool.tool import getlines, to_thread,load_cq,trans_to_cq,add_tab,trans_to_cq,getlines
 
 
 class py:
@@ -30,9 +31,10 @@ class py:
         bot.storage.msg_locals['back']=True
         locals().update(bot.storage.msg_locals)
         try:
-            exec(body,globals(),locals())
-            if locals()['back']:
-                Msg.send('执行成功，返回'+str(locals()['out']))
+            exec(getlines(body,None,-1),globals(),locals())
+            out = eval(getlines(body,-1,None),globals(),locals())
+            if out:
+                Msg.send(str(out))
         except Exception as e:
             Msg.send(getlines(traceback.format_exc(),3,None))
             print(traceback.format_exc())

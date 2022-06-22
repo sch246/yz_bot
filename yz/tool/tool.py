@@ -182,7 +182,7 @@ def trans_rep(src_rep:str):
         keys.add(key)
         return rtn
     # 得检测重复的group并替换成引用
-    return src_.sub(f,src_rep)
+    return src_.sub(f,load_cq(src_rep))
 
 def rep_str(rep:str, tar:str, src:str):
     re_rep = re.compile(trans_rep(rep))

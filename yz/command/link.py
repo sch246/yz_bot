@@ -26,15 +26,15 @@ init = {
     "Command":{
         "links":{
             ".运行{A}":".py{A}",
-            ".ifcatch {a}":".py back=0\nbot.config.save_config({a},'Bot','ifcatch')\nbot.ifcatch={a}\nMsg.send('自动捕获设置为{a}')",
-            ".dir( {A})?": ".py back=0\ns = os.listdir({A})\nMsg.send(s)",
-            "柚子你?{A}": ".py back=0\nif 'group_id' in msg.keys() and 'card' in msg['sender'].keys():\n        s=msg['sender']['card']\nelse:\n    s=msg['sender']['nickname']\ns='你也{A}，'+s\nMsg.send(s)",
-            ".savelog": ".py back=0\nbot.logger.save()\nMsg.send('保存完成')",
-            ".savestorage": ".py back=0\nbot.storage.save_storage()\nMsg.send('保存完成')",
-            "柚子$": ".py back=0\ns = '''我在'''\nMsg.send(s)",
-            ".file read (?P<file>.*?)(?: (?P<from>\\-?[0-9]+) (?P<to>\\-?[0-9]+))?$": ".py back=0\ntry:\n    t=open({file}).read()\n    t='\\n'.join(t.splitlines()[{from}:{to}])\n    if isinstance(t,str):\n        if not t:\n            raise Exception('内容为空')\n        Msg.send('打开成功，内容如下:\\n'+trans_to_cq(t))\n    else:\n        raise Exception('不是字符串')\nexcept Exception as e:\n    Msg.send('打开失败，'+str(e))",
-            ".file new (?P<File>.+)\n{Value}": ".py back=0\nif os.path.exists({File}):\n    Msg.send('文件已存在')\nelse:\n    open({File},'w',encoding='utf-8').write('''{Value}''')\n    Msg.send(f\"已创建文件'{ {File} }'\")",
-            ".file write (?P<file>.*?)(?: (?P<from>\\-?[0-9]+) (?P<to>\\-?[0-9]+))?\r?\n{A}": ".py back=0\ntry:\n    if not os.path.exists({file}):\n        raise Exception('文件不存在')\n    elif not os.path.isfile({file}):\n        raise Exception('路径存在，但不是文件')\n    t=open({file}).read()\n    sl=t.splitlines()\n    tarl='''{A}'''.splitlines()\n    p='\\n'.join(sl[{from}:{to}])\n    sl[{from}:{to}]=tarl\n    open({file},'w',encoding='utf-8').write('\\n'.join(sl))\n    Msg.send('写入成功')\nexcept Exception as e:\n    Msg.send('写入失败，\\n'+str(e))",
+            ".ifcatch {a}":".py\nbot.config.save_config({a},'Bot','ifcatch')\nbot.ifcatch={a}\n'自动捕获设置为{a}'",
+            ".dir( {A})?": ".py\ns = os.listdir({A})\ns",
+            "柚子你?{a}": ".py\nif 'group_id' in msg.keys() and 'card' in sender.keys():\n        s=sender['card']\nelse:\n    s=sender['nickname']\ns='你也{a}，'+s\ns",
+            ".savelog": ".py\nbot.logger.save()\n'保存完成'",
+            ".savestorage": ".py\nbot.storage.save_storage()\n'保存完成'",
+            "柚子$": ".py\n'''我在'''",
+            ".file read (?P<file>.*?)(?: (?P<from>\\-?[0-9]+) (?P<to>\\-?[0-9]+))?$": ".py\ntry:\n    t=open({file}).read()\n    t='\\n'.join(t.splitlines()[{from}:{to}])\n    if isinstance(t,str):\n        if not t:\n            raise Exception('内容为空')\n        Msg.send('打开成功，内容如下:\\n'+trans_to_cq(t))\n    else:\n        raise Exception('不是字符串')\nexcept Exception as e:\n    Msg.send('打开失败，'+str(e))\nNone",
+            ".file new (?P<File>.+)\n{Value}": ".py\nif os.path.exists({File}):\n    Msg.send('文件已存在')\nelse:\n    open({File},'w',encoding='utf-8').write('''{Value}''')\n    Msg.send(f\"已创建文件'{ {File} }'\")\nNone",
+            ".file write (?P<file>.*?)(?: (?P<from>\\-?[0-9]+) (?P<to>\\-?[0-9]+))?\r?\n{A}": ".py\ntry:\n    if not os.path.exists({file}):\n        raise Exception('文件不存在')\n    elif not os.path.isfile({file}):\n        raise Exception('路径存在，但不是文件')\n    t=open({file}).read()\n    sl=t.splitlines()\n    tarl='''{A}'''.splitlines()\n    p='\\n'.join(sl[{from}:{to}])\n    sl[{from}:{to}]=tarl\n    open({file},'w',encoding='utf-8').write('\\n'.join(sl))\n    Msg.send('写入成功')\nexcept Exception as e:\n    Msg.send('写入失败，\\n'+str(e))\nNone",
         }
     }
 }
@@ -94,8 +94,8 @@ class link:  #TODO disable, off
     def add(d, k, v, opr):
         dic={
             'to':f'{v}',
-            'func':f'.py back=0\n{v}',
-            'reply':f".py back=0\ns = '''{v}'''\nMsg.send(s)"
+            'func':f'.py\n{v}\nNone',
+            'reply':f".py\ns = '''{v}'''\ns"
         }
         if opr in dic.keys():
             d[k]=dic[opr]
@@ -173,6 +173,7 @@ def CQ2re(CQ:str):
 def re2CQ(reCQ):
     '''把CQ2re函数的结果转化回去\n注意: 不保证等价'''
     
+
 
 # 猜猜为什么不用装饰器？因为python3.7.9使用装饰器就不能正常使用atexit._run_exitfuncs()了
 atexit.register(link._save_link)
