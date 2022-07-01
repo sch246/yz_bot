@@ -4,12 +4,15 @@ import traceback
 import time as Time
 import math
 import random
+import atexit
 from inspect import getsource as getdef
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),os.pardir)))
-from tool.tool import getlines, to_thread,load_cq,trans_to_cq,add_tab,trans_to_cq,getlines
+from tool.tool import getlines, to_thread,load_cq,trans_to_cq,add_tab,trans_to_cq,getlines,Now
+from tool.config import init_or_load_config,save_config
 
 sqrt = math.sqrt
 getran=random.choice
+now = Now()
 
 class py:
     '''格式: .py <code>
@@ -17,7 +20,8 @@ class py:
     最后一行将会作为表达式解析，若不是None则会发送消息以返回结果
     让bot发送和接收消息可以用Msg.send(<msg>)和Msg.recv(<msg>)，具体可以使用.py out=Msg.__doc__来查看
     msg是当前被执行消息的msg字典
-    可以使用locals()或globals()来查看局部或全局变量'''
+    可以使用locals()或globals()来查看局部或全局变量
+    定义函数时使用now['变量名']以使用函数被调用时的变量'''
     docs={
         'run':__doc__
     }
@@ -32,11 +36,12 @@ class py:
         bot.storage.msg = msg  # 防止有sb命名了msg
         bot.storage.msg_locals.update(msg)
         bot.storage.msg_locals['out']=None
-        bot.storage.msg_locals['back']=True
         locals().update(bot.storage.msg_locals)
+        dic = {**locals(),**globals()}
+        now.dic.update(dic)
         try:
-            exec(getlines(body,None,-1),{**locals(),**globals()},locals())
-            out = eval(getlines(body,-1,None),{**locals(),**globals()},locals())
+            exec(getlines(body,None,-1),dic,locals())
+            out = eval(getlines(body,-1,None),dic,locals())
             if out:
                 Msg.send(str(out))
         except Exception as e:
@@ -49,38 +54,33 @@ class py:
         return py.run(bot, body, msg)
 
 class Names:
-    """class Names:
-    dic={}
+    """保存昵称"""
+    dic=init_or_load_config({'Names':{}})['Names']
     @classmethod
-    def set(cls,msg,name):
-        cls.dic[msg['user_id']]=name
+    def set(cls,name):
+        cls.dic[now['msg']['user_id']]=name
     @classmethod
-    def get(cls,msg):
+    def get(cls):
         names=cls.dic
-        if msg['user_id'] in names.keys():
-            return names[msg['user_id']]
-        if 'group_id' in msg.keys() and 'card' in msg['sender'].keys():
-            return msg['sender']['card']
+        msg = now['msg']
+        user_id = msg['user_id']
+        if user_id in names.keys():
+            return names[user_id]
+        sender = msg['sender']
+        if 'group_id' in msg.keys() and 'card' in sender.keys():
+            return sender['card']
         else:
-            return msg['sender']['nickname']"""
-    dic={}
+            return sender['nickname']
     @classmethod
-    def set(cls,msg,name):
-        cls.dic[msg['user_id']]=name
-    @classmethod
-    def get(cls,msg):
-        names=cls.dic
-        if msg['user_id'] in names.keys():
-            return names[msg['user_id']]
-        if 'group_id' in msg.keys() and 'card' in msg['sender'].keys():
-            return msg['sender']['card']
-        else:
-            return msg['sender']['nickname']
+    def save(cls):
+        save_config(cls.dic,'Names')
 
-def getname(msg):
-    '''def getname(msg):
-    return Names.get(msg)'''
-    return Names.get(msg)
+atexit.register(Names.save)
+
+def getname():
+    '''def getname():
+    return Names.get()'''
+    return Names.get()
 
 def isfunc(o):
     return hasattr(o,'__call__')
