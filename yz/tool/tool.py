@@ -255,3 +255,8 @@ def insert_str(s:str,insert:str,start:int,end:int=None):
     if end==None:
         return s[:start] + insert +s[start:]
     return s[:start] + insert +s[end:]
+
+class Now:
+    dic={}
+    def __getitem__(self,index):
+        return self.dic[index]
