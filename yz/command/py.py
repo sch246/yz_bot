@@ -58,16 +58,16 @@ class Names:
     dic=init_or_load_config({'Names':{}})['Names']
     @classmethod
     def set(cls,name):
-        cls.dic[now['msg']['user_id']]=name
+        cls.dic[str(now['msg']['user_id'])]=name
     @classmethod
     def get(cls):
         names=cls.dic
         msg = now['msg']
         user_id = msg['user_id']
-        if user_id in names.keys():
-            return names[user_id]
+        if str(user_id) in names.keys():
+            return names[str(user_id)]
         sender = msg['sender']
-        if 'group_id' in msg.keys() and 'card' in sender.keys():
+        if 'group_id' in msg.keys() and 'card' in sender.keys() and sender['card']:
             return sender['card']
         else:
             return sender['nickname']
