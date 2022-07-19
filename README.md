@@ -121,7 +121,7 @@ initfunc> 初始化完成
 
 几个核心命令在这里有说:https://www.sch246.com/Computer/project/qq_bot/yz_bot
 
-`.py`内的运行环境存储在`run.py`同目录的 `./storage/msg_locals.pkl` 内，你可以手动保存，也可以删掉它来回复原始的环境
+`.py`内的变量环境存储在`run.py`同目录的 `./storage/msg_locals.pkl` 内，你可以手动保存，也可以删掉它来回复原始的环境
 
 聊天记录存在同目录的`./log/`文件夹内
 
