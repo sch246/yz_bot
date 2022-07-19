@@ -133,8 +133,6 @@ initfunc> 初始化完成
 
 [@sch246](https://github.com/sch246)
 
-### Any optional sections
-
 ## 使用许可
 
 [GPL](LICENSE)
