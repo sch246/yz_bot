@@ -40,6 +40,7 @@ def first_start():
                 config.save_config([master],'ops')
                 send('已成为管理员', user_id=master)
                 break
+    time.sleep(0.3)
     send('请输入对bot的昵称，不要包含单引号', user_id=master)
     while True:
         msg = rev_msg()

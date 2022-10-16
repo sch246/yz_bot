@@ -10,6 +10,8 @@ def is_evt(msg:dict):
 
 def is_heartbeat(msg:dict):
     return 'meta_event_type' in msg.keys() and msg['meta_event_type'] == 'heartbeat'
+def is_connected(msg:dict):
+    return 'meta_event_type' in msg.keys() and msg['meta_event_type'] == 'lifecycle' and 'sub_type' in msg.keys() and msg['sub_type']=='connect'
 
 
 # post_type = message
