@@ -6,8 +6,7 @@ path = '.'
 def ensure_file(path):
     '''确保文件路径存在，并且返回文件路径'''
     dirpath = os.path.split(path)[0]
-    if not os.path.isdir(dirpath):
-        os.makedirs(dirpath)
+    os.makedirs(dirpath,exist_ok=True)
     return path
 
 def read(file_path, start_line=None, end_line=None):

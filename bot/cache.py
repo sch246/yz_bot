@@ -85,25 +85,27 @@ msgs = {
     'last':None
 }
 
+MAX_LEN = 256
+
 def add_msg(type, uid, msg):
     if not uid in msgs[type].keys():
         msgs[type][uid] = []
     lst = msgs[type][uid]
     lst.insert(0, msg)
     msgs['last'] = msg
-    if len(lst)>256:
+    if len(lst)>MAX_LEN:
         lst.pop()
 
 def add_self_msg(msg):
     msgs['bot'].insert(0, msg)
-    if len(msgs['bot'])>256:
+    if len(msgs['bot'])>MAX_LEN:
         msgs['bot'].pop()
 
 def get_last():
     return msgs['last']
 
 
-'''保存和读取msgs'''
+'''保存和读取msgs，每个人每个群不会超过256条，所以不用担心无限增长的问题'''
 import atexit
 from s3.file import write, ensure_file
 
