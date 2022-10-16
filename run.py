@@ -1,16 +1,10 @@
-#!/usr/bin/env python
-import asyncio
-import os
+'''启动bot'''
 
-
-from yz.bot import Bot
-from yz.tool.Storage import Storage
-from yz.tool.Logger import Logger
-
-
-
-if __name__ == "__main__":
-    # os.chdir(os.path.dirname(__file__))
-    bot = Bot(Storage(),Logger())
-    asyncio.run(bot.run())
-
+import subprocess,sys
+while True:
+    out = subprocess.run([sys.executable,'./bot/__init__.py',*sys.argv[1:]])
+    print('已退出，返回码为',out.returncode)
+    if out.returncode==2:
+        print('重启中...')
+        continue
+    break
