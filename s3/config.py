@@ -1,11 +1,40 @@
-from yz.tool.tool import dicts
 import json
 import os
 
-config_file = 'Config.json'
+config_file = 'config.json'
 
 init = {
 }
+
+
+class dicts:
+    @staticmethod
+    def get(d,*k_):
+        '''递归打开字典'''
+        if  len(k_)==1:
+            return d[k_[0]]
+        else:
+            return dicts.get(d[k_[0]],*k_[1:])
+
+    @staticmethod
+    def set(d, value, *k_):
+        '''递归写入字典'''
+        if  len(k_)==1:
+            d[k_[0]] = value
+        else:
+            if k_[0] not in d.keys():
+                d[k_[0]]={}
+            dicts.set(d[k_[0]], value, *k_[1:])
+
+    @staticmethod
+    def update(d1, d2):
+        '''递归更新字典
+        参考:https://www.coder.work/article/1283998
+        '''
+        return {
+            **d1, **d2,
+            **{k: dicts.update(d1[k], d2[k]) for k in {*d1} & {*d2} if isinstance(d1[k],dict)}
+        }
 
 def init_config():
     with open(config_file,'w',encoding='utf-8') as f:
