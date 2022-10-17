@@ -150,7 +150,7 @@ def _recv_file(file_msg, path):
     if 'file' not in file_msg.keys():
         return '发送的不是文件，接收终止'
     # 离线文件具有url，群文件需要调用api获取链接
-    if file_msg['group_id']!=None:
+    if 'group_id' in file_msg.keys() and file_msg['group_id']!=None:
         file = file_msg['file']
         ret = call_api('get_group_file_url',group_id=file_msg['group_id'], file_id=file['id'], busid=file['busid'])
         if ret['retcode']==0:
@@ -164,6 +164,7 @@ def _recv_file(file_msg, path):
 def _set(m):
     path = m.group(1)
     extra_param = m.group(2).strip()
+    params=[]
     if extra_param:
         params = extra_param.split(' ')
     if '-y' in params or not os.path.exists(path):
