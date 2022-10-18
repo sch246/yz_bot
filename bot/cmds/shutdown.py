@@ -13,6 +13,8 @@ def run(body:str):
     if body.strip()=='':
         send('关闭中', **msg)
         write(ensure_file('data/shutdown_greet.py'), f"send('{get_nickname()}醒了！',**{msg})")
+        from bot.connect import stop_thread
+        stop_thread()
         exit(0)
 
 

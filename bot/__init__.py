@@ -6,17 +6,18 @@ import time
 sys.path.append(os.path.join(os.path.split(__file__)[0], '..'))
 
 
-from bot.connect import rev_msg
+from bot.connect import recv, start
 from bot.chatlog import write
 from bot.connect import *
 # import bot.tick
-# from s3.log import debug, info, warn, error
 from bot.cache import set_self_qq, update_user_name, set_ops, set_nicknames
-from bot.msgs import is_heartbeat, is_msg
+from bot.msgs import is_connected, is_heartbeat, is_msg, not_api
 import bot.cmds
 from s3 import config
 from s3.file import ensure_file
 from s3.thread import to_thread
+from s3 import debug, in_debug
+
 
 
 def I(msg:dict):
@@ -28,12 +29,12 @@ def loc(msg:dict):
 def first_start():
     '''第一次加载'''
     config.init_config()
-    print('未检测到config，第一次加载中')
+    print('未检测到config，第一次加载中\nps:bot刚启动的一段时间接收消息可能延迟几秒，是正常现象，我也不知道为什么')
     from random import randint
     check = randint(0, 9999)
     print(f'私聊bot验证码以确定master: {check:04d}')
     while True:
-        msg = rev_msg()
+        msg = recv(not_api)
         if is_msg(msg):
             if msg['message'] == f'{check:04d}':
                 master = msg['user_id']
@@ -43,7 +44,7 @@ def first_start():
     time.sleep(0.3)
     send('请输入对bot的昵称，不要包含单引号', user_id=master)
     while True:
-        msg = rev_msg()
+        msg = recv(not_api)
         if is_msg(msg) and msg['user_id']==master:
             name = msg['message']
             if "'" not in name:
@@ -69,6 +70,7 @@ def _init_self():
 @to_thread
 def send(text: Any, user_id: int | str = None, group_id: int | str = None, **params) -> dict:
     '''user_id或者group_id是必须的'''
+    debug('准备发送消息')
     text = str(text)
     if 'message' in params.keys():
         del params['message']
@@ -91,6 +93,7 @@ def send(text: Any, user_id: int | str = None, group_id: int | str = None, **par
         self_msg['user_id'] = user_id
     else:
         self_msg['user_id'] = self_msg['sender']['user_id']
+    debug(f'准备记录消息:{self_msg}')
     write(**self_msg)
 
 
@@ -111,30 +114,26 @@ def cmd_ret(ret):
 
 
 if __name__=="__main__":
+    loop_thread = start()
     _init_self()
     bot.cmds.load()
 
-    # # 在多线程开启tick循环
-    # to_thread(bot.tick.main_loop)()
-
     while True:
-        msg = rev_msg()
-        if msg==None:
-            print('连接已断开')
-            time.sleep(1)
-            continue
-            # exit(0)
-        if not is_heartbeat(msg):
+        msg = recv(not_api)
+        # if msg==None:
+        #     print('连接已断开')
+        #     time.sleep(1)
+        #     continue
+        #     # exit(0)
+        if msg=='exit':
+            raise '事件循环已断开'
+        if in_debug and (is_heartbeat(msg)):
+            print('.')
+        if (not is_heartbeat(msg)) and (not is_connected(msg)):
+            debug(f'收到消息: {msg}')
             # print(write(**msg)[:-1])
             write(**msg)
             msg_loc = loc(msg)
-
-            # # 检测waiter，定义在cache里，在这里是为了筛选条件并且触发
-            # for wait in list(waiter.waits.values()):
-            #     if wait.检测函数(msg):
-            #         wait.删除自身()
-            #         wait.运行函数(msg)
-            #         continue
 
             if msg_loc in catches.keys() and catches[msg_loc]:
                 gen = catches[msg_loc][-1]
@@ -160,5 +159,11 @@ if __name__=="__main__":
                     if not s=='':
                         send(s, **msg)
 
-{'group': False, 'message': '测试！', 'message_type': 'private', 'sender': {'nickname': '清羽', 'user_id': 1581186041}, 'time': 1660817235, 'user_id': 1581186041}
-{'group': True, 'group_id': 916083933, 'message': '测试！', 'message_type': 'group', 'real_id': 658901, 'sender': {'nickname': '清羽', 'user_id': 1581186041}, 'time': 1660817367, 'user_id': 1581186041}
+
+import atexit
+
+@atexit.register
+def on_exit():
+    # 我也不知道这个有没有必要，，不过还是加上比较好
+    from bot.connect import stop_thread
+    stop_thread()

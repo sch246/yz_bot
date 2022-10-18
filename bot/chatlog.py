@@ -15,12 +15,15 @@ import s3.file as file
 from bot.cache import update, get_group_user_info, get_user_name, get_self_qq, msgs, add_msg, add_self_msg
 from bot.cq import unescape
 from bot.msgs import *
+from s3 import in_debug
+
 
 rootfile = 'chatlog'
 
 
 def write(**msg):
-    print(f'{msg}')
+    if not in_debug:
+        print(f'{msg}')
     t = msg['time']
     if is_msg(msg):
         text = unescape(msg['message'])

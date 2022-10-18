@@ -157,32 +157,3 @@ def set_nicknames(names):
     nicknames.clear()
     nicknames.extend(names)
 
-
-# import time
-# from collections import namedtuple
-# from s3.counter import Counter
-# from bot.tick import tick
-
-# class Waiter:
-#     Wait = namedtuple('wait',['检测函数', '运行函数', '失效时间', '失效时函数', '删除自身'])
-#     def __init__(self) -> None:
-#         self.waits = {}
-#         self.counter = Counter()
-#     def add(self, 检测函数:Callable, 运行函数:Callable, 失效时间:float, 失效时函数:Callable):
-#         '''将在收到消息时将消息字典传递给检测函数(msg:dict)，若符合则会运行运行函数
-#         运行函数(msg:dict)运行会把本wait删掉，其返回值并没有用
-#         如果时限内没有收到消息启动运行函数，时间到后会删掉()本wait，并运行失效时函数()
-#         这分别由bot和tick实现'''
-#         uid = next(self.counter)
-#         def 删除自身():
-#             del self.waits[uid]
-#         self.waits[uid] = self.Wait(检测函数, 运行函数, time.time()+失效时间, 失效时函数, 删除自身)
-# waiter = Waiter()
-
-# @tick
-# def check_time_out():
-#     now = time.time()
-#     for wait in list(waiter.waits.values()):
-#         if now >= wait.失效时间:
-#             wait.删除自身()
-#             wait.失效时函数()
