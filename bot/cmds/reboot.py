@@ -11,8 +11,6 @@ def run(body:str):
     if body.strip()=='':
         send('重启中', **msg)
         write(ensure_file('data/reboot_greet.py'), f"send('重启完成',**{msg})")
-        from bot.connect import stop_thread
-        stop_thread()
         exit(2)
 
 # 用于重启时打招呼

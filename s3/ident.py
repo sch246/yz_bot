@@ -1,5 +1,6 @@
 '''简单地分配id'''
 
+from typing import Iterator
 from s3.counter import Counter
 
 class Ident_getter:
@@ -28,8 +29,10 @@ class Box:
     def __init__(self) -> None:
         self.box = {}
         self.id_getter = Ident_getter()
-    def get_iter(self):
-        return list(self.box.values())
+    def __len__(self) -> int:
+        return len(self.box)
+    def __iter__(self) -> Iterator:
+        return iter(list(self.box.values()))
     def add(self, obj):
         uid = self.id_getter.get()
         self.box[uid]=obj
@@ -37,5 +40,3 @@ class Box:
             del self.box[uid]
             self.id_getter.ret(uid)
         return del_self
-    def get_len(self):
-        return len(self.box)

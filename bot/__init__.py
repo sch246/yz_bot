@@ -29,7 +29,7 @@ def loc(msg:dict):
 def first_start():
     '''第一次加载'''
     config.init_config()
-    print('未检测到config，第一次加载中\nps:bot刚启动的一段时间接收消息可能延迟几秒，是正常现象，我也不知道为什么')
+    print('未检测到config，第一次加载中')
     from random import randint
     check = randint(0, 9999)
     print(f'私聊bot验证码以确定master: {check:04d}')
@@ -70,7 +70,7 @@ def _init_self():
 @to_thread
 def send(text: Any, user_id: int | str = None, group_id: int | str = None, **params) -> dict:
     '''user_id或者group_id是必须的'''
-    debug('准备发送消息')
+    debug('【准备发送消息】')
     text = str(text)
     if 'message' in params.keys():
         del params['message']
@@ -93,7 +93,7 @@ def send(text: Any, user_id: int | str = None, group_id: int | str = None, **par
         self_msg['user_id'] = user_id
     else:
         self_msg['user_id'] = self_msg['sender']['user_id']
-    debug(f'准备记录消息:{self_msg}')
+    debug(f'【准备记录消息】{self_msg}')
     write(**self_msg)
 
 
@@ -117,7 +117,7 @@ if __name__=="__main__":
     loop_thread = start()
     _init_self()
     bot.cmds.load()
-
+    i = 0
     while True:
         msg = recv(not_api)
         # if msg==None:
@@ -128,9 +128,13 @@ if __name__=="__main__":
         if msg=='exit':
             raise '事件循环已断开'
         if in_debug and (is_heartbeat(msg)):
-            print('.')
+            i += 1
+            i = i %5
+            print('.', end='')
+            if i==0:
+                print('.')
         if (not is_heartbeat(msg)) and (not is_connected(msg)):
-            debug(f'收到消息: {msg}')
+            debug(f'【收到消息】 {msg}')
             # print(write(**msg)[:-1])
             write(**msg)
             msg_loc = loc(msg)
@@ -165,5 +169,5 @@ import atexit
 @atexit.register
 def on_exit():
     # 我也不知道这个有没有必要，，不过还是加上比较好
-    from bot.connect import stop_thread
-    stop_thread()
+    from bot.connect import stop
+    stop()

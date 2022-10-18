@@ -138,6 +138,7 @@ from bot.msgs import is_msg
 @to_thread
 def download(url, path, imsg):
     try:
+        import requests
         r = requests.get(url, stream=True)
         with open(path, "wb") as f:
             for chunk in r.iter_content(chunk_size=512):
