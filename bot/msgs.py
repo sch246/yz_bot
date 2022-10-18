@@ -13,6 +13,10 @@ def is_heartbeat(msg:dict):
 def is_connected(msg:dict):
     return 'meta_event_type' in msg.keys() and msg['meta_event_type'] == 'lifecycle' and 'sub_type' in msg.keys() and msg['sub_type']=='connect'
 
+def is_api(msg):
+    return 'retcode' in msg.keys()
+def not_api(msg):
+    return 'retcode' not in msg.keys()
 
 # post_type = message
 evt_msg = evt + ['sub_type','message_id','user_id','message','raw_message','font','sender']

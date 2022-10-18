@@ -1,79 +1,142 @@
-'''用于连接bot'''
-
-import requests
-import socket
+# 它可能被多个线程调用，大意了
+import asyncio
 import json
-from typing import Any
+from typing import Any, Callable
+from threading import Event
+from s3.ident import Ident_getter, Box
+from s3.thread import to_thread
+from bot.msgs import is_api
 
-# https://blog.csdn.net/qq_27694835/article/details/108613607
-# Requests 模块 https://www.cnblogs.com/saneri/p/9870901.html
+from s3 import debug
 
-url = 'http://127.0.0.1:5700'
+uri = "ws://localhost:6700"
+ws: Any      # websocket
+stop = False
+stopping = Event()
+stopping.clear()
 
+def stop_thread():
+    global stop
+    global stopping
+    stop = True
+    stopping.wait()
 
-def call_api(action: str, **params) -> dict:
-    headers = {
-        'Content-Type': 'application/json'
-    }
-    re = requests.post(
-        url+f'/{action}', headers=headers, json=params, verify=False)
-    return json.loads(re.text)
+class EvtObj:
+    evt_objs = Box()
 
+    def __init__(self, evt_dict: dict) -> None:
+        self.value = evt_dict
+        self.del_self = EvtObj.evt_objs.add(self)
 
-def send_msg(msg: str, user_id: int | str = None, group_id: int | str = None, **params) -> dict:
-    '''user_id或者group_id是必须的'''
-    if user_id == None and group_id == None:
-        raise Exception('至少输入一个id!')
-    return call_api('send_msg', message=msg, user_id=user_id, group_id=group_id, **params)
-
-
-# 以下copy自https://zhuanlan.zhihu.com/p/404342876
-
-ListenSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-ListenSocket.bind(('127.0.0.1', 5701))
-ListenSocket.listen(100)  # 传入的参数指定等待连接的最大数量
-
-HttpResponseHeader = '''HTTP/1.1 200 OK\r\n
-Content-Type: text/html\r\n\r\n
-'''
-
-
-def request_to_json(msg: str) -> dict | None:
-    '''遍历request字符串, 直到后面是json格式, 读取对应json文本并返回'''
-    for i in range(len(msg)):
-        if msg[i] == "{" and msg[-1] == "\n":
-            return json.loads(msg[i:])
-    return None
-
-# 需要循环执行，返回值为json格式
+    def check(self, wait: 'Wait'):
+        if wait.check(self.value):
+            self.del_self()
+            return True
+        return False
 
 
-def rev_msg() -> dict | None:
-    Client, Address = ListenSocket.accept()
-    Request = Client.recv(1024).decode(encoding='utf-8')
-    rev_json = request_to_json(Request)
-    # 发送信号表示我收到了
-    Client.sendall(HttpResponseHeader.encode(encoding='utf-8'))
-    Client.close()
-    return rev_json
+class Wait:
+    new_waits = Box()   # 存放新wait
+    waits = Box()       # 存放所有的旧wait
+
+    def __init__(self, condition: Callable) -> None:
+        self.waiting = Event()
+        self.waiting.clear()
+        self.condition = condition
+        self.ret: dict
+        self.del_self = Wait.new_waits.add(self)
+
+    def reply(self, value):
+        self.ret = value
+        self.waiting.set()
+
+    def check(self, evt: dict):
+        '''检查evt，若通过，则进行回复并把自身从对应的box里删除，同时也要删除对应的evt'''
+        if self.condition(evt):
+            self.del_self()
+            self.reply(evt)
+            return True
+        return False
+
+    def first_check(self):
+        if not any(evt_obj.check(self) for evt_obj in EvtObj.evt_objs.get_iter()):
+            # 如果没有一个evt符合，则转入总的waits
+            self.del_self()
+            self.del_self = Wait.waits.add(self)
 
 
-# while True:
-#     rev = rev_msg()
-#     if rev["post_type"] == "message":
-#         # print(rev) #需要功能自己DIY
-#         if rev["message_type"] == "private":  # 私聊
-#             if rev['raw_message'] == '在吗':
-#                 qq = rev['sender']['user_id']
-#                 print(send_msg('我在', user_id=qq))
-#         elif rev["message_type"] == "group":  # 群聊
-#             group = rev['group_id']
-#             if "[CQ:at,qq=机器人的QQ号]" in rev["raw_message"]:
-#                 if rev['raw_message'].split(' ')[1] == '在吗':
-#                     qq = rev['sender']['user_id']
-#                     send_msg({'msg_type': 'group', 'number': group,
-#                              'msg': '[CQ:poke,qq={}]'.format(qq)})
-#         else:
-#             continue
-#     else:  # rev["post_type"]=="meta_event":
-#         continue
+async def _run():
+    global ws
+    import websockets
+    try:
+        async with websockets.connect(uri) as websocket:
+            ws = websocket
+            waiting_connect.set()
+            try:
+                async for evt_json in ws:
+                    # 可能进来新的evt，同时进来了新的wait
+                    evt = json.loads(evt_json)
+                    debug('\n收到evt:', evt)
+                    # 先让新的wait过一遍旧的evt_objs
+                    for wait in Wait.new_waits.get_iter():
+                        wait.first_check()
+                    # 然后所有的waits过一遍新的evt
+                    if not any(wait.check(evt) for wait in Wait.waits.get_iter()):
+                        EvtObj(evt)
+                    if stop:
+                        stopping.set()
+                        exit()
+            except websockets.ConnectionClosed:
+                print('连接关闭')
+                return
+    except ConnectionRefusedError:
+        print('连接被拒绝')
+        return
+
+
+
+waiting_connect = Event()
+waiting_connect.clear()
+def start():
+    thread = to_thread(asyncio.run, True)(_run())
+    waiting_connect.wait()
+    return thread
+
+def recv(condition: Callable = lambda e: True):
+    wait = Wait(condition)
+    wait.waiting.wait()
+    return wait.ret
+
+
+_id_getter = Ident_getter()
+
+
+def arun(coroutine):
+    '''在非协程函数里调用协程函数'''
+    try:
+        coroutine.send(None)
+    except StopIteration as e:
+        return e.value
+
+
+def call_api(action: str, **params):
+    global ws
+    '''调用api'''
+    uid = _id_getter.get()
+    arun(ws.send(json.dumps({
+        'action': action,
+        'echo': uid,
+        'params': params
+    })))
+
+    debug('\ncall_api:', action)
+
+    def condition(evt):
+        if is_api(evt) and evt['echo'] == uid:
+            _id_getter.ret(uid)
+            debug('\ncall_api:', action, '<-', evt)
+            return True
+        return False
+    return recv(condition)
+
+
