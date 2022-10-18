@@ -19,3 +19,9 @@ in_debug = 'debug' in sys.argv[1:]
 def debug(*args):
     if in_debug:
         print(*args)
+
+class Show:
+    def __init__(self,s:str) -> None:
+        self.value = s
+    def __repr__(self) -> str:
+        return self.value

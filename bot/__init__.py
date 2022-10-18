@@ -52,6 +52,7 @@ def first_start():
                 send(f'昵称已设置为【{name}】', user_id=master)
                 break
             send('请输入对bot的昵称，不要包含单引号', user_id=master)
+    time.sleep(0.3)
     send('设置完毕！', user_id=master)
 
 def _init_self():

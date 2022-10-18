@@ -130,17 +130,19 @@ def get_ops():
 def _add_op(i):
     if not i in ops:
         ops.append(i)
+        return True
+    return False
 def add_op(uid):
     if isinstance(uid, int):
-        _add_op(uid)
+        return _add_op(uid)
     elif isinstance(uid, str):
-        _add_op(int(uid))
-    else:
-        for i in uid:
-            add_op(i)
+        return _add_op(int(uid))
+    return False
 def del_op(uid):
     if uid in ops:
         ops.remove(uid)
+        return True
+    return False
 def is_op(uid):
     return uid in ops
 def set_ops(uids):

@@ -5,14 +5,33 @@
 
 柚子bot
 
-远程控制，`.py`运行 python，`.link`映射输入，记录聊天记录
+远程控制，`.py`运行 python，`.link`映射输入(划掉，暂时没啦)，记录聊天记录
 
-无异步，低性能，暂时没有权限系统(会有的)
+无异步(划掉)有一点点异步了
+
+低性能
+
+暂时没有权限系统(会有的)(划掉)有权限管理系统啦
 
 记录:
 - [开始](https://www.sch246.com/Computer/project/qq_bot/start)
 - [第一次重构](https://www.sch246.com/Computer/project/qq_bot/yz_bot)
-- [第二次重构(暂无)]
+- [第二次重构(就是目前)]
+
+- 0.3版
+    - 写着写着就不写了，甚至没有上传github
+
+<summary>0.4版(目前版本)</summary>
+
+先是用 http 通信发现很方便，于是开始改用 http 通信为基础在写，抛弃了 0.3 版
+
+后来发现似乎不能发送长文本于是改回了 websocket，并封装得比 http 通信的版本还好用
+
+改完了才发现不是 http 的问题，不过管他呢
+
+</details>
+
+
 
 ## 内容列表
 - [安全性](#安全性)
@@ -24,6 +43,10 @@
 
 ## 安全性
 
+<details>
+
+<summary>0.2版</summary>
+
 目前没有权限系统，而且有`.py`这种逆天命令
 
 安全性基本是0
@@ -31,6 +54,16 @@
 任何加了 bot 好友的人，或者 bot 所在群的任何人都可以发送命令运行任何 python 代码
 
 不要用 root 用户启动 bot 吧
+
+</details>
+
+有最基本的权限管理系统，你可以理解为类似于我的世界(Minecraft)的 op 系统
+
+除了第一个 op 是 master 且 master 无法被 `op` 命令删除之外，和 Minecraft 并没有什么区别
+
+op 可以调用 bot 的全部命令和功能，依旧包括 `.py` 这种逆天命令，可以发送命令运行任何 python 代码
+
+因此事实上任何 op 都可以对 master 取而代之，或者对 bot 所在的服务器造成破坏，这点务必注意
 
 ## 背景
 
@@ -55,13 +88,20 @@ QQ自带的聊天记录检索不好用是推动我让 bot 能运行的直接原�
 
 满足一般 bot 的功能需求倒是其次，我觉得 柚子bot 的功能应该是一整个对象，所以并**没有插件系统**
 
-当然想用 `.link` 添加一些功能也不是不能做到()
+当然想用 `.link` 添加一些功能也不是不能做到(link 暂时没啦)
 
 ## 安装
 
-众所周知(雾)，QQ bot 运行需要2个程序，一个用来登录QQ，一个用来处理和回应事件，这里的程序是后一个
+众所周知(雾)，QQ bot 运行需要2个程序
 
-关于前一个程序请参考[go-cqhttp](https://github.com/Mrs4s/go-cqhttp)，并且选择正向代理(尽管这意味着 bot 只能同时运行在一个QQ号上)
+- 登录QQ，和腾讯的服务器通讯(大概)，是一个qq客户端
+- 操作前面的那个程序，处理和回应事件
+
+这里的程序是后一个
+
+关于前一个程序请参考[go-cqhttp](https://github.com/Mrs4s/go-cqhttp)
+
+并且选择正向代理(尽管这意味着 bot 只能同时运行在一个QQ号上)
 
 <details>
 <summary>go-cqhttp登录问题</summary>
@@ -84,7 +124,7 @@ go-cqhttp链接时需要设备信息，若没有则会随机生成一个
 
 把成功那一次使用或生成的device.json替换或者复制过去
 
-据测试，需要填入密码才能跳过扫码
+据测试，需要填入密码才能跳过扫码(大概)
 
 ---
 
@@ -94,40 +134,68 @@ bot 需要 python 3.7.9 或更高的版本
 
 更低的版本不知道能不能运行，反正我没试过
 
-需要第三方库 `websockets` 和 `dill`
+需要第三方库 `websockets` 和 `dill`(划掉, 0.4版本不用这个了)
 
 然后使用 python 运行`run.py`
 
-成功启动后大概会输出这个
+成功启动后会输出类似下面的东西
 
 ```
-尝试连接..
-initfunc> 运行初始化函数
-正在获取登录信息..
-正在获取好友列表..
-正在获取群列表..
-initfunc> 初始化完成
-其它>{'_post_method': 2, 'meta_event_type': 'lifecycle', 'post_type': 'meta_event', 'self_id': <你的QQ号>, 'sub_type': 'connect', 'time': ....}
-好友列表获取完成,共xx个
-<你的QQ的昵称> (<你的QQ号>), 已启动
-群列表获取完成,共xx个
+未检测到config，第一次加载中
+私聊bot验证码以确定master: 3447
 ```
+
+这是给 bot 设定一个管理员，用一个有 bot 好友的 qq 对 bot 发送验证码即可
+
+随后的操作和 bot qq 聊天即可
+
+![](https://s2.loli.net/2022/10/18/PgZprRhvBbAG4Yj.png)
 
 ## 使用
 
-启动成功后对 bot 发特定信息应该能有反应了
+`!`开头的消息会被识别成命令行指令
 
-发送`.help`可以查看帮助，详细的可以自己看
+`.`开头的消息会被识别成命令，所有的命令在`./bot/cmds`下定义
 
-几个核心命令在这里有说:https://www.sch246.com/Computer/project/qq_bot/yz_bot
+<details>
+<summary>命令</summary>
 
-`.py`内的变量环境存储在`run.py`同目录的 `./storage/msg_locals.pkl` 内，你可以手动保存，也可以删掉它来回复原始的环境
+`.py`可以运行 python 代码，最后一行必须为表达式，或者以`###`开头
 
-聊天记录存在同目录的`./log/`文件夹内
+`.echo`会让bot重复echo后的话
 
-设置存在同目录的`./Config.json`内，应该挺好理解的
+`.file`用于查看以及上传下载文件
 
-以上这些运行一次后会自动生成，不用手动创建
+`.op`可以管理权限
+
+`.reboot`和`.shutdown`可以重启和关闭 bot，在控制台用`Ctrl+C`有时候会没啥反应
+
+`.test`就是个测试命令
+
+</details>
+
+以`###`开头的 python 代码会运行一遍，然后被保存在`./data/pyload.py`，在随后每次加载bot时运行
+
+消息记录存储在`./chatlog`下
+
+`./data/cache_msgs`会存储每群或者每人的最近 256 条消息
+
+<details>
+<summary>进阶</summary>
+
+新建命令的话，可以在`./bot/cmds`下新建个`<命令名>.py`
+
+在其中定义一个`run`函数
+
+函数的参数是 消息本身的字符串除去开头的`.<命令名>`
+
+函数的返回值是 bot 将要回复的消息
+
+也可以使用`yield <回复:str>`或者`recv(<条件:function>)`来进行多段的交互
+
+`bot.caches.msgs`会存储每群或者每人的最近 256 条消息
+
+</details>
 
 ## 维护者
 
