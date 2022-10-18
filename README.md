@@ -49,7 +49,7 @@
 
 有最基本的权限管理系统，你可以理解为类似于我的世界(Minecraft)的 op 系统
 
-除了第一个 op 是 master 且 master 无法被 `op` 命令删除之外，和 Minecraft 并没有什么区别
+除了第一个 op 是 master 且 master 无法被 `.op` 命令删除之外，和 Minecraft 并没有什么区别
 
 op 可以调用 bot 的全部命令和功能，依旧包括 `.py` 这种逆天命令，可以发送命令运行任何 python 代码
 
