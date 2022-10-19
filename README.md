@@ -168,7 +168,7 @@ bot 需要 python 3.7.9 或更高的版本
 
 </details>
 
-以`###`开头的 python 代码会运行一遍，然后被保存在`./data/pyload.py`，在随后每次加载bot时运行
+最后一行以`###`开头的 python 代码消息会运行一遍，然后被保存在`./data/pyload.py`，在随后每次加载bot时运行
 
 消息记录存储在`./chatlog`下
 
