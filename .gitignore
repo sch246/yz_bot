@@ -153,3 +153,4 @@ cython_debug/
 config.json
 .test/
 cache_msgs
+tmp.txt
