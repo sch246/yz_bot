@@ -2,6 +2,7 @@
 import asyncio
 import json
 import websockets
+import time
 from typing import Any, Callable
 from threading import Event
 from s3.ident import Ident_getter, Box
@@ -9,6 +10,7 @@ from s3.thread import to_thread
 from bot.msgs import is_api
 
 from s3 import debug
+from s3.counter import Counter
 
 uri = "ws://localhost:6700"
 ws: Any      # websocket
@@ -86,6 +88,7 @@ async def _run():
             waiting_connect.set()
             try:
                 async for evt_json in ws:
+                    # print('!')
                     # 进来新的evt，就过一遍所有的wait
                     # debug(' | len:', len(Evt.box))
                     Evt(json.loads(evt_json)).when_recv()
@@ -107,12 +110,20 @@ def start():
     waiting_connect.wait()
     return thread
 
-
+c = Counter()
 def recv(condition: Callable = lambda e: True):
     global loop
     wait = Wait(condition)
     asyncio.run_coroutine_threadsafe(wait.when_recv(), loop)
-    wait.waiting.wait()
+    # ci = next(c)
+    # print(f'{ci} ↓')
+    t0 = time.time()
+    wait.waiting.wait(timeout=15)
+    dt = time.time() - t0
+    # print(f'{ci} ↑', dt)
+    if dt > 14.9:
+        # 这样的话大概是超时了
+        raise Exception('recv超时')
     return wait.ret
 
 

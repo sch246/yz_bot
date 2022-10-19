@@ -73,28 +73,36 @@ def send(text: Any, user_id: int | str = None, group_id: int | str = None, **par
     '''user_id或者group_id是必须的'''
     debug('【准备发送消息】')
     text = str(text)
+
     if 'message' in params.keys():
+        # 防止message在下面的call_api撞车
         del params['message']
     if user_id == None and group_id == None:
         raise Exception('至少输入一个id!')
-    # 当仅同时传入group和user时保证是群聊
     if group_id:
+        # 当仅同时传入group和user时保证是群聊
         user_id = None
+
     call = call_api('send_msg', message=text, user_id=user_id, group_id=group_id, **params)
     if not call['retcode'] == 0:
         print('发送消息失败 '+call['wording'])
         send('发送消息失败\n'+call['wording'], user_id, group_id)
         return
+
+    #------以下是获取自身发送的消息，并且记录下来------#
+
     call2 = call_api('get_msg', message_id=call['data']['message_id'])
     if not call2['retcode'] == 0:
         print('获取发送的消息失败'+call['wording'])
         return
     self_msg = call2['data']
+
     if group_id==None:
         self_msg['user_id'] = user_id
     else:
         self_msg['user_id'] = self_msg['sender']['user_id']
-    debug(f'【准备记录消息】{self_msg}')
+
+    debug(f'【记录消息】', self_msg)
     write(**self_msg)
 
 
@@ -130,10 +138,10 @@ if __name__=="__main__":
             raise '事件循环已断开'
         if in_debug and (is_heartbeat(msg)):
             i += 1
-            i = i %5
+            i = i %12
             print('.', end='')
             if i==0:
-                print('.')
+                print('')
         if (not is_heartbeat(msg)) and (not is_connected(msg)):
             debug(f'【收到消息】 {msg}')
             # print(write(**msg)[:-1])
@@ -169,6 +177,6 @@ import atexit
 
 @atexit.register
 def on_exit():
-    # 我也不知道这个有没有必要，，不过还是加上比较好
+    # 用于命令重启或关闭时，关闭其它线程
     from bot.connect import stop
     stop()

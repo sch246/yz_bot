@@ -37,11 +37,11 @@ def write(**msg):
             user_id = int(msg['sender']['user_id'])
             group_id = int(msg['group_id'])
             title, name = get_group_user_info(group_id, user_id)
-            return _group_write(msg, group_id, _group_str(title, name, user_id, t, text))
+            return _group_write(msg, group_id, _group_str(title, name, user_id, t, text, msg['message_id']))
         else:
             user_id = int(msg['user_id'])
             name = get_user_name(int(msg['sender']['user_id']))
-            return _private_write(msg, user_id, _private_str(name, t, text))
+            return _private_write(msg, user_id, _private_str(name, t, text, msg['message_id']))
     elif is_notice(msg):
         if 'user_id' in msg.keys():
             user_id = int(msg['user_id'])
@@ -50,11 +50,11 @@ def write(**msg):
             group_id = int(msg['group_id'])
             title, name = get_group_user_info(group_id, user_id)
         if is_group_file(msg):
-            return _group_write(msg, group_id, _group_str(title, name, user_id, t, _file_str(msg['file'])))
+            return _group_write(msg, group_id, _group_str(title, name, user_id, t, _file_str(msg['file']), msg['message_id']))
         elif is_private_file(msg):
             if 'sender' in msg.keys() and 'user_id' in msg['sender'].keys():
                 name = get_user_name(int(msg['sender']['user_id']))
-            return _private_write(msg, user_id, _private_str(name, t, _file_str(msg['file'])))
+            return _private_write(msg, user_id, _private_str(name, t, _file_str(msg['file']), msg['message_id']))
         elif is_change_admin(msg):
             if msg['subtype']=='set':
                 text = f'{name}({user_id})被设为了管理员'
@@ -193,12 +193,14 @@ def _get_size(byte:int):
         byte = byte / 1024
 
 
-def _group_str(title: str, name: str, user_id: int, t: int, text: str):
-    return f'【{title}】{name}({user_id}) {time.strftime("%H:%M:%S", time.localtime(t))}\n{addtab(text)}\n'
+def _group_str(title: str, name: str, user_id: int, t: int, text: str, msg_id:int):
+    return f'【{title}】{name}({user_id}) {time.strftime("%H:%M:%S", time.localtime(t))} | {msg_id}\n{addtab(text)}\n'
 
 
-def _private_str(name: str, t: int, text: str):
-    return f'{name} {time.strftime(r"%H:%M:%S", time.localtime(t))}\n{addtab(text)}\n'
+def _private_str(name: str, t: int, text: str, msg_id:str=''):
+    if msg_id:
+        msg_id = f' | {msg_id}'
+    return f'{name} {time.strftime(r"%H:%M:%S", time.localtime(t))}{msg_id}\n{addtab(text)}\n'
 
 
 def _notice_str(t: int, text: str):
