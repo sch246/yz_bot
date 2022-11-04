@@ -1,7 +1,9 @@
 '''用于缓存群和用户的名字啥的，以及群和用户的消息，这应该叫缓存吧）'''
 
 from typing import Callable
-from bot.connect import call_api
+from main import connect
+
+call_api = connect.call_api
 
 qq = None
 user_names = {}

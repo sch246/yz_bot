@@ -1,12 +1,11 @@
 
-from bot.cq import unescape
-from bot.connect import *
-from bot.cmds import msg
-from bot.cache import get_ops, get_last
-from bot import I
-from bot import send
+
+import traceback
 import re
 import os
+
+from main import cq, connect, cache, send, to_thread, msgs
+is_msg = msgs.is_msg
 
 def getint(s):
     try:
@@ -25,12 +24,11 @@ def run(body:str):
 || 意味着需要分为多次消息发送
 :: 意味着该命令会读取之前的消息'''
 
-    global msg
-    msg = get_last()
-    if not msg['user_id'] in get_ops():
+    msg = cache.get_last()
+    if not msg['user_id'] in cache.get_ops():
         return
 
-    body = unescape(body)
+    body = cq.unescape(body)
     lines = body.splitlines()
     if not lines:
         lines = ['']
@@ -68,31 +66,27 @@ def _read(m):
         return read_text
 
 def _get(m):
+    msg = cache.get_last()
     path = m.group(1)
     path=os.path.abspath(path)
     if not os.path.isfile(path):
         return f'打开失败，文件"{path}"不存在'
     if 'group_id' in msg.keys():
-        ret = call_api('upload_group_file', group_id=msg['group_id'], file=path, name=os.path.split(path)[1])
+        ret = connect.call_api('upload_group_file', group_id=msg['group_id'], file=path, name=os.path.split(path)[1])
         if not ret['retcode']==0:
             return ret['wording']
         return
     elif 'user_id' in msg.keys():
-        ret = call_api('upload_private_file', user_id=msg['user_id'], file=path, name=os.path.split(path)[1])
+        ret = connect.call_api('upload_private_file', user_id=msg['user_id'], file=path, name=os.path.split(path)[1])
         if not ret['retcode']==0:
             return ret['wording']
         return
     return '找到了文件，但是发送失败了'
 
-from bot.connect import call_api
-from s3.thread import to_thread
-import traceback
 
-
-from bot.msgs import is_msg
 
 @to_thread
-def download(url, path, imsg):
+def download(url, path, msg):
     try:
         import requests
         r = requests.get(url, stream=True)
@@ -100,8 +94,8 @@ def download(url, path, imsg):
             for chunk in r.iter_content(chunk_size=512):
                 f.write(chunk)
     except:
-        send(''.join(traceback.format_exc().splitlines(True)[:]), **imsg)
-    send(f'文件已保存到\n{path}', **imsg)
+        send(''.join(traceback.format_exc().splitlines(True)[:]), **msg)
+    send(f'文件已保存到\n{path}', **msg)
 
 def _recv_file(file_msg, path):
     if 'file' not in file_msg.keys():
@@ -109,12 +103,12 @@ def _recv_file(file_msg, path):
     # 离线文件具有url，群文件需要调用api获取链接
     if 'group_id' in file_msg.keys() and file_msg['group_id']!=None:
         file = file_msg['file']
-        ret = call_api('get_group_file_url',group_id=file_msg['group_id'], file_id=file['id'], busid=file['busid'])
+        ret = connect.call_api('get_group_file_url',group_id=file_msg['group_id'], file_id=file['id'], busid=file['busid'])
         if ret['retcode']==0:
             url = ret['data']['url']
     else:
         url = file_msg['file']['url']
-    download(url, path, I(file_msg))
+    download(url, path, file_msg)
     return f'正在将文件保存到\n{path}'
 
 # 是生成器

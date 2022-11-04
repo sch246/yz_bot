@@ -1,6 +1,8 @@
 '''以json格式给每个用户提供存储'''
 
-from s3.storage import get_namespace
+from main import storage
+
+get_namespace = storage.get_namespace
 
 
 namespace_users = get_namespace('users')
