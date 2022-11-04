@@ -150,6 +150,11 @@ def recv(msg:dict):
         chatlog.write(**msg)
         msg_loc = loc(msg)
 
+        if is_msg(msg) and msg['message'].startswith('^'):
+            text = msg['message'][1:].rstrip()
+            if text in 'Cc':
+                del catches[msg_loc]
+
         if msg_loc in catches.keys() and catches[msg_loc]:
             gen = catches[msg_loc][-1]
             try:
@@ -187,7 +192,7 @@ def recv(msg:dict):
             print('.')
         elif i==0 and j!=0 and k==0:
             print('|')
-        elif j==0 and k!=0:
+        elif i==0 and j==0 and k!=0:
             print('||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||')
 
 
