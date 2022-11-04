@@ -1,166 +1,79 @@
-'''websocket版本的connect'''
-import asyncio
+'''用于连接bot'''
+
+import requests
+import socket
 import json
-import websockets
-import time
-from typing import Any, Callable
-from threading import Event
-from s3.ident import Ident_getter, Box
-from s3.thread import to_thread
-from bot.msgs import is_api
+from typing import Any
 
-from s3 import debug
-from s3.counter import Counter
+# https://blog.csdn.net/qq_27694835/article/details/108613607
+# Requests 模块 https://www.cnblogs.com/saneri/p/9870901.html
 
-uri = "ws://localhost:6700"
-ws: Any      # websocket
+url = 'http://127.0.0.1:5700'
 
 
-class Evt:
-    box = Box()
-
-    def __init__(self, evt_dict: dict) -> None:
-        self.value = evt_dict
-
-    def when_recv(self):
-        if all(not wait.check(self.value) for wait in Wait.box):
-            # 如果没有一个wait符合，则转入总的evts
-            self.del_self = Evt.box.add(self)
-
-    def check(self, wait: 'Wait'):
-        '''检查wait，若通过则将自身在evt_objs中删除'''
-        if wait.condition(self.value):
-            self.del_self()
-            wait.reply(self.value)
-            return True
-        return False
+def call_api(action: str, **params) -> dict:
+    headers = {
+        'Content-Type': 'application/json'
+    }
+    re = requests.post(
+        url+f'/{action}', headers=headers, json=params, verify=False)
+    return json.loads(re.text)
 
 
-class Wait:
-    box = Box()       # 存放所有的旧wait
-    ret: dict
-    del_self: Callable
-
-    def __init__(self, condition: Callable) -> None:
-        self.waiting = Event()
-        self.waiting.clear()
-        self.condition = condition
-
-    def reply(self, value):
-        self.ret = value
-        self.waiting.set()
-
-    async def when_recv(self):
-        if all(not evt_obj.check(self) for evt_obj in Evt.box):
-            # 如果没有一个evt符合，则转入总的waits
-            self.del_self = Wait.box.add(self)
-
-    def check(self, evt: dict):
-        '''检查evt，若通过，则进行回复并把自身从对应的box里删除'''
-        if self.condition(evt):
-            self.del_self()
-            self.reply(evt)
-            return True
-        return False
+def send_msg(msg: str, user_id: int | str = None, group_id: int | str = None, **params) -> dict:
+    '''user_id或者group_id是必须的'''
+    if user_id == None and group_id == None:
+        raise Exception('至少输入一个id!')
+    return call_api('send_msg', message=msg, user_id=user_id, group_id=group_id, **params)
 
 
-loop: asyncio.AbstractEventLoop
-stopping = Event()
-stopping.clear()
+# 以下copy自https://zhuanlan.zhihu.com/p/404342876
 
-async def _stop():
-    stopping.set()
-    exit()
+ListenSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+ListenSocket.bind(('127.0.0.1', 5701))
+ListenSocket.listen(100)  # 传入的参数指定等待连接的最大数量
 
-def stop():
-    global stopping
-    global loop
-    asyncio.run_coroutine_threadsafe(_stop(), loop)
-    stopping.wait()
-
-async def _run():
-    global loop
-    global ws
-    loop = asyncio.get_running_loop()
-    try:
-        async with websockets.connect(uri) as websocket:
-            ws = websocket
-            waiting_connect.set()
-            try:
-                async for evt_json in ws:
-                    # print('!')
-                    # 进来新的evt，就过一遍所有的wait
-                    # debug(' | len:', len(Evt.box))
-                    Evt(json.loads(evt_json)).when_recv()
-            except websockets.ConnectionClosed:
-                print('连接关闭')
-                return
-    except ConnectionRefusedError:
-        print('连接被拒绝')
-        return
+HttpResponseHeader = '''HTTP/1.1 200 OK\r\n
+Content-Type: text/html\r\n\r\n
+'''
 
 
-waiting_connect = Event()
-waiting_connect.clear()
+def request_to_json(msg: str) -> dict | None:
+    '''遍历request字符串, 直到后面是json格式, 读取对应json文本并返回'''
+    for i in range(len(msg)):
+        if msg[i] == "{" and msg[-1] == "\n":
+            return json.loads(msg[i:])
+    return None
+
+# 需要循环执行，返回值为json格式
 
 
-def start():
-    global waiting_connect
-    thread = to_thread(asyncio.run, True)(_run())
-    waiting_connect.wait()
-    return thread
-
-c = Counter()
-def recv(condition: Callable = lambda e: True):
-    global loop
-    wait = Wait(condition)
-    asyncio.run_coroutine_threadsafe(wait.when_recv(), loop)
-    # ci = next(c)
-    # print(f'{ci} ↓')
-    t0 = time.time()
-    wait.waiting.wait(timeout=15)
-    dt = time.time() - t0
-    # print(f'{ci} ↑', dt)
-    if dt > 14.9:
-        # 这样的话大概是超时了
-        raise Exception('recv超时')
-    return wait.ret
+def recv() -> dict | None:
+    Client, Address = ListenSocket.accept()
+    Request = Client.recv(1024).decode(encoding='utf-8')
+    rev_json = request_to_json(Request)
+    # 发送信号表示我收到了
+    Client.sendall(HttpResponseHeader.encode(encoding='utf-8'))
+    Client.close()
+    return rev_json
 
 
-_id_getter = Ident_getter()
-
-
-def arun(coroutine):
-    '''在非协程函数里调用协程函数'''
-    try:
-        coroutine.send(None)
-    except StopIteration as e:
-        return e.value
-
-
-def call_api(action: str, **params):
-    global ws
-    '''调用api'''
-    uid = _id_getter.get()
-    arun(ws.send(json.dumps({
-        'action': action,
-        'echo': uid,
-        'params': params
-    })))
-
-    debug(' | ', action, ':', params)
-
-    def condition(evt):
-        if is_api(evt) and evt['echo'] == uid:
-            _id_getter.ret(uid)
-            debug(' √ ', action, '<-', evt)
-            return True
-        return False
-    return recv(condition)
-
-# import atexit
-
-# @atexit.register
-# def on_exit():
-#     for wait in Wait.box:
-#         wait.reply('exit')
+# while True:
+#     rev = rev_msg()
+#     if rev["post_type"] == "message":
+#         # print(rev) #需要功能自己DIY
+#         if rev["message_type"] == "private":  # 私聊
+#             if rev['raw_message'] == '在吗':
+#                 qq = rev['sender']['user_id']
+#                 print(send_msg('我在', user_id=qq))
+#         elif rev["message_type"] == "group":  # 群聊
+#             group = rev['group_id']
+#             if "[CQ:at,qq=机器人的QQ号]" in rev["raw_message"]:
+#                 if rev['raw_message'].split(' ')[1] == '在吗':
+#                     qq = rev['sender']['user_id']
+#                     send_msg({'msg_type': 'group', 'number': group,
+#                              'msg': '[CQ:poke,qq={}]'.format(qq)})
+#         else:
+#             continue
+#     else:  # rev["post_type"]=="meta_event":
+#         continue

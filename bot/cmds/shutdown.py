@@ -2,12 +2,14 @@
 import os
 from bot import send
 from s3.file import write, ensure_file
-from . import msg
-from bot.cache import get_ops, get_nickname
+from bot.cmds import msg
+from bot.cache import get_ops, get_nickname, get_last
 
 
 
 def run(body:str):
+    global msg
+    msg = get_last()
     if not msg['user_id'] in get_ops():
         return
     if body.strip()=='':

@@ -4,8 +4,8 @@ import re
 from s3 import Show
 
 from s3.config import save_config
-from . import msg
-from bot.cache import get_ops, add_op, _add_op, del_op
+from bot.cmds import msg
+from bot.cache import get_ops, add_op, _add_op, del_op, get_last
 
 _match_at = re.compile(r'\[CQ:at,qq=([0-9]+)\]$')
 _match_qq = re.compile(r'[0-9]+$')
@@ -31,6 +31,8 @@ def run(body:str):
     '''用于管理权限
     格式: .op [del] (<qq号:int> | <at某人:cq[at]>)+ 可换行
     警告: op可以给予任何人op, 或者删除任何master外的人的op, 请谨慎给予'''
+    global msg
+    msg = get_last()
     if not msg['user_id'] in get_ops():
         return
     body = body.strip()
