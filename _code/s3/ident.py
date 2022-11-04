@@ -1,7 +1,8 @@
 '''简单地分配id'''
 
 from typing import Iterator
-from s3.counter import Counter
+from main import counter
+Counter = counter.Counter
 
 class Ident_getter:
     _cycle = set()

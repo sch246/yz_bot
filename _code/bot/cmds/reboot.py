@@ -1,18 +1,16 @@
 '''重启'''
 import os
-from s3.file import write, ensure_file
-from bot import send
-from bot.cmds import msg
-from bot.cache import get_ops, get_last
+
+from main import file, send, cache
+
 
 def run(body:str):
-    global msg
-    msg = get_last()
-    if not msg['user_id'] in get_ops():
+    msg = cache.get_last()
+    if not msg['user_id'] in cache.get_ops():
         return
     if body.strip()=='':
         send('重启中', **msg)
-        write(ensure_file('data/reboot_greet.py'), f"send('重启完成',**{msg})")
+        file.write(file.ensure_file('data/reboot_greet.py'), f"send('重启完成',**{msg})")
         exit(2)
 
 # 用于重启时打招呼

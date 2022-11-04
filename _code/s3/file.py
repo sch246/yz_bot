@@ -8,7 +8,17 @@ path = '.'
 def ensure_file(path):
     '''确保文件路径存在，并且返回文件路径'''
     dirpath = os.path.split(path)[0]
-    os.makedirs(dirpath,exist_ok=True)
+    try:
+        os.makedirs(dirpath,exist_ok=True)
+    except FileExistsError:
+        print(f'{path}: 对应文件夹的位置已经有同名文件')
+        return
+    except OSError:
+        print(f'{path}: 命名空间是作为文件路径的，文件路径不合法')
+        return
+    except Exception as e:
+        print(f'{path}: {e}')
+        return
     return path
 
 def read(file_path, start_line=None, end_line=None):
