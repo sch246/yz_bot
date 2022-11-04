@@ -1,8 +1,8 @@
 
 from bot.cq import unescape
 from bot.connect import *
-from . import msg
-from bot.cache import get_ops
+from bot.cmds import msg
+from bot.cache import get_ops, get_last
 from bot import I
 from bot import send
 import re
@@ -21,8 +21,12 @@ def insert_linemark(s:str):
 
 def run(body:str):
     '''查看和编辑文件
-.file (read <文件路径> [<起始行> <结束行>]) | (get <文件路径>) | (set <文件路径>, <文件>)'''
+.file (read <文件路径> [<起始行> <结束行>]) | (get <文件路径>) | (set <文件路径> || <文件>) | (<文件> :: to <文件路径>)
+|| 意味着需要分为多次消息发送
+:: 意味着该命令会读取之前的消息'''
 
+    global msg
+    msg = get_last()
     if not msg['user_id'] in get_ops():
         return
 

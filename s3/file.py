@@ -1,5 +1,7 @@
 from os.path import join
 import os
+import re
+import json
 
 path = '.'
 
@@ -37,3 +39,20 @@ def overwrite(file_path, text: str, start_line=None, end_line=None):
 
 def getpath(file_path):
     return join(path, file_path)
+
+def json_read(file_path):
+    return json.loads(read(file_path))
+
+def json_write(file_path, obj):
+    return write(file_path, json.dumps(obj, indent=4, ensure_ascii=False))
+
+
+def let_be_filename(title):
+    '''符合文件命名'''
+    rstr = r"[\/\\\:\*\?\"\<\>\|]"  # '/ \ : * ? " < > |'
+    new_title = re.sub(rstr, "_", title).strip()  # 替换为下划线
+    return new_title
+
+def can_be_filename(name):
+    '''这里没有检测空格'''
+    return not (set(name) & set(r'/\:*?"<>|'))

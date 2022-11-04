@@ -6,17 +6,16 @@ import time
 sys.path.append(os.path.join(os.path.split(__file__)[0], '..'))
 
 
-from bot.connect import recv, start
 from bot.chatlog import write
 from bot.connect import *
 # import bot.tick
 from bot.cache import set_self_qq, update_user_name, set_ops, set_nicknames
-from bot.msgs import is_connected, is_heartbeat, is_msg, not_api
+from bot.msgs import is_heartbeat, is_msg
 import bot.cmds
 from s3 import config
 from s3.file import ensure_file
 from s3.thread import to_thread
-from s3 import debug, in_debug
+from s3 import debug
 
 
 
@@ -34,7 +33,7 @@ def first_start():
     check = randint(0, 9999)
     print(f'私聊bot验证码以确定master: {check:04d}')
     while True:
-        msg = recv(not_api)
+        msg = recv()
         if is_msg(msg):
             if msg['message'] == f'{check:04d}':
                 master = msg['user_id']
@@ -44,7 +43,7 @@ def first_start():
     time.sleep(0.3)
     send('请输入对bot的昵称，不要包含单引号', user_id=master)
     while True:
-        msg = recv(not_api)
+        msg = recv()
         if is_msg(msg) and msg['user_id']==master:
             name = msg['message']
             if "'" not in name:
@@ -103,6 +102,7 @@ def send(text: Any, user_id: int | str = None, group_id: int | str = None, **par
         self_msg['user_id'] = self_msg['sender']['user_id']
 
     debug(f'【记录消息】', self_msg)
+    print('【发送消息】',end='')
     write(**self_msg)
 
 
@@ -123,28 +123,29 @@ def cmd_ret(ret):
 
 
 if __name__=="__main__":
-    loop_thread = start()
+    # loop_thread = start()
     _init_self()
     bot.cmds.load()
     i = 0
     while True:
-        msg = recv(not_api)
-        # if msg==None:
-        #     print('连接已断开')
-        #     time.sleep(1)
-        #     continue
-        #     # exit(0)
-        if msg=='exit':
-            raise '事件循环已断开'
-        if in_debug and (is_heartbeat(msg)):
-            i += 1
-            i = i %12
-            print('.', end='')
-            if i==0:
-                print('')
-        if (not is_heartbeat(msg)) and (not is_connected(msg)):
+        msg = recv()
+        if msg==None:
+            print('连接已断开')
+            time.sleep(1)
+            continue
+            # exit(0)
+        # if msg=='exit':
+        #     raise '事件循环已断开'
+        # if in_debug and (is_heartbeat(msg)):
+        #     i += 1
+        #     i = i %12
+        #     print('.', end='')
+        #     if i==0:
+        #         print('')
+        if not is_heartbeat(msg):
             debug(f'【收到消息】 {msg}')
             # print(write(**msg)[:-1])
+            print('【收到消息】',end='')
             write(**msg)
             msg_loc = loc(msg)
 
@@ -161,7 +162,6 @@ if __name__=="__main__":
                 text = msg['message']
                 # 执行命令
                 if text.startswith('.'):
-                    bot.cmds.msg.update(msg)
                     cmd_ret(bot.cmds.run(text[1:]))
                 # 执行bash
                 elif text.startswith('!'):
@@ -173,10 +173,10 @@ if __name__=="__main__":
                         send(s, **msg)
 
 
-import atexit
+# import atexit
 
-@atexit.register
-def on_exit():
-    # 用于命令重启或关闭时，关闭其它线程
-    from bot.connect import stop
-    stop()
+# @atexit.register
+# def on_exit():
+#     # 用于命令重启或关闭时，关闭其它线程
+#     from bot.connect import stop
+#     stop()

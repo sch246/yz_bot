@@ -19,6 +19,7 @@ for name in os.listdir(os.path.split(__file__)[0]):
 # print(commands)
 _match_S = re.compile(r'\S')
 
+
 def run(text:str):
     for command in commands:
         if text.startswith(command):
