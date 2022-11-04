@@ -19,7 +19,7 @@ def insert_linemark(s:str):
     return ''.join(map(lambda s:str(next(c))+'│ '+s, s.splitlines(True)))
 
 def run(body:str):
-    '''查看和编辑文件
+    '''查看和编辑文件，私聊似乎没办法传文件(api错误)
 .file (read <文件路径> [<起始行> <结束行>]) | (get <文件路径>) | (set <文件路径> || <文件>) | (<文件> :: to <文件路径>)
 || 意味着需要分为多次消息发送
 :: 意味着该命令会读取之前的消息'''
