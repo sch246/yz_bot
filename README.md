@@ -130,7 +130,7 @@ bot 需要 python 3.7.9 或更高的版本
 
 更低的版本不知道能不能运行，反正我没试过
 
-需要第三方库 `websockets` 和 `dill`(划掉, 0.4版本不用这个了)
+需要第三方库 `requests`
 
 然后使用 python 运行`run.py`
 
