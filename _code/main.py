@@ -9,7 +9,7 @@ from s3 import *
 import s3.config as config
 import s3.counter as counter
 import s3.file as file
-import s3.log as log
+# import s3.log as log
 import s3.params as params
 import s3.schedule as schedule
 import s3.str_tool as str_tool
