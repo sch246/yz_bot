@@ -30,6 +30,10 @@ def send_msg(msg: str, user_id: int | str = None, group_id: int | str = None, **
 # 以下copy自https://zhuanlan.zhihu.com/p/404342876
 
 ListenSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+# 参考http://www.codebaoku.com/it-python/it-python-236394.html
+# 以及https://blog.csdn.net/rlenew/article/details/107592753
+# 这个SO_REUSEADDR是允许重用本地地址和端口
+ListenSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 ListenSocket.bind(('127.0.0.1', 5701))
 ListenSocket.listen(100)  # 传入的参数指定等待连接的最大数量
 
