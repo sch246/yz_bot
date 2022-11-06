@@ -5,9 +5,9 @@ from typing import Any, Callable
 
 def curry(f, _args=None, _kwargs=None):
     '''任意分离参数，使用空括号以调用'''
-    if _args == None:
+    if _args is None:
         _args = []
-    if _kwargs == None:
+    if _kwargs is None:
         _kwargs = {}
 
     def _(*args, **kwargs):

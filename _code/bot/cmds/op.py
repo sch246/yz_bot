@@ -30,8 +30,12 @@ def run(body:str):
     警告: op可以给予任何人op, 或者删除任何master外的人的op, 请谨慎给予'''
     msg = cache.get_last()
     if not msg['user_id'] in cache.get_ops():
+        if not cache.any_same(msg, '\.op'):
+            return '权限不足(一定消息内将不再提醒)'
         return
     body = body.strip()
+    if body=='':
+        return run.__doc__
     if body.splitlines()[0].split(' ')[0]=='del':
         body = body[3:]
         success, fail = [], []

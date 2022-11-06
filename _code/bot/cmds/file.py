@@ -4,8 +4,7 @@ import traceback
 import re
 import os
 
-from main import cq, connect, cache, send, to_thread, msgs
-is_msg = msgs.is_msg
+from main import cq, connect, cache, send, to_thread, is_file, is_msg
 
 def getint(s):
     try:
@@ -19,13 +18,14 @@ def insert_linemark(s:str):
     return ''.join(map(lambda s:str(next(c))+'│ '+s, s.splitlines(True)))
 
 def run(body:str):
-    '''查看和编辑文件，私聊似乎没办法传文件(api错误)
+    '''查看和编辑文件，私聊似乎没办法传文件(api错误)，set可以读取之后发送的文件，to可以读取10条消息内最近的文件
 .file (read <文件路径> [<起始行> <结束行>]) | (get <文件路径>) | (set <文件路径> || <文件>) | (<文件> :: to <文件路径>)
-|| 意味着需要分为多次消息发送
-:: 意味着该命令会读取之前的消息'''
+'''
 
     msg = cache.get_last()
     if not msg['user_id'] in cache.get_ops():
+        if not cache.any_same(msg, '\.file'):
+            return '权限不足(一定消息内将不再提醒)'
         return
 
     body = cq.unescape(body)
@@ -44,6 +44,9 @@ def run(body:str):
     m = re.match(r'set ([\S]+)(.*)', head)
     if m:
         return _set(m)
+    m = re.match(r'to ([\S]+)(.*)', head)
+    if m:
+        return _to(m)
 
     return run.__doc__
 
@@ -123,10 +126,29 @@ def _set(m):
         return _recv_file(file_msg, path)
     elif os.path.isfile(path):
         reply = yield '文件已存在，确定要覆盖文件吗(y/n)'
-        if 'file' in reply.keys():
+        if is_file(reply):
             return _recv_file(reply, path)
         if not is_msg(reply) or not reply['message'] in ['是','确定','y','Y','yes','Yes','YES','OK','ok','Ok']:
             return '操作终止'
         file_msg = yield f'请发送一个文件'
+        return _recv_file(file_msg, path)
+    return '找到了文件，但是发送失败了'
+
+
+def _to(m):
+    file_msg = cache.get_one(cache.get_last(), is_file, 10)# 接收10条消息以内任何人发的文件
+    if not file_msg:
+        return '10条消息内没有文件'
+    path = m.group(1)
+    extra_param = m.group(2).strip()
+    params=[]
+    if extra_param:
+        params = extra_param.split(' ')
+    if '-y' in params or not os.path.exists(path):
+        return _recv_file(file_msg, path)
+    elif os.path.isfile(path):
+        reply = yield '文件已存在，确定要覆盖文件吗(y/n)'
+        if not is_msg(reply) or not reply['message'] in ['是','确定','y','Y','yes','Yes','YES','OK','ok','Ok']:
+            return '操作终止'
         return _recv_file(file_msg, path)
     return '找到了文件，但是发送失败了'
