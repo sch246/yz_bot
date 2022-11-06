@@ -1,23 +1,20 @@
-'''websocket版本的connect'''
+'''websocket版本的connect，不过要应用的话需要更改import顺序以及一部分其它代码'''
 import asyncio
 import json
 import websockets
 import time
 from typing import Any, Callable
 from threading import Event
-from s3.ident import Ident_getter, Box
-from s3.thread import to_thread
-from bot.msgs import is_api
 
-from s3 import debug
-from s3.counter import Counter
+from main import ident, to_thread, is_api, debug, counter
+
 
 uri = "ws://localhost:6700"
 ws: Any      # websocket
 
 
 class Evt:
-    box = Box()
+    box = ident.Box()
 
     def __init__(self, evt_dict: dict) -> None:
         self.value = evt_dict
@@ -37,7 +34,7 @@ class Evt:
 
 
 class Wait:
-    box = Box()       # 存放所有的旧wait
+    box = ident.Box()       # 存放所有的旧wait
     ret: dict
     del_self: Callable
 
@@ -110,8 +107,8 @@ def start():
     waiting_connect.wait()
     return thread
 
-c = Counter()
-def recv(condition: Callable = lambda e: True):
+c = counter.Counter()
+def recv(condition: Callable = lambda e: not is_api(e)):
     global loop
     wait = Wait(condition)
     asyncio.run_coroutine_threadsafe(wait.when_recv(), loop)
@@ -127,7 +124,7 @@ def recv(condition: Callable = lambda e: True):
     return wait.ret
 
 
-_id_getter = Ident_getter()
+_id_getter = ident.Ident_getter()
 
 
 def arun(coroutine):

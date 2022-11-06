@@ -20,7 +20,7 @@ import s3.ident as ident
 import s3.storage as storage
 
 
-import bot.connect as connect
+import bot.connect_with_http as connect
 import bot.msgs as msgs
 from bot.msgs import *
 import bot.cmds as cmds
@@ -30,6 +30,7 @@ import bot.data as data
 import bot.cache as cache
 import bot.user_storage as user_storage
 import bot.chatlog as chatlog
+
 
 
 def loc(msg:dict):
@@ -87,7 +88,7 @@ def send(text: Any, user_id: int | str = None, group_id: int | str = None, **par
     if 'message' in params.keys():
         # 防止message在下面的call_api撞车
         del params['message']
-    if user_id == None and group_id == None:
+    if user_id is None and group_id is None:
         raise Exception('至少输入一个id!')
     if group_id:
         # 当仅同时传入group和user时保证是群聊
@@ -107,7 +108,7 @@ def send(text: Any, user_id: int | str = None, group_id: int | str = None, **par
         return
     self_msg = call2['data']
 
-    if group_id==None:
+    if group_id is None:
         self_msg['user_id'] = user_id
     else:
         self_msg['user_id'] = self_msg['sender']['user_id']
@@ -130,7 +131,7 @@ def cmd_ret(ret, msg):
             cmd_ret(next(ret), msg)
         except StopIteration as e:
             cmd_ret(e.value, msg)
-    elif not ret == None and not ret=='':
+    elif not ret is None and not ret=='':
         send(ret, **msg)
 
 i = 0
@@ -139,7 +140,10 @@ k = 0
 def recv(msg:dict):
     global i, j, k
     global catches
-    if msg==None:
+
+    cmd_py = cmds.modules['py']
+
+    if msg is None:
         print('连接已断开')
         time.sleep(1)
         return
@@ -169,6 +173,8 @@ def recv(msg:dict):
             # 执行命令
             if text.startswith('.'):
                 cmd_ret(cmds.run(text[1:]), msg)
+            elif cmd_py.links:
+                cmd_py.exec_links()
             # 执行bash
             elif text.startswith('!'):
                 os.makedirs('data',exist_ok=True)

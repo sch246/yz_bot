@@ -25,3 +25,11 @@ def unescape(text: str):
     '''将CQ码的一团转义成正常文本'''
     return replace_dic_reverse(text, escape_dic)
 
+def escape2(text: str):
+    '''将正常文本转义成CQ码的一团'''
+    return replace_dic(text, escape_dic2)
+
+def unescape2(text: str):
+    '''将CQ码的一团转义成正常文本'''
+    return replace_dic_reverse(text, escape_dic2)
+

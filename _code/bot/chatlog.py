@@ -41,11 +41,11 @@ def write(**msg):
             group_id = int(msg['group_id'])
             title, name = cache.get_group_user_info(group_id, user_id)
         if is_group_file(msg):
-            return _group_write(msg, group_id, _group_str(title, name, user_id, t, _file_str(msg['file']), msg['message_id']))
+            return _group_write(msg, group_id, _group_str(title, name, user_id, t, _file_str(msg['file']), ''))
         elif is_private_file(msg):
             if 'sender' in msg.keys() and 'user_id' in msg['sender'].keys():
                 name = cache.get_user_name(int(msg['sender']['user_id']))
-            return _private_write(msg, user_id, _private_str(name, t, _file_str(msg['file']), msg['message_id']))
+            return _private_write(msg, user_id, _private_str(name, t, _file_str(msg['file']), ''))
         elif is_change_admin(msg):
             if msg['subtype']=='set':
                 text = f'{name}({user_id})被设为了管理员'
@@ -148,7 +148,7 @@ def _bot_write(msg, text:str):
 
 # def _write_str(type: str, uid: int, t: int, text: str):
 #     f = params.append(time.strftime, [time.localtime(t)])
-#     if uid == None:
+#     if uid is None:
 #         dirpath = join(rootfile, type, f(r"%Y-%m"))
 #     else:
 #         dirpath = join(rootfile, type, str(uid), f(r"%Y-%m"))

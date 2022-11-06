@@ -22,7 +22,7 @@ def call_api(action: str, **params) -> dict:
 
 def send_msg(msg: str, user_id: int | str = None, group_id: int | str = None, **params) -> dict:
     '''user_id或者group_id是必须的'''
-    if user_id == None and group_id == None:
+    if user_id is None and group_id is None:
         raise Exception('至少输入一个id!')
     return call_api('send_msg', message=msg, user_id=user_id, group_id=group_id, **params)
 

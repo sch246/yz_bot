@@ -12,7 +12,7 @@ def Iter(start=0, func=lambda x: x+1):
     value = start
     while True:
         args = yield value
-        if args==None:args=()
+        if args is None:args=()
         value = func(value, *args)
 
 if __name__=="__main__":

@@ -5,20 +5,21 @@ import json
 
 path = '.'
 
-def ensure_file(path):
-    '''确保文件路径存在，并且返回文件路径'''
-    dirpath = os.path.split(path)[0]
-    try:
-        os.makedirs(dirpath,exist_ok=True)
-    except FileExistsError:
-        print(f'{path}: 对应文件夹的位置已经有同名文件')
-        return
-    except OSError:
-        print(f'{path}: 命名空间是作为文件路径的，文件路径不合法')
-        return
-    except Exception as e:
-        print(f'{path}: {e}')
-        return
+def ensure_file(path:str):
+    '''确保文件路径存在，并且返回文件路径(可能会与输入不一致)
+    无法确保文件夹路径时报错'''
+    # assert isinstance(path,str) and can_be_filename(path)
+    os.makedirs(os.path.split(path)[0],exist_ok=True)
+
+    if os.path.isdir(path):
+        i = 0
+        dirfile, ex = os.path.splitext(path)
+        while os.path.isdir(dirfile + f'_{i}' + ex):
+            i += 1
+            if i>99:
+                raise Exception('循环超过上限')
+        path = dirfile + f'_{i}' + ex
+
     return path
 
 def read(file_path, start_line=None, end_line=None):
@@ -51,10 +52,14 @@ def getpath(file_path):
     return join(path, file_path)
 
 def json_read(file_path):
-    return json.loads(read(file_path))
+    file_path = join(path, file_path)
+    with open(file_path, 'r',encoding='utf-8') as f:
+        return json.load(f)
 
 def json_write(file_path, obj):
-    return write(file_path, json.dumps(obj, indent=4, ensure_ascii=False))
+    file_path = join(path, file_path)
+    with open(file_path, 'w', encoding='utf-8') as f:
+        json.dump(obj, f, indent=4, ensure_ascii=False)
 
 
 def let_be_filename(title):

@@ -1,11 +1,13 @@
 '''用于缓存群和用户的名字啥的，以及群和用户的消息，这应该叫缓存吧）'''
 
+import re
 from typing import Callable
-from main import connect
+from main import connect, file, is_group_msg, is_msg
 
 call_api = connect.call_api
 
 qq = None
+name = None
 user_names = {}
 group_user_infos = {}
 
@@ -31,8 +33,11 @@ def update(msg):
             update_group_user_info(group_id, user_id, title, card)
 
 
-def update_user_name(user_id: int, name: str):
-    user_names[user_id] = name
+def update_user_name(user_id: int, _name: str):
+    if user_id==qq:
+        global name
+        name = _name
+    user_names[user_id] = _name
 
 
 def update_group_user_info(group_id: int, user_id: int, title: str, card: str):
@@ -109,12 +114,11 @@ def get_last():
 
 '''保存和读取msgs，每个人每个群不会超过256条，所以不用担心无限增长的问题'''
 import atexit
-from s3.file import write, ensure_file
 
-cache_msgs = 'data/cache_msgs'
+cache_msgs = file.ensure_file('data/cache_msgs')
 
 def save():
-    write(ensure_file(cache_msgs),f'{msgs}')
+    file.write(cache_msgs,f'{msgs}')
 atexit.register(save)
 
 try:
@@ -161,3 +165,53 @@ def set_nicknames(names):
     nicknames.clear()
     nicknames.extend(names)
 
+
+def getlog(msg):
+    if is_group_msg(msg):
+        return msgs['group'][msg['group_id']]
+    elif is_msg(msg):
+        return msgs['private'][msg['user_id']]
+    else:
+        return []
+
+def IsSelf(msg):
+    def is_self(m):
+        return is_msg(m) and m['user_id']==msg['user_id']
+    return is_self
+
+def get_self_log(msg):
+    return list(filter(IsSelf(msg), getlog(msg)))
+
+def same_times(msg:dict, f:Callable|str, i=None):
+    '''判断最近几条消息是否重复'''
+    if isinstance(f,str):
+        mt = f
+        is_self = IsSelf(msg)
+        def f(_msg):
+            return is_self(_msg) and re.match(mt, _msg['message'])
+    log_lst = getlog(msg)
+    if not (i is None):
+        i += 1
+        if len(log_lst)<i:
+            return False
+    return all(map(f, log_lst[1:i]))
+
+def any_same(msg:dict, f:Callable|str, i=None):
+    '''在cache有记录的范围内进行检索'''
+    # print('awa')
+    if isinstance(f,str):
+        mt = f
+        is_self = IsSelf(msg)
+        def f(_msg):
+            return is_self(_msg) and re.match(mt, _msg['message'])
+    log_lst = getlog(msg)
+    if not (i is None):
+        i += 1
+    return any(map(f, log_lst[1:i]))
+
+def get_one(msg:dict, f:Callable, i=None):
+    if not (i is None):
+        i += 1
+    for m in getlog(msg)[1:i]:
+        if f(m):
+            return m
