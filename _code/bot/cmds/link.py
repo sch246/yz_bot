@@ -19,6 +19,8 @@ def run(body:str):
 格式: .link
     : set <name:str>[ while( <name2:str> (fail | succ))+] || <cond:pycode> || <action:pycode>
     | del <name:str>
+    | get <name:str>
+    | list
     | (catch <example:str>)
 使用catch可以获取一个消息能触发哪些link
 虽然链接是列表存储的，但是在列表中放重复的值会引起难以预料的后果'''
@@ -43,6 +45,14 @@ def run(body:str):
     m = re.match(r'del ([\S]+)$', head)
     if m:
         return _del(m)
+
+    m = re.match(r'get ([\S]+)$', head)
+    if m:
+        return _get(m)
+
+    m = re.match(r'list[\s]*$', head)
+    if m:
+        return _list(m)
     return run.__doc__
 
 
@@ -148,6 +158,33 @@ def _del(m):
     else:
         return '没有找到link'
 
+def _get(m):
+    '''列出link的cond和action'''
+    name = m.group(1)
+    link = get_link(name)
+    if link:
+        return formats_link(link, 1)
+    else:
+        return '没有找到link'
+
+def _list(m):
+    '''列出links的名字和它的指向
+早
+    fail
+        啊这
+啊这
+    succ
+        awa
+    fail
+        ww
+类似这样'''
+    lst = []
+    for link in links:
+        lst.append(formats_link(link))
+    if lst:
+        return '\n'.join(lst)
+    else:
+        return 'links 为空'
 
 
 

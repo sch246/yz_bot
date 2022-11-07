@@ -235,3 +235,19 @@ def run_action(linkname):
     _run_action(get_link(linkname)['action'])
 do_action = run_action
 
+def formats_link(link:dict, mode=0):
+    '''输出link的显示用字符串形式'''
+    lst = [link['name']]
+    if mode==0:
+        if link['succ']:
+            lst.append('    succ')
+            lst.extend(map(lambda s:'        '+s, link['succ']))
+        if link['fail']:
+            lst.append('    fail')
+            lst.extend(map(lambda s:'        '+s, link['fail']))
+    elif mode==1:
+        lst.append('    cond')
+        lst.append(str_tool.addtab(link['cond'],tab='        '))
+        lst.append('    action')
+        lst.append(str_tool.addtab(link['action'],tab='        '))
+    return '\n'.join(lst)
