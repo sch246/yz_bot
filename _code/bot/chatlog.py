@@ -50,16 +50,16 @@ def write(**msg):
                 name = cache.get_user_name(int(msg['sender']['user_id']))
             return _private_write(msg, user_id, _private_str(name, t, _file_str(msg['file']), ''))
         elif is_change_admin(msg):
-            if msg['subtype']=='set':
+            if msg['sub_type']=='set':
                 text = f'{name}({user_id})被设为了管理员'
             else:
                 text = f'{name}({user_id})被移除了管理员'
             return _group_write(msg, group_id, _notice_str(t, text))
         elif is_leave(msg):
-            if msg['subtype']=='leave':
+            if msg['sub_type']=='leave':
                 text = f'{name}({user_id})离开了群'
             else:
-                if msg['subtype']=='kick_me':
+                if msg['sub_type']=='kick_me':
                     user_id = cache.get_self_qq()
                 operator_id = int(msg['operator_id'])
                 _, operator = cache.get_group_user_info(group_id, operator_id)
@@ -68,7 +68,7 @@ def write(**msg):
         elif is_join(msg):
             operator_id = int(msg['operator_id'])
             _, operator = cache.get_group_user_info(group_id, operator_id)
-            if msg['subtype']=='approve':
+            if msg['sub_type']=='approve':
                 text = f'{operator}({operator_id})同意{name}({user_id})加入了群'
             else:
                 text = f'{operator}({operator_id})邀请{name}({user_id})加入了群'
@@ -76,7 +76,7 @@ def write(**msg):
         elif is_ban(msg):
             operator_id = int(msg['operator_id'])
             _, operator = cache.get_group_user_info(group_id, operator_id)
-            if msg['subtype']=='ban':
+            if msg['sub_type']=='ban':
                 text = f'{name}({user_id})被{operator}({operator_id})禁言%s天%s时%分%s秒' % gettime(msg['duration'])
             else:
                 text = f'{name}({user_id})被{operator}({operator_id})解除禁言'
