@@ -2,12 +2,13 @@
 
 import re
 from typing import Callable
-from main import connect, file, is_group_msg, is_msg
+from main import connect, file, is_group_msg, is_msg, config
 
 call_api = connect.call_api
 
 qq = None
 name = None
+names = None  # 只读，包括name和nicknames，对它的修改是非永久的，要改请去改config
 user_names = {}
 group_user_infos = {}
 
@@ -35,8 +36,9 @@ def update(msg):
 
 def update_user_name(user_id: int, _name: str):
     if user_id==qq:
-        global name
+        global name, names
         name = _name
+        names = nicknames if name in nicknames else nicknames + [name]
     user_names[user_id] = _name
 
 
@@ -154,7 +156,8 @@ def is_op(uid):
 def set_ops(uids):
     ops.clear()
     ops.extend(uids)
-
+def ops_save():
+    config.save_config(ops,'ops')
 
 def get_nicknames():
     return nicknames
@@ -164,6 +167,8 @@ def get_nickname():
 def set_nicknames(names):
     nicknames.clear()
     nicknames.extend(names)
+def nicknames_save():
+    config.save_config(nicknames,'nicknames')
 
 
 def getlog(msg):

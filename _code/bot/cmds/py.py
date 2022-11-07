@@ -1,6 +1,6 @@
 '''运行python代码的命令，是临时环境，重启后消失,除非最后一行以###开头'''
 import traceback
-import os, json, time, re
+import os, json, time, re, random
 
 from main import *
 
@@ -8,21 +8,21 @@ from main import *
 msg = {}
 
 def match(s:str):
-    msg = cache.get_last()
-    return is_msg(msg) and re.match(s, msg['message'])
+    if is_msg(msg):
+        return re.match(s, msg['message'])
 
 def getlog():
     return cache.getlog(msg)
 
-def sendmsg(text,_msg=None):
-    if _msg is None:
-        _msg = cache.get_last()
+def sendmsg(text,**_msg):
+    if not _msg:
+        _msg = msg
     send(text,**_msg)
 
 def recvmsg(text, sender_id:int=None, private=None, **kws):
     '''不输入后面的参数时，默认是同一个人同一个位置的recv，否则可以设定对应的sender和group
+    私聊想模拟群内，只需要加group_id=xx
     当在群内想模拟私聊时，需要设private为True'''
-    msg = cache.get_last()
     if sender_id is None:
         sender_id = msg['user_id']
     if private is True:
@@ -31,29 +31,41 @@ def recvmsg(text, sender_id:int=None, private=None, **kws):
     recv({**msg, 'user_id':sender_id, 'message':text,'sender':{'user_id': sender_id}, **kws})
 
 
-def getstorage(_msg=None):
-    if _msg is None:
-        _msg = msg
-    return user_storage.storage_get(_msg['user_id'])
+def getstorage(user_id=None):
+    if user_id is None:
+        user_id = msg['user_id']
+    return user_storage.storage_get(user_id)
 
 
-def getname(_msg=None):
-    if _msg is None:
-        _msg = msg
-    name = user_storage.storage_getname(_msg['user_id'])
+def getname(user_id=None, group_id=None):
+    if user_id is None:
+        user_id = msg['user_id']
+    if group_id is None and is_group_msg(msg):
+        group_id = msg['group_id']
+    name = user_storage.storage_getname(user_id)
     if name:
         return name
-    if is_group_msg(_msg):
-        _, name = cache.get_group_user_info(_msg['group_id'], _msg['user_id'])
+    if is_group_msg(msg):
+        _, name = cache.get_group_user_info(group_id, user_id)
     else:
-        name = cache.get_user_name(_msg['user_id'])
+        name = cache.get_user_name(user_id)
     return name
 
-def setname(name, _msg=None):
-    if _msg is None:
-        _msg = msg
-    name = user_storage.storage_setname(name, _msg['user_id'])
+def setname(name, user_id=None):
+    if user_id is None:
+        user_id = msg['user_id']
+    name = user_storage.storage_setname(name, user_id)
     return name
+
+
+def msglog(i=0):
+    msg = getlog()[i]
+    if is_msg(msg):
+        return msg['message']
+
+def getran(lst:list):
+    if lst:
+        return lst[random.randint(0, len(lst)-1)]
 
 
 try:
@@ -145,21 +157,26 @@ def connect_link(linkname:dict, tarlinkname:dict, type:str):
     tarlink = get_link(tarlinkname)
     if tarlink and not linkname in tarlink[type]:
         tarlink[type].append(linkname)
+    link = get_link(linkname)
+    if link and not tarlinkname in link['while'][type]:
+        link['while'][type].append(tarlinkname)
 def disconnect_link(linkname:dict, tarlinkname:dict, type:str):
     tarlink = get_link(tarlinkname)
     if tarlink and linkname in tarlink[type]:
         lst_remove(tarlink[type], linkname)
+    link = get_link(linkname)
+    if link and tarlinkname in link['while'][type]:
+        lst_remove(link['while'][type], tarlinkname)
 
 # def setroot():
+@to_thread
 def exec_links():
     global msg
     msg = cache.get_last()
-    actions = []
-    exec_link(links[0], actions)
-    actions_run(actions)
+    exec_link(links[0])
 
 
-def exec_link(link, actions):
+def exec_link(link):
     name = link['name']
     cond = link['cond']
     succ = link['succ']
@@ -169,6 +186,7 @@ def exec_link(link, actions):
     if code=='':
         return
     lst = code.splitlines(True)
+    out = None
     try:
         exec(''.join(lst[:-1]), globals(), loc)
         last = lst[-1].strip()
@@ -176,40 +194,42 @@ def exec_link(link, actions):
             out = None
         else:
             out = eval(last, globals(), loc)
-        if out:
-            # 如果通过了，运行succ内的link，
-            # succ内的link没找到则删掉
-            print('触发了link:', name)
-            actions.append(action)
-            run_or_remove(succ, actions)
-        else:
-            # 如果没通过，运行fail内的link
-            # fail内的link没找到则删掉
-            run_or_remove(fail, actions)
 
     except:
         print(''.join(traceback.format_exc().splitlines(True)[3:]), **msg)
+    if out:
+        # 如果通过了，运行succ内的link，
+        # succ内的link没找到则删掉
+        print('触发了link:', name)
+        _run_action(action)
+        run_or_remove(succ)
+    else:
+        # 如果没通过，运行fail内的link
+        # fail内的link没找到则删掉
+        run_or_remove(fail)
 
-def run_or_remove(linklst:list,actions):
+def run_or_remove(linklst:list):
     _del = []
     for linkname in linklst:
         _link = get_link(linkname)
         if not _link:
             _del.append(linkname)
             continue
-        exec_link(_link, actions)
+        exec_link(_link)
     for linkname in _del:
         lst_remove(linklst,linkname)
 
 
-@to_thread
-def actions_run(actions):
+
+def _run_action(action):
     '''actions不需要捕获返回值'''
-    for action in actions:
-        if action=='':
-            return
-        action = cq.unescape(action)
-        try:
-            exec(action, globals(), loc)
-        except:
-            print(''.join(traceback.format_exc().splitlines(True)[3:]), **msg)
+    if action=='':
+        return
+    action = cq.unescape(action)
+    try:
+        exec(action, globals(), loc)
+    except:
+        print(''.join(traceback.format_exc().splitlines(True)[3:]), **msg)
+
+def run_action(linkname):
+    _run_action(get_link(linkname)['action'])
