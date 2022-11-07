@@ -232,4 +232,5 @@ def _run_action(action):
         print(''.join(traceback.format_exc().splitlines(True)[3:]), **msg)
 
 def run_action(linkname):
-    _run_action(get_link(linkname)['action'])
+do_action = run_action
+
