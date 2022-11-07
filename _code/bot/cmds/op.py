@@ -2,7 +2,7 @@
 from itertools import chain
 import re
 
-from main import Show, config, cache
+from main import Show, cache
 
 _match_at = re.compile(r'\[CQ:at,qq=([0-9]+)\]$')
 _match_qq = re.compile(r'[0-9]+$')
@@ -48,7 +48,7 @@ def run(body:str):
                 success.append(uid)
             else:
                 fail.append(Show(f'{uid}:不是op'))
-        config.save_config(cache.get_ops(),'ops')
+        cache.ops_save()
         return f'执行完毕,成功:{success}，失败:{fail}'
     if not body=='':
         uids = get_uids_from_body(body)
@@ -62,6 +62,6 @@ def run(body:str):
                     fail.append(Show(f'{uid}:已是op'))
             else:
                 fail.append(Show(f'{uid}:格式错误'))
-        config.save_config(cache.get_ops(),'ops')
+        cache.ops_save()
         return f'执行完毕,成功:{success}，失败:{fail}'
     return run.__doc__

@@ -34,7 +34,10 @@ def write(**msg):
             name = cache.get_user_name(int(msg['sender']['user_id']))
             return _private_write(msg, user_id, _private_str(name, t, text, msg['message_id']))
     elif is_notice(msg):
-        if 'user_id' in msg.keys():
+        if 'operator_id' in msg.keys():
+            user_id = int(msg['user_id'])
+            name = cache.get_user_name(user_id)
+        elif 'user_id' in msg.keys():
             user_id = int(msg['user_id'])
             name = cache.get_user_name(user_id)
         if 'group_id' in msg.keys():
