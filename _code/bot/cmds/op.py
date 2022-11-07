@@ -1,4 +1,4 @@
-'''设定管理员，应当编辑并reload此文件以应用更改'''
+'''设定管理员'''
 from itertools import chain
 import re
 
