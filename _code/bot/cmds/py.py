@@ -104,7 +104,7 @@ def run(body:str):
             if out is not None:
                 send(out, **msg)
     except:
-        send(''.join(traceback.format_exc().splitlines(True)[3:]), **msg)
+        send(''.join(traceback.format_exc().splitlines(True)[3:]).strip(), **msg)
 
 
 
