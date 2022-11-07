@@ -16,7 +16,7 @@
 记录:
 - [开始](https://www.sch246.com/Computer/project/qq_bot/start)
 - [第一次重构](https://www.sch246.com/Computer/project/qq_bot/yz_bot)
-- [第二次重构(就是目前)]
+- [第二次重构(0.2版本)]
 
 - 0.3版
     - 写着写着就不写了，甚至没有上传github
