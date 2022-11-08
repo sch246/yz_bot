@@ -190,29 +190,29 @@ def get_self_log(msg):
 def same_times(msg:dict, f:Callable|str, i=None):
     '''判断最近几条消息是否重复'''
     if isinstance(f,str):
-        mt = f
         is_self = IsSelf(msg)
+        mt = re.compile(f)
         def f(_msg):
-            return is_self(_msg) and re.match(mt, _msg['message'])
+            return is_self(_msg) and mt.match(_msg['message'])
     log_lst = getlog(msg)
     if not (i is None):
         i += 1
         if len(log_lst)<i:
             return False
-    return all(map(f, log_lst[1:i]))
+    return all(f(m) for m in log_lst[1:i])
 
 def any_same(msg:dict, f:Callable|str, i=None):
     '''在cache有记录的范围内进行检索'''
     # print('awa')
     if isinstance(f,str):
-        mt = f
         is_self = IsSelf(msg)
+        mt = re.compile(f)
         def f(_msg):
-            return is_self(_msg) and re.match(mt, _msg['message'])
+            return is_self(_msg) and mt.match(_msg['message'])
     log_lst = getlog(msg)
     if not (i is None):
         i += 1
-    return any(map(f, log_lst[1:i]))
+    return any(f(m) for m in log_lst[1:i])
 
 def get_one(msg:dict, f:Callable, i=None):
     if not (i is None):
