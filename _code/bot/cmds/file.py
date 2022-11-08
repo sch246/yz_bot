@@ -68,10 +68,9 @@ def _read(m):
     else:
         return read_text
 
-def _get(m):
+def _send_file(path):
+    path = os.path.abspath(path)
     msg = cache.get_last()
-    path = m.group(1)
-    path=os.path.abspath(path)
     if not os.path.isfile(path):
         return f'打开失败，文件"{path}"不存在'
     if 'group_id' in msg.keys():
@@ -85,6 +84,12 @@ def _get(m):
             return ret['wording']
         return
     return '找到了文件，但是发送失败了'
+
+
+
+def _get(m):
+    path = m.group(1)
+    _send_file(path)
 
 
 
@@ -136,7 +141,7 @@ def _set(m):
 
 
 def _to(m):
-    file_msg = cache.get_one(cache.get_last(), is_file, 10)# 接收10条消息以内任何人发的文件
+    file_msg = cache.get_one(is_file, 10)# 接收10条消息以内任何人发的文件
     if not file_msg:
         return '10条消息内没有文件'
     path = m.group(1)
