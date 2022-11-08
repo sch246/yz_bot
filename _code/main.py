@@ -113,8 +113,7 @@ def send(text: Any, user_id: int | str = None, group_id: int | str = None, **par
     else:
         self_msg['user_id'] = self_msg['sender']['user_id']
 
-    debug(f'【记录消息】', self_msg)
-    print('【发送消息】',end='')
+    print(f'[{time.strftime(r"%H:%M:%S")}]【发送消息】',end='')
     chatlog.write(**self_msg)
 
 
@@ -149,8 +148,7 @@ def recv(msg:dict):
         return
     if not is_heartbeat(msg):
         i, j, k = 0, 0, 0
-        debug(f'【收到消息】 {msg}')
-        print('【收到消息】',end='')
+        print(f'[{time.strftime(r"%H:%M:%S")}]【收到消息】',end='')
         chatlog.write(**msg)
         msg_loc = loc(msg)
 
@@ -194,12 +192,14 @@ def recv(msg:dict):
             k += 1
         i %= 12
         j %= 60
+        if i+j+k>0:
+            print(str_tool.LASTLINE,end='')
         if j==0 and k==0:
-            print('.')
-        elif i==0 and j!=0 and k==0:
-            print('|')
-        elif i==0 and j==0 and k!=0:
-            print('||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||')
+            print(f'.{i}')
+        elif j!=0 and k==0:
+            print(f'|{j}.{i}')
+        elif k!=0:
+            print(f'█{k}|{j}.{i}')
 
 
 if __name__=="__main__":

@@ -22,3 +22,5 @@ def replace_by_dic2(s: str, d: dict):
     for k, v in d.items():
         s = s.replace(v, k)
     return s
+
+LASTLINE = '\33[1A\r\33[K'
