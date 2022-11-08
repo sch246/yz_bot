@@ -7,12 +7,54 @@ from main import *
 
 msg = {}
 
+try:
+    exec(open('data/pyload.py', encoding='utf-8').read())
+except:
+    pass
+
+loc = {}
+
+@to_thread
+def run(body:str):
+    '''运行python命令，在.py后空格或换行都行，最后一行的表达式若不是None或注释则会被返回
+    默认情况下是临时环境，会在下一次重启后消失
+    当最后一行以###开头时，代码将会在每次开启bot时被运行，注意不要写依赖于临时环境的代码
+格式: .py <code:pycode>'''
+    global msg
+    msg = cache.get_last()
+    if not msg['user_id'] in cache.get_ops():
+        if not cache.any_same(msg, '\.py'):
+            send('权限不足(一定消息内将不再提醒)', **msg)
+        return
+    body = cq.unescape(body.strip())
+    if body=='':
+        return run.__doc__
+    lst = body.splitlines(True)
+    try:
+        exec(''.join(lst[:-1]), globals(), loc)
+        last = lst[-1].strip()
+        if last.startswith('###'):
+            file.add('data/pyload.py', '\n'+body)
+            send('添加成功', **msg)
+        elif last.startswith('#'):
+            return
+        else:
+            out = eval(last, globals(), loc)
+            if out is not None:
+                send(out, **msg)
+    except:
+        send(''.join(traceback.format_exc().splitlines(True)[3:]).strip(), **msg)
+
+
 def match(s:str):
     if is_msg(msg):
         return re.match(s, msg['message'])
 
-def getlog():
-    return cache.getlog(msg)
+def getlog(i=None):
+    if i is None:
+        return cache.getlog(msg)
+    else:
+        return cache.getlog(msg)[i]
 
 def sendmsg(text,**_msg):
     if not _msg:
@@ -67,44 +109,22 @@ def getran(lst:list):
     if lst:
         return lst[random.randint(0, len(lst)-1)]
 
+# 接收文件！
+recv_file = cmds.modules['file']._recv_file
+send_file = cmds.modules['file']._send_file
 
-try:
-    exec(open('data/pyload.py', encoding='utf-8').read())
-except:
-    pass
+def same_times(f:Callable|str, i=None):
+    return cache.same_times(cache.get_last(), f, i)
+def any_same(f:Callable|str, i=None):
+    return cache.any_same(cache.get_last(), f, i)
+def get_one(f:Callable, i=None):
+    return cache.get_one(cache.get_last(), f, i)
 
-loc = {}
 
-@to_thread
-def run(body:str):
-    '''运行python命令，在.py后空格或换行都行，最后一行的表达式若不是None或注释则会被返回
-    默认情况下是临时环境，会在下一次重启后消失
-    当最后一行以###开头时，代码将会在每次开启bot时被运行，注意不要写依赖于临时环境的代码
-格式: .py <code:pycode>'''
-    global msg
-    msg = cache.get_last()
-    if not msg['user_id'] in cache.get_ops():
-        if not cache.any_same(msg, '\.py'):
-            send('权限不足(一定消息内将不再提醒)', **msg)
-        return
-    body = cq.unescape(body.strip())
-    if body=='':
-        return run.__doc__
-    lst = body.splitlines(True)
-    try:
-        exec(''.join(lst[:-1]), globals(), loc)
-        last = lst[-1].strip()
-        if last.startswith('###'):
-            file.add('data/pyload.py', '\n'+body)
-            send('添加成功', **msg)
-        elif last.startswith('#'):
-            return
-        else:
-            out = eval(last, globals(), loc)
-            if out is not None:
-                send(out, **msg)
-    except:
-        send(''.join(traceback.format_exc().splitlines(True)[3:]).strip(), **msg)
+
+
+
+
 
 
 
