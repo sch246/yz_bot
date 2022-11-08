@@ -47,16 +47,19 @@ def run(body:str):
 
 
 def match(s:str):
+    '''判断当前的消息是否通过某正则表达式，当前消息必须为文本消息'''
     if is_msg(msg):
         return re.match(s, msg['message'])
 
 def getlog(i=None):
+    '''获取这个聊天区域的消息列表，由于是cache存的，默认只会保存最多256条'''
     if i is None:
         return cache.getlog(msg)
     else:
         return cache.getlog(msg)[i]
 
 def sendmsg(text,**_msg):
+    '''发送消息，就是可以省略后续参数而已'''
     if not _msg:
         _msg = msg
     send(text,**_msg)
@@ -74,12 +77,14 @@ def recvmsg(text, sender_id:int=None, private=None, **kws):
 
 
 def getstorage(user_id=None):
+    '''获取个人的存储字典'''
     if user_id is None:
         user_id = msg['user_id']
     return user_storage.storage_get(user_id)
 
 
 def getname(user_id=None, group_id=None):
+    '''获取名字，如果有设置名字就返回设置的名字，反正无论如何都会获得一个'''
     if user_id is None:
         user_id = msg['user_id']
     if group_id is None and is_group_msg(msg):
@@ -94,6 +99,7 @@ def getname(user_id=None, group_id=None):
     return name
 
 def setname(name, user_id=None):
+    '''设置名字，将会把名字存进个人存储字典中，可以被获取名字的函数获取'''
     if user_id is None:
         user_id = msg['user_id']
     name = user_storage.storage_setname(name, user_id)
@@ -101,11 +107,17 @@ def setname(name, user_id=None):
 
 
 def msglog(i=0):
-    msg = getlog()[i]
-    if is_msg(msg):
-        return msg['message']
+    '''按索引获取文本消息，不会获取到其它类型的信息，若索引超出范围则返回None
+    通常来讲默认会返回本条消息(本条消息肯定是文本啦)'''
+    _i = 0
+    for msg in getlog():
+        if is_msg(msg):
+            if _i == i:
+                return msg['message']
+            _i += 1
 
 def getran(lst:list):
+    '''随机取出列表中的元素'''
     if lst:
         return lst[random.randint(0, len(lst)-1)]
 
@@ -114,10 +126,13 @@ recv_file = cmds.modules['file']._recv_file
 send_file = cmds.modules['file']._send_file
 
 def same_times(f:Callable|str, i=None):
+    '''用all筛选最近的i条消息，不包括本条消息，设为None则是筛选全部消息'''
     return cache.same_times(cache.get_last(), f, i)
 def any_same(f:Callable|str, i=None):
+    '''用any筛选最近的i条消息，不包括本条消息，设为None则是筛选全部消息'''
     return cache.any_same(cache.get_last(), f, i)
 def get_one(f:Callable, i=None):
+    '''获取最近的一条满足条件的消息，不包括本条消息'''
     return cache.get_one(cache.get_last(), f, i)
 
 
