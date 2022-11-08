@@ -1,11 +1,11 @@
 '''后面的判断函数都默认需要满足开头的函数'''
 
-def haskey(dic:dict, lst:list):
-    return all([k in dic.keys() for k in lst])
+def haskeys(dic:dict, lst:list):
+    return all(k in dic.keys() for k in lst)
 
 evt = ['time','self_id','post_type']
 def is_evt(msg:dict):
-    return haskey(msg, evt)
+    return haskeys(msg, evt)
 
 
 def is_heartbeat(msg:dict):
