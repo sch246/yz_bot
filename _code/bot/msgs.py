@@ -44,7 +44,8 @@ def is_img(msg):
     if is_cq(msg):
         s = msg['message']
         return cq.load(s)['type']=='image'
-
+def is_reply(msg):
+    return 'reply_cq' in msg.keys()
 
 
 
