@@ -47,10 +47,10 @@ def append(f: Callable, _args:list):
         return f(*args, **kwargs)
     return _
 
-def insert(f: Callable, i:int, _args:list):
+def insert(f: Callable, i:int, *_args:list):
     '''插入参数'''
     def _(*args, **kwargs):
-        args = *args[:i], *_args, *args[i:]
+        args[i:i] = _args
         return f(*args, **kwargs)
     return _
 
