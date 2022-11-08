@@ -13,8 +13,7 @@ rootfile = 'chatlog'
 
 
 def write(**msg):
-    if not in_debug:
-        print(f'{msg}')
+    print(f'{msg}')
     t = msg['time']
     if is_msg(msg):
         text = cq.unescape(msg['message'])
