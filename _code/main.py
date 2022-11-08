@@ -184,6 +184,8 @@ def recv(msg:dict):
     else:
         # 非常傻逼地用ijk作计时器，需要将心跳间隔设置为5s)
         # 虽然这玩意不准，不过用来大致度量时间还是可以的
+        if i+j+k>0:
+            print(str_tool.LASTLINE,end='')
         i += 1
         if i==12:
             j += 1
@@ -191,8 +193,6 @@ def recv(msg:dict):
             k += 1
         i %= 12
         j %= 60
-        if i+j+k>0:
-            print(str_tool.LASTLINE,end='')
         if j==0 and k==0:
             print(f'.{i}')
         elif j!=0 and k==0:
