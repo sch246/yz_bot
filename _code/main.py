@@ -1,4 +1,5 @@
 '''大概是用来启动bot的主程序，不过直接从这里启动的话，bot将失去重启功能'''
+import re
 import sys,os
 from typing import Generator
 import time
@@ -104,7 +105,7 @@ def send(text: Any, user_id: int | str = None, group_id: int | str = None, **par
 
     call2 = connect.call_api('get_msg', message_id=call['data']['message_id'])
     if not call2['retcode'] == 0:
-        print('获取发送的消息失败'+call['wording'])
+        print('获取发送的消息失败'+call2['wording'])
         return
     self_msg = call2['data']
 
@@ -136,6 +137,7 @@ def cmd_ret(ret, msg):
 i = 0
 j = 0
 k = 0
+reply_cq = re.compile(r'^(\[CQ:reply,[^\]]+\])([\S\s]*)')
 def recv(msg:dict):
     global i, j, k
     global catches
@@ -148,6 +150,13 @@ def recv(msg:dict):
         return
     if not is_heartbeat(msg):
         i, j, k = 0, 0, 0
+
+        if is_msg(msg):
+            m = reply_cq.match(msg['message'])
+            if m:
+                msg['reply_cq'] = m.group(1)
+                msg['message'] = m.group(2).lstrip()
+
         print(f'[{time.strftime(r"%H:%M:%S")}]【收到消息】',end='')
         chatlog.write(**msg)
         msg_loc = loc(msg)
