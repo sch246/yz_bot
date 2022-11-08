@@ -1,4 +1,6 @@
 '''后面的判断函数都默认需要满足开头的函数'''
+from main import cq
+
 
 def haskeys(dic:dict, lst:list):
     return all(k in dic.keys() for k in lst)
@@ -32,6 +34,17 @@ def is_friend(msg:dict):
 def is_anonymous(msg:dict):
     '''匿名消息'''
     return msg['sub_type'] == 'anonymous'
+def is_cq(msg):
+    '''单个cq消息'''
+    if is_msg(msg):
+        s = msg['message']
+        return cq.find_all(s)==[s]
+def is_img(msg):
+    '''单个img消息'''
+    if is_cq(msg):
+        s = msg['message']
+        return cq.load(s)['type']=='image'
+
 
 
 

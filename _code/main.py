@@ -21,12 +21,12 @@ import s3.storage as storage
 
 
 import bot.connect_with_http as connect
-import bot.msgs as msgs
-from bot.msgs import *
 import bot.cmds as cmds
 import bot.cq as cq
 import bot.data as data
 
+import bot.msgs as msgs
+from bot.msgs import *
 import bot.cache as cache
 import bot.user_storage as user_storage
 import bot.chatlog as chatlog
