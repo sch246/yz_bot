@@ -199,20 +199,20 @@ def set_link(linkname:str, d:dict):
             return
     links.append({**d, 'name':linkname})
 
-def connect_link(linkname:dict, tarlinkname:dict, type:str):
+def connect_link(linkname:dict, tarlinkname:dict, connect_type:str):
     tarlink = get_link(tarlinkname)
-    if tarlink and not linkname in tarlink[type]:
-        tarlink[type].append(linkname)
+    if tarlink and not linkname in tarlink[connect_type]:
+        tarlink[connect_type].append(linkname)
     link = get_link(linkname)
-    if link and not tarlinkname in link['while'][type]:
-        link['while'][type].append(tarlinkname)
-def disconnect_link(linkname:dict, tarlinkname:dict, type:str):
+    if link and not tarlinkname in link['while'][connect_type]:
+        link['while'][connect_type].append(tarlinkname)
+def disconnect_link(linkname:dict, tarlinkname:dict, connect_type:str):
     tarlink = get_link(tarlinkname)
-    if tarlink and linkname in tarlink[type]:
-        lst_remove(tarlink[type], linkname)
+    if tarlink and linkname in tarlink[connect_type]:
+        lst_remove(tarlink[connect_type], linkname)
     link = get_link(linkname)
-    if link and tarlinkname in link['while'][type]:
-        lst_remove(link['while'][type], tarlinkname)
+    if link and tarlinkname in link['while'][connect_type]:
+        lst_remove(link['while'][connect_type], tarlinkname)
 
 def run_or_remove(linklst:list):
     _del = []

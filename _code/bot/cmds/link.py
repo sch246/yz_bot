@@ -96,14 +96,14 @@ action 紧挨着 cond 成功时执行，原则上不允许 conds 使用 send,rec
         if len(params)%2==1:
             return 'while参数不成对'
         for i in range(len(params)//2):
-            tar = params[2*i-1]
+            tar = params[2*i]
             if tar == name:
                 return '递归达咩！'
             if not get_link(tar):
                 return f'不存在的link:"{tar}"'
-            type = params[2*i]
-            if type not in ['succ','fail']:
-                return f'期望得到"succ"或"fail"，但得到了"{type}"'
+            connect_type = params[2*i+1]
+            if connect_type not in ['succ','fail']:
+                return f'期望得到"succ"或"fail"，但得到了"{connect_type}"'
     else:
         params = []
 
@@ -122,16 +122,16 @@ action 紧挨着 cond 成功时执行，原则上不允许 conds 使用 send,rec
         link = get_link(name)
         new = {'succ':[],'fail':[]}
         for i in range(len(params)//2):
-            tar = params[2*i-1]
-            type = params[2*i]
-            new[type].append(tar)
+            tar = params[2*i]
+            connect_type = params[2*i+1]
+            new[connect_type].append(tar)
         old = link['while']
-        def _(type):
-            for tar in set((*old[type],*new[type])):
-                if tar in old[type] and tar not in new[type]:
-                    disconnect_link(name, tar, type)
-                elif tar in new[type] and tar not in old[type]:
-                    connect_link(name, tar, type)
+        def _(connect_type):
+            for tar in set((*old[connect_type],*new[connect_type])):
+                if tar in old[connect_type] and tar not in new[connect_type]:
+                    disconnect_link(name, tar, connect_type)
+                elif tar in new[connect_type] and tar not in old[connect_type]:
+                    connect_link(name, tar, connect_type)
         _('succ')
         _('fail')
         link['type'] = type
@@ -163,8 +163,8 @@ action 紧挨着 cond 成功时执行，原则上不允许 conds 使用 send,rec
         })
         for i in range(len(params)//2):
             tar = params[2*i-1]
-            type = params[2*i]
-            connect_link(name, tar, type)
+            connect_type = params[2*i]
+            connect_link(name, tar, connect_type)
         return '创建成功'
 
 
