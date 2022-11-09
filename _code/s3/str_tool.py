@@ -25,7 +25,7 @@ def replace_by_dic2(s: str, d: dict):
 
 
 
-re_stc = re.compile(r'{([^:},]*):([^}]+)}|{([^:},]+)}')
+re_stc = re.compile(r'{(\D[^:},]*)?:([^}]+)}|{(\D[^:},]*)}')
 
 def _gen_f(loc):
     names = set()
