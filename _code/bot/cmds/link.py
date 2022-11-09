@@ -17,7 +17,7 @@ from .py import *
 def run(body:str):
     '''判断收到的消息，通过则进行处理，优先级比默认命令低，需要分条发送，
 格式: .link
-    : set <name:str>[ while( <name2:str> (fail | succ))+] || <cond:pycode> || <action:pycode>
+    : (set|set2) <name:str>[ while( <name2:str> (fail | succ))+] || <cond:pycode> || <action:pycode>
     | del <name:str>
     | get <name:str>
     | list
@@ -38,7 +38,7 @@ def run(body:str):
     head = lines[0].strip()
     value = lines[1:]
 
-    m = re.match(r'set ([\S]+)( while (\S.+))?$', head)
+    m = re.match(r'(set|set2) ([\S]+)( while (\S.+))?$', head)
     if m:
         return _set(m)
 
@@ -59,22 +59,39 @@ def run(body:str):
 
 def _set(m):
     '''创建或修改link，需要分条发送
-    格式: .link (set <name:str>[ while( <name2:str> (fail | succ))+] || <cond:pycode> || <action:pycode>)
-    while 可以设置它在哪条 link 通过或未通过时执行
-    cond 和 action 是 python 代码，并共享 .py 的环境
-    cond 会以最后一行作为表达式求布尔值作为判断依据，action则是无脑exec
-    若打算 cond 无条件通过请使用 True 作为最后一行，否则使用 None 或者 以#开头 作为最后一行
-    action 紧挨着 cond 成功时执行，原则上不允许 conds 使用 send,recv 和 do_action 等干涉自身的函数，这会影响到 catch 函数的准确性'''
+    格式: .link ((set|set2) <name:str>[ while( <name2:str> (fail | succ))+] || <cond:pycode> || <action:pycode>)
 
-    name = m.group(1)
+使用set2将会创建特殊的link，仅捕获文本消息
+    cond将会作为特殊正则表达式，{name:type}会按照.py中str(type)作为正则表达式,捕获对应的字符串赋给name作为命名组
+    type会寻找同名的变量，并转化为字符串插入
+        若没有对应的变量或者不是合法的变量名，则作为字符串本身插入
+        若type是字符串列表，则会变成(xx|xx|..)这样
+    若name和type俱有，则以name创建命名组，type插入到命名组的匹配规则中
+    若没有name，{:type}则直接插入
+    若没有type，{name}则根据name本身进行判断，若name开头为大写字母则为'[\S\s]+'否则为'\S+'
+    action使用{:name}进行替换，且最后一行作为表达式返回
+    cond创建的命名组不进入.py的locals里
+
+while 可以设置它在哪条 link 通过或未通过时执行
+cond 和 action 是 python 代码，并共享 .py 的环境
+cond 会以最后一行作为表达式求布尔值作为判断依据，action则是无脑exec
+若打算 cond 无条件通过请使用 True 作为最后一行，否则使用 None 或者 以#开头 作为最后一行
+action 紧挨着 cond 成功时执行，原则上不允许 conds 使用 send,recv 和 do_action 等干涉自身的函数，这会影响到 catch 函数的准确性'''
+
+    type = m.group(1)
+    if type=='set':
+        type = 'py'
+    else:
+        type = 're'
+    name = m.group(2)
     if get_link(name):
         exist = True
     else:
         exist = False
 
 
-    if m.group(3):
-        extra_param = m.group(3).strip()
+    if m.group(4):
+        extra_param = m.group(4).strip()
         params = extra_param.split(' ')
         if len(params)%2==1:
             return 'while参数不成对'
@@ -117,12 +134,14 @@ def _set(m):
                     connect_link(name, tar, type)
         _('succ')
         _('fail')
+        link['type'] = type
         link['cond'] = cond
         link['action'] = action
         return '修改成功'
     elif not params:
         links.insert(0,{
             'name':name,
+            'type':type,
             'while':{'succ':[],'fail':[]},
             'cond':cond,
             'succ':[],
@@ -135,6 +154,7 @@ def _set(m):
     else:
         links.append({
             'name':name,
+            'type':type,
             'while':{'succ':[],'fail':[]},
             'cond':cond,
             'succ':[],
@@ -159,7 +179,7 @@ def _del(m):
         return '没有找到link'
 
 def _get(m):
-    '''列出link的cond和action'''
+    '''列出link的type, cond和action'''
     name = m.group(1)
     link = get_link(name)
     if link:
@@ -169,10 +189,10 @@ def _get(m):
 
 def _list(m):
     '''列出links的名字和它的指向
-早
+早:py
     fail
         啊这
-啊这
+啊这:re
     succ
         awa
     fail
