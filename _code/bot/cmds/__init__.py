@@ -19,17 +19,17 @@ for name in os.listdir(os.path.split(__file__)[0]):
 # print(commands)
 _match_S = re.compile(r'\S')
 
-
-def run(text:str):
+def is_cmd(text:str):
     for command in commands:
         if text.startswith(command):
-
             body = text[len(command):]
             if re.match(_match_S, body):  # 如果命令后跟的是非空白符，则表示不是这个命令
                 continue
             body = body.lstrip()  # body是命令后面的其余部分
+            return command, body
 
-            return modules[command].run(body)
+def run(command, body):
+    return modules[command].run(body)
 
 def load():
     for command in commands:

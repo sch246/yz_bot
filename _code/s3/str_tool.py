@@ -23,4 +23,59 @@ def replace_by_dic2(s: str, d: dict):
         s = s.replace(v, k)
     return s
 
+
+
+re_stc = re.compile(r'{([^:}]*):([^}]+)}|{([^:}]+)}')
+
+def _gen_f(loc):
+    names = set()
+    def f(m:re.Match):
+        if m.group(2) is None:
+            # 表明没有冒号
+            name = m.group(3)
+            if name[0].isupper():
+                var = r'[\S\s]+'
+            else:
+                var = r'\S+'
+        else:
+            name = m.group(1)
+            try:
+                var = eval(m.group(2), loc)
+                if not var:
+                    var = ''
+                elif isinstance(var,list):
+                    var = f'({"|".join(map(str, var))})'
+                else:
+                    var = str(var)
+            except:
+                var = m.group(2)
+        if name:
+            if name not in names:
+                names.add(name)
+                return f'(?P<{name}>{var})'
+            else:
+                return f'(?P={name})'
+        else:
+            return var
+    return f
+
+def stc_get(src:str):
+    def _(s:str, loc:dict, src=src)->dict|None:
+        '''没有match的话返回None，否则返回一个字典(可能为空)'''
+        src = re_stc.sub(_gen_f(loc), src)
+        m = re.match(src, s)
+        if m:
+            return m.groupdict()
+    return _
+
+def stc_set(tar:str):
+    def _(names:dict,tar=tar)->str:
+        for k,v in names.items():
+            tar = tar.replace('{:%s}'%k, v)
+        return tar
+    return _
+
+def stc(s:str, loc:dict, src:str, tar:str):
+    return stc_set(src)(stc_get(tar)(s, loc))
+
 LASTLINE = '\33[1A\r\33[K'

@@ -63,6 +63,11 @@ def update(f, dic: dict):
     return _
 
 
+def setl(l:list, value):
+    '''将值塞进列表并且返回这个值'''
+    l.append(value)
+    return value
+
 if __name__ == "__main__":
     #下面是测试
     def test(a=None, b=None, c=None):

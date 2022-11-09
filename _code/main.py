@@ -178,8 +178,9 @@ def recv(msg:dict):
         if is_msg(msg):
             text = msg['message']
             # 执行命令
-            if text.startswith('.'):
-                cmd_ret(cmds.run(text[1:]), msg)
+            r = []
+            if text.startswith('.') and params.setl(r, cmds.is_cmd(text[1:])):
+                cmd_ret(cmds.run(*r[0]), msg)
             elif cmd_py.links:
                 cmd_py.exec_links()
             # 执行bash

@@ -135,10 +135,21 @@ def get_one(f:Callable, i=None):
     '''获取最近的一条满足条件的消息，不包括本条消息'''
     return cache.get_one(cache.get_last(), f, i)
 
+# def recv_img(_msg, path):
+#     if not is_img(_msg):
+#         return '目标msg不是单个图片'
+#     cmds.modules['file'].download(cq.load(_msg['message'])['data']['url'], path, msg)
 
 
-
-
+# def send_img(path):
+#     path = os.path.abspath(path)
+#     cq_dict = {
+#         'type':'image',
+#         'data':{
+#             'file':cq.escape(path)
+#         }
+#     }
+#     sendmsg(cq.dump(cq_dict))
 
 
 
@@ -203,6 +214,17 @@ def disconnect_link(linkname:dict, tarlinkname:dict, type:str):
     if link and tarlinkname in link['while'][type]:
         lst_remove(link['while'][type], tarlinkname)
 
+def run_or_remove(linklst:list):
+    _del = []
+    for linkname in linklst:
+        _link = get_link(linkname)
+        if not _link:
+            _del.append(linkname)
+            continue
+        exec_link(_link)
+    for linkname in _del:
+        lst_remove(linklst,linkname)
+
 # def setroot():
 @to_thread
 def exec_links():
@@ -213,10 +235,29 @@ def exec_links():
 
 def exec_link(link):
     name = link['name']
+    type = link['type']
     cond = link['cond']
     succ = link['succ']
     fail = link['fail']
     action = link['action']
+    if type=='py':
+        out = exec_link_py(cond, action)
+    else:
+        out = exec_link_re(cond, action)
+    if out:
+        # 如果通过了，运行succ内的link，
+        # succ内的link没找到则删掉
+        print('触发了link:', name)
+        run_or_remove(succ)
+    else:
+        # 如果没通过，运行fail内的link
+        # fail内的link没找到则删掉
+        run_or_remove(fail)
+
+
+# exec py-------------------------------------------------
+
+def exec_link_py(cond, action):
     code = cq.unescape(cond) # cond仅经过了一次strip
     if code=='':
         return
@@ -233,46 +274,72 @@ def exec_link(link):
     except:
         print(''.join(traceback.format_exc().splitlines(True)[3:]), **msg)
     if out:
-        # 如果通过了，运行succ内的link，
-        # succ内的link没找到则删掉
-        print('触发了link:', name)
-        _run_action(action)
-        run_or_remove(succ)
-    else:
-        # 如果没通过，运行fail内的link
-        # fail内的link没找到则删掉
-        run_or_remove(fail)
-
-def run_or_remove(linklst:list):
-    _del = []
-    for linkname in linklst:
-        _link = get_link(linkname)
-        if not _link:
-            _del.append(linkname)
-            continue
-        exec_link(_link)
-    for linkname in _del:
-        lst_remove(linklst,linkname)
+        _run_action_py(action, loc)
+    return out
 
 
 
-def _run_action(action):
+def _run_action_py(action, _loc):
     '''actions不需要捕获返回值'''
     if action=='':
         return
     action = cq.unescape(action)
     try:
-        exec(action, globals(), loc)
+        exec(action, globals(), _loc)
     except:
         print(''.join(traceback.format_exc().splitlines(True)[3:]), **msg)
 
-def run_action(linkname):
-    _run_action(get_link(linkname)['action'])
+
+# exec re-------------------------------------------------
+
+# t = re.compile(r'({([^:}]*):([^}]+)}|{([^:}]+)})')
+
+def exec_link_re(cond, action):
+    cond = cq.unescape(cond) # cond仅经过了一次strip
+    if cond=='':
+        return True
+    if is_msg(msg):
+        names = str_tool.stc_get(cond)(msg['message'],{**globals(),**loc})
+        if names is not None:
+            _run_action_re(action, loc, names)
+            return True
+
+
+
+def _run_action_re(action, _loc, names:dict):
+    '''actions不需要捕获返回值'''
+    if action=='':
+        return
+    action = cq.unescape(action)
+    action = str_tool.stc_set(action)(names)
+    lst = action.splitlines(True)
+    out = None
+    try:
+        exec(''.join(lst[:-1]), globals(), _loc)
+        last = lst[-1].strip()
+        if last.startswith('#'):
+            out = None
+        else:
+            out = eval(last, globals(), _loc)
+        if out is not None:
+            send(out, **msg)
+    except:
+        print(''.join(traceback.format_exc().splitlines(True)[3:]), **msg)
+
+#-------------------------------------------------
+
+
+def run_action(linkname, _loc, names={}):
+    link = get_link(linkname)
+    if link['type']=='py':
+        _run_action_py(link['action'], _loc)
+    else:
+        _run_action_re(link['action'], _loc, names)
 do_action = run_action
 
 def formats_link(link:dict, mode=0):
     '''输出link的显示用字符串形式'''
-    lst = [link['name']]
+    lst = [link['name']+': '+link['type']]
     if mode==0:
         if link['succ']:
             lst.append('    succ')
