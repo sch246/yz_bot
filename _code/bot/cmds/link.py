@@ -16,12 +16,10 @@ from .py import *
 
 def run(body:str):
     '''判断收到的消息，通过则进行处理，优先级比默认命令低，需要分条发送，
-格式: .link
-    : (set|set2) <name:str>[ while( <name2:str> (fail | succ))+] || <cond:pycode> || <action:pycode>
-    | del <name:str>
-    | get <name:str>
-    | list
-    | (catch <example:str>)
+格式:
+.link (set|set2) <name>[ while( <other_name> (succ|fail))+]
+ || <cond>
+ || <action>
 使用catch可以获取一个消息能触发哪些link
 虽然链接是列表存储的，但是在列表中放重复的值会引起难以预料的后果'''
     global msg
