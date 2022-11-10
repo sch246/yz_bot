@@ -97,7 +97,7 @@ QQ自带的聊天记录检索不好用是推动我让 bot 能运行的直接原�
 
 关于前一个程序请参考[go-cqhttp](https://github.com/Mrs4s/go-cqhttp)
 
-并且选择正向代理(尽管这意味着 bot 只能同时运行在一个QQ号上)
+并且选择 http 通信
 
 <details>
 <summary>go-cqhttp登录问题</summary>
