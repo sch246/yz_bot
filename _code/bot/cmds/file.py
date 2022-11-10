@@ -15,7 +15,13 @@ def getint(s):
 from s3.counter import Counter
 def insert_linemark(s:str):
     c = Counter()
-    return ''.join(map(lambda s:str(next(c))+'│ '+s, s.splitlines(True)))
+    return ''.join(map(lambda s:str(next(c))+'│'+s, s.splitlines(True)))
+
+def _strip_linemark(line:str):
+    return re.sub(r'^\d+\|','',line, 1)
+
+def strip_linemark(s:str):
+    return ''.join(map(_strip_linemark, s.splitlines(True)))
 
 def run(body:str):
     '''查看和编辑文件，私聊似乎没办法传文件(api错误)，set可以读取之后发送的文件，to可以读取10条消息内最近的文件
@@ -38,6 +44,9 @@ def run(body:str):
     m = re.match(r'read ([\S]+)(.*)', head)
     if m:
         return _read(m)
+    m = re.match(r'write ([\S]+)(.*)', head)
+    if m:
+        return _write(m, value)
     m = re.match(r'get ([\S]+).*', head)
     if m:
         return _get(m)
@@ -50,23 +59,72 @@ def run(body:str):
 
     return run.__doc__
 
+def read_text(text, start=None, end=None):
+    return ''.join(insert_linemark(text).splitlines(True)[start:end])
+
+def read_file(path, start=None, end=None):
+    with open(path,encoding='utf-8') as f:
+        text = f.read()
+        return read_text(text, start, end)
+
+def listitems(path):
+    lst = os.listdir(path)
+    dirs = []
+    files = []
+    for item in lst:
+        if os.path.isdir(os.path.join(path,item)):
+            dirs.append(item)
+        else:
+            files.append(item)
+    dirs.sort()
+    files.sort()
+    return dirs, files
+def listdir(path='.'):
+    dirs, files = listitems(path)
+    return '\n'.join((*map(lambda s:'> '+s, dirs),*files))
+
 def _read(m):
     path = m.group(1)
+    if os.path.isdir(path):
+        return listdir(path)
     extra_param = m.group(2).strip()
-    try:
-        read_text = open(path,encoding='utf-8').read()
-    except Exception as e:
-        return f'打开失败\n{e}'
-    read_text = insert_linemark(read_text)
     if extra_param:
-        params = extra_param.split(' ')
-        try:
-            params = list(map(getint, params))
-            return ''.join(read_text.splitlines(True)[params[0]:params[1]])
-        except:
-            pass
+        params = list(map(getint, extra_param.split(' ')))
+        if len(params)==1:
+            params.append(None)
     else:
-        return read_text
+        params = [None,None]
+    try:
+        text = read_file(path, params[0], params[1])
+        if text=='':
+            return '文件为空'
+        else:
+            return text
+    except Exception as e:
+        return e
+
+def write_text(text, lines, start=None, end=None):
+    textlines = text.splitlines(True)
+    textlines[start:end] = map(_strip_linemark, lines)
+    return ''.join(textlines)
+
+def write_file(path, lines, start=None, end=None):
+    with open(path,encoding='utf-8') as f:
+        f.write(write_text(f.read(), lines, start, end))
+
+
+def _write(m, lines):
+    path = m.group(1)
+    extra_param = m.group(2).strip()
+    if extra_param:
+        params = list(map(getint, extra_param.split(' ')))
+        if len(params)==1:
+            params.append(None)
+    try:
+        write_file(path,lines,params[0],params[1])
+        return '已写入 '+path
+    except Exception as e:
+        return e
 
 def _send_file(path):
     path = os.path.abspath(path)
@@ -89,7 +147,7 @@ def _send_file(path):
 
 def _get(m):
     path = m.group(1)
-    _send_file(path)
+    return _send_file(path)
 
 
 

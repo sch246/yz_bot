@@ -178,11 +178,8 @@ def recv(msg:dict):
         if is_msg(msg):
             text = msg['message']
             # 执行命令
-            r = []
-            if text.startswith('.') and params.setl(r, cmds.is_cmd(text[1:])):
-                cmd_ret(cmds.run(*r[0]), msg)
-            elif cmd_py.links:
-                cmd_py.exec_links()
+            if text.startswith('.') and cmds.is_cmd(text[1:]):
+                cmd_ret(cmds.run(*cmds.is_cmd(text[1:])), msg)
             # 执行bash
             elif text.startswith('!'):
                 os.makedirs('data',exist_ok=True)
@@ -191,6 +188,8 @@ def recv(msg:dict):
                     s = f.read()
                 if not s=='':
                     send(s, **msg)
+            elif cmd_py.links:
+                cmd_py.exec_links()
     else:
         # 非常傻逼地用ijk作计时器，需要将心跳间隔设置为5s)
         # 虽然这玩意不准，不过用来大致度量时间还是可以的
