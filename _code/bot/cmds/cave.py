@@ -13,7 +13,7 @@ def run(body:str):
 .cave [<id:int>]  #获取一条消息
 .cave add || <msg> # 放入一条消息'''
     body = body.strip()
-    m = re.match(r'(\d+)', body)
+    m = re.match(r'(-?\d+)$', body)
     if m or body=='':
         if not cave:
             return '回声洞是空的！'
@@ -24,6 +24,8 @@ def run(body:str):
                 i = int(m.group(1))
             except:
                 return run.__doc__
+        if i<0 or i>=len(cave):
+            i = i%len(cave)
         s = cave[i]
         if s.get('group'):
             return f"{i}:\n{s['text']}\n    ——{s['sender']} 于 {s['group']}，\n  {s['time']}"
