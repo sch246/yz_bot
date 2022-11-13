@@ -9,7 +9,7 @@ while True:
     if out.returncode in [233,-6]: # 当python多线程写入中强制关闭时，返回是-6
         print('重启中...')
         continue
-    if auto_reboot and out!=0:
+    if auto_reboot and out.returncode!=0:
         print('自动重启中...')
         continue
     break
