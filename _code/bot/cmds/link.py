@@ -26,7 +26,15 @@ def run(body:str):
  | list
  | catch || <text>
 使用catch可以获取一个消息能触发哪些link
-虽然链接是列表存储的，但是在列表中放重复的值会引起难以预料的后果'''
+虽然链接是列表存储的，但是在fail或者succ列表中放重复的值会引起难以预料的后果
+每个link都会有2个列表，succ和fail
+所有links放在一个列表内，当进来一条新消息时，默认测试最开头的那个link
+创建link时，需要设定while，while就是反向连接
+当指定的link成功或者失败时，运行本link
+再然后，如果不设定while
+那么就是默认情况，会放到列表开头，并且将fail指向原来的开头link
+这样会形成列表结构
+'''
     msg = cache.get_last()
     if not msg['user_id'] in cache.get_ops():
         if not cache.any_same(msg, '\.link'):
