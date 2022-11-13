@@ -16,7 +16,7 @@ def _zero_time(now: float) -> int:
 
 
 def nextday(*args, **kwargs):
-    '''明天运行函数'''
+    '''明天零点运行函数'''
     def wrapper(f):
         scheduler.enterabs(_zero_time(time.time()+86400), 1, f, args, kwargs)
         return f

@@ -2,15 +2,9 @@
 
 from main import storage
 
-get_namespace = storage.get_namespace
-
-
-namespace_users = get_namespace('users')
 
 def storage_get(user_id):
-    user_id = str(user_id)
-    namespace_users.setdefault(user_id,{})
-    return namespace_users[user_id]
+    return storage.get('users',str(user_id))
 
 
 def storage_getname(user_id):

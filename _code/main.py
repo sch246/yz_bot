@@ -2,7 +2,7 @@
 import re
 import sys,os
 from typing import Generator
-import time
+import time,random
 from typing import Any
 
 
@@ -16,7 +16,10 @@ import s3.schedule as schedule
 import s3.str_tool as str_tool
 import s3.thread as thread
 from s3.thread import to_thread
+import s3.mcrcon as mcrcon
 
+import s3.linux_screen as screen
+import s3.mc as mc
 import s3.ident as ident
 import s3.storage as storage
 
@@ -30,8 +33,8 @@ import bot.msgs as msgs
 from bot.msgs import *
 import bot.cache as cache
 import bot.user_storage as user_storage
+import bot.group_storage as group_storage
 import bot.chatlog as chatlog
-
 
 
 def loc(msg:dict):
@@ -115,7 +118,7 @@ def send(text: Any, user_id: int | str = None, group_id: int | str = None, **par
         self_msg['user_id'] = self_msg['sender']['user_id']
 
     print(f'[{time.strftime(r"%H:%M:%S")}]【发送消息】',end='')
-    chatlog.write(**self_msg)
+    chatlog.write(self_msg)
 
 
 # 添加一个对于每个用户和群的待检测列表
@@ -131,6 +134,7 @@ def cmd_ret(ret, msg):
             cmd_ret(next(ret), msg)
         except StopIteration as e:
             cmd_ret(e.value, msg)
+            del catches[msg_loc][-1]
     elif not ret is None and not ret=='':
         send(ret, **msg)
 
@@ -158,8 +162,9 @@ def recv(msg:dict):
                 msg['message'] = m.group(2).lstrip()
 
         print(f'[{time.strftime(r"%H:%M:%S")}]【收到消息】',end='')
-        chatlog.write(**msg)
+        chatlog.write(msg)
         msg_loc = loc(msg)
+
 
         if is_msg(msg) and msg['message'].startswith('^'):
             text = msg['message'][1:].rstrip()
@@ -189,6 +194,7 @@ def recv(msg:dict):
                 if not s=='':
                     send(s, **msg)
             elif cmd_py.links:
+                print('进入links')
                 cmd_py.exec_links()
     else:
         # 非常傻逼地用ijk作计时器，需要将心跳间隔设置为5s)
@@ -208,6 +214,114 @@ def recv(msg:dict):
             print(f'|{j}.{i}')
         elif k!=0:
             print(f'█{k}|{j}.{i}')
+
+
+
+
+def match(s:str):
+    '''判断当前的消息是否通过某正则表达式，当前消息必须为文本消息'''
+    msg = cache.get_last()
+    if is_msg(msg):
+        return re.match(s, msg['message'])
+
+def getlog(i=None):
+    '''获取这个聊天区域的消息列表，由于是cache存的，默认只会保存最多256条'''
+    msg = cache.get_last()
+    if i is None:
+        return cache.getlog(msg)
+    else:
+        return cache.getlog(msg)[i]
+
+def sendmsg(text,**_msg):
+    '''发送消息，就是可以省略后续参数而已'''
+    msg = cache.get_last()
+    if not _msg:
+        _msg = msg
+    send(text,**_msg)
+
+def recvmsg(text, sender_id:int=None, private=None, **kws):
+    '''不输入后面的参数时，默认是同一个人同一个位置的recv，否则可以设定对应的sender和group
+    私聊想模拟群内，只需要加group_id=xx
+    当在群内想模拟私聊时，需要设private为True'''
+    if sender_id is None:
+        sender_id = msg['user_id']
+    if private is True:
+        msg = msg.copy()
+        del msg['group_id']
+    recv({**msg, 'user_id':sender_id, 'message':text,'sender':{'user_id': sender_id}, **kws})
+
+
+def getstorage(user_id=None):
+    '''获取个人的存储字典'''
+    msg = cache.get_last()
+    if user_id is None:
+        user_id = msg['user_id']
+    return user_storage.storage_get(user_id)
+
+
+def getname(user_id=None, group_id=None):
+    '''获取名字，如果有设置名字就返回设置的名字，反正无论如何都会获得一个'''
+    msg = cache.get_last()
+    if user_id is None:
+        user_id = msg['user_id']
+    if group_id is None and is_group_msg(msg):
+        group_id = msg['group_id']
+    name = user_storage.storage_getname(user_id)
+    if name:
+        return name
+    if is_group_msg(msg):
+        _, name = cache.get_group_user_info(group_id, user_id)
+    else:
+        name = cache.get_user_name(user_id)
+    return name
+
+def setname(name, user_id=None):
+    '''设置名字，将会把名字存进个人存储字典中，可以被获取名字的函数获取'''
+    msg = cache.get_last()
+    if user_id is None:
+        user_id = msg['user_id']
+    name = user_storage.storage_setname(name, user_id)
+    return name
+
+def getgroupname(group_id=None):
+    '''获取名字，如果有设置名字就返回设置的名字，反正无论如何都会获得一个'''
+    msg = cache.get_last()
+    if group_id is None and is_group_msg(msg):
+        group_id = msg['group_id']
+    if not group_id:
+        return
+    name = group_storage.storage_getname(group_id)
+    if name:
+        return name
+    else:
+        return cache.get_group_name(group_id)
+
+def setgroupname(name, group_id=None):
+    '''设置名字，将会把名字存进群存储字典中，可以被获取名字的函数获取'''
+    msg = cache.get_last()
+    if group_id is None:
+        group_id = msg['group_id']
+    if not group_id:
+        return
+    name = group_storage.storage_setname(name, group_id)
+    return name
+
+
+def msglog(i=0):
+    '''按索引获取文本消息，不会获取到其它类型的信息，若索引超出范围则返回None
+    通常来讲默认会返回本条消息(本条消息肯定是文本啦)'''
+    _i = 0
+    for msg in getlog():
+        if is_msg(msg):
+            if _i == i:
+                return msg['message']
+            _i += 1
+
+def getran(lst:list):
+    '''随机取出列表中的元素'''
+    if lst:
+        return lst[random.randint(0, len(lst)-1)]
+
 
 
 if __name__=="__main__":
