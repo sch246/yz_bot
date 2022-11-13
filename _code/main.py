@@ -191,10 +191,7 @@ def recv(msg:dict):
                 cmd_ret(cmds.run(*cmds.is_cmd(text[1:])), msg)
             # 执行bash
             elif text.startswith('!'):
-                os.makedirs('data',exist_ok=True)
-                os.system(text[1:]+' > data/tmp.txt')
-                with open('data/tmp.txt') as f:
-                    s = f.read()
+                s = os.popen(text[1:]).read()
                 if not s=='':
                     send(s, **msg)
             elif cmd_py.links:

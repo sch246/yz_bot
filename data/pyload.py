@@ -42,9 +42,7 @@ def checkmc():
     elif connect_mc(): # 如果MC是开着的
         return 1
     else:
-        os.system(f'screen -ls|grep .{mc_screen} > data/tmp.txt')
-        s = file.read('data/tmp.txt')
-        if s:
+        if os.popen(f'screen -ls|grep .{mc_screen}').read():
             return 0 # 有screen
         else:
             return -1 # screen 未开启
