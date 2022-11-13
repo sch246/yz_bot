@@ -268,7 +268,7 @@ do_action = run_action
 
 def formats_link(link:dict, mode=0):
     '''输出link的显示用字符串形式'''
-    lst = [link['name']+': '+link['type']]
+    lst = [link['type']+' '+link['name']]
     if mode==0:
         if link['succ']:
             lst.append('    succ')
@@ -277,8 +277,41 @@ def formats_link(link:dict, mode=0):
             lst.append('    fail')
             lst.extend(map(lambda s:'        '+s, link['fail']))
     elif mode==1:
+        lst[0] += (' while'
+            +''.join(f' {name} fail' for name in link['while']['fail'])
+            +''.join(f' {name} succ' for name in link['while']['succ']))
         lst.append('    cond')
         lst.append(str_tool.addtab(link['cond'],tab='        '))
         lst.append('    action')
         lst.append(str_tool.addtab(link['action'],tab='        '))
     return '\n'.join(lst)
+
+
+
+def catch_links(_msg):
+    global msg
+    msg = _msg
+    names = []
+    catch_link(links[0], names)
+    return names
+
+
+def catch_link(link, names):
+    name = link['name']
+    type = link['type']
+    cond = link['cond']
+    succ = link['succ']
+    fail = link['fail']
+    if type=='py':
+        out = exec_link_py(cond, '')
+    else:
+        out = exec_link_re(cond, '')
+    if out:
+        names.append(name)
+        for linkname in succ:
+            _link = get_link(linkname)
+            catch_link(_link, names)
+    else:
+        for linkname in fail:
+            _link = get_link(linkname)
+            catch_link(_link, names)

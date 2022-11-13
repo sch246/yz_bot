@@ -17,9 +17,14 @@ from .py import *
 def run(body:str):
     '''判断收到的消息，通过则进行处理，优先级比默认命令低，需要分条发送，
 格式:
-.link (set|set2) <name>[ while( <other_name> (succ|fail))+]
+.link (py|re) <name>[ while( <other_name> (succ|fail))+]
  || <cond>
  || <action>
+.link
+ : del <name>
+ | get <name>
+ | list
+ | catch || <text>
 使用catch可以获取一个消息能触发哪些link
 虽然链接是列表存储的，但是在列表中放重复的值会引起难以预料的后果'''
     msg = cache.get_last()
@@ -35,7 +40,7 @@ def run(body:str):
     head = lines[0].strip()
     value = lines[1:]
 
-    m = re.match(r'(set|set2) ([\S]+)( while (\S.+))?$', head)
+    m = re.match(r'(re|py) ([\S]+)( while (\S.+))?$', head)
     if m:
         return _set(m)
 
@@ -50,15 +55,22 @@ def run(body:str):
     m = re.match(r'list[\s]*$', head)
     if m:
         return _list(m)
+
+    m = re.match(r'catch$', head)
+    if m:
+        return _catch(m)
     return run.__doc__
 
 
 
 def _set(m):
     '''创建或修改link，需要分条发送
-    格式: .link ((set|set2) <name:str>[ while( <name2:str> (fail | succ))+] || <cond:pycode> || <action:pycode>)
-
-使用set2将会创建特殊的link，仅捕获文本消息
+    格式: .link ((py|re) <name:str>[ while( <name2:str> (fail | succ))+] || <cond:pycode> || <action:pycode>)
+使用py
+    cond 和 action 是 python 代码，并共享 .py 的环境
+    cond 会以最后一行作为表达式求布尔值作为判断依据，action则是无脑exec
+    若打算 cond 无条件通过请使用 True 作为最后一行，否则使用 None 或者 以#开头 作为最后一行
+使用re将会创建特殊的link，仅捕获文本消息
     cond将会作为特殊正则表达式，{name:type}会按照.py中str(type)作为正则表达式,捕获对应的字符串赋给name作为命名组
     type会寻找同名的变量，并转化为字符串插入
         若没有对应的变量或者不是合法的变量名，则作为字符串本身插入
@@ -68,18 +80,10 @@ def _set(m):
     若没有type，{name}则根据name本身进行判断，若name开头为大写字母则为'[\S\s]+'否则为'\S+'
     action使用{:name}进行替换，且最后一行作为表达式返回
     cond创建的命名组不进入.py的locals里
-
 while 可以设置它在哪条 link 通过或未通过时执行
-cond 和 action 是 python 代码，并共享 .py 的环境
-cond 会以最后一行作为表达式求布尔值作为判断依据，action则是无脑exec
-若打算 cond 无条件通过请使用 True 作为最后一行，否则使用 None 或者 以#开头 作为最后一行
 action 紧挨着 cond 成功时执行，原则上不允许 conds 使用 send,recv 和 do_action 等干涉自身的函数，这会影响到 catch 函数的准确性'''
 
     type = m.group(1)
-    if type=='set':
-        type = 'py'
-    else:
-        type = 're'
     name = m.group(2)
     if get_link(name):
         exist = True
@@ -202,6 +206,14 @@ def _list(m):
         return '\n'.join(lst)
     else:
         return 'links 为空'
+
+def _catch(m):
+    '''根据输入的字符串，返回可能触发的link的名字'''
+    reply = yield '输入想筛选的文本'
+    names = catch_links(reply)
+    if not names:
+        return '该消息不触发任何link'
+    return '触发的links: '+'\n'.join(names)
 
 
 
