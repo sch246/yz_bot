@@ -22,7 +22,6 @@ def run(body:str):
  || <action>
 使用catch可以获取一个消息能触发哪些link
 虽然链接是列表存储的，但是在列表中放重复的值会引起难以预料的后果'''
-    global msg
     msg = cache.get_last()
     if not msg['user_id'] in cache.get_ops():
         if not cache.any_same(msg, '\.link'):

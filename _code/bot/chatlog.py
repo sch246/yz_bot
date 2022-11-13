@@ -12,7 +12,7 @@ from main import *
 rootfile = 'chatlog'
 
 
-def write(**msg):
+def write(msg):
     print(f'{msg}')
     t = msg['time']
     if is_msg(msg):
@@ -209,7 +209,7 @@ def gettime(sec:int):
     return day, hour, minu, sec
 
 if __name__ == "__main__":
-    write(**{
+    write({
         "anonymous": None,
         "font": 0,
         "group_id": 916083933,

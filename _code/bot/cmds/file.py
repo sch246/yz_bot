@@ -32,7 +32,6 @@ def run(body:str):
  | set <文件路径> || <文件>
 <文件> || .file to <文件路径>
 '''
-
     msg = cache.get_last()
     if not msg['user_id'] in cache.get_ops():
         if not cache.any_same(msg, '\.file'):
@@ -114,7 +113,7 @@ def write_text(text, lines, start=None, end=None):
     return ''.join(textlines)
 
 def write_file(path, lines, start=None, end=None):
-    with open(path,encoding='utf-8') as f:
+    with open(path,'w',encoding='utf-8') as f:
         f.write(write_text(f.read(), lines, start, end))
 
 
@@ -132,8 +131,8 @@ def _write(m, lines):
         return e
 
 def _send_file(path):
-    path = os.path.abspath(path)
     msg = cache.get_last()
+    path = os.path.abspath(path)
     if not os.path.isfile(path):
         return f'打开失败，文件"{path}"不存在'
     if 'group_id' in msg.keys():

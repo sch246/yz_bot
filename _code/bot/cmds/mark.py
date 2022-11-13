@@ -4,12 +4,15 @@ import re
 
 from main import cache, cq, is_reply, user_storage, connect, is_msg
 
+
 def run(body:str):
     '''设置名字，回复想要保存的消息，进行标记，不支持文件，必须at，一次仅标记一条消息，不知道能有效多久
 格式: [reply:cq_reply].mark set <name:str>
     | .mark
         : get <name:str>
         | list'''
+    global msg
+    msg = cache.get_last()
 
     cqs = cq.find_all(body)
 
@@ -28,7 +31,6 @@ def run(body:str):
         return _get(m)
 
 def _set(m):
-    msg = cache.get_last()
     storage = user_storage.storage_get(msg['user_id'])
     storage.setdefault('marks',{})
     storage = storage['marks']
@@ -49,7 +51,6 @@ def _set(m):
         return f'已删除"{name}"'
 
 def _get(m):
-    msg = cache.get_last()
     storage = user_storage.storage_get(msg['user_id'])
     storage.setdefault('marks',{})
     storage = storage['marks']

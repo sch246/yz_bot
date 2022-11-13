@@ -48,6 +48,7 @@
 - [使用](#使用)
 - [维护者](#维护者)
 - [使用许可](#使用许可)
+- [引用](#引用)
 
 ## 安全性
 
@@ -158,3 +159,9 @@ bot 需要 python 3.10 或更高的版本
 ## 使用许可
 
 [GPL](LICENSE)
+
+## 引用
+
+- https://github.com/barneygale/MCRcon
+
+[./_code/s3/mcrcon.py](./_code/s3/mcrcon.py)使用了其中的`mcrcon.py`

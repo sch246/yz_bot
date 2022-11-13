@@ -5,7 +5,6 @@ import os, json, time, re, random
 from main import *
 
 
-msg = {}
 
 try:
     exec(open('data/pyload.py', encoding='utf-8').read())
@@ -45,81 +44,6 @@ def run(body:str):
     except:
         send(''.join(traceback.format_exc().splitlines(True)[3:]).strip(), **msg)
 
-
-def match(s:str):
-    '''判断当前的消息是否通过某正则表达式，当前消息必须为文本消息'''
-    if is_msg(msg):
-        return re.match(s, msg['message'])
-
-def getlog(i=None):
-    '''获取这个聊天区域的消息列表，由于是cache存的，默认只会保存最多256条'''
-    if i is None:
-        return cache.getlog(msg)
-    else:
-        return cache.getlog(msg)[i]
-
-def sendmsg(text,**_msg):
-    '''发送消息，就是可以省略后续参数而已'''
-    if not _msg:
-        _msg = msg
-    send(text,**_msg)
-
-def recvmsg(text, sender_id:int=None, private=None, **kws):
-    '''不输入后面的参数时，默认是同一个人同一个位置的recv，否则可以设定对应的sender和group
-    私聊想模拟群内，只需要加group_id=xx
-    当在群内想模拟私聊时，需要设private为True'''
-    if sender_id is None:
-        sender_id = msg['user_id']
-    if private is True:
-        msg = msg.copy()
-        del msg['group_id']
-    recv({**msg, 'user_id':sender_id, 'message':text,'sender':{'user_id': sender_id}, **kws})
-
-
-def getstorage(user_id=None):
-    '''获取个人的存储字典'''
-    if user_id is None:
-        user_id = msg['user_id']
-    return user_storage.storage_get(user_id)
-
-
-def getname(user_id=None, group_id=None):
-    '''获取名字，如果有设置名字就返回设置的名字，反正无论如何都会获得一个'''
-    if user_id is None:
-        user_id = msg['user_id']
-    if group_id is None and is_group_msg(msg):
-        group_id = msg['group_id']
-    name = user_storage.storage_getname(user_id)
-    if name:
-        return name
-    if is_group_msg(msg):
-        _, name = cache.get_group_user_info(group_id, user_id)
-    else:
-        name = cache.get_user_name(user_id)
-    return name
-
-def setname(name, user_id=None):
-    '''设置名字，将会把名字存进个人存储字典中，可以被获取名字的函数获取'''
-    if user_id is None:
-        user_id = msg['user_id']
-    name = user_storage.storage_setname(name, user_id)
-    return name
-
-
-def msglog(i=0):
-    '''按索引获取文本消息，不会获取到其它类型的信息，若索引超出范围则返回None
-    通常来讲默认会返回本条消息(本条消息肯定是文本啦)'''
-    _i = 0
-    for msg in getlog():
-        if is_msg(msg):
-            if _i == i:
-                return msg['message']
-            _i += 1
-
-def getran(lst:list):
-    '''随机取出列表中的元素'''
-    if lst:
-        return lst[random.randint(0, len(lst)-1)]
 
 # 接收文件！
 recv_file = cmds.modules['file']._recv_file
@@ -164,9 +88,8 @@ def get_one(f:Callable, i=None):
 
 
 # 开头第一个即为link进入的点
-root_storage = storage.get_namespace('')
-root_storage.setdefault('links',[])
-links = root_storage['links']
+links = storage.get('','links',list)
+
 
 
 def lst_remove(lst, value):
@@ -278,7 +201,7 @@ def exec_link_py(cond, action):
             out = eval(last, globals(), loc)
 
     except:
-        print(''.join(traceback.format_exc().splitlines(True)[3:]), **msg)
+        print(''.join(traceback.format_exc().splitlines(True)[3:]))
     if out:
         _run_action_py(action, loc)
     return out
@@ -293,7 +216,7 @@ def _run_action_py(action, _loc):
     try:
         exec(action, globals(), _loc)
     except:
-        print(''.join(traceback.format_exc().splitlines(True)[3:]), **msg)
+        print(''.join(traceback.format_exc().splitlines(True)[3:]))
 
 
 # exec re-------------------------------------------------
@@ -305,7 +228,7 @@ def exec_link_re(cond, action):
     if cond=='':
         return True
     if is_msg(msg):
-        names = str_tool.stc_get(cond)(msg['message'],{**globals(),**loc})
+        names = str_tool.stc_get(cond)(cq.unescape(msg['message']),{**globals(),**loc})
         if names is not None:
             _run_action_re(action, loc, names)
             return True
@@ -330,7 +253,7 @@ def _run_action_re(action, _loc, names:dict):
         if out is not None:
             send(out, **msg)
     except:
-        print(''.join(traceback.format_exc().splitlines(True)[3:]), **msg)
+        print(''.join(traceback.format_exc().splitlines(True)[3:]))
 
 #-------------------------------------------------
 

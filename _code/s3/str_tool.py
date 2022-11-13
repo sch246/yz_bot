@@ -78,4 +78,18 @@ def stc_set(tar:str):
 def stc(s:str, loc:dict, src:str, tar:str):
     return stc_set(src)(stc_get(tar)(s, loc))
 
+
+def slice(s:str, start, end):
+    lst = s.splitlines(True)
+    if not lst:
+        lst=['']
+    return ''.join(lst[start:end])
+
+def remove_emptyline(s):
+    lst = s.splitlines(True)
+    lst = filter(lambda s:s.strip()!='', lst)
+    if not lst:
+        lst=['']
+    return ''.join(lst)
+
 LASTLINE = '\33[1A\r\33[K'

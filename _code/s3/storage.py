@@ -1,5 +1,6 @@
 '''提供一个存储空间，在程序启动时自动加载，关闭时自动保存，以多个json文件的形式存储(不能直接查看的数据是不好的！)'''
 import os
+from typing import Callable
 from main import file
 
 json_read, json_write = file.json_read, file.json_write
@@ -54,9 +55,9 @@ def get_namespace(name_space):
     storage.setdefault(name_space,{})
     return storage[name_space]
 
-def get(name_space, name):
+def get(name_space:str, name:str, default:Callable=dict):
     storage.setdefault(name_space,{})
-    storage[name_space].setdefault(name,{})
+    storage[name_space].setdefault(name,default())
     return storage[name_space][name]
 
 load()

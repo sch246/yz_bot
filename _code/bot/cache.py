@@ -4,6 +4,8 @@ import re
 from typing import Callable
 from main import connect, file, is_group_msg, is_msg, config
 
+
+
 call_api = connect.call_api
 
 qq = None
@@ -84,7 +86,14 @@ def _group_back(user_id, title, card):
     else:
         return title, get_user_name(user_id)
 
-
+def get_group_name(group_id:int):
+    call = call_api('get_group_info', group_id=group_id)
+    if call['retcode'] == 0:
+        data = call['data']
+        group_name = data['group_name']
+        return group_name
+    else:
+        return '[unknow]'
 
 
 msgs = {
