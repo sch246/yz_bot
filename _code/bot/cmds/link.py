@@ -17,14 +17,17 @@ from .py import *
 def run(body:str):
     '''判断收到的消息，通过则进行处理，优先级比默认命令低，需要分条发送，
 格式:
-.link (py|re) <name>[ while( <other_name> (succ|fail))+]
- || <cond>
- || <action>
 .link
- : del <name>
- | get <name>
- | list
- | catch || <text>
+    : (py|re) <name>[ while( <other_name> (succ|fail))+]
+        : \\n <cond> \\n===\\n <action>
+        | \\n <cond> || <action>
+        | || <cond> || <action>
+    | get <name>
+    | del <name>
+    | list
+    | catch
+        : <text>
+        | || <text>
 使用catch可以获取一个消息能触发哪些link
 虽然链接是列表存储的，但是在fail或者succ列表中放重复的值会引起难以预料的后果
 每个link都会有2个列表，succ和fail
@@ -48,30 +51,46 @@ def run(body:str):
     head = lines[0].strip()
     value = lines[1:]
 
-    m = re.match(r'(re|py) ([\S]+)( while (\S.+))?$', head)
+    m = re.match(r'(re|py) ([\S]+)( while( \S.+)?)?$', head)
     if m:
-        return _set(m)
-
-    m = re.match(r'del ([\S]+)$', head)
-    if m:
-        return _del(m)
+        return _set(m, value)
 
     m = re.match(r'get ([\S]+)$', head)
     if m:
         return _get(m)
 
+    m = re.match(r'del ([\S]+)$', head)
+    if m:
+        return _del(m)
+
     m = re.match(r'list[\s]*$', head)
     if m:
         return _list(m)
 
-    m = re.match(r'catch$', head)
+    m = re.match(r'catch( [\S\s]+)?$', head)
     if m:
         return _catch(m)
     return run.__doc__
 
 
+def set_while(link, params):
+    new = {'succ':[],'fail':[]}
+    for i in range(len(params)//2):
+        tar = params[2*i]
+        connect_type = params[2*i+1]
+        new[connect_type].append(tar)
+    old = link['while']
+    def _(connect_type):
+        for tar in set((*old[connect_type],*new[connect_type])):
+            if tar in old[connect_type] and tar not in new[connect_type]:
+                disconnect_link(link['name'], tar, connect_type)
+            elif tar in new[connect_type] and tar not in old[connect_type]:
+                connect_link(link['name'], tar, connect_type)
+    _('succ')
+    _('fail')
 
-def _set(m):
+
+def _set(m, value):
     '''创建或修改link，需要分条发送
     格式: .link ((py|re) <name:str>[ while( <name2:str> (fail | succ))+] || <cond:pycode> || <action:pycode>)
 使用py
@@ -93,14 +112,16 @@ action 紧挨着 cond 成功时执行，原则上不允许 conds 使用 send,rec
 
     type = m.group(1)
     name = m.group(2)
+    setwhile = m.group(3)
+    whiles = m.group(4)
     if get_link(name):
         exist = True
     else:
         exist = False
 
 
-    if m.group(4):
-        extra_param = m.group(4).strip()
+    if whiles:
+        extra_param = whiles.strip()
         params = extra_param.split(' ')
         if len(params)%2==1:
             return 'while参数不成对'
@@ -116,33 +137,36 @@ action 紧挨着 cond 成功时执行，原则上不允许 conds 使用 send,rec
     else:
         params = []
 
-    reply = yield '输入cond'
-    if not is_msg(reply):
-        return '操作终止'
-    cond = reply['message'].strip()
-    reply = yield '输入action'
-    if not is_msg(reply):
-        return '操作终止'
-    action = reply['message'].strip()
+    if exist:
+        link = get_link(name)
+        if setwhile and links[0]['name']!=link['name'] and not params:
+            reply = yield '正在编辑已有link:\n不在links开头且while为空将无法被触发\n输入"y"以继续'
+            if not (is_msg(reply) and reply['message'].strip()=='y'):
+                return '操作终止'
+
+
+    body = '\n'.join(value)
+    parts = body.split('\n===\n')
+    if parts:
+        cond = parts.pop(0)
+    else:
+        reply = yield '输入cond'
+        if not is_msg(reply):
+            return '操作终止'
+        cond = reply['message'].strip()
+    if parts:
+        action = parts.pop(0)
+    else:
+        reply = yield '输入action'
+        if not is_msg(reply):
+            return '操作终止'
+        action = reply['message'].strip()
 
     # 如果编辑的是已有的link，遍历
 
     if exist:
-        link = get_link(name)
-        new = {'succ':[],'fail':[]}
-        for i in range(len(params)//2):
-            tar = params[2*i]
-            connect_type = params[2*i+1]
-            new[connect_type].append(tar)
-        old = link['while']
-        def _(connect_type):
-            for tar in set((*old[connect_type],*new[connect_type])):
-                if tar in old[connect_type] and tar not in new[connect_type]:
-                    disconnect_link(name, tar, connect_type)
-                elif tar in new[connect_type] and tar not in old[connect_type]:
-                    connect_link(name, tar, connect_type)
-        _('succ')
-        _('fail')
+        if setwhile:
+            set_while(link, params)
         link['type'] = type
         link['cond'] = cond
         link['action'] = action
@@ -217,7 +241,12 @@ def _list(m):
 
 def _catch(m):
     '''根据输入的字符串，返回可能触发的link的名字'''
-    reply = yield '输入想筛选的文本'
+    text = m.group(1)
+    if text:
+        text = text[1:]
+        reply = {**cache.get_last(), 'message':text}
+    else:
+        reply = yield '输入想筛选的文本'
     names = catch_links(reply)
     if not names:
         return '该消息不触发任何link'
