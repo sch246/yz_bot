@@ -82,6 +82,10 @@ def _init_self():
     cache.set_self_qq(qq)
     cache.update_user_name(qq, name)
     print(f'{name}({qq})启动了！')
+    if 'auto_reboot' in sys.argv[1:]:
+        print('自动重启已开启')
+    if 'debug' in sys.argv[1:]:
+        print('debug模式')
 
 @to_thread
 def send(text: Any, user_id: int | str = None, group_id: int | str = None, **params) -> dict:
