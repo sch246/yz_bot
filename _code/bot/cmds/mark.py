@@ -1,8 +1,8 @@
 '''收藏，并且存储到个人存储中，不支持文件，必须at，不知道能有效多久'''
 
-import re
+import re, time
 
-from main import cache, cq, is_reply, user_storage, connect, is_msg
+from main import cache, cq, is_reply, storage, connect, is_msg, chatlog
 
 
 def run(body:str):
@@ -31,9 +31,9 @@ def run(body:str):
         return _get(m)
 
 def _set(m):
-    storage = user_storage.storage_get(msg['user_id'])
-    storage.setdefault('marks',{})
-    storage = storage['marks']
+    self_storage = storage.get('users',str(msg['user_id']))
+    self_storage.setdefault('marks',{})
+    self_storage = self_storage['marks']
     name = m.group(1)
     if is_reply(msg):
         reply_id = cq.load(msg['reply_cq'])['data']['id']
@@ -44,18 +44,28 @@ def _set(m):
         reply_msg = call2['data']
         if not is_msg(reply_msg):
             return '不支持mark此类消息'
-        storage[name] = reply_msg['message']
+        self_storage[name] = reply_msg
         return f'已保存"{name}"'
     else:
-        del storage[name]
+        self_storage.pop(name,None)
         return f'已删除"{name}"'
 
 def _get(m):
-    storage = user_storage.storage_get(msg['user_id'])
-    storage.setdefault('marks',{})
-    storage = storage['marks']
+    self_storage = storage.get('users',str(msg['user_id']))
+    self_storage.setdefault('marks',{})
+    self_storage = self_storage['marks']
     name = m.group(1)
-    if name in storage.keys():
-        return storage[name]
+    if name in self_storage.keys():
+        s = self_storage[name]
+        if s.get('sender'):
+            s['user_id'] = s['sender']['user_id']
+        if s.get('group_id'):
+            group_id, user_id = s['group_id'], s['user_id']
+            title, name = cache.get_group_user_info(group_id, user_id)
+            return chatlog._group_str(title, name, user_id, s['time'], s['message'], s['message_id'])
+        else:
+            user_id = s['user_id']
+            name = cache.get_user_name(user_id)
+            return chatlog._private_str(name,s['time'],s['message'],s['message_id'])
     else:
         return '对应mark不存在'
