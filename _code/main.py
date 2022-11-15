@@ -4,6 +4,7 @@ import sys,os
 from typing import Generator
 import time,random
 from typing import Any
+from queue import Queue
 
 
 from s3 import *
@@ -32,12 +33,10 @@ import bot.data as data
 import bot.msgs as msgs
 from bot.msgs import *
 import bot.cache as cache
-import bot.user_storage as user_storage
-import bot.group_storage as group_storage
 import bot.chatlog as chatlog
 
 
-def loc(msg:dict):
+def msg_id(msg:dict):
     return (msg['group_id'] if 'group_id' in msg.keys() else None, msg['user_id'])
 
 
@@ -74,12 +73,14 @@ def _init_self():
     # 加载设置
     if not os.path.isfile('config.json'):
         first_start()
-    cache.set_ops(config.load_config('ops'))
-    cache.set_nicknames(config.load_config('nicknames'))
+    cache.ops_load()
+    cache.nicknames_load()
 
     login_info = connect.call_api('get_login_info')['data']
     qq, name = login_info['user_id'], login_info['nickname']
-    cache.set_self_qq(qq)
+    cache.set('qq',qq)
+    cache.set('name',name)
+    cache.set('names',set([*cache.nicknames,name]))
     cache.update_user_name(qq, name)
     print(f'{name}({qq})启动了！')
     if 'auto_reboot' in sys.argv[1:]:
@@ -125,20 +126,18 @@ def send(text: Any, user_id: int | str = None, group_id: int | str = None, **par
     chatlog.write(self_msg)
 
 
-# 添加一个对于每个用户和群的待检测列表
-catches = {}
+
 # 对命令返回值的处理
 def cmd_ret(ret, msg):
-    global catches
-    msg_loc = loc(msg)
     if isinstance(ret, Generator):
-        catches.setdefault(msg_loc, [])
-        catches[msg_loc].append(ret)
+        catches = cache.get('catches') # 对每个输入区域的检测
+        msg_loc = msg_id(msg)
         try:
             cmd_ret(next(ret), msg)
+            catches[msg_loc] = ret
         except StopIteration as e:
+            catches.pop(msg_loc,None)
             cmd_ret(e.value, msg)
-            del catches[msg_loc][-1]
     elif not ret is None and not ret=='':
         send(ret, **msg)
 
@@ -146,9 +145,9 @@ i = 0
 j = 0
 k = 0
 reply_cq = re.compile(r'^(\[CQ:reply,[^\]]+\])([\S\s]*)')
+at_cq = re.compile(r'^(\[CQ:at,[^\]]+\])([\S\s]*)')
 def recv(msg:dict):
     global i, j, k
-    global catches
 
     cmd_py = cmds.modules['py']
 
@@ -164,10 +163,19 @@ def recv(msg:dict):
             if m:
                 msg['reply_cq'] = m.group(1)
                 msg['message'] = m.group(2).lstrip()
+                m = at_cq.match(msg['message'])
+                if m:
+                    msg['at_cq'] = [m.group(1)]
+                    msg['message'] = m.group(2).lstrip()
+            m = at_cq.match(msg['message'])
+            if m:
+                msg.setdefault('at_cq',[])
+                msg['at_cq'].append(m.group(1))
+                msg['message'] = m.group(2).lstrip()
 
         print(f'[{time.strftime(r"%H:%M:%S")}]【收到消息】',end='')
         chatlog.write(msg)
-        msg_loc = loc(msg)
+        msg_loc = msg_id(msg)
 
 
         if is_msg(msg) and msg['message'].startswith('^'):
@@ -175,13 +183,14 @@ def recv(msg:dict):
             if text in 'Cc':
                 del catches[msg_loc]
 
-        if msg_loc in catches.keys() and catches[msg_loc]:
-            gen = catches[msg_loc][-1]
-            try:
-                cmd_ret(gen.send(msg), msg)
-            except StopIteration as e:
-                cmd_ret(e.value, msg)
+        catches = cache.get('catches')
+        if catches.get(msg_loc):
+            c = catches[msg_loc][-1]
+            if isinstance(c,Queue):
+                c.put(msg)
                 del catches[msg_loc][-1]
+            else:
+                cmd_ret(c, msg)
             return
 
         if is_msg(msg):
@@ -257,7 +266,7 @@ def getstorage(user_id=None):
     msg = cache.get_last()
     if user_id is None:
         user_id = msg['user_id']
-    return user_storage.storage_get(user_id)
+    return storage.get('users',str(user_id))
 
 
 def getname(user_id=None, group_id=None):
@@ -267,7 +276,7 @@ def getname(user_id=None, group_id=None):
         user_id = msg['user_id']
     if group_id is None and is_group_msg(msg):
         group_id = msg['group_id']
-    name = user_storage.storage_getname(user_id)
+    name = storage.get('users',str(user_id)).get('name')
     if name:
         return name
     if is_group_msg(msg):
@@ -281,7 +290,7 @@ def setname(name, user_id=None):
     msg = cache.get_last()
     if user_id is None:
         user_id = msg['user_id']
-    name = user_storage.storage_setname(name, user_id)
+    name = storage.get('users',str(user_id))['name'] = name
     return name
 
 def getgroupname(group_id=None):
@@ -291,7 +300,7 @@ def getgroupname(group_id=None):
         group_id = msg['group_id']
     if not group_id:
         return
-    name = group_storage.storage_getname(group_id)
+    name = storage.get('groups',str(group_id)).get('name')
     if name:
         return name
     else:
@@ -304,7 +313,7 @@ def setgroupname(name, group_id=None):
         group_id = msg['group_id']
     if not group_id:
         return
-    name = group_storage.storage_setname(name, group_id)
+    storage.get('groups',str(group_id))['name'] = name
     return name
 
 

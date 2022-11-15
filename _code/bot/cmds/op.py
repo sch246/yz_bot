@@ -7,9 +7,6 @@ from main import Show, cache
 _match_at = re.compile(r'\[CQ:at,qq=([0-9]+)\]$')
 _match_qq = re.compile(r'[0-9]+$')
 
-def add(uid):
-    cache.add_op(uid)
-
 def get_uid(uid:str):
     is_CQ = re.match(_match_at, uid)
     is_qq = re.match(_match_qq, uid)
@@ -29,7 +26,7 @@ def run(body:str):
     格式: .op [del] (<qq号:int> | <at某人:cq[at]>)+ 可换行
     警告: op可以给予任何人op, 或者删除任何master外的人的op, 请谨慎给予'''
     msg = cache.get_last()
-    if not msg['user_id'] in cache.get_ops():
+    if not msg['user_id'] in cache.ops:
         if not cache.any_same(msg, '\.op'):
             return '权限不足(一定消息内将不再提醒)'
         return
@@ -42,9 +39,10 @@ def run(body:str):
         uids = get_uids_from_body(body)
         for uid in uids:
             uid = get_uid(uid)
-            if uid == cache.get_ops()[0]:
+            if uid == cache.ops[0]:
                 fail.append(Show(f'{uid}:不能移除master'))
-            elif cache.del_op(uid):
+            elif uid in cache.ops:
+                cache.ops.remove(uid)
                 success.append(uid)
             else:
                 fail.append(Show(f'{uid}:不是op'))
@@ -56,7 +54,8 @@ def run(body:str):
         for uid in uids:
             uid = get_uid(uid)
             if uid:
-                if cache._add_op(uid):
+                if not uid in cache.ops:
+                    cache.ops.add(uid)
                     success.append(uid)
                 else:
                     fail.append(Show(f'{uid}:已是op'))

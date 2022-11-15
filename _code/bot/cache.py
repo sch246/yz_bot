@@ -15,13 +15,6 @@ user_names = {}
 group_user_infos = {}
 
 
-def set_self_qq(uid):
-    global qq
-    qq = uid
-def get_self_qq():
-    global qq
-    return qq
-
 def update(msg):
     user_id = msg['sender']['user_id']
     sender_keys = msg['sender'].keys()
@@ -37,17 +30,12 @@ def update(msg):
 
 
 def update_user_name(user_id: int, _name: str):
-    if user_id==qq:
-        global name, names
-        name = _name
-        names = nicknames if name in nicknames else nicknames + [name]
     user_names[user_id] = _name
 
 
 def update_group_user_info(group_id: int, user_id: int, title: str, card: str):
-    if not group_id in group_user_infos.keys():
-        group_user_infos[group_id] = {}
-    group_user_infos[group_id][user_id] = dict(title=title, card=card)
+    group_user_infos.setdefault(group_id,{})
+    group_user_infos[group_id][user_id] = [title, card]
 
 
 def get_user_name(user_id: int):
@@ -64,34 +52,24 @@ def get_user_name(user_id: int):
 
 
 def get_group_user_info(group_id: int, user_id: int):
-    if group_id in group_user_infos.keys() and user_id in group_user_infos[group_id].keys():
-        title = group_user_infos[group_id][user_id]['title']
-        card = group_user_infos[group_id][user_id]['card']
-        return _group_back(user_id, title, card)
+    d = group_user_infos.get(group_id,{}).get(user_id)
+    if d:
+        title, card = d
+        return title, card if card else get_user_name(user_id)
     else:
         call = call_api('get_group_member_info', group_id=group_id, user_id=user_id)
         if call['retcode'] == 0:
             data = call['data']
-            title = data['title']
-            card = data['card']
+            title, card = data['title'], data['card']
             update_group_user_info(group_id, user_id, title, card)
-            return _group_back(user_id, title, card)
+            return title, card if card else get_user_name(user_id)
         else:
             return '', '[unknow]'
-
-
-def _group_back(user_id, title, card):
-    if card: # 当card为空时显示昵称
-        return title, card
-    else:
-        return title, get_user_name(user_id)
 
 def get_group_name(group_id:int):
     call = call_api('get_group_info', group_id=group_id)
     if call['retcode'] == 0:
-        data = call['data']
-        group_name = data['group_name']
-        return group_name
+        return call['data']['group_name']
     else:
         return '[unknow]'
 
@@ -106,8 +84,7 @@ msgs = {
 MAX_LEN = 256
 
 def add_msg(type, uid, msg):
-    if not uid in msgs[type].keys():
-        msgs[type][uid] = []
+    msgs[type].setdefault(uid,[])
     lst = msgs[type][uid]
     lst.insert(0, msg)
     msgs['last'] = msg
@@ -138,46 +115,25 @@ except:
     pass
 
 
-ops = []
-nicknames = []
+ops = set()
+nicknames = set()
+_set = set
 
-def get_ops():
-    return ops
-
-def _add_op(i):
-    if not i in ops:
-        ops.append(i)
-        return True
-    return False
-def add_op(uid):
-    if isinstance(uid, int):
-        return _add_op(uid)
-    elif isinstance(uid, str):
-        return _add_op(int(uid))
-    return False
-def del_op(uid):
-    if uid in ops:
-        ops.remove(uid)
-        return True
-    return False
-def is_op(uid):
-    return uid in ops
-def set_ops(uids):
-    ops.clear()
-    ops.extend(uids)
+def ops_load():
+    global ops
+    ops = _set(config.load_config('ops'))
 def ops_save():
-    config.save_config(ops,'ops')
+    config.save_config(list(ops),'ops')
 
-def get_nicknames():
-    return nicknames
 def get_nickname():
     if len(nicknames)>0:
         return nicknames[0]
-def set_nicknames(names):
-    nicknames.clear()
-    nicknames.extend(names)
+    return 'bot'
+def nicknames_load():
+    global nicknames
+    nicknames = _set(config.load_config('nicknames'))
 def nicknames_save():
-    config.save_config(nicknames,'nicknames')
+    config.save_config(list(nicknames),'nicknames')
 
 
 def getlog(msg):
@@ -229,3 +185,14 @@ def get_one(msg:dict, f:Callable, i=None):
     for m in getlog(msg)[1:i]:
         if f(m):
             return m
+
+
+catches = {}
+
+
+def get(name, type=dict):
+    globals().setdefault(name,type())
+    return globals()[name]
+
+def set(name,value):
+    globals()[name] = value

@@ -33,7 +33,7 @@ def run(body:str):
 <文件> || .file to <文件路径>
 '''
     msg = cache.get_last()
-    if not msg['user_id'] in cache.get_ops():
+    if not msg['user_id'] in cache.ops:
         if not cache.any_same(msg, '\.file'):
             return '权限不足(一定消息内将不再提醒)'
         return

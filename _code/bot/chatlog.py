@@ -58,7 +58,7 @@ def write(msg):
                 text = f'{name}({user_id})离开了群'
             else:
                 if msg['sub_type']=='kick_me':
-                    user_id = cache.get_self_qq()
+                    user_id = cache.get('qq')
                 operator_id = int(msg['operator_id'])
                 _, operator = cache.get_group_user_info(group_id, operator_id)
                 text = f'{name}({user_id})被{operator}({operator_id})踢出了群'
