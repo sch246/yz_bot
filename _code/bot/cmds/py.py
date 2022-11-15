@@ -1,17 +1,43 @@
 '''运行python代码的命令，是临时环境，重启后消失,除非最后一行以###开头'''
 import traceback
 import os, json, time, re, random
+from queue import Queue
+from inspect import currentframe
 
 from main import *
-
-
 
 try:
     exec(open('data/pyload.py', encoding='utf-8').read())
 except:
     pass
 
-loc = {}
+def _input(s:str='',recv_all=False):
+    msg = currentframe().f_back.f_locals['msg']
+    q = Queue()
+    msg_loc = msg_id(msg)
+    catches = cache.get('catches')
+    catches[msg_loc] = q
+    if s!='':
+        send(s, **msg)
+    r =  q.get(block=True)
+    if not recv_all:
+        if is_msg(r):
+            return r['message']
+        return
+    return r
+
+def _print(*values, sep=' ', end='\n', file=None,flush=False):
+    if file is None:
+        msg = currentframe().f_back.f_locals['msg']
+        send(sep.join(map(str,values)), **msg)
+    else:
+        print(*values, sep,end, file, flush)
+
+loc = {**globals()}
+# 修改input和print
+loc['input'] = _input
+loc['print'] = _print
+
 
 @to_thread
 def run(body:str):
@@ -21,7 +47,8 @@ def run(body:str):
 格式: .py <code:pycode>'''
     global msg
     msg = cache.get_last()
-    if not msg['user_id'] in cache.get_ops():
+    loc.update(globals())
+    if not msg['user_id'] in cache.ops:
         if not cache.any_same(msg, '\.py'):
             send('权限不足(一定消息内将不再提醒)', **msg)
         return
@@ -30,7 +57,7 @@ def run(body:str):
         return run.__doc__
     lst = body.splitlines(True)
     try:
-        exec(''.join(lst[:-1]), globals(), loc)
+        exec(''.join(lst[:-1]), loc)
         last = lst[-1].strip()
         if last.startswith('###'):
             file.add('data/pyload.py', '\n'+body)
@@ -38,7 +65,7 @@ def run(body:str):
         elif last.startswith('#'):
             return
         else:
-            out = eval(last, globals(), loc)
+            out = eval(last, loc)
             if out is not None:
                 send(out, **msg)
     except:
@@ -159,6 +186,7 @@ def run_or_remove(linklst:list):
 def exec_links():
     global msg
     msg = cache.get_last()
+    loc.update(globals())
     exec_link(links[0])
 
 
@@ -193,12 +221,12 @@ def exec_link_py(cond, action):
     lst = code.splitlines(True)
     out = None
     try:
-        exec(''.join(lst[:-1]), globals(), loc)
+        exec(''.join(lst[:-1]), loc)
         last = lst[-1].strip()
         if last.startswith('#'):
             out = None
         else:
-            out = eval(last, globals(), loc)
+            out = eval(last, loc)
 
     except:
         print(''.join(traceback.format_exc().splitlines(True)[3:]))
@@ -214,7 +242,7 @@ def _run_action_py(action, _loc):
         return
     action = cq.unescape(action)
     try:
-        exec(action, globals(), _loc)
+        exec(action, _loc)
     except:
         print(''.join(traceback.format_exc().splitlines(True)[3:]))
 
@@ -244,12 +272,12 @@ def _run_action_re(action, _loc, names:dict):
     lst = action.splitlines(True)
     out = None
     try:
-        exec(''.join(lst[:-1]), globals(), _loc)
+        exec(''.join(lst[:-1]), _loc)
         last = lst[-1].strip()
         if last.startswith('#'):
             out = None
         else:
-            out = eval(last, globals(), _loc)
+            out = eval(last, _loc)
         if out is not None:
             send(out, **msg)
     except:

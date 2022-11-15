@@ -39,7 +39,7 @@ def run(body:str):
 这样会形成列表结构
 '''
     msg = cache.get_last()
-    if not msg['user_id'] in cache.get_ops():
+    if not msg['user_id'] in cache.ops:
         if not cache.any_same(msg, '\.link'):
             return '权限不足(一定消息内将不再提醒)'
         return
@@ -67,7 +67,7 @@ def run(body:str):
     if m:
         return _list(m)
 
-    m = re.match(r'catch( [\S\s]+)?$', head)
+    m = re.match(r'catch( [\S\s]+)?$', body.strip())
     if m:
         return _catch(m)
     return run.__doc__
