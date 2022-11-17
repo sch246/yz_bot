@@ -1,4 +1,5 @@
 import re
+from typing import Iterable
 
 def addtab(s: str, tab='    '):
     '''适用于\\n，\\r\\n以及\\r'''
@@ -43,7 +44,9 @@ def _gen_f(loc):
                 var = eval(m.group(2), loc)
                 if not var:
                     var = ''
-                elif isinstance(var,list):
+                elif isinstance(var, str):
+                    pass
+                elif isinstance(var,Iterable):
                     var = f'({"|".join(map(str, var))})'
                 else:
                     var = str(var)
