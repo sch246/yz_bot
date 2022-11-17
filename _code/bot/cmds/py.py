@@ -320,11 +320,12 @@ def catch_links(_msg):
     global msg
     msg = _msg
     names = []
-    catch_link(links[0], names)
-    return names
+    ends = []
+    catch_link(links[0], names, ends)
+    return names, ends
 
 
-def catch_link(link, names):
+def catch_link(link, names, ends):
     name = link['name']
     type = link['type']
     cond = link['cond']
@@ -336,10 +337,14 @@ def catch_link(link, names):
         out = exec_link_re(cond, '')
     if out:
         names.append(name)
+        if not succ:
+            ends.append(name+':succ')
         for linkname in succ:
             _link = get_link(linkname)
-            catch_link(_link, names)
+            catch_link(_link, names, ends)
     else:
+        if not fail:
+            ends.append(name+':fail')
         for linkname in fail:
             _link = get_link(linkname)
-            catch_link(_link, names)
+            catch_link(_link, names, ends)
