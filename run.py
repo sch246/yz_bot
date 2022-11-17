@@ -1,6 +1,13 @@
 '''启动bot'''
 
-import subprocess,sys
+import subprocess,sys,time
+
+if '-h' in sys.argv[1:]:
+    print('''接受的参数:
+    -h          显示本提示
+    auto_reboot 当出现异常时自动重启
+    debug       debug模式(并没有什么区别)''')
+    exit()
 
 auto_reboot = 'auto_reboot' in sys.argv[1:]
 while True:
@@ -11,5 +18,6 @@ while True:
         continue
     if auto_reboot and out.returncode!=0:
         print('自动重启中...')
+        time.sleep(1)
         continue
     break

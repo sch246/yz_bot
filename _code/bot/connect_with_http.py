@@ -9,7 +9,7 @@ from typing import Any
 # Requests 模块 https://www.cnblogs.com/saneri/p/9870901.html
 
 url = 'http://127.0.0.1:5700'
-
+listen = ('127.0.0.1', 5701)
 
 def call_api(action: str, **params) -> dict:
     headers = {
@@ -34,7 +34,7 @@ ListenSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 # 以及https://blog.csdn.net/rlenew/article/details/107592753
 # 这个SO_REUSEADDR是允许重用本地地址和端口
 ListenSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-ListenSocket.bind(('127.0.0.1', 5701))
+ListenSocket.bind(listen)
 ListenSocket.listen(100)  # 传入的参数指定等待连接的最大数量
 
 HttpResponseHeader = '''HTTP/1.1 200 OK\r\n

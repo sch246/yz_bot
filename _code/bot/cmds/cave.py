@@ -13,7 +13,7 @@ def run(body:str):
 .cave [<id:int>]  #获取一条消息
 .cave add
  : <msg>    # 放入一条消息
- | || <msg> # 分条放入一条消息'''
+ | || <msg> # 放入一条消息'''
     body = body.strip()
     m = re.match(r'(-?\d+)$', body)
     if m or body=='':

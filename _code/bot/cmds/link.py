@@ -18,7 +18,7 @@ def run(body:str):
     '''判断收到的消息，通过则进行处理，优先级比默认命令低，需要分条发送，
 格式:
 .link
-    : (py|re) <name>[ while( <other_name> (succ|fail))+]
+    : (py|re) <name>[ while[ <other_name> (succ|fail)]+]
         : \\n <cond> \\n===\\n <action>
         | \\n <cond> || <action>
         | || <cond> || <action>
@@ -92,7 +92,10 @@ def set_while(link, params):
 
 def _set(m, value):
     '''创建或修改link，需要分条发送
-    格式: .link ((py|re) <name:str>[ while( <name2:str> (fail | succ))+] || <cond:pycode> || <action:pycode>)
+.link (py|re) <name>[ while[ <other_name> (succ|fail)]+]
+    : \\n <cond> \\n===\\n <action>
+    | \\n <cond> || <action>
+    | || <cond> || <action>
 使用py
     cond 和 action 是 python 代码，并共享 .py 的环境
     cond 会以最后一行作为表达式求布尔值作为判断依据，action则是无脑exec
