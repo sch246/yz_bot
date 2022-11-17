@@ -202,7 +202,7 @@ def recv(msg:dict):
             if text.startswith('.') and cmds.is_cmd(text[1:]):
                 cmd_ret(cmds.run(*cmds.is_cmd(text[1:])), msg)
             # 执行bash
-            elif text.startswith('!'):
+            elif text.startswith('!') and msg['user_id'] in cache.ops:
                 s = os.popen(text[1:]).read()
                 if not s=='':
                     send(s, **msg)
