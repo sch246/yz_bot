@@ -150,7 +150,7 @@ bot 需要 python 3.10 或更高的版本
 
 ## 使用
 
-- https://www.sch246.com/Computer/project/qq_bot/yz_bot0.4
+- https://www.sch246.com/yz_bot/start
 
 ## 维护者
 
