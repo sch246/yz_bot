@@ -67,7 +67,7 @@ def run(body:str):
     if m:
         return _list(m)
 
-    m = re.match(r'catch( [\S\s]+)?$', body.strip())
+    m = re.match(r'catch( [\S\s]+)?$', head)
     if m:
         return _catch(m)
     return run.__doc__
@@ -247,10 +247,11 @@ def _catch(m):
         reply = {**cache.get_last(), 'message':text}
     else:
         reply = yield '输入想筛选的文本'
-    names = catch_links(reply)
+    names, ends = catch_links(reply)
+    end = '\n终结于: '+' '.join(ends)
     if not names:
-        return '该消息不触发任何link'
-    return '触发的links: '+'\n'.join(names)
+        return '该消息不触发任何link'+end
+    return '触发的links: '+'\n'.join(names)+end
 
 
 
