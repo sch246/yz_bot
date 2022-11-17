@@ -1,5 +1,5 @@
 '''易经起卦，用最近的3句的句长，也可以指定数字'''
-from main import msglog,random
+from main import random
 
 #     000  001  010  011  100  101  110  111
 #     111  110  101  100  011  010  001  000

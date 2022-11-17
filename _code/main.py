@@ -260,6 +260,7 @@ def recvmsg(text, sender_id:int=None, private=None, **kws):
     '''不输入后面的参数时，默认是同一个人同一个位置的recv，否则可以设定对应的sender和group
     私聊想模拟群内，只需要加group_id=xx
     当在群内想模拟私聊时，需要设private为True'''
+    msg = cache.get_last()
     if sender_id is None:
         sender_id = msg['user_id']
     if private is True:

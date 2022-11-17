@@ -1,6 +1,8 @@
 '''启动bot'''
 
-import subprocess,sys,time
+import subprocess
+import sys
+import time
 
 if '-h' in sys.argv[1:]:
     print('''接受的参数:
@@ -9,14 +11,14 @@ if '-h' in sys.argv[1:]:
     debug       debug模式(并没有什么区别)''')
     exit()
 
-auto_reboot = 'auto_reboot' in sys.argv[1:]
+AUTO_REBOOT = 'auto_reboot' in sys.argv[1:]
 while True:
-    out = subprocess.run([sys.executable,'./_code/main.py',*sys.argv[1:]])
+    out = subprocess.run([sys.executable,'./_code/main.py',*sys.argv[1:]], check=False)
     print('已退出，返回码为',out.returncode)
     if out.returncode in [233,-6]: # 当python多线程写入中强制关闭时，返回是-6
         print('重启中...')
         continue
-    if auto_reboot and out.returncode!=0:
+    if AUTO_REBOOT and out.returncode!=0:
         print('自动重启中...')
         time.sleep(1)
         continue

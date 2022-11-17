@@ -1,9 +1,9 @@
 '''用于连接bot'''
 
-import requests
 import socket
 import json
-from typing import Any
+
+import requests
 
 # https://blog.csdn.net/qq_27694835/article/details/108613607
 # Requests 模块 https://www.cnblogs.com/saneri/p/9870901.html
@@ -53,7 +53,7 @@ def request_to_json(msg: str) -> dict | None:
 
 
 def recv_msg() -> dict | None:
-    Client, Address = ListenSocket.accept()
+    Client, _ = ListenSocket.accept()
     Request = Client.recv(2048).decode(encoding='utf-8')
     rev_json = request_to_json(Request)
     # 发送信号表示我收到了

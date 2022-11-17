@@ -141,5 +141,5 @@ answers=[
     '拭目以待。',
 ]
 
-def run(body:str):
+def run(_:str):
     return getran(answers)

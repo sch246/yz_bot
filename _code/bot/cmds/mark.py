@@ -1,9 +1,10 @@
 '''收藏，并且存储到个人存储中，不支持文件，必须at，不知道能有效多久'''
 
-import re, time
+import re
 
 from main import cache, cq, is_reply, storage, connect, is_msg, chatlog
 
+msg = {}
 
 def run(body:str):
     '''设置名字，回复想要保存的消息，进行标记，不支持文件，必须at，一次仅标记一条消息，不知道能有效多久

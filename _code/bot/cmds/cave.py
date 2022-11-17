@@ -1,3 +1,4 @@
+'''回声洞'''
 from random import randint
 import re
 import time

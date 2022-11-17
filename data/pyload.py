@@ -1,3 +1,5 @@
+'''每次启动时在_code/bot/cmds/py.py加载'''
+
 if (lambda:False)():
     # 纯粹是为了不要编辑器显示警告，运行是不可能的
     from _code.bot.cmds.py import *
