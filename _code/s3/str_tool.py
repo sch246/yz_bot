@@ -74,7 +74,7 @@ def stc_get(src:str):
 def stc_set(tar:str):
     def _(names:dict,tar=tar)->str:
         for k,v in names.items():
-            tar = tar.replace(f'{{:{k}}}"', v)
+            tar = tar.replace(f'{{:{k}}}', v)
         return tar
     return _
 
