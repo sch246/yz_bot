@@ -202,7 +202,11 @@ def recv(msg:dict):
             if text.startswith('.') and cmds.is_cmd(text[1:]):
                 cmd_ret(cmds.run(*cmds.is_cmd(text[1:])), msg)
             # 执行bash
-            elif text.startswith('!') and msg['user_id'] in cache.ops:
+            elif text.startswith('!'):
+                if not msg['user_id'] in cache.ops:
+                    if not cache.any_same(msg, '!'):
+                        send('权限不足(一定消息内将不再提醒)',**msg)
+                    return
                 s = os.popen(text[1:]).read()
                 if not s=='':
                     send(s, **msg)
