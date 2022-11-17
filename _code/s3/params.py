@@ -50,6 +50,7 @@ def append(f: Callable, _args:list):
 def insert(f: Callable, i:int, *_args:list):
     '''插入参数'''
     def _(*args, **kwargs):
+        args = list(args)
         args[i:i] = _args
         return f(*args, **kwargs)
     return _

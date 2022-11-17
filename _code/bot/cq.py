@@ -1,3 +1,4 @@
+'''处理cq码相关的东西'''
 import re
 
 from main import str_tool
@@ -33,17 +34,17 @@ def unescape2(text: str):
     return str_tool.replace_by_dic2(text, escape_dic2)
 
 
-re_CQdatas = '(?:,[^,=]+=[^,\]]+)*'
+re_CQdatas = r'(?:,[^,=]+=[^,\]]+)*'
 
-_re_CQ = re.compile(f'\[CQ:[^,\]]+{re_CQdatas}\]')
-re_CQ = re.compile(f'\[CQ:(?P<type>[^,\]]+)(?P<data>{re_CQdatas})\]')
+_re_CQ = re.compile(rf'\[CQ:[^,\]]+{re_CQdatas}\]')
+re_CQ = re.compile(rf'\[CQ:(?P<type>[^,\]]+)(?P<data>{re_CQdatas})\]')
 
 def find_all(s:str):
     return _re_CQ.findall(s)
 
 def load(CQ:str):
     '''将字符串形式的单个CQ转化为字典，并且将其中乱七八糟的东东转化为正常'''
-    CQ = re.sub('\s','',CQ)  # 去掉空白符
+    CQ = re.sub(r'\s','',CQ)  # 去掉空白符
     mt = re_CQ.match(CQ)
     stype=mt.group('type')
     sdata=mt.group('data')

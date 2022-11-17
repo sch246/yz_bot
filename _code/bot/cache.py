@@ -100,7 +100,7 @@ def get_last():
     return msgs['last']
 
 
-'''保存和读取msgs，每个人每个群不会超过256条，所以不用担心无限增长的问题'''
+# 保存和读取msgs，每个人每个群不会超过256条，所以不用担心无限增长的问题
 import atexit
 
 cache_msgs = file.ensure_file('data/cache_msgs')
@@ -115,15 +115,14 @@ except:
     pass
 
 
-ops = set()
-nicknames = set()
-_set = set
+ops = []
+nicknames = []
 
 def ops_load():
     global ops
-    ops = _set(config.load_config('ops'))
+    ops = config.load_config('ops')
 def ops_save():
-    config.save_config(list(ops),'ops')
+    config.save_config(ops,'ops')
 
 def get_nickname():
     if len(nicknames)>0:
@@ -131,9 +130,9 @@ def get_nickname():
     return 'bot'
 def nicknames_load():
     global nicknames
-    nicknames = _set(config.load_config('nicknames'))
+    nicknames = config.load_config('nicknames')
 def nicknames_save():
-    config.save_config(list(nicknames),'nicknames')
+    config.save_config(nicknames,'nicknames')
 
 
 def getlog(msg):
@@ -157,14 +156,16 @@ def same_times(msg:dict, f:Callable|str, i=None):
     if isinstance(f,str):
         is_self = IsSelf(msg)
         mt = re.compile(f)
-        def f(_msg):
+        def new_func(_msg):
             return is_self(_msg) and mt.match(_msg['message'])
+    else:
+        new_func = f
     log_lst = getlog(msg)
     if not (i is None):
         i += 1
         if len(log_lst)<i:
             return False
-    return all(f(m) for m in log_lst[1:i])
+    return all(new_func(m) for m in log_lst[1:i])
 
 def any_same(msg:dict, f:Callable|str, i=None):
     '''在cache有记录的范围内进行检索'''
@@ -172,8 +173,10 @@ def any_same(msg:dict, f:Callable|str, i=None):
     if isinstance(f,str):
         is_self = IsSelf(msg)
         mt = re.compile(f)
-        def f(_msg):
+        def new_func(_msg):
             return is_self(_msg) and mt.match(_msg['message'])
+    else:
+        new_func = f
     log_lst = getlog(msg)
     if not (i is None):
         i += 1

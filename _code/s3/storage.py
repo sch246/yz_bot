@@ -16,8 +16,7 @@ storage = {}
 # 第三级开始才允许字符串以外的键
 
 def load():
-    global storage
-    for root, dirs, files in os.walk(root_path):
+    for root, _, files in os.walk(root_path):
         name_space = root[len(root_path):]
         storage[name_space] = {}
         for file in files:
@@ -31,9 +30,9 @@ def load():
                     print(f'读取"{path}"时发生错误')
 
 def save():
-    global storage
-    for name_space in storage.keys():
-        root = join(root_path,name_space)
+    '''退出时保存storage'''
+    for s_name, s_value in storage.items():
+        root = join(root_path,s_name)
         try:
             os.makedirs(root,exist_ok=True)
         except FileExistsError:
@@ -45,10 +44,10 @@ def save():
         except Exception as e:
             print(f'{root}: {e}')
             continue
-        for name in storage[name_space].keys():
+        for name, value in s_value.items():
             path = join(root,name+'.json')
             # 这里没有做检验
-            json_write(path, storage[name_space][name])
+            json_write(path, value)
 
 
 def get_namespace(name_space):

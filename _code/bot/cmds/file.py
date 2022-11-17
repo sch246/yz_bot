@@ -1,4 +1,4 @@
-
+'''文件操作相关的命令'''
 
 import traceback
 import re
@@ -34,7 +34,7 @@ def run(body:str):
 '''
     msg = cache.get_last()
     if not msg['user_id'] in cache.ops:
-        if not cache.any_same(msg, '\.file'):
+        if not cache.any_same(msg, r'\.file'):
             return '权限不足(一定消息内将不再提醒)'
         return
 
@@ -189,7 +189,7 @@ def _set(m):
     if extra_param:
         params = extra_param.split(' ')
     if '-y' in params or not os.path.exists(path):
-        file_msg = yield f'请发送一个文件'
+        file_msg = yield '请发送一个文件'
         return _recv_file(file_msg, path)
     elif os.path.isfile(path):
         reply = yield '文件已存在，确定要覆盖文件吗(y/n)'
@@ -197,7 +197,7 @@ def _set(m):
             return _recv_file(reply, path)
         if not is_msg(reply) or not reply['message'] in ['是','确定','y','Y','yes','Yes','YES','OK','ok','Ok']:
             return '操作终止'
-        file_msg = yield f'请发送一个文件'
+        file_msg = yield '请发送一个文件'
         return _recv_file(file_msg, path)
     return '找到了文件，但是发送失败了'
 
