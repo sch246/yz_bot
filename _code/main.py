@@ -37,7 +37,7 @@ import bot.chatlog as chatlog
 
 
 def msg_id(msg:dict):
-    return (msg['group_id'] if 'group_id' in msg.keys() else None, msg['user_id'])
+    return (msg.get('group_id'), msg['user_id'])
 
 
 def first_start():
@@ -133,8 +133,11 @@ def cmd_ret(ret, msg):
         catches = cache.get('catches') # 对每个输入区域的检测
         msg_loc = msg_id(msg)
         try:
-            cmd_ret(next(ret), msg)
-            catches[msg_loc] = ret
+            if msg_loc not in catches.keys():
+                cmd_ret(next(ret), msg)
+                catches[msg_loc] = ret
+            else:
+                cmd_ret(ret.send(msg), msg)
         except StopIteration as e:
             catches.pop(msg_loc,None)
             cmd_ret(e.value, msg)
@@ -185,10 +188,10 @@ def recv(msg:dict):
 
         catches = cache.get('catches')
         if catches.get(msg_loc):
-            c = catches[msg_loc][-1]
+            c = catches[msg_loc]
             if isinstance(c,Queue):
                 c.put(msg)
-                del catches[msg_loc][-1]
+                del catches[msg_loc]
             else:
                 cmd_ret(c, msg)
             return
