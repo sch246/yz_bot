@@ -5,13 +5,15 @@
 
 柚子bot
 
-远程控制，`.py`运行 python，`.link`映射输入，记录聊天记录
+远程控制，`.py`运行 python，`.link`映射输入，记录聊天记录，给mc服务器输入命令
 
 无异步
 
 低性能
 
-暂时没有权限系统(会有的)(划掉)有权限管理系统啦
+有权限管理系统啦
+
+不考虑同时运行多个bot，不考虑一个群有多个bot
 
 记录:
 - [开始](https://www.sch246.com/Computer/project/qq_bot/start)
