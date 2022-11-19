@@ -95,4 +95,34 @@ def remove_emptyline(s):
         lst=['']
     return ''.join(lst)
 
+def has_nextline(s:str):
+    '''检查字符串中是否有换行'''
+    return len((s+'a').splitlines())>1
+
+re_read = re.compile(r'(\s+)("[^"]*"|\S+)([\S\s]*)')
+def read_next(s:str,checkline=False):
+    '''从字符串中读取空白符后的下一段字符串，如果有单引号则会单独读取
+    若以非空白符开头，返回None
+    若全是空白符，返回2个空字符串
+    返回读取出的字符串以及读取后的字符串
+    若checkline为True，会返回开头的空白符是否包含换行'''
+    r = re_read.match(s)
+    if r:
+        spaces, text, last = r.groups()
+        if text.startswith('"'):
+            if (not text.endswith('"')):
+                return
+            text = text[1:-1]
+        if checkline:
+            return text, last, has_nextline(spaces)
+        else:
+            return text, last
+    if not s.strip():# 如果全是空白符
+        if checkline:
+            return '', '', has_nextline(s)
+        else:
+            return '', ''
+
+
+
 LASTLINE = '\33[1A\r\33[K'

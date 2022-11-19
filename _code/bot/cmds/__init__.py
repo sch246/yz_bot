@@ -25,7 +25,7 @@ def is_cmd(text:str):
             body = text[len(command):]
             if re.match(_match_S, body):  # 如果命令后跟的是非空白符，则表示不是这个命令
                 continue
-            body = body.lstrip()  # body是命令后面的其余部分
+            # body = body.lstrip()  # body是命令后面的其余部分
             return command, body
 
 def run(command, body):

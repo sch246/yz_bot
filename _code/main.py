@@ -340,7 +340,11 @@ def getran(lst:list):
     if lst:
         return lst[random.randint(0, len(lst)-1)]
 
-
+def getint(s:str):
+    try:
+        return int(s)
+    except:
+        return
 
 if __name__=="__main__":
     _init_self()
