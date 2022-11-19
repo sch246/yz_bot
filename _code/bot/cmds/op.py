@@ -33,7 +33,7 @@ def run(body:str):
     body = body.strip()
     if body=='':
         return run.__doc__
-    if body.splitlines()[0].split(' ')[0]=='del':
+    if body.startswith('del'):
         body = body[3:]
         success, fail = [], []
         uids = get_uids_from_body(body)
@@ -48,7 +48,7 @@ def run(body:str):
                 fail.append(Show(f'{uid}:不是op'))
         cache.ops_save()
         return f'执行完毕,成功:{success}，失败:{fail}'
-    if not body=='':
+    else:
         uids = get_uids_from_body(body)
         success, fail = [], []
         for uid in uids:
@@ -63,4 +63,3 @@ def run(body:str):
                 fail.append(Show(f'{uid}:格式错误'))
         cache.ops_save()
         return f'执行完毕,成功:{success}，失败:{fail}'
-    return run.__doc__
