@@ -4,33 +4,28 @@ import traceback
 import re
 import os
 
-from main import cq, connect, cache, send, to_thread, is_file, is_msg
+from main import cq, connect, cache, send, to_thread, is_file, is_msg, is_img, read_params, getint
 
-def getint(s):
-    try:
-        return int(s)
-    except:
-        return None
 
 from s3.counter import Counter
 def insert_linemark(s:str):
     c = Counter()
-    return ''.join(map(lambda s:str(next(c))+'│'+s, s.splitlines(True)))
+    return '\n'.join(map(lambda s:str(next(c))+'│'+s, s.splitlines()))
 
 def _strip_linemark(line:str):
     return re.sub(r'^\d+\|','',line, 1)
 
 def strip_linemark(s:str):
-    return ''.join(map(_strip_linemark, s.splitlines(True)))
+    return '\n'.join(map(_strip_linemark, s.splitlines()))
 
 def run(body:str):
-    '''查看和编辑文件，私聊似乎没办法传文件(api错误)，set可以读取之后发送的文件，to可以读取10条消息内最近的文件
+    '''查看和编辑文件，私聊似乎没办法传文件(api错误)，set可以读取之后发送的文件/图片，to可以读取10条消息内最近的文件
 .file
- : read <文件路径> [<起始行> <结束行>]
- | write <文件路径> [<起始行> <结束行>]\\n<内容>
+ : read <文件路径> [-i:是否显示行号] [<起始行:int> <结束行:int>]
+ | write <文件路径> [<起始行:int> <结束行:int>]\\n<内容>
  | get <文件路径>
- | set <文件路径> || <文件>
-<文件> || .file to <文件路径>
+ | set <文件路径> [-y/-f:是否覆盖已有文件] || <文件>
+<文件> || .file to <文件路径> [-y/-f:是否覆盖已有文件]
 '''
     msg = cache.get_last()
     if not msg['user_id'] in cache.ops:
@@ -40,36 +35,46 @@ def run(body:str):
 
     body = cq.unescape(body)
     lines = body.splitlines()
-    if not lines:
-        lines = ['']
-    head = lines[0].strip()
-    value = lines[1:]
+    while len(lines)<2:
+        lines.append('')
+    first_line, *last_lines = lines
 
-    m = re.match(r'read ([\S]+)(.*)', head)
-    if m:
-        return _read(m)
-    m = re.match(r'write ([\S]+)(.*)', head)
-    if m:
-        return _write(m, value)
-    m = re.match(r'get ([\S]+).*', head)
-    if m:
-        return _get(m)
-    m = re.match(r'set ([\S]+)(.*)', head)
-    if m:
-        return _set(m)
-    m = re.match(r'to ([\S]+)(.*)', head)
-    if m:
-        return _to(m)
-
+    s, last = read_params(first_line)
+    if s=='read':
+        path, *params, last = read_params(last, 4)
+        if not params[0]=='-i':
+            i, start, end = False, *params[:2]
+        else:
+            i, start, end = True, *params[1:]
+        return _read(path or '.', i, getint(start), getint(end))
+    elif s=='write':
+        path, start, end, last = read_params(last, 3)
+        if not os.path.isfile(path):
+            return '目标不是文件'
+        return _write(path, getint(start), getint(end), last_lines)
+    elif s=='get':
+        path, last = read_params(last)
+        if not os.path.isfile(path):
+            return '目标不是文件'
+        return _get(path)
+    elif s=='set':
+        path, extra, last = read_params(last, 2)
+        return _set(path, extra in ['-y', '-f'])
+    elif s=='to':
+        path, extra, last = read_params(last, 2)
+        return _to(path, extra in ['-y', '-f'])
     return run.__doc__
 
 def read_text(text, start=None, end=None):
-    return ''.join(insert_linemark(text).splitlines(True)[start:end])
+    return '\n'.join(insert_linemark(text).splitlines()[start:end])
 
-def read_file(path, start=None, end=None):
+def read_file(path, with_linemark, start=None, end=None):
     with open(path,encoding='utf-8') as f:
         text = f.read()
-        return read_text(text, start, end)
+        if with_linemark:
+            return read_text(text, start, end)
+        else:
+            return text
 
 def listitems(path):
     lst = os.listdir(path)
@@ -87,19 +92,11 @@ def listdir(path='.'):
     dirs, files = listitems(path)
     return '\n'.join((*map(lambda s:'> '+s, dirs),*files))
 
-def _read(m):
-    path = m.group(1)
+def _read(path, with_linemark, start, end):
     if os.path.isdir(path):
         return listdir(path)
-    extra_param = m.group(2).strip()
-    if extra_param:
-        params = list(map(getint, extra_param.split(' ')))
-        if len(params)==1:
-            params.append(None)
-    else:
-        params = [None,None]
     try:
-        text = read_file(path, params[0], params[1])
+        text = read_file(path, with_linemark, start, end)
         if text=='':
             return '文件为空'
         else:
@@ -108,24 +105,18 @@ def _read(m):
         return e
 
 def write_text(text, lines, start=None, end=None):
-    textlines = text.splitlines(True)
+    textlines = text.splitlines()
     textlines[start:end] = map(_strip_linemark, lines)
-    return ''.join(textlines)
+    return '\n'.join(textlines)
 
 def write_file(path, lines, start=None, end=None):
     with open(path,'w',encoding='utf-8') as f:
         f.write(write_text(f.read(), lines, start, end))
 
 
-def _write(m, lines):
-    path = m.group(1)
-    extra_param = m.group(2).strip()
-    if extra_param:
-        params = list(map(getint, extra_param.split(' ')))
-        if len(params)==1:
-            params.append(None)
+def _write(path, start, end, lines):
     try:
-        write_file(path,lines,params[0],params[1])
+        write_file(path,lines,start,end)
         return '已写入 '+path
     except Exception as e:
         return e
@@ -149,10 +140,8 @@ def _send_file(path):
 
 
 
-def _get(m):
-    path = m.group(1)
+def _get(path):
     return _send_file(path)
-
 
 
 @to_thread
@@ -166,6 +155,12 @@ def download(url, path, msg):
     except:
         send(''.join(traceback.format_exc().splitlines(True)[:]), **msg)
     send(f'文件已保存到\n{path}', **msg)
+
+def recv_img(_msg, path):
+    if not is_img(_msg):
+        return '目标msg不是单个图片'
+    download(cq.load(_msg['message'])['data']['url'], path, cache.get_last())
+    return f'正在将图片保存到\n{path}'
 
 def _recv_file(file_msg, path):
     if 'file' not in file_msg.keys():
@@ -182,19 +177,19 @@ def _recv_file(file_msg, path):
     return f'正在将文件保存到\n{path}'
 
 # 是生成器
-def _set(m):
-    path = m.group(1)
-    extra_param = m.group(2).strip()
-    params=[]
-    if extra_param:
-        params = extra_param.split(' ')
-    if '-y' in params or not os.path.exists(path):
-        file_msg = yield '请发送一个文件'
-        return _recv_file(file_msg, path)
+def _set(path, is_force):
+    if is_force or not os.path.exists(path):
+        reply = yield '请发送一个文件/图片'
+        if is_file(reply):
+            return _recv_file(reply, path)
+        elif is_img(reply):
+            return recv_img(reply, path)
     elif os.path.isfile(path):
         reply = yield '文件已存在，确定要覆盖文件吗(y/n)'
         if is_file(reply):
             return _recv_file(reply, path)
+        elif is_img(reply):
+            return recv_img(reply, path)
         if not is_msg(reply) or not reply['message'] in ['是','确定','y','Y','yes','Yes','YES','OK','ok','Ok']:
             return '操作终止'
         file_msg = yield '请发送一个文件'
@@ -202,16 +197,11 @@ def _set(m):
     return '找到了文件，但是发送失败了'
 
 
-def _to(m):
-    file_msg = cache.get_one(is_file, 10)# 接收10条消息以内任何人发的文件
+def _to(path, is_force):
+    file_msg = cache.get_one(cache.get_last(), is_file, 10)# 接收10条消息以内任何人发的文件
     if not file_msg:
         return '10条消息内没有文件'
-    path = m.group(1)
-    extra_param = m.group(2).strip()
-    params=[]
-    if extra_param:
-        params = extra_param.split(' ')
-    if '-y' in params or not os.path.exists(path):
+    if is_force or not os.path.exists(path):
         return _recv_file(file_msg, path)
     elif os.path.isfile(path):
         reply = yield '文件已存在，确定要覆盖文件吗(y/n)'

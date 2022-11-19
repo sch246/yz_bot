@@ -3,7 +3,7 @@ from random import randint
 import re
 import time
 
-from main import storage, is_msg, getname, getgroupname, str_tool, getran
+from main import storage, is_msg, getname, getgroupname, read_params, getran
 
 cave = storage.get('','cave',list)
 cave_indexs = [i for i in range(len(cave))]
@@ -27,8 +27,11 @@ def run(body:str):
  : <msg>    # 放入一条消息
  | || <msg> # 放入一条消息
 .cave del [<id:int>] # 删除一条消息，默认为上一条消息'''
-    s, last = str_tool.read_next(body)
-    if s=='':
+    try:
+        s, last = read_params(body)
+    except SyntaxError as e:
+        return e.text
+    if not s:
         return _get(ran_index())
     elif re_int.match(s):
         return _get(int(s))
@@ -36,7 +39,7 @@ def run(body:str):
         if not last.strip():
             i = -1
         else:
-            s, last = str_tool.read_next(last)
+            s, last = read_params(last)
             if not re_int.match(s):
                 return run.__doc__
             i = int(s)

@@ -15,6 +15,7 @@ import s3.file as file
 import s3.params as params
 import s3.schedule as schedule
 import s3.str_tool as str_tool
+read_params = str_tool.read_params
 import s3.thread as thread
 from s3.thread import to_thread
 import s3.mcrcon as mcrcon
