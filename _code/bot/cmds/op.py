@@ -55,7 +55,7 @@ def run(body:str):
             uid = get_uid(uid)
             if uid:
                 if not uid in cache.ops:
-                    cache.ops.add(uid)
+                    cache.ops.append(uid)
                     success.append(uid)
                 else:
                     fail.append(Show(f'{uid}:已是op'))
