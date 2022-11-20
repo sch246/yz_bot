@@ -46,31 +46,67 @@ def run(body:str):
 
     body = cq.unescape(body)
     lines = body.splitlines()
-    if not lines:
-        lines = ['']
-    head = lines[0].strip()
-    value = lines[1:]
+    while len(lines)<2:
+        lines.append('')
+    first_line, *last_lines = lines
 
-    m = re.match(r'(re|py) ([\S]+)( while( \S.+)?)?$', head)
-    if m:
-        return _set(m, value)
+    s, last = read_params(first_line)
 
-    m = re.match(r'get ([\S]+)$', head)
-    if m:
-        return _get(m)
-
-    m = re.match(r'del ([\S]+)$', head)
-    if m:
-        return _del(m)
-
-    m = re.match(r'list[\s]*$', head)
-    if m:
-        return _list(m)
-
-    m = re.match(r'catch( [\S\s]+)?$', head)
-    if m:
-        return _catch(m)
+    if s in ['re','py']:
+        name, _while, whiles = read_params(last, 2)
+        if _while=='while' and whiles:
+            params = whiles.strip().split(' ')
+            s = check_while(name, params)
+            if s:
+                return s
+        elif _while=='while':
+            params = ['']
+        elif _while:
+            return run.__doc__
+        else:
+            params = []
+        link = get_link(name)
+        if params==['']:
+            if not link:
+                reply = yield '正在创建新link:\nwhile为空将无法被触发\n输入"y"以继续'
+                if not (is_msg(reply) and reply['message'].strip()=='y'):
+                    return '操作终止'
+            elif links[0]['name']!=link[name]:
+                reply = yield '正在编辑已有link:\n不在links开头且while为空将无法被触发\n输入"y"以继续'
+                if not (is_msg(reply) and reply['message'].strip()=='y'):
+                    return '操作终止'
+        parts = '\n'.join(last_lines).split('\n===\n')
+        return _set(name, s, link, params, parts)
+    elif s=='del':
+        name, last = read_params(last)
+        return _del(name)
+    elif s=='get':
+        name, last = read_params(last)
+        return _get(name)
+    elif s=='list':
+        return _list()
+    elif s=='catch':
+        if last.lstrip():
+            reply = {**cache.get_last(), 'message':last.lstrip()}
+        else:
+            reply = yield '输入想筛选的文本'
+        return _catch(reply)
     return run.__doc__
+
+
+def check_while(name, params):
+    '''检查while后面的参数，通过返回None，不通过则返回字符串'''
+    if len(params)%2==1:
+        return 'while参数不成对'
+    for i in range(len(params)//2):
+        tar = params[2*i]
+        if tar == name:
+            return '递归达咩！'
+        if not get_link(tar):
+            return f'不存在的link:"{tar}"'
+        connect_type = params[2*i+1]
+        if connect_type not in ['succ','fail']:
+            return f'期望得到"succ"或"fail"，但得到了"{connect_type}"'
 
 
 def set_while(link, params):
@@ -90,7 +126,7 @@ def set_while(link, params):
     _('fail')
 
 
-def _set(m, value):
+def _set(name, type, link, params, parts):
     '''创建或修改link，需要分条发送
 .link (py|re) <name>[ while[ <other_name> (succ|fail)]+]
     : \\n <cond> \\n===\\n <action>
@@ -112,44 +148,6 @@ def _set(m, value):
     cond创建的命名组不进入.py的locals里
 while 可以设置它在哪条 link 通过或未通过时执行
 action 紧挨着 cond 成功时执行，原则上不允许 conds 使用 send,recv 和 do_action 等干涉自身的函数，这会影响到 catch 函数的准确性'''
-
-    type = m.group(1)
-    name = m.group(2)
-    setwhile = m.group(3)
-    whiles = m.group(4)
-    if get_link(name):
-        exist = True
-    else:
-        exist = False
-
-
-    if whiles:
-        extra_param = whiles.strip()
-        params = extra_param.split(' ')
-        if len(params)%2==1:
-            return 'while参数不成对'
-        for i in range(len(params)//2):
-            tar = params[2*i]
-            if tar == name:
-                return '递归达咩！'
-            if not get_link(tar):
-                return f'不存在的link:"{tar}"'
-            connect_type = params[2*i+1]
-            if connect_type not in ['succ','fail']:
-                return f'期望得到"succ"或"fail"，但得到了"{connect_type}"'
-    else:
-        params = []
-
-    if exist:
-        link = get_link(name)
-        if setwhile and links[0]['name']!=link['name'] and not params:
-            reply = yield '正在编辑已有link:\n不在links开头且while为空将无法被触发\n输入"y"以继续'
-            if not (is_msg(reply) and reply['message'].strip()=='y'):
-                return '操作终止'
-
-
-    body = '\n'.join(value)
-    parts = body.split('\n===\n')
     if parts:
         cond = parts.pop(0)
     else:
@@ -167,9 +165,12 @@ action 紧挨着 cond 成功时执行，原则上不允许 conds 使用 send,rec
 
     # 如果编辑的是已有的link，遍历
 
-    if exist:
-        if setwhile:
-            set_while(link, params)
+    if link:
+        if params:
+            if params==['']:
+                set_while(link, [])
+            else:
+                set_while(link, params)
         link['type'] = type
         link['cond'] = cond
         link['action'] = action
@@ -197,33 +198,32 @@ action 紧挨着 cond 成功时执行，原则上不允许 conds 使用 send,rec
             'fail':[],
             'action':action,
         })
-        for i in range(len(params)//2):
-            tar = params[2*i-1]
-            connect_type = params[2*i]
-            connect_link(name, tar, connect_type)
+        if params!=['']:
+            for i in range(len(params)//2):
+                tar = params[2*i-1]
+                connect_type = params[2*i]
+                connect_link(name, tar, connect_type)
         return '创建成功'
 
 
 
 
-def _del(m):
+def _del(name):
     '''删除link，如果有痕迹就也一并删了'''
-    name = m.group(1)
     if del_link(name):
         return '删除成功'
     else:
         return '没有找到link'
 
-def _get(m):
+def _get(name):
     '''列出link的type, cond和action'''
-    name = m.group(1)
     link = get_link(name)
     if link:
         return formats_link(link, 1)
     else:
         return '没有找到link'
 
-def _list(m):
+def _list():
     '''列出links的名字和它的指向
 早:py
     fail
@@ -242,14 +242,8 @@ def _list(m):
     else:
         return 'links 为空'
 
-def _catch(m):
+def _catch(reply):
     '''根据输入的字符串，返回可能触发的link的名字'''
-    text = m.group(1)
-    if text:
-        text = text[1:]
-        reply = {**cache.get_last(), 'message':text}
-    else:
-        reply = yield '输入想筛选的文本'
     names, ends = catch_links(reply)
     end = '\n终结于: '+' '.join(ends)
     if not names:
