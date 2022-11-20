@@ -347,6 +347,9 @@ def getint(s:str):
     except:
         return
 
+def getcmd(name:str):
+    return cmds.modules[name]
+
 if __name__=="__main__":
     _init_self()
     cmds.load()
