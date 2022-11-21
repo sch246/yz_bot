@@ -50,6 +50,7 @@ def checkmc():
             return -1 # screen 未开启
 
 def start_mc(timeout=120):
+    _msg = msg
     t = 0
     i = checkmc()
     if i>0:
@@ -63,16 +64,17 @@ def start_mc(timeout=120):
     while t<timeout:
         log = screen.pop_log(mc_screen)
         if log:
-            sendmsg(str_tool.remove_emptyline(log))
+            sendmsg(str_tool.remove_emptyline(log),**_msg)
         if rcon or 'RCON running' in log:
             rcon = True
             if connect_mc():
                 return '启动完毕'
-        time.sleep(1)
-        t += 1
-    sendmsg('超时')
+        time.sleep(3)
+        t += 3
+    sendmsg('超时',**_msg)
 
 def stop_mc(close_screen=False,timeout=30):
+    _msg = msg
     i = checkmc()
     if i==-1:
         return 'screen和MC已是关闭状态'
@@ -85,11 +87,13 @@ def stop_mc(close_screen=False,timeout=30):
     t = 0
     while t<timeout:
         log = screen.pop_log(mc_screen)
+        if log:
+            sendmsg(str_tool.remove_emptyline(log),**_msg)
         if 'All dimensions are saved' in log:
-            sendmsg('All dimensions are saved')
+            sendmsg('All dimensions are saved',**_msg)
             break
-        time.sleep(1)
-        t += 1
+        time.sleep(3)
+        t += 3
     if close_screen:
         return screen.stop(mc_screen)
     return 'MC已关闭'

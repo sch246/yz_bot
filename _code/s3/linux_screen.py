@@ -4,24 +4,28 @@ import time,os
 from main import file, str_tool
 
 def _logpath(name):
-    return f'data/screens/{name}/screenlog.0'
+    return f'data/screens/{name}.0'
 
 def rel_exec(path, command):
     os.system(f'cd {path} && {command} && cd -')
 
 def start(name):
-    dirpath = f'data/screens/{name}'
-    os.makedirs(dirpath,exist_ok=True)
-    rel_exec(dirpath, f'screen -L -dmS {name}')
+    os.makedirs('data/screens',exist_ok=True)
+    logpath = _logpath(name)
+    os.system(f"screen -dmS {name} \
+        && screen -S {name} -X stuff $'exec 1>> {logpath}\n' \
+        && screen -S {name} -X stuff $'exec 2>> {logpath}\n'")
 
 def send(name, command):
     logpath = _logpath(name)
     file.write(logpath, '')
     os.system(f"screen -S {name} -X stuff $'{command}\n'")
-    s=''
-    while s=='':
-        s = file.read(logpath)
-        time.sleep(0.2)
+    # s=''
+    # while s=='':
+    #     s = file.read(logpath)
+    #     time.sleep(0.2)
+    time.sleep(0.2)
+    s = file.read(logpath)
     return str_tool.remove_emptyline(s)
 
 def pop_log(name):
