@@ -106,7 +106,7 @@ def read_params(s:str, count=1, read_str=False):
     '''从字符串中读取空白符后的下n段字符串
     如果要读取引号，则可能抛出异常
     读完后剩余的都是空字符串
-    若以非空白符开头，返回None
+    若以非空白符开头，抛出SyntaxError
     返回的字符串数量=count+1，最后一个为剩下的部分'''
     if read_str:
         r = re_read_str.match(s)
