@@ -336,10 +336,14 @@ def msglog(i=0):
                 return msg['message']
             _i += 1
 
-def getran(lst:list):
+def getran(lst:list, ret_idx=False):
     '''随机取出列表中的元素'''
     if lst:
-        return lst[random.randint(0, len(lst)-1)]
+        idx = random.randint(0, len(lst)-1)
+        if ret_idx:
+            return idx, lst[idx]
+        else:
+            return lst[idx]
 
 def getint(s:str):
     try:
