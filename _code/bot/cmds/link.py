@@ -200,8 +200,8 @@ action 紧挨着 cond 成功时执行，原则上不允许 conds 使用 send,rec
         })
         if params!=['']:
             for i in range(len(params)//2):
-                tar = params[2*i-1]
-                connect_type = params[2*i]
+                tar = params[2*i]
+                connect_type = params[2*i+1]
                 connect_link(name, tar, connect_type)
         return '创建成功'
 
