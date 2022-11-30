@@ -19,7 +19,8 @@ def start(name):
 def send(name, command):
     logpath = _logpath(name)
     file.write(logpath, '')
-    os.system(f"screen -S {name} -X stuff $'{command}\n'")
+    command = command.replace('"','\\"')
+    os.system(f'''screen -S {name} -X stuff "{command}\n"''')
     # s=''
     # while s=='':
     #     s = file.read(logpath)
