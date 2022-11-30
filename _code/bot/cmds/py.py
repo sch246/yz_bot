@@ -1,6 +1,6 @@
 '''运行python代码的命令，是临时环境，重启后消失,除非最后一行以###开头'''
 import traceback
-import os, json, time, re, random
+import os, json, time, re, random, inspect
 from queue import Queue
 from inspect import currentframe
 
