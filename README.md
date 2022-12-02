@@ -7,6 +7,8 @@
 
 远程控制，`.py`运行 python，`.link`映射输入，记录聊天记录，给mc服务器输入命令
 
+`.js`运行 JavaScript(需要服务器安装了 JS 和 screen)，`.nim`运行 nim (需要服务器安装了 nim)
+
 无异步，基本单线程
 
 低性能
@@ -16,8 +18,8 @@
 不考虑同时运行多个bot，不考虑一个群有多个bot
 
 记录:
-- [开始](https://www.sch246.com/Computer/project/qq_bot/start)
-- [第一次重构](https://www.sch246.com/Computer/project/qq_bot/yz_bot)
+- [开始](https://www.sch246.com/docs/1-code/3-project/0-qq_bot.html)
+- [第一次重构](https://www.sch246.com/docs/1-code/3-project/0-qq_bot/yz_bot.html)
 - [第二次重构(0.2版本)]
 
 - 0.3版
