@@ -88,12 +88,13 @@ def slice(s:str, start, end):
         lst=['']
     return ''.join(lst[start:end])
 
-def remove_emptyline(s):
+def stripline(s):
+    '''去除空行，兼strip'''
     lst = s.splitlines(True)
     lst = filter(lambda s:s.strip()!='', lst)
     if not lst:
         lst=['']
-    return ''.join(lst)
+    return ''.join(lst).strip()
 
 def has_nextline(s:str):
     '''检查字符串中是否有换行'''
