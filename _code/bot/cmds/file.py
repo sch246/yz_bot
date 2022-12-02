@@ -4,7 +4,7 @@ import traceback
 import re
 import os
 
-from main import cq, connect, cache, send, to_thread, is_file, is_msg, is_img, read_params, getint
+from main import cq, connect, cache, send, to_thread, is_file, is_msg, is_img, read_params, getint, file
 
 
 from s3.counter import Counter
@@ -104,19 +104,10 @@ def _read(path, with_linemark, start, end):
     except Exception as e:
         return e
 
-def write_text(text, lines, start=None, end=None):
-    textlines = text.splitlines()
-    textlines[start:end] = map(_strip_linemark, lines)
-    return '\n'.join(textlines)
-
-def write_file(path, lines, start=None, end=None):
-    with open(path,'w',encoding='utf-8') as f:
-        f.write(write_text(f.read(), lines, start, end))
-
 
 def _write(path, start, end, lines):
     try:
-        write_file(path,lines,start,end)
+        file.overwrite(path,'\n'.join(lines),start,end)
         return '已写入 '+path
     except Exception as e:
         return e
