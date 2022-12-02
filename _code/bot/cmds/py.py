@@ -71,6 +71,24 @@ def run(body:str):
     except:
         send(''.join(traceback.format_exc().splitlines(True)[3:]).strip(), **msg)
 
+#-----------------------------------------------
+#----------------------------------------
+def ls(obj):
+    '''配合dir(), keys(), vars, __dict__等'''
+    return '\n'.join(sorted(list(map(str,obj))))
+def rd(r,d):
+    '''掷骰子'''
+    return sum(random.randint(1, d) for _ in range(r))
+
+# 用于.link set2的捕获类型设置，举例: {a:Int}
+Int = r'(?:0|-?[1-9]\d*)'
+Name = r'\w+'
+Param = r'\S+'
+All = r'[\S\s]+'
+CQ = r'\[CQ:[^,\]]+(?:,[^,=]+=[^,\]]+)*\]'
+
+#----------------------------------------
+#-----------------------------------------------
 
 # 接收文件！
 recv_file = cmds.modules['file']._recv_file

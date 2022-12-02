@@ -9,6 +9,14 @@ def _logpath(name):
 def rel_exec(path, command):
     os.system(f'cd {path} && {command} && cd -')
 
+def check(name=None):
+    if name is not None:
+        return os.popen(f'screen -ls | grep .{name}').read()
+    elif 'version' in os.popen('screen -v').read():
+        return True
+    else:
+        return False
+
 def start(name):
     os.makedirs('data/screens',exist_ok=True)
     logpath = _logpath(name)
@@ -26,10 +34,9 @@ def send(name, command):
     #     s = file.read(logpath)
     #     time.sleep(0.2)
     time.sleep(0.2)
-    s = file.read(logpath)
-    return str_tool.remove_emptyline(s)
+    return pop(name)
 
-def pop_log(name):
+def pop(name):
     '''这个可能会获取过长的字符串，经过处理再发送消息比较好'''
     logpath = _logpath(name)
     text = file.read(logpath)
