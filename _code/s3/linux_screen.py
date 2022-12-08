@@ -18,11 +18,13 @@ def check(name=None):
         return False
 
 def start(name):
+    if check(name): return '已存在同名screen'
     os.makedirs('data/screens',exist_ok=True)
     logpath = _logpath(name)
     os.system(f"screen -dmS {name} \
         && screen -S {name} -X stuff $'exec 1>> {logpath}\n' \
         && screen -S {name} -X stuff $'exec 2>> {logpath}\n'")
+    return f'已启动: {name}'
 
 def send(name, command):
     logpath = _logpath(name)
