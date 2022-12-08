@@ -3,7 +3,7 @@ from random import randint
 import re
 import time
 
-from main import storage, is_msg, getname, getgroupname, read_params, getran, cache
+from main import storage, is_msg, getname, getgroupname, read_params, getran, cache, cq
 
 cave = storage.get('','cave')
 cave_pool = storage.get('','cave_pool',list)
@@ -98,11 +98,11 @@ def _add(text:str):
     last += 1
     i = str(last)
     cave[i] = {
-        'sender':getname(),
+        'sender':cq.save_pic(getname()),
         'qq':cache.get_last()['user_id'],
         'group':getgroupname(),
         'time':time.strftime('%Y-%m-%d %H:%M'),
-        'text':text,
+        'text':cq.save_pic(text),
     }
     cave_pool.append(i)
     return f'已添加，序号 {i}'
