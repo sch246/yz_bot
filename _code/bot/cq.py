@@ -1,7 +1,7 @@
 '''处理cq码相关的东西'''
-import re
+import re,os
 
-from main import str_tool
+from main import str_tool, connect, to_thread
 
 
 escape_dic={ # CQ码内的转义
@@ -65,3 +65,22 @@ def dump(d:dict):
     type=d['type']
     data = ''.join(map(lambda x:','+escape(f'{x[0]}={x[1]}'), d['data'].items()))
     return f'[CQ:{type}{data}]'
+
+
+def save_pic(text):
+    def f(m:re.Match):
+        cq = m.group(0)
+        CQ = load(cq)
+        if CQ['type']=='image':
+            reply = connect.call_api('download_file',url=CQ['data'].get('url'))
+            if reply['retcode']==0:
+                return dump({
+                    'type':'image',
+                    'data':{
+                        'file':'../cache/'+os.path.split(reply['data']['file'])[1]
+                    }
+                })
+            else:
+                print('warning: 图片下载失败')
+        return cq
+    return re_CQ.sub(f,text)
