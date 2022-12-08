@@ -326,10 +326,9 @@ def formats_link(link:dict, mode=0):
         lst[0] += (' while'
             +''.join(f' {name} fail' for name in link['while']['fail'])
             +''.join(f' {name} succ' for name in link['while']['succ']))
-        lst.append('    cond')
-        lst.append(str_tool.addtab(link['cond'],tab='        '))
-        lst.append('    action')
-        lst.append(str_tool.addtab(link['action'],tab='        '))
+        lst.append(link['cond'])
+        lst.append('===')
+        lst.append(link['action'])
     return '\n'.join(lst)
 
 
