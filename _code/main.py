@@ -208,9 +208,12 @@ def recv(msg:dict):
                     if not cache.any_same(msg, '!'):
                         send('权限不足(一定消息内将不再提醒)',**msg)
                     return
-                s = os.popen(text[1:]).read()
-                if not s=='':
-                    send(s, **msg)
+                @to_thread
+                def f(code):
+                    s = os.popen(cq.unescape2(code)).read()
+                    if not s=='':
+                        send(cq.escape2(s), **msg)
+                f(text[1:])
             elif cmd_py.links:
                 print('进入links')
                 cmd_py.exec_links()
