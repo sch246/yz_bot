@@ -54,7 +54,7 @@ def request_to_json(msg: str) -> dict | None:
 
 def recv_msg() -> dict | None:
     Client, _ = ListenSocket.accept()
-    Request = Client.recv(2048).decode(encoding='utf-8')
+    Request = Client.recv(8192).decode(encoding='utf-8')
     rev_json = request_to_json(Request)
     # 发送信号表示我收到了
     Client.sendall(HttpResponseHeader.encode(encoding='utf-8'))
