@@ -180,7 +180,7 @@ def any_same(msg:dict, f:Callable|str, i=None):
     log_lst = getlog(msg)
     if not (i is None):
         i += 1
-    return any(f(m) for m in log_lst[1:i])
+    return any(new_func(m) for m in log_lst[1:i])
 
 def get_one(msg:dict, f:Callable, i=None):
     if not (i is None):
