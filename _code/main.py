@@ -209,11 +209,18 @@ def recv(msg:dict):
                         send('权限不足(一定消息内将不再提醒)',**msg)
                     return
                 @to_thread
-                def f(code):
-                    s = os.popen(cq.unescape2(code)).read()
-                    if not s=='':
-                        send(cq.escape2(s), **msg)
-                f(text[1:])
+                def observer(cmd, timeout):
+                    proc = subprocess.Popen(args=cmd,shell=True,encoding='utf-8'
+                            , stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    try:
+                        proc.wait(timeout)
+                        s = cq.escape2(proc.stdout.read()).strip()
+                        send(s,**msg)
+                    except subprocess.TimeoutExpired:
+                        send('超时',**msg)
+                        proc.kill()
+                        proc.wait()
+                observer(cq.unescape2(text[1:]), 5)
             elif cmd_py.links:
                 print('进入links')
                 cmd_py.exec_links()
