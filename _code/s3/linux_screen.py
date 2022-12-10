@@ -29,7 +29,7 @@ def start(name):
 def send(name, command):
     logpath = _logpath(name)
     file.write(logpath, '')
-    command = command.replace('"','\\"')
+    command = command.replace('"','\\"').replace('\\','\\\\').replace('`','\\`').replace('$',r'\\\$')
     os.system(f'''screen -S {name} -X stuff "{command}\n"''')
     # s=''
     # while s=='':
