@@ -152,24 +152,15 @@ def _recv_time_counter():
         elif k!=0:
                 print(f'█{k}|{j}.{i}')
 
-reply_cq = re.compile(r'^(\[CQ:reply,[^\]]+\])\s*([\S\s]*)')
-at_cq = re.compile(r'^(\[CQ:at,[^\]]+\])\s*([\S\s]*)')
+reply_cq = re.compile(r'^(\[CQ:reply,[^\]]+\])(\[CQ:at,[^\]]+\])\s*([\S\s]*)')
 def _strip_reply(msg):
         message = msg['message']
-        msg['reply_cq'] = None
+        msg['reply'] = None
         msg['at_cq'] = []
         m = reply_cq.match(message)
         if m:
-                reply, message = m.groups()
-                msg['reply_cq'] = reply
-                m = at_cq.match(message)
-                if m:
-                        at, message = m.groups()
-                        msg['at_cq'].append(at)
-        m = at_cq.match(message)
-        if m:
-                at, message = m.groups()
-                msg['at_cq'].append(at)
+                reply, at, message = m.groups()
+                msg['reply'] = {'reply':reply, 'at':at}
         msg['message'] = message
         return msg
 

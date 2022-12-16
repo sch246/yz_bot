@@ -39,6 +39,7 @@ def _gen_f(loc):
             else:
                 var = r'\S+'
         else:
+            # 如果有冒号
             name = m.group(1)
             try:
                 var = eval(m.group(2), loc)

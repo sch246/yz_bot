@@ -1,4 +1,5 @@
-'''色图'''
+'''色图
+使用的api:https://api.lolicon.app/#/setu'''
 import re
 from main import jcurl, cq,sendmsg
 

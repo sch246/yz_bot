@@ -1,4 +1,5 @@
-'''kemomimi!'''
+'''kemomimi!
+使用的api:https://api.moedog.org/pixiv/v2.html'''
 from random import randint
 import re
 import time

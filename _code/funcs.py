@@ -6,6 +6,21 @@ import bot.cache as cache
 
 from main import storage, connect, cmds, cq, send, recv
 
+#-----------------------------------------------
+#----------------------------------------
+
+# 用于.link re的捕获类型设置，举例: {a:Int}
+Int = r'(?:0|-?[1-9]\d*)'
+Name = r'\w+'
+Param = r'\S+'
+All = r'[\S\s]+'
+CQ = r'\[CQ:[^,\]]+(?:,[^,=]+=[^,\]]+)*\]'
+def CQ_at(qq):
+        '''要获取bot的qq匹配可以用CQ_at(cache.qq)'''
+        return fr'\[CQ:at,qq={qq}\]'
+#----------------------------------------
+#-----------------------------------------------
+
 def match(s:str):
         '''判断当前的消息是否通过某正则表达式，当前消息必须为文本消息'''
         msg = cache.thismsg()
@@ -141,6 +156,10 @@ def curl(url):
 
 def jcurl(url):
         return json.loads(curl(url))
+
+def ls(obj):
+    '''配合dir(), keys(), vars, __dict__等'''
+    return '\n'.join(sorted(list(map(str,obj))))
 
 def rd(r,d):
         '''掷骰子'''
