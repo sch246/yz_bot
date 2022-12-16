@@ -2,14 +2,22 @@
 
 import socket
 import json
-
+import sys
 import requests
 
 # https://blog.csdn.net/qq_27694835/article/details/108613607
 # Requests 模块 https://www.cnblogs.com/saneri/p/9870901.html
 
-url = 'http://127.0.0.1:5700'
-listen = ('127.0.0.1', 5701)
+try:
+    i = sys.argv[1:].index('-p0')
+    url = f'http://127.0.0.1:{sys.argv[1:][i+1]}'
+except:
+    url = 'http://127.0.0.1:5700'
+try:
+    i = sys.argv[1:].index('-p1')
+    listen = ('127.0.0.1', int(sys.argv[1:][i+1]))
+except:
+    listen = ('127.0.0.1', 5701)
 
 def call_api(action: str, **params) -> dict:
     headers = {

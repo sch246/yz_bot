@@ -11,6 +11,8 @@ if any(c in sys.argv[1:] for c in ['-h','--help','help']):
     --auto_reboot   同上
     -l              仅记录log
     --log_only      同上
+    -p0 5700        发送端口
+    -p1 5701        监听端口
     debug           debug模式(并没有什么区别)''')
     exit()
 
