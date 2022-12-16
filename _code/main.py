@@ -235,6 +235,8 @@ def recv(msg:dict):
         print(f'[{time.strftime(r"%H:%M:%S")}]【收到消息】',end='')
         cache.thismsg(msg)
         chatlog.write(msg)
+        if any(c in sys.argv[1:] for c in ['-l','log_only']):
+                return
 
         if is_msg(msg):
                 msg = _strip_reply(msg)
