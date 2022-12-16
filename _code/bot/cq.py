@@ -16,7 +16,6 @@ escape_dic2={ # CQ码外的转义
     ']':'&#93;'
 }
 
-
 def escape(text: str):
     '''将正常文本转义成CQ码的一团'''
     return str_tool.replace_by_dic(text, escape_dic)
@@ -66,6 +65,12 @@ def dump(d:dict):
     data = ''.join(map(lambda x:','+escape(f'{x[0]}={x[1]}'), d['data'].items()))
     return f'[CQ:{type}{data}]'
 
+
+def cq(type, **data):
+    return dump({
+        'type':type,
+        'data':data
+    })
 
 def url2cq(url):
     reply = connect.call_api('download_file',url=url)
