@@ -154,9 +154,7 @@ bot 需要 python 3.10 或更高的版本
 
 ![](https://s2.loli.net/2022/10/18/PgZprRhvBbAG4Yj.png)
 
-## 使用
-
-- https://www.sch246.com/yz_bot/start
+## [使用](/md/use.md)
 
 ## 维护者
 

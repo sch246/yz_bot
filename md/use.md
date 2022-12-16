@@ -235,7 +235,7 @@ cond 和 action 可以和其它的在一条命令内同时完成设置，也可�
 
 while 可以设置它在哪条 link 通过或未通过时执行，当没有 while 参数时，将不会改变原有 link 的 while，否则会覆盖
 
-::: details 当使用`py`时
+<details><summary>当使用`py`时</summary>
 
 `cond`和`action`作为 py 代码解析
 
@@ -245,9 +245,9 @@ cond 会以最后一行作为表达式求布尔值作为判断依据，action则
 
 action 紧挨着 cond 成功时执行，原则上不允许 conds 使用 send,recv 和 do_action 等干涉自身的函数
 
-:::
+</details>
 
-::: details 当使用`re`时
+<details><summary>当使用`re`时</summary>
 
 `cond`和`action`分别作为特殊的正则表达式和特殊的 py 代码解析
 
@@ -279,7 +279,7 @@ action 紧挨着 cond 成功时执行，原则上不允许 conds 使用 send,rec
 
 最后一行作为表达式返回
 
-:::
+</details>
 
 使用`get`可以得到一个 link 的信息，不包括它能触发哪些 links(这在`list`里有显示)，可以据此便捷重设这个 link
 
