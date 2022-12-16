@@ -377,13 +377,13 @@ setname('{:name}')
 
 随机色图，由于真的会把 r18 图片发(不)出来所以注意风控
 
-### [.js](/_code/bot/cmds/js.py)
+### [.js](/_code/bot/cmds/js.py)(需要权限)
 
 运行 JavaScript 代码，需要服务器上面安装了 screen 和 node
 
 基于 node 的 [REPL](https://www.bing.com/search?q=REPL)
 
-### [.nim](/_code/bot/cmds/nim.py)
+### [.nim](/_code/bot/cmds/nim.py)(需要权限)
 
 运行 nim 代码，需要服务器上面安装了 nim
 
