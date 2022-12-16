@@ -5,28 +5,76 @@ import time
 
 from main import storage, is_msg, getname, getgroupname, read_params, getran, cache, cq
 
-cave = storage.get('','cave')
-cave_pool = storage.get('','cave_pool',list)
-last = int(list(cave.keys())[-1]) if cave else -1
+class Cave:
+    def __init__(self) -> None:
+        items = storage.get('','cave').items()
+        items = sorted(items,key=lambda item:int(item[0]))
+        self.msgs = dict(items)
+        storage.get_namespace('')['cave'] = self.msgs
+        self.pool = storage.get('','cave_pool',list)
+    def index(self, i:str=''):
+        '''从随机池获取index，抽出后有2/3的概率在随机池消失，随机池抽完后会重置'''
+        if i == '':
+            if not self.pool:
+                self.pool.extend(self.msgs.keys()) #需要确保在原地改动
+            idx, i = getran(self.pool, True)
+            if randint(0,2):
+                del self.pool[idx] # 按照概率删掉
+        if i.startswith('-'):
+            keys = list(self.msgs.keys())
+            i = keys[int(i)+len(keys)] # 如果负数在范围内，则通过
+        return i
+    def empty(self):
+        '''获取空位的index'''
+        keys = list(self.msgs.keys())
+        keys.sort(key=lambda s:int(s))
+        last = int(keys[-1]) if self.msgs else -1
+        for i in range(0,last+2):
+            if i>=len(keys) or not str(i)==keys[i] and str(i) not in keys:
+                break
+        return str(i)
+    def last(self):
+        '''获取最后一个自己设置的cave的index'''
+        qq = cache.thismsg()['user_id']
+        caves = list(filter(lambda m:qq==m[1].get('qq'),self.msgs.items()))
+        if not caves:
+            return
+        else:
+            return caves[-1][0]
+    def get(self, i:str):
+        '''根据索引返回值'''
+        if not self.msgs:
+            return '回声洞是空的！'
+        if not self.msgs.get(i):
+            return '该条消息不存在！'
+        s = self.msgs[i]
+        if s.get('group'):
+            return f"{i}:\n{s['text']}\n    ——{s['sender']} 于 {s['group']}，\n  {s['time']}"
+        else:
+            return f"{i}:\n{s['text']}\n    ——{s['sender']} 于 {s['time']}"
+    def delete(self, i:str):
+        if not self.msgs:
+            return '回声洞是空的！'
+        if not self.msgs.get(i):
+            return '该条消息不存在！'
+        user_id = cache.thismsg()['user_id']
+        if not (user_id in cache.ops or user_id==self.msgs[i].get('qq')):
+            return '删除其他人的回声洞需要op'
+        del self.msgs[i]
+        self.pool.remove(i)
+        return f'序号 {i} 删除成功'
+    def set(self, i:str, text:str):
+        self.msgs[i] = {
+            'sender':cq.save_pic(getname()),
+            'qq':cache.thismsg()['user_id'],
+            'group':getgroupname(),
+            'time':time.strftime('%Y-%m-%d %H:%M'),
+            'text':cq.save_pic(text),
+        }
+        self.pool.append(i)
+        return f'已添加，序号 {i}'
 
-def ran_index() -> str:
-    global cave_pool
-    if not cave_pool:
-        cave_pool.extend(cave.keys())
-    idx, i = getran(cave_pool, True)
-    if randint(0,2):
-        del cave_pool[idx]
-    return i
-
-def get_ne(i):
-    if i == '-1':
-        i = str(last)
-    else:
-        keys = list(cave.keys())
-        if int(i) >= -len(keys):
-            i = keys[int(i)]
-    return i
-
+cave  = Cave()
 re_int = re.compile(r'(-?\d+)$')
 
 def run(body:str):
@@ -37,23 +85,20 @@ def run(body:str):
  : <msg>    # 放入一条消息
  | || <msg> # 放入一条消息
 .cave del [<id:int>] # 删除一条消息，默认为上一条消息'''
-    try:
-        s, last = read_params(body)
-    except SyntaxError as e:
-        return e.text
-    if not s:
-        return _get(ran_index())
-    elif re_int.match(s):
-        return _get(s)
+    s, last = read_params(body)
+    if not s or re_int.match(s):
+        return cave.get(cave.index(s))
     elif s=='del':
         if not last.strip():
-            i = '-1'
+            i = cave.last()
+            if i is None:
+                return '没有找到你设置的回声洞'
         else:
             s, last = read_params(last)
             if not re_int.match(s):
                 return run.__doc__
             i = s
-        return _del(i)
+        return cave.delete(cave.index(i))
     elif s=='add':
         text = last.strip()
         if not text:
@@ -61,48 +106,5 @@ def run(body:str):
             if not is_msg(reply):
                 return '非消息，执行终止'
             text = reply['message']
-        return _add(text)
+        return cave.set(cave.empty(),text)
     return run.__doc__
-
-def _get(i:str):
-    if not cave:
-        return '回声洞是空的！'
-    if i.startswith('-'):
-        i = get_ne(i)
-    if not cave.get(i):
-        return '该条消息不存在！'
-    s = cave[i]
-    if s.get('group'):
-        return f"{i}:\n{s['text']}\n    ——{s['sender']} 于 {s['group']}，\n  {s['time']}"
-    else:
-        return f"{i}:\n{s['text']}\n    ——{s['sender']} 于 {s['time']}"
-
-def _del(i:str):
-    if not cave:
-        return '回声洞是空的！'
-    if i.startswith('-'):
-        i = get_ne(i)
-    if not cave.get(i):
-        return '该条消息不存在！'
-    user_id = cache.get_last()['user_id']
-    if not (user_id in cache.ops or user_id==cave[i].get('qq')):
-        return '删除其他人的回声洞需要op'
-    global last
-    if i == str(last):
-        last -= 1
-    del cave[i]
-    return f'序号 {i} 删除成功'
-
-def _add(text:str):
-    global last
-    last += 1
-    i = str(last)
-    cave[i] = {
-        'sender':cq.save_pic(getname()),
-        'qq':cache.get_last()['user_id'],
-        'group':getgroupname(),
-        'time':time.strftime('%Y-%m-%d %H:%M'),
-        'text':cq.save_pic(text),
-    }
-    cave_pool.append(i)
-    return f'已添加，序号 {i}'

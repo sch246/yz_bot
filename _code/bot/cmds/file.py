@@ -27,7 +27,7 @@ def run(body:str):
  | set <文件路径> [-y/-f:是否覆盖已有文件] || <文件>
 <文件> || .file to <文件路径> [-y/-f:是否覆盖已有文件]
 '''
-    msg = cache.get_last()
+    msg = cache.thismsg()
     if not msg['user_id'] in cache.ops:
         if not cache.any_same(msg, r'\.file'):
             return '权限不足(一定消息内将不再提醒)'
@@ -113,7 +113,7 @@ def _write(path, start, end, lines):
         return e
 
 def _send_file(path):
-    msg = cache.get_last()
+    msg = cache.thismsg()
     path = os.path.abspath(path)
     if not os.path.isfile(path):
         return f'打开失败，文件"{path}"不存在'
@@ -150,7 +150,7 @@ def download(url, path, msg):
 def recv_img(_msg, path):
     if not is_img(_msg):
         return '目标msg不是单个图片'
-    download(cq.load(_msg['message'])['data']['url'], path, cache.get_last())
+    download(cq.load(_msg['message'])['data']['url'], path, cache.thismsg())
     return f'正在将图片保存到\n{path}'
 
 def _recv_file(file_msg, path):
@@ -189,7 +189,7 @@ def _set(path, is_force):
 
 
 def _to(path, is_force):
-    file_msg = cache.get_one(cache.get_last(), is_file, 10)# 接收10条消息以内任何人发的文件
+    file_msg = cache.get_one(cache.thismsg(), is_file, 10)# 接收10条消息以内任何人发的文件
     if not file_msg:
         return '10条消息内没有文件'
     if is_force or not os.path.exists(path):

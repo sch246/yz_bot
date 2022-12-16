@@ -25,7 +25,7 @@ def run(body:str):
     '''用于管理权限
     格式: .op [del] (<qq号:int> | <at某人:cq[at]>)+ 可换行
     警告: op可以给予任何人op, 或者删除任何master外的人的op, 请谨慎给予'''
-    msg = cache.get_last()
+    msg = cache.thismsg()
     if not msg['user_id'] in cache.ops:
         if not cache.any_same(msg, r'\.op'):
             return '权限不足(一定消息内将不再提醒)'

@@ -12,13 +12,12 @@ except:
     pass
 
 def _input(s:str='',recv_all=False):
-    msg = currentframe().f_back.f_locals['msg']
     q = Queue()
-    msg_loc = msg_id(msg)
+    msg_loc = msg_id(cache.thismsg())
     catches = cache.get('catches')
     catches[msg_loc] = q
     if s!='':
-        send(s, **msg)
+        sendmsg(s)
     r =  q.get(block=True)
     if not recv_all:
         if is_msg(r):
@@ -28,10 +27,9 @@ def _input(s:str='',recv_all=False):
 
 def _print(*values, sep=' ', end='\n', file=None,flush=False):
     if file is None:
-        msg = currentframe().f_back.f_locals['msg']
-        send(sep.join(map(str,values)), **msg)
+        sendmsg(sep.join(map(str,values)))
     else:
-        print(*values, sep,end, file, flush)
+        print(*values, sep, end, file, flush)
 
 loc = {**globals()}
 # 修改input和print
@@ -45,12 +43,11 @@ def run(body:str):
     默认情况下是临时环境，会在下一次重启后消失
     当最后一行以###开头时，代码将会在每次开启bot时被运行，注意不要写依赖于临时环境的代码
 格式: .py <code:pycode>'''
-    global msg
-    msg = cache.get_last()
+    msg = cache.thismsg(cache.get_last())
     loc.update(globals())
     if not msg['user_id'] in cache.ops:
         if not cache.any_same(msg, '\.py'):
-            send('权限不足(一定消息内将不再提醒)', **msg)
+            sendmsg('权限不足(一定消息内将不再提醒)')
         return
     body = cq.unescape(body.strip())
     if body=='':
@@ -61,15 +58,15 @@ def run(body:str):
         last = lst[-1].strip()
         if last.startswith('###'):
             file.add('data/pyload.py', '\n'+body)
-            send('添加成功', **msg)
+            sendmsg('添加成功')
         elif last.startswith('#'):
             return
         else:
             out = eval(last, loc)
             if out is not None:
-                send(out, **msg)
+                sendmsg(out)
     except:
-        send(''.join(traceback.format_exc().splitlines(True)[3:]).strip(), **msg)
+        sendmsg(''.join(traceback.format_exc().splitlines(True)[3:]).strip())
 
 #-----------------------------------------------
 #----------------------------------------
@@ -102,13 +99,13 @@ listdir = cmds.modules['file'].listdir
 
 def same_times(f:Callable|str, i=None):
     '''用all筛选最近的i条消息，不包括本条消息，设为None则是筛选全部消息'''
-    return cache.same_times(cache.get_last(), f, i)
+    return cache.same_times(cache.thismsg(), f, i)
 def any_same(f:Callable|str, i=None):
     '''用any筛选最近的i条消息，不包括本条消息，设为None则是筛选全部消息'''
-    return cache.any_same(cache.get_last(), f, i)
+    return cache.any_same(cache.thismsg(), f, i)
 def get_one(f:Callable, i=None):
     '''获取最近的一条满足条件的消息，不包括本条消息'''
-    return cache.get_one(cache.get_last(), f, i)
+    return cache.get_one(cache.thismsg(), f, i)
 
 # def recv_img(_msg, path):
 #     if not is_img(_msg):
@@ -202,8 +199,7 @@ def run_or_remove(linklst:list):
 # def setroot():
 @to_thread
 def exec_links():
-    global msg
-    msg = cache.get_last()
+    cache.thismsg(cache.get_last())
     loc.update(globals())
     exec_link(links[0])
 
@@ -247,7 +243,7 @@ def exec_link_py(cond, action):
             out = eval(last, loc)
 
     except:
-        print(''.join(traceback.format_exc().splitlines(True)[3:]))
+        sendmsg(''.join(traceback.format_exc().splitlines(True)[3:]))
     if out:
         _run_action_py(action, loc)
     return out
@@ -262,7 +258,7 @@ def _run_action_py(action, _loc):
     try:
         exec(action, _loc)
     except:
-        print(''.join(traceback.format_exc().splitlines(True)[3:]))
+        sendmsg(''.join(traceback.format_exc().splitlines(True)[3:]))
 
 
 # exec re-------------------------------------------------
@@ -270,6 +266,7 @@ def _run_action_py(action, _loc):
 # t = re.compile(r'({([^:}]*):([^}]+)}|{([^:}]+)})')
 
 def exec_link_re(cond, action):
+    msg = cache.thismsg()
     cond = cq.unescape(cond) # cond仅经过了一次strip
     if cond=='':
         return True
@@ -297,9 +294,9 @@ def _run_action_re(action, _loc, names:dict):
         else:
             out = eval(last, _loc)
         if out is not None:
-            send(out, **msg)
+            sendmsg(out)
     except:
-        print(''.join(traceback.format_exc().splitlines(True)[3:]))
+        sendmsg(''.join(traceback.format_exc().splitlines(True)[3:]))
 
 #-------------------------------------------------
 
@@ -334,8 +331,7 @@ def formats_link(link:dict, mode=0):
 
 
 def catch_links(_msg):
-    global msg
-    msg = _msg
+    cache.thismsg(_msg)
     names = []
     ends = []
     catch_link(links[0], names, ends)
