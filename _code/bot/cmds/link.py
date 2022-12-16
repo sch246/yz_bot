@@ -38,7 +38,7 @@ def run(body:str):
 那么就是默认情况，会放到列表开头，并且将fail指向原来的开头link
 这样会形成列表结构
 '''
-    msg = cache.get_last()
+    msg = cache.thismsg()
     if not msg['user_id'] in cache.ops:
         if not cache.any_same(msg, '\.link'):
             return '权限不足(一定消息内将不再提醒)'
@@ -87,7 +87,7 @@ def run(body:str):
         return _list()
     elif s=='catch':
         if last.lstrip():
-            reply = {**cache.get_last(), 'message':last.lstrip()}
+            reply = {**cache.thismsg(), 'message':last.lstrip()}
         else:
             reply = yield '输入想筛选的文本'
         return _catch(reply)

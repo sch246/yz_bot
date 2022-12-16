@@ -4,7 +4,7 @@ import os
 from main import cache, cq, screen, str_tool
 
 def run(body:str):
-    msg = cache.get_last()
+    msg = cache.thismsg()
     body = cq.unescape(body.strip())
 
     if not msg['user_id'] in cache.ops:

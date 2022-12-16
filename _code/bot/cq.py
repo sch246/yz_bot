@@ -67,20 +67,27 @@ def dump(d:dict):
     return f'[CQ:{type}{data}]'
 
 
+def url2cq(url):
+    reply = connect.call_api('download_file',url=url)
+    if reply['retcode']==0:
+        return dump({
+            'type':'image',
+            'data':{
+                'file':'../cache/'+os.path.split(reply['data']['file'])[1]
+            }
+        })
+    else:
+        raise Exception('warning: 图片下载失败')
+
+
 def save_pic(text):
     def f(m:re.Match):
         cq = m.group(0)
         CQ = load(cq)
         if CQ['type']=='image':
-            reply = connect.call_api('download_file',url=CQ['data'].get('url'))
-            if reply['retcode']==0:
-                return dump({
-                    'type':'image',
-                    'data':{
-                        'file':'../cache/'+os.path.split(reply['data']['file'])[1]
-                    }
-                })
-            else:
-                print('warning: 图片下载失败')
+            try:
+                return url2cq(CQ['data'].get('url'))
+            except:
+                return cq
         return cq
     return re_CQ.sub(f,text)

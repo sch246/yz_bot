@@ -5,7 +5,7 @@ from main import file, send, cache
 
 
 def run(body:str):
-    msg = cache.get_last()
+    msg = cache.thismsg()
     if not msg['user_id'] in cache.ops:
         if not cache.any_same(msg, r'\.reboot'):
             return '权限不足(一定消息内将不再提醒)'

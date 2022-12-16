@@ -13,7 +13,7 @@ def run(body:str):
         : get <name:str>
         | list'''
     global msg
-    msg = cache.get_last()
+    msg = cache.thismsg()
 
     cqs = cq.find_all(body)
 

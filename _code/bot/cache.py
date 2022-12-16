@@ -99,6 +99,16 @@ def add_self_msg(msg):
 def get_last():
     return msgs['last']
 
+msgs_this = {}
+
+def thismsg(msg=None):
+    import threading
+    ident = threading.get_ident()
+    if msg is None:
+        return msgs_this[ident]
+    else:
+        msgs_this[ident] = msg
+        return msg
 
 # 保存和读取msgs，每个人每个群不会超过256条，所以不用担心无限增长的问题
 import atexit
@@ -199,3 +209,5 @@ def get(name, type=dict):
 
 def set(name,value):
     globals()[name] = value
+
+

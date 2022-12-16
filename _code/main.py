@@ -1,10 +1,12 @@
 '''大概是用来启动bot的主程序，不过直接从这里启动的话，bot将失去重启功能'''
 import re
 import sys,os
+import subprocess
 from typing import Generator
-import time,random
+import time
 from typing import Any
 from queue import Queue
+from inspect import getgeneratorstate, GEN_CREATED
 
 
 from s3 import *
@@ -38,334 +40,248 @@ import bot.chatlog as chatlog
 
 
 def msg_id(msg:dict):
-    return (msg.get('group_id'), msg['user_id'])
+        return (msg.get('group_id'), msg['user_id'])
 
 
 def first_start():
-    '''第一次加载'''
-    config.init_config()
-    print('未检测到config，第一次加载中')
-    from random import randint
-    check = randint(0, 9999)
-    print(f'私聊bot验证码以确定master: {check:04d}')
-    while True:
-        msg = connect.recv_msg()
-        if is_msg(msg):
-            if msg['message'] == f'{check:04d}':
-                master = msg['user_id']
-                config.save_config([master],'ops')
-                send('已成为管理员', user_id=master)
-                break
-    time.sleep(0.3)
-    send('请输入对bot的昵称，不要包含单引号', user_id=master)
-    while True:
-        msg = connect.recv_msg()
-        if is_msg(msg) and msg['user_id']==master:
-            name = msg['message']
-            if "'" not in name:
-                config.save_config([name],'nicknames')
-                send(f'昵称已设置为【{name}】', user_id=master)
-                break
-            send('请输入对bot的昵称，不要包含单引号', user_id=master)
-    time.sleep(0.3)
-    send('设置完毕！', user_id=master)
+        '''第一次加载'''
+        config.init_config()
+        print('未检测到config，第一次加载中')
+        from random import randint
+        check = randint(0, 9999)
+        print(f'私聊bot验证码以确定master: {check:04d}')
+        while True:
+                msg = connect.recv_msg()
+                if is_msg(msg) and msg['message'] == f'{check:04d}':
+                        master = msg['user_id']
+                        config.save_config([master],'ops')
+                        send('已成为管理员', user_id=master)
+                        break
+        time.sleep(0.3)
+        while True:
+                send('请输入对bot的昵称，不要包含单引号', user_id=master)
+                msg = connect.recv_msg()
+                if not is_msg(msg) or not msg['user_id']==master:
+                        continue
+                name = msg['message'].strip()
+                if "'" not in name:
+                        config.save_config([name],'nicknames')
+                        send(f'昵称已设置为【{name}】', user_id=master)
+                        break
+        time.sleep(0.3)
+        send('设置完毕！', user_id=master)
 
 def _init_self():
-    # 加载设置
-    if not os.path.isfile('config.json'):
-        first_start()
-    cache.ops_load()
-    cache.nicknames_load()
+        # 加载设置
+        if not os.path.isfile('config.json'):
+                first_start()
+        cache.ops_load()
+        cache.nicknames_load()
 
-    login_info = connect.call_api('get_login_info')['data']
-    qq, name = login_info['user_id'], login_info['nickname']
-    cache.set('qq',qq)
-    cache.set('name',name)
-    cache.set('names',set([*cache.nicknames,name]))
-    cache.update_user_name(qq, name)
-    print(f'{name}({qq})启动了！')
-    if 'auto_reboot' in sys.argv[1:]:
-        print('自动重启已开启')
-    if 'debug' in sys.argv[1:]:
-        print('debug模式')
+        login_info = connect.call_api('get_login_info')['data']
+        qq, name = login_info['user_id'], login_info['nickname']
+        cache.set('qq',qq)
+        cache.set('name',name)
+        cache.set('names',set([*cache.nicknames,name]))
+        cache.update_user_name(qq, name)
+        print(f'{name}({qq})启动了！')
+        if 'auto_reboot' in sys.argv[1:]:
+                print('自动重启已开启')
+        if 'debug' in sys.argv[1:]:
+                print('debug模式')
 
 @to_thread
 def send(text: Any, user_id: int | str = None, group_id: int | str = None, **params) -> dict:
-    '''user_id或者group_id是必须的'''
-    debug('【准备发送消息】')
-    text = str(text)
+        '''user_id或者group_id是必须的'''
+        debug('【准备发送消息】')
+        text = str(text)
 
-    if 'message' in params.keys():
-        # 防止message在下面的call_api撞车
-        del params['message']
-    if user_id is None and group_id is None:
-        raise Exception('至少输入一个id!')
-    if group_id:
-        # 当仅同时传入group和user时保证是群聊
-        user_id = None
+        if 'message' in params.keys():
+                # 防止message在下面的call_api撞车
+                del params['message']
+        if user_id is None and group_id is None:
+                raise Exception('至少输入一个id!')
+        if group_id:
+                # 当仅同时传入group和user时保证是群聊
+                user_id = None
 
-    call = connect.call_api('send_msg', message=text, user_id=user_id, group_id=group_id, **params)
-    if not call['retcode'] == 0:
-        print('发送消息失败 '+call['wording'])
-        send('发送消息失败\n'+call['wording'], user_id, group_id)
-        return
+        call = connect.call_api('send_msg', message=text, user_id=user_id, group_id=group_id, **params)
+        if not call['retcode'] == 0:
+                print('发送消息失败 '+call['wording'])
+                send('发送消息失败\n'+call['wording'], user_id, group_id)
+                return
 
-    #------以下是获取自身发送的消息，并且记录下来------#
+        #------以下是获取自身发送的消息，并且记录下来------#
 
-    call2 = connect.call_api('get_msg', message_id=call['data']['message_id'])
-    if not call2['retcode'] == 0:
-        print('获取发送的消息失败'+call2['wording'])
-        return
-    self_msg = call2['data']
+        call2 = connect.call_api('get_msg', message_id=call['data']['message_id'])
+        if not call2['retcode'] == 0:
+                print('获取发送的消息失败'+call2['wording'])
+                return
+        self_msg = call2['data']
 
-    if group_id is None:
-        self_msg['user_id'] = user_id
-    else:
-        self_msg['user_id'] = self_msg['sender']['user_id']
+        if group_id is None:
+                self_msg['user_id'] = user_id
+        else:
+                self_msg['user_id'] = self_msg['sender']['user_id']
 
-    print(f'[{time.strftime(r"%H:%M:%S")}]【发送消息】',end='')
-    chatlog.write(self_msg)
+        print(f'[{time.strftime(r"%H:%M:%S")}]【发送消息】',end='')
+        chatlog.write(self_msg)
 
-
-
-# 对命令返回值的处理
-def cmd_ret(ret, msg):
-    if isinstance(ret, Generator):
-        catches = cache.get('catches') # 对每个输入区域的检测
-        msg_loc = msg_id(msg)
-        try:
-            if msg_loc not in catches.keys():
-                cmd_ret(next(ret), msg)
-                catches[msg_loc] = ret
-            else:
-                cmd_ret(ret.send(msg), msg)
-        except StopIteration as e:
-            catches.pop(msg_loc,None)
-            cmd_ret(e.value, msg)
-    elif not ret is None and not ret=='':
-        send(ret, **msg)
 
 i = 0
 j = 0
 k = 0
-reply_cq = re.compile(r'^(\[CQ:reply,[^\]]+\])([\S\s]*)')
-at_cq = re.compile(r'^(\[CQ:at,[^\]]+\])([\S\s]*)')
-def recv(msg:dict):
-    global i, j, k
 
-    cmd_py = cmds.modules['py']
-
-    if msg is None:
-        print('连接已断开')
-        time.sleep(1)
-        return
-    if not is_heartbeat(msg):
-        i, j, k = 0, 0, 0
-
-        if is_msg(msg):
-            m = reply_cq.match(msg['message'])
-            if m:
-                msg['reply_cq'] = m.group(1)
-                msg['message'] = m.group(2).lstrip()
-                m = at_cq.match(msg['message'])
-                if m:
-                    msg['at_cq'] = [m.group(1)]
-                    msg['message'] = m.group(2).lstrip()
-            m = at_cq.match(msg['message'])
-            if m:
-                msg.setdefault('at_cq',[])
-                msg['at_cq'].append(m.group(1))
-                msg['message'] = m.group(2).lstrip()
-
-        print(f'[{time.strftime(r"%H:%M:%S")}]【收到消息】',end='')
-        chatlog.write(msg)
-        msg_loc = msg_id(msg)
-
-
-        if is_msg(msg) and msg['message'].startswith('^'):
-            text = msg['message'][1:].rstrip()
-            if text in 'Cc':
-                del catches[msg_loc]
-
-        catches = cache.get('catches')
-        if catches.get(msg_loc):
-            c = catches[msg_loc]
-            if isinstance(c,Queue):
-                c.put(msg)
-                del catches[msg_loc]
-            else:
-                cmd_ret(c, msg)
-            return
-
-        if is_msg(msg):
-            text = msg['message']
-            # 执行命令
-            if text.startswith('.') and cmds.is_cmd(text[1:]):
-                cmd_ret(cmds.run(*cmds.is_cmd(text[1:])), msg)
-            # 执行bash
-            elif text.startswith('!'):
-                if not msg['user_id'] in cache.ops:
-                    if not cache.any_same(msg, '!'):
-                        send('权限不足(一定消息内将不再提醒)',**msg)
-                    return
-                @to_thread
-                def observer(cmd, timeout):
-                    proc = subprocess.Popen(args=cmd,shell=True,encoding='utf-8'
-                            , stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    try:
-                        proc.wait(timeout)
-                        s = cq.escape2(proc.stdout.read()).strip()
-                        send(s,**msg)
-                    except subprocess.TimeoutExpired:
-                        send('超时',**msg)
-                        proc.kill()
-                        proc.wait()
-                observer(cq.unescape2(text[1:]), 5)
-            elif cmd_py.links:
-                print('进入links')
-                cmd_py.exec_links()
-    else:
+def _recv_time_counter():
+        global i, j, k
         # 非常傻逼地用ijk作计时器，需要将心跳间隔设置为5s)
         # 虽然这玩意不准，不过用来大致度量时间还是可以的
         if i+j+k>0:
-            print(str_tool.LASTLINE,end='')
+                print(str_tool.LASTLINE,end='')
         i += 1
         if i==12:
-            j += 1
+                j += 1
         if j==60:
-            k += 1
+                k += 1
         i %= 12
         j %= 60
         if j==0 and k==0:
-            print(f'.{i}')
+                print(f'.{i}')
         elif j!=0 and k==0:
-            print(f'|{j}.{i}')
+                print(f'|{j}.{i}')
         elif k!=0:
-            print(f'█{k}|{j}.{i}')
+                print(f'█{k}|{j}.{i}')
+
+reply_cq = re.compile(r'^(\[CQ:reply,[^\]]+\])\s*([\S\s]*)')
+at_cq = re.compile(r'^(\[CQ:at,[^\]]+\])\s*([\S\s]*)')
+def _strip_reply(msg):
+        message = msg['message']
+        msg['reply_cq'] = None
+        msg['at_cq'] = []
+        m = reply_cq.match(message)
+        if m:
+                reply, message = m.groups()
+                msg['reply_cq'] = reply
+                m = at_cq.match(message)
+                if m:
+                        at, message = m.groups()
+                        msg['at_cq'].append(at)
+        m = at_cq.match(message)
+        if m:
+                at, message = m.groups()
+                msg['at_cq'].append(at)
+        msg['message'] = message
+        return msg
 
 
 
-
-def match(s:str):
-    '''判断当前的消息是否通过某正则表达式，当前消息必须为文本消息'''
-    msg = cache.get_last()
-    if is_msg(msg):
-        return re.match(s, msg['message'])
-
-def getlog(i=None):
-    '''获取这个聊天区域的消息列表，由于是cache存的，默认只会保存最多256条'''
-    msg = cache.get_last()
-    if i is None:
-        return cache.getlog(msg)
-    else:
-        return cache.getlog(msg)[i]
-
-def sendmsg(text,**_msg):
-    '''发送消息，就是可以省略后续参数而已'''
-    msg = cache.get_last()
-    if not _msg:
-        _msg = msg
-    send(text,**_msg)
-
-def recvmsg(text, sender_id:int=None, private=None, **kws):
-    '''不输入后面的参数时，默认是同一个人同一个位置的recv，否则可以设定对应的sender和group
-    私聊想模拟群内，只需要加group_id=xx
-    当在群内想模拟私聊时，需要设private为True'''
-    msg = cache.get_last()
-    if sender_id is None:
-        sender_id = msg['user_id']
-    if private is True:
-        msg = msg.copy()
-        del msg['group_id']
-    recv({**msg, 'user_id':sender_id, 'message':text,'sender':{'user_id': sender_id}, **kws})
-
-
-def getstorage(user_id=None):
-    '''获取个人的存储字典'''
-    msg = cache.get_last()
-    if user_id is None:
-        user_id = msg['user_id']
-    return storage.get('users',str(user_id))
-
-
-def getname(user_id=None, group_id=None):
-    '''获取名字，如果有设置名字就返回设置的名字，反正无论如何都会获得一个'''
-    msg = cache.get_last()
-    if user_id is None:
-        user_id = msg['user_id']
-    if group_id is None and is_group_msg(msg):
-        group_id = msg['group_id']
-    name = storage.get('users',str(user_id)).get('name')
-    if name:
-        return name
-    if is_group_msg(msg):
-        _, name = cache.get_group_user_info(group_id, user_id)
-    else:
-        name = cache.get_user_name(user_id)
-    return name
-
-def setname(name, user_id=None):
-    '''设置名字，将会把名字存进个人存储字典中，可以被获取名字的函数获取'''
-    msg = cache.get_last()
-    if user_id is None:
-        user_id = msg['user_id']
-    name = storage.get('users',str(user_id))['name'] = name
-    return name
-
-def getgroupname(group_id=None):
-    '''获取名字，如果有设置名字就返回设置的名字，反正无论如何都会获得一个'''
-    msg = cache.get_last()
-    if group_id is None and is_group_msg(msg):
-        group_id = msg['group_id']
-    if not group_id:
-        return
-    name = storage.get('groups',str(group_id)).get('name')
-    if name:
-        return name
-    else:
-        return cache.get_group_name(group_id)
-
-def setgroupname(name, group_id=None):
-    '''设置名字，将会把名字存进群存储字典中，可以被获取名字的函数获取'''
-    msg = cache.get_last()
-    if group_id is None:
-        group_id = msg['group_id']
-    if not group_id:
-        return
-    storage.get('groups',str(group_id))['name'] = name
-    return name
-
-
-def msglog(i=0):
-    '''按索引获取文本消息，不会获取到其它类型的信息，若索引超出范围则返回None
-    通常来讲默认会返回本条消息(本条消息肯定是文本啦)'''
-    _i = 0
-    for msg in getlog():
-        if is_msg(msg):
-            if _i == i:
-                return msg['message']
-            _i += 1
-
-def getran(lst:list, ret_idx=False):
-    '''随机取出列表中的元素'''
-    if lst:
-        idx = random.randint(0, len(lst)-1)
-        if ret_idx:
-            return idx, lst[idx]
+def _set_catches(value=None):
+        msg = cache.thismsg()
+        msg_loc = msg_id(msg)
+        catches = cache.get('catches')
+        if value is None:
+                catches.pop(msg_loc, None)
         else:
-            return lst[idx]
+                catches[msg_loc] = value
 
-def getint(s:str):
-    try:
-        return int(s)
-    except:
-        return
+def _iter_ret(gen):
+        '''获取generate的返回值，设置catches，并且发送msg过去'''
+        try:
+                if getgeneratorstate(gen)==GEN_CREATED:
+                        _set_catches(gen)
+                        return next(gen)
+                else:
+                        return gen.send(cache.thismsg())
+        except StopIteration as e:
+                _set_catches()
+                return e.value
 
-def getcmd(name:str):
-    return cmds.modules[name]
+def _cmd_ret(ret):
+        '''对命令返回值的处理'''
+        if ret is None or ret=='':
+                return
+        elif isinstance(ret, Generator):
+                _cmd_ret(_iter_ret(ret))
+        else:
+                sendmsg(ret)
+
+
+def _run_bash(msg):
+        text = msg['message']
+        if not check_op_and_reply():
+                return
+        @to_thread
+        def observer(cmd, timeout):
+                cache.thismsg(cache.get_last())
+                proc = subprocess.Popen(args=cmd,shell=True,encoding='utf-8'
+                                , stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                try:
+                        proc.wait(timeout)
+                        s = cq.escape2(proc.stdout.read()).strip()
+                        sendmsg(s)
+                except subprocess.TimeoutExpired:
+                        sendmsg('超时')
+                        proc.kill()
+                        proc.wait()
+        observer(cq.unescape2(text[1:]), 5)
+
+def recv(msg:dict):
+
+        cmd_py = cmds.modules['py']
+
+        if msg is None:
+                print('连接已断开')
+                time.sleep(1)
+                return
+
+        if is_heartbeat(msg):
+                _recv_time_counter()
+                return
+
+        global i, j, k
+        i, j, k = 0, 0, 0
+
+        print(f'[{time.strftime(r"%H:%M:%S")}]【收到消息】',end='')
+        cache.thismsg(msg)
+        chatlog.write(msg)
+
+        if is_msg(msg):
+                msg = _strip_reply(msg)
+
+
+        msg_loc = msg_id(msg)
+        if is_msg(msg) and msg['message'].startswith('^'):
+                text = msg['message'][1:].rstrip()
+                if text in 'Cc':
+                        del catches[msg_loc]
+
+        catches = cache.get('catches')
+        if catches.get(msg_loc):
+                c = catches[msg_loc]
+                if isinstance(c,Queue): # 在.py的input内使用
+                        c.put(msg)
+                        del catches[msg_loc]
+                else:
+                        _cmd_ret(c)
+                return
+
+        if is_msg(msg):
+                text = msg['message']
+                # 执行命令
+                if text.startswith('.') and cmds.is_cmd(text[1:]):
+                        _cmd_ret(cmds.run(*cmds.is_cmd(text[1:])))
+                # 执行bash
+                elif text.startswith('!'):
+                        _run_bash(msg)
+                elif cmd_py.links:
+                        print('进入links')
+                        cmd_py.exec_links()
+
+
+from funcs import *
 
 if __name__=="__main__":
-    _init_self()
-    cmds.load()
-    while True:
-        recv(connect.recv_msg())
+        _init_self()
+        cmds.load()
+        while True:
+                recv(connect.recv_msg())
