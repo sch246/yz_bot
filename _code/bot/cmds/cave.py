@@ -67,7 +67,7 @@ class Cave:
         self.msgs[i] = {
             'sender':cq.save_pic(getname()),
             'qq':cache.thismsg()['user_id'],
-            'group':getgroupname(),
+            'group':getgroupname() if cache.thismsg().get('group_id') else None,
             'time':time.strftime('%Y-%m-%d %H:%M'),
             'text':cq.save_pic(text),
         }
