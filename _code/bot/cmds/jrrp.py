@@ -34,6 +34,9 @@ def run(body:str):
                 if_show = False
         else:
             data['jrrp'] = str(r)
-        data['jrrp_date'] = date
+
+        if time.strftime('%m-%d')!='04-01':
+            # 4月1号人品不固定
+            data['jrrp_date'] = date
     if if_show:
         return data['jrrp']
