@@ -10,6 +10,7 @@ cond和action都是可执行的python代码, 但是环境不同, 执行流程是
 import re
 import os
 import traceback
+from main import data
 
 from .py import *
 
@@ -54,19 +55,21 @@ def run(body:str):
 
     if s in ['re','py']:
         name, _while, whiles = read_params(last, 2)
-        if _while=='while' and whiles:
-            params = whiles.strip().split(' ')
-            s = check_while(name, params)
-            if s:
-                return s
-        elif _while=='while':
-            params = ['']
-        elif _while:
+        if _while and _while != 'while':
+            # 设置了错误的参数
             return run.__doc__
+        elif not _while:
+            # 空参数
+            params = None
         else:
-            params = []
+            # 否则得到[]或者[...]
+            params = _params_from_whiles(whiles)
+            if (s:=check_while(name, params)):
+                return s
+
         link = get_link(name)
-        if params==['']:
+        if params==[]:
+            # 清空前确认
             if not link:
                 reply = yield '正在创建新link:\nwhile为空将无法被触发\n输入"y"以继续'
                 if not (is_msg(reply) and reply['message'].strip()=='y'):
@@ -75,8 +78,8 @@ def run(body:str):
                 reply = yield '正在编辑已有link:\n不在links开头且while为空将无法被触发\n输入"y"以继续'
                 if not (is_msg(reply) and reply['message'].strip()=='y'):
                     return '操作终止'
-        parts = '\n'.join(last_lines).split('\n===\n')
-        return _set(name, s, link, params, parts)
+        cond_and_action = '\n'.join(last_lines).split('\n===\n')
+        return _set(name, s, link, params, cond_and_action)
     elif s=='del':
         name, last = read_params(last)
         return _del(name)
@@ -148,14 +151,14 @@ def _set(name, type, link, params, parts):
     cond创建的命名组不进入.py的locals里
 while 可以设置它在哪条 link 通过或未通过时执行
 action 紧挨着 cond 成功时执行，原则上不允许 conds 使用 send,recv 和 do_action 等干涉自身的函数，这会影响到 catch 函数的准确性'''
-    if parts:
+    if parts[0]:
         cond = parts.pop(0)
     else:
         reply = yield '输入cond'
         if not is_msg(reply):
             return '操作终止'
         cond = reply['message'].strip()
-    if parts:
+    if parts[0]:
         action = parts.pop(0)
     else:
         reply = yield '输入action'
@@ -166,16 +169,47 @@ action 紧挨着 cond 成功时执行，原则上不允许 conds 使用 send,rec
     # 如果编辑的是已有的link，遍历
 
     if link:
-        if params:
-            if params==['']:
-                set_while(link, [])
-            else:
-                set_while(link, params)
-        link['type'] = type
-        link['cond'] = cond
-        link['action'] = action
-        return '修改成功'
-    elif not params:
+        return _edit(name, type, cond, action, params)
+    else:
+        return _add(name, type, cond, action, params)
+
+def _set2(name, type, cond, action, whiles=None):
+    '''while不输入则保持不变，设为''则清空链接，设为'a succ b fail'则设置链接'''
+    # 弃用正则匹配
+    cond = data.strip_re(cond)
+    if (get_link(name)):
+        # 如果已存在
+        return _edit(name, type, cond, action, _params_from_whiles(whiles))
+    else:
+        # 如果添加
+        return _add(name, type, cond, action, _params_from_whiles(whiles))
+
+def _params_from_whiles(whiles=None):
+    '''while不输入则保持不变，设为''则清空链接，设为'a succ b fail'则设置链接'''
+    if whiles is None:
+        return None
+    elif whiles == '':
+        return []
+    else:
+        return whiles.strip().split()
+
+def _edit(name, type, cond, action, params=None):
+    '''编辑已存在的链接
+    params为None保持不变，设为[]以清空连接，设为['a', 'succ', 'b','fail',...]以设置连接'''
+    link = get_link(name)
+    if params is not None:
+        set_while(link, params)
+    link['type'] = type
+    link['cond'] = cond
+    link['action'] = action
+    return '修改成功'
+
+
+def _add(name, type, cond, action, params=None):
+    '''添加链接
+    params为None将无法触发，设为[]以清空连接，设为['a', 'succ', 'b','fail',...]以设置连接'''
+    if params is None:
+        # 默认链接
         links.insert(0,{
             'name':name,
             'type':type,
@@ -189,6 +223,7 @@ action 紧挨着 cond 成功时执行，原则上不允许 conds 使用 send,rec
             connect_link(links[1]['name'], name, 'fail')
         return '创建成功'
     else:
+        # 如果添加自定义连接
         links.append({
             'name':name,
             'type':type,
@@ -198,13 +233,12 @@ action 紧挨着 cond 成功时执行，原则上不允许 conds 使用 send,rec
             'fail':[],
             'action':action,
         })
-        if params!=['']:
+        if params!=[]:
             for i in range(len(params)//2):
                 tar = params[2*i]
                 connect_type = params[2*i+1]
                 connect_link(name, tar, connect_type)
         return '创建成功'
-
 
 
 
