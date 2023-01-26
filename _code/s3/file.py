@@ -25,7 +25,7 @@ def ensure_file(path:str):
 def read(file_path, start_line=None, end_line=None):
     file_path = join(path, file_path)
     with open(file_path, 'r', encoding='utf-8') as f:
-        return '\n'.join(f.readlines()[start_line:end_line])
+        return ''.join(f.readlines()[start_line:end_line])
 
 
 def add(file_path, text):

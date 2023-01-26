@@ -242,13 +242,13 @@ def recv(msg:dict):
                 msg = _strip_reply(msg)
 
 
+        catches = cache.get('catches')
         msg_loc = msg_id(msg)
         if is_msg(msg) and msg['message'].startswith('^'):
                 text = msg['message'][1:].rstrip()
-                if text in 'Cc':
+                if text in 'Cc' and catches.get(msg_loc):
                         del catches[msg_loc]
 
-        catches = cache.get('catches')
         if catches.get(msg_loc):
                 c = catches[msg_loc]
                 if isinstance(c,Queue): # 在.py的input内使用
