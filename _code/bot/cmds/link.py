@@ -151,14 +151,14 @@ def _set(name, type, link, params, parts):
     cond创建的命名组不进入.py的locals里
 while 可以设置它在哪条 link 通过或未通过时执行
 action 紧挨着 cond 成功时执行，原则上不允许 conds 使用 send,recv 和 do_action 等干涉自身的函数，这会影响到 catch 函数的准确性'''
-    if parts[0]:
+    if parts and parts[0]:
         cond = parts.pop(0)
     else:
         reply = yield '输入cond'
         if not is_msg(reply):
             return '操作终止'
         cond = reply['message'].strip()
-    if parts[0]:
+    if parts and parts[0]:
         action = parts.pop(0)
     else:
         reply = yield '输入action'
