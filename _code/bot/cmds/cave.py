@@ -84,6 +84,8 @@ def run(body:str):
 .cave add
  : <msg>    # 放入一条消息
  | || <msg> # 放入一条消息
+.cave addn <count:int>
+ : || ... # n次
 .cave del [<id:int>] # 删除一条消息，默认为上一条消息'''
     s, last = read_params(body)
     if not s or re_int.match(s):
@@ -107,4 +109,29 @@ def run(body:str):
                 return '非消息，执行终止'
             text = reply['message']
         return cave.set(cave.empty(),text)
+    elif s=='addn':
+        s, last = read_params(last)
+        try:
+            n = int(s)
+        except ValueError:
+            return '语法: .cave addn <n:int>'
+        if n==0:
+            return 'n不能为0'
+        elif n<0:
+            msgs = cache.get_self_log(cache.thismsg())[1:-n+1]
+            text = ''.join(map(lambda m:m['message'], msgs))
+            return cave.set(cave.empty(),text)
+        elif n>0:
+            text = ''
+            for i in range(n):
+                if i==0:
+                    reply = yield f'接下来的{n}条消息将会被合并为1条记录'
+                else:
+                    reply = yield
+                if not is_msg(reply):
+                    return '非消息，执行终止'
+                text += reply['message']
+            if not text:
+                return '不知道为啥消息为空'
+            return cave.set(cave.empty(),text)
     return run.__doc__

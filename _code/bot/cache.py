@@ -159,6 +159,7 @@ def IsSelf(msg):
     return is_self
 
 def get_self_log(msg):
+    '''获取这人发的文本消息列表'''
     return list(filter(IsSelf(msg), getlog(msg)))
 
 def same_times(msg:dict, f:Callable|str, i=None):
