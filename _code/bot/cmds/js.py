@@ -8,7 +8,7 @@ def run(body:str):
     body = cq.unescape(body.strip())
 
     if not msg['user_id'] in cache.ops:
-        if not cache.any_same(msg, '\.py'):
+        if not cache.any_same(msg, '\.js'):
             return '权限不足(一定消息内将不再提醒)'
 
     flag, value = ensure()
