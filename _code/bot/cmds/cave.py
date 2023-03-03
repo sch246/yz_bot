@@ -119,7 +119,7 @@ def run(body:str):
             return 'n不能为0'
         elif n<0:
             msgs = cache.get_self_log(cache.thismsg())[1:-n+1]
-            text = ''.join(map(lambda m:m['message'], msgs))
+            text = ''.join(map(lambda m:m['message'], reversed(msgs)))
             return cave.set(cave.empty(),text)
         elif n>0:
             text = ''

@@ -3,27 +3,30 @@ import socket, atexit
 
 from main import mcrcon
 
-sock = None
 
-def connect(host, port, password):
-    global sock
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.connect((host, port))
-    result = mcrcon.login(sock, password)
-    if not result:
-        return False
-    return True
+class mc:
+    def __init__(self, host, port, password) -> None:
+        self.sock = None
+        self.host = host
+        self.port = port
+        self.password = password
+        atexit.register(self.close)
 
-def send(command):
-    global sock
-    if sock:
-        return mcrcon.command(sock, command)
-    else:
-        return 'rcon未连接'
+    def connect(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.connect((self.host, self.port))
+        result = mcrcon.login(self.sock, self.password)
+        if not result:
+            return False
+        return True
 
-def close():
-    if sock:
-        sock.close()
+    def send(self, command):
+        if self.sock:
+            return mcrcon.command(self.sock, command)
+        else:
+            return 'rcon未连接'
 
-atexit.register(close)
+    def close(self):
+        if self.sock:
+            self.sock.close()
