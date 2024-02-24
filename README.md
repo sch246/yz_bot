@@ -9,6 +9,11 @@
 
 远程控制，`.py`运行 python，`.link`映射输入，记录聊天记录，给mc服务器输入命令
 
+有 GPT 聊天功能，不过需要
+- 在 `_code/.env` 内设置 `OPENAI_BASE_URL=".."` 和 `OPENAI_API_KEY=".."`
+- 在 `data/storage/chat_groups.json` 里添加允许启用 gpt 的群
+    - 或者在聊天使用 `.py chat_groups.append(群号)`
+
 其它命令自行探索
 
 无 async，有一点点多线程
