@@ -4,6 +4,9 @@ import os
 from main import cache, cq, screen, str_tool
 
 def run(body:str):
+    '''运行js代码，仅在linux上有效
+格式:
+.js <Code>'''
     msg = cache.thismsg()
     body = cq.unescape(body.strip())
 

@@ -17,7 +17,7 @@ storage = {}
 
 def load():
     for root, _, files in os.walk(root_path):
-        name_space = root[len(root_path):]
+        name_space = root[len(root_path):].replace('\\','/')
         storage[name_space] = {}
         for file in files:
             name = file[:-5]
@@ -46,8 +46,9 @@ def save():
             continue
         for name, value in s_value.items():
             path = join(root,name+'.json')
-            # 这里没有做检验
-            json_write(path, value)
+            # 非基本键值将被跳过
+            # 非基本对象将会被设为null
+            json_write(path, value, skipkeys=True, default=lambda x:None)
 
 
 def get_namespace(name_space):

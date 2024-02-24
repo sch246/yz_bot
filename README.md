@@ -5,11 +5,13 @@
 
 柚子bot
 
+基于 go-cqhttp 运行
+
 远程控制，`.py`运行 python，`.link`映射输入，记录聊天记录，给mc服务器输入命令
 
-`.js`运行 JavaScript(需要服务器安装了 JS 和 screen)，`.nim`运行 nim (需要服务器安装了 nim)
+其它命令自行探索
 
-无异步，基本单线程
+无 async，有一点点多线程
 
 低性能
 
@@ -107,7 +109,7 @@ bot没有插件系统，不过添加命令本身也是相对独立的，可以�
 并且选择 http 通信
 
 <details>
-<summary>go-cqhttp登录问题</summary>
+<summary>go-cqhttp登录问题(已过期)</summary>
 
 - [CSDN - 解决xdd/傻妞/go-cqhttp机器人扫码登录异常/全部亲测可用/补充环节【2020年4月30日】](https://blog.csdn.net/m0_57009761/article/details/124521022)
 
@@ -135,9 +137,9 @@ go-cqhttp链接时需要设备信息，若没有则会随机生成一个
 
 bot 需要 python 3.10 或更高的版本
 
-需要第三方库 `requests`
+需要许多第三方库, 写在 `requirements.txt` 里了
 
-然后使用 python 运行`run.py`
+然后运行`python3 run.py`，可以使用`-a`开启自动重启，使用`-l`仅记录聊天记录而不能触发其它功能
 
 第一次启动后会输出类似下面的东西
 

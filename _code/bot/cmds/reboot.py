@@ -5,13 +5,16 @@ from main import file, send, cache
 
 
 def run(body:str):
+    '''重启
+格式:
+.reboot'''
     msg = cache.thismsg()
     if not msg['user_id'] in cache.ops:
         if not cache.any_same(msg, r'\.reboot'):
             return '权限不足(一定消息内将不再提醒)'
         return
     if body.strip()=='':
-        send('重启中', **msg)
+        send('重启中', **msg).result()
         file.write(file.ensure_file('data/reboot_greet.py'), f"send('重启完成',**{msg})")
         exit(233)
 

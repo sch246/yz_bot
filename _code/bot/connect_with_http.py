@@ -5,19 +5,25 @@ import json
 import sys
 import requests
 
+from main import ctrlc_decorator
+
 # https://blog.csdn.net/qq_27694835/article/details/108613607
 # Requests 模块 https://www.cnblogs.com/saneri/p/9870901.html
 
 try:
-    i = sys.argv[1:].index('-p0')
-    url = f'http://127.0.0.1:{sys.argv[1:][i+1]}'
+    i = sys.argv[1:].index('-q')
+    post_port = sys.argv[1:][i+1]
 except:
-    url = 'http://127.0.0.1:5700'
+    post_port = '5700'
 try:
-    i = sys.argv[1:].index('-p1')
-    listen = ('127.0.0.1', int(sys.argv[1:][i+1]))
+    i = sys.argv[1:].index('-p')
+    listen_port = sys.argv[1:][i+1]
 except:
-    listen = ('127.0.0.1', 5701)
+    listen_port = '5701'
+
+
+url = f'http://127.0.0.1:{post_port}'
+listen = ('127.0.0.1', int(listen_port))
 
 def call_api(action: str, **params) -> dict:
     headers = {
@@ -60,6 +66,7 @@ def request_to_json(msg: str) -> dict | None:
 # 需要循环执行，返回值为json格式
 
 
+@ctrlc_decorator(lambda:requests.post(f'http://127.0.0.1:{listen_port}',data={}))
 def recv_msg() -> dict | None:
     Client, _ = ListenSocket.accept()
     Request = Client.recv(8192).decode(encoding='utf-8')

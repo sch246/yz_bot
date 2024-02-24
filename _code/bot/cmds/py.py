@@ -6,6 +6,18 @@ from inspect import currentframe
 
 from main import *
 
+
+
+
+try:
+    data = json.load(open('data.json','r',encoding='utf-8'))
+except:
+    data = {}
+import atexit
+atexit.register(lambda:json.dump(data, open('data.json','w',encoding='utf-8'),ensure_ascii=False,indent=4))
+
+
+
 try:
     exec(open('data/pyload.py', encoding='utf-8').read())
 except:
@@ -27,6 +39,8 @@ def _input(s:str='',recv_all=False):
 
 def _print(*values, sep=' ', end='\n', file=None,flush=False):
     if file is None:
+        if not values or (len(values)==1 and values[0] is None):
+            return
         sendmsg(sep.join(map(str,values)))
     else:
         print(*values, sep, end, file, flush)
@@ -38,18 +52,39 @@ loc['print'] = _print
 
 
 @to_thread
-def run(body:str):
+def run(body:str, msg: dict = None, skip_op: bool = False, insert: dict = None):
     '''运行python命令，在.py后空格或换行都行，最后一行的表达式若不是None或注释则会被返回
+
     默认情况下是临时环境，会在下一次重启后消失
+
     当最后一行以###开头时，代码将会在每次开启bot时被运行，注意不要写依赖于临时环境的代码
-格式: .py <code:pycode>'''
-    msg = cache.thismsg(cache.get_last())
-    loc.update(globals())
-    if not msg['user_id'] in cache.ops:
+
+    body: 执行的表达式
+
+    msg: 触发表达式的消息，决定消息默认返回到哪里
+
+    skip_op: 若为True，则不检查op权限，直接通过
+
+    insert: 添加的变量字典，注意这种影响会持续下去
+
+    格式: .py <Code>'''
+
+    if msg is None:
+        msg = cache.thismsg(cache.get_last())
+    else:
+        cache.thismsg(msg)
+
+    if not skip_op and not msg['user_id'] in cache.ops:
         if not cache.any_same(msg, '\.py'):
             sendmsg('权限不足(一定消息内将不再提醒)')
         return
+
+    loc['_py_expr'] = body
+    loc['_py_msg'] = msg
+    if insert is not None:
+        loc.update(insert)
     body = cq.unescape(body.strip())
+
     if body=='':
         return run.__doc__
     lst = body.splitlines(True)

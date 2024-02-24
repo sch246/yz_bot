@@ -70,31 +70,33 @@ def is_file(msg:dict):
     return is_notice(msg) and 'file' in msg.keys()
 def is_group_file(msg:dict):
     '''群文件'''
-    return msg['notice_type'] == 'group_upload'
+    return msg.get('notice_type') == 'group_upload'
 def is_private_file(msg:dict):
     '''离线文件'''
-    return msg['notice_type'] == 'offline_file'
+    return msg.get('notice_type') == 'offline_file'
 def is_change_admin(msg:dict):
     '''管理员变动'''
-    return msg['notice_type'] == 'group_admin'
+    return msg.get('notice_type') == 'group_admin'
 def is_leave(msg:dict):
     '''群成员减少'''
-    return msg['notice_type'] == 'group_decrease'
+    return msg.get('notice_type') == 'group_decrease'
 def is_join(msg:dict):
     '''群成员增多'''
-    return msg['notice_type'] == 'group_increase'
+    return msg.get('notice_type') == 'group_increase'
 def is_ban(msg:dict):
     '''群禁言'''
-    return msg['notice_type'] == 'group_ban'
+    return msg.get('notice_type') == 'group_ban'
 def is_group_recall(msg:dict):
     '''群撤回'''
-    return msg['notice_type'] == 'group_recall'
+    return msg.get('notice_type') == 'group_recall'
 def is_friend_recall(msg:dict):
     '''好友撤回'''
-    return msg['notice_type'] == 'friend_recall'
+    return msg.get('notice_type') == 'friend_recall'
+def is_recall(msg:dict):
+    return is_group_recall(msg) or is_friend_recall(msg)
 def is_newfriend(msg:dict):
     '''新加好友提醒'''
-    return msg['notice_type'] == 'friend_add'
+    return msg.get('notice_type') == 'friend_add'
 
 def is_card_new(msg:dict):
     '''群成员名片更新'''
@@ -102,9 +104,13 @@ def is_card_new(msg:dict):
 
 def is_notify(msg:dict):
     return is_notice(msg) and msg['notice_type'] == 'notify'
-def is_poke(msg:dict):
-    '''包括好友戳一戳和群戳一戳'''
-    return is_notify(msg) and msg['sub_type'] == 'poke'
+def is_poke(qq=None):
+    if isinstance(qq, dict):
+        msg = qq
+        return is_notice(msg) and msg.get('sub_type')=='poke'
+    def _(msg):
+        return is_notice(msg) and msg.get('sub_type')=='poke' and msg.get('target_id')==qq
+    return _
 def is_lucky_king(msg:dict):
     '''红包运气王'''
     return is_notify(msg) and msg['sub_type'] == 'lucky_king'

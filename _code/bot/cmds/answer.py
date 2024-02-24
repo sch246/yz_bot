@@ -142,4 +142,8 @@ answers=[
 ]
 
 def run(_:str):
+    '''从答案之书中随机一个答案
+用法:
+.answer
+或者用"柚子柚子"开头'''
     return getran(answers)

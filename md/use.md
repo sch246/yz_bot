@@ -22,8 +22,8 @@
     --auto_reboot   同上
     -l              仅记录log
     --log_only      同上
-    -p0 5700        发送端口
-    -p1 5701        监听端口
+    -q 5700         发送端口, 对应 go-cqhttp 的 HTTP 监听地址
+    -p 5701         监听端口, 对应 go-cqhttp 的 HTTP POST 地址
     debug           debug模式(并没有什么区别)
 ```
 

@@ -25,3 +25,5 @@ class Show:
         self.value = s
     def __repr__(self) -> str:
         return self.value
+def cut(obj, sec:int):                            return [obj[i:i+sec] for i in range(0,len(obj),sec)]
+

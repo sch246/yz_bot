@@ -102,11 +102,11 @@ def has_nextline(s:str):
     return len((s+'a').splitlines())>1
 
 re_read = re.compile(r'\s+(\S+)([\S\s]*)')
-re_read_str = re.compile(r'\s+("[^"]*"|\S+)([\S\s]*)')
+re_read_str = re.compile(r'\s+(\'[^\']*\'|"[^"]*"|\S+)([\S\s]*)')
 
 def read_params(s:str, count=1, read_str=False):
     '''从字符串中读取空白符后的下n段字符串
-    如果要读取引号，则可能抛出异常
+    如果要读取引号，则可能抛出异常，当read_str是其它数字时，会连带引号一起返回
     读完后剩余的都是空字符串
     若以非空白符开头，抛出SyntaxError
     返回的字符串数量=count+1，最后一个为剩下的部分'''
@@ -119,15 +119,19 @@ def read_params(s:str, count=1, read_str=False):
             return ['']*(count+1)
         raise SyntaxError('需要以空白符开头') # 剩下的唯一可能，引号后接非空白符也会触发
     text, last = r.groups()
-    if read_str and len(text)>=2 and text[0] in ['"',"'"] and text[0]==text[1]:
-        text = text[1:-1]
+    if read_str and len(text)>=2 and text[0] in ['"',"'"]:
+        if read_str==True:# 它可以是其它的数字，这样将不会去除字符串
+            text = text[1:-1]
     if count==1:
         return text, last
     elif count>1:
-        return text, *read_params(last, count-1)
+        return text, *read_params(last, count-1, read_str)
     else:
         raise ValueError('count必须大于0')
 
-
+def limit(s:str, n:int):
+    if len(s)>n:
+        return repr(s[:n])+'...'
+    return repr(s)
 
 LASTLINE = '\33[1A\r\33[K'

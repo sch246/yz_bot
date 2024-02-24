@@ -1,10 +1,5 @@
 '''
-link, 每个link可被命名, 由cond和action构成, 当cond被判断并通过时action将被执行
-创建link时, 可以指定是默认还是自定义
-    默认则是插入到列表中(依旧需要命名)
-    自定义则是决定在其它某个cond通过或失败时, 触发本cond的判定
-cond和action都是可执行的python代码, 但是环境不同, 执行流程是以links的第一个link作为开始，对每个link，判断cond，若成功则执行action然后依次执行succ内的links，失败则依次执行fail内的links, 前面的变量能传到后面，在执行整个links的过程中借用的是.py的globals和locals
-    cond不应该使用sendmsg和recvmsg, 也不应该主动触发action, 它只能获得bot的状态, 传入的消息, 以及前面的cond留下的变量, 最终由最后一行表达式来判断通过与否
+设定当检测到什么消息时回复什么，与命令的触发相独立
 '''
 
 import re
@@ -29,15 +24,23 @@ def run(body:str):
     | catch
         : <text>
         | || <text>
+
+link, 每个link可被命名, 由cond和action构成, 当cond被判断并通过时action将被执行
+创建link时, 可以指定是默认还是自定义
+    默认则是插入到列表中(依旧需要命名)
+    自定义则是决定在其它某个cond通过或失败时, 触发本cond的判定(好像有bug)
+cond和action都是可执行的python代码, 但是环境不同, 执行流程是以links的第一个link作为开始，对每个link，判断cond，若成功则执行action然后依次执行succ内的links，失败则依次执行fail内的links, 前面的变量能传到后面，在执行整个links的过程中借用的是.py的globals和locals
+    cond不应该使用sendmsg和recvmsg, 也不应该主动触发action, 它只能获得bot的状态, 传入的消息, 以及前面的cond留下的变量, 最终由最后一行表达式来判断通过与否
+
 使用catch可以获取一个消息能触发哪些link
 虽然链接是列表存储的，但是在fail或者succ列表中放重复的值会引起难以预料的后果
-每个link都会有2个列表，succ和fail
-所有links放在一个列表内，当进来一条新消息时，默认测试最开头的那个link
+    每个link都会有2个列表，succ和fail
+所有links放在一个列表内，当进来一条新消息时，默认测试最开头的那个link(最新创建的)
 创建link时，需要设定while，while就是反向连接
-当指定的link成功或者失败时，运行本link
+    当指定的link成功或者失败时，运行本link
 再然后，如果不设定while
-那么就是默认情况，会放到列表开头，并且将fail指向原来的开头link
-这样会形成列表结构
+    那么就是默认情况，会放到列表开头，并且将fail指向原来的开头link
+    这样会形成列表结构
 '''
     msg = cache.thismsg()
     if not msg['user_id'] in cache.ops:
