@@ -4,6 +4,9 @@ import os
 from main import cache, cq, file
 
 def run(body:str):
+    '''运行nim代码，仅在linux上有效
+格式:
+.nim <Code>'''
     msg = cache.thismsg()
     body = cq.unescape(body.strip())
 

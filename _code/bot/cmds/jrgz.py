@@ -4,8 +4,14 @@ from main import getgroupstorage, memberlist, getname, headshot, getran
 
 
 def run(_:str):
+    '''从群友中随机抽一个作为今天的鸽子，群之间是独立的
+格式:
+.jrgz'''
     date = time.strftime('%y-%m-%d')
-    data = getgroupstorage()
+    try:
+        data = getgroupstorage()
+    except Exception as e:
+        return '不支持私聊'
     if data.get('jrgz_date')!=date:
         data['jrgz_date'] = date
         member = getran(memberlist())

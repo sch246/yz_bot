@@ -20,6 +20,7 @@ def strip_linemark(s:str):
 
 def run(body:str):
     '''查看和编辑文件，私聊似乎没办法传文件(api错误)，set可以读取之后发送的文件/图片，to可以读取10条消息内最近的文件
+    有一些bug
 .file
  : read <文件路径> [-i:是否显示行号] [<起始行:int> <结束行:int>]
  | write <文件路径> [<起始行:int> <结束行:int>]\\n<内容>

@@ -1,8 +1,13 @@
 '''处理cq码相关的东西'''
 import re,os
+import shutil
+import requests
 
 from main import str_tool, connect, to_thread
 
+# image_path = os.path.abspath('./data/images')
+my_image_path = './data/images'
+image_path = '/opt/bot/cq/bot0.4/data/images'
 
 escape_dic={ # CQ码内的转义
     '&':'&amp;',
@@ -72,17 +77,48 @@ def cq(type, **data):
         'data':data
     })
 
-def url2cq(url):
+def download_img(url:str, name:str=None):
     reply = connect.call_api('download_file',url=url)
-    if reply['retcode']==0:
-        return dump({
-            'type':'image',
-            'data':{
-                'file':'../cache/'+os.path.split(reply['data']['file'])[1]
-            }
-        })
-    else:
+    if reply['retcode']!=0:
         raise Exception('warning: 图片下载失败')
+    file_path = reply['data']['file']
+    print('download:', file_path)
+
+    if name is None:
+        name = os.path.basename(file_path)
+    target_path = os.path.join(image_path, name)
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+
+    shutil.move(file_path, target_path)
+    return target_path
+
+def generate_unique_filename(directory):
+    filenames = os.listdir(directory)
+    i = 0
+    while f'{i}.image' in filenames:
+        i += 1
+    return f'{i}.image'
+
+
+def download_img(picture_url, name=None):
+    if name is None:
+        name = generate_unique_filename(my_image_path)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36             (KHTML, like Gecko) Chrome/63.0.3239.132 Safari/537.36 QIHU 360SE",
+        }
+    r = requests.get(picture_url, headers=headers)
+    with open(os.path.join(my_image_path,name), 'wb') as f:
+        f.write(r.content)
+    return os.path.join(image_path,name)
+
+def url2cq(url:str,name:str=None):
+    img = download_img(url,name).replace('\\','/')
+    return dump({
+        'type':'image',
+        'data':{
+            'file':f'file://{img}'
+        }
+    })
 
 
 def save_pic(text):
@@ -91,7 +127,7 @@ def save_pic(text):
         CQ = load(cq)
         if CQ['type']=='image':
             try:
-                return url2cq(CQ['data'].get('url'))
+                return url2cq(CQ['data'].get('url'),CQ['data'].get('file'))
             except:
                 return cq
         return cq

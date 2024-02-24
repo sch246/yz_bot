@@ -7,7 +7,8 @@ from main import cq,file
 from .py import mc_path, mc_worldname, mc_packformat, read_params
 
 def run(body:str):
-    '''.mcf <pack>
+    '''编辑mcf代码
+.mcf <pack>
 #set <func>
 <line>
 ...

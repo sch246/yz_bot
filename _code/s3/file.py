@@ -51,15 +51,15 @@ def overwrite(file_path, text: str, start_line=None, end_line=None):
 def getpath(file_path):
     return join(path, file_path)
 
-def json_read(file_path):
+def json_read(file_path, **kws):
     file_path = join(path, file_path)
     with open(file_path, 'r',encoding='utf-8') as f:
-        return json.load(f)
+        return json.load(f, **kws)
 
-def json_write(file_path, obj):
+def json_write(file_path, obj, **kws):
     file_path = join(path, file_path)
     with open(file_path, 'w', encoding='utf-8') as f:
-        json.dump(obj, f, indent=4, ensure_ascii=False)
+        json.dump(obj, f, indent=4, ensure_ascii=False, **kws)
 
 
 def let_be_filename(title):
@@ -71,3 +71,25 @@ def let_be_filename(title):
 def can_be_filename(name):
     '''这里没有检测空格'''
     return not (set(name) & set(r'/\:*?"<>|'))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

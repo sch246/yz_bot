@@ -1,4 +1,4 @@
-'''易经起卦，用最近的3句的句长，也可以指定数字'''
+'''易经起卦'''
 from main import random
 
 #     000  001  010  011  100  101  110  111
@@ -34,6 +34,10 @@ def get(i,j,k):
 
 
 def run(body:str):
+    '''易经起卦，完全用随机数，也可以指定数字
+格式:
+.change[ <上卦:int> <下卦:int> <爻:int>]
+'''
     if body.strip():
         params = body.strip().split(' ')
         i,j,k = map(int,params)

@@ -1,8 +1,19 @@
 
 .test/
+.sync
 cache_msgs
 tmp.txt
-*.json
+/data/images
+/data/screens
+/data/storage/later_list
+/data/storage/[^lpsg]*
+
+data.json
+
+*__code
+chatlog
+.vscode
+/config.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -157,4 +168,3 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-*__code

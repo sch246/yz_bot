@@ -1,0 +1,670 @@
+[
+    {
+        "name": "cs",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": []
+        },
+        "cond": "~{A}",
+        "succ": [],
+        "fail": [
+            "狐狸叫"
+        ],
+        "action": "cs = mc.mc('cs.sch246.io',27016,'2333')\ncs.connect()\nresult = cs.send('''{:A}''')\nresult"
+    },
+    {
+        "name": "狐狸叫",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "cs"
+            ]
+        },
+        "cond": "嘤嘤嘤",
+        "succ": [],
+        "fail": [
+            "ping"
+        ],
+        "action": "s='''嘤嘤嘤'''\ns"
+    },
+    {
+        "name": "ping",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "狐狸叫"
+            ]
+        },
+        "cond": "ping",
+        "succ": [],
+        "fail": [
+            "chatend"
+        ],
+        "action": "s='''pong'''\ns"
+    },
+    {
+        "name": "chatend",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "",
+                "ping"
+            ]
+        },
+        "cond": "柚子不聊了$",
+        "succ": [],
+        "fail": [
+            "recall"
+        ],
+        "action": "chatting=True\nchat_context=[]\n'聊天结束'"
+    },
+    {
+        "name": "recall",
+        "type": "py",
+        "while": {
+            "succ": [],
+            "fail": [
+                "chatend"
+            ]
+        },
+        "cond": "msg=cache.thismsg()\nis_notice(msg) and (is_group_recall(msg) or is_friend_recall(msg))",
+        "succ": [],
+        "fail": [
+            "shownotice"
+        ],
+        "action": "recall_id = msg['message_id']\ngetlog().pop(find(getlog(),lambda m:is_msg(m) and m.get('message_id')==recall_id))"
+    },
+    {
+        "name": "shownotice",
+        "type": "py",
+        "while": {
+            "succ": [],
+            "fail": [
+                "recall"
+            ]
+        },
+        "cond": "msg=cache.thismsg()\nget_shownotice() and is_notice(msg)",
+        "succ": [],
+        "fail": [
+            "chatting"
+        ],
+        "action": "print(msg)"
+    },
+    {
+        "name": "chatting",
+        "type": "py",
+        "while": {
+            "succ": [],
+            "fail": [
+                "shownotice"
+            ]
+        },
+        "cond": "msg=cache.thismsg()\nenablechat = msg.get('group_id') in chat_groups or msg.get('group_id') is None\npokechat = is_poke(cache.qq)(msg)\nmsgchat = is_msg(msg) and (has_at(cache.qq)(msg) or msg['message'].startswith('柚子，') or msg['message'].startswith('神奇柚子，'))\nenablechat and (pokechat or msgchat)",
+        "succ": [],
+        "fail": [
+            "chatstart"
+        ],
+        "action": "if 'message' in msg and msg['message'].startswith('神奇柚子，'):\n    print(getcmd('chat4').chat())\nelse:\n    print(getcmd('chat').chat())"
+    },
+    {
+        "name": "chatstart",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "chatting"
+            ]
+        },
+        "cond": "柚子聊聊天$",
+        "succ": [],
+        "fail": [
+            "server"
+        ],
+        "action": "chatting=True\nchat_context=[]\n'聊天开始'"
+    },
+    {
+        "name": "server",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "chatstart"
+            ]
+        },
+        "cond": "% {Value}",
+        "succ": [],
+        "fail": [
+            "2048_fast"
+        ],
+        "action": "s=server.call('''{:Value}''')\ns"
+    },
+    {
+        "name": "2048_fast",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "server"
+            ]
+        },
+        "cond": "\\.{arg:[wasd]}$",
+        "succ": [],
+        "fail": [
+            "2048"
+        ],
+        "action": "run_action('2048',{**globals(),**locals()},{'arg':'{:arg}'})\n#"
+    },
+    {
+        "name": "2048",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "2048_fast"
+            ]
+        },
+        "cond": "\\.2048 {arg}",
+        "succ": [],
+        "fail": [
+            "doge"
+        ],
+        "action": "if msgs.is_group_msg(cache.thismsg()):\n    store = getgroupstorage()\nelse:\n    store = getstorage()\nmat = store.get('mat')\narg='{:arg}'\nif arg=='start':\n    mat=[[0 for i in range(4)] for i in range(4)]\n    step_2048(mat)\nelif arg.startswith('start'):\n    n=int(arg[5:])\n    mat=[[0 for i in range(n)] for i in range(n)]\n    step_2048(mat)\nelif d2048.get(arg):\n    newmat=[list(line) for line in move_mat(mat,d2048[arg])]\n    if mat!=newmat:\n        step_2048(newmat)\n    mat=newmat\nstore['mat']=mat\nshow_mat(mat)"
+    },
+    {
+        "name": "doge",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "2048"
+            ]
+        },
+        "cond": "\\[CQ:face,id=277\\]",
+        "succ": [],
+        "fail": [
+            "6"
+        ],
+        "action": "'''[CQ:image,file=147c01ec2bac5116c68c689447db3a30.image,url=https://c2cpicdw.qpic.cn/offpic_new/0/980001119-1936243186-147C01EC2BAC5116C68C689447DB3A30/0?term=3]'''"
+    },
+    {
+        "name": "6",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "doge"
+            ]
+        },
+        "cond": "6$",
+        "succ": [],
+        "fail": [
+            "好耶"
+        ],
+        "action": "s = \"[CQ:image,file=89308ecdd1d3e9d2b879dfbf42042576.image,url=https://c2cpicdw.qpic.cn/offpic_new/980001119//980001119-4202816234-89308ECDD1D3E9D2B879DFBF42042576/0?term=3&is_origin=0]\"\nif cache.thismsg()['user_id'] in 准6:\n    s = None\ns"
+    },
+    {
+        "name": "好耶",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "6"
+            ]
+        },
+        "cond": "好耶",
+        "succ": [],
+        "fail": [
+            "petpet2"
+        ],
+        "action": "\"[CQ:image,file=09ed942e277a0fb014b845399d38a5dc.image,subType=1,url=https://gchat.qpic.cn/gchatpic_new/1531412938/916083933-3043722186-09ED942E277A0FB014B845399D38A5DC/0?term=3&is_origin=0]\""
+    },
+    {
+        "name": "petpet2",
+        "type": "py",
+        "while": {
+            "succ": [],
+            "fail": [
+                "好耶"
+            ]
+        },
+        "cond": "msg = cache.thismsg()\nreply_msg = {}\nif is_msg(msg):\n    text = msg['message'].strip()\n    if (text in list(petpet_dic.keys())+petpet_keys) and msg.get('reply'):\n        reply_id = cq.load(msg['reply']['reply'])['data']['id']\n        reply_msg = connect.call_api('get_msg',message_id=reply_id)['data']\nis_img(reply_msg)",
+        "succ": [],
+        "fail": [
+            "yggktk"
+        ],
+        "action": "action = petpet_trans(text)\npic_url = cq.load(reply_msg['message'])['data']['url']\nsendmsg(petpet(key=action ,toAvatar=pic_url))"
+    },
+    {
+        "name": "yggktk",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "petpet2"
+            ]
+        },
+        "cond": "yggktk$",
+        "succ": [],
+        "fail": [
+            "petpet"
+        ],
+        "action": "action='yggktk'\nuser_id = cache.thismsg()['user_id']\npetpet(key=action,toAvatar=headshot_url(user_id))"
+    },
+    {
+        "name": "petpet",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "yggktk"
+            ]
+        },
+        "cond": "{action:..?.?|[a-z_]+}{at:CQ_at('\\d+')}",
+        "succ": [],
+        "fail": [
+            "reply"
+        ],
+        "action": "action=petpet_trans('{:action}')\npetpet(key=action,toAvatar=headshot_url(cq.load('{:at}')['data']['qq']))"
+    },
+    {
+        "name": "reply",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "petpet"
+            ]
+        },
+        "cond": "\\.reply {name}\\s*\n{Key}\\s*\n###\\s*\n{Value}",
+        "succ": [],
+        "fail": [
+            "restartmc"
+        ],
+        "action": "getcmd('link')._set2('{:name}', 're', '''{:Key}''', \"s='''{:Value}'''\\ns\")"
+    },
+    {
+        "name": "restartmc",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "reply"
+            ]
+        },
+        "cond": "柚子[，,]重启服务器",
+        "succ": [],
+        "fail": [
+            "stopmc"
+        ],
+        "action": "restart_mc()"
+    },
+    {
+        "name": "stopmc",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "restartmc"
+            ]
+        },
+        "cond": "柚子[，,]关闭服务器",
+        "succ": [],
+        "fail": [
+            "startmc"
+        ],
+        "action": "stop_mc()"
+    },
+    {
+        "name": "startmc",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "stopmc"
+            ]
+        },
+        "cond": "柚子[，,]启动服务器",
+        "succ": [],
+        "fail": [
+            "真太阳时"
+        ],
+        "action": "start_mc()"
+    },
+    {
+        "name": "真太阳时",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "startmc"
+            ]
+        },
+        "cond": "\\.sun$",
+        "succ": [],
+        "fail": [
+            "查询经纬"
+        ],
+        "action": "time.strftime('%H:%M:%S', 真太阳时(time.time(), getstorage()['经度']))"
+    },
+    {
+        "name": "查询经纬",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "真太阳时"
+            ]
+        },
+        "cond": "\\.jw$",
+        "succ": [],
+        "fail": [
+            "经纬"
+        ],
+        "action": "f\"经纬度: {getstorage()['经度']} {getstorage()['纬度']}\""
+    },
+    {
+        "name": "经纬",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "查询经纬"
+            ]
+        },
+        "cond": "\\.jw {j} {w}",
+        "succ": [],
+        "fail": [
+            "不可以",
+            "设置城市"
+        ],
+        "action": "getstorage()['经度'] = {:j}\ngetstorage()['纬度'] = {:w}\n'设置经纬度: {:j} {:w}'"
+    },
+    {
+        "name": "不可以",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "经纬"
+            ]
+        },
+        "cond": "(不可以|禁止){a}{a}[!！]?$",
+        "succ": [],
+        "fail": [
+            "柚子亲亲"
+        ],
+        "action": "'就要{:a}{:a}！'"
+    },
+    {
+        "name": "柚子亲亲",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                ""
+            ]
+        },
+        "cond": "柚子亲亲",
+        "succ": [],
+        "fail": [
+            "柚子憨憨"
+        ],
+        "action": "'噫呃'"
+    },
+    {
+        "name": "柚子憨憨",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "柚子亲亲"
+            ]
+        },
+        "cond": "柚子憨憨",
+        "succ": [],
+        "fail": [
+            "r1d100"
+        ],
+        "action": "'啧'"
+    },
+    {
+        "name": "r1d100",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "柚子憨憨"
+            ]
+        },
+        "cond": "\\.r$",
+        "succ": [],
+        "fail": [
+            "mc命令2"
+        ],
+        "action": "f'{getname()} 投了 1 个 100 面骰，总数为 {rd(1, 100)}'"
+    },
+    {
+        "name": "mc命令2",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "r1d100"
+            ]
+        },
+        "cond": "(\\\\\\\\){command:.*}",
+        "succ": [],
+        "fail": [
+            "获取他人名字"
+        ],
+        "action": "'\\n'.join(map(lambda s:s[33:].strip(), screen.send('mc',\"\"\"{:command} \"\"\".strip()).splitlines()))"
+    },
+    {
+        "name": "获取他人名字",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "mc命令2"
+            ]
+        },
+        "cond": "{at:CQ}\\s*叫什么",
+        "succ": [],
+        "fail": [
+            "答案之书"
+        ],
+        "action": "getname(int(cq.load('{:at}')['data']['qq']))"
+    },
+    {
+        "name": "答案之书",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "获取他人名字"
+            ]
+        },
+        "cond": "(柚子(告诉我|我该)怎么办|无所不知伟大的柚子啊，请为我指引吧！|为什么不问问神奇柚子呢|柚子柚子(告诉我)?)",
+        "succ": [],
+        "fail": [
+            "mc命令"
+        ],
+        "action": "cmds.modules['answer'].run('')"
+    },
+    {
+        "name": "mc命令",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "答案之书"
+            ]
+        },
+        "cond": "\\\\{command:.*}",
+        "succ": [],
+        "fail": [
+            "吗？"
+        ],
+        "action": "mc.send(\"\"\"{:command} \"\"\".strip()).strip()"
+    },
+    {
+        "name": "吗？",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "mc命令"
+            ]
+        },
+        "cond": "{:cache.names}[,，\\s]+{Text}",
+        "succ": [],
+        "fail": [
+            "name加复读"
+        ],
+        "action": "msg=cache.thismsg()\nif not is_group_msg(msg) or msg.get('group_id') in chat_groups:\n    preset=[{'role': 'system', 'content':f'现在是{time.strftime(\"%Y年%m月%d日%H时%M分%S秒\")}'}]\n    call=preset+settings+[{\"role\": \"user\", \"content\": \"\"\"{:Text}\"\"\"}]\n    calls.put((msg_id(msg),call))\nelse:\n    ret ='''{:Text}'''.rstrip().rstrip('？').rstrip('?').rstrip('吗').replace('你',cache.nicknames[0]).replace('我','你')+'！'\nret"
+    },
+    {
+        "name": "name加复读",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "吗？"
+            ]
+        },
+        "cond": "{:cache.names}{a:[^？！~:;!\\?\\.]+}{b:[？！~:;!\\?\\.]}$",
+        "succ": [],
+        "fail": [
+            "r1d6"
+        ],
+        "action": "f'{:a}{:b}'"
+    },
+    {
+        "name": "r1d6",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "name加复读"
+            ]
+        },
+        "cond": "\\.r{r:Int}d{d:Int}$",
+        "succ": [],
+        "fail": [
+            "AA式复读"
+        ],
+        "action": "f'{getname()} 投了 {:r} 个 {:d} 面骰，总数为 {rd({:r}, {:d})}'"
+    },
+    {
+        "name": "AA式复读",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "r1d6"
+            ]
+        },
+        "cond": ".?{a:[^\\.\\?\\!？！\\s，。~0-9a-z]+}{a}.?$",
+        "succ": [],
+        "fail": [
+            "被问好"
+        ],
+        "action": "'{:a}{:a}~'"
+    },
+    {
+        "name": "被问好",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "AA式复读"
+            ]
+        },
+        "cond": "你好[，, ]{:cache.names}.?$",
+        "succ": [],
+        "fail": [
+            "call"
+        ],
+        "action": "getran(你也好).replace('$name',getname())"
+    },
+    {
+        "name": "call",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "被问好"
+            ]
+        },
+        "cond": "{:cache.names}$",
+        "succ": [],
+        "fail": [
+            "getname"
+        ],
+        "action": "'我在'"
+    },
+    {
+        "name": "getname",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "call"
+            ]
+        },
+        "cond": "({:cache.names}[,，]?)?我叫什么$",
+        "succ": [],
+        "fail": [
+            "setname"
+        ],
+        "action": "getname()"
+    },
+    {
+        "name": "setname",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "getname"
+            ]
+        },
+        "cond": "({:cache.names}[,，]?)?叫我{name:.*}",
+        "succ": [],
+        "fail": [
+            "早"
+        ],
+        "action": "setname('{:name}')\n'你好，{:name}'"
+    },
+    {
+        "name": "早",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "setname"
+            ]
+        },
+        "cond": "{:cache.names}?早.{0,3}$",
+        "succ": [],
+        "fail": [],
+        "action": "getran(早).replace('$name',getname())"
+    },
+    {
+        "name": "设置城市",
+        "type": null,
+        "while": {
+            "succ": [],
+            "fail": [
+                "经纬"
+            ]
+        },
+        "cond": "\\.jw {city}",
+        "succ": [],
+        "fail": [],
+        "action": "loc=geocode('{:city}')['location']\nlng = loc['lng']\nlat = loc['lat']\ngetstorage()['经度'] = lng\ngetstorage()['纬度'] = lat\nf'设置经纬度: {lng} {lat}'"
+    }
+]

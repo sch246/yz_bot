@@ -1,7 +1,12 @@
+'''newlisp!'''
+
 import os
 from main import cache, cq, screen
 
 def run(body:str):
+    '''运行newlisp代码，仅在linux上有效
+格式:
+.nl <Code>'''
     msg = cache.thismsg()
     body = cq.unescape(body.strip())
     if not msg['user_id'] in cache.ops:

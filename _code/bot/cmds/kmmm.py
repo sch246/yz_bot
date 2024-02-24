@@ -6,7 +6,7 @@ import time
 from main import cache, getran, jcurl, read_params, cq, to_thread,sendmsg
 
 def run(body:str):
-    '''随机返回一张kemomimi酱作者的图片
+    '''随机返回一张kemomimi酱作者的图片(似乎已经用不了了)
     格式: .kmmm [<page:Int>]'''
     thread(body)
 

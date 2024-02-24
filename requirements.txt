@@ -1,0 +1,11 @@
+
+click
+httpx
+openai
+python-dotenv
+tenacity
+termcolor
+lunardate
+pillow
+numpy
+matplotlib

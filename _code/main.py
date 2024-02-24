@@ -7,25 +7,29 @@ import time
 from typing import Any
 from queue import Queue
 from inspect import getgeneratorstate, GEN_CREATED
-
+import random
 
 from s3 import *
 import s3.config as config
 import s3.counter as counter
+from s3.add_attr import add_attr
 import s3.file as file
 # import s3.log as log
 import s3.params as params
-import s3.schedule as schedule
 import s3.str_tool as str_tool
 read_params = str_tool.read_params
 import s3.thread as thread
-from s3.thread import to_thread
+from s3.thread import to_thread, ctrlc_decorator
+from s3.delay_func import call_delay
 import s3.mcrcon as mcrcon
+from s3.cache_args import cache_args
 
 import s3.linux_screen as screen
 import s3.mc as mc
 import s3.ident as ident
 import s3.storage as storage
+
+import s3.src as src
 
 
 import bot.connect_with_http as connect
@@ -38,10 +42,18 @@ from bot.msgs import *
 import bot.cache as cache
 import bot.chatlog as chatlog
 
+from chat import Chat, MessageStream
+
 
 def msg_id(msg:dict):
         return (msg.get('group_id'), msg['user_id'])
 
+def find(lst, f):
+        '''返回None如果没有找到索引'''
+        i=0
+        for o in lst:
+                if f(o):return i
+                i += 1
 
 def first_start():
         '''第一次加载'''
@@ -72,13 +84,25 @@ def first_start():
         send('设置完毕！', user_id=master)
 
 def _init_self():
+
+        while True:
+                try:
+                        login_info = connect.call_api('get_login_info')['data']
+                        break
+                except requests.exceptions.ConnectionError as e:
+                        print(f'连接错误: {connect.url}')
+                        print('3秒后重试...')
+                        time.sleep(3)
+
         # 加载设置
         if not os.path.isfile('config.json'):
                 first_start()
-        cache.ops_load()
-        cache.nicknames_load()
+        try:
+                cache.ops_load()
+                cache.nicknames_load()
+        except KeyError:
+                first_start()
 
-        login_info = connect.call_api('get_login_info')['data']
         qq, name = login_info['user_id'], login_info['nickname']
         cache.set('qq',qq)
         cache.set('name',name)
@@ -90,7 +114,7 @@ def _init_self():
         if 'debug' in sys.argv[1:]:
                 print('debug模式')
 
-@to_thread
+@call_delay(delay_secs=lambda *_,**__:random.uniform(-0.3, -0.6), max_size=20)
 def send(text: Any, user_id: int | str = None, group_id: int | str = None, **params) -> dict:
         '''user_id或者group_id是必须的'''
         debug('【准备发送消息】')
@@ -108,7 +132,7 @@ def send(text: Any, user_id: int | str = None, group_id: int | str = None, **par
         call = connect.call_api('send_msg', message=text, user_id=user_id, group_id=group_id, **params)
         if not call['retcode'] == 0:
                 print('发送消息失败 '+call['wording'])
-                send('发送消息失败\n'+call['wording'], user_id, group_id)
+                # send('发送消息失败\n'+call['wording'], user_id, group_id)
                 return
 
         #------以下是获取自身发送的消息，并且记录下来------#
@@ -226,7 +250,7 @@ def recv(msg:dict):
                 return
 
         if is_heartbeat(msg):
-                _recv_time_counter()
+                # _recv_time_counter()
                 return
 
         global i, j, k
@@ -269,6 +293,18 @@ def recv(msg:dict):
                 elif cmd_py.links:
                         print('进入links')
                         cmd_py.exec_links()
+        elif is_notice(msg):
+                if is_recall(msg):
+                        _log = cache.getlog(msg)
+                        recall_id = msg['message_id']
+                        def _pop(m):
+                                return is_msg(m) and recall_id==m.get('message_id')
+                        m = find(_log, _pop)
+                        if m:
+                                _log.pop(m)
+                elif cmd_py.links:
+                        print('进入links2')
+                        cmd_py.exec_links()
 
 
 from funcs import *
@@ -277,4 +313,8 @@ if __name__=="__main__":
         _init_self()
         cmds.load()
         while True:
-                recv(connect.recv_msg())
+                try:
+                        recv(connect.recv_msg())
+                except KeyboardInterrupt:
+                        print('bye.')
+                        exit(0)

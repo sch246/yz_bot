@@ -101,7 +101,7 @@ def get_last():
 
 msgs_this = {}
 
-def thismsg(msg=None):
+def thismsg(msg:dict=None) -> dict:
     import threading
     ident = threading.get_ident()
     if msg is None:
@@ -148,7 +148,7 @@ def nicknames_save():
 def getlog(msg):
     if is_group_msg(msg):
         return msgs['group'][msg['group_id']]
-    elif is_msg(msg):
+    elif msg.get('user_id'):
         return msgs['private'][msg['user_id']]
     else:
         return []
