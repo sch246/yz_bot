@@ -1,5 +1,6 @@
 '''简单创建个多线程'''
 
+from queue import Queue
 from threading import Thread, Event
 from functools import wraps
 
@@ -28,28 +29,19 @@ def ctrlc_decorator(on_exit):
         # 这是被装饰器包裹的函数
         @wraps(func)
         def wrapper(*args, **kwargs):
-            result = None  # 存储函数的返回结果
-            event = Event()
+            q = Queue()
 
-            # 这是新开启线程要执行的功能，执行传入的函数并获取结果
-            def target():
-                nonlocal result
-                result = func(*args, **kwargs)
-                event.set()
-
-            thread = Thread(target=target)
+            thread = Thread(target=lambda:q.put(func(*args, **kwargs)))
             thread.daemon = True
             thread.start()
 
             try:
-                while not event.wait(0.1):
-                    ...
+                return q.get(block=True)
             except KeyboardInterrupt:
                 # 当接收到键盘中断信号时，执行指定的on_exit函数
                 on_exit()
                 print('bye.')
                 exit(0)
-            return result
 
         # 返回包裹了原函数的新函数
         return wrapper
