@@ -62,7 +62,7 @@ def ensure_user_id(user_id):
     return user_id
 
 
-def getstorage(user_id=None):
+def getstorage(user_id=None)->dict:
     '''获取个人的存储字典'''
     return storage.get('users',str(ensure_user_id(user_id)))
 
@@ -137,7 +137,7 @@ def ensure_group_id(group_id):
             raise ValueError('需要在群内发送或者输入群号以调用此函数!')
     return group_id
 
-def getgroupstorage(group_id=None):
+def getgroupstorage(group_id=None)->dict:
     '''获取群的存储字典，可能异常'''
     return storage.get('groups',str(ensure_group_id(group_id)))
 
@@ -186,6 +186,13 @@ def check_op_and_reply(msg=None):
         send('权限不足(一定消息内将不再提醒)', **msg)
     return False
 
+
+def getchatstorage()->dict:
+    '''获取当前聊天空间的storage'''
+    if is_group_msg(cache.thismsg()):
+        return getgroupstorage()
+    else:
+        return getstorage()
 
 
 #-----------------------------------------------------------------
