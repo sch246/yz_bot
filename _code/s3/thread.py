@@ -31,9 +31,10 @@ def ctrlc_decorator(on_exit):
         def wrapper(*args, **kwargs):
             q = Queue()
 
-            thread = Thread(target=lambda:q.put(func(*args, **kwargs)))
-            thread.daemon = True
-            thread.start()
+            Thread(
+                target=lambda:q.put(func(*args, **kwargs)),
+                daemon=True
+            ).start()
 
             try:
                 return q.get(block=True)
