@@ -1,10 +1,58 @@
 [
     {
-        "name": "cs",
+        "name": "bottles_guess",
         "type": "re",
         "while": {
             "succ": [],
             "fail": []
+        },
+        "cond": "猜瓶子 {Lst}",
+        "succ": [],
+        "fail": [
+            "bottles_init"
+        ],
+        "action": "bottles_guess('{:Lst}'.split())"
+    },
+    {
+        "name": "bottles_init",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "bottles_guess"
+            ]
+        },
+        "cond": "开始猜瓶子 {Lst}",
+        "succ": [],
+        "fail": [
+            "？"
+        ],
+        "action": "bottles_init('{:Lst}'.split())"
+    },
+    {
+        "name": "？",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "bottles_init"
+            ]
+        },
+        "cond": "？",
+        "succ": [],
+        "fail": [
+            "cs"
+        ],
+        "action": "'？' if random.random()>0.5 else None"
+    },
+    {
+        "name": "cs",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "？"
+            ]
         },
         "cond": "~{A}",
         "succ": [],
