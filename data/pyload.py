@@ -1,6 +1,7 @@
 if (lambda:False)():
     # 纯粹是为了不要编辑器显示警告，运行是不可能的
     from _code.bot.cmds.py import *
+    from _code.bot.cmds.py import _input, _print, getchatstorage
 
 Int = r'(?:0|-?[1-9]\d*)'
 Name = r'\w+'
@@ -165,3 +166,54 @@ def my_product(*seqs):
             yield (item,) + others
 
 ###
+
+
+def bottles_get():
+    return getchatstorage().get('bottles',[])
+def bottles_answer_get():
+    return getchatstorage().get('bottles_answer',[])
+def bottles_set(lst):
+    getchatstorage()['bottles'] = lst
+    return lst
+def bottles_answer_set(lst):
+    getchatstorage()['bottles_answer'] = lst
+    return lst
+
+def bottles_init(lst):
+    if len(lst)<= 2:
+        return _print('瓶子数量至少是3！')
+    elif len(set(lst))==1:
+        return _print('瓶子不能全部一样！')
+
+    bottles = bottles_set(lst.copy())
+    bottles_answer = bottles_answer_set(lst.copy())
+    random.shuffle(bottles_answer)
+
+    while _bottles_check() == len(bottles):
+        random.shuffle(bottles_answer)
+
+    _print('猜瓶子游戏！')
+    bottles_check()
+
+def bottles_guess(lst):
+    if len(lst) != len(bottles_answer_get()):
+        return _print('瓶子数量不对！')
+    elif set(lst) != set(bottles_answer_get()):
+        return _print('瓶子类型不对！')
+    bottles_set(lst)
+    bottles_check()
+
+def _bottles_check():
+    bottles = bottles_get()
+    bottles_answer = bottles_answer_get()
+    return len([i for i in range(len(bottles))
+                if bottles[i]==bottles_answer[i]])
+
+def bottles_check():
+    count = _bottles_check()
+    if count==len(bottles_get()):
+        _print('瓶子全对了！')
+    elif count==0:
+        _print('瓶子全不对！')
+    else:
+        _print('对了', count, '个！')
