@@ -18,11 +18,6 @@ atexit.register(lambda:json.dump(data, open('data.json','w',encoding='utf-8'),en
 
 
 
-try:
-    exec(open('data/pyload.py', encoding='utf-8').read())
-except:
-    pass
-
 def _input(s:str='',recv_all=False):
     q = Queue()
     msg_loc = msg_id(cache.thismsg())
@@ -50,6 +45,10 @@ loc = {**globals()}
 loc['input'] = _input
 loc['print'] = _print
 
+try:
+    exec(open('data/pyload.py', encoding='utf-8').read())
+except:
+    pass
 
 @to_thread
 def run(body:str, msg: dict = None, skip_op: bool = False, insert: dict = None):
