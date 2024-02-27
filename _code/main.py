@@ -44,6 +44,7 @@ import bot.chatlog as chatlog
 
 from chat import Chat, MessageStream
 
+__botdir__ = '/'.join(__file__.split('/')[:-2])
 
 def msg_id(msg:dict):
         return (msg.get('group_id'), msg['user_id'])
@@ -119,6 +120,9 @@ def send(text: Any, user_id: int | str = None, group_id: int | str = None, **par
         '''user_id或者group_id是必须的'''
         debug('【准备发送消息】')
         text = str(text)
+
+        # 转换魔术字符串
+        text = text.replace('__botdir__',__botdir__)
 
         if 'message' in params.keys():
                 # 防止message在下面的call_api撞车

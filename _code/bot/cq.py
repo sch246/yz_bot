@@ -5,10 +5,7 @@ import requests
 
 from main import str_tool, connect, to_thread
 
-# image_path = os.path.abspath('./data/images')
-bot_path = '/opt/bot/cq/bot0.4/'
 image_path = 'data/images'
-# image_path = '/opt/bot/cq/bot0.4/data/images'
 
 escape_dic={ # CQ码内的转义
     '&':'&amp;',
@@ -87,11 +84,11 @@ def download_img(url:str, name:str=None):
 
     if name is None:
         name = os.path.basename(file_path)
-    target_path = os.path.join(bot_path, image_path, name)
+    target_path = os.path.join(image_path, name)
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
 
     shutil.move(file_path, target_path)
-    return target_path
+    return os.path.abspath(target_path)
 
 def generate_unique_filename(directory):
     filenames = os.listdir(directory)
@@ -110,14 +107,14 @@ def download_img(picture_url, name=None):
     r = requests.get(picture_url, headers=headers)
     with open(os.path.join(image_path,name), 'wb') as f:
         f.write(r.content)
-    return os.path.abspath(os.path.join(image_path,name))
+    return os.path.join(image_path,name)
 
 def url2cq(url:str,name:str=None):
     img = download_img(url,name).replace('\\','/')
     return dump({
         'type':'image',
         'data':{
-            'file':f'file://{img}'
+            'file':f'file://__botdir__/{img}'  # 设置一个魔术字符串
         }
     })
 
