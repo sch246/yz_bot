@@ -6,8 +6,9 @@ import requests
 from main import str_tool, connect, to_thread
 
 # image_path = os.path.abspath('./data/images')
-my_image_path = './data/images'
-image_path = '/opt/bot/cq/bot0.4/data/images'
+bot_path = '/opt/bot/cq/bot0.4/'
+image_path = 'data/images'
+# image_path = '/opt/bot/cq/bot0.4/data/images'
 
 escape_dic={ # CQ码内的转义
     '&':'&amp;',
@@ -86,7 +87,7 @@ def download_img(url:str, name:str=None):
 
     if name is None:
         name = os.path.basename(file_path)
-    target_path = os.path.join(image_path, name)
+    target_path = os.path.join(bot_path, image_path, name)
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
 
     shutil.move(file_path, target_path)
@@ -102,14 +103,14 @@ def generate_unique_filename(directory):
 
 def download_img(picture_url, name=None):
     if name is None:
-        name = generate_unique_filename(my_image_path)
+        name = generate_unique_filename(image_path)
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36             (KHTML, like Gecko) Chrome/63.0.3239.132 Safari/537.36 QIHU 360SE",
         }
     r = requests.get(picture_url, headers=headers)
-    with open(os.path.join(my_image_path,name), 'wb') as f:
+    with open(os.path.join(image_path,name), 'wb') as f:
         f.write(r.content)
-    return os.path.join(image_path,name)
+    return os.path.abspath(os.path.join(image_path,name))
 
 def url2cq(url:str,name:str=None):
     img = download_img(url,name).replace('\\','/')
@@ -119,7 +120,6 @@ def url2cq(url:str,name:str=None):
             'file':f'file://{img}'
         }
     })
-
 
 def save_pic(text):
     def f(m:re.Match):

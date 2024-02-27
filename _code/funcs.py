@@ -449,4 +449,4 @@ def latex2img(text, size=32, color=(0, 0, 0), bg_color=(255, 255, 255), out='dem
     
     # Save the final image
     combined.convert("RGB").save(out, 'PNG')
-    return f'[CQ:image,file=file://./bot0.4/{out}]'
+    return f'[CQ:image,file=file://{os.path.abspath(out)}]'
