@@ -3,6 +3,8 @@
 import os
 import importlib
 import re
+from inspect import signature
+from functools import wraps
 
 commands = []
 msg = {}
@@ -34,3 +36,37 @@ def run(command, body):
 def load():
     for command in commands:
         modules[command] = importlib.import_module('bot.cmds.'+command)
+
+
+
+def params(f):
+    from main import cache, cq, read_params
+    @wraps(f)
+    def wrapper(body:str):
+        msg = cache.thismsg()
+
+        body = cq.unescape(body)
+        lines = body.splitlines()
+        while len(lines)<2:
+            lines.append('')
+        last, *last_lines = lines
+
+        num_args = len(signature(f).parameters)
+        args = [msg]
+
+        while len(args) < num_args-2:
+            s, last = read_params(last)
+            args.append(s)
+
+        return f(*args, last, last_lines)
+    return wrapper
+
+def grouponly(f):
+    from main import cache
+    @wraps(f)
+    def wrapper(*args,**kws):
+        group_id = cache.thismsg().get('group_id')
+        if group_id is None:
+            return '此命令仅群内可用!'
+        return f(*args,**kws)
+    return wrapper
