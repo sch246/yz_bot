@@ -1,7 +1,7 @@
 '''简单创建个多线程'''
 
-from queue import Queue
-from threading import Thread, Event
+from concurrent.futures import Future
+from threading import Thread
 from functools import wraps
 
 def to_thread(func, ret_thread=False):
@@ -18,7 +18,7 @@ def to_thread(func, ret_thread=False):
     return wrapper
 
 
-def ctrlc_decorator(on_exit):
+def ctrlc_decorator(on_exit=lambda:None):
     '''
     让任意函数可以被ctrl+c中断，随后运行回调函数
     '''
@@ -29,15 +29,15 @@ def ctrlc_decorator(on_exit):
         # 这是被装饰器包裹的函数
         @wraps(func)
         def wrapper(*args, **kwargs):
-            q = Queue()
+            res = Future()
 
             Thread(
-                target=lambda:q.put(func(*args, **kwargs)),
+                target=lambda:res.set_result(func(*args, **kwargs)),
                 daemon=True
             ).start()
 
             try:
-                return q.get(block=True)
+                return res.result()
             except KeyboardInterrupt:
                 # 当接收到键盘中断信号时，执行指定的on_exit函数
                 on_exit()
