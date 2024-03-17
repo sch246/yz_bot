@@ -11,7 +11,7 @@ def members(lst):
 @params
 @grouponly
 def run(msg, arg0, arg1, last, last_lines):
-    '''用于cs内战组队，所有人确认后会随机roll出一个人
+    '''用于cs内战组队，所有人确认后会随机roll出一个人，人数不满时也可以直接结束并选人
 格式:
 .join start[ <总人数>]
 .join
@@ -40,22 +40,22 @@ def run(msg, arg0, arg1, last, last_lines):
             return '已在列表中！'
         loc['count'] -= 1
         loc['lst'].append(qq)
-        sendmsg(f"已加入！\n当前人数: {len(loc['lst'])} / {loc['size']}")
+        sendmsg(f"已加入！\n当前人数: {len(loc['lst'])} / {loc['size']}\n" + members(loc['lst']))
 
         if loc['count']==0:
-            sendmsg(f"人数已满！\n" + members(loc['lst']))
+            sendmsg(f"人数已满！")
             qq = choice(loc['lst'])
+            sendmsg(f'随机出的人选是: {getname(qq)} ({qq})！')
             del loc['count']
             del loc['size']
             del loc['lst']
-            sendmsg(f'随机出的人选是: {getname(qq)} ({qq})！')
         return
 
     elif arg0=='end':
         if not loc['lst']:
             return '已取消'
         else:
-            sendmsg(f"人数已定！\n" + members(loc['lst']))
+            sendmsg(f"人数已定！")
             qq = choice(loc['lst'])
             sendmsg(f'随机出的人选是: {getname(qq)} ({qq})！')
         del loc['count']
