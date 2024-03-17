@@ -102,43 +102,19 @@ bot没有插件系统，不过添加命令本身也是相对独立的，可以�
 
 ## 安装
 
-众所周知(雾)，QQ bot 运行需要2个程序
+QQ bot 运行需要2个(划掉，3个)程序
 
-- 登录QQ，和腾讯的服务器通讯(大概)，是一个qq客户端
-- 操作前面的那个程序，处理和回应事件
+- 登录 QQ ，和腾讯的服务器通讯(大概)，是一个 QQ 客户端
+  - 给 QQ 客户端的消息进行签名，防止被封的服务器
+- bot本体，与客户端通信，处理和回应事件
 
-这里的程序是后一个
+这里的程序是最后一个
 
 关于前一个程序请参考[go-cqhttp](https://github.com/Mrs4s/go-cqhttp)
 
-并且选择 http 通信
+第二个程序请参考[unidbg-fetch-qsign](https://github.com/CikeyQi/unidbg-fetch-qsign-shell)
 
-<details>
-<summary>go-cqhttp登录问题(已过期)</summary>
-
-- [CSDN - 解决xdd/傻妞/go-cqhttp机器人扫码登录异常/全部亲测可用/补充环节【2020年4月30日】](https://blog.csdn.net/m0_57009761/article/details/124521022)
-
-QQ在信任的设备上登录可以不用扫码
-
-go-cqhttp链接时需要设备信息，若没有则会随机生成一个
-
-若成功登录了，该设备会被QQ信任
-
-设备信息存储在同目录下的device.json
-
-因此只要在本地或者随便哪里成功一次制造出一个被QQ信任的设备信息
-
-以该设备信息来连接，就能跳过扫码了
-
-具体操作是在电脑上运行并扫码登录go-cqhttp
-
-把成功那一次使用或生成的device.json替换或者复制过去
-
-据测试，需要填入密码才能跳过扫码(大概)
-
----
-
-</details>
+本 bot 需要选择 go-cqhttp 的 http 通信，把 go-cqhttp 的 http 监听端口设为 5700(默认), http post 端口设为 5701(默认) 即可
 
 bot 需要 python 3.10 或更高的版本
 

@@ -83,6 +83,12 @@ v _code
 
 ## 基本命令
 
+### [.help](/_code/bot/cmds/help.py)
+
+可以用来`.help`查看所有命令及其简略说明
+
+或者`.help <命令名>`来查看命令的详细解释
+
 ### [.test](/_code/bot/cmds/test.py)
 
 基础命令，可以用来测试 bot 还在不在
