@@ -308,7 +308,7 @@ def chat(model="gpt-3.5-turbo"):
     chat_logs=list(filter(lambda m:is_msg(m) and not m['message'].startswith('#'),getlog()))
     i = find(chat_logs, lambda m:m['message']=='聊天开始' or m['message']=='聊天结束')
     chat_logs=list(reversed(chat_logs[:i]))
-    chat_client.messages = list(map(msg2chat,chat_logs))
+    chat_client.messages = list(map(msg2chat,chat_logs))[-30:]
     # chats = []
     # while chat_contexts:
     #     message = chat_contexts.pop()

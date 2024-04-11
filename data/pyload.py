@@ -217,3 +217,17 @@ def bottles_check():
         _print('瓶子全不对！')
     else:
         _print('对了', count, '个！')
+
+def vcs(cmd=''):
+    msg=cache.thismsg()
+    if msg['user_id'] not in cache.ops:
+        return '无权限'
+    else:
+        s=screen.send('vcs',cmd)
+        lines=s.splitlines()[1:]
+        return '\n'.join(lines).replace('''^[[?2004h''','').replace('''^[[?2004l
+''','')
+###
+def iex(cmd=''):
+    return screen.send('iex',cmd)
+###

@@ -15,12 +15,13 @@ def run(body:str):
         return
     if body.strip()=='':
         send('重启中', **msg).result()
-        file.write(file.ensure_file('data/reboot_greet.py'), f"send('重启完成',**{msg})")
+        file.json_write(file.ensure_file('data/reboot_greet.py'), msg)
         exit(233)
 
 # 用于重启时打招呼
 # def load():
 reboot_greet = file.ensure_file('data/reboot_greet.py')
 if os.path.isfile(reboot_greet):
-    exec(open(reboot_greet,encoding='utf-8').read())
+    msg = file.json_read('data/reboot_greet.py')
+    send('重启完成', **msg)
     os.remove(reboot_greet)
