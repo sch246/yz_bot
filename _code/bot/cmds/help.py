@@ -7,7 +7,7 @@ def run(body:str):
 格式: .help[ <命令>]'''
     name = body.strip()
     if not name:
-        return '\n'.join([f'{name}\n    {model.__doc__.strip()}' for name, model in cmds.modules.items()])
+        return '\n'.join([f'{name}\n    {str(model.__doc__).strip()}' for name, model in cmds.modules.items()])
     cmd = getcmd(name)
     if cmd:
         return cmd.run.__doc__

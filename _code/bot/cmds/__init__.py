@@ -6,9 +6,12 @@ import re
 from inspect import signature
 from functools import wraps
 
+
 commands = []
 msg = {}
 modules = {}
+fails = []
+
 
 for name in os.listdir(os.path.split(__file__)[0]):
     if name.startswith('_'):
@@ -34,8 +37,19 @@ def run(command, body):
     return modules[command].run(body)
 
 def load():
+    from main import file, send
+    
+    if os.path.isfile(file.ensure_file('data/reboot_greet.py')):
+        msg = file.json_read('data/reboot_greet.py')
+
     for command in commands:
-        modules[command] = importlib.import_module('bot.cmds.'+command)
+        try:
+            modules[command] = importlib.import_module('bot.cmds.'+command)
+        except:
+            fails.append(command)
+
+    if fails:
+        send(f'加载失败: {fails}', **msg)
 
 
 
