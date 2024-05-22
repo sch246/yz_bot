@@ -1,10 +1,92 @@
 [
     {
+        "name": "mytest",
+        "type": "py",
+        "while": {
+            "succ": [],
+            "fail": []
+        },
+        "cond": "msg=cache.thismsg()\nmsg.get('message')=='rua'",
+        "succ": [
+            "mytest2"
+        ],
+        "fail": [
+            "百变小猫"
+        ],
+        "action": "print('rua!')"
+    },
+    {
+        "name": "百变小猫",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "mytest"
+            ]
+        },
+        "cond": "(|柚子|柚子，)(|我是|我也是)百变小猫$",
+        "succ": [],
+        "fail": [
+            "iex"
+        ],
+        "action": "bbxm()"
+    },
+    {
+        "name": "iex",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "百变小猫"
+            ]
+        },
+        "cond": "\\.iex {Cmd}",
+        "succ": [],
+        "fail": [
+            "vcs0"
+        ],
+        "action": "iex(\"\"\" {:Cmd} \"\"\".strip())"
+    },
+    {
+        "name": "vcs0",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "iex"
+            ]
+        },
+        "cond": "\\.vcs$",
+        "succ": [],
+        "fail": [
+            "vcs"
+        ],
+        "action": "vcs()"
+    },
+    {
+        "name": "vcs",
+        "type": "re",
+        "while": {
+            "succ": [],
+            "fail": [
+                "vcs0"
+            ]
+        },
+        "cond": "\\.vcs {Cmd}",
+        "succ": [],
+        "fail": [
+            "bottles_guess"
+        ],
+        "action": "vcs(\"\"\" {:Cmd} \"\"\".strip())"
+    },
+    {
         "name": "bottles_guess",
         "type": "re",
         "while": {
             "succ": [],
-            "fail": []
+            "fail": [
+                "vcs"
+            ]
         },
         "cond": "猜瓶子 {Lst}",
         "succ": [],
@@ -99,7 +181,6 @@
         "while": {
             "succ": [],
             "fail": [
-                "",
                 "ping"
             ]
         },
@@ -452,9 +533,7 @@
         "type": "re",
         "while": {
             "succ": [],
-            "fail": [
-                ""
-            ]
+            "fail": []
         },
         "cond": "柚子亲亲",
         "succ": [],
@@ -714,5 +793,19 @@
         "succ": [],
         "fail": [],
         "action": "loc=geocode('{:city}')['location']\nlng = loc['lng']\nlat = loc['lat']\ngetstorage()['经度'] = lng\ngetstorage()['纬度'] = lat\nf'设置经纬度: {lng} {lat}'"
+    },
+    {
+        "name": "mytest2",
+        "type": "py",
+        "while": {
+            "succ": [
+                "mytest"
+            ],
+            "fail": []
+        },
+        "cond": "msg.get('user_id')==980001119",
+        "succ": [],
+        "fail": [],
+        "action": "print('AAAAAAAAAAAAAAA')"
     }
 ]

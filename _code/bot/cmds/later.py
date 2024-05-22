@@ -128,6 +128,22 @@ def normalize_time_tuple(*time_tuple):
 re_m = re.compile(r'^\d+-\d+(-\d+)?$')
 re_M = re.compile(r'^\d+:\d+(:\d+)?$')
 re_abstime = re.compile(r'^\d+:\d+(:\d+)?|\d+-\d+(-\d+)?( \d+:\d+(:\d+)?)?$')
+def has_time_passed(hour, minute, second):
+    # 获取当前时间的struct_time对象
+    now = time.localtime()
+    
+    # 创建一个struct_time对象表示今天的给定时分秒
+    target_time = time.struct_time((now.tm_year, now.tm_mon, now.tm_mday, hour, minute, second, 
+                                    now.tm_wday, now.tm_yday, now.tm_isdst))
+    
+    # 将struct_time对象转换为时间戳
+    target_timestamp = time.mktime(target_time)
+    
+    # 获取当前时间的时间戳
+    current_timestamp = time.mktime(now)
+    
+    # 比较当前时间与给定时间
+    return current_timestamp > target_timestamp
 def read_abstime(s_time:str):
     '''
     完整格式是 年-月-日 时:分:秒
@@ -151,7 +167,10 @@ def read_abstime(s_time:str):
             时分秒 = list(map(int,t.split(':')))
             if len(时分秒)==2:
                 时分秒.append(0)
-            (Y,m,d,_,_,_,_,_,_)  = time.localtime()
+            if has_time_passed(*时分秒):
+                (Y,m,d,_,_,_,_,_,_)  = time.localtime(time.time()+86400)
+            else:
+                (Y,m,d,_,_,_,_,_,_)  = time.localtime()
             年月日时分秒 = [Y,m,d]+时分秒
         else:
             raise ValueError(f'绝对时间字符串格式错误，得到了: {repr(s_time)}')

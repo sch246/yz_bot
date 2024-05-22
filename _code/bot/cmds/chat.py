@@ -200,9 +200,9 @@ chat_client.add_tool(exec_code)
 # chat_client.add_tool(xiaoliu)
 # chat_client.add_tool(sendmsg)
 # chat_client.add_tool(later_list)
-# chat_client.add_tool(later_add)
+chat_client.add_tool(later_add)
 # chat_client.add_tool(later_set)
-# chat_client.add_tool(later_del)
+chat_client.add_tool(later_del)
 chat_client.add_tool(create_image)
 chat_client.add_tool(chat_client.read_image)
 # chat_client.add_tool(url2cq)
@@ -299,7 +299,7 @@ def add(msg):
     chat_client.messages.append(msg)
     return msg
 
-def chat(model="gpt-3.5-turbo"):
+def chat(model="gpt-4o"):
     # call = [
     #     *settings,
     #     {'role': 'system', 'content':f'现在是{time.strftime("%Y年%m月%d日%H时%M分%S秒")}'}
@@ -324,7 +324,6 @@ def chat(model="gpt-3.5-turbo"):
     stream = chat_client.req(tools, "auto", model)
     res_msg = add(stream)
     tool_calls = res_msg.tool_calls
-
     while tool_calls:
         for tool_call in tool_calls:
             function_name = tool_call.function.name

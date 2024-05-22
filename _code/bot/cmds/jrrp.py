@@ -26,6 +26,13 @@ def run(body:str):
         data['jrrp_'] = rd(1,101) -1 if not if_setzero else 0
         r = data['jrrp_']
 
+        if time.strftime('%m-%d')!='04-01':
+            # 4月1号人品不固定
+            data['jrrp_date'] = date
+        else:
+            data['jrrp_'] = rd(1,1000001) -1 if not if_setzero else 0
+            r = data['jrrp_']
+
         if r>95:data['jrrp']=f'{r}\n{getran(大成功)}'
         elif r<5:
             data['jrrp'] = f'{r}\n{getran(大失败)}'
@@ -34,9 +41,5 @@ def run(body:str):
                 if_show = False
         else:
             data['jrrp'] = str(r)
-
-        if time.strftime('%m-%d')!='04-01':
-            # 4月1号人品不固定
-            data['jrrp_date'] = date
     if if_show:
         return data['jrrp']

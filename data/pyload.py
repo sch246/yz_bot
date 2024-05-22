@@ -3,6 +3,7 @@ if (lambda:False)():
     from _code.bot.cmds.py import *
     from _code.bot.cmds.py import _input, _print, getchatstorage
 
+
 Int = r'(?:0|-?[1-9]\d*)'
 Name = r'\w+'
 Param = r'\S+'
@@ -230,4 +231,22 @@ def vcs(cmd=''):
 ###
 def iex(cmd=''):
     return screen.send('iex',cmd)
+###
+
+def bbxm():
+    with open('data/bbxm.txt', 'r', encoding='utf-8') as a:
+        lines = a.readlines()
+
+    bbxm = random.choice(lines).strip()
+    return f'现在{bbxm}！'
+###
+def testprint(text):
+    print(text)
+###
+def testprint(text):
+    print(text)
+###
+true = True
+false = False
+none = nil = null = None
 ###
