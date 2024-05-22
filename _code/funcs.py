@@ -120,6 +120,7 @@ def getcmd(name:str):
     return cmds.modules.get(name)
 
 def headshot_url(user_id=None):
+    return f'https://q2.qlogo.cn/headimg_dl?dst_uin={ensure_user_id(user_id)}&spec=100'
     return f'http://q1.qlogo.cn/g?b=qq&nk={ensure_user_id(user_id)}&s=640'
 def headshot(user_id=None):
     return cq.url2cq(headshot_url(user_id))

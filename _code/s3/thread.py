@@ -1,4 +1,5 @@
 '''简单创建个多线程'''
+from functools import cache
 
 from concurrent.futures import Future
 from threading import Thread

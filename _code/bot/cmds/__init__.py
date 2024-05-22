@@ -41,6 +41,8 @@ def load():
     
     if os.path.isfile(file.ensure_file('data/reboot_greet.py')):
         msg = file.json_read('data/reboot_greet.py')
+    else:
+        msg = None
 
     for command in commands:
         try:
@@ -49,7 +51,10 @@ def load():
             fails.append(command)
 
     if fails:
-        send(f'加载失败: {fails}', **msg)
+        if msg:
+            send(f'加载失败: {fails}', **msg)
+        else:
+            print(f'加载失败: {fails}')
 
 
 

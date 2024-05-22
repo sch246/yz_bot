@@ -44,11 +44,16 @@ loc = {**globals()}
 # 修改input和print
 loc['input'] = _input
 loc['print'] = _print
+__input = input
+__print = print
+input = _input
+print = _print
 
 try:
     exec(open('data/pyload.py', encoding='utf-8').read())
 except:
     pass
+
 
 @to_thread
 def run(body:str, msg: dict = None, skip_op: bool = False, insert: dict = None):
@@ -235,7 +240,7 @@ def exec_link(link):
     if out:
         # 如果通过了，运行succ内的link，
         # succ内的link没找到则删掉
-        print('触发了link:', name)
+        __print('触发了link:', name)
         run_or_remove(succ)
     else:
         # 如果没通过，运行fail内的link
