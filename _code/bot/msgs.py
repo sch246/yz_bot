@@ -67,7 +67,13 @@ def is_notice(msg:dict):
     return 'notice_type' in msg.keys()
 def is_file(msg:dict):
     '''可以是群文件或者离线文件'''
-    return is_notice(msg) and 'file' in msg.keys()
+    if is_msg(msg) and is_cq(msg):
+        CQ = cq.find_all(msg['message'])[0]
+        d = cq.load(CQ)
+        if d['type']=='file':
+            return True
+    return False
+
 def is_group_file(msg:dict):
     '''群文件'''
     return msg.get('notice_type') == 'group_upload'
