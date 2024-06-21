@@ -118,17 +118,23 @@ def _send_file(path):
     path = os.path.abspath(path)
     if not os.path.isfile(path):
         return f'打开失败，文件"{path}"不存在'
-    if 'group_id' in msg.keys():
-        ret = connect.call_api('upload_group_file', group_id=msg['group_id'], file=path, name=os.path.split(path)[1])
-        if not ret['retcode']==0:
-            return ret['wording']
-        return
-    elif 'user_id' in msg.keys():
-        ret = connect.call_api('upload_private_file', user_id=msg['user_id'], file=path, name=os.path.split(path)[1])
-        if not ret['retcode']==0:
-            return ret['wording']
-        return
-    return '找到了文件，但是发送失败了'
+    return cq.dump({
+        'type':'file',
+        'data':{
+            'file':f'file://{path}'
+        }
+    })
+    # if 'group_id' in msg.keys():
+    #     ret = connect.call_api('upload_group_file', group_id=msg['group_id'], file=path, name=os.path.split(path)[1])
+    #     if not ret['retcode']==0:
+    #         return ret['wording']
+    #     return
+    # elif 'user_id' in msg.keys():
+    #     ret = connect.call_api('upload_private_file', user_id=msg['user_id'], file=path, name=os.path.split(path)[1])
+    #     if not ret['retcode']==0:
+    #         return ret['wording']
+    #     return
+    # return '找到了文件，但是发送失败了'
 
 
 
@@ -155,18 +161,27 @@ def recv_img(_msg, path):
     return f'正在将图片保存到\n{path}'
 
 def _recv_file(file_msg, path):
-    if 'file' not in file_msg.keys():
-        return '发送的不是文件，接收终止'
-    # 离线文件具有url，群文件需要调用api获取链接
-    if 'group_id' in file_msg.keys() and file_msg['group_id']!=None:
-        file = file_msg['file']
-        ret = connect.call_api('get_group_file_url',group_id=file_msg['group_id'], file_id=file['id'], busid=file['busid'])
-        if ret['retcode']==0:
-            url = ret['data']['url']
-    else:
-        url = file_msg['file']['url']
-    download(url, path, file_msg)
-    return f'正在将文件保存到\n{path}'
+    CQ = cq.find_all(file_msg['message'])[0]
+    file_id = cq.load(CQ)['data']['file_id']
+    ret = connect.call_api('get_file', file_id=file_id)
+    if not ret['retcode']==0:
+        return ret['wording']
+    abs_path = ret['data']['file']
+    os.rename(abs_path, path)
+    send(f'文件已保存到\n{path}', **file_msg)
+
+    # if 'file' not in file_msg.keys():
+    #     return '发送的不是文件，接收终止'
+    # # 离线文件具有url，群文件需要调用api获取链接
+    # if 'group_id' in file_msg.keys() and file_msg['group_id']!=None:
+    #     file = file_msg['file']
+    #     ret = connect.call_api('get_group_file_url',group_id=file_msg['group_id'], file_id=file['id'], busid=file['busid'])
+    #     if ret['retcode']==0:
+    #         url = ret['data']['url']
+    # else:
+    #     url = file_msg['file']['url']
+    # download(url, path, file_msg)
+    # return f'正在将文件保存到\n{path}'
 
 # 是生成器
 def _set(path, is_force):

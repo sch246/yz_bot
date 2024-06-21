@@ -3,6 +3,7 @@
 import os
 import importlib
 import re
+import traceback
 from inspect import signature
 from functools import wraps
 
@@ -48,6 +49,7 @@ def load():
         try:
             modules[command] = importlib.import_module('bot.cmds.'+command)
         except:
+            print(traceback.format_exc())
             fails.append(command)
 
     if fails:

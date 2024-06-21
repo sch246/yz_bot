@@ -31,7 +31,13 @@ def call_api(action: str, **params) -> dict:
     }
     re = requests.post(
         url+f'/{action}', headers=headers, json=params, verify=False)
-    return json.loads(re.text)
+    try:
+        return json.loads(re.text)
+    except:
+        return {
+            'retcode':400,
+            'wording':re.text,
+        }
 
 
 def send_msg(msg: str, user_id: int | str = None, group_id: int | str = None, **params) -> dict:
@@ -59,7 +65,7 @@ Content-Type: text/html\r\n\r\n
 def request_to_json(msg: str) -> dict | None:
     '''遍历request字符串, 直到后面是json格式, 读取对应json文本并返回'''
     for i in range(len(msg)):
-        if msg[i] == "{" and msg[-1] == "\n":
+        if msg[i] == "{" and msg[i-1] == "\n":
             return json.loads(msg[i:])
     return None
 
@@ -70,6 +76,7 @@ def request_to_json(msg: str) -> dict | None:
 def recv_msg() -> dict | None:
     Client, _ = ListenSocket.accept()
     Request = Client.recv(8192).decode(encoding='utf-8')
+    #print(Request)
     rev_json = request_to_json(Request)
     # 发送信号表示我收到了
     Client.sendall(HttpResponseHeader.encode(encoding='utf-8'))

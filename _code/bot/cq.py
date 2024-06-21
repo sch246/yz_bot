@@ -2,10 +2,14 @@
 import re,os
 import shutil
 import requests
+import threading
+import time
+from PIL import Image
 
 from main import str_tool, connect, to_thread
 
 image_path = 'data/images'
+temp_path = 'data/tmp_files'
 
 escape_dic={ # CQ码内的转义
     '&':'&amp;',
@@ -36,7 +40,7 @@ def unescape2(text: str):
     return str_tool.replace_by_dic2(text, escape_dic2)
 
 
-re_CQdatas = r'(?:,[^,=]+=[^,\]]+)*'
+re_CQdatas = r'(?:,[^,=]+=[^,\]]*)*'
 
 _re_CQ = re.compile(rf'\[CQ:[^,\]]+{re_CQdatas}\]')
 re_CQ = re.compile(rf'\[CQ:(?P<type>[^,\]]+)(?P<data>{re_CQdatas})\]')
@@ -90,27 +94,55 @@ def download_img(url:str, name:str=None):
     shutil.move(file_path, target_path)
     return os.path.abspath(target_path)
 
+lock = threading.Lock()
+
 def generate_unique_filename(directory):
-    filenames = os.listdir(directory)
-    i = 0
-    while f'{i}.image' in filenames:
-        i += 1
-    return f'{i}.image'
+    with lock:
+        filenames:list[str] = os.listdir(directory)
+        date = time.strftime('%Y-%m-%d')
+        i = 0
+        while list(filter(lambda x:x.startswith(f'{date}-{i}'), filenames)):
+            i += 1
+        return f'{date}-{i}.cache'
 
-
-def download_img(picture_url, name=None):
-    if name is None:
-        name = generate_unique_filename(image_path)
+def download_img(picture_url, name=None, temp=True):
+    if temp:
+        target_dir = temp_path
+    else:
+        target_dir = image_path
+    # 下载
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36             (KHTML, like Gecko) Chrome/63.0.3239.132 Safari/537.36 QIHU 360SE",
         }
     r = requests.get(picture_url, headers=headers)
-    with open(os.path.join(image_path,name), 'wb') as f:
-        f.write(r.content)
-    return os.path.join(image_path,name)
+    if r.status_code != 200:
+        raise Exception(f"Failed to download image, status code: {r.status_code}")
 
-def url2cq(url:str,name:str=None):
-    img = download_img(url,name).replace('\\','/')
+    # 生成图片名(如果没有)
+    if name is None:
+        name = generate_unique_filename(target_dir)
+    # 修改拓展名
+    with Image.open(r.content) as img:
+        img_format = img.format.lower()
+
+        if img_format == 'jpeg':
+            name = name.rsplit('.', 1)[0] + '.jpg'
+        elif img_format == 'png':
+            name = name.rsplit('.', 1)[0] + '.png'
+        elif img_format == 'gif':
+            name = name.rsplit('.', 1)[0] + '.gif'
+        else:
+            pass
+
+    file_path = os.path.join(target_dir, name)
+
+    with open(file_path, 'wb') as f:
+        f.write(r.content)
+
+    return file_path
+
+def url2cq(url:str,name:str=None, temp=True):
+    img = download_img(url,name, temp).replace('\\','/')
     return dump({
         'type':'image',
         'data':{
@@ -124,7 +156,7 @@ def save_pic(text):
         CQ = load(cq)
         if CQ['type']=='image':
             try:
-                return url2cq(CQ['data'].get('url'),CQ['data'].get('file'))
+                return url2cq(CQ['data'].get('url'), temp=False)
             except:
                 return cq
         return cq

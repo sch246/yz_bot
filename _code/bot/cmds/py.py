@@ -110,14 +110,14 @@ def run(body:str, msg: dict = None, skip_op: bool = False, insert: dict = None):
 
 
 # 接收文件！
-recv_file = cmds.modules['file']._recv_file
-send_file = cmds.modules['file']._send_file
-read_file = cmds.modules['file'].read_file
+# recv_file = cmds.modules['file']._recv_file
+# send_file = cmds.modules['file']._send_file
+# read_file = cmds.modules['file'].read_file
 def write_file(path, value:str, start=None, end=None):
     lines = value.splitlines(True)
     cmds.modules['file'].write_file(path,lines,start,end)
     return '已写入 '+path
-listdir = cmds.modules['file'].listdir
+# listdir = cmds.modules['file'].listdir
 
 def same_times(f:Callable|str, i=None):
     '''用all筛选最近的i条消息，不包括本条消息，设为None则是筛选全部消息'''
