@@ -315,7 +315,7 @@ class Chat(OpenAI):
             enum: ["low", "high", "auto"]
         '''
         response = self.chat.completions.create(
-        model="gpt-4-vision-preview",
+        model="gpt-4o",
         messages=[
             {
             "role": "user",

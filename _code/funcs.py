@@ -239,7 +239,59 @@ def has_at(qq):
     return _
 ###
 ###
+def is_image_accessible(url):
+    try:
+        response = requests.get(url, stream=True)
+        # 检查响应状态码是否为200
+        if response.status_code == 200:
+            # 检查内容类型是否为图片
+            content_type = response.headers.get('Content-Type')
+            if 'image' in content_type:
+                return True
+    except requests.RequestException as e:
+        pass
+    return False
+
+# 定义正则表达式匹配CoolQ码中的图片标记
+image_pattern = re.compile(rf'(\[CQ:image(?:,[^,=]+=[^,\]]*)*\])')
+
+def msg_split(text):
+    lst = []
+    for part in image_pattern.split(text):
+        if image_pattern.match(part):
+            try:
+                # 假设cq.load(part)能正确提取图片URL数据
+                url = cq.load(part)['data']['url']
+                if is_image_accessible(url):
+                    lst.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": url,
+                        }
+                    })
+                    continue
+            except KeyError:
+                # 万一cq.load没有获取到url，可以记录日志或者返回错误信息
+                pass
+        lst.append({
+            "type": "text",
+            "text": part
+        })
+
+    return lst
+
+
 def msg2chat(msg, in_group=True):
+    # if msg.get('sender') and msg['sender']['user_id']==cache.qq:
+    #     role = 'assistant'
+    #     content_pre = []
+    # else:
+    #     role = 'user'
+    #     if in_group:
+    #         content_pre = [{"type": "text", "text": f'---\nqq: {msg["user_id"]}\nname: {repr(msg2name(msg))}\nmessage_id: {msg["message_id"]}\n---\n'}]
+    #     else:
+    #         content_pre = []
+    # return {'role':role, 'content':content_pre+msg_split(msg['message'])}
     if msg.get('sender') and msg['sender']['user_id']==cache.qq:
         return {'role':'assistant','content':msg['message']}
     elif in_group:
