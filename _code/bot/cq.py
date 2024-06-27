@@ -1,5 +1,5 @@
 '''处理cq码相关的东西'''
-import re,os
+import re,os,io
 import shutil
 import requests
 import threading
@@ -10,6 +10,11 @@ from main import str_tool, connect, to_thread
 
 image_path = 'data/images'
 temp_path = 'data/tmp_files'
+
+if not os.path.exists(image_path):
+    os.mkdir(image_path)
+if not os.path.exists(temp_path):
+    os.mkdir(temp_path)
 
 escape_dic={ # CQ码内的转义
     '&':'&amp;',
@@ -122,7 +127,7 @@ def download_img(picture_url, name=None, temp=True):
     if name is None:
         name = generate_unique_filename(target_dir)
     # 修改拓展名
-    with Image.open(r.content) as img:
+    with Image.open(io.BytesIO(r.content)) as img:
         img_format = img.format.lower()
 
         if img_format == 'jpeg':
