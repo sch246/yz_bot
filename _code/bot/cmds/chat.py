@@ -253,12 +253,12 @@ def pprint(message:dict | ChatCompletionMessage | MessageStream):
                 print(colored(delta, "yellow"),end='', flush=True)
         else:
             print(colored(f"assistant: ", role_to_color[role]),end='', flush=True)
-            text = ''
+            text:str = ''
             for delta in message:
                 print(colored(delta, role_to_color[role]),end='', flush=True)
                 text += delta
-                if text.endswith('\n\n'):
-                    _sendmsg(text.strip())
+                if text.endswith('\n\n') and text.count('\n```')%2==0:
+                    _sendmsg(text[:-2])
                     text = ''
             if text:
                 _sendmsg(text.strip())
