@@ -11,6 +11,7 @@ from termcolor import colored
 
 import openai
 from openai.types.chat.chat_completion_message import ChatCompletionMessage
+import tiktoken
 
 
 from main import sendmsg
@@ -23,9 +24,44 @@ import json
 
 from main import Chat, MessageStream
 
+from main import memberlist
+
 chat_client = Chat()
 
-from main import memberlist
+encoding = tiktoken.encoding_for_model('gpt-4')
+
+def count_tokens(text:str):
+    return len(encoding.encode(text))
+
+prices = {
+    "gpt-3.5-turbo":(0.0035, 0.0105),
+    "gpt-4":(0.21, 0.42),
+    "gpt-4o":(0.035, 0.105)
+}
+
+def get_caller():
+    msg = cache.thismsg()
+    qq = str(msg['user_id'])
+    mon = f'{datetime.today().month}'
+    usage:dict = storage.get('usage', mon)
+    usage.setdefault(qq, [0,0])
+    return usage[qq]
+
+def inc_call_count():
+    get_caller()[0] += 1
+
+def inc_call_cost(model, type:int, text:str):
+    token = count_tokens(text)
+    price = token*prices[model][type]/1000
+    get_caller()[1] += price
+
+def inc_call_image_cost(size:str, quality:str):
+    price = 0.28
+    if size != "1024x1024":
+        price += 0.28
+    if quality == 'hd':
+        price += 0.28
+    get_caller()[1] += price
 
 def get_time():
     '''
@@ -173,6 +209,7 @@ def create_image(prompt:str, size:str, quality:str):
     quality: Image quality
         enum: ["standard", "hd"]
     '''
+    inc_call_image_cost(size, quality)
     picCQ = url2cq(chat_client.create_image(prompt, size, quality))
     sendmsg(picCQ)
     return picCQ
@@ -190,42 +227,46 @@ def baidu_encyclopedia(object:str):
         return '查询失败'
     return res['data']['text']
 
-# chat.add_tool(get_location)
-chat_client.add_tool(get_time)
-chat_client.add_tool(exec_code)
-# chat_client.add_tool(read_data)
-# chat_client.add_tool(group_size)
-# chat_client.add_tool(group_members)
-# chat_client.add_tool(lunar_date)
-# chat_client.add_tool(xiaoliu)
-# chat_client.add_tool(sendmsg)
-# chat_client.add_tool(later_list)
-chat_client.add_tool(later_add)
-# chat_client.add_tool(later_set)
-chat_client.add_tool(later_del)
-chat_client.add_tool(create_image)
-chat_client.add_tool(chat_client.read_image)
-# chat_client.add_tool(url2cq)
-# chat_client.add_tool(muti_reply)
-chat_client.add_tool(baidu_encyclopedia)
 
-# chat.add(chat.req())
 
-last_data = None
-def show_data(s):
-    data = getcmd('py').data
-    global last_data
-    result = '`data`内的键及类型: {'+', '.join([f"`{k}`: {type(v)}" for k, v in data.items()])+'}' if data!=last_data else None
-    last_data = data.copy()
-    return result
+def init_chat(chat_client:Chat):
+    inc_call_count()
+    # chat.add_tool(get_location)
+    chat_client.add_tool(get_time)
+    chat_client.add_tool(exec_code)
+    # chat_client.add_tool(read_data)
+    # chat_client.add_tool(group_size)
+    # chat_client.add_tool(group_members)
+    # chat_client.add_tool(lunar_date)
+    # chat_client.add_tool(xiaoliu)
+    # chat_client.add_tool(sendmsg)
+    # chat_client.add_tool(later_list)
+    chat_client.add_tool(later_add)
+    # chat_client.add_tool(later_set)
+    chat_client.add_tool(later_del)
+    chat_client.add_tool(create_image)
+    chat_client.add_tool(chat_client.read_image)
+    # chat_client.add_tool(url2cq)
+    # chat_client.add_tool(muti_reply)
+    chat_client.add_tool(baidu_encyclopedia)
 
-chat_client.set_settings([
-        settings[0]['content'],
-        group_state,
-        # show_data,
-        # 'If necessary, remember to use python to read the storage in \'data\' at any time',
-        # 'Images must be converted to cq code before they can be sent, do not use the markdown format',
-        ])
+    # chat.add(chat.req())
+
+    # last_data = None
+    # def show_data(s):
+    #     data = getcmd('py').data
+    #     global last_data
+    #     result = '`data`内的键及类型: {'+', '.join([f"`{k}`: {type(v)}" for k, v in data.items()])+'}' if data!=last_data else None
+    #     last_data = data.copy()
+    #     return result
+
+    chat_client.set_settings([
+            settings[0]['content'],
+            group_state,
+            # show_data,
+            # 'If necessary, remember to use python to read the storage in \'data\' at any time',
+            # 'Images must be converted to cq code before they can be sent, do not use the markdown format',
+            ])
 
 
 
@@ -239,7 +280,7 @@ def show_args(args):
     return ', '.join([f'{k}={repr(v)}' for k, v in args.items()])
 def show_tool_calls(tool_calls):
     return ''.join(map(lambda s:f'\n    {s["function"]["name"]}({show_args(json.loads(s["function"]["arguments"]))})', tool_calls))
-def pprint(message:dict | ChatCompletionMessage | MessageStream):
+def pprint(message:dict | ChatCompletionMessage | MessageStream, model:str):
     '''
     打印 dict, 普通消息, 或者流式消息, 然后返回
     流式消息会转换为普通消息
@@ -249,8 +290,11 @@ def pprint(message:dict | ChatCompletionMessage | MessageStream):
         tool_calls = message.tool_calls
         if message.tool_calls:
             print(colored(f"assistant called: {tool_calls[0].function.name} ", "yellow"),end='', flush=True)
+            text:str = ''
             for delta in message:
+                text += delta
                 print(colored(delta, "yellow"),end='', flush=True)
+            inc_call_cost(model, 1, text) #TODO 调用函数应该也算输出吧
         else:
             print(colored(f"assistant: ", role_to_color[role]),end='', flush=True)
             sum_text = ''
@@ -260,10 +304,12 @@ def pprint(message:dict | ChatCompletionMessage | MessageStream):
                 text += delta
                 sum_text += delta
                 if text.endswith('\n\n') and sum_text.count('\n```')%2==0+sum_text.startswith('```'):
+                    inc_call_cost(model, 1, text)
                     _sendmsg(text[:-2])
                     text = ''
             if text:
-                _sendmsg(text.strip())
+                inc_call_cost(model, 1, text)
+                _sendmsg(text)
         print('\n')
         return message.msg
     else:
@@ -282,14 +328,16 @@ def pprint(message:dict | ChatCompletionMessage | MessageStream):
             # print(colored(f"user: {content}\n", role_to_color[role]))
         elif role == "assistant" and tool_calls:
             print(colored(f"assistant called: {show_tool_calls(tool_calls)}\n", "yellow"))
+            #TODO 没想好应该怎么计算
         elif role == "assistant" and not tool_calls:
             print(colored(f"assistant: {content}\n", role_to_color[role]))
+            inc_call_cost(model, 1, content)
         elif role == "tool":
             print(colored(f"function ({name}): {content}\n", role_to_color[role]))
         else:
             print('else:',msg)
         return message
-def add(msg):
+def add(msg, chat_client:Chat):
     """
     Print, transform and add a message to the chat history, then return the transformed message
     流式消息会被转换为普通消息
@@ -297,7 +345,7 @@ def add(msg):
     :param msg: The message to be added.
     :return: The added message.
     """
-    msg = pprint(msg)
+    msg = pprint(msg, chat_client.model)
     chat_client.messages.append(msg)
     return msg
 
@@ -307,10 +355,24 @@ def chat(model="gpt-4o"):
     #     {'role': 'system', 'content':f'现在是{time.strftime("%Y年%m月%d日%H时%M分%S秒")}'}
     # ]
     # prompt_tokens = counts_token(call)
+
+    chat_client = Chat(model=model)
+    init_chat(chat_client)
+
+    in_group = cache.thismsg().get('group_id')
+
     chat_logs=list(filter(lambda m:is_msg(m) and not m['message'].startswith('#'),getlog()))
     i = find(chat_logs, lambda m:m['message']=='聊天开始' or m['message']=='聊天结束')
-    chat_logs=list(reversed(chat_logs[:i]))
-    chat_client.messages = list(map(msg2chat,chat_logs))[-30:]
+    chat_logs = chat_logs[:i]
+    chat_client.messages = []
+
+    for msg in chat_logs[:30]:
+        chat_client.messages.insert(0, msg2chat(msg, in_group))
+
+    # 假设所有消息都是简单的情况，增加计费
+    sum_text = '\n\n'.join([chat['content'] for chat in chat_client.messages])
+    inc_call_cost(model, 0, sum_text)
+
     # chats = []
     # while chat_contexts:
     #     message = chat_contexts.pop()
@@ -324,7 +386,7 @@ def chat(model="gpt-4o"):
     tools = [v.description for v in chat_client.tools.values()]
     model = model if model is not None else chat_client.model
     stream = chat_client.req(tools, "auto", model)
-    res_msg = add(stream)
+    res_msg = add(stream, chat_client)
     tool_calls = res_msg.tool_calls
     while tool_calls:
         for tool_call in tool_calls:
@@ -338,9 +400,9 @@ def chat(model="gpt-4o"):
                 "name": function_name,
                 "content": content,
                 "tool_call_id": tool_call.id,
-            })
+            }, chat_client)
         stream = chat_client.req(tools, "auto", model)
-        res_msg = add(stream)
+        res_msg = add(stream, chat_client)
         tool_calls = res_msg.tool_calls
 
 def _rm_pre_text(text:str):
@@ -365,18 +427,16 @@ def process_res(res):
             text = StringIO()
     yield _rm_pre_text(text.getvalue())
 
-multis = {
-    "gpt-3.5-turbo":(1.5, 2),
-    "gpt-4":(180, 360),
-    "gpt-4-poe":(30, 60),
-}
-
 
 def run(body:str, model="gpt-3.5-turbo"):
     '''询问柚子单句问题
 .chat <内容>
 多句请使用“柚子聊聊天”截断前文
 然后使用“柚子，”开头”'''
+
+    chat_client = Chat(model=model)
+    init_chat(chat_client)
+
     chat_client.messages = [msg2chat({**cache.thismsg(),**{'message':body.lstrip()}})]
     # chats = []
     # while chat_contexts:
@@ -392,7 +452,7 @@ def run(body:str, model="gpt-3.5-turbo"):
     # model = model if model is not None else chat_client.model
     model = chat_client.model
     stream = chat_client.req(tools, "auto", model)
-    res_msg = add(stream)
+    res_msg = add(stream, chat_client)
     tool_calls = res_msg.tool_calls
 
     while tool_calls:
@@ -407,7 +467,7 @@ def run(body:str, model="gpt-3.5-turbo"):
                 "name": function_name,
                 "content": content,
                 "tool_call_id": tool_call.id,
-            })
+            }, chat_client)
         stream = chat_client.req(tools, "auto", model)
-        res_msg = add(stream)
+        res_msg = add(stream, chat_client)
         tool_calls = res_msg.tool_calls
