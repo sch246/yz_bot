@@ -3,12 +3,13 @@ from datetime import datetime
 
 from main import storage, getname
 
-# price = 0.000_002
-price  = 0.000_001
+last_call:dict = storage.get('usage', 'last_call')
+last_call.setdefault('last_call', '')
+
+price  = 1
 def run(body:str):
     '''格式:
 .chattop[ <月份:int>]'''
-
     body = body.strip()
     if not body:
         body = f'{datetime.today().month}'
@@ -18,7 +19,15 @@ def run(body:str):
         return run.__doc__
     if not 1<=month<=12:
         return run.__doc__
-    usage=storage.get('usage', body)
+
+    usage:dict = storage.get('usage', body)
+
+    # 如果上次调用不是这个月的，表明是新的时间，清空当前月份
+    this_mon = f'{datetime.today().year}-{datetime.today().month}'
+    if last_call['last_call']!= this_mon:
+        usage.clear()
+    last_call['last_call'] = this_mon
+
     if not usage:
         return '这个月没有使用记录'
     total_price = price*sum(map(lambda val: val[1], usage.values()))

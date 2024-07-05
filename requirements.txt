@@ -9,3 +9,4 @@ lunardate
 pillow
 numpy
 matplotlib
+tiktoken
