@@ -32,6 +32,6 @@ def run(body:str):
         return '这个月没有使用记录'
     total_price = price*sum(map(lambda val: val[1], usage.values()))
     return f'总费用:￥{total_price}\n'+'\n'.join(map(
-            lambda item:f'{getname(item[0])}: {item[1][0]} 次调用, 共 ￥{price*item[1][1]}',
+            lambda item:f'{getname(item[0])}({item[0]}): {item[1][0]} 次调用, 共 ￥{price*item[1][1]:.4f}',
             sorted(usage.items(), key=lambda x:x[1][1], reverse=True)
             ))

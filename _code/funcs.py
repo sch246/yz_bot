@@ -201,7 +201,7 @@ def getchatstorage()->dict:
 ###
 settings = storage.get('','settings',list)
 ###
-grpsettings = storage.get('','grpsettings',list)
+group_settings = storage.get('','group_settings')
 ###
 def msg2name(msg=None):
     '''获取名字，如果有设置名字就返回设置的名字，反正无论如何都会获得一个'''

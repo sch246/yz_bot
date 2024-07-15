@@ -151,9 +151,9 @@ class Chat(OpenAI):
         :param settings: The setting string described in natural language.
         :return: self
         """
-        for setting in settings:
-            if isinstance(setting, str):
-                pprint({'role':'system','content':setting})
+        # for setting in settings:
+        #     if isinstance(setting, str):
+        #         pprint({'role':'system','content':setting})
         self.settings = settings
         return self
 
@@ -259,10 +259,11 @@ class Chat(OpenAI):
         for s in self.settings:
             if isinstance(s, Callable):
                 s = s(self)
-                if s:
-                    pprint({'role':'system','content':s})
-            if s:
-                messages.append({'role':'system','content':s})
+            if isinstance(s, str):
+                s = {'role':'system','content':s}
+            if isinstance(s, dict) or isinstance(s, ChatCompletionMessage):
+                pprint(s)
+                messages.append(s)
         messages += self.messages
         tools = tools if tools is not None else [v.description for v in self.tools.values()]
         model = model if model is not None else self.model

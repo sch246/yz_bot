@@ -16,7 +16,7 @@ import tiktoken
 
 from main import sendmsg
 from main import cache, msg_id, storage, str_tool
-from main import settings
+from main import settings, group_settings
 from main import is_msg,find, getlog, msg2chat, chat2msg, getcmd, getgroupname, getname, lunar_time, 小六壬, sendmsg as _sendmsg
 from main import cq
 
@@ -36,7 +36,8 @@ def count_tokens(text:str):
 prices = {
     "gpt-3.5-turbo":(0.0035, 0.0105),
     "gpt-4":(0.21, 0.42),
-    "gpt-4o":(0.035, 0.105)
+    "gpt-4o":(0.035, 0.105),
+    "claude-3-5-sonnet-20240620":(0.012, 0.06),
 }
 
 def get_caller():
@@ -248,7 +249,7 @@ def init_chat(chat_client:Chat):
     chat_client.add_tool(chat_client.read_image)
     # chat_client.add_tool(url2cq)
     # chat_client.add_tool(muti_reply)
-    chat_client.add_tool(baidu_encyclopedia)
+    # chat_client.add_tool(baidu_encyclopedia)
 
     # chat.add(chat.req())
 
@@ -260,8 +261,14 @@ def init_chat(chat_client:Chat):
     #     last_data = data.copy()
     #     return result
 
+    group_id = cache.thismsg().get('group_id', None)
+    if group_id and group_settings.get(str(group_id), None):
+        prompt = group_settings[str(group_id)]
+    else:
+        prompt = settings
+
     chat_client.set_settings([
-            settings[0]['content'],
+            *prompt,
             group_state,
             # show_data,
             # 'If necessary, remember to use python to read the storage in \'data\' at any time',
@@ -280,6 +287,20 @@ def show_args(args):
     return ', '.join([f'{k}={repr(v)}' for k, v in args.items()])
 def show_tool_calls(tool_calls):
     return ''.join(map(lambda s:f'\n    {s["function"]["name"]}({show_args(json.loads(s["function"]["arguments"]))})', tool_calls))
+def split_string_with_code_blocks(text:str):
+    result = []
+    count = 0
+
+    for part in text.split('\n\n'):
+        last_is_code = count%2==1
+        count += part.startswith('```')+part.count('\n```')
+        if last_is_code and count%2==1:
+            result[-1] += '\n\n'+part
+        else:
+            result.append(part)
+
+    return result
+
 def pprint(message:dict | ChatCompletionMessage | MessageStream, model:str):
     '''
     打印 dict, 普通消息, 或者流式消息, 然后返回
@@ -297,16 +318,16 @@ def pprint(message:dict | ChatCompletionMessage | MessageStream, model:str):
             inc_call_cost(model, 1, text) #TODO 调用函数应该也算输出吧
         else:
             print(colored(f"assistant: ", role_to_color[role]),end='', flush=True)
-            sum_text = ''
+            sum_text:str = ''
             text:str = ''
             for delta in message:
                 print(colored(delta, role_to_color[role]),end='', flush=True)
                 text += delta
                 sum_text += delta
-                if text.endswith('\n\n') and sum_text.count('\n```')%2==0+sum_text.startswith('```'):
-                    inc_call_cost(model, 1, text)
-                    _sendmsg(text[:-2])
-                    text = ''
+                *parts, text = split_string_with_code_blocks(text)
+                for part in parts:
+                    inc_call_cost(model, 1, part)
+                    _sendmsg(part)
             if text:
                 inc_call_cost(model, 1, text)
                 _sendmsg(text)
@@ -349,7 +370,7 @@ def add(msg, chat_client:Chat):
     chat_client.messages.append(msg)
     return msg
 
-def chat(model="gpt-4o"):
+def chat(model="claude-3-5-sonnet-20240620"):
     # call = [
     #     *settings,
     #     {'role': 'system', 'content':f'现在是{time.strftime("%Y年%m月%d日%H时%M分%S秒")}'}
