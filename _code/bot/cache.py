@@ -50,6 +50,21 @@ def get_user_name(user_id: int):
         else:
             return '[unknow]'
 
+group_member_list = {}
+def refresh_group_member_list(group_id: int):
+    call = call_api('get_group_member_list', group_id=group_id)
+    if call['retcode'] == 0:
+        data = call['data']
+        res = [member['user_id'] for member in data]
+        group_member_list[group_id] = res
+    else:
+        raise Exception(f"api出错: {call['wording']}")
+
+def in_group(user_id:int, group_id: int, refresh=True):
+    if group_id not in group_member_list or refresh:
+        refresh_group_member_list(group_id)
+    return user_id in group_member_list[group_id]
+
 
 def get_group_user_info(group_id: int, user_id: int):
     d = group_user_infos.get(group_id,{}).get(user_id)

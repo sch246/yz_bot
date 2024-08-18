@@ -9,6 +9,8 @@ from openai.types.chat.chat_completion_message import ChatCompletionMessage
 
 from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCall
 
+from openai import InternalServerError
+
 import json
 import traceback
 from dotenv import load_dotenv
@@ -267,20 +269,23 @@ class Chat(OpenAI):
         messages += self.messages
         tools = tools if tools is not None else [v.description for v in self.tools.values()]
         model = model if model is not None else self.model
-        if tools:
-            return MessageStream(self.chat.completions.create(
-                model=model,
-                messages=messages,
-                tools=tools,
-                tool_choice=tool_choice,
-                stream=True  # 开启流式响应
-            ))
-        else:
-            return MessageStream(self.chat.completions.create(
-                model=model,
-                messages=messages,
-                stream=True
-            ))
+        try:
+            if tools:
+                return MessageStream(self.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    stream=True  # 开启流式响应
+                ))
+            else:
+                return MessageStream(self.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    stream=True
+                ))
+        except InternalServerError as e:
+            return e.message #最终会成为system消息和#开头的消息
 
 
     def create_image(self, prompt:str, size:str, quality:str):
@@ -306,7 +311,7 @@ class Chat(OpenAI):
         image_url = response.data[0].url
         return image_url
 
-    def read_image(self, url:str, detail:str):
+    def read_image(self, url:str, detail:str='auto'):
         '''
         Read information from the image
 
@@ -321,7 +326,7 @@ class Chat(OpenAI):
             {
             "role": "user",
             "content": [
-                {"type": "text", "text": "What’s in this image?"},
+                {"type": "text", "text": "Describe the image in detail"},
                 {
                 "type": "image_url",
                 "image_url": {
@@ -331,16 +336,15 @@ class Chat(OpenAI):
                 },
             ],
             }
-        ],
-        max_tokens=300,
+        ]
         )
 
         return response.choices[0].message.content
 
 if __name__=='__main__':
-    chat = Chat()
+    chat = Chat(model='gpt-3.5-turbo')
     chat.set_settings(["Don't make assumptions about what values to plug into functions. Ask for clarification if a user request is ambiguous."])
     chat.add({'role':'user','content':'awa'})
-    print(chat.add(chat.req()))
-    print(chat.call({'role':'user','content':'nothing.'}))
+    print(chat.add(chat.req()).content)
+    print(chat.call({'role':'user','content':'nothing.'}).content)
 

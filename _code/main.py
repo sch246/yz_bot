@@ -10,6 +10,7 @@ from inspect import getgeneratorstate, GEN_CREATED
 import random
 
 from s3 import *
+from s3.command_manager import CommandManager
 import s3.config as config
 import s3.counter as counter
 from s3.add_attr import add_attr
@@ -43,6 +44,10 @@ import bot.cache as cache
 import bot.chatlog as chatlog
 
 from chat import Chat, MessageStream
+def gpt(settings, question):
+        chat = Chat(model='gpt-3.5-turbo')
+        chat.set_settings(settings)
+        return chat.call({'role':'user','content':question}).content
 
 __botdir__ = '/'.join(__file__.split('/')[:-2])
 
@@ -224,11 +229,22 @@ def _cmd_ret(ret):
         else:
                 sendmsg(ret)
 
+def check_safe(command):
+        res = gpt(['请你扮演一个linux命令检测函数，如果输入的命令是危险的，给出简短的危险警告信息，否则仅返回"True"'], command)
+        if res=='True':
+                return True, ''
+        else:
+                return False, res
 
-def _run_bash(msg):
-        text = msg['message']
+def _run_bash(command, test=False):
         if not check_op_and_reply():
                 return
+
+        is_safe, reason = check_safe(command)
+        if not is_safe:
+                sendmsg(reason)
+                return
+
         @to_thread
         def observer(cmd, timeout):
                 cache.thismsg(cache.get_last())
@@ -242,9 +258,12 @@ def _run_bash(msg):
                         sendmsg('超时')
                         proc.kill()
                         proc.wait()
-        observer(cq.unescape2(text[1:]), 5)
+        if not test:
+                observer(cq.unescape2(command), 5)
+        else:
+                sendmsg(f'执行了: {command}')
 
-def recv(msg:dict):
+def recv(msg:dict|None):
 
         cmd_py = cmds.modules['py']
 
@@ -293,7 +312,10 @@ def recv(msg:dict):
                         _cmd_ret(cmds.run(*cmds.is_cmd(text[1:])))
                 # 执行bash
                 elif text.startswith('!'):
-                        _run_bash(msg)
+                        _run_bash(msg['message'][1:])
+                # 测试执行bash
+                elif text.startswith('#!'):
+                        _run_bash(msg['message'][2:],test=True)
                 elif cmd_py.links:
                         print('进入links')
                         cmd_py.exec_links()

@@ -4,6 +4,7 @@ import socket
 import json
 import sys
 import requests
+import time
 
 from main import ctrlc_decorator
 
@@ -57,31 +58,95 @@ ListenSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 ListenSocket.bind(listen)
 ListenSocket.listen(100)  # 传入的参数指定等待连接的最大数量
 
-HttpResponseHeader = '''HTTP/1.1 200 OK\r\n
-Content-Type: text/html\r\n\r\n
-'''
-
 
 def request_to_json(msg: str) -> dict | None:
-    '''遍历request字符串, 直到后面是json格式, 读取对应json文本并返回'''
+    """
+    遍历request字符串, 直到后面是json格式, 读取对应json文本并返回
+
+    Args:
+        msg (str): 请求消息字符串
+
+    Returns:
+        Optional[Dict]: 解析后的JSON对象，如果没有找到JSON则返回None
+    """
     for i in range(len(msg)):
         if msg[i] == "{" and msg[i-1] == "\n":
             return json.loads(msg[i:])
     return None
 
-# 需要循环执行，返回值为json格式
 
+def recv_full_message(client: socket, buffer_size=8192, max_size=1024*1024, timeout=5) ->str:
+    """
+    从客户端接收完整消息
+
+    Args:
+        client (socket.socket): 客户端socket对象
+
+    Returns:
+        str: 接收到的完整消息
+
+    Raises:
+        ValueError: 如果消息过大
+        socket.timeout: 如果接收超时
+    """
+    client.settimeout(timeout)
+    full_msg = b''
+    start_time = time.time()
+
+    try:
+        while True:
+            part = client.recv(buffer_size)
+            full_msg += part
+
+            if len(full_msg) > max_size:
+                raise ValueError(f"Message too large: {len(full_msg)} bytes")
+
+            if len(part) < buffer_size:
+                break
+
+            if time.time() - start_time > timeout:
+                raise socket.timeout("Timeout while receiving message")
+
+    except socket.timeout:
+        if not full_msg:
+            raise  # 如果完全没有接收到数据，则抛出超时异常
+
+    finally:
+        client.settimeout(None)  # 恢复到阻塞模式
+
+    return full_msg.decode(encoding='utf-8', errors='ignore')
+
+HttpResponseHeader = '''HTTP/1.1 200 OK\r\n
+Content-Type: text/html\r\n\r\n
+'''.encode(encoding='utf-8')
+
+# 需要循环执行，返回值为json格式
 
 @ctrlc_decorator(lambda:requests.post(f'http://127.0.0.1:{listen_port}',data={}))
 def recv_msg() -> dict | None:
-    Client, _ = ListenSocket.accept()
-    Request = Client.recv(8192).decode(encoding='utf-8')
-    #print(Request)
-    rev_json = request_to_json(Request)
-    # 发送信号表示我收到了
-    Client.sendall(HttpResponseHeader.encode(encoding='utf-8'))
-    Client.close()
-    return rev_json
+    """
+    接收消息并解析为JSON
+
+    Returns:
+        Optional[Dict]: 解析后的JSON对象，如果解析失败则返回None
+    """
+    res = None
+    with ListenSocket.accept()[0] as client:
+        try:
+            Request = recv_full_message(client)
+            res = request_to_json(Request)
+            # 发送信号表示我收到了
+            client.sendall(HttpResponseHeader)
+        except ValueError:
+            print('消息过大')
+        except socket.timeout:
+            print('接收超时')
+        except BrokenPipeError:
+            print('BrokenPipeError')
+        except Exception as e:
+            print(f"接收信息时发生错误: {e}")
+
+    return res
 
 
 # while True:
