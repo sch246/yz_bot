@@ -201,8 +201,6 @@ def getchatstorage()->dict:
 ###
 settings = storage.get('','settings',list)
 ###
-group_settings = storage.get('','group_settings')
-###
 def msg2name(msg=None):
     '''获取名字，如果有设置名字就返回设置的名字，反正无论如何都会获得一个'''
     if msg is None:
@@ -239,6 +237,9 @@ def has_at(qq):
     return _
 ###
 ###
+import base64
+import os
+
 def is_image_accessible(url):
     try:
         response = requests.get(url, stream=True)
@@ -252,52 +253,158 @@ def is_image_accessible(url):
         pass
     return False
 
-# 定义正则表达式匹配CoolQ码中的图片标记
-image_pattern = re.compile(rf'(\[CQ:image(?:,[^,=]+=[^,\]]*)*\])')
+# 初始化缓存字典
+downloaded_files = {}
 
+# 从文件夹中初始化缓存字典
+tmp_files_dir = 'data/tmp_files_chat'
+if not os.path.exists(tmp_files_dir):
+    os.makedirs(tmp_files_dir)
+
+for file_name in os.listdir(tmp_files_dir):
+    if file_name.endswith(('.jpg', '.png', '.jpeg', '.gif')):
+        file_path = os.path.join(tmp_files_dir, file_name)
+        downloaded_files[file_name] = file_path
+
+# 函数：下载图片
+def download_img(picture_url, name):
+    response = requests.get(picture_url)
+    file_path = os.path.join(tmp_files_dir, name)
+    with open(file_path, 'wb') as file:
+        file.write(response.content)
+    return file_path
+
+# 获取文件的MIME类型
+def get_mime_type(file_name):
+    ext = file_name.split('.')[-1].lower()
+    return {
+        'jpg': 'image/jpeg',
+        'jpeg': 'image/jpeg',
+        'png': 'image/png',
+        'gif': 'image/gif'
+    }.get(ext, 'application/octet-stream')
+
+
+def calculate_image_tokens(image_path:str | bytes):
+    # 打开图片并获取尺寸
+    with Image.open(image_path) as img:
+        width, height = img.size
+
+    # 默认情况下，512x512以下的图片消耗85 tokens
+    if width <= 512 and height <= 512:
+        return 85
+
+    # 将图片缩放至2048x2048以内，保持宽高比
+    max_side = 2048
+    if max(width, height) > max_side:
+        scale_ratio = max_side / max(width, height)
+        width = int(width * scale_ratio)
+        height = int(height * scale_ratio)
+
+    # 将图片缩放至最短边为768像素，保持宽高比
+    min_side = 768
+    if min(width, height) < min_side:
+        scale_ratio = min_side / min(width, height)
+        width = int(width * scale_ratio)
+        height = int(height * scale_ratio)
+
+    # 计算512x512像素的块数
+    num_squares = (width // 512) * (height // 512)
+    if width % 512 != 0:
+        num_squares += height // 512
+    if height % 512 != 0:
+        num_squares += width // 512
+    if width % 512 != 0 and height % 512 != 0:
+        num_squares += 1
+
+    # 计算最终的token消耗
+    return 170 * num_squares + 85
+
+
+chat_picture_descriptions = storage.get('','chat_picture_descriptions')
+
+# 正则表达式模式
+image_pattern = re.compile(r'(\[CQ:image(?:,[^,=]+=[^,\]]*)*\])')
+import traceback
+from chat import Chat
+chat_client = Chat()
+# 分割消息并处理图片
 def msg_split(text):
     lst = []
     for part in image_pattern.split(text):
         if image_pattern.match(part):
             try:
                 # 假设cq.load(part)能正确提取图片URL数据
-                url = cq.load(part)['data']['url']
-                if is_image_accessible(url):
-                    lst.append({
-                        "type": "image_url",
-                        "image_url": {
-                            "url": url,
-                        }
-                    })
-                    continue
-            except KeyError:
-                # 万一cq.load没有获取到url，可以记录日志或者返回错误信息
-                pass
-        lst.append({
-            "type": "text",
-            "text": part
-        })
+                data = cq.load(part)['data']
+                url = data['url']
+                file_name = data['file']
+
+                # 检查缓存字典
+                if file_name in chat_picture_descriptions:
+                    description = chat_picture_descriptions[file_name]
+                else:
+                    # 下载图片并缓存
+                    description = chat_client.read_image(url)
+                    print(f"read_image: {description}")
+                    chat_picture_descriptions[file_name] = description
+
+                lst.append({
+                    "type": "text",
+                    "text": f"![{description}]({url})"
+                })
+
+                # # 读取图片并编码为base64
+                # with open(file_path, 'rb') as image_file:
+                #     image_tokens = calculate_image_tokens(image_file)
+                #     image_bytes = image_file.read()
+                # image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+
+                # # 获取文件的MIME类型
+                # mime_type = get_mime_type(file_name)
+
+                # lst.append({
+                #     "type": "image_url",
+                #     "image_url": {
+                #         "url": f"data:{mime_type};base64,{image_base64}"
+                #     },
+                #     "token_cost": image_tokens
+                # })
+                continue
+            except Exception as e:
+                # print(f"load picture error: {e}")
+                traceback.print_exc()
+                # 图片可能读取不到或者下载不了什么的
+                lst.append({
+                    "type": "text",
+                    "text": f"![解析失败的图片]({url})"
+                })
+        else:
+            lst.append({
+                "type": "text",
+                "text": part
+            })
 
     return lst
 
 
 def msg2chat(msg, in_group=True):
-    # if msg.get('sender') and msg['sender']['user_id']==cache.qq:
-    #     role = 'assistant'
-    #     content_pre = []
-    # else:
-    #     role = 'user'
-    #     if in_group:
-    #         content_pre = [{"type": "text", "text": f'---\nqq: {msg["user_id"]}\nname: {repr(msg2name(msg))}\nmessage_id: {msg["message_id"]}\n---\n'}]
-    #     else:
-    #         content_pre = []
-    # return {'role':role, 'content':content_pre+msg_split(msg['message'])}
     if msg.get('sender') and msg['sender']['user_id']==cache.qq:
-        return {'role':'assistant','content':msg['message']}
-    elif in_group:
-        return {'role':'user','content':msgtext(msg)}
+        role = 'assistant'
+        content_pre = []
     else:
-        return {'role':'user','content':msg['message']}
+        role = 'user'
+        if in_group:
+            content_pre = [{"type": "text", "text": f'---\nqq: {msg["user_id"]}\nname: {repr(msg2name(msg))}\nmessage_id: {msg["message_id"]}\n---\n'}]
+        else:
+            content_pre = []
+    content = '\n\n'.join([part['text'] for part in content_pre+msg_split(msg['message'])])
+    return {'role':role, 'content':content}
+    # if msg.get('sender') and msg['sender']['user_id']==cache.qq:
+    #     return {'role':'assistant','content':msg['message']}
+    # elif in_group:
+    #     return {'role':'user','content':msgtext(msg)}
+    # else:
+    #     return {'role':'user','content':msg['message']}
 
 def chat2msg(chat:dict):
     if chat['role']=='user':

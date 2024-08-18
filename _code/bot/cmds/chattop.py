@@ -1,15 +1,15 @@
-'''打印gpt使用计数(目前已经没用了)'''
+'''打印gpt使用计数'''
 from datetime import datetime
 
-from main import storage, getname
+from main import storage, getname, cache
 
 last_call:dict = storage.get('usage', 'last_call')
 last_call.setdefault('last_call', '')
 
-price  = 1
+multi  = 1
 def run(body:str):
     '''格式:
-.chattop[ <月份:int>]'''
+.chattop[ <月份:1..12>]'''
     body = body.strip()
     if not body:
         body = f'{datetime.today().month}'
@@ -28,10 +28,49 @@ def run(body:str):
         usage.clear()
     last_call['last_call'] = this_mon
 
-    if not usage:
+    msg = cache.thismsg()
+    if 'group_id' in msg:
+        return _group(msg['group_id'], usage)
+    elif msg['user_id'] in cache.ops:
+        return _op(usage)
+    else:
+        return _user(msg['user_id'], usage)
+
+
+def _group(group_id:int, usage):
+    total_price = 0
+    prices = []
+    cache.refresh_group_member_list(group_id)
+    for qq, (call_count, cost) in sorted(usage.items(), key=lambda x:x[1][1], reverse=True):
+        qq = int(qq)
+        if cache.in_group(qq, group_id, refresh=False):
+            price = multi*cost
+            total_price += price
+            prices.append(f'{getname(qq)}({qq}): {call_count} 次调用, 共 ￥{price:.4f}')
+
+    if not prices:
         return '这个月没有使用记录'
-    total_price = price*sum(map(lambda val: val[1], usage.values()))
-    return f'总费用:￥{total_price}\n'+'\n'.join(map(
-            lambda item:f'{getname(item[0])}({item[0]}): {item[1][0]} 次调用, 共 ￥{price*item[1][1]:.4f}',
-            sorted(usage.items(), key=lambda x:x[1][1], reverse=True)
-            ))
+    else:
+        return f'总费用:￥{total_price:.4f}\n'+'\n'.join(prices)
+
+def _user(user_id:int, usage):
+    for qq, (call_count, cost) in sorted(usage.items(), key=lambda x:x[1][1], reverse=True):
+        qq = int(qq)
+        if qq == user_id:
+            price = multi*cost
+            return f'{getname(qq)}({qq}): {call_count} 次调用, 共 ￥{price:.4f}'
+    return '这个月没有使用记录'
+
+def _op(usage):
+    total_price = 0
+    prices = []
+    for qq, (call_count, cost) in sorted(usage.items(), key=lambda x:x[1][1], reverse=True):
+        qq = int(qq)
+        price = multi*cost
+        total_price += price
+        prices.append(f'{getname(qq)}({qq}): {call_count} 次调用, 共 ￥{price:.4f}')
+
+    if not prices:
+        return '这个月没有使用记录'
+    else:
+        return f'总费用:￥{total_price:.4f}\n'+'\n'.join(prices)

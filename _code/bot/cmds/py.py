@@ -105,7 +105,7 @@ def run(body:str, msg: dict = None, skip_op: bool = False, insert: dict = None):
             if out is not None:
                 sendmsg(out)
     except:
-        sendmsg(''.join(traceback.format_exc().splitlines(True)[3:]).strip())
+        sendmsg('#'+''.join(traceback.format_exc().splitlines(True)[3:]).strip())
 
 
 
@@ -265,7 +265,7 @@ def exec_link_py(cond, action):
             out = eval(last, loc)
 
     except:
-        sendmsg(''.join(traceback.format_exc().splitlines(True)[3:]))
+        sendmsg('#'+''.join(traceback.format_exc().splitlines(True)[3:]))
     if out:
         _run_action_py(action, loc)
     return out
@@ -280,7 +280,7 @@ def _run_action_py(action, _loc):
     try:
         exec(action, _loc)
     except:
-        sendmsg(''.join(traceback.format_exc().splitlines(True)[3:]))
+        sendmsg('#'+''.join(traceback.format_exc().splitlines(True)[3:]))
 
 
 # exec re-------------------------------------------------
@@ -318,7 +318,7 @@ def _run_action_re(action, _loc, names:dict):
         if out is not None:
             sendmsg(out)
     except:
-        sendmsg(''.join(traceback.format_exc().splitlines(True)[3:]))
+        sendmsg('#'+''.join(traceback.format_exc().splitlines(True)[3:]))
 
 #-------------------------------------------------
 
