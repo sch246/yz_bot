@@ -1,5 +1,5 @@
 import openai
-openai.api_key='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'
+
 from queue import Queue
 from multiprocessing.managers import BaseManager
 
