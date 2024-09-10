@@ -5,7 +5,7 @@ import re
 from datetime import datetime
 from io import StringIO
 import traceback
-from typing import Any, Callable
+from typing import Any, Callable, Tuple
 import requests
 from urllib.request import quote, unquote
 from termcolor import colored
@@ -34,12 +34,30 @@ encoding = tiktoken.encoding_for_model('gpt-4')
 
 def count_tokens(text:str):
     return len(encoding.encode(text))
-
 prices = {
-    "gpt-3.5-turbo":(0.0035, 0.0105),
-    "gpt-4":(0.21, 0.42),
-    "gpt-4o":(0.035, 0.105),
-    "claude-3-5-sonnet-20240620":(0.012, 0.06),
+    "gpt-3.5-turbo-ca": (0.001, 0.003),
+    "gpt-3.5-turbo": (0.0035, 0.0105),
+    "gpt-3.5-turbo-1106": (0.007, 0.014),
+    "gpt-3.5-turbo-0125": (0.0035, 0.0105),
+    "gpt-3.5-turbo-16k": (0.021, 0.028),
+    "gpt-4": (0.21, 0.42),
+    "gpt-4o": (0.035, 0.105),
+    "gpt-4o-2024-05-13": (0.035, 0.105),
+    "gpt-4o-2024-08-06": (0.0175, 0.07),
+    "chatgpt-4o-latest": (0.035, 0.105),
+    "gpt-4o-mini": (0.00105, 0.0042),
+    "gpt-4-0613": (0.21, 0.42),
+    "gpt-4-turbo-preview": (0.07, 0.21),
+    "gpt-4-0125-preview": (0.07, 0.21),
+    "gpt-4-1106-preview": (0.07, 0.21),
+    "gpt-4-vision-preview": (0.07, 0.21),
+    "gpt-4-turbo": (0.07, 0.21),
+    "gpt-4-turbo-2024-04-09": (0.07, 0.21),
+    "gpt-4-ca": (0.12, 0.24),
+    "gpt-4-turbo-ca": (0.04, 0.12),
+    "gpt-4o-ca": (0.02, 0.06),
+    "gpt-3.5-turbo-instruct": (0.0105, 0.014),
+    "claude-3-5-sonnet-20240620": (0.012, 0.06),
 }
 
 def get_caller():
@@ -348,6 +366,26 @@ def _()->str:
     data = getchatstorage()
     data['split'] = not data.get('split')
     return f"split: {data['split']}"
+
+def format_price(model: str, prices: Tuple[float, float]) -> str:
+    return f"{model} {prices[0]} {prices[1]}"
+
+@cm.register('model')
+def list_all_models() -> str:
+    '''
+    列出所有模型的价格
+    '''
+    return "\n".join(["模型 输入价格 输出价格 (单位: 元/(1k token))"]+[format_price(model, price) for model, price in prices.items()])
+
+@cm.register('model <model:str>')
+def list_specific_model(model: str) -> str:
+    '''
+    列出特定模型的价格
+    '''
+    if model in prices:
+        return "模型 输入价格 输出价格 (单位: 元/(1k token))\n"+format_price(model, prices[model])
+    else:
+        return f"未找到模型: {model}"
 
 @cm.register('use_model')
 def _()->str:

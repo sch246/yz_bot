@@ -279,6 +279,10 @@ def recv(msg:dict|None):
         global i, j, k
         i, j, k = 0, 0, 0
 
+        if is_notify(msg) and msg['sub_type']=='input_status':
+                #'post_type': 'notice', 'notice_type': 'notify', 'sub_type': 'input_status'
+                return
+
         print(f'[{time.strftime(r"%H:%M:%S")}]【收到消息】',end='')
         cache.thismsg(msg)
         chatlog.write(msg)
