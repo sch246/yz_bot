@@ -610,3 +610,59 @@ def latex2img(text, size=32, color=(0, 0, 0), bg_color=(255, 255, 255), out='dem
     # Save the final image
     combined.convert("RGB").save(out, 'PNG')
     return f'[CQ:image,file=file://{os.path.abspath(out)}]'
+
+
+
+import select, subprocess
+
+def run_process(args, sendmsg):
+    process = subprocess.Popen(args,
+                               stdin=subprocess.PIPE,
+                               stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE,
+                               text=True,
+                               bufsize=1)
+    # 设置非阻塞模式
+    process.stdin.flush()
+    process.stdout.flush()
+    yield from read_process(process, sendmsg)
+
+def read_process(process, sendmsg):
+    while True:
+        # 检查是否有输出可读
+        readable, _, _ = select.select([process.stdout, process.stderr], [], [], 0.1)
+
+
+        if process.stdout in readable:
+            output = process.stdout.readline()
+            if output:
+                sendmsg(output.strip())
+
+        if process.stderr in readable:
+            error = process.stderr.readline()
+            if error:
+                sendmsg(f"错误: {error.strip()}")
+
+        if process.poll() is not None:
+            break
+
+        # 接收输入并发送给程序
+        user_input = yield '等待输入...'
+        if not is_msg(user_input):
+            sendmsg('请输入文本消息')
+            continue
+        user_input = user_input['message']
+        if process.poll() is not None:
+            break
+        print(f'输入: {user_input}')
+        process.stdin.write(user_input + '\n')
+        process.stdin.flush()
+
+    # 读取剩余的输出
+    remaining_output, remaining_error = process.communicate()
+    if remaining_output:
+        sendmsg(remaining_output.strip())
+    if remaining_error:
+        sendmsg(f"错误: {remaining_error.strip()}")
+    sendmsg(f'程序已退出，返回值 {process.returncode}')
+    return
