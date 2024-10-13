@@ -33,7 +33,7 @@ class Repl:
     def is_running(self):
         return self.process is not None and self.process.poll() is None
 
-    def run_code(self, code: str, callback: Callable[[str], None], endsign: str, waittime: float = 0.2, timeout: float = 0):
+    def run_code(self, code: str, callback: Callable[[str], None], endsigns: list[str], waittime: float = 0.2, timeout: float = 0):
         if not self.is_running():
             self.start()
 
@@ -52,7 +52,7 @@ class Repl:
                     output = os.read(self.process.stdout.fileno(), 1024).decode()
                     if output:
                         callback(output.strip())
-                        if output.rstrip().endswith(endsign):
+                        if any(output.rstrip().endswith(endsign) for endsign in endsigns):
                             return
                 except BlockingIOError:
                     pass

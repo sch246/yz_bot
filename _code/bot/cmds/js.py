@@ -3,7 +3,7 @@ from main import repl
 from main import cache, cq, send, to_thread
 
 node_repl = repl.Repl(['node', '-i'])
-node_sign = ">"
+node_signs = [">","..."]
 
 def run(body: str):
     '''运行js代码
@@ -25,10 +25,11 @@ def run(body: str):
         return "已关闭"
 
     def sendmsg(text: str):
-        text = text.replace(f"{node_sign} ", "")
+        for node_sign in node_signs:
+            text = text.replace(f"{node_sign} ", "")
         if not text:
             text = "结果为空"
         send(text, **msg)
 
-    to_thread(node_repl.run_code)(body, sendmsg, node_sign, timeout=30)
+    to_thread(node_repl.run_code)(body, sendmsg, node_signs, timeout=30)
 
