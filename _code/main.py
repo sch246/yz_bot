@@ -10,6 +10,7 @@ from inspect import getgeneratorstate, GEN_CREATED
 import random
 
 from s3 import *
+import s3.repl as repl
 from s3.command_manager import CommandManager
 import s3.config as config
 import s3.counter as counter

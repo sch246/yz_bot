@@ -1,12 +1,14 @@
 '''JavaScript!'''
+from main import repl
+from main import cache, cq, send, to_thread
 
-import os
-from main import cache, cq, screen, str_tool
+node_repl = repl.Repl(['node', '-i'])
+node_sign = ">"
 
-def run(body:str):
-    '''运行js代码，仅在linux上有效
-格式:
-.js <Code>'''
+def run(body: str):
+    '''运行js代码
+    格式:
+    .js <Code>'''
     msg = cache.thismsg()
     body = cq.unescape(body.strip())
 
@@ -14,23 +16,19 @@ def run(body:str):
         if not cache.any_same(msg, '\.js'):
             return '权限不足(一定消息内将不再提醒)'
 
-    flag, value = ensure()
+    flag, value = repl.ensure(['node', '-v'])
     if not flag:
         return value
 
-    return str_tool.stripline(screen.send('js',f'{body}\n'))
+    if body==':bye':
+        node_repl.stop()
+        return "已关闭"
 
+    def sendmsg(text: str):
+        text = text.replace(f"{node_sign} ", "")
+        if not text:
+            text = "结果为空"
+        send(text, **msg)
 
-def ensure():
-    '''保证可以运行，并且保证运行的是js'''
-    def err(name, info):
-        return name+' 错误:\n'+info
-    if not screen.check():
-        return False, err('screen',os.popen('screen -v').read())
-    if not screen.check('js'):
-        screen.start('js')
-    if not screen.send('js','1').endswith('> '):
-        s = screen.send('js','node')
-        if 'Type ".help"' not in s:
-            return False, err('node',str_tool.stripline(s))
-    return True, None
+    to_thread(node_repl.run_code)(body, sendmsg, node_sign, timeout=30)
+
