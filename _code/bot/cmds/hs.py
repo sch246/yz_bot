@@ -4,7 +4,7 @@ from main import cache, cq, send, to_thread
 
 ghci_path = "/root/.ghcup/bin/ghci"
 ghci_repl = repl.Repl([ghci_path])
-ghci_sign = "ghci>"
+ghci_signs = ["ghci>","ghci|"]
 
 def run(body: str):
     '''运行Haskell代码
@@ -26,10 +26,11 @@ def run(body: str):
         return "GHCi 已关闭"
 
     def sendmsg(text: str):
-        text = text.replace(f"{ghci_sign} ", "")
+        for ghci_sign in ghci_signs:
+            text = text.replace(f"{ghci_sign} ", "")
         if not text:
             text = "结果为空"
         send(text, **msg)
 
-    to_thread(ghci_repl.run_code)(body, sendmsg, ghci_sign, timeout=30)
+    to_thread(ghci_repl.run_code)(body, sendmsg, ghci_signs, timeout=30)
 
