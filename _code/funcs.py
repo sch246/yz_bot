@@ -552,6 +552,7 @@ def vars_update(dic):
     ctypes.pythonapi.PyFrame_LocalsToFast(ctypes.py_object(frm),ctypes.c_int(0))
 ###
 chat_groups=storage.get('','chat_groups',list)
+nolog_groups = storage.get('','nolog_groups',list)
 ###
 import datetime
 ###

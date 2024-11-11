@@ -8,7 +8,7 @@ def run(body:str):
     '''随机返回一张色图
     格式: .setu [<params>]'''
     cache.thismsg(cache.get_last())
-    params = list(map(lambda s:s.strip(),body.strip().split('\n')))
+    params = list(map(lambda s:s.strip(),body.strip().split()))
     pics= jcurl(f'https://api.lolicon.app/setu/v2?size=original&size=regular&{"&".join(params)}').get('data')
     if not pics: return '获取失败'
     pic = pics[0]
