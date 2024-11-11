@@ -286,7 +286,8 @@ def recv(msg:dict|None):
 
         print(f'[{time.strftime(r"%H:%M:%S")}]【收到消息】',end='')
         cache.thismsg(msg)
-        chatlog.write(msg)
+        if not is_group_msg(msg) or msg not in nolog_groups:
+                chatlog.write(msg)
         if any(c in sys.argv[1:] for c in ['-l','log_only']):
                 return
 
