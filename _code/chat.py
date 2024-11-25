@@ -95,7 +95,7 @@ def pprint(message:dict | ChatCompletionMessage | MessageStream):
             print(colored(f"system: {content}\n", role_to_color[role]))
         elif role == "user":
             pass
-            # print(colored(f"user: {content}\n", role_to_color[role]))
+            print(colored(f"user: {content}\n", role_to_color[role]))
         elif role == "assistant" and tool_calls:
             print(colored(f"assistant called: {show_tool_calls(tool_calls)}\n", "yellow"))
         elif role == "assistant" and not tool_calls:
@@ -266,6 +266,9 @@ class Chat(OpenAI):
             if isinstance(s, dict) or isinstance(s, ChatCompletionMessage):
                 pprint(s)
                 messages.append(s)
+        for s in self.messages:
+            if isinstance(s, dict) or isinstance(s, ChatCompletionMessage):
+                pprint(s)
         messages += self.messages
         tools = tools if tools is not None else [v.description for v in self.tools.values()]
         model = model if model is not None else self.model
