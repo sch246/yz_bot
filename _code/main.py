@@ -10,6 +10,8 @@ from inspect import getgeneratorstate, GEN_CREATED
 import random
 
 from s3 import *
+from s3 import __logging
+from s3.scheduler import scheduler
 import s3.repl as repl
 from s3.command_manager import CommandManager
 import s3.config as config
