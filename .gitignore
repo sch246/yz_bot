@@ -7,6 +7,9 @@ tmp.txt
 /data/screens
 /data/storage/later_list
 /data/storage/[^lpsg]*
+/data/storage/groups/*
+/data/storage/group_settings.json
+/data/storage/prompts.json
 
 data.json
 

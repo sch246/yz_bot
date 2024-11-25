@@ -309,9 +309,9 @@ for line in setting_filter(settings):
     else:
         handler = ObserveToRemote(local_folder, remote_host, remote_folder)
 
-    if 初始同步:
-        handler._delete(local_folder)
-        handler._create(local_folder, True)
+    # if 初始同步:
+    #     handler._delete(local_folder)
+    #     handler._create(local_folder, True)
     observer.schedule(handler, local_folder, recursive=True)
 
 observer.start()
