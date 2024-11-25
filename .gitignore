@@ -2,8 +2,10 @@
 .test/
 .sync
 cache_msgs
-tmp.txt
-/data/images
+/data/bbxm.txt
+/data/chatserver.py
+/data/tmp*
+/data/images*
 /data/screens
 /data/storage/later_list
 /data/storage/[^lpsg]*
