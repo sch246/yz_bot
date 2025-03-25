@@ -1,5 +1,6 @@
 import inspect
 import httpx
+import os
 from typing import Any, Callable, List, Dict
 from openai import Stream, resources
 
@@ -20,6 +21,8 @@ from openai import OpenAI
 
 from tool import Tool
 
+from main import storage
+
 def dmp(m:ChoiceDeltaToolCall) -> dict[str, Any]:
     return m.model_dump()
 
@@ -34,11 +37,18 @@ class MessageStream:
             tool_calls=map(dmp, self.tool_calls) if self.tool_calls else None,
             content=None if self.tool_calls else ''
             )
+        self.thinking = False
 
     def __iter__(self):
         return self
     def __next__(self):
-        delta = next(self._iter).choices[0].delta
+        response = next(self._iter)
+        if not response.choices:
+            prompt_tokens = response.usage.prompt_tokens
+            completion_tokens = response.usage.completion_tokens
+            return (prompt_tokens, completion_tokens)
+        choice = response.choices[0]
+        delta = choice.delta
         if self.tool_calls:
             if delta.tool_calls is None:
                 raise StopIteration
@@ -46,11 +56,14 @@ class MessageStream:
             self.msg.tool_calls[0].function.arguments += delta_text
             return delta_text
         else:
-            if delta.content is None:
+            delta_dict = delta.to_dict(exclude_unset=False)
+            if delta_dict.get('reasoning_content'):
+                return delta_dict
+            elif delta.content:
+                self.msg.content += delta.content
+                return delta_dict
+            else:
                 raise StopIteration
-            delta_text = delta.content
-            self.msg.content += delta_text
-            return delta_text
 
 
 
@@ -138,6 +151,27 @@ class Chat(OpenAI):
             **kws,
             ) -> None:
         load_dotenv()  # load environment variables from .env file
+
+        # 获取AI配置
+        ai_config = storage.get('', 'ai_config')
+        ai_config.setdefault('default', {
+            'api_key': 'OPENAI_API_KEY',
+            'base_url': 'OPENAI_BASE_URL',
+            'vision': False,
+            'func': False,
+        })
+
+        # 获取当前模型的配置，如果没有则使用默认配置
+        self.model_config = ai_config.get(model, ai_config['default'])
+        # 使用环境变量中的实际值
+        if api_key is None:
+            api_key = os.getenv(self.model_config['api_key'])
+        if base_url is None:
+            base_url = os.getenv(self.model_config['base_url'])
+
+        # print('init:当前url:', base_url)
+        # print('init:当前key:', api_key)
+
         super().__init__(api_key=api_key,base_url=base_url,**kws)
 
         self.model = model
@@ -266,26 +300,34 @@ class Chat(OpenAI):
             if isinstance(s, dict) or isinstance(s, ChatCompletionMessage):
                 pprint(s)
                 messages.append(s)
+        messages += self.messages
         for s in self.messages:
             if isinstance(s, dict) or isinstance(s, ChatCompletionMessage):
                 pprint(s)
-        messages += self.messages
         tools = tools if tools is not None else [v.description for v in self.tools.values()]
         model = model if model is not None else self.model
         try:
-            if tools:
+            # print('当前url:', self.base_url)
+            # print('当前模型:', self.model)
+            if tools and self.model_config.get('func'):
                 return MessageStream(self.chat.completions.create(
                     model=model,
                     messages=messages,
                     tools=tools,
                     tool_choice=tool_choice,
-                    stream=True  # 开启流式响应
+                    stream=True,  # 开启流式响应
+                    stream_options={
+                        "include_usage": True,
+                    },
                 ))
             else:
                 return MessageStream(self.chat.completions.create(
                     model=model,
                     messages=messages,
-                    stream=True
+                    stream=True,
+                    stream_options={
+                        "include_usage": True,
+                    },
                 ))
         except InternalServerError as e:
             return e.message #最终会成为system消息和#开头的消息

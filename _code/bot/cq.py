@@ -110,11 +110,33 @@ def generate_unique_filename(directory):
             i += 1
         return f'{date}-{i}.cache'
 
+import hashlib
 def download_img(picture_url, name=None, temp=True):
     if temp:
         target_dir = temp_path
     else:
         target_dir = image_path
+
+    # 检查并创建目标目录
+    os.makedirs(target_dir, exist_ok=True)
+    # 如果提供了文件名，则检查文件是否已存在
+    if name:
+        potential_files = [name, name.rsplit('.', 1)[0] + '.jpg', 
+                           name.rsplit('.', 1)[0] + '.png', 
+                           name.rsplit('.', 1)[0] + '.gif']
+        for fname in potential_files:
+            file_path = os.path.join(target_dir, fname)
+            if os.path.exists(file_path):
+                return file_path
+    # 如果未提供name，但是是临时的，使用url的哈希值作为缓存文件名
+    elif temp:
+        url_hash = hashlib.md5(picture_url.encode('utf-8')).hexdigest()
+        # 在缓存中寻找可能存在的文件，避免重复下载
+        existing_files = [f for f in os.listdir(target_dir) if os.path.splitext(os.path.basename(f))[0]==url_hash]
+        if existing_files:
+            # 有缓存直接返回
+            return os.path.join(target_dir, existing_files[0])
+
     # 下载
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36             (KHTML, like Gecko) Chrome/63.0.3239.132 Safari/537.36 QIHU 360SE",
@@ -123,21 +145,25 @@ def download_img(picture_url, name=None, temp=True):
     if r.status_code != 200:
         raise Exception(f"Failed to download image, status code: {r.status_code}")
 
-    # 生成图片名(如果没有)
-    if name is None:
-        name = generate_unique_filename(target_dir)
-    # 修改拓展名
+    # 获取图片格式并确定扩展名
     with Image.open(io.BytesIO(r.content)) as img:
         img_format = img.format.lower()
-
-        if img_format == 'jpeg':
-            name = name.rsplit('.', 1)[0] + '.jpg'
-        elif img_format == 'png':
-            name = name.rsplit('.', 1)[0] + '.png'
-        elif img_format == 'gif':
-            name = name.rsplit('.', 1)[0] + '.gif'
-        else:
-            pass
+    if img_format == 'jpeg':
+        ext = '.jpg'
+    elif img_format == 'png':
+        ext = '.png'
+    elif img_format == 'gif':
+        ext = '.gif'
+    else:
+        ext = ''
+    # 生成图片名(如果没有)
+    if name is None:
+        if temp: # 临时的 hash
+            name = url_hash
+        else: # 否则 按照序号排序
+            name = generate_unique_filename(target_dir)
+    # 修改拓展名
+    name = name.rsplit('.', 1)[0] + ext
 
     file_path = os.path.join(target_dir, name)
 

@@ -61,18 +61,46 @@ ListenSocket.listen(100)  # 传入的参数指定等待连接的最大数量
 
 def request_to_json(msg: str) -> dict | None:
     """
-    遍历request字符串, 直到后面是json格式, 读取对应json文本并返回
-
+    从分块传输的HTTP请求中提取并解析JSON数据
+    
+    处理格式如：
+    [HTTP Headers]
+    
+    c4
+    {"json": "data"}
+    0
+    
     Args:
-        msg (str): 请求消息字符串
+        msg (str): HTTP请求消息字符串
 
     Returns:
-        Optional[Dict]: 解析后的JSON对象，如果没有找到JSON则返回None
+        Optional[dict]: 解析后的JSON对象，如果没有找到JSON则返回None
     """
-    for i in range(len(msg)):
-        if msg[i] == "{" and msg[i-1] == "\n":
-            return json.loads(msg[i:])
-    return None
+    try:
+        # 查找消息体开始的位置（双换行符后）
+        body_start = msg.find('\r\n\r\n')
+        if body_start == -1:
+            body_start = msg.find('\n\n')
+        
+        if body_start == -1:
+            return None
+            
+        # 获取消息体
+        body = msg[body_start:].strip()
+        
+        # 查找第一个 { 和最后一个 }
+        json_start = body.find('{')
+        json_end = body.rfind('}')
+        
+        if json_start == -1 or json_end == -1:
+            return None
+            
+        # 提取JSON字符串并解析
+        json_str = body[json_start:json_end + 1]
+        return json.loads(json_str)
+        
+    except json.JSONDecodeError:
+        return None
 
 
 def recv_full_message(client: socket, buffer_size=8192, max_size=1024*1024, timeout=5) ->str:
@@ -116,12 +144,10 @@ def recv_full_message(client: socket, buffer_size=8192, max_size=1024*1024, time
 
     return full_msg.decode(encoding='utf-8', errors='ignore')
 
-HttpResponseHeader = '''HTTP/1.1 200 OK\r\n
-Content-Type: text/html\r\n\r\n
-'''.encode(encoding='utf-8')
+HttpResponseHeader = '''HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n'''.encode(encoding='utf-8')
 
 # 需要循环执行，返回值为json格式
-
+import traceback
 @ctrlc_decorator(lambda:requests.post(f'http://127.0.0.1:{listen_port}',data={}))
 def recv_msg() -> dict | None:
     """
@@ -138,7 +164,8 @@ def recv_msg() -> dict | None:
             # 发送信号表示我收到了
             client.sendall(HttpResponseHeader)
         except ValueError:
-            print('消息过大')
+            traceback.print_exc()
+            print('消息错误')
         except socket.timeout:
             print('接收超时')
         except BrokenPipeError:

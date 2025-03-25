@@ -1,5 +1,6 @@
 '''文件操作相关的命令'''
 
+import shutil
 import traceback
 import re
 import os
@@ -24,9 +25,12 @@ def run(body:str):
 .file
  : read <文件路径> [-i:是否显示行号] [<起始行:int> <结束行:int>]
  | write <文件路径> [<起始行:int> <结束行:int>]\\n<内容>
- | get <文件路径>
+ | get <文件路径/目录路径>
+ | del <文件路径> [-r:删除目录]
  | set <文件路径> [-y/-f:是否覆盖已有文件] || <文件>
-<文件> || .file to <文件路径> [-y/-f:是否覆盖已有文件]
+ | <文件> || .file to <文件路径> [-y/-f:是否覆盖已有文件]
+ | setdir <目录路径> [-y/-f:是否覆盖已有目录] || <压缩包>
+ | <压缩包> || .file dirto <目录路径> [-y/-f:是否覆盖已有目录]
 '''
     msg = cache.thismsg()
     if not msg['user_id'] in cache.ops:
@@ -55,15 +59,26 @@ def run(body:str):
         return _write(path, getint(start), getint(end), last_lines)
     elif s=='get':
         path, last = read_params(last)
-        if not os.path.isfile(path):
-            return '目标不是文件'
-        return _get(path)
+        if os.path.isfile(path):
+            return _get(path)
+        elif os.path.isdir(path):
+            return _getdir(path)
+        return '目标不存在'
     elif s=='set':
         path, extra, last = read_params(last, 2)
         return _set(path, extra in ['-y', '-f'])
+    elif s=='del':
+        path, extra, last = read_params(last, 2)
+        return _del(path, extra in ['-r'])
     elif s=='to':
         path, extra, last = read_params(last, 2)
         return _to(path, extra in ['-y', '-f'])
+    elif s=='setdir':
+        path, extra, last = read_params(last, 2)
+        return _setdir(path, extra in ['-y', '-f'])
+    elif s=='dirto':
+        path, extra, last = read_params(last, 2)
+        return _dirto(path, extra in ['-y', '-f'])
     return run.__doc__
 
 def read_text(text, start=None, end=None):
@@ -142,6 +157,55 @@ def _get(path):
     return _send_file(path)
 
 
+def _dir_send(path):
+    msg = cache.thismsg()
+    path = os.path.abspath(path)
+    if not os.path.exists(path):
+        return f'路径"{path}"不存在'
+    if not os.path.isdir(path):
+        return f'路径"{path}"不是文件夹'
+    try:
+        tmp_zip = f'/tmp/tmp.zip'
+        shutil.make_archive(tmp_zip.replace('.zip', ''), 'zip', path)
+        ret = _send_file(tmp_zip)
+        return ret
+    except Exception as e:
+        return f'压缩出错: {e}'
+
+def _getdir(path):
+    return _dir_send(path)
+
+def _rm(path, isdir=False):
+    try:
+        if isdir:
+            shutil.rmtree(path,True)
+        else:
+            os.remove(path)
+        return f'已删除: {path}'
+    except Exception as e:
+        return f'删除出错: {e}'
+
+def _del(path: str, isdir=False):
+    msg = cache.thismsg()
+    if any(f(path) for f in [lambda x:re.match('^/([^/]+(/)?)?$', x)]):
+        return '危险操作，已禁用'
+    path = os.path.abspath(path)
+    if not os.path.exists(path):
+        return f'路径"{path}"不存在'
+    elif os.path.isfile(path):
+        return _rm(path)
+    elif os.path.isdir(path):
+        if isdir:
+            return _rm(path, True)
+        else:
+            reply = yield '目标是目录而不是文件，确定要删除吗(y/n)'
+            if not is_msg(reply) or not reply['message'] in ['是','确定','y','Y','yes','Yes','YES','OK','ok','Ok']:
+                return '操作终止'
+            return _rm(path, True)
+    else:
+        return '未知错误，遇到了不是文件也不是文件夹的东西'
+
+
 @to_thread
 def download(url, path, msg):
     try:
@@ -216,3 +280,48 @@ def _to(path, is_force):
             return '操作终止'
         return _recv_file(file_msg, path)
     return '找到了文件，但是发送失败了'
+
+def _dir_recv_zip(file_msg, dest_dir):
+    CQ = cq.find_all(file_msg['message'])[0]
+    file_id = cq.load(CQ)['data']['file_id']
+    ret = connect.call_api('get_file', file_id=file_id)
+    if ret['retcode'] != 0:
+        return ret['wording']
+    abs_path = ret['data']['file']
+    tmp_zip_path = f'/tmp/tmp.zip'
+    shutil.move(abs_path, tmp_zip_path)
+    if os.path.exists(dest_dir):
+        shutil.rmtree(dest_dir)  # 删除已有文件夹，执行强制覆盖
+    os.makedirs(dest_dir, exist_ok=True)
+    shutil.unpack_archive(tmp_zip_path, dest_dir)
+    os.remove(tmp_zip_path)
+    send(f'文件夹内容已成功解压到\n{dest_dir}', **file_msg)
+
+# 是生成器
+def _setdir(path, is_force):
+    if is_force or not os.path.exists(path):
+        reply = yield '请发送一个zip压缩文件（包含要解压的文件夹内容）'
+        if is_file(reply):
+            return _dir_recv_zip(reply, path)
+        return '发送的不是文件，操作终止'
+    elif os.path.isdir(path):
+        reply = yield '目标文件夹已存在，确定要覆盖吗(y/n)'
+        if not is_msg(reply) or not reply['message'] in ['是','确定','y','Y','yes','Yes','YES','OK','ok','Ok']:
+            return '操作终止'
+        file_msg = yield '请发送一个zip压缩文件（包含要解压的文件夹内容）'
+        return _dir_recv_zip(file_msg, path)
+    return '该路径已存在但不是文件夹，操作终止'
+
+
+def _dirto(path, is_force):
+    file_msg = cache.get_one(cache.thismsg(), is_file, 10)# 接收10条消息以内任何人发的文件
+    if not file_msg:
+        return '10条消息内没有文件'
+    if is_force or not os.path.exists(path):
+        return _dir_recv_zip(file_msg, path)
+    elif os.path.isdir(path):
+        reply = yield '目标目录已存在，确定要覆盖吗(y/n)'
+        if not is_msg(reply) or not reply['message'] in ['是','确定','y','Y','yes','Yes','YES','OK','ok','Ok']:
+            return '操作终止'
+        return _dir_recv_zip(file_msg, path)
+    return '该路径已存在但不是文件夹，操作终止'

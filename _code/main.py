@@ -43,6 +43,7 @@ import bot.data as data
 
 import bot.msgs as msgs
 from bot.msgs import *
+import bot.pages as pages
 import bot.cache as cache
 import bot.chatlog as chatlog
 
@@ -124,7 +125,7 @@ def _init_self():
                 print('debug模式')
 
 @call_delay(delay_secs=lambda *_,**__:random.uniform(-0.3, -0.6), max_size=20)
-def send(text: Any, user_id: int | str = None, group_id: int | str = None, **params) -> dict:
+def send(text: Any, user_id: int | str = None, group_id: int | str = None, **params) -> int:
         '''user_id或者group_id是必须的'''
         debug('【准备发送消息】')
         text = str(text)
@@ -162,6 +163,7 @@ def send(text: Any, user_id: int | str = None, group_id: int | str = None, **par
 
         print(f'[{time.strftime(r"%H:%M:%S")}]【发送消息】',end='')
         chatlog.write(self_msg)
+        return call['data']['message_id']
 
 
 i = 0
@@ -188,15 +190,15 @@ def _recv_time_counter():
         elif k!=0:
                 print(f'█{k}|{j}.{i}')
 
-reply_cq = re.compile(r'^(\[CQ:reply,[^\]]+\])(\[CQ:at,[^\]]+\])\s*([\S\s]*)')
+reply_cq = re.compile(r'^(\[CQ:reply,[^\]]+\])([\S\s]*)')
 def _strip_reply(msg):
         message = msg['message']
         msg['reply'] = None
         msg['at_cq'] = []
         m = reply_cq.match(message)
         if m:
-                reply, at, message = m.groups()
-                msg['reply'] = {'reply':reply, 'at':at}
+                reply, message = m.groups()
+                msg['reply'] = reply
         msg['message'] = message
         return msg
 
@@ -243,10 +245,10 @@ def _run_bash(command, test=False):
         if not check_op_and_reply():
                 return
 
-        is_safe, reason = check_safe(command)
-        if not is_safe:
-                sendmsg(reason)
-                return
+        #is_safe, reason = check_safe(command)
+        #if not is_safe:
+        #        sendmsg(reason)
+        #        return
 
         @to_thread
         def observer(cmd, timeout):
@@ -262,7 +264,7 @@ def _run_bash(command, test=False):
                         proc.kill()
                         proc.wait()
         if not test:
-                observer(cq.unescape2(command), 5)
+                observer(cq.unescape2(command), 10)
         else:
                 sendmsg(f'执行了: {command}')
 
@@ -288,6 +290,7 @@ def recv(msg:dict|None):
 
         print(f'[{time.strftime(r"%H:%M:%S")}]【收到消息】',end='')
         cache.thismsg(msg)
+        cache.msgs['last'] = msg
         if not is_group_msg(msg) or msg not in nolog_groups:
                 chatlog.write(msg)
         if any(c in sys.argv[1:] for c in ['-l','log_only']):
@@ -326,7 +329,7 @@ def recv(msg:dict|None):
                         _run_bash(msg['message'][2:],test=True)
                 elif cmd_py.links:
                         print('进入links')
-                        cmd_py.exec_links()
+                        cmd_py.exec_links(msg)
         elif is_notice(msg):
                 if is_recall(msg):
                         _log = cache.getlog(msg)
@@ -338,7 +341,7 @@ def recv(msg:dict|None):
                                 _log.pop(m)
                 elif cmd_py.links:
                         print('进入links2')
-                        cmd_py.exec_links()
+                        cmd_py.exec_links(msg)
 
 
 from funcs import *

@@ -220,8 +220,8 @@ def run_or_remove(linklst:list):
 
 # def setroot():
 @to_thread
-def exec_links():
-    cache.thismsg(cache.get_last())
+def exec_links(msg:dict):
+    cache.thismsg(msg)
     loc.update(globals())
     exec_link(links[0])
 
@@ -333,14 +333,18 @@ do_action = run_action
 
 def formats_link(link:dict, mode=0):
     '''输出link的显示用字符串形式'''
-    lst = [link['type']+' '+link['name']]
+    lst = [link.get('type', 're')+' '+link['name']]
     if mode==0:
         if link['succ']:
             lst.append('    succ')
             lst.extend(map(lambda s:'        '+s, link['succ']))
         if link['fail']:
-            lst.append('    fail')
-            lst.extend(map(lambda s:'        '+s, link['fail']))
+            keys = [v['name'] for v in links]
+            if len(link['fail'])==1 and link['fail'][0] in keys and keys.index(link['name'])+1 == keys.index(link['fail'][0]):
+                lst.append('    ↓')
+            else:
+                lst.append('    fail')
+                lst.extend(map(lambda s:'        '+s, link['fail']))
     elif mode==1:
         lst[0] += (' while'
             +''.join(f' {name} fail' for name in link['while']['fail'])
