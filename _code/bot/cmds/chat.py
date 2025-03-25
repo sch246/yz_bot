@@ -35,6 +35,8 @@ encoding = tiktoken.encoding_for_model('gpt-4')
 def count_tokens(text:str):
     return len(encoding.encode(text))
 
+default_model = "gpt-4o-mini"
+
 prices = {
     "gpt-3.5-turbo-ca": (1, 3),
     "gpt-3.5-turbo": (3.5, 10.5),
@@ -61,6 +63,18 @@ prices = {
     "claude-3-5-sonnet-20240620": (15, 75),
     "claude-3-5-sonnet-20241022": (15, 75),
     "claude-3-5-haiku-20241022": (5, 25),
+    "deepseek-reasoner": (4,16),
+    "deepseek-chat": (1,2),
+    "deepseek-ai/DeepSeek-R1":(4,16),
+    "deepseek-ai/DeepSeek-V3": (1,2),
+    "Pro/deepseek-ai/DeepSeek-R1": (4,16),
+    "Pro/deepseek-ai/DeepSeek-V3": (1,8),
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B": (0,0),
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B": (0,0),
+    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B": (0,0),
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B": (0, 0.7),
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B": (0, 1.26),
+    "deepseek-ai/DeepSeek-R1-Distill-Llama-70B": (0, 4.13)
 }
 
 def get_caller():
@@ -73,6 +87,11 @@ def get_caller():
 
 def inc_call_count():
     get_caller()[0] += 1
+
+def inc_call_tokens_cost(model, tokens: tuple[int, int]):
+    (prompt_tokens, completion_tokens) = tokens
+    price = (prompt_tokens*prices[model][0] + completion_tokens*prices[model][1])/1_000_000
+    get_caller()[1] += price
 
 def inc_call_token_cost(model, type:int, token:int):
     price = token*prices[model][type]/1_000_000
@@ -269,7 +288,7 @@ def get_prompt() -> list|None:
     else:
         return None
 
-def get_msgs(max_token=1_000, return_token=False):
+def get_msgs(max_token=4_000, return_token=False):
     in_group = cache.thismsg().get('group_id')
 
     chat_logs = []
@@ -304,7 +323,15 @@ def get_msgs(max_token=1_000, return_token=False):
 
         if sum_token > max_token:
             break
-        messages.insert(0, chat_msg)
+        if messages and chat_msg['role'] == messages[0]['role']:
+            #TODO 默认全是字符串
+            messages[0]['content'] = f'{content}\n\n{messages[0]["content"]}'
+        else:
+            messages.insert(0, chat_msg)
+
+    if messages[-1]['role'] == 'assistant':
+        messages[-1]['prefix'] = True
+        # messages.append({'role':'user','content':f'---\nsystem\n---\n这是为了防止报错而添加的分隔线'})
 
     if return_token:
         return messages, sum_token
@@ -348,6 +375,13 @@ def init_chat(chat_client:Chat):
 
     chat_client.set_settings([
             *prompt,
+            '''## 注意事项
+- 你的id: 柚子
+- 你的QQ号：1581186041。at格式:"[CQ:at,qq=qq号]"(仅在群聊下有效)；reply格式:"[CQ:reply,id=message_id]"
+- 你的回复会直接发送到聊天当中，直接输出内容即可，格式会自动处理
+- 聊天中可能不会有明显的问题，扮演好角色即可
+- 如无特殊要求，请用中文回复
+- 发送`# <拒绝原因>`以拒绝回复''',
             group_state,
             # show_data,
             # 'If necessary, remember to use python to read the storage in \'data\' at any time',
@@ -376,6 +410,13 @@ def format_price(model: str, prices: Tuple[float, float]) -> str:
 @cm.register('model')
 def list_all_models() -> str:
     '''
+    查看当前模型
+    '''
+    return getchatstorage().get('model', default_model)
+
+@cm.register('models')
+def list_all_models() -> str:
+    '''
     列出所有模型的价格
     '''
     return "\n".join(["模型 输入价格 输出价格 (单位: 元/(1m token))"]+[format_price(model, price) for model, price in prices.items()])
@@ -402,7 +443,7 @@ def _()->str:
 @cm.register('use_model <model:str>')
 def _(model:str)->str:
     '''
-    设置模型
+    使用模型
     '''
     getchatstorage()['model'] = model
     return f'模型设置为 {model}'
@@ -412,7 +453,13 @@ def _()->list:
     '''
     查看当前提示词
     '''
-    return getchatstorage()['prompt']
+    name = getchatstorage().get('prompt')
+    if name is None:
+        return f'{settings}\n(默认)'
+    elif isinstance(name, str):
+        return f'{prompts[name]}\n({name})'
+    else:
+        return f'{name}'
 
 @cm.register('add_prompt')
 def _()->str:
@@ -457,6 +504,24 @@ def _(prompt:list)->str:
         data['prompt'] = old_prompt + prompt
         return f'提示词已追加'
 
+@cm.register('setting')
+def _()->str:
+    '''
+    列出当前所有设定名字
+    '''
+    return '\n'.join(list(prompts.keys()))
+
+@cm.register('setting <name:str>')
+def _(name:str)->list|str:
+    '''
+    查找设定
+    '''
+    prompt = prompts.get(name)
+    if prompt:
+        return prompt
+    else:
+        return '未找到设定，你可能需要先创建设定'
+
 @cm.register('use_setting')
 def _()->str:
     '''
@@ -471,8 +536,8 @@ def _(name:str)->str:
     '''
     应用设定
     '''
-    if prompts.get(name):
-        getchatstorage()['prompt'] = prompts[name]
+    if not prompts.get(name) is None:
+        getchatstorage()['prompt'] = name
         return '设定已应用'
     else:
         return '未找到设定，你可能需要先创建设定'
@@ -501,17 +566,30 @@ def _(name:str, prompt:list)->str:
     prompts[name] = prompt
     return '设定已保存'
 
-@cm.register('get_setting <name:str>')
-def _(name:str)->list|str:
-    '''
-    查找设定
-    '''
-    prompt = prompts.get(name)
-    if prompt:
-        return prompt
+def get_balance(base_url, api_key):
+    url = f'{base_url}/user/balance'
+    headers = {
+        'Accept': 'application/json',
+        'Authorization': f'Bearer {api_key}'
+    }
+    
+    response = requests.get(url, headers=headers)
+    
+    if response.status_code == 200:
+        return response.json()
     else:
-        return '未找到设定，你可能需要先创建设定'
+        return f"错误: {response.status_code}, {response.text}"
 
+@cm.register('balance <model:str>')
+def _(model:str)->str:
+    '''
+    查询余额
+    '''
+    import os
+    if model.startswith('deepseek'):
+        return get_balance(os.getenv('DEEPSEEK_BASE_URL'), os.getenv('DEEPSEEK_API_KEY'))
+    else:
+        return '暂不支持查询'
 
 
 # 作为条件调用，返回非空值(data)以触发结果(call(data))
@@ -547,6 +625,7 @@ def call(data: Callable | bool):
 role_to_color = {
     "system": "red",
     "user": "green",
+    "think": "yellow",
     "assistant": "blue",
     "tool": "magenta",
 }
@@ -567,7 +646,7 @@ def split_string_with_code_blocks(text:str):
             result.append(part)
 
     return result
- 
+
 def pprint(message:dict | ChatCompletionMessage | MessageStream | str, model:str, split=True):
     '''
     打印 dict, 普通消息, 或者流式消息, 然后返回
@@ -584,25 +663,46 @@ def pprint(message:dict | ChatCompletionMessage | MessageStream | str, model:str
             print(colored(f"assistant called: {tool_calls[0].function.name} ", "yellow"),end='', flush=True)
             text:str = ''
             for delta in message:
-                text += delta
-                print(colored(delta, "yellow"),end='', flush=True)
-            inc_call_text_cost(model, 1, text) #TODO 调用函数应该也算输出吧
+                if isinstance(delta, Tuple):
+                    inc_call_tokens_cost(model, delta)
+                else:
+                    text += delta
+                    print(colored(delta, "yellow"),end='', flush=True)
         else:
             print(colored(f"assistant: ", role_to_color[role]),end='', flush=True)
             sum_text:str = ''
             text:str = ''
+            thinking = False
             for delta in message:
-                print(colored(delta, role_to_color[role]),end='', flush=True)
-                text += delta
-                sum_text += delta
-                if not split:
-                    continue
-                *parts, text = split_string_with_code_blocks(text)
-                for part in parts:
-                    inc_call_text_cost(model, 1, part)
-                    _sendmsg(part)
+                if isinstance(delta, Tuple):
+                    inc_call_tokens_cost(model, delta)
+                elif isinstance(delta, dict):
+                    if reasoning_content:=delta.get('reasoning_content'):
+                        print(colored(reasoning_content, role_to_color['think']),end='', flush=True)
+                    elif content:=delta.get('content'):
+                        if '<think>' in content:
+                            thinking = True
+                            pre_content, content = content.split('<think>')
+                            print(colored(pre_content, role_to_color[role]),end='', flush=True)
+                        if thinking:
+                            if '</think>' in content:
+                                thinking = False
+                                reasoning_content, content = content.split('</think>')
+                            else:
+                                reasoning_content, content = content, ''
+                            print(colored(reasoning_content, role_to_color['think']),end='', flush=True)
+                        print(colored(content, role_to_color[role]),end='', flush=True)
+                        text += content
+                        sum_text += content
+                        if split:
+                            *parts, text = split_string_with_code_blocks(text)
+                            for part in parts:
+                                _sendmsg(part)
+                    else:
+                        print('这里不应该运行到，因为若没有reasoning_content和content应该停止循环')
+                else:
+                    print('这里不应该运行到，因为只返回了这两个类型的值')
             if text:
-                inc_call_text_cost(model, 1, text)
                 _sendmsg(text)
         print('\n')
         return message.msg
@@ -631,6 +731,7 @@ def pprint(message:dict | ChatCompletionMessage | MessageStream | str, model:str
         else:
             print('else:',msg)
         return message
+
 def add(msg, chat_client:Chat):
     """
     Print, transform and add a message to the chat history, then return the transformed message
@@ -655,15 +756,15 @@ def chat(model=None):
         if data.get('model', None):
             model = data['model']
         else:
-            model = "gpt-4o-mini"
+            model = default_model
 
     chat_client = Chat(model=model)
     init_chat(chat_client)
 
-    chat_client.messages, sum_token = get_msgs(return_token=True)
+    chat_client.messages = get_msgs()
 
     # 增加计费
-    inc_call_token_cost(model, 0, sum_token)
+    # inc_call_token_cost(model, 0, sum_token)
 
     # chats = []
     # while chat_contexts:

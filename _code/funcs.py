@@ -42,7 +42,7 @@ def sendmsg(text,**_msg):
     msg = cache.thismsg()
     if not _msg:
         _msg = msg
-    send(text,**_msg)
+    return send(text, **_msg)
 
 def recvmsg(text, sender_id:int=None, private=None, **kws):
     '''不输入后面的参数时，默认是同一个人同一个位置的recv，否则可以设定对应的sender和group
@@ -397,7 +397,7 @@ def msg2chat(msg, in_group=True):
             content_pre = [{"type": "text", "text": f'---\nqq: {msg["user_id"]}\nname: {repr(msg2name(msg))}\nmessage_id: {msg["message_id"]}\n---\n'}]
         else:
             content_pre = []
-    content = '\n\n'.join([part['text'] for part in content_pre+msg_split(msg['message'])])
+    content = '\n'.join([part['text'] for part in content_pre+msg_split(msg['message'])])
     return {'role':role, 'content':content}
     # if msg.get('sender') and msg['sender']['user_id']==cache.qq:
     #     return {'role':'assistant','content':msg['message']}
@@ -667,3 +667,85 @@ def read_process(process, sendmsg):
         sendmsg(f"错误: {remaining_error.strip()}")
     sendmsg(f'程序已退出，返回值 {process.returncode}')
     return
+
+import math
+from PIL import Image, ImageSequence
+def deal_img(pic, size, is_fit):
+    pic_url = pic['data']['url']
+    pic_path = cq.download_img(pic_url)
+    from PIL import Image
+
+    with Image.open(pic_path) as img:
+        # 获取缩放比例
+        w, h = img.size
+        area = w * h
+        if isinstance(size, int):
+            # fit 且小于等于 则基本不作处理
+            # 除非是gif
+            if is_fit and area <= size:
+                if pic_path.endswith('.gif'):
+                    raise ValueError()
+                return
+            scale = math.sqrt(size / area)
+        elif isinstance(size, float):
+            scale = size
+        else:
+            raise Exception('size 必须是整数或浮点数')
+        new_size = max(1, int(w * scale)), max(1, int(h * scale))
+        # 获取路径
+        base, _ = os.path.splitext(pic_path)
+        # 如果是 gif 则需要特殊处理
+        if pic_path.lower().endswith('.gif'):
+            resized_path = f"{base}_resized_{size}.gif"
+            # 获取GIF头部信息
+            palette = img.getpalette()
+            transparency = img.info.get('transparency')
+            background = img.info.get('background', 0)
+            duration = img.info.get('duration', 100)
+            loop = img.info.get('loop', 0)
+
+            resized_frames = []
+            frames_duration = []
+            frames_disposal = []
+            frames_transparency = []
+
+            for frame in ImageSequence.Iterator(img):
+                frames_duration.append(frame.info.get('duration', duration))
+                frames_disposal.append(frame.disposal_method if hasattr(frame, 'disposal_method') else 2)
+                frames_transparency.append(frame.info.get('transparency', transparency))
+
+                # 转RGBA用高质量算法缩放
+                frame_rgba = frame.convert('RGBA')
+                resized_frame = frame_rgba.resize(new_size, Image.LANCZOS)
+
+                # 再转换回调色板模式 ("P")，以回收调色板模式优势
+                resized_frame_p = resized_frame.convert('P', palette=Image.ADAPTIVE, colors=256)
+                resized_frames.append(resized_frame_p)
+
+            # 准备保存的额外参数
+            save_kwargs = {
+                'save_all': True,
+                'append_images': resized_frames[1:],
+                'duration': frames_duration,
+                'loop': loop,
+                'background': background,
+                'optimize': False,
+                'disposal': frames_disposal,
+            }
+            # 如果存在透明色，添加透明索引
+            if transparency is not None:
+                save_kwargs['transparency'] = transparency
+            
+            # 保存GIF动画
+            resized_frames[0].save(resized_path, **save_kwargs)
+        else:
+            resized_path = f"{base}_resized_{size}.png"
+            # 如果是一般图片
+            # 图片模式转换
+            if img.mode not in ('RGBA', 'RGB'):
+                img = img.convert('RGBA' if img.mode == 'P' else 'RGB')
+
+            # 保存调整后的图片
+            img.resize(new_size, Image.Resampling.LANCZOS).save(resized_path, format="PNG")
+        
+        return os.path.abspath(resized_path)

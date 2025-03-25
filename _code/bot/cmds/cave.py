@@ -3,7 +3,7 @@ from random import randint
 import re
 import time
 
-from main import storage, is_msg, getname, getgroupname, read_params, getran, cache, cq
+from main import storage, is_msg, getname, getgroupname, read_params, getran, cache, cq, str_tool, sendmsg, pages
 
 class Cave:
     def __init__(self) -> None:
@@ -74,6 +74,28 @@ class Cave:
         self.pool.append(i)
         return f'已添加，序号 {i}'
 
+    def search(self, keyword):
+        '''根据关键词搜索cave内容'''
+        if not self.msgs:
+            return '回声洞是空的！'
+
+        results = []
+        for idx, msg in self.msgs.items():
+            if keyword.lower() in msg['text'].lower():
+                # 添加简短预览，最多显示20个字符
+                preview = msg['text']
+                t = msg['time']
+                if len(preview) > 20:
+                    preview = preview[:20] + "..."
+                preview = '    '+str_tool.addtab(preview)
+                results.append(f"{idx} | {t}:\n{preview}")
+
+        if not results:
+            return f'未找到包含关键词 "{keyword}" 的消息'
+
+        sendmsg(f'找到 {len(results)} 条包含 "{keyword}" 的消息:')
+        return pages.display(results, 10)
+
 cave  = Cave()
 re_int = re.compile(r'(-?\d+)$')
 
@@ -134,4 +156,9 @@ def run(body:str):
             if not text:
                 return '不知道为啥消息为空'
             return cave.set(cave.empty(),text)
+    elif s=='search':
+        keyword = last.strip()
+        if not keyword:
+            return '请输入要搜索的关键词'
+        return cave.search(keyword)
     return run.__doc__

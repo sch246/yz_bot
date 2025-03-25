@@ -275,7 +275,7 @@ def _list():
     for link in links:
         lst.append(formats_link(link))
     if lst:
-        return '\n'.join(lst)
+        return pages.display(lst, 10)
     else:
         return 'links 为空'
 

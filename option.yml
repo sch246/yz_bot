@@ -1,0 +1,33 @@
+client:
+  cache: null
+  domain: []
+  impl: api
+  postman:
+    meta_data:
+      headers: null
+      impersonate: chrome110
+      proxies:
+        http: 127.0.0.1:7897
+        https: 127.0.0.1:7897
+    type: cffi
+  retry_times: 5
+dir_rule:
+  base_dir: E:\code\yz_bot\jm
+  rule: Bd_Pname
+download:
+  cache: true
+  image:
+    decode: true
+    suffix: null
+  threading:
+    image: 30
+    photo: 20
+log: true
+plugins:
+  valid: log
+  after_album:
+    - plugin: img2pdf
+      kwargs:
+        pdf_dir: E:\code\yz_bot\jm # pdf存放文件夹
+        filename_rule: Aid # pdf命名规则，A代表album, name代表使用album.name也就是本子名称
+version: '2.1'

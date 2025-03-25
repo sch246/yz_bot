@@ -226,7 +226,7 @@ def vcs(cmd=''):
     else:
         s=screen.send('vcs',cmd)
         lines=s.splitlines()[1:]
-        return '\n'.join(lines).replace('''^[[?2004h''','').replace('''^[[?2004l
+        return '\n'.join(lines).replace('''[?2004h''','').replace('''[?2004l
 ''','')
 ###
 def iex(cmd=''):
@@ -281,4 +281,93 @@ def time_between(start, end):
 ]
 ###
 睡着了 = ['（柚子已经睡着了，没有回应）','（柚子正在甜甜地睡觉,没有回应）', '（只听到柚子轻轻的呼吸声,她还在梦乡中）', '（柚子在睡梦中翻了个身,继续安睡）', '（柚子的耳朵微微动了动,但她依然熟睡）', '唔...柚子还在睡觉呢 (揉眼睛)', '嗯...现在什么时间吗 (迷迷糊糊)', '（柚子的尾巴轻轻摇了摇,但她没有醒来）', '呼...呼...(*ﾉωﾉ) 柚子还在睡觉呢...有什么事等天亮再说哦...','(￣ρ￣)..zZZ','柚子困困，再睡会儿 (´ω｀)','唔...柚子还想睡觉呢 (揉眼睛)', '（柚子的尾巴轻轻摇了摇，但她依然熟睡）']
+###
+def get_reply(msg):
+    if is_msg(msg):
+        text = msg['message'].strip()
+        if (text == '/file' and msg.get('reply')):
+            reply_id = cq.load(msg['reply'])['data']['id']
+            return connect.call_api('get_msg',message_id=reply_id)['data']
+    return {}
+###
+def get_reply(msg,filter=lambda x: True):
+    if is_msg(msg):
+        text = msg['message']
+        try:
+            if (filter(text) and msg.get('reply')):
+                reply_id = cq.load(msg['reply'])['data']['id']
+                return connect.call_api('get_msg',message_id=reply_id)['data']
+        except:
+            pass
+    return {}
+###
+def is_valid_ssh_pubkey(pubkey: str) -> bool:
+    """
+    检查字符串是否为有效的SSH公钥格式。
+    支持多种SSH公钥类型，包括RSA、DSA、ECDSA、ED25519等。
+    
+    Args:
+        pubkey: 可能的公钥字符串
+        
+    Returns:
+        bool: 如果是有效的SSH公钥则返回True，否则返回False
+    """
+    # 移除首尾空白
+    pubkey = pubkey.strip()
+    
+    # 检查是否为空
+    if not pubkey:
+        return False
+    
+    # 分割公钥的各部分
+    parts = pubkey.split()
+    
+    # 有效的SSH公钥通常有2或3部分:
+    # [密钥类型] [密钥数据] [可选注释]
+    if len(parts) < 2:
+        return False
+    
+    # 第一部分应该是密钥类型
+    valid_key_types = [
+        "ssh-rsa",           # RSA
+        "ssh-dss",           # DSA
+        "ssh-ed25519",       # ED25519
+        "ecdsa-sha2-nistp256", # ECDSA
+        "ecdsa-sha2-nistp384",
+        "ecdsa-sha2-nistp521",
+        "sk-ecdsa-sha2-nistp256@openssh.com",  # FIDO/U2F
+        "sk-ssh-ed25519@openssh.com",
+        "ssh-rsa-cert-v01@openssh.com",        # 证书格式
+        "ssh-dss-cert-v01@openssh.com",
+        "ssh-ed25519-cert-v01@openssh.com",
+        "ecdsa-sha2-nistp256-cert-v01@openssh.com",
+        "ecdsa-sha2-nistp384-cert-v01@openssh.com",
+        "ecdsa-sha2-nistp521-cert-v01@openssh.com"
+    ]
+    
+    if parts[0] not in valid_key_types:
+        return False
+    
+    # 第二部分应该是base64编码的数据
+    try:
+        # 尝试解码base64部分
+        import base64
+        base64.b64decode(parts[1])
+    except Exception:
+        return False
+    
+    # 所有检查通过
+    return True
+###
+def isfloat(str):
+    s=str.split('.')
+    if len(s)>2:
+        return False
+    else:
+        for si in s:
+            if not si.isdigit():
+                return False
+        return True
+###
+
 ###
