@@ -11,7 +11,6 @@ from urllib.request import quote, unquote
 from termcolor import colored
 
 import openai
-from openai.types.chat.chat_completion_message import ChatCompletionMessage
 import tiktoken
 
 
@@ -24,18 +23,45 @@ from main import CommandManager
 
 import json
 
-from main import Chat, MessageStream
+from main import LLMCilent, Chat, sum_res, LLMResponse, get_image_base64
 
 from main import memberlist
 
-chat_client = Chat()
+llm_cilent = LLMCilent()
+
+llm_config = storage.get("llm_system", "config")
+description_dict = storage.get("llm_system", "description_cache")
+
+# _url_pattern = re.compile(r'https?://[^\?]+\?.*rkey=([^&]+)')
+# def _format_key(key):
+#     match = _url_pattern.search(key)
+#     if match:
+#         return match.group(1)
+#     return key
+
+# class DescriptionCache:
+#     def __init__(self, original_dict):
+#         self.original_dict = original_dict
+
+#     def __contains__(self, key):
+#         return _format_key(key) in self.original_dict
+
+#     def __getitem__(self, key):
+#         return self.original_dict[_format_key(key)]
+
+#     def __setitem__(self, key, value):
+#         self.original_dict[_format_key(key)] = value
+
+#     def get(self, key, default=None):
+#         return self.original_dict.get(_format_key(key), default)
+
+# description_cache = DescriptionCache(description_dict)
+description_cache = description_dict
 
 encoding = tiktoken.encoding_for_model('gpt-4')
 
 def count_tokens(text:str):
     return len(encoding.encode(text))
-
-default_model = "gpt-4o-mini"
 
 prices = {
     "gpt-3.5-turbo-ca": (1, 3),
@@ -88,18 +114,29 @@ def get_caller():
 def inc_call_count():
     get_caller()[0] += 1
 
-def inc_call_tokens_cost(model, tokens: tuple[int, int]):
+def get_attr(provider:str, model:str):
+    return llm_config['providers'].get(provider, {}).get('models',{}).get(model,{})
+
+def get_prices(provider:str, model:str):
+    attr = get_attr(provider, model)
+    prompt_price = attr.get('prompt_price', 0)
+    completion_price = attr.get('completion_price', 0)
+    return (prompt_price, completion_price)
+
+def inc_call_tokens_cost(provider, model, tokens: tuple[int, int]):
     (prompt_tokens, completion_tokens) = tokens
-    price = (prompt_tokens*prices[model][0] + completion_tokens*prices[model][1])/1_000_000
+    (prompt_price, completion_price) = get_prices(provider, model)
+    price = (prompt_tokens*prompt_price + completion_tokens*completion_price)/1_000_000
     get_caller()[1] += price
 
-def inc_call_token_cost(model, type:int, token:int):
-    price = token*prices[model][type]/1_000_000
+def inc_call_token_cost(provider, model, type:int, token:int):
+    prices = get_prices(provider, model)
+    price = token*prices[type]/1_000_000
     get_caller()[1] += price
 
-def inc_call_text_cost(model, type:int, text:str):
+def inc_call_text_cost(provider, model, type:int, text:str):
     token = count_tokens(text)
-    inc_call_token_cost(model, type, token)
+    inc_call_token_cost(provider, model, type, token)
 
 def inc_call_image_cost(size:str, quality:str):
     price = 0.28
@@ -109,19 +146,53 @@ def inc_call_image_cost(size:str, quality:str):
         price += 0.28
     get_caller()[1] += price
 
+def group_state(s=None):
+    group_id = cache.thismsg().get('group_id')
+    if group_id:
+        return {'role':'system','content':f'当前所在群聊:{getgroupname(group_id)}({group_id})'}
+    else:
+        user_id = cache.thismsg().get('user_id')
+        return {'role':'system','content':f'当前在私聊:{getname(user_id)}({user_id})'}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#-------------------------------------------------------------------------------------------------------------
+
 def get_time():
     '''
     获取当前时间
     '''
     return f'现在是{time.strftime("%Y年%m月%d日%H时%M分%S秒")}'
-
-def group_state(s=None):
-    group_id = cache.thismsg().get('group_id')
-    if group_id:
-        return f'当前所在群聊:{getgroupname(group_id)}({group_id})'
-    else:
-        user_id = cache.thismsg().get('user_id')
-        return f'当前在私聊:{getname(user_id)}({user_id})'
 
 def group_size():
     '''
@@ -137,8 +208,7 @@ def group_members():
 def exec_code(expr:str,code:str=''):
     '''
     execute a real-time python code.
-    你应该可以用python读取和编辑`data`字典，其中的数据会被持久化保存
-    保存时尽可能使用问句作为键名
+    用python读取和编辑`data`字典，其中的数据会被持久化保存
 
     @param
     code: The code to execute
@@ -247,6 +317,7 @@ def create_image(prompt:str, size:str, quality:str):
     '''
     Create an image based on the description and return the cq code, pictures are automatically sent
     Use the standard parameter whenever possible unless explicitly requested by the user
+    处于不可用状态
 
     @param
     prompt: Description text used to create the image
@@ -255,10 +326,10 @@ def create_image(prompt:str, size:str, quality:str):
     quality: Image quality
         enum: ["standard", "hd"]
     '''
-    inc_call_image_cost(size, quality)
-    picCQ = url2cq(chat_client.create_image(prompt, size, quality))
-    sendmsg(picCQ)
-    return picCQ
+    # inc_call_image_cost(size, quality)
+    # picCQ = url2cq(chat_client.create_image(prompt, size, quality))
+    # sendmsg(picCQ)
+    # return picCQ
 
 def baidu_encyclopedia(object:str):
     '''
@@ -274,19 +345,53 @@ def baidu_encyclopedia(object:str):
     return res['data']['text']
 
 
-prompts = storage.get('', 'prompts')
+#---------------------------------------------------------------------------------------------------------------
 
-def get_prompt() -> list|None:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+prompts = storage.get('llm_system', 'prompts')
+
+
+def get_prompt() -> list:
     data = getchatstorage()
     name = data.get('prompt') #可能是name索引或者list
     if not name:
         return settings
-    elif isinstance(name, list):
+    elif isinstance(name, str) and name in prompts:
+        name = prompts[name]
+
+    if isinstance(name, list):
         return name
-    elif name in prompts:
-        return prompts[name]
     else:
-        return None
+        return []
 
 def get_msgs(max_token=4_000, return_token=False):
     in_group = cache.thismsg().get('group_id')
@@ -315,7 +420,7 @@ def get_msgs(max_token=4_000, return_token=False):
                 if part.get('type')=='text':
                     sum_token += count_tokens(part['text'])
                 elif part.get('type')=='image_url':
-                    sum_token += part['token_cost']
+                    sum_token += part.get('token_cost',0)
                 else:
                     print(f"chat error: 消息中有text和image_url之外的对象: {part}")
         else:
@@ -323,11 +428,13 @@ def get_msgs(max_token=4_000, return_token=False):
 
         if sum_token > max_token:
             break
-        if messages and chat_msg['role'] == messages[0]['role']:
-            #TODO 默认全是字符串
-            messages[0]['content'] = f'{content}\n\n{messages[0]["content"]}'
-        else:
-            messages.insert(0, chat_msg)
+
+        messages.insert(0, chat_msg)
+        # if messages and chat_msg['role'] == messages[0]['role']:
+        #     #TODO 默认全是字符串
+        #     messages[0]['content'] = f'{content}\n\n{messages[0]["content"]}'
+        # else:
+        #     messages.insert(0, chat_msg)
 
     if messages[-1]['role'] == 'assistant':
         messages[-1]['prefix'] = True
@@ -337,7 +444,10 @@ def get_msgs(max_token=4_000, return_token=False):
         return messages, sum_token
     return messages
 
-def init_chat(chat_client:Chat):
+def init_chat(chat_client:Chat, messages=[]):
+    '''
+    添加工具，设定
+    '''
     inc_call_count()
     # chat.add_tool(get_location)
     chat_client.add_tool(get_time)
@@ -352,8 +462,8 @@ def init_chat(chat_client:Chat):
     chat_client.add_tool(later_add)
     # chat_client.add_tool(later_set)
     chat_client.add_tool(later_del)
-    chat_client.add_tool(create_image)
-    chat_client.add_tool(chat_client.read_image)
+    # chat_client.add_tool(create_image)
+    # chat_client.add_tool(chat_client.read_image)
     # chat_client.add_tool(url2cq)
     # chat_client.add_tool(muti_reply)
     # chat_client.add_tool(baidu_encyclopedia)
@@ -368,66 +478,74 @@ def init_chat(chat_client:Chat):
     #     last_data = data.copy()
     #     return result
 
-    data = getchatstorage()
-    prompt = get_prompt()
-    if not prompt:
-        prompt = []
+    # data = getchatstorage()
 
-    chat_client.set_settings([
-            *prompt,
-            '''## 注意事项
+    prompts.setdefault('base', [
+        {'role':'system', 'content':'''## 注意事项
 - 你的id: 柚子
 - 你的QQ号：0。at格式:"[CQ:at,qq=qq号]"(仅在群聊下有效)；reply格式:"[CQ:reply,id=message_id]"
 - 你的回复会直接发送到聊天当中，直接输出内容即可，格式会自动处理
 - 聊天中可能不会有明显的问题，扮演好角色即可
 - 如无特殊要求，请用中文回复
-- 发送`# <拒绝原因>`以拒绝回复''',
+- 发送`# <拒绝原因>`以拒绝回复'''}
+    ])
+
+    chat_client.set_messages([
+            *get_prompt(),
+            *prompts.get('base'),
             group_state,
-            # show_data,
-            # 'If necessary, remember to use python to read the storage in \'data\' at any time',
-            # 'Images must be converted to cq code before they can be sent, do not use the markdown format',
+            *messages
             ])
 
-    if 'split' not in data: # 设置默认值
-        data['split'] = True
-    chat_client.split = data['split'] #决定是否划分发送
+    # if 'split' not in data: # 设置默认值
+    #     data['split'] = True
+    # chat_client.split = data['split'] #决定是否划分发送
 
 
 cm = CommandManager()
 
-@cm.register('split')
-def _()->str:
-    '''
-    切换是否划分发送消息
-    '''
-    data = getchatstorage()
-    data['split'] = not data.get('split')
-    return f"split: {data['split']}"
+# @cm.register('split')
+# def _()->str:
+#     '''
+#     切换是否划分发送消息
+#     '''
+#     data = getchatstorage()
+#     data['split'] = not data.get('split')
+#     return f"split: {data['split']}"
 
-def format_price(model: str, prices: Tuple[float, float]) -> str:
-    return f"{model}\n    {prices[0]} {prices[1]}"
+def format_price(model: str, attr: dict) -> str:
+    return f"{model}\n    {attr.get('prompt_price', '-')} {attr.get('completion_price', '-')} { '👀' if attr.get('vision') else ''} { '⚙️' if attr.get('function_calling') else ''}"
+
+@cm.register('provider')
+def get_provider() -> str:
+    '''
+    查看当前供应商
+    '''
+    return getchatstorage().get('provider', llm_config.get('default_provider', 'openai'))
 
 @cm.register('model')
-def list_all_models() -> str:
+def get_model() -> str:
     '''
     查看当前模型
     '''
-    return getchatstorage().get('model', default_model)
+    return getchatstorage().get('model', llm_config.get('default_model', 'gpt-4o-mini'))
 
 @cm.register('models')
-def list_all_models() -> str:
+def list_models() -> str:
     '''
     列出所有模型的价格
     '''
-    return "\n".join(["模型 输入价格 输出价格 (单位: 元/(1m token))"]+[format_price(model, price) for model, price in prices.items()])
+    models = llm_config.get('providers', {}).get(get_provider(), {}).get('models', {})
+    return "\n".join(["模型 输入价格 输出价格 (单位: 元/(1m token)) 视觉识别 函数调用"]+[format_price(model, attr) for model, attr in models.items()])
 
 @cm.register('model <model:str>')
 def list_specific_model(model: str) -> str:
     '''
     列出特定模型的价格
     '''
-    if model in prices:
-        return "模型 输入价格 输出价格 (单位: 元/(1k token))\n"+format_price(model, prices[model])
+    model_attr = llm_config.get('providers', {}).get(get_provider(), {}).get('models', {}).get(model)
+    if model_attr:
+        return "模型 输入价格 输出价格 (单位: 元/(1k token)) 视觉识别 函数调用\n"+format_price(model, model_attr)
     else:
         return f"未找到模型: {model}"
 
@@ -566,34 +684,37 @@ def _(name:str, prompt:list)->str:
     prompts[name] = prompt
     return '设定已保存'
 
-def get_balance(base_url, api_key):
-    url = f'{base_url}/user/balance'
-    headers = {
-        'Accept': 'application/json',
-        'Authorization': f'Bearer {api_key}'
-    }
+# def get_balance(base_url, api_key):
+#     url = f'{base_url}/user/balance'
+#     headers = {
+#         'Accept': 'application/json',
+#         'Authorization': f'Bearer {api_key}'
+#     }
     
-    response = requests.get(url, headers=headers)
+#     response = requests.get(url, headers=headers)
     
-    if response.status_code == 200:
-        return response.json()
-    else:
-        return f"错误: {response.status_code}, {response.text}"
+#     if response.status_code == 200:
+#         return response.json()
+#     else:
+#         return f"错误: {response.status_code}, {response.text}"
 
-@cm.register('balance <model:str>')
-def _(model:str)->str:
-    '''
-    查询余额
-    '''
-    import os
-    if model.startswith('deepseek'):
-        return get_balance(os.getenv('DEEPSEEK_BASE_URL'), os.getenv('DEEPSEEK_API_KEY'))
-    else:
-        return '暂不支持查询'
+# @cm.register('balance <model:str>')
+# def _(model:str)->str:
+#     '''
+#     查询余额
+#     '''
+#     import os
+#     if model.startswith('deepseek'):
+#         return get_balance(os.getenv('DEEPSEEK_BASE_URL'), os.getenv('DEEPSEEK_API_KEY'))
+#     else:
+#         return '暂不支持查询'
 
 
-# 作为条件调用，返回非空值(data)以触发结果(call(data))
 def cond() -> Callable | bool:
+    '''
+    被links引用
+    作为条件调用，返回非空值(data)以触发结果(call(data))
+    '''
     msg = cache.thismsg()
 
     # 如果是群聊且在没有开放的群聊中
@@ -615,134 +736,140 @@ def cond() -> Callable | bool:
     return False
 
 def call(data: Callable | bool):
-
+    '''
+    被links引用
+    data来自cond函数的返回值
+    '''
     # 如果是命令则执行
     if callable(data):
         return '#'+cq.escape(str(data()))
 
     return chat()
 
-role_to_color = {
-    "system": "red",
-    "user": "green",
-    "think": "yellow",
-    "assistant": "blue",
-    "tool": "magenta",
-}
-def show_args(args):
-    return ', '.join([f'{k}={repr(v)}' for k, v in args.items()])
-def show_tool_calls(tool_calls):
-    return ''.join(map(lambda s:f'\n    {s["function"]["name"]}({show_args(json.loads(s["function"]["arguments"]))})', tool_calls))
-def split_string_with_code_blocks(text:str):
-    result = []
-    count = 0
+# role_to_color = {
+#     "system": "red",
+#     "user": "green",
+#     "think": "yellow",
+#     "assistant": "blue",
+#     "tool": "magenta",
+# }
+# def show_args(args):
+#     return ', '.join([f'{k}={repr(v)}' for k, v in args.items()])
+# def show_tool_calls(tool_calls):
+#     return ''.join(map(lambda s:f'\n    {s["function"]["name"]}({show_args(json.loads(s["function"]["arguments"]))})', tool_calls))
+# def split_string_with_code_blocks(text:str):
+#     result = []
+#     count = 0
 
-    for part in text.split('\n\n'):
-        last_is_code = count%2==1
-        count += part.startswith('```')+part.count('\n```')
-        if last_is_code and count%2==1:
-            result[-1] += '\n\n'+part
-        else:
-            result.append(part)
+#     for part in text.split('\n\n'):
+#         last_is_code = count%2==1
+#         count += part.startswith('```')+part.count('\n```')
+#         if last_is_code and count%2==1:
+#             result[-1] += '\n\n'+part
+#         else:
+#             result.append(part)
 
-    return result
+#     return result
 
-def pprint(message:dict | ChatCompletionMessage | MessageStream | str, model:str, split=True):
-    '''
-    打印 dict, 普通消息, 或者流式消息, 然后返回
-    流式消息会转换为普通消息
-    '''
-    if isinstance(message, str):
-        print(colored(f"system: {message}", "red"))
-        _sendmsg('#error: '+message)
-        return ChatCompletionMessage(role='system', content=message)
-    elif isinstance(message, MessageStream):
-        role = message.role
-        tool_calls = message.tool_calls
-        if message.tool_calls:
-            print(colored(f"assistant called: {tool_calls[0].function.name} ", "yellow"),end='', flush=True)
-            text:str = ''
-            for delta in message:
-                if isinstance(delta, Tuple):
-                    inc_call_tokens_cost(model, delta)
-                else:
-                    text += delta
-                    print(colored(delta, "yellow"),end='', flush=True)
-        else:
-            print(colored(f"assistant: ", role_to_color[role]),end='', flush=True)
-            sum_text:str = ''
-            text:str = ''
-            thinking = False
-            for delta in message:
-                if isinstance(delta, Tuple):
-                    inc_call_tokens_cost(model, delta)
-                elif isinstance(delta, dict):
-                    if reasoning_content:=delta.get('reasoning_content'):
-                        print(colored(reasoning_content, role_to_color['think']),end='', flush=True)
-                    elif content:=delta.get('content'):
-                        if '<think>' in content:
-                            thinking = True
-                            pre_content, content = content.split('<think>')
-                            print(colored(pre_content, role_to_color[role]),end='', flush=True)
-                        if thinking:
-                            if '</think>' in content:
-                                thinking = False
-                                reasoning_content, content = content.split('</think>')
-                            else:
-                                reasoning_content, content = content, ''
-                            print(colored(reasoning_content, role_to_color['think']),end='', flush=True)
-                        print(colored(content, role_to_color[role]),end='', flush=True)
-                        text += content
-                        sum_text += content
-                        if split:
-                            *parts, text = split_string_with_code_blocks(text)
-                            for part in parts:
-                                _sendmsg(part)
-                    else:
-                        print('这里不应该运行到，因为若没有reasoning_content和content应该停止循环')
-                else:
-                    print('这里不应该运行到，因为只返回了这两个类型的值')
-            if text:
-                _sendmsg(text)
-        print('\n')
-        return message.msg
-    else:
-        if (isinstance(message,ChatCompletionMessage)):
-            msg = message.dict()
-        else:
-            msg = message
-        role = msg.get('role')
-        tool_calls = msg.get('tool_calls')
-        content = msg.get('content')
-        name = msg.get('name')
-        if role == "system":
-            print(colored(f"system: {content}\n", role_to_color[role]))
-        elif role == "user":
-            pass
-            # print(colored(f"user: {content}\n", role_to_color[role]))
-        elif role == "assistant" and tool_calls:
-            print(colored(f"assistant called: {show_tool_calls(tool_calls)}\n", "yellow"))
-            #TODO 没想好应该怎么计算
-        elif role == "assistant" and not tool_calls:
-            print(colored(f"assistant: {content}\n", role_to_color[role]))
-            inc_call_text_cost(model, 1, content)
-        elif role == "tool":
-            print(colored(f"function ({name}): {content}\n", role_to_color[role]))
-        else:
-            print('else:',msg)
-        return message
+# def pprint(message:dict | ChatCompletionMessage | MessageStream | str, model:str, split=True):
+#     '''
+#     打印 dict, 普通消息, 或者流式消息, 然后返回
+#     流式消息会转换为普通消息
+#     '''
+#     if isinstance(message, str):
+#         print(colored(f"system: {message}", "red"))
+#         _sendmsg('#error: '+message)
+#         return ChatCompletionMessage(role='system', content=message)
+#     elif isinstance(message, MessageStream):
+#         role = message.role
+#         tool_calls = message.tool_calls
+#         if message.tool_calls:
+#             print(colored(f"assistant called: {tool_calls[0].function.name} ", "yellow"),end='', flush=True)
+#             text:str = ''
+#             for delta in message:
+#                 if isinstance(delta, Tuple):
+#                     inc_call_tokens_cost(model, delta)
+#                 else:
+#                     text += delta
+#                     print(colored(delta, "yellow"),end='', flush=True)
+#         else:
+#             print(colored(f"assistant: ", role_to_color[role]),end='', flush=True)
+#             sum_text:str = ''
+#             text:str = ''
+#             thinking = False
+#             for delta in message:
+#                 if isinstance(delta, Tuple):
+#                     inc_call_tokens_cost(model, delta)
+#                 elif isinstance(delta, dict):
+#                     if reasoning_content:=delta.get('reasoning_content'):
+#                         print(colored(reasoning_content, role_to_color['think']),end='', flush=True)
+#                     elif content:=delta.get('content'):
+#                         if '<think>' in content:
+#                             thinking = True
+#                             pre_content, content = content.split('<think>')
+#                             print(colored(pre_content, role_to_color[role]),end='', flush=True)
+#                         if thinking:
+#                             if '</think>' in content:
+#                                 thinking = False
+#                                 reasoning_content, content = content.split('</think>')
+#                             else:
+#                                 reasoning_content, content = content, ''
+#                             print(colored(reasoning_content, role_to_color['think']),end='', flush=True)
+#                         print(colored(content, role_to_color[role]),end='', flush=True)
+#                         text += content
+#                         sum_text += content
+#                         if split:
+#                             *parts, text = split_string_with_code_blocks(text)
+#                             for part in parts:
+#                                 _sendmsg(part)
+#                     else:
+#                         print('这里不应该运行到，因为若没有reasoning_content和content应该停止循环')
+#                 else:
+#                     print('这里不应该运行到，因为只返回了这两个类型的值')
+#             if text:
+#                 _sendmsg(text)
+#         print('\n')
+#         return message.msg
+#     else:
+#         raise ValueError('没想好怎么处理')
+#         # if (isinstance(message,ChatCompletionMessage)):
+#         #     msg = message.dict()
+#         # else:
+#         #     msg = message
+#         # role = msg.get('role')
+#         # tool_calls = msg.get('tool_calls')
+#         # content = msg.get('content')
+#         # name = msg.get('name')
+#         # if role == "system":
+#         #     print(colored(f"system: {content}\n", role_to_color[role]))
+#         # elif role == "user":
+#         #     pass
+#         #     # print(colored(f"user: {content}\n", role_to_color[role]))
+#         # elif role == "assistant" and tool_calls:
+#         #     print(colored(f"assistant called: {show_tool_calls(tool_calls)}\n", "yellow"))
+#         #     #TODO 没想好应该怎么计算
+#         # elif role == "assistant" and not tool_calls:
+#         #     print(colored(f"assistant: {content}\n", role_to_color[role]))
+#         #     inc_call_text_cost(model, 1, content)
+#         # elif role == "tool":
+#         #     print(colored(f"function ({name}): {content}\n", role_to_color[role]))
+#         # else:
+#         #     print('else:',msg)
+#         return message
 
-def add(msg, chat_client:Chat):
-    """
-    Print, transform and add a message to the chat history, then return the transformed message
-    流式消息会被转换为普通消息
+# def add(msg, chat_client:Chat):
+#     """
+#     Print, transform and add a message to the chat history, then return the transformed message
+#     流式消息会被转换为普通消息
 
-    :param msg: The message to be added.
-    :return: The added message.
-    """
-    msg = pprint(msg, chat_client.model, chat_client.split)
-    chat_client.messages.append(msg)
-    return msg
+#     :param msg: The message to be added.
+#     :return: The added message.
+#     """
+#     msg = pprint(msg, chat_client.model, chat_client.split)
+#     chat_client.messages.append(msg)
+#     return msg
+
+
 
 def chat(model=None):
     # call = [
@@ -751,17 +878,28 @@ def chat(model=None):
     # ]
     # prompt_tokens = counts_token(call)
 
-    if model is None:
-        data = getchatstorage()
-        if data.get('model', None):
-            model = data['model']
-        else:
-            model = default_model
+    chat_client = Chat(provider=get_provider(),model=model or get_model(),chat_client=llm_cilent)
+    init_chat(chat_client, get_msgs())
 
-    chat_client = Chat(model=model)
-    init_chat(chat_client)
+    def handle_LLMResponse(chunk: LLMResponse):
+        if chunk.role == 'assistant' and chunk.content:
+            _sendmsg(chunk.content)
+        if chunk.total_tokens:
+            inc_call_tokens_cost(
+                chat_client.provider,
+                chat_client.model,
+                (
+                    chunk.prompt_tokens,
+                    chunk.completion_tokens,
+                ),
+            )
 
-    chat_client.messages = get_msgs()
+    chat_client.print_messages()
+    chat_client.chat(
+        recall_func=handle_LLMResponse,
+        url_to_base64_func=get_image_base64,
+        description_cache=description_cache,
+    )
 
     # 增加计费
     # inc_call_token_cost(model, 0, sum_token)
@@ -776,57 +914,57 @@ def chat(model=None):
     # chats.append({'role':'assistant','content':''})
 
     # return chat_client.call().content
-    tools = [v.description for v in chat_client.tools.values()]
-    model = model if model is not None else chat_client.model
-    try:
-        stream = chat_client.req(tools, "auto", model)
-    except StopIteration:
-        _sendmsg('# 模型返回了空消息')
-        return
-    res_msg = add(stream, chat_client)
-    tool_calls = res_msg.tool_calls
-    while tool_calls:
-        for tool_call in tool_calls:
-            function_name = tool_call.function.name
-            try:
-                content = chat_client.tools[function_name].call(**json.loads(tool_call.function.arguments))
-            except:
-                content =f'called: {json.loads(tool_call.function.arguments)}\n\n'+ traceback.format_exc()
-            add({
-                "role": "tool",
-                "name": function_name,
-                "content": content,
-                "tool_call_id": tool_call.id,
-            }, chat_client)
-        try:
-            stream = chat_client.req(tools, "auto", model)
-        except StopIteration:
-            _sendmsg('# 模型返回了空消息')
-            return
-        res_msg = add(stream, chat_client)
-        tool_calls = res_msg.tool_calls
+    # tools = [v.description for v in chat_client.tools.values()]
+    # model = model if model is not None else chat_client.model
+    # try:
+    #     stream = chat_client.req(tools, "auto", model)
+    # except StopIteration:
+    #     _sendmsg('# 模型返回了空消息')
+    #     return
+    # res_msg = add(stream, chat_client)
+    # tool_calls = res_msg.tool_calls
+    # while tool_calls:
+    #     for tool_call in tool_calls:
+    #         function_name = tool_call.function.name
+    #         try:
+    #             content = chat_client.tools[function_name].call(**json.loads(tool_call.function.arguments))
+    #         except:
+    #             content =f'called: {json.loads(tool_call.function.arguments)}\n\n'+ traceback.format_exc()
+    #         add({
+    #             "role": "tool",
+    #             "name": function_name,
+    #             "content": content,
+    #             "tool_call_id": tool_call.id,
+    #         }, chat_client)
+    #     try:
+    #         stream = chat_client.req(tools, "auto", model)
+    #     except StopIteration:
+    #         _sendmsg('# 模型返回了空消息')
+    #         return
+    #     res_msg = add(stream, chat_client)
+    #     tool_calls = res_msg.tool_calls
 
-def _rm_pre_text(text:str):
-    name = cache.nicknames[0]
-    pre = f'[{name}]({cache.qq}): '
-    if text.startswith(pre):
-        return text.lstrip(pre)
-    return text
+# def _rm_pre_text(text:str):
+#     name = cache.nicknames[0]
+#     pre = f'[{name}]({cache.qq}): '
+#     if text.startswith(pre):
+#         return text.lstrip(pre)
+#     return text
 
-def process_res(res):
-    text = StringIO()
-    for chunk in res:
-        delta = chunk['choices'][0]['delta']
-        char = delta.get('content')
-        if char is None:
-            continue
-        if not delta:
-            break
-        text.write(char)
-        if text.getvalue().endswith('\n\n'):
-            yield text.getvalue()[:-2]
-            text = StringIO()
-    yield _rm_pre_text(text.getvalue())
+# def process_res(res):
+#     text = StringIO()
+#     for chunk in res:
+#         delta = chunk['choices'][0]['delta']
+#         char = delta.get('content')
+#         if char is None:
+#             continue
+#         if not delta:
+#             break
+#         text.write(char)
+#         if text.getvalue().endswith('\n\n'):
+#             yield text.getvalue()[:-2]
+#             text = StringIO()
+#     yield _rm_pre_text(text.getvalue())
 
 
 def run(body:str, model="gpt-3.5-turbo"):
@@ -835,40 +973,70 @@ def run(body:str, model="gpt-3.5-turbo"):
 多句请使用“柚子聊聊天”截断前文
 然后使用“柚子，”开头”'''
 
-    chat_client = Chat(model=model)
-    init_chat(chat_client)
+    
+    chat_client = Chat(provider=get_provider(),model=model or get_model(),chat_client=llm_cilent)
+    init_chat(chat_client, [
+        {
+            'role': 'assistant',
+            'content': body
+        }
+    ])
 
-    chat_client.messages = [msg2chat({**cache.thismsg(),**{'message':body.lstrip()}})]
-    # chats = []
-    # while chat_contexts:
-    #     message = chat_contexts.pop()
-    #     if len(chats)<100:
-    #         chats.insert(0, message)
-    # if cache.get('debug_chat') and chat_contexts:
-    #     print('#被截断的消息有', len(chat_contexts), '条。')
-    # chats.append({'role':'assistant','content':''})
+    def handle_LLMResponse(chunk: LLMResponse):
+        if chunk.role == 'assistant' and chunk.content:
+            _sendmsg(chunk.content)
+        if chunk.total_tokens:
+            inc_call_tokens_cost(
+                chat_client.provider,
+                chat_client.model,
+                (
+                    chunk.prompt_tokens,
+                    chunk.completion_tokens,
+                ),
+            )
 
-    # return chat_client.call().content
-    tools = [v.description for v in chat_client.tools.values()]
-    # model = model if model is not None else chat_client.model
-    model = chat_client.model
-    stream = chat_client.req(tools, "auto", model)
-    res_msg = add(stream, chat_client)
-    tool_calls = res_msg.tool_calls
+    chat_client.print_messages()
+    chat_client.chat(
+        recall_func=handle_LLMResponse,
+        url_to_base64_func=get_image_base64,
+        description_cache=description_cache,
+    )
 
-    while tool_calls:
-        for tool_call in tool_calls:
-            function_name = tool_call.function.name
-            try:
-                content = chat_client.tools[function_name].call(**json.loads(tool_call.function.arguments))
-            except:
-                content =f'called: {json.loads(tool_call.function.arguments)}\n\n'+ traceback.format_exc()
-            add({
-                "role": "tool",
-                "name": function_name,
-                "content": content,
-                "tool_call_id": tool_call.id,
-            }, chat_client)
-        stream = chat_client.req(tools, "auto", model)
-        res_msg = add(stream, chat_client)
-        tool_calls = res_msg.tool_calls
+
+    # chat_client = Chat(model=model)
+    # init_chat(chat_client)
+
+    # chat_client.messages = [msg2chat({**cache.thismsg(),**{'message':body.lstrip()}})]
+    # # chats = []
+    # # while chat_contexts:
+    # #     message = chat_contexts.pop()
+    # #     if len(chats)<100:
+    # #         chats.insert(0, message)
+    # # if cache.get('debug_chat') and chat_contexts:
+    # #     print('#被截断的消息有', len(chat_contexts), '条。')
+    # # chats.append({'role':'assistant','content':''})
+
+    # # return chat_client.call().content
+    # tools = [v.description for v in chat_client.tools.values()]
+    # # model = model if model is not None else chat_client.model
+    # model = chat_client.model
+    # stream = chat_client.req(tools, "auto", model)
+    # res_msg = add(stream, chat_client)
+    # tool_calls = res_msg.tool_calls
+
+    # while tool_calls:
+    #     for tool_call in tool_calls:
+    #         function_name = tool_call.function.name
+    #         try:
+    #             content = chat_client.tools[function_name].call(**json.loads(tool_call.function.arguments))
+    #         except:
+    #             content =f'called: {json.loads(tool_call.function.arguments)}\n\n'+ traceback.format_exc()
+    #         add({
+    #             "role": "tool",
+    #             "name": function_name,
+    #             "content": content,
+    #             "tool_call_id": tool_call.id,
+    #         }, chat_client)
+    #     stream = chat_client.req(tools, "auto", model)
+    #     res_msg = add(stream, chat_client)
+    #     tool_calls = res_msg.tool_calls

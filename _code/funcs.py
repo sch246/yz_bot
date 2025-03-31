@@ -321,13 +321,13 @@ def calculate_image_tokens(image_path:str | bytes):
     return 170 * num_squares + 85
 
 
-chat_picture_descriptions = storage.get('','chat_picture_descriptions')
+# chat_picture_descriptions = storage.get('','chat_picture_descriptions')
 
 # 正则表达式模式
 image_pattern = re.compile(r'(\[CQ:image(?:,[^,=]+=[^,\]]*)*\])')
 import traceback
-from chat import Chat
-chat_client = Chat()
+# from _code.s3.chat import Chat
+# chat_client = Chat()
 # 分割消息并处理图片
 def msg_split(text):
     lst = []
@@ -337,20 +337,21 @@ def msg_split(text):
                 # 假设cq.load(part)能正确提取图片URL数据
                 data = cq.load(part)['data']
                 url = data['url']
-                file_name = data['file']
+                # file_name = data['file']
 
-                # 检查缓存字典
-                if file_name in chat_picture_descriptions:
-                    description = chat_picture_descriptions[file_name]
-                else:
-                    # 下载图片并缓存
-                    description = chat_client.read_image(url)
-                    print(f"read_image: {description}")
-                    chat_picture_descriptions[file_name] = description
+                # # 检查缓存字典
+                # if file_name in chat_picture_descriptions:
+                #     description = chat_picture_descriptions[file_name]
+                # else:
+                #     # 下载图片并缓存
+                #     description = chat_client.read_image(url)
+                #     print(f"read_image: {description}")
+                #     chat_picture_descriptions[file_name] = description
 
                 lst.append({
                     "type": "text",
-                    "text": f"![{description}]({url})"
+                    # "text": f"![{description}]({url})"
+                    "text": f"![]({url})"
                 })
 
                 # # 读取图片并编码为base64
@@ -405,6 +406,62 @@ def msg2chat(msg, in_group=True):
     #     return {'role':'user','content':msgtext(msg)}
     # else:
     #     return {'role':'user','content':msg['message']}
+
+def msg_split(text):
+    lst = []
+    for part in image_pattern.split(text):
+        if image_pattern.match(part):
+            try:
+                data = cq.load(part)['data']
+                url = data['url']
+                # 图片消息使用 image_url 类型
+                lst.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": url
+                    }
+                })
+            except Exception as e:
+                traceback.print_exc()
+                lst.append({
+                    "type": "text",
+                    "text": f"[解析失败的图片]({url})"
+                })
+        elif part.strip():  # 只添加非空文本
+            lst.append({
+                "type": "text",
+                "text": part
+            })
+    return lst
+
+def msg2chat(msg, in_group=True):
+    if msg.get('sender') and msg['sender']['user_id'] == cache.qq:
+        role = 'assistant'
+        content = msg_split(msg['message'])  # 返回消息部分列表
+    else:
+        role = 'user'
+        if in_group:
+            header = {
+                "type": "text", 
+                "text": f'---\nqq: {msg["user_id"]}\nname: {repr(msg2name(msg))}\nmessage_id: {msg["message_id"]}\n---\n'
+            }
+            content = [header] + msg_split(msg['message'])  # 合并header和消息部分
+        else:
+            header = {
+                "type": "text", 
+                "text": f'[message_id: {msg["message_id"]}]'
+            }
+            content =[header] +  msg_split(msg['message'])  # 合并header和消息部分
+            
+    # 确保所有内容都是字典格式，而不是字符串
+    for item in content:
+        if isinstance(item.get('text'), str):
+            item['text'] = item['text'].replace('\\', '\\\\').replace('"', '\\"')
+    
+    return {
+        'role': role,
+        'content': content  # 直接传递列表，不要转换为字符串
+    }
 
 def chat2msg(chat:dict):
     if chat['role']=='user':

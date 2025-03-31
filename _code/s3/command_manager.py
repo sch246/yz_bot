@@ -53,6 +53,11 @@ class CommandManager:
             return eval(value)
 
     def check(self, text: str) -> Callable | None:
+        '''
+        匹配text是否符合格式
+        匹配成功返回可执行的函数
+        匹配失败返回None
+        '''
         for pattern, func in self.commands.items():
             regex_pattern = self._parse_pattern(pattern)
             match = re.match(f'^{regex_pattern}$', text, re.DOTALL)

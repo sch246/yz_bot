@@ -47,11 +47,19 @@ import bot.pages as pages
 import bot.cache as cache
 import bot.chatlog as chatlog
 
-from chat import Chat, MessageStream
+from s3.chat import LLMCilent, Chat, sum_res, LLMResponse
+from s3.url_to_base64 import get_image_base64
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+llm_cilent = LLMCilent()
+
 def gpt(settings, question):
-        chat = Chat(model='gpt-3.5-turbo')
+        chat = Chat(chat_client=llm_cilent)
         chat.set_settings(settings)
-        return chat.call({'role':'user','content':question}).content
+        return sum_res(chat.chat(question)).content
 
 __botdir__ = '/'.join(__file__.split('/')[:-2])
 
