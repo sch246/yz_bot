@@ -26,6 +26,8 @@ import json
 from main import LLMCilent, Chat, sum_res, LLMResponse, get_image_base64
 
 from main import memberlist
+from main import search_city, get_realtime_weather, get_daily_forecast, get_hourly_forecast
+from main import getstorage
 
 llm_cilent = LLMCilent()
 
@@ -344,6 +346,33 @@ def baidu_encyclopedia(object:str):
         return '查询失败'
     return res['data']['text']
 
+def get_user_data(user_id:int):
+    '''
+    查询用户数据，返回用户的数据字典，可以用于查询用户的经纬度或者城市id等
+
+    @param
+    user_id: 用户的qq号
+    '''
+    return str(getstorage(user_id))
+
+def set_user_data(user_id:int,key:str,value:str):
+    '''
+    编辑用户的数据字典，可以用于设置用户的城市id等
+
+    @param
+    user_id: 用户的qq号
+    key: 需要编辑的键
+    value: 需要设置的值，接受python表达式，如果是del，则删除这个键
+    '''
+    try:
+        sto = getstorage(user_id)
+        if value=='del':
+            del sto[key]
+        else:
+            sto[key]=eval(value)
+        return 'done'
+    except Exception as e:
+        return str(e)
 
 #---------------------------------------------------------------------------------------------------------------
 
@@ -467,7 +496,12 @@ def init_chat(chat_client:Chat, messages=[]):
     # chat_client.add_tool(url2cq)
     # chat_client.add_tool(muti_reply)
     # chat_client.add_tool(baidu_encyclopedia)
-
+    chat_client.add_tool(search_city)
+    chat_client.add_tool(get_realtime_weather)
+    chat_client.add_tool(get_daily_forecast)
+    chat_client.add_tool(get_hourly_forecast)
+    chat_client.add_tool(get_user_data)
+    chat_client.add_tool(set_user_data)
     # chat.add(chat.req())
 
     # last_data = None

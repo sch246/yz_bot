@@ -50,11 +50,12 @@ def _action(seq, expr, msg):
     _list_pop(seq, msg)
     pyrun(expr, msg, skip_op=True, insert={'later_repeat':repeat})
 
-def repeat(reltime:str):
+
+def repeat(t:str):
     '''在触发的任务中使用，用于重复执行任务'''
     loc = inspect.currentframe().f_back.f_locals
     expr, msg = loc.get('_py_expr'), loc.get('_py_msg')
-    enter(read_reltime(reltime), expr, msg)
+    enter(t, expr, msg)
 
 def msg_id(msg:dict):
     if 'group_id' in msg:

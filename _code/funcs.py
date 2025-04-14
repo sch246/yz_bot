@@ -806,3 +806,126 @@ def deal_img(pic, size, is_fit):
             img.resize(new_size, Image.Resampling.LANCZOS).save(resized_path, format="PNG")
         
         return os.path.abspath(resized_path)
+ 
+from typing import Dict, List, Optional
+import time
+import jwt
+import requests
+import json
+from pathlib import Path
+
+API_HOST = "ma4bj98cvh.re.qweatherapi.com"
+KEY_ID = "CNPKE8B4G8"
+PROJECT_ID = "2G877M3PJY"
+TOKEN_CACHE = Path.home() / ".qweather-token"
+
+# 内部工具函数
+def _load_private_key() -> str:
+    """加载Ed25519私钥"""
+    try:
+        with open("ed25519-private.pem", "r") as f:
+            return f.read()
+    except Exception as e:
+        raise RuntimeError(f"无法读取私钥文件: {e}")
+
+def _generate_token() -> str:
+    """生成JWT认证令牌"""
+    private_key = _load_private_key()
+    now = int(time.time())
+    payload = {'iat': now-30, 'exp': now+900, 'sub': PROJECT_ID}
+    return jwt.encode(payload, private_key, algorithm='EdDSA', headers={'kid': KEY_ID})
+
+def _get_cached_token() -> Optional[str]:
+    """获取缓存的JWT令牌"""
+    try:
+        if TOKEN_CACHE.exists():
+            with open(TOKEN_CACHE, "r") as f:
+                data = json.load(f)
+                if data['exp'] > time.time():
+                    return data['token']
+    except Exception:
+        pass
+    return None
+
+def _api_request(endpoint: str, params: Dict) -> Optional[Dict]:
+    """执行API请求"""
+    token = _get_cached_token() or _generate_token()
+    url = f"https://{API_HOST}{endpoint}"
+    
+    try:
+        response = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            params=params,
+            timeout=10
+        )
+        response.raise_for_status()
+        return response.json()
+    except Exception:
+        return None
+
+# 公开API函数
+def search_city(location: str, adm: str = "", lang: str = "zh") -> Optional[List[Dict]]:
+    '''
+    城市地理位置搜索
+    返回包含城市信息的字典列表，搜索失败返回None
+
+    @param
+    location: 需要查询地区的名称，支持文字、以英文逗号分隔的'经度,纬度'（十进制，最多支持小数点后两位）、LocationID或Adcode(仅限中国城市)
+    adm: 上级行政区划用于过滤结果
+    lang: 返回语言，默认中文
+    '''
+    params = {"location": location, "adm": adm, "lang": lang}
+    response = _api_request("/geo/v2/city/lookup", params)
+    return response.get('location') if response and response.get('code') == "200" else None
+
+def get_realtime_weather(location_id: str, unit: str = "m") -> Optional[Dict]:
+    '''
+    获取实时天气数据
+    返回字典包含字段：温度(temp/℃)、体感温度(feelsLike/℃)、天气状况(text)、
+    风向(windDir)、风力等级(windScale)、风速(windSpeed/km/h)、湿度(humidity/%)、
+    观测时间(obsTime/ISO8601)、能见度(vis/km)、气压(pressure/hPa)、降水量(precip/mm)
+    查询失败返回None
+
+    @param
+    location_id: 通过search_city获取的位置ID
+    unit: 单位制，m-公制/i-英制
+    '''
+    response = _api_request("/v7/weather/now", {"location": location_id, "unit": unit})
+    return response.get('now') if response and response.get('code') == "200" else None
+
+def get_daily_forecast(location_id: str, days: int = 3, unit: str = "m") -> Optional[List[Dict]]:
+    '''
+    获取多日天气预报
+    返回字典列表，每个字典包含字段：预报日期(fxDate/YYYY-MM-DD)、最高温度(tempMax/℃)、
+    最低温度(tempMin/℃)、白天天气(textDay)、夜间天气(textNight)、
+    日出时间(sunrise/HH:MM)、日落时间(sunset/HH:MM)、风向(windDirDay)、
+    风力等级(windScale)、风速(windSpeed/km/h)
+
+    @param
+    location_id: 地理位置ID
+    days: 预报天数(3|7|10|15|30)，默认3天
+    unit: 单位制，m-公制/i-英制
+    '''
+    valid_days = {3: '3d', 7: '7d', 10: '10d', 15: '15d', 30: '30d'}
+    endpoint = f"/v7/weather/{valid_days.get(days, '3d')}"
+    response = _api_request(endpoint, {"location": location_id, "unit": unit})
+    return response.get('daily') if response and response.get('code') == "200" else None
+
+def get_hourly_forecast(location_id: str, hours: int = 24, unit: str = "m") -> Optional[List[Dict]]:
+    '''
+    获取逐小时天气预报
+    返回字典列表，每个字典包含字段：预报时间(fxTime/ISO8601)、温度(temp/℃)、
+    天气状况(text)、风向(windDir)、风力等级(windScale)、风速(windSpeed/km/h)、
+    降水量(precip/mm)、降水概率(pop/%)、湿度(humidity/%)、气压(pressure/hPa)
+
+    @param
+    location_id: 地理位置ID
+    hours: 预报小时数(24|72|168)，默认24小时
+    unit: 单位制，m-公制/i-英制
+    '''
+    valid_hours = {24: '24h', 72: '72h', 168: '168h'}
+    endpoint = f"/v7/weather/{valid_hours.get(hours, '24h')}"
+    response = _api_request(endpoint, {"location": location_id, "unit": unit})
+    return response.get('hourly') if response and response.get('code') == "200" else None
+ 

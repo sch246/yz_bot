@@ -17,9 +17,16 @@ re_num_to = r'\d+(\-\d+)?'
 re_num_or = rf'{re_num_to}(,{re_num_to})*'
 re_cond = rf'^( \-)|( \*(\*|{re_num_or}))?( (\*|{re_num_or})){{1,5}}' # -|周?年月日时分
 
+def _read_cond(text: str):
+    '''读取cond，支持cron表达式'''
+    print('text:', repr(text))
+    cond = text.strip()
+    validate_cron_expr(cond)  # 验证Cron表达式是否合法
+    return cond, ''
 def _read_cond(text:str):
     '''读取cond'''
     print('text:', repr(text))
+    validate_cron_expr(cond)
     cond = re.match(re_cond, text)
     if not cond:
         raise SyntaxError('语法不符，未通过正则表达式')
@@ -121,6 +128,87 @@ def get_todo_list() -> list:
     else:
         return storage.get('todo_list/users', str(msg['user_id']), list)
 
+import re
+import time
+from typing import Iterable
+
+# Cron格式正则表达式
+cron_pattern = r'^(?:\*|([0-9]|[1-5][0-9])|([0-9]|[1-2][0-9]|3[0-1])|([1-9]|1[0-2])|([0-6]))(\/([0-9]+))?$'
+
+# 任务条件验证函数
+def validate_cron_expr(cron_expr: str) -> bool:
+    # 基本的Cron表达式规则检查
+    parts = cron_expr.split(' ')
+    if len(parts) != 5:
+        raise SyntaxError(f"Invalid cron expression: {cron_expr}, it should have exactly 5 fields.")
+
+    # 分钟, 小时, 日期, 月份, 星期 (Cron format)
+    for i, part in enumerate(parts):
+        # 检查每一部分的合法性
+        if not re.match(cron_pattern, part):
+            raise SyntaxError(f"Invalid cron field {i}: {part}")
+
+    return True
+
+
+
+
+from datetime import datetime
+
+# 当前时间验证
+def _check(cond: str) -> bool:
+    now = datetime.now()
+    cron_parts = cond.split(' ')
+
+    # 分钟, 小时, 日期, 月份, 星期
+    minute_expr, hour_expr, day_expr, month_expr, weekday_expr = cron_parts
+
+    # 分别检查每个字段
+    if not _match_field(minute_expr, now.minute, 0, 59): return False
+    if not _match_field(hour_expr, now.hour, 0, 23): return False
+    if not _match_field(day_expr, now.day, 1, 31): return False
+    if not _match_field(month_expr, now.month, 1, 12): return False
+    if not _match_field(weekday_expr, now.weekday(), 0, 6): return False
+
+    return True
+
+def _match_field(expr: str, current_value: int, min_value: int, max_value: int) -> bool:
+    '''检查表达式是否与当前值匹配'''
+    if expr == '*':
+        return True  # *表示匹配任何值
+    
+    # 支持类似*/5，5,10-15等
+    if '/' in expr:
+        base, step = expr.split('/')
+        step = int(step)
+        return current_value % step == 0
+    
+    # 支持类似1,5-10等
+    if '-' in expr:
+        start, end = map(int, expr.split('-'))
+        return start <= current_value <= end
+    
+    # 直接匹配数字
+    if expr.isdigit():
+        return current_value == int(expr)
+
+    return False
+
+# 执行任务函数
+def execute_task(expr: str, group_id: str = None, user_id: str = None):
+    """根据任务表达式执行任务"""
+    try:
+        # 执行表达式 (需要根据任务来修改为合适的行为)
+        result = eval(expr)  # 请谨慎使用eval，确保表达式是可信的
+        # 发送消息
+        if group_id:
+            send(result, group_id=group_id)
+        elif user_id:
+            send(result, user_id=user_id)
+    except Exception as e:
+        print(f"Error executing task: {e}")
+
+
 @to_thread
 def _loop():
     while True:
@@ -128,15 +216,15 @@ def _loop():
             for todo in todo_list:
                 cond, expr = todo.get('cond'), todo.get('expr')
                 if _check(cond):
-                    send(eval(expr), group_id=group_id)
+                    execute_task(expr, group_id=group_id)
+        
         for user_id, todo_list in storage.storage['todo_list/users'].items():
             for todo in todo_list:
                 cond, expr = todo.get('cond'), todo.get('expr')
                 if _check(cond):
-                    send(eval(expr), user_id=user_id)
+                    execute_task(expr, user_id=user_id)
+        
+        # 每分钟执行一次任务
         time.sleep(60)
-
-def _check(cond:str) -> bool:
-    ...
 
 _loop()
