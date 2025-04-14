@@ -135,3 +135,23 @@ def limit(s:str, n:int):
     return repr(s)
 
 LASTLINE = '\33[1A\r\33[K'
+
+def is_num(s:str):
+    """
+    使用字符串方法判断是否为数字(整数和浮点数)
+    允许`.2`这样的形式但是不允许`1.`这样的形式
+    """
+    # 处理正负号
+    if s.startswith(('-', '+')):
+        s = s[1:]
+
+    if not ('.' in s):
+        return s.isdigit()
+
+    # 处理小数点
+    parts = s.split('.')
+    if len(parts) > 2:  # 如果有超过一个小数点，不是有效数字
+        return False
+
+    # 检查每个部分是否都由数字组成
+    return (not parts[0] or parts[0].isdigit()) and parts[1].isdigit()

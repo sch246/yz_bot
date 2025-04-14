@@ -1598,16 +1598,18 @@ if __name__ == "__main__":
 
     chat = Chat(
         chat_client=llm_client,
-        model='gpt-3.5-turbo',
+        model='gpt-4o-mini',
         url_to_base64_func=get_image_base64,
     )
     chat.messages = messages
     chat.add_tool(get_weather)
     chat.print_messages()
-    models = storage.get("llm_system", "config")['providers']['openai']['models']
-    for model, attr in models.items():
-        if test(model, attr):
-            test_func(model, attr)
-            test_vision(model, attr)
+    chat.chat('你好呀')
+
+    # models = storage.get("llm_system", "config")['providers']['openai']['models']
+    # for model, attr in models.items():
+    #     if test(model, attr):
+    #         test_func(model, attr)
+    #         test_vision(model, attr)
     # chat.print_messages()
     # print(chat.chat(user_message='我超，好低的温度', stream=True))

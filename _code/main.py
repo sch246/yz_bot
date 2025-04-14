@@ -58,7 +58,7 @@ llm_cilent = LLMCilent()
 
 def gpt(settings, question):
         chat = Chat(chat_client=llm_cilent)
-        chat.set_settings(settings)
+        chat.set_messages(settings)
         return sum_res(chat.chat(question)).content
 
 __botdir__ = '/'.join(__file__.split('/')[:-2])
