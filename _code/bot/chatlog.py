@@ -13,7 +13,6 @@ rootfile = 'chatlog'
 
 
 def write(msg):
-    print(f'{msg}')
     t = msg['time']
     try:
         if is_msg(msg):
@@ -137,18 +136,21 @@ def _group_write(msg, uid, text:str):
     filepath = get_path(join(rootfile, 'group',str(uid)), t)
     file.add(filepath, text)
     cache.add_msg('group', uid, msg)
+    print(text)
     return text
 def _private_write(msg, uid, text:str):
     t = msg['time']
     filepath = get_path(join(rootfile, 'private',str(uid)), t)
     file.add(filepath, text)
     cache.add_msg('private', uid, msg)
+    print(text)
     return text
 def _bot_write(msg, text:str):
     t = msg['time']
     filepath = get_path(join(rootfile, 'bot'), t)
     file.add(filepath, text)
     cache.add_self_msg(msg)
+    print(text)
     return text
 
 # def _write_str(type: str, uid: int, t: int, text: str):

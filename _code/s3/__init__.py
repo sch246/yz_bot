@@ -15,7 +15,7 @@ def n(f:Callable):
         return not f(*args, **kwargs)
     return _
 
-in_debug = 'debug' in sys.argv[1:]
+in_debug = '-d' in sys.argv[1:]
 def debug(*args):
     if in_debug:
         print(*args)

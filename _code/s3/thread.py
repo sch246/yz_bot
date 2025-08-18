@@ -1,22 +1,76 @@
 '''简单创建个多线程'''
+from threading import Event
 from functools import cache
+from typing import Callable
 
 from concurrent.futures import Future
 from threading import Thread
 from functools import wraps
 
-def to_thread(func, ret_thread=False):
+
+class SimpleFuture:
     '''
-    此装饰器不打算获取返回值
+    一个简单的future，用于替代concurrent.futures.Future
     '''
-    @wraps(func)
-    def wrapper(*args, **kargs):
-        thread = Thread(target=func, args=args, kwargs=kargs)
-        thread.daemon = True
-        thread.start()
-        if ret_thread:
-            return thread
-    return wrapper
+    def __init__(self) -> None:
+        self._event = Event()
+        self._result = None
+        self._exception = None
+
+    def set_result(self, value):
+        self._result = value
+        self._event.set()
+
+    def set_exception(self, exc):
+        self._exception = exc
+        self._event.set()
+
+    def result(self, timeout:float|None = None):
+        if not self._event.wait(timeout):
+            raise TimeoutError("Result not ready in time")
+        if self._exception:
+            raise self._exception
+        return self._result
+
+    def done(self):
+        return self._event.is_set()
+
+def to_thread(ret: Callable|str = 'future'):
+    '''
+    将任意函数转换为线程
+    ret: None: 返回None, 'future': 返回future, 'thread': 返回thread
+    可以作装饰器使用，默认返回future
+    '''
+    if callable(ret):
+        func = ret
+        ret = 'future'
+    else:
+        func = None
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kargs):
+            future = SimpleFuture()
+            def run():
+                try:
+                    future.set_result(func(*args, **kargs))
+                except Exception as e:
+                    future.set_exception(e)
+
+            thread = Thread(target=run)
+
+            thread.daemon = True
+            thread.start()
+            if ret == 'thread':
+                return thread
+            elif ret == 'future':
+                return future
+            else:
+                return None
+        return wrapper
+    if func:
+        return decorator(func)
+    return decorator
 
 
 def ctrlc_decorator(on_exit=lambda:None):

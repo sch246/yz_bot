@@ -1,10 +1,12 @@
 '''用于缓存群和用户的名字啥的，以及群和用户的消息，这应该叫缓存吧）'''
 
 import re
+import time
 from typing import Callable
 from main import connect, file, is_group_msg, is_msg, config
-
-
+# from main import hipporag
+import tiktoken
+from main import to_thread
 
 call_api = connect.call_api
 
@@ -14,6 +16,10 @@ names = None  # 只读，包括name和nicknames，对它的修改是非永久的
 user_names = {}
 group_user_infos = {}
 
+encoding = tiktoken.encoding_for_model('gpt-4')
+
+def count_tokens(text:str):
+    return len(encoding.encode(text))
 
 def update(msg):
     user_id = msg['sender']['user_id']
@@ -96,7 +102,16 @@ msgs = {
     'last':None
 }
 
+new_tokens = {
+    'group':{},
+    'private':{},
+}
+
 MAX_LEN = 256
+
+REFRESH_TOKEN_THRESHOLD = 256
+WINDOW_SIZE = 512
+
 
 def add_msg(type, uid, msg):
     msgs[type].setdefault(uid,[])
@@ -105,6 +120,67 @@ def add_msg(type, uid, msg):
     msgs['last'] = msg
     if len(lst)>MAX_LEN:
         lst.pop()
+
+    # @to_thread
+    # def add_memory(msg, uid, lst):
+    #     # 计算当前消息的 token 数
+    #     current_tokens = count_tokens(msg.get('message', ''))
+
+    #     if new_tokens.get(type, {}).get(uid) is None:
+    #         # 如果还没有记录，则初始化
+    #         new_tokens[type][uid] = 0
+    #     new_tokens[type][uid] += current_tokens
+
+    #     print(f'{type} {uid} {new_tokens[type][uid]}')
+
+    #     # 如果总 token 数超过阈值，存储到 RAG 系统
+    #     if new_tokens[type][uid] > REFRESH_TOKEN_THRESHOLD:  # 当积累到 200 token 时触发存储
+    #         new_tokens[type][uid] = 0
+    #         # 获取要存储的消息（最多 512 token）
+    #         time_str = time.strftime("%Y年%m月%d日 %H时", time.localtime(msg['time']))
+    #         stored_tokens = 0
+    #         stored_messages = []
+    #         for m in lst:
+    #             msg_tokens = count_tokens(m.get('message', ''))
+    #             if stored_tokens == 0 and msg_tokens > WINDOW_SIZE:
+    #                 # 超长消息，还是记录一条
+    #                 stored_messages.append(m)
+    #                 break
+    #             elif stored_tokens + msg_tokens > WINDOW_SIZE:
+    #                 break
+    #             stored_messages.append(m)
+    #             stored_tokens += msg_tokens
+            
+    #         my_name = get_nickname()
+    #         # 构建存储文档
+    #         if type == 'group':
+    #             group_id = uid
+    #             doc = f"群聊{group_id}内的对话记录：\n"
+    #         else:
+    #             user_id = uid
+    #             doc = f"{my_name}与用户{user_id}的私聊记录：\n"
+                
+    #         for m in reversed(stored_messages):  # 按时间顺序存储
+    #             if 'group_id' in m:
+    #                 group_id = int(m['group_id'])
+    #                 user_id = int(m['sender']['user_id'])
+    #                 name = get_user_name(user_id)
+    #                 if user_id == int(qq):
+    #                     doc += f"{my_name}说：{m.get('message', '')}\n"
+    #                 else:
+    #                     doc += f"{name}({user_id})说：{m.get('message', '')}\n"
+    #             else:
+    #                 user_id = int(m['sender']['user_id'])
+    #                 name = get_user_name(user_id)
+    #                 if user_id == int(qq):
+    #                     doc += f"{my_name}说：{m.get('message', '')}\n"
+    #                 else:
+    #                     doc += f"{name}({user_id})说：{m.get('message', '')}\n"
+            
+    #         doc += f"时间：{time_str}\n"
+    #         # 存储到 RAG 系统
+    #         hipporag.index(docs=[doc])
+    # add_memory(msg, uid, lst)
 
 def add_self_msg(msg):
     msgs['bot'].insert(0, msg)

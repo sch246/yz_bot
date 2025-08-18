@@ -11,6 +11,7 @@ import random
 
 from s3 import *
 from s3 import __logging
+# from s3.rag import hipporag
 from s3.scheduler import scheduler
 import s3.repl as repl
 from s3.command_manager import CommandManager
@@ -23,7 +24,7 @@ import s3.params as params
 import s3.str_tool as str_tool
 read_params = str_tool.read_params
 import s3.thread as thread
-from s3.thread import to_thread, ctrlc_decorator
+from s3.thread import to_thread, ctrlc_decorator, SimpleFuture
 from s3.delay_func import call_delay
 import s3.mcrcon as mcrcon
 from s3.cache_args import cache_args
@@ -60,6 +61,45 @@ def gpt(settings, question):
         chat = Chat(chat_client=llm_cilent)
         chat.set_messages(settings)
         return sum_res(chat.chat(question)).content
+
+description_dict = storage.get("llm_system", "description_cache")
+
+def transform_image_to_text(text: str):
+        '''
+        将消息中的图片转换为描述
+        多线程将图片转换为描述，然后合并
+        '''
+        lst = []
+        for part in image_pattern.split(text):
+                if image_pattern.match(part):
+                        try:
+                                data = cq.load(part)['data']
+                                url = data['url']
+
+                                if url in description_dict:
+                                        print(f"✅ 图片描述缓存命中: {description_dict[url]}")
+                                        lst.append(description_dict[url])
+                                else:
+                                        res = llm_cilent.get_vision_model()
+                                        if res:
+                                                vision_provider, vision_model = res
+                                                print(f"❌ 图片描述缓存未命中: {url}")
+                                                future = to_thread(llm_cilent._describe_image)(url, vision_provider, vision_model, get_image_base64)
+                                                print(f'future: {future}')
+                                                lst.append(future)
+                                        else:
+                                                lst.append("[图片: 解析失败]")
+                        except Exception as e:
+                                traceback.print_exc()
+                                lst.append("[图片: 解析失败]")
+                elif part.strip():  # 只添加非空文本
+                        lst.append(part)
+
+        # 多线程（to_thread）将图片转换为描述
+        lst = [f"[图片:{future.result()}]" if isinstance(future, SimpleFuture) else future for future in lst]
+
+        return ''.join(lst)
+
 
 __botdir__ = '/'.join(__file__.split('/')[:-2])
 
@@ -127,9 +167,9 @@ def _init_self():
         cache.set('names',set([*cache.nicknames,name]))
         cache.update_user_name(qq, name)
         print(f'{name}({qq})启动了！')
-        if 'auto_reboot' in sys.argv[1:]:
+        if '-a' in sys.argv[1:]:
                 print('自动重启已开启')
-        if 'debug' in sys.argv[1:]:
+        if '-d' in sys.argv[1:]:
                 print('debug模式')
 
 @call_delay(delay_secs=lambda *_,**__:random.uniform(-0.3, -0.6), max_size=20)
@@ -297,6 +337,11 @@ def recv(msg:dict|None):
                 return
 
         print(f'[{time.strftime(r"%H:%M:%S")}]【收到消息】',end='')
+
+        # # 转换收到消息的图片为描述
+        # if 'message' in msg:
+        #         msg['message'] = transform_image_to_text(msg['message'])
+
         cache.thismsg(msg)
         cache.msgs['last'] = msg
         if not is_group_msg(msg) or msg not in nolog_groups:

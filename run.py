@@ -7,12 +7,17 @@ import click
 
 @click.command()
 @click.option('-l', '--log-only', 'log_only', is_flag=True, help='是否仅记录log')
+@click.option('-d', '--debug', 'debug', is_flag=True, help='启用debug')
 @click.option('-a', '--auto-reboot', 'auto_reboot', is_flag=True, help='自动重启')
 @click.option('-q', '--qq', 'qq', type=int, default=5700, help='发送端口, go-cqhttp 的监听端口')
 @click.option('-p', '--port', 'port', type=int, default=5701, help='监听端口')
-def run(log_only, auto_reboot, qq, port):
+def run(log_only, debug, auto_reboot, qq, port):
     args = []
     if log_only:
+        args.append('-l')
+    if debug:
+        args.append('-d')
+    if auto_reboot:
         args.append('-a')
     args.extend(['-q',str(qq)])
     args.extend(['-p',str(port)])

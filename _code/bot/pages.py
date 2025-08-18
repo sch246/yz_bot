@@ -43,7 +43,7 @@ def paginate(content, page_size=10, current_page=1):
 
     return current_content, total_pages, current_page, nav_prompt
 
-def display(content, page_size=10):
+def display(content, page_size=10, init_page=1):
     """翻页展示内容
 
     使用yield等待用户输入来控制翻页
@@ -51,12 +51,13 @@ def display(content, page_size=10):
     参数:
         content: 多行字符串或列表
         page_size: 每页显示的行数/元素数
+        init_page: 初始页，默认为1
 
     用法:
         response = yield from display(content, page_size)
         return response # 当用户退出翻页时的最终响应
     """
-    current_page = 1
+    current_page = init_page
     total_pages = 0
 
     # 获取当前页内容和导航信息
@@ -68,12 +69,16 @@ def display(content, page_size=10):
     else:
         display = page_content
 
+    if total_pages == 0:
+        return "内容为空！"
+
     if total_pages == 1:
         return display
 
     # 发送当前页和导航提示
     response = yield f"{display}\n\n{nav_prompt}"
 
+    last = False
     while True:
 
         # 检查用户输入是否为消息
@@ -90,21 +95,28 @@ def display(content, page_size=10):
                 current_page += 1
             else:
                 response = yield "已经是最后一页了！"
+                last = False
                 continue
         elif user_input in ['p', 'prev', '上一页']:
             if current_page > 1:
                 current_page -= 1
             else:
                 response = yield "已经是第一页了！"
+                last = False
                 continue
         elif user_input.isdigit():
             page_num = int(user_input)
             if 1 <= page_num <= total_pages:
                 current_page = page_num
             else:
-                yield f"页码超出范围！请输入1-{total_pages}之间的数字"
+                response = yield f"页码超出范围！请输入1-{total_pages}之间的数字"
+                last = False
+                continue
         else:
+            if last == True:
+                return "翻页已结束"
             response = yield "回复 p/prev 查看上一页，n/next 查看下一页，数字跳转到指定页，q/quit 退出"
+            last = True
             continue
 
         # 获取当前页内容和导航信息
@@ -112,9 +124,11 @@ def display(content, page_size=10):
 
         # 显示当前页内容和导航提示
         if isinstance(page_content, list):
+            page_content = [str(item) for item in page_content]
             display = '\n'.join(page_content)
         else:
             display = page_content
 
         # 发送当前页和导航提示
         response = yield f"{display}\n\n{nav_prompt}"
+        last = False

@@ -8,6 +8,7 @@ from openai import OpenAI
 import re
 from enum import Enum
 from termcolor import colored
+import traceback
 
 # import html
 # import time
@@ -593,21 +594,10 @@ class LLMCilent:
         # print("<- 退出 _convert_images 函数。")
         return processed_messages
 
-    def _process_images(
-            self,
-            messages: list[dict],
-            convert_url: Callable[[str], str],
-            description_cache: dict[str, str],
-            vision_model: str = None
-    ) -> list[dict]:
-        """处理消息中的图片, 并添加缓存命中日志"""
+    def get_vision_model(self):
+        vision_model = self.config.get("vision_model", None)
         if not vision_model:
-            vision_model = self.config.get("vision_model", None)
-            if not vision_model:
-                # print("未配置视觉模型，跳过图片处理。")
-                return messages # 如果没有视觉模型，直接返回，不处理
-
-        vision_provider = None
+            return # 如果没有视觉模型，直接返回，不处理
         # 确保 providers 配置存在且是字典
         providers_config = self.config.get("providers", {})
         if isinstance(providers_config, dict):
@@ -619,10 +609,22 @@ class LLMCilent:
                     if isinstance(model_config, dict) and model_config.get("vision"):
                         vision_provider = provider
                         break
-
         if not vision_provider:
-            # print(f"在配置中未找到支持视觉模型 '{vision_model}' 的提供者，跳过图片处理。")
-            return messages # 如果找不到提供者，也直接返回
+            return # 如果找不到提供者，也直接返回
+        return vision_provider, vision_model
+
+    def _process_images(
+            self,
+            messages: list[dict],
+            convert_url: Callable[[str], str],
+            description_cache: dict[str, str],
+            vision_model: str = None
+    ) -> list[dict]:
+        """处理消息中的图片, 并添加缓存命中日志"""
+        res = self.get_vision_model()
+        if not res:
+            return messages
+        vision_provider, vision_model = res
 
         # print(f"使用 '{vision_provider}' 的 '{vision_model}' 处理图片...") # 可以加一个开始处理的日志
 
@@ -1208,7 +1210,6 @@ class LLMCilent:
 
                                 # 输出错误信息
                                 print(colored(f" -> 错误: {str(e)}", "red"))
-                                import traceback
                                 print(traceback.format_exc())
 
                                 yield LLMResponse(
@@ -1403,7 +1404,7 @@ class Chat:
 
     def chat(
         self,
-        user_message: Optional[str] = None,
+        user_message: Optional[Union[str, dict, Callable, LLMResponse]] = None,
         recall_func: Optional[Callable[[LLMResponse], None]] = None,
         stream: bool = True,
         tool_choice: Union[str, dict, None] = 'auto',
@@ -1488,7 +1489,16 @@ class Chat:
 
         except Exception as e:
             # 这里可以添加日志记录
-            raise RuntimeError(f"聊天过程中发生错误: {str(e)}") from e
+            response = LLMResponse(
+                content=f'# {e}',
+                role='assistant',
+                prompt_tokens=0,
+                completion_tokens=0,
+                total_tokens=0,
+            )
+            effective_recall(response)
+            return [response]
+            # raise RuntimeError(f"聊天过程中发生错误: {str(e)}") from e
 
     def __repr__(self) -> str:
         """返回会话的字符串表示"""

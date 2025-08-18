@@ -26,8 +26,11 @@ import json
 from main import LLMCilent, Chat, sum_res, LLMResponse, get_image_base64
 
 from main import memberlist
+
+# from main import hipporag
 from main import search_city, get_realtime_weather, get_daily_forecast, get_hourly_forecast
 from main import getstorage
+import xml.etree.ElementTree as ET
 
 llm_cilent = LLMCilent()
 
@@ -374,6 +377,20 @@ def set_user_data(user_id:int,key:str,value:str):
     except Exception as e:
         return str(e)
 
+
+
+# def rag_search(queries:str, num_to_retrieve:int=1):
+#     '''
+#     主动回忆
+
+#     @param
+#     queries: 查询的问题，用英文逗号分隔
+#     num_to_retrieve: 每个查询返回的结果数量
+#     '''
+#     # 将今天、昨天、明天替换为对应时间
+#     queries = queries.replace('今天', time.strftime('%Y年%m月%d日')).replace('昨天', time.strftime('%Y年%m月%d日', time.localtime(time.time() - 86400))).replace('明天', time.strftime('%Y年%m月%d日', time.localtime(time.time() + 86400)))
+#     return hipporag.retrieve(queries.split(','), num_to_retrieve)
+
 #---------------------------------------------------------------------------------------------------------------
 
 
@@ -422,7 +439,10 @@ def get_prompt() -> list:
     else:
         return []
 
-def get_msgs(max_token=4_000, return_token=False):
+max_token = storage.get('llm_system', 'config').get('max_token', 4000)
+
+
+def get_msgs(max_token=max_token, return_token=False):
     in_group = cache.thismsg().get('group_id')
 
     chat_logs = []
@@ -496,12 +516,14 @@ def init_chat(chat_client:Chat, messages=[]):
     # chat_client.add_tool(url2cq)
     # chat_client.add_tool(muti_reply)
     # chat_client.add_tool(baidu_encyclopedia)
+
     chat_client.add_tool(search_city)
     chat_client.add_tool(get_realtime_weather)
     chat_client.add_tool(get_daily_forecast)
     chat_client.add_tool(get_hourly_forecast)
     chat_client.add_tool(get_user_data)
     chat_client.add_tool(set_user_data)
+    # chat_client.add_tool(rag_search)
     # chat.add(chat.req())
 
     # last_data = None
@@ -515,13 +537,23 @@ def init_chat(chat_client:Chat, messages=[]):
     # data = getchatstorage()
 
     prompts.setdefault('base', [
-        {'role':'system', 'content':'''## 注意事项
-- 你的id: 柚子
-- 你的QQ号：0。at格式:"[CQ:at,qq=qq号]"(仅在群聊下有效)；reply格式:"[CQ:reply,id=message_id]"
-- 你的回复会直接发送到聊天当中，直接输出内容即可，格式会自动处理
+#         {'role':'system', 'content':'''## 注意事项
+# - 你的昵称: 柚子
+# - 你的QQ号：0。at格式:"[CQ:at,qq=qq号]"(仅在群聊下有效)；reply格式:"[CQ:reply,id=message_id]"
+# - 你的回复需要严格按照以下XML格式输出，如果需要更新记忆，采用先删除，后添加的方式：
+# <message>
+#   <content>
+#     <text>你的回复内容</text>
+#   </content>
+# </message>
+
+# - 聊天中可能不会有明显的问题，扮演好角色即可
+# - 如无特殊要求，请用中文回复'''},
+        {'role':'system', 'content':f'''## 注意事项
+- 你的昵称: 柚子
+- 你的QQ号：{cache.qq}。at格式:"[CQ:at,qq=qq号]"(仅在群聊下有效)；reply格式:"[CQ:reply,id=message_id]"
 - 聊天中可能不会有明显的问题，扮演好角色即可
-- 如无特殊要求，请用中文回复
-- 发送`# <拒绝原因>`以拒绝回复'''}
+- 如无特殊要求，请用中文回复'''}
     ])
 
     chat_client.set_messages([
@@ -906,26 +938,83 @@ def call(data: Callable | bool):
 
 
 def chat(model=None):
-    # call = [
-    #     *settings,
-    #     {'role': 'system', 'content':f'现在是{time.strftime("%Y年%m月%d日%H时%M分%S秒")}'}
-    # ]
-    # prompt_tokens = counts_token(call)
+    chat_client = Chat(provider=get_provider(), model=model or get_model(), chat_client=llm_cilent)
 
-    chat_client = Chat(provider=get_provider(),model=model or get_model(),chat_client=llm_cilent)
-    init_chat(chat_client, get_msgs())
+    # msg = cache.thismsg()
+    # if 'group_id' in msg:
+    #     location = f'群聊 {msg.get("group_id")}'
+    # else:
+    #     location = f'私聊 {msg.get("user_id")}'
+    
+    # # 获取最近3条消息并合并为查询字符串
+    messages = get_msgs()
+    # query = "\n".join([
+    #     " ".join([
+    #         part.get("text", "") 
+    #         for part in msg["content"] 
+    #         if isinstance(part, dict) and "text" in part
+    #     ]) if isinstance(msg, dict) else str(msg) for msg in messages[-3:]
+    # ])
+    
+    # # 进行 RAG 查询
+    # # print(query)
+    # results = []
+    # try:
+    #     print('开始查询')
+    #     results = hipporag.retrieve([query], num_to_retrieve=5)[0].docs
+    # except Exception as e:
+    #     print(f'查询中遇到错误: {traceback.format_exc()}')
+    # # print(results)
+    # if results:
+    #     print('查询成功')
+    #     memory_results = []
+    #     for i, doc in enumerate(results, 1):
+    #         memory_results.append(f"{i}. {doc}")
+    #     memory_text = "\n".join(memory_results)
+    #     messages.insert(0, {'role': 'system', 'content': f"找到以下相关记忆:\n{memory_text}"})
+    # else:
+    #     print('查询失败')
+    
+    init_chat(chat_client, messages)
 
     def handle_LLMResponse(chunk: LLMResponse):
         if chunk.role == 'assistant' and chunk.content:
-            _sendmsg(chunk.content)
+            text = chunk.content
+            # # 使用正则表达式提取内容
+            # text_match = re.search(r'<text>(.*?)</text>', chunk.content, re.DOTALL)
+            # text = text_match.group(1) if text_match else chunk.content
+            
+            # # 提取所有memory标签内容
+            # memories = re.findall(r'<memory>(.*?)</memory>', chunk.content, re.DOTALL)
+            
+            # # 提取out_of_date内容
+            # out_of_date_match = re.search(r'<out_of_date>(.*?)</out_of_date>', chunk.content, re.DOTALL)
+            # out_of_date = out_of_date_match.group(1) if out_of_date_match else None
+            
+            # 发送回复内容
+            _sendmsg(text)
+            
+            # # 如果有记忆点，存储到 RAG 系统
+            # if memories:
+            #     hipporag.index(docs=[memory+f'\n记录时间: {time.strftime("%Y年%m月%d日 %H时")} 于 {location}' for memory in memories if memory.strip()])
+                
+            # # 如果有需要删除的记忆，从 RAG 系统中删除
+            # if out_of_date:
+            #     try:
+            #         indices = [int(idx.strip()) for idx in out_of_date.split(',')]
+            #         if results and indices:
+            #             docs_to_delete = [results[idx-1] for idx in indices if 0 < idx <= len(results)]
+            #             if docs_to_delete:
+            #                 hipporag.delete(docs_to_delete)
+            #                 print(f"已删除 {len(docs_to_delete)} 条过期记忆")
+            #     except Exception as e:
+            #         print(f"删除记忆失败: {e}")
+
         if chunk.total_tokens:
             inc_call_tokens_cost(
                 chat_client.provider,
                 chat_client.model,
-                (
-                    chunk.prompt_tokens,
-                    chunk.completion_tokens,
-                ),
+                (chunk.prompt_tokens, chunk.completion_tokens),
             )
 
     chat_client.print_messages()
@@ -1004,8 +1093,8 @@ def chat(model=None):
 def run(body:str, model="gpt-3.5-turbo"):
     '''询问柚子单句问题
 .chat <内容>
-多句请使用“柚子聊聊天”截断前文
-然后使用“柚子，”开头”'''
+多句请使用"柚子聊聊天"截断前文
+然后使用"柚子，"开头"'''
 
     
     chat_client = Chat(provider=get_provider(),model=model or get_model(),chat_client=llm_cilent)

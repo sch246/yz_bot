@@ -55,7 +55,8 @@ except:
     pass
 
 
-@to_thread
+
+@to_thread(ret='None')
 def run(body:str, msg: dict = None, skip_op: bool = False, insert: dict = None):
     '''运行python命令，在.py后空格或换行都行，最后一行的表达式若不是None或注释则会被返回
 
@@ -387,3 +388,27 @@ def catch_link(link, names, ends):
         for linkname in fail:
             _link = get_link(linkname)
             catch_link(_link, names, ends)
+
+
+from main import pages
+
+
+def prints(content, page_size=10, init_page=1):
+    """翻页展示内容
+
+    使用yield等待用户输入来控制翻页
+
+    参数:
+        content: 多行字符串或列表
+        page_size: 每页显示的行数/元素数
+        init_page: 初始页数，默认为1
+
+    """
+    gen = pages.display(content, page_size=page_size, init_page=init_page)
+    text = None
+    try:
+        while 1:
+            reply = _input(gen.send(text))
+            text = {'message':reply}
+    except StopIteration:
+        _print('翻页已结束')

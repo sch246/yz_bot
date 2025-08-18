@@ -1,28 +1,11 @@
 '''修饰一个函数，函数调用之间保持时间间隔'''
 
-from threading import Event
 from time import sleep
 from typing import Callable
 from queue import Queue
 from functools import wraps
 
-from s3.thread import to_thread
-
-class SimpleFuture:
-    def __init__(self) -> None:
-        self._event = Event()
-        self._result = None
-
-    def set_result(self, value):
-        self._result = value
-        self._event.set()
-
-    def result(self, timeout:float|None = None):
-        self._event.wait(timeout)
-        return self._result
-
-    def done(self):
-        return self._event.is_set()
+from s3.thread import to_thread, SimpleFuture
 
 class _QueueExecutor:
     def __init__(
