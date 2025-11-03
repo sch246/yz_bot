@@ -9,6 +9,8 @@ from typing import Any, Callable, Tuple
 import requests
 from urllib.request import quote, unquote
 from termcolor import colored
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import openai
 import tiktoken
@@ -128,11 +130,13 @@ def get_prices(provider:str, model:str):
     completion_price = attr.get('completion_price', 0)
     return (prompt_price, completion_price)
 
+cost_lock = threading.Lock()
 def inc_call_tokens_cost(provider, model, tokens: tuple[int, int]):
-    (prompt_tokens, completion_tokens) = tokens
-    (prompt_price, completion_price) = get_prices(provider, model)
-    price = (prompt_tokens*prompt_price + completion_tokens*completion_price)/1_000_000
-    get_caller()[1] += price
+    with cost_lock:
+        (prompt_tokens, completion_tokens) = tokens
+        (prompt_price, completion_price) = get_prices(provider, model)
+        price = (prompt_tokens*prompt_price + completion_tokens*completion_price)/1_000_000
+        get_caller()[1] += price
 
 def inc_call_token_cost(provider, model, type:int, token:int):
     prices = get_prices(provider, model)
@@ -193,6 +197,8 @@ def group_state(s=None):
 
 #-------------------------------------------------------------------------------------------------------------
 
+all_func_names = set(vars().keys())
+
 def get_time():
     '''
     获取当前时间
@@ -213,7 +219,7 @@ def group_members():
 def exec_code(expr:str,code:str=''):
     '''
     execute a real-time python code.
-    用python读取和编辑`data`字典，其中的数据会被持久化保存
+    若用python读取和编辑`data`字典，其中的数据会被持久化保存
 
     @param
     code: The code to execute
@@ -377,8 +383,154 @@ def set_user_data(user_id:int,key:str,value:str):
     except Exception as e:
         return str(e)
 
+def assign_tasks(prompt: str, tasks: str, tools: str, model: str = "deepseek-v3", max_workers: int = 5):
+    '''
+    使用多线程并发执行，用于分派子任务给其它AI，返回一个包含结果的列表，每个元素是一个元组 (task, result_text)
+    当任务可以分解为上下文无关的独立子任务时，分派给其它AI模型，可以节省上下文和提升效率
+    当任务非常繁杂时，不应该自己管理所有AI，可以发给子AI让子AI再发给子子AI，分而治之，并确保任务所需上下文准确传达。那么每层AI只需要总结少量几个的AI总结
+    当你是父AI时，请明确指定子AI使用的模型
+    当你是子AI时，并发数必须为1，否则很容易并发数过多
+
+    @param
+    model: 调用的大语言模型
+    prompt: 给每个子AI的统一提示词，如 prompt="搜索这个我的世界mod并总结内容:"
+    tasks: 附加在统一提示词后面的内容，每行对应一个任务，如 tasks="acedium\\nalexs caves delight\\nArgentina s delight"
+    tools: 分派给所有AI使用的工具，每行一个名称，不能重复，必须是你已有的工具，如 "search_mc_mod\\ncheck_mod"
+    max_workers: 最大并发线程数，默认为5。
+    '''
+
+    # 1. 将任务和工具预处理成列表，过滤掉空行
+    task_list = [t for t in tasks.split('\n') if t.strip()]
+    tool_list = [t for t in tools.split('\n') if t.strip()]
+
+    msg = cache.thismsg()
+
+    # 2. 定义 Worker 函数（处理单个任务的逻辑）
+    #    我们把它定义在主函数内部，这样它可以方便地访问 prompt, tool_list 等变量
+    def run_single_task(task: str) -> tuple[str, str]:
+        """为单个任务执行LLM调用并返回结果"""
+        task_result = ""
+
+        def handle_LLMResponse(chunk: LLMResponse):
+            nonlocal task_result
+            cache.thismsg(msg)
+            # print("handle",chunk)
+            if chunk.role == 'assistant' and chunk.content:
+                # 确保内容是字符串
+                if isinstance(chunk.content, list):
+                    # 如果是列表，提取文本部分
+                    text_content = ""
+                    for item in chunk.content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            text_content += item["text"]
+                        elif isinstance(item, str):
+                            text_content += item
+                    task_result += text_content
+                else:
+                    task_result += str(chunk.content)
+
+            if chunk.total_tokens:
+                # 调用线程安全的费用更新函数
+                inc_call_tokens_cost(
+                    chat_client.provider,
+                    chat_client.model,
+                    (chunk.prompt_tokens, chunk.completion_tokens),
+                )
+
+        try:
+            # 每个线程创建自己独立的 ChatClient 实例，这是非常重要的，可以避免状态混淆
+            chat_client = Chat(provider='openai', model=model, chat_client=llm_cilent)
+
+            for tool_name in tool_list:
+                if tool_name in all_funcs:
+                    chat_client.add_tool(all_funcs[tool_name])
+
+            chat_client.set_messages([f"{prompt}\n{task}"])
+
+            print(f"线程 {threading.get_ident()}: 开始处理任务 '{task}'")
+
+            chat_client.chat(
+                recall_func=handle_LLMResponse
+            )
+
+            print(f"线程 {threading.get_ident()}: 完成任务 '{task}'")
+            return (task, task_result.strip())
+
+        except Exception as e:
+            print(f"线程 {threading.get_ident()}: 任务 '{task}' 发生错误: {e}")
+            return (task, f"ERROR: {e}")
 
 
+    # 3. 创建并使用线程池来并发执行任务
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # 使用 executor.submit 提交所有任务
+        # future_to_task 是一个字典，用于在任务完成时找回原始任务内容
+        future_to_task = {executor.submit(run_single_task, task): task for task in task_list}
+
+        # 使用 as_completed 来获取已完成任务的结果，哪个先完成就先处理哪个
+        for future in as_completed(future_to_task):
+            task_name = future_to_task[future]
+            try:
+                # .result() 会获取 worker 函数的返回值
+                result_tuple = future.result()
+                results.append(result_tuple)
+            except Exception as exc:
+                # 如果 worker 函数本身抛出未被捕获的异常，这里会捕捉到
+                print(f"任务 '{task_name}' 在执行期间生成了异常: {exc}")
+                results.append((task_name, f"EXECUTION FAILED: {exc}"))
+
+    # 可以选择对结果进行排序，使其与输入任务的顺序一致
+    # 如果不需要保持顺序，直接返回 results 即可
+    ordered_results = sorted(results, key=lambda x: task_list.index(x[0]))
+
+    return repr(ordered_results)
+
+def search_mc_mod(name:str):
+    '''
+    通过mcmod搜索我的世界mod
+
+    @param
+    name: 关键字，最好是mod名字，宜少不宜多，不接受带版本和后缀的字符串
+    '''
+    from bs4 import BeautifulSoup
+    response = requests.get(f'https://search.mcmod.cn/s?key={name}')
+    soup = BeautifulSoup(response.text, 'html.parser')
+
+    results = []
+    elements = soup.find_all(class_='search-result-list')
+
+    for element in elements:
+        results.append(element.get_text().strip())
+
+    full_result = '\n'.join(results)
+    # 截断结果，只返回前1000字符以避免过长
+    if len(full_result) > 1000:
+        full_result = full_result[:1000] + "..."
+    return full_result
+
+def check_mod(id:int):
+    '''
+    通过mcmod链接id查询我的世界mod
+
+    @param
+    id: 查询 f"https://www.mcmod.cn/class/{id}.html" 中的信息
+    '''
+    from bs4 import BeautifulSoup
+    response = requests.get(f'https://www.mcmod.cn/class/{id}.html')
+    soup = BeautifulSoup(response.text, 'html.parser')
+
+    results = []
+
+    elements = soup.find_all(class_='text-area')
+
+    for element in elements:
+        results.append(element.get_text().strip())
+
+    return '\n'.join(results)
+
+
+all_funcs = {name:func for name, func in vars().items() if callable(func) and name not in all_func_names}
 # def rag_search(queries:str, num_to_retrieve:int=1):
 #     '''
 #     主动回忆
@@ -525,6 +677,9 @@ def init_chat(chat_client:Chat, messages=[]):
     chat_client.add_tool(set_user_data)
     # chat_client.add_tool(rag_search)
     # chat.add(chat.req())
+    chat_client.add_tool(assign_tasks)
+    chat_client.add_tool(search_mc_mod)
+    chat_client.add_tool(check_mod)
 
     # last_data = None
     # def show_data(s):
@@ -536,7 +691,7 @@ def init_chat(chat_client:Chat, messages=[]):
 
     # data = getchatstorage()
 
-    prompts.setdefault('base', [
+    prompts['base'] = [
 #         {'role':'system', 'content':'''## 注意事项
 # - 你的昵称: 柚子
 # - 你的QQ号：0。at格式:"[CQ:at,qq=qq号]"(仅在群聊下有效)；reply格式:"[CQ:reply,id=message_id]"
@@ -554,7 +709,7 @@ def init_chat(chat_client:Chat, messages=[]):
 - 你的QQ号：{cache.qq}。at格式:"[CQ:at,qq=qq号]"(仅在群聊下有效)；reply格式:"[CQ:reply,id=message_id]"
 - 聊天中可能不会有明显的问题，扮演好角色即可
 - 如无特殊要求，请用中文回复'''}
-    ])
+    ]
 
     chat_client.set_messages([
             *get_prompt(),
@@ -563,6 +718,8 @@ def init_chat(chat_client:Chat, messages=[]):
             *messages
             ])
 
+    data = getchatstorage()
+    chat_client.do_process_image = data.get('image', False)
     # if 'split' not in data: # 设置默认值
     #     data['split'] = True
     # chat_client.split = data['split'] #决定是否划分发送
@@ -750,15 +907,25 @@ def _(name:str, prompt:list)->str:
     prompts[name] = prompt
     return '设定已保存'
 
+@cm.register('image')
+def _()->str:
+    '''
+    切换是否读取图片
+    '''
+    data = getchatstorage()
+    data['image'] = not data.get('image')
+    return f"image: {data['image']}"
+
+
 # def get_balance(base_url, api_key):
 #     url = f'{base_url}/user/balance'
 #     headers = {
 #         'Accept': 'application/json',
 #         'Authorization': f'Bearer {api_key}'
 #     }
-    
+
 #     response = requests.get(url, headers=headers)
-    
+
 #     if response.status_code == 200:
 #         return response.json()
 #     else:
@@ -936,68 +1103,28 @@ def call(data: Callable | bool):
 #     return msg
 
 
-
-def chat(model=None):
-    chat_client = Chat(provider=get_provider(), model=model or get_model(), chat_client=llm_cilent)
-
-    # msg = cache.thismsg()
-    # if 'group_id' in msg:
-    #     location = f'群聊 {msg.get("group_id")}'
-    # else:
-    #     location = f'私聊 {msg.get("user_id")}'
-    
-    # # 获取最近3条消息并合并为查询字符串
-    messages = get_msgs()
-    # query = "\n".join([
-    #     " ".join([
-    #         part.get("text", "") 
-    #         for part in msg["content"] 
-    #         if isinstance(part, dict) and "text" in part
-    #     ]) if isinstance(msg, dict) else str(msg) for msg in messages[-3:]
-    # ])
-    
-    # # 进行 RAG 查询
-    # # print(query)
-    # results = []
-    # try:
-    #     print('开始查询')
-    #     results = hipporag.retrieve([query], num_to_retrieve=5)[0].docs
-    # except Exception as e:
-    #     print(f'查询中遇到错误: {traceback.format_exc()}')
-    # # print(results)
-    # if results:
-    #     print('查询成功')
-    #     memory_results = []
-    #     for i, doc in enumerate(results, 1):
-    #         memory_results.append(f"{i}. {doc}")
-    #     memory_text = "\n".join(memory_results)
-    #     messages.insert(0, {'role': 'system', 'content': f"找到以下相关记忆:\n{memory_text}"})
-    # else:
-    #     print('查询失败')
-    
-    init_chat(chat_client, messages)
-
+def get_handler(chat_client:Chat):
     def handle_LLMResponse(chunk: LLMResponse):
         if chunk.role == 'assistant' and chunk.content:
             text = chunk.content
             # # 使用正则表达式提取内容
             # text_match = re.search(r'<text>(.*?)</text>', chunk.content, re.DOTALL)
             # text = text_match.group(1) if text_match else chunk.content
-            
+
             # # 提取所有memory标签内容
             # memories = re.findall(r'<memory>(.*?)</memory>', chunk.content, re.DOTALL)
-            
+
             # # 提取out_of_date内容
             # out_of_date_match = re.search(r'<out_of_date>(.*?)</out_of_date>', chunk.content, re.DOTALL)
             # out_of_date = out_of_date_match.group(1) if out_of_date_match else None
-            
+
             # 发送回复内容
             _sendmsg(text)
-            
+
             # # 如果有记忆点，存储到 RAG 系统
             # if memories:
             #     hipporag.index(docs=[memory+f'\n记录时间: {time.strftime("%Y年%m月%d日 %H时")} 于 {location}' for memory in memories if memory.strip()])
-                
+
             # # 如果有需要删除的记忆，从 RAG 系统中删除
             # if out_of_date:
             #     try:
@@ -1016,10 +1143,51 @@ def chat(model=None):
                 chat_client.model,
                 (chunk.prompt_tokens, chunk.completion_tokens),
             )
+    return handle_LLMResponse
+
+def chat(model=None):
+    chat_client = Chat(provider=get_provider(), model=model or get_model(), chat_client=llm_cilent)
+
+    # msg = cache.thismsg()
+    # if 'group_id' in msg:
+    #     location = f'群聊 {msg.get("group_id")}'
+    # else:
+    #     location = f'私聊 {msg.get("user_id")}'
+
+    # # 获取最近3条消息并合并为查询字符串
+    messages = get_msgs()
+    # query = "\n".join([
+    #     " ".join([
+    #         part.get("text", "")
+    #         for part in msg["content"]
+    #         if isinstance(part, dict) and "text" in part
+    #     ]) if isinstance(msg, dict) else str(msg) for msg in messages[-3:]
+    # ])
+
+    # # 进行 RAG 查询
+    # # print(query)
+    # results = []
+    # try:
+    #     print('开始查询')
+    #     results = hipporag.retrieve([query], num_to_retrieve=5)[0].docs
+    # except Exception as e:
+    #     print(f'查询中遇到错误: {traceback.format_exc()}')
+    # # print(results)
+    # if results:
+    #     print('查询成功')
+    #     memory_results = []
+    #     for i, doc in enumerate(results, 1):
+    #         memory_results.append(f"{i}. {doc}")
+    #     memory_text = "\n".join(memory_results)
+    #     messages.insert(0, {'role': 'system', 'content': f"找到以下相关记忆:\n{memory_text}"})
+    # else:
+    #     print('查询失败')
+
+    init_chat(chat_client, messages)
 
     chat_client.print_messages()
     chat_client.chat(
-        recall_func=handle_LLMResponse,
+        recall_func=get_handler(chat_client),
         url_to_base64_func=get_image_base64,
         description_cache=description_cache,
     )
@@ -1096,7 +1264,7 @@ def run(body:str, model="gpt-3.5-turbo"):
 多句请使用"柚子聊聊天"截断前文
 然后使用"柚子，"开头"'''
 
-    
+
     chat_client = Chat(provider=get_provider(),model=model or get_model(),chat_client=llm_cilent)
     init_chat(chat_client, [
         {

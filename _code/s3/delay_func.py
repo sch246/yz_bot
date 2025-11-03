@@ -2,8 +2,9 @@
 
 from time import sleep
 from typing import Callable
-from queue import Queue
+from queue import Queue, Empty
 from functools import wraps
+import threading
 
 from s3.thread import to_thread, SimpleFuture
 
@@ -15,34 +16,80 @@ class _QueueExecutor:
         ):
         self._work_queue = Queue(max_queue_size)
         self._delay_secs = delay_secs
+        self._stop_event = threading.Event()
         self.loop()
 
     @to_thread
     def loop(self):
-        while True:
+        while not self._stop_event.is_set():
+            try:
+                future, func, args, kws = self._work_queue.get(timeout=1.0)  # 添加超时，避免永久阻塞
+                
+                delay = (self._delay_secs(*args,**kws)
+                         if callable(self._delay_secs)
+                         else self._delay_secs)
 
-            future, func, args, kws = self._work_queue.get()
+                if delay >= 0:
+                    sleep(delay)
 
-            delay = (self._delay_secs(*args,**kws)
-                     if callable(self._delay_secs)
-                     else self._delay_secs)
+                # 使用带超时的函数执行
+                result = self._execute_with_timeout(func, args, kws, timeout=10.0)  # 10秒超时
+                
+                if isinstance(result, Exception):
+                    future.set_exception(result)
+                else:
+                    future.set_result(result)
 
-            if delay>=0:
-                sleep(delay)
+                if delay < 0:
+                    sleep(-delay)
+                    
+            except Empty:
+                # 这是正常的超时，继续循环
+                continue
+            except Exception as e:
+                # 记录错误但继续运行
+                print(f"队列执行器错误: {e}")
+                continue
 
-            future.set_result(func(*args, **kws))
-
-            if delay<0:
-                sleep(-delay)
+    def _execute_with_timeout(self, func, args, kws, timeout=10.0):
+        """带超时执行函数"""
+        result = None
+        exception = None
+        
+        def worker():
+            nonlocal result, exception
+            try:
+                result = func(*args, **kws)
+            except Exception as e:
+                exception = e
+        
+        thread = threading.Thread(target=worker)
+        thread.daemon = True
+        thread.start()
+        thread.join(timeout)
+        
+        if thread.is_alive():
+            # 函数执行超时
+            return TimeoutError(f"函数执行超时 ({timeout}秒)")
+        elif exception is not None:
+            # 函数执行出错
+            return exception
+        else:
+            # 函数正常执行完成
+            return result
 
     def submit(self, func, args, kws):
         future = SimpleFuture()
         if self._work_queue.full():
             print('队列已满,函数被忽略:', (func, args, kws))
-            future.set_result(None)
+            future.set_exception(RuntimeError("队列已满"))
         else:
             self._work_queue.put((future, func, args, kws))
         return future
+    
+    def shutdown(self):
+        """停止队列执行器"""
+        self._stop_event.set()
 
 
 def call_delay(

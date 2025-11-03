@@ -190,6 +190,11 @@ def send(text: Any, user_id: int | str = None, group_id: int | str = None, **par
                 # 当仅同时传入group和user时保证是群聊
                 user_id = None
 
+        params['sender'] = {
+                'user_id': cache.qq,
+                'nickname': cache.name
+        }
+
         call = connect.call_api('send_msg', message=text, user_id=user_id, group_id=group_id, **params)
         if not call['retcode'] == 0:
                 print('发送消息失败 '+call['wording'])
@@ -198,7 +203,7 @@ def send(text: Any, user_id: int | str = None, group_id: int | str = None, **par
 
         #------以下是获取自身发送的消息，并且记录下来------#
 
-        call2 = connect.call_api('get_msg', message_id=call['data']['message_id'])
+        call2 = connect.call_api('get_msg', message_id=call['data']['message_id'], user_id=user_id, group_id=group_id)
         if not call2['retcode'] == 0:
                 print('获取发送的消息失败'+call2['wording'])
                 return

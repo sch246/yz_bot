@@ -829,6 +829,7 @@ class LLMCilent:
         stream: bool = True,
         url_to_base64_func: Optional[Callable[[str], str]] = None,
         description_cache: dict[str, str] = None,
+        do_process_image: Optional[bool] = None,
     ) -> Generator[LLMResponse, None, None]:
         """生成LLM响应"""
         if not provider:
@@ -849,12 +850,13 @@ class LLMCilent:
         if url_to_base64_func is None:
             url_to_base64_func = default_url_to_base64
 
-        if not capabilities.vision:
-            if description_cache is None:
-                description_cache = {}
-            messages = self._process_images(messages, url_to_base64_func, description_cache)
-        else:
-            messages = self._convert_images(messages, url_to_base64_func)
+        if do_process_image:
+            if not capabilities.vision:
+                if description_cache is None:
+                    description_cache = {}
+                messages = self._process_images(messages, url_to_base64_func, description_cache)
+            else:
+                messages = self._convert_images(messages, url_to_base64_func)
 
         # print(messages)
 
@@ -880,7 +882,7 @@ class LLMCilent:
 
         try:
             if stream:
-                return self._stream_response(client, request_params)
+                return self._stream_response(client, request_params, model)
             else:
                 return self._non_stream_response(client, request_params)
         except Exception as e:
@@ -891,6 +893,7 @@ class LLMCilent:
         self,
         client: OpenAI,
         params: dict,
+        model: str
     ) -> Generator[LLMResponse, None, None]:
         """
         处理流式响应
@@ -907,7 +910,8 @@ class LLMCilent:
         buffer: str = ""
         current_role = None
         tool_calls = []  # 存储正在构建中的工具调用
-        completed_tool_calls = []  # 存储已完成的工具调用
+        completed_tool_calls = set()  # 存储已完成的工具调用
+        id_to_index = {}
         usage = None
         status = 0 # 1think, 2content, 3tool
 
@@ -915,7 +919,6 @@ class LLMCilent:
             stream = client.chat.completions.create(**params)
 
             for chunk in stream:
-                # print(chunk)
                 # 如果结束了
                 if getattr(chunk, 'finish_reason', None) or not getattr(chunk, 'choices', None):
                     # 处理使用情况数据
@@ -933,7 +936,7 @@ class LLMCilent:
                 if reasoning_content:=delta_dict.get('reasoning_content'):
                     if status != 1:
                         status = 1
-                        print_colored(f"{current_role}: ", current_role, end='', flush=True)
+                        print_colored(f"{current_role}({model}): ", current_role, end='', flush=True)
                     print_colored(reasoning_content, MessageRole.THINK.value, end='', flush=True)
 
                 # 处理普通文本内容
@@ -941,7 +944,7 @@ class LLMCilent:
                     if status != 2:
                         content = content.lstrip()
                         status = 2
-                        print_colored(f"{current_role}: ", current_role, end='', flush=True)
+                        print_colored(f"{current_role}({model}): ", current_role, end='', flush=True)
 
                     buffer += content
 
@@ -961,35 +964,47 @@ class LLMCilent:
                 if delta_dict.get('tool_calls'):
                     if status != 3:
                         status = 3
-                        print_colored(f"{current_role}: ", current_role, end='', flush=True)
+                        print_colored(f"{current_role}({model}): ", current_role, end='', flush=True)
                     # 实时输出增量内容
                     if delta.tool_calls:
                         for tool_call in delta.tool_calls:
-                            if tool_call.index >= len(tool_calls) and tool_call.function.name:
+                            if tool_call.id is not None: # 假设每个第一次出现肯定带id
+                                call_id = tool_call.id
+                                if call_id not in id_to_index:
+                                    index = len(tool_calls)
+                                    id_to_index[call_id] = index
+                                    tool_calls.append({
+                                        "id": tool_call.id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": '',
+                                            "arguments": ''
+                                        }
+                                    })
+                                else:
+                                    index = id_to_index[index]
+                            elif tool_call.index is not None:
+                                index = tool_call.index
+
+                            if tool_call.function.name:
+                                tool_calls[index]["function"]["name"] = tool_call.function.name
                                 print_colored(tool_call.function.name, MessageRole.TOOL.value, end='', flush=True)
-                                tool_calls.append({
-                                    "id": tool_call.id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": tool_call.function.name,
-                                        "arguments": ''
-                                    }
-                                })
-                            tool_calls[tool_call.index]["function"]["arguments"] += tool_call.function.arguments
-                            print_colored(tool_call.function.arguments, MessageRole.TOOL.value, end='', flush=True)
+                            if tool_call.function.arguments:
+                                tool_calls[index]["function"]["arguments"] += tool_call.function.arguments
+                                print_colored(tool_call.function.arguments, MessageRole.TOOL.value, end='', flush=True)
 
                     # 检查是否有工具调用可以返回
-                    for i, tool_call in enumerate(tool_calls):
+                    for tool_call in tool_calls:
                         if (tool_call["id"] and
                             tool_call["function"]["name"] and
-                            tool_call not in completed_tool_calls and
+                            tool_call["id"] not in completed_tool_calls and
                             self._is_complete_json(tool_call["function"]["arguments"])):
                             yield LLMResponse(
                                 content=json.dumps(tool_call, ensure_ascii=False),
                                 role=MessageRole.TOOL.value
                             )
 
-                            completed_tool_calls.append(tool_call)
+                            completed_tool_calls.add(tool_call["id"])
 
 
             # 处理最终剩余的内容
@@ -1001,10 +1016,10 @@ class LLMCilent:
                     role=current_role or MessageRole.ASSISTANT.value,
                 )
 
-            for i, tool_call in enumerate(tool_calls): #报错也传上去
+            for tool_call in tool_calls: #报错也传上去
                 if (tool_call["id"] and
                     tool_call["function"]["name"] and
-                    tool_call not in completed_tool_calls):
+                    tool_call["id"] not in completed_tool_calls):
                     yield LLMResponse(
                         content=json.dumps(tool_call, ensure_ascii=False),
                         role=MessageRole.TOOL.value
@@ -1022,6 +1037,7 @@ class LLMCilent:
 
         except Exception as e:
             error_msg = f"流式响应处理失败: {e}"
+            print(traceback.format_exc())
             print_colored(f"\n{error_msg}", MessageRole.SYSTEM.value)
             raise
 
@@ -1036,7 +1052,7 @@ class LLMCilent:
     def _non_stream_response(
         self,
         client: OpenAI,
-        params: dict,
+        params: dict
     ) -> Generator[LLMResponse, None, None]:
         """处理非流式响应"""
         try:
@@ -1105,6 +1121,7 @@ class LLMCilent:
         stream: bool = True,
         url_to_base64_func: Optional[Callable[[str], str]] = None,
         description_cache: dict[str,str] = None,
+        do_process_image: Optional[bool] = None,
     ) -> Generator[LLMResponse, None, None]:
         """聊天接口"""
         # 应用默认值
@@ -1126,6 +1143,7 @@ class LLMCilent:
                 stream=stream,
                 url_to_base64_func=url_to_base64_func,
                 description_cache=description_cache,
+                do_process_image = do_process_image,
             )
 
             tool_mapping = {tool.description["function"]["name"]: tool
@@ -1135,6 +1153,7 @@ class LLMCilent:
             tool_results: list[ToolCallResult] = []
             yield from self._process_response(response, tool_mapping, tool_results)
 
+            # print("工具调用：",tool_results)
             # 如果没有tool调用，退出循环
             if not tool_results:
                 break
@@ -1222,6 +1241,7 @@ class LLMCilent:
 
                 except Exception as e:
                     print(f"工具调用解析失败: {e}")
+                    print(traceback.format_exc())
                     # 如果解析失败，仍然传递原始响应
                     yield chunk
                     continue
@@ -1249,6 +1269,7 @@ class Chat:
         recall_func: Callable = None,
         url_to_base64_func: Optional[Callable[[str], str]] = None,
         description_cache: dict[str,str] = None,
+        do_process_image: Optional[bool] = None
     ):
         """初始化聊天会话
 
@@ -1266,6 +1287,7 @@ class Chat:
         self.provider = provider
         self.model = model
         self.chat_client = chat_client
+        self.do_process_image = do_process_image
 
         # 工具函数初始化
         self.recall_func = recall_func
@@ -1410,6 +1432,7 @@ class Chat:
         tool_choice: Union[str, dict, None] = 'auto',
         url_to_base64_func: Optional[Callable[[str], str]] = None,
         description_cache: Optional[dict[str, str]] = None,
+        do_process_image: Optional[bool] = None,
         **kwargs
     ) -> list[LLMResponse]:
         """执行聊天交互并返回响应
@@ -1467,6 +1490,7 @@ class Chat:
                 stream=stream,
                 url_to_base64_func=effective_url_func,
                 description_cache=effective_cache,
+                do_process_image=do_process_image if do_process_image is not None else self.do_process_image,
                 **kwargs
             )
 
@@ -1496,6 +1520,7 @@ class Chat:
                 completion_tokens=0,
                 total_tokens=0,
             )
+            print(traceback.format_exc())
             effective_recall(response)
             return [response]
             # raise RuntimeError(f"聊天过程中发生错误: {str(e)}") from e

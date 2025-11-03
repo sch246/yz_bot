@@ -1,5 +1,6 @@
 '''今日小动物'''
 import time
+import re
 
 from main import storage, getstorage, random, getname, headshot, read_params, cache, cq, pages
 
@@ -21,16 +22,37 @@ happys = [
 '(≧◡≦) ♡',
 ]
 
+def my_zip(*lists):
+    if len(lists)==1:
+        return ([arg] for arg in lists[0])
+    return zip(*lists)
 
-def get_jrxdw(personal_animal_types: list[str]):
+def the_zip(*lists):
+    if not lists or not lists[0]:
+        return ()
+    length = min(len(lst) for lst in lists)
+    return ((lst[i] for lst in lists)
+            for i in range(length))
+
+re_num = re.compile(r'^(\d+(\.\d+)?)|(\.\d+)$')
+
+def get_jrxdw(personal_animal_types: list[list]|None):
     '''
     获取今日小动物
 
     Arg:
-        personal_animal_types: 个人的今日小动物列表，默认全部动物
+        personal_animal_types: 个人的今日小动物列表，不填默认全部动物
     '''
-    fix_type = random.choices(['prefix', 'suffix'], weights=[len(prefix), len(suffix)])[0]
-    animal_type = random.choice(personal_animal_types or list(animal_types.keys()))
+    if not personal_animal_types:
+        animal_type = random.choice(list(animal_types.keys()))
+    else:
+        animals, weights = the_zip(*personal_animal_types)
+        animal_type = random.choices(animals, weights=weights)[0]
+        if animal_type == '*':
+            others = list(set(animal_types.keys()) - set(animals))
+            if not others:
+                animal_type = '虚空生物'
+            animal_type = random.choice(others)
 
     repeat_chance = animal_types.get(animal_type, 0)
 
@@ -38,6 +60,10 @@ def get_jrxdw(personal_animal_types: list[str]):
     while random.random() < repeat_chance:
         final_animal_type += animal_type
 
+    if not prefix and not suffix:
+        return final_animal_type
+
+    fix_type = random.choices(['prefix', 'suffix'], weights=[len(prefix), len(suffix)])[0]
     if fix_type == 'prefix':
         return random.choice(prefix) + final_animal_type
     else:
@@ -49,7 +75,11 @@ def run(body:str):
 格式:
 .jrxdw           # 今日小动物
 .jrxdw list      # 获取今日小动物列表
-.jrxdw set <animal_type>*  # 设置自己的今日小动物类别，可以用空格隔开，每个类别不能超过4个字
+.jrxdw me        # 查看自己的今日小动物类别
+.jrxdw set (<animal_type> <weight:num>?)*
+    # 设置自己的今日小动物类别，可以用空格隔开，每个类别不能超过4个字，每个权重默认为1.0，每个类别后面能设置权重（可选）
+    # 使用 * 设定剩余权重的和，不写默认为0
+    # 例如 .jrxdw set 猫 .1 兔 狐 3.14 鸟 6 * 0
 .jrxdw set                 # 重置自己的今日小动物类别'''
     if not animal_types:
         return '目前没有小动物，请先.bbxdw add 添加动物类型'
@@ -124,19 +154,37 @@ def run(body:str):
                 return f'今日小动物（们）：\n{result}\n\n今天真是小动物大军呢...'
             else:
                 return f'今日小动物（们）：\n{result}'
+    if s=='me':
+        if not personal_animal_types:
+            return '你还没有设置自己的小动物！'
+        if isinstance(personal_animal_types[0], str):
+            personal_animal_types = [[name, 1] for name in personal_animal_types]
+        show = "\n".join([f"{k[0]}: {k[1]}" for k in personal_animal_types])
+        return f'你的小动物及其权重是：\n{show}'
     if s=='set':
-        personal_animal_types = last.strip().split()
-        if personal_animal_types:
-            for animal_type in personal_animal_types:
-                if not animal_type in animal_types:
-                    return f'不存在的动物 {animal_type}，请先通过 .bbxdw add 来添加动物'
-            user_data['animal_types'] = personal_animal_types
-            return f'已设置动物种类 {personal_animal_types}'
+        args = last.strip().split()
+        if args:
+            add_types = []
+            while args:
+                head = args.pop(0)
+                if re_num.match(head):
+                    return run.__doc__
+                elif head not in [*animal_types.keys(), '*']:
+                    return f'不存在的动物 {head}，请先通过 .bbxdw add 来添加动物'
+                if args and re_num.match(args[0]):
+                    weight = float(args.pop(0))
+                    add_types.append([head, weight])
+                else:
+                    add_types.append([head, 1])
+
+            user_data['animal_types'] = add_types
+            show = "\n".join([f"{k[0]}: {k[1]}" for k in add_types])
+            return f'已设置你的小动物及其权重：\n{show}'
         elif user_data.get('animal_types'):
             del user_data['animal_types']
-            return '已重置你的动物种类设置'
+            return '已重置你的小动物设置'
         else:
-            return f'无需重置，本就没有设置动物种类\n建议种类:\n{list(animal_types.keys())}'
+            return f'无需重置，本就没有设置小动物\n可设置种类:\n{list(animal_types.keys())}'
 
     else:
         return run.__doc__

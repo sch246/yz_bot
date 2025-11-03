@@ -410,5 +410,5 @@ def prints(content, page_size=10, init_page=1):
         while 1:
             reply = _input(gen.send(text))
             text = {'message':reply}
-    except StopIteration:
-        _print('翻页已结束')
+    except StopIteration as e:
+        _print(e)

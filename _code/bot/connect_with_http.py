@@ -5,8 +5,13 @@ import json
 import sys
 import requests
 import time
+import re
 
 from main import ctrlc_decorator
+
+# 这些群/私聊的消息将转发到对应端口而不是默认
+post_map = {
+}
 
 # https://blog.csdn.net/qq_27694835/article/details/108613607
 # Requests 模块 https://www.cnblogs.com/saneri/p/9870901.html
@@ -23,15 +28,28 @@ except:
     listen_port = '5701'
 
 
-url = f'http://127.0.0.1:{post_port}'
+post_url = f'http://127.0.0.1'
 listen = ('127.0.0.1', int(listen_port))
+REQUEST_TIMEOUT = 5  # 5秒超时
 
 def call_api(action: str, **params) -> dict:
+    port = post_port
+    if 'group_id' in params:
+        group_key = f'g{params["group_id"]}'
+        port = post_map.get(group_key, post_port)
+    if 'user_id' in params:
+        user_key = f'u{params["user_id"]}'
+        port = post_map.get(user_key, post_port)
     headers = {
         'Content-Type': 'application/json'
     }
     re = requests.post(
-        url+f'/{action}', headers=headers, json=params, verify=False)
+        post_url+f':{port}/{action}',
+        headers=headers,
+        json=params,
+        verify=False,
+        timeout=REQUEST_TIMEOUT  # 添加超时
+        )
     try:
         return json.loads(re.text)
     except:
@@ -61,88 +79,113 @@ ListenSocket.listen(100)  # 传入的参数指定等待连接的最大数量
 
 def request_to_json(msg: str) -> dict | None:
     """
-    从分块传输的HTTP请求中提取并解析JSON数据
-    
-    处理格式如：
-    [HTTP Headers]
-    
-    c4
-    {"json": "data"}
-    0
-    
-    Args:
-        msg (str): HTTP请求消息字符串
-
-    Returns:
-        Optional[dict]: 解析后的JSON对象，如果没有找到JSON则返回None
+    从完整的HTTP请求中提取并解析JSON数据。
+    这个版本更通用，能处理两种类型的请求。
     """
     try:
         # 查找消息体开始的位置（双换行符后）
         body_start = msg.find('\r\n\r\n')
-        if body_start == -1:
-            body_start = msg.find('\n\n')
-        
         if body_start == -1:
             return None
             
         # 获取消息体
         body = msg[body_start:].strip()
         
-        # 查找第一个 { 和最后一个 }
-        json_start = body.find('{')
-        json_end = body.rfind('}')
-        
-        if json_start == -1 or json_end == -1:
-            return None
+        # 尝试直接解析，这适用于Content-Length的情况
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError:
+            # 如果直接解析失败，可能是chunked编码，其格式为
+            # [hex_len]\r\n{json_data}\r\n0\r\n\r\n
+            # 我们直接在body里找第一个 { 和最后一个 }
+            json_start = body.find('{')
+            json_end = body.rfind('}')
             
-        # 提取JSON字符串并解析
-        json_str = body[json_start:json_end + 1]
-        return json.loads(json_str)
-        
-    except json.JSONDecodeError:
+            if json_start != -1 and json_end != -1:
+                json_str = body[json_start:json_end + 1]
+                return json.loads(json_str)
+            else:
+                return None
+                
+    except Exception:
+        # 捕获所有可能的解析错误
         return None
 
 
-def recv_full_message(client: socket, buffer_size=8192, max_size=1024*1024, timeout=5) ->str:
+def recv_full_message(client: socket.socket, buffer_size=4092) -> str:
     """
-    从客户端接收完整消息
+    从客户端接收完整的HTTP消息（支持Content-Length和Chunked编码）。
 
     Args:
-        client (socket.socket): 客户端socket对象
+        client (socket.socket): 客户端socket对象.
+        buffer_size (int): 每次读取的缓冲区大小.
 
     Returns:
-        str: 接收到的完整消息
-
-    Raises:
-        ValueError: 如果消息过大
-        socket.timeout: 如果接收超时
+        str: 接收到的完整消息字符串.
     """
-    client.settimeout(timeout)
-    full_msg = b''
-    start_time = time.time()
-
-    try:
-        while True:
+    client.settimeout(5.0)  # 设置一个整体的超时
+    
+    # 1. 先接收HTTP头部
+    raw_request = b''
+    while b'\r\n\r\n' not in raw_request:
+        try:
             part = client.recv(buffer_size)
-            full_msg += part
+            if not part:
+                break # 连接已关闭
+            raw_request += part
+        except socket.timeout:
+            print("接收HTTP头部超时")
+            return "" # 返回空字符串表示失败
 
-            if len(full_msg) > max_size:
-                raise ValueError(f"Message too large: {len(full_msg)} bytes")
+    # 将字节解码为字符串，仅处理头部部分以避免解码错误
+    headers_part = raw_request.split(b'\r\n\r\n', 1)[0].decode('utf-8', errors='ignore')
+    
+    # 2. 检查 Content-Length
+    content_length_match = re.search(r'Content-Length: (\d+)', headers_part, re.IGNORECASE)
+    
+    if content_length_match:
+        # --- 方案A: 存在 Content-Length ---
+        content_length = int(content_length_match.group(1))
+        
+        # 从 raw_request 中分离出已经接收到的 body 部分
+        header_bytes, body_received = raw_request.split(b'\r\n\r\n', 1)
+        
+        # 计算还需要接收多少字节
+        remaining_bytes = content_length - len(body_received)
+        
+        # 循环接收直到满足 Content-Length
+        while remaining_bytes > 0:
+            try:
+                part = client.recv(min(remaining_bytes, buffer_size))
+                if not part:
+                    break # 连接异常关闭
+                body_received += part
+                remaining_bytes -= len(part)
+            except socket.timeout:
+                print(f"接收消息体超时，已接收 {len(body_received)}/{content_length} 字节")
+                break # 超时退出
+        
+        return (header_bytes + b'\r\n\r\n' + body_received).decode('utf-8', errors='ignore')
 
-            if len(part) < buffer_size:
-                break
-
-            if time.time() - start_time > timeout:
-                raise socket.timeout("Timeout while receiving message")
-
-    except socket.timeout:
-        if not full_msg:
-            raise  # 如果完全没有接收到数据，则抛出超时异常
-
-    finally:
-        client.settimeout(None)  # 恢复到阻塞模式
-
-    return full_msg.decode(encoding='utf-8', errors='ignore')
+    else:
+        # --- 方案B: 不存在 Content-Length (假定为 Chunked 或简单连接) ---
+        # 我们已经接收了头部和可能的第一部分数据，继续接收直到超时或收到空数据
+        full_msg_bytes = raw_request
+        try:
+            while True:
+                # 在非阻塞模式下尝试读取，直到没有更多数据
+                client.settimeout(0.2) # 短暂超时，用于接收分块数据
+                part = client.recv(buffer_size)
+                if not part:
+                    break # 这是chunked编码的正常结束方式之一
+                full_msg_bytes += part
+        except socket.timeout:
+            # 超时在这里是正常的，表示数据流结束
+            pass
+        finally:
+            client.settimeout(None) # 恢复阻塞模式
+            
+        return full_msg_bytes.decode('utf-8', errors='ignore')
 
 HttpResponseHeader = '''HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n'''.encode(encoding='utf-8')
 
@@ -160,6 +203,9 @@ def recv_msg() -> dict | None:
     with ListenSocket.accept()[0] as client:
         try:
             Request = recv_full_message(client)
+            if not Request:
+                print("未接收到有效请求")
+                return None
             res = request_to_json(Request)
             # 发送信号表示我收到了
             client.sendall(HttpResponseHeader)
