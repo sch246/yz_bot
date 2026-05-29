@@ -1,9 +1,17 @@
 '''回声洞'''
 from random import randint
 import re
+import json
+import os
 import time
 
-from main import storage, is_msg, getname, getgroupname, read_params, getran, cache, cq, str_tool, sendmsg, pages
+from main import storage, is_msg, getname, getgroupname, read_params, getran, cache, cq, str_tool, sendmsg, pages, file
+
+# 启动时的 cave 快照
+_cave_startup_snapshot = json.dumps({
+    'msgs': storage.get('', 'cave'),
+    'pool': storage.get('', 'cave_pool', list),
+}, ensure_ascii=False, sort_keys=True)
 
 class Cave:
     def __init__(self) -> None:
@@ -108,7 +116,9 @@ def run(body:str):
  | || <msg> # 放入一条消息
 .cave addn <count:int>
  : || ... # n次
-.cave del [<id:int>] # 删除一条消息，默认为上一条消息'''
+.cave del [<id:int>] # 删除一条消息，默认为上一条消息
+.cave save [<path>]   # 导出到文件
+.cave load [<path>]   # 从文件导入'''
     s, last = read_params(body)
     if not s or re_int.match(s):
         return cave.get(cave.index(s))
@@ -161,4 +171,83 @@ def run(body:str):
         if not keyword:
             return '请输入要搜索的关键词'
         return cave.search(keyword)
+    elif s=='save':
+        path, _ = read_params(last)
+        return _save_cave(path.strip() or 'data/cave_save.json')
+    elif s=='load':
+        path, _ = read_params(last)
+        return _load_cave(path.strip() or 'data/cave_save.json')
     return run.__doc__
+
+
+# ---- cave 配置的导入/导出 ----
+
+CAVE_MSG_REQUIRED_KEYS = ('sender', 'qq', 'time', 'text')
+
+def _save_cave(path: str):
+    '''保存当前 cave 到文件'''
+    data = {
+        'msgs': cave.msgs,
+        'pool': cave.pool,
+    }
+    try:
+        current = json.dumps(data, ensure_ascii=False, indent=2, default=str)
+    except Exception as e:
+        return f'序列化失败: {e}'
+
+    if _cave_startup_snapshot != current:
+        reply = yield f'当前 cave 与启动时不同（{len(cave.msgs)} 条），确认覆盖 {path}？(y/n)'
+        if not (is_msg(reply) and reply['message'].strip().lower() == 'y'):
+            return '操作取消'
+
+    file.json_write(path, data)
+    return f'已保存 {len(cave.msgs)} 条回声洞到 {path}'
+
+
+def _load_cave(path: str):
+    '''从文件加载 cave，验证后替换。失败则保留原数据'''
+    if not os.path.exists(path):
+        return f'文件不存在: {path}'
+
+    try:
+        data = file.json_read(path)
+    except Exception as e:
+        return f'读取失败: {e}'
+
+    if not isinstance(data, dict):
+        return f'格式错误: 期望 JSON 对象，得到 {type(data).__name__}'
+    if 'msgs' not in data or not isinstance(data['msgs'], dict):
+        return '格式错误: 缺少 msgs 字段或不是对象'
+    if 'pool' not in data or not isinstance(data['pool'], list):
+        return '格式错误: 缺少 pool 字段或不是列表'
+
+    # 逐条验证 msgs
+    errors = []
+    for key, msg in data['msgs'].items():
+        if not isinstance(msg, dict):
+            errors.append(f'msgs[{key}]: 不是对象')
+            continue
+        for k in CAVE_MSG_REQUIRED_KEYS:
+            if k not in msg:
+                errors.append(f'msgs[{key}]: 缺少字段 {k!r}')
+
+    if errors:
+        return f'验证失败，保留当前数据 ({len(cave.msgs)} 条):\n' + '\n'.join(errors[:10]) + (
+            f'\n... 共 {len(errors)} 处错误' if len(errors) > 10 else ''
+        )
+
+    # 确认替换
+    reply = yield f'将用 {len(data["msgs"])} 条替换当前 {len(cave.msgs)} 条，确认？(y/n)'
+    if not (is_msg(reply) and reply['message'].strip().lower() == 'y'):
+        return '操作取消'
+
+    cave.msgs.clear()
+    cave.msgs.update(data['msgs'])
+    cave.pool[:] = data['pool']
+    storage.save()
+    global _cave_startup_snapshot
+    _cave_startup_snapshot = json.dumps({
+        'msgs': cave.msgs,
+        'pool': cave.pool,
+    }, ensure_ascii=False, sort_keys=True)
+    return f'已加载 {len(cave.msgs)} 条回声洞，数据已保存到磁盘'
