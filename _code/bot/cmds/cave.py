@@ -5,7 +5,7 @@ import json
 import os
 import time
 
-from main import storage, is_msg, getname, getgroupname, read_params, getran, cache, cq, str_tool, sendmsg, pages, file
+from main import storage, is_msg, getname, getgroupname, read_params, getran, cache, cq, str_tool, sendmsg, pages
 
 # 启动时的 cave 快照
 _cave_startup_snapshot = json.dumps({
@@ -200,7 +200,9 @@ def _save_cave(path: str):
         if not (is_msg(reply) and reply['message'].strip().lower() == 'y'):
             return '操作取消'
 
-    file.json_write(path, data)
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False, default=str)
     return f'已保存 {len(cave.msgs)} 条回声洞到 {path}'
 
 
@@ -210,7 +212,8 @@ def _load_cave(path: str):
         return f'文件不存在: {path}'
 
     try:
-        data = file.json_read(path)
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
     except Exception as e:
         return f'读取失败: {e}'
 

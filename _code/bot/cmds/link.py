@@ -319,14 +319,12 @@ def _save_links(path: str):
 
     if os.path.exists(path):
         try:
-            existing = json.dumps(file.json_read(path), ensure_ascii=False, sort_keys=True)
-            if current != json.dumps(links, ensure_ascii=False, sort_keys=True):
-                # 文件内容与当前不一致（不同时间导出的旧文件）
-                pass  # 继续确认流程
-            elif existing == json.dumps(links, ensure_ascii=False, sort_keys=True):
+            with open(path, 'r', encoding='utf-8') as _f:
+                existing = json.load(_f)
+            if json.dumps(existing, ensure_ascii=False, sort_keys=True) == json.dumps(links, ensure_ascii=False, sort_keys=True):
                 return f'文件 {path} 内容与当前一致，无需保存'
         except Exception:
-            pass  # 文件损坏或格式不对，也走确认流程
+            pass  # 文件损坏或格式不对，走确认流程
 
     # 与启动快照对比
     if _links_startup_snapshot != current:
@@ -334,7 +332,9 @@ def _save_links(path: str):
         if not (is_msg(reply) and reply['message'].strip().lower() == 'y'):
             return '操作取消'
 
-    file.json_write(path, links)
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(links, f, indent=2, ensure_ascii=False, default=str)
     return f'已保存 {len(links)} 条 link 到 {path}'
 
 
@@ -345,7 +345,8 @@ def _load_links(path: str):
 
     # 读取
     try:
-        new_links = file.json_read(path)
+        with open(path, 'r', encoding='utf-8') as f:
+            new_links = json.load(f)
     except Exception as e:
         return f'读取失败: {e}'
 
