@@ -4,10 +4,14 @@
 
 import re
 import os
+import json
 import traceback
 from main import data
 
 from .py import *
+
+# 启动时的 links 快照，save 时对比是否被修改过
+_links_startup_snapshot = json.dumps(links, ensure_ascii=False, sort_keys=True)
 
 
 def run(body:str):
@@ -24,6 +28,8 @@ def run(body:str):
     | catch
         : <text>
         | || <text>
+    | save [<path>]
+    | load [<path>]
 
 link, 每个link可被命名, 由cond和action构成, 当cond被判断并通过时action将被执行
 创建link时, 可以指定是默认还是自定义
@@ -97,6 +103,12 @@ cond和action都是可执行的python代码, 但是环境不同, 执行流程是
         else:
             reply = yield '输入想筛选的文本'
         return _catch(reply)
+    elif s=='save':
+        path, _ = read_params(last)
+        return _save_links(path.strip() or 'data/links_save.json')
+    elif s=='load':
+        path, _ = read_params(last)
+        return _load_links(path.strip() or 'data/links_save.json')
     return run.__doc__
 
 
@@ -293,17 +305,89 @@ def _catch(reply):
 
 
 
-[
-    {
-        'name':'name',
-        'while':{
-            'succ':[],
-            'fail':[]
-        },
-        'cond':'python code',
-        'success':['linkname',...],
-        'fail':['linkname',...],
-        'action':'python code',
-    },
-    ...
-]
+# ---- link 配置的导入/导出 ----
+
+LINK_SAVE_REQUIRED_KEYS = ('name', 'type', 'cond', 'action')
+LINK_SAVE_VALID_TYPES = ('re', 'py')
+
+def _save_links(path: str):
+    '''保存当前 links 到文件。若文件已存在且内容与启动时有差异，确认覆盖'''
+    try:
+        current = json.dumps(links, ensure_ascii=False, indent=2, default=str)
+    except Exception as e:
+        return f'序列化失败: {e}'
+
+    if os.path.exists(path):
+        try:
+            existing = json.dumps(file.json_read(path), ensure_ascii=False, sort_keys=True)
+            if current != json.dumps(links, ensure_ascii=False, sort_keys=True):
+                # 文件内容与当前不一致（不同时间导出的旧文件）
+                pass  # 继续确认流程
+            elif existing == json.dumps(links, ensure_ascii=False, sort_keys=True):
+                return f'文件 {path} 内容与当前一致，无需保存'
+        except Exception:
+            pass  # 文件损坏或格式不对，也走确认流程
+
+    # 与启动快照对比
+    if _links_startup_snapshot != current:
+        reply = yield f'当前 links 与启动时不同（{len(links)} 条），确认覆盖 {path}？(y/n)'
+        if not (is_msg(reply) and reply['message'].strip().lower() == 'y'):
+            return '操作取消'
+
+    file.json_write(path, links)
+    return f'已保存 {len(links)} 条 link 到 {path}'
+
+
+def _load_links(path: str):
+    '''从文件加载 links，验证后替换当前配置。失败则保留原配置'''
+    if not os.path.exists(path):
+        return f'文件不存在: {path}'
+
+    # 读取
+    try:
+        new_links = file.json_read(path)
+    except Exception as e:
+        return f'读取失败: {e}'
+
+    if not isinstance(new_links, list):
+        return f'格式错误: 期望 JSON 数组，得到 {type(new_links).__name__}'
+
+    # 逐条验证
+    errors = []
+    for i, link in enumerate(new_links):
+        if not isinstance(link, dict):
+            errors.append(f'[{i}] 不是对象，得到 {type(link).__name__}')
+            continue
+        name = link.get('name', f'[{i}]')
+        for key in LINK_SAVE_REQUIRED_KEYS:
+            if key not in link:
+                errors.append(f'{name}: 缺少字段 {key!r}')
+        if link.get('type') not in LINK_SAVE_VALID_TYPES:
+            errors.append(f'{name}: type 无效 ({link.get("type")!r})，应为 re 或 py')
+        for list_key in ('succ', 'fail'):
+            if list_key not in link or not isinstance(link.get(list_key), list):
+                errors.append(f'{name}: 缺少列表字段 {list_key!r}')
+        w = link.get('while')
+        if not isinstance(w, dict):
+            errors.append(f'{name}: while 应为对象')
+        else:
+            for k in ('succ', 'fail'):
+                if k not in w or not isinstance(w[k], list):
+                    errors.append(f'{name}: while.{k} 应为列表')
+
+    if errors:
+        return f'验证失败，保留当前配置 ({len(links)} 条):\n' + '\n'.join(errors[:10]) + (
+            f'\n... 共 {len(errors)} 处错误' if len(errors) > 10 else ''
+        )
+
+    # 确认替换
+    reply = yield f'将用 {len(new_links)} 条 link 替换当前 {len(links)} 条，确认？(y/n)'
+    if not (is_msg(reply) and reply['message'].strip().lower() == 'y'):
+        return '操作取消'
+
+    # 原地替换，保持所有引用有效
+    links[:] = new_links
+    storage.save()
+    global _links_startup_snapshot
+    _links_startup_snapshot = json.dumps(links, ensure_ascii=False, sort_keys=True)
+    return f'已加载 {len(links)} 条 link，配置已保存到磁盘'
