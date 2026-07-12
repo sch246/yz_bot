@@ -37,7 +37,6 @@ def run(body: str):
 
 用户发送 `.hello Alice` → Bot 回复 `你好，Alice！`
 用户发送 `.hello` → Bot 回复 `你好，世界！`
-用户发送 `.hello 文档不匹配时` → 返回 `run.__doc__`（帮助文本）
 
 > **重要**：文件名就是命令名。`hello.py` → `.hello` 触发。
 
@@ -68,10 +67,12 @@ _code/bot/cmds/
 
 ### 加载流程
 
-1. `__init__.py` 在启动时扫描 `bot/cmds/` 下所有非 `_` 开头的 `.py` 文件
+1. `__init__.py` 导入时扫描 `bot/cmds/` 下所有非 `_` 开头的 `.py` 文件；顺序来自未排序的 `os.listdir()`
 2. 每个文件通过 `importlib.import_module('bot.cmds.xxx')` 导入
 3. 加载成功的命令存入 `modules` 字典
-4. 加载失败的存入 `fails` 列表，启动时通过消息通知
+4. 加载失败的存入 `fails` 列表；有 reboot 来源消息时回传，否则只在终端打印
+
+这套 `cmds` 就是项目的插件系统。插件只需要提供 `run(body)`，并可通过 `from main import ...` 获得几乎全部 Bot 能力。收益是添加命令的样板极少；代价是依赖没有自动解析，`main.py` 必须精确维护名称出现和插件加载的先后顺序。移动 import 或让命令提前加载都可能破坏启动，不应当作纯格式整理。
 
 ### 消息路由
 
@@ -81,9 +82,11 @@ if text.startswith('.') and cmds.is_cmd(text[1:]):
     _cmd_ret(cmds.run(*cmds.is_cmd(text[1:])))
 ```
 
-`is_cmd(text[1:])` 按 `commands` 列表顺序匹配：匹配第一个前缀相同的命令，且命令名后不能紧跟非空白符。例如 `.py print(1)` → 匹配 `py`，body = ` print(1)`。
+`is_cmd(text[1:])` 按 `commands` 列表顺序匹配：匹配第一个前缀相同的命令，且命令名后不能紧跟非空白符。例如 `.py print(1)` → 匹配 `py`，body = ` print(1)`。未知的 `.xxx` 不会被命令层消费，仍可能进入 link。
 
-**命令优先级** > link 系统 > python 执行（`!`）。
+候选名 `commands` 和成功导入的 `modules` 不是同一集合：失败候选不会自动移除，后续调用可能 KeyError；`main.recv()` 又把 `modules['py']` 当作路由必需项，因此 `.py` 加载失败会影响所有事件处理。
+
+完整入口顺序是用户可见协议，以[交互模型](docs/interaction-model.md#入口有优先级)为唯一说明；不要在插件指南中维护第二份顺序表。插件作者只需特别注意：成功匹配的文件命令优先于 link，但同一交互线里已经开始的 yield / `.py input()` 会先取得下一条消息；未知点命令仍可能落入 link。改变这些关系不是内部重排。
 
 ---
 
@@ -98,7 +101,7 @@ def run(body: str):
 .命令名 <参数说明>'''
 ```
 
-- `body`：命令名后面的部分（已 strip 开头的空白），不包含 `.` 和命令名本身
+- `body`：命令名后面的原始剩余部分，不包含 `.` 和命令名本身；若有分隔空白，该空白会保留
 - 返回 `str` 表示发送消息，返回 `None` 表示静默
 
 ### 权限检查
@@ -116,6 +119,8 @@ def run(body: str):
 - `cache.ops`：管理员 QQ 列表
 - `cache.any_same(msg, pattern)`：防止权限提示刷屏，同一人在一定消息内不再提醒
 
+命令加载器没有集中权限中间件，必须由每个插件自己检查。遗漏检查就会默认向普通用户开放；尤其是 `.py`、shell、文件、进程和宿主服务能力，不能依赖“命令看起来像管理员命令”获得保护。
+
 ### 参数解析
 
 ```python
@@ -125,9 +130,11 @@ s, last = read_params(body)
 # s = 第一个空格前的词
 # last = 剩余部分
 
-s, last = read_params(body, 2)
-# s = 第一个词, last = 第二个词开始的部分（用于取多个参数）
+first, second, rest = read_params(body, 2)
+# count=2 会返回两个词和剩余部分，共 3 个值
 ```
+
+因为命令路由保留命令名后的原始内容，`body` 要么为空，要么通常从分隔空白开始；`read_params()` 会校验这一点。需要把引号包围的内容视作一个参数时使用 `read_str=True`。读取完的最后一个值始终是尚未消费的剩余文本。
 
 ### 使用 pages 翻页
 
@@ -177,7 +184,9 @@ def run(body: str):
 - `yield 'xxx'` → 发送 `'xxx'`，等待用户的下一条消息
 - 用户的下一条消息通过 `yield` 的返回值获取（`reply` 是完整的消息字典）
 - `is_msg(reply)` 检查是否是有效消息（不是通知、心跳等）
-- 用户发送 `^C` 可以取消交互（`catches` 中对应 key 被删除）
+- 阻塞按 `(群号或私聊, 用户)` 隔离；同一用户在同一位置发送的点命令也会被当作 reply
+- 用户发送 `^C` 或 `^c` 会删除 `catches` 中对应 key，原 generator 不再继续；当前实现中裸 `^` 也会命中
+- 对 `.py input()` 使用的 Queue，这只会解除消息拦截，已经阻塞的 `Queue.get()` 线程不会收到取消信号，仍然等待
 
 ### 框架如何处理 yield
 
@@ -214,10 +223,9 @@ ns['cave'] = some_dict  # 原地修改
 
 ```
 data/storage/              # 根目录
-├── /                       # 空命名空间（默认）
-│   ├── cave.json           # storage.get('', 'cave')
-│   ├── links.json          # storage.get('', 'links')
-│   └── cave_pool.json
+├── cave.json               # storage.get('', 'cave')：空命名空间直接位于根
+├── links.json              # storage.get('', 'links')
+├── cave_pool.json
 ├── namespace_a/
 │   └── data.json           # storage.get('namespace_a', 'data')
 └── llm_system/
@@ -234,8 +242,18 @@ data/storage/              # 根目录
 ### 注意事项
 
 - `storage.get()` 返回的是**引用**，原地修改会自动反映到存储
-- 非基本类型的键（如 `int` key）在 `save()` 时会被 `skipkeys=True` 跳过
+- 非字符串基本键（如 `int`）会被 JSON 转成字符串；tuple 等 JSON 不支持的键会被 `skipkeys=True` 跳过
 - 不可 JSON 序列化的值会被 `default=lambda x: None` 转为 null
+- storage 在启动时载入内存、退出时整文件保存；运行期间直接手改对应 JSON 不会自动 reload，并可能在退出时被内存旧值覆盖
+- 需要在线修改时优先通过函数操作内存并显式 `storage.save()`；需要人工改磁盘时应先停止实例或建立冲突检测
+
+### 当前消息与近期记录
+
+- `cache.thismsg()` 取得当前线程正在处理的原始事件 dict；传入 dict 时会设置它。
+- `cache.get_last()` 取得最近记录的事件。
+- `cache.getlog(msg)` 取得同群或同私聊的近期消息，**最新一条位于索引 0**。
+- 每个聊天范围默认最多保留 256 条；这是运行时上下文和退出恢复缓存，不是完整历史检索库。
+- `cache.get_one()` / `same_times()` / `any_same()` 只在这段近期窗口中查找，不应当作长期聊天记录查询。
 
 ---
 
@@ -272,9 +290,10 @@ action: "{:name}" → 替换为捕获的值
 
 示例：
 ```
-.link re 回应 while
-: {称呼:柚子|YuZU}
-: s='我在'
+.link re 回应
+{称呼:柚子|YuZU}$
+===
+'我在'
 ```
 
 **py 类型**（Python 代码）：
@@ -284,6 +303,15 @@ action: sendmsg('pong')
 ```
 
 cond 最后一行作为布尔表达式判断通过/失败，`#` 开头视为 None。
+
+两种类型的 action 契约不同：
+
+| 类型 | cond | action |
+|------|------|--------|
+| `py` | 前几行 `exec`，末行 `eval` 判真 | 整段 `exec`；不会自动发送末行表达式 |
+| `re` | 模板展开后用 `re.match` 前缀匹配 | 替换 `{:name}`，前几行 `exec`、末行 `eval`；非 `None` 自动发送 |
+
+`{name:type}` 会尝试在共享环境中求值 `type`：字符串作为正则，可迭代值组成候选，失败则按字面正则；`{name}` 根据首字母大小写选择非空白或跨空白匹配，`{:type}` 只插入模式，重复命名会变成反向引用。捕获值用于 action 文本替换，不进入 `.py` locals。
 
 ### 链结构
 
@@ -317,6 +345,10 @@ cond 最后一行作为布尔表达式判断通过/失败，`#` 开头视为 Non
 - 加载前验证每条 link 的结构完整性
 - 验证失败保留当前配置
 - 保存时若当前 links 与启动时有差异，要求确认
+
+`.link catch` 会抑制 action，但仍真实执行每个 cond。`py cond` 可以包含任意 Python 副作用，因此 catch 不是纯 dry-run；cond 应遵守“不 send/recv、不改状态、不主动触发 action”的约定。
+
+当前异常路径需要特别注意：cond 报错会把 traceback 发到聊天、返回 falsy，并沿 `fail` 继续；action 报错同样会回传 traceback，但节点仍可能继续 `succ`。后者是现行缺陷。聊天提醒节流和全局 link 报错开关尚未实现，候选设计见 [docs/working/proposals/errors-and-logging.md](docs/working/proposals/errors-and-logging.md)。
 
 ---
 
@@ -381,7 +413,7 @@ from main import pages
 
 def run(body: str):
     items = [f'第{i}条记录: 内容...' for i in range(100)]
-    # 返回一个在 __send__ 中自动迭代的生成器
+    # 返回一个由 _cmd_ret() 自动推进的生成器
     return pages.display(items, page_size=10, init_page=1)
 ```
 
@@ -411,6 +443,21 @@ def heavy_task():
 future = heavy_task()  # 立即返回，不阻塞
 result = future.result()  # 阻塞等待结果
 ```
+
+### call_delay 装饰器
+
+`call_delay(delay_secs, max_size)` 把普通函数包装成串行队列并返回 `SimpleFuture`。`delay_secs` 可以是数值或根据调用参数计算的函数；正数在调用前等待，负数在调用后等待。当前 `main.send()` 正是这样统一限制 OneBot 发送频率，命令本身不需要各写一套 sleep/queue：
+
+```python
+@call_delay(
+    delay_secs=lambda *args, **kwargs: random.uniform(-0.3, -0.6),
+    max_size=20,
+)
+def send(...):
+    ...
+```
+
+普通回复可以忽略 Future；生命周期提示等必须确认完成的调用使用 `.result()`。需要注意：队列满、执行异常和超时都会进入 Future，忽略它也会忽略失败；当前超时只结束等待，不能真正停止底层工作线程。
 
 ### ctrlc_decorator
 
@@ -452,7 +499,7 @@ Ctrl+C 时会执行回调函数然后 `exit(0)`。
 ```python
 is_msg(msg)           # 是否普通消息
 is_group_msg(msg)     # 是否群消息
-is_private_msg(msg)   # 是否私聊消息
+# 私聊通常判断为 is_msg(msg) and not is_group_msg(msg)
 is_notice(msg)        # 是否通知
 is_recall(msg)        # 是否撤回通知
 is_heartbeat(msg)     # 是否心跳
@@ -465,17 +512,11 @@ is_img(msg)           # 消息是否仅含一张图片
 
 ### 本地测试命令逻辑
 
-可以在 `test.py` 中模拟：
+不要在临时脚本中直接 `import _code.main`：当前 import 会绑定 HTTP 监听端口、启动 scheduler、加载真实 storage，并注册退出保存器，不是隔离测试。
 
-```python
-# 模拟消息上下文
-from _code.main import cache
-cache.thismsg({'user_id': 123456, 'message': '.hello world', 'group_id': None})
+现有代码可以组合出私聊交互式集成调试：向 `5701` 注入虚拟私聊事件，再让该窗口执行 `.post <假 OneBot API 端口>`，后续 `send_msg`/`get_msg` 会被路由到假端而不发给 QQ。群映射当前会被 `user_id=None` 的默认路由覆盖，尚不能可靠截获 `main.send()`。详细步骤和副作用边界见 [`docs/runtime.md`](docs/runtime.md#组合式交互测试)。
 
-# 直接调用命令
-from _code.bot.cmds import hello
-print(hello.run('world'))
-```
+这仍不是无副作用单元测试：入站消息会进入真实日志、storage、link action 和计划任务。
 
 ### 查看 link 链
 
@@ -490,6 +531,8 @@ print(hello.run('world'))
 ```
 .reboot     # op 可用，正常重启（触发 atexit 保存）
 ```
+
+`.reboot` 会把发起消息保存为一次性钩子，重启后由命令插件向原聊天发送“重启完成”并删除钩子。`.shutdown` 同样留下只执行一次的下次启动问候。两者不仅是退出码封装，也是跨进程恢复交互的一部分。
 
 ### 日志
 
