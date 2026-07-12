@@ -479,7 +479,28 @@ def 小六壬(offset=0):
 
 
 def petpet(**kws):
+    temp_path = None
+    if 'toAvatar' in kws and str(kws['toAvatar']).startswith('http'):
+        try:
+            import requests, time
+            res = requests.get(kws['toAvatar'], timeout=10)
+            temp_path = f'/tmp/petpet_{int(time.time())}.png'
+            with open(temp_path, 'wb') as f:
+                f.write(res.content)
+            kws['toAvatar'] = f'file://{temp_path}'
+        except:
+            pass
+
     result = cq.url2cq(f'http://127.0.0.1:2334/petpet?{dict2url(kws)}')
+
+    # 用完即焚：自动清理临时文件
+    if temp_path:
+        try:
+            import os
+            os.remove(temp_path)
+        except:
+            pass
+
     return result
 ###
 petpet_dic=storage.get('','petpet')
