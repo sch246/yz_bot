@@ -639,7 +639,8 @@ def get_msgs(max_token=max_token, return_token=False):
 
     if messages[-1]['role'] == 'assistant':
         messages[-1]['prefix'] = True
-        # messages.append({'role':'user','content':f'---\nsystem\n---\n这是为了防止报错而添加的分隔线'})
+        messages.append({'role':'user','content':'（戳了戳你）'})
+      # messages.append({'role':'user','content':f'---\nsystem\n---\n这是为了防止报错而添加的分隔线'})
 
     if return_token:
         return messages, sum_token
@@ -1331,3 +1332,20 @@ def run(body:str, model="gpt-3.5-turbo"):
     #     stream = chat_client.req(tools, "auto", model)
     #     res_msg = add(stream, chat_client)
     #     tool_calls = res_msg.tool_calls
+#tools = [v.description for v in chat_client.tools.values()]
+    # # model = model if model is not None else chat_client.model
+    # model = chat_client.model
+    # stream = chat_client.req(tools, "auto", model)
+    # res_msg = add(stream, chat_client)
+    # tool_calls = res_msg.tool_calls
+
+    # while tool_calls:
+    #     for tool_call in tool_calls:
+    #         function_name = tool_call.function.name
+    #         try:
+    #             content = chat_client.tools[function_name].call(**json.loads(tool_call.function.arguments))
+    #         except:
+    #             content =f'called: {json.loads(tool_call.function.arguments)}\n\n'+ traceback.format_exc()
+    #         add({
+    #             "role": "tool",
+    #             "name": function_name,
