@@ -9,10 +9,13 @@
 ## 从哪里开始
 
 - [交互模型与设计哲学](docs/interaction-model.md)：命令优先级、上下文延续、状态范围，以及“修改后重启”为什么是有意的设计。
+- [设计原则与重写判断](docs/design-principles.md)：维护者如何评估抽象、直接能力、数据透明性和从零重写；架构讨论应先读这里。
 - [运行架构](docs/architecture.md)：命令插件、`main` 的人工依赖编排、`funcs.py` 与 `data/pyload.py` 的不同角色。
 - [演进历史](docs/history.md)：从学习 OneBot、早期 `.py`/`.link` 到 HTTP、WebSocket、go-cqhttp 与 NapCat 的变迁，以及哪些旧设计已经被替换。
 - [功能与命令目录](docs/commands.md)：按功能族说明公开命令、扩展运行环境和主要状态。
+- [LLM 聊天与工具调用](docs/llm.md)：上下文构建、模型配置、函数工具、自动调用循环和当前信任边界。
 - [运行边界与交互测试](docs/runtime.md)：NapCat 接入、真实消息路径，以及如何避免测试影响正在运行的实例。
+- [当前维护队列](docs/working/current-issues.md)：已经确认要修的缺陷、接受的现行约束，以及仍可选的加固项。
 - [未实现设计提案](docs/working/proposals/README.md)：Core 降级、Storage 热同步、异常日志、权限和多个独立 Bot 项目共存；这些内容不是当前契约。
 - [当前 link 反应快照](docs/working/link-reactions.md)：`data/storage/links.json` 中当前动态反应的可读索引；它是会随在线配置变化的工作快照。
 - [命令开发指南](COMMANDS.md)：新增命令时使用的实现级资料。预期交互语义以交互文档为准，当前精确语法以命令 docstring/`.help` 为准；若代码与设计意图冲突，应记录差异，而不是静默任选一边。

@@ -98,7 +98,7 @@ f'{getname()} 投了 {:r} 个 {:d} 面骰，总数为 {rd(int("{:r}"), int("{:d}
 
 `.link catch` 不执行 action，但会真实求值 cond。尤其 `py cond` 仍会运行其中的 Python 语句，所以它只是“抑制 action 的路径检查”，不是无副作用 dry-run。cond 约定上不应 send/recv、修改状态或主动调用 action，否则 catch 结果也不可信。
 
-当前 cond 报错会把 traceback 发到聊天，并把该条件视为失败后沿 `fail` 继续；action 报错也会回传 traceback，但该节点仍可能被视为成功并继续 `succ`。后者是现行缺陷，不是应依赖的契约。重复报错节流和 `.link error off|on|status` 仍是[未实现提案](working/proposals/errors-and-logging.md)。
+当前 cond 报错会把 traceback 发到聊天，并把该条件视为失败后沿 `fail` 继续；action 报错也会回传 traceback，但该节点仍可能被视为成功并继续 `succ`。后者是已确认要修的现行缺陷：action 异常应使节点失败，不能继续成功后继；异常后的失败分支如何执行仍需在实现时结合半执行状态决定。重复报错节流和 `.link error off|on|status` 仍是[未实现提案](working/proposals/errors-and-logging.md)。
 
 `.reply` 是当前 link 配置中的便捷反应：通过聊天内容生成一个静态回复节点，体现了“反应系统可以继续修改自己”。当前节点见 [link 快照](working/link-reactions.md)。
 
@@ -172,7 +172,7 @@ f'{getname()} 投了 {:r} 个 {:d} 面骰，总数为 {rd(int("{:r}"), int("{:d}
 
 当前 `#` 控制面包括查看供应商、查看或切换模型、查看模型列表、查看/追加/保存/应用提示词设定，以及切换图片读取。聊天历史从当前窗口近期消息重建，并以“聊天开始/聊天结束”标记截断。
 
-LLM 当前可使用时间、延时任务、天气和用户数据等工具；工具集合是运行配置的一部分，不应假设所有源码中出现的工具都已启用。
+LLM 当前还可以自动调用普通 Python 函数，包括时间、`.py` 共享环境执行、延时任务、天气、用户 storage、子模型任务分派和 MC 百科查询。工具 schema、启用列表、循环回写和高权限边界见独立的 [LLM 文档](llm.md)；不能把源码中所有已定义函数都当作当前已开放工具。
 
 ## Minecraft 与宿主服务
 

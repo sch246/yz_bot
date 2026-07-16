@@ -20,7 +20,7 @@ core 外的模块按照“失败后应一起废弃哪些功能”切分，而不
 
 大量模块 `from main import ...`，整个 `funcs.py` 又在 cmds 前一次性注入全局名称。直接拆目录会把一个启动失败变成大量连锁 NameError，因此采用纵向切片：
 
-1. 修复 cmds 的真实隔离边界：失败命令不可调用，路由不再硬取 `.py`；
+1. 先修复 cmds 的局部真实缺陷：失败命令不可调用；只有决定让 `.py` 成为可降级 feature 时，路由才不再硬取 `.py`；
 2. 从 `funcs.py` 只抽出真正不可缺的 core 函数，其余代码暂时由显式 feature loader 导入；
 3. 选择一个边界清楚的 feature，使其命令直接依赖该 feature 模块，而不是反向依赖 `main`；
 4. 验证后删除 `main` 中对应兼容导出，再迁移下一个 feature；
@@ -38,6 +38,6 @@ core 外的模块按照“失败后应一起废弃哪些功能”切分，而不
 
 - 一个非核心 feature 导入失败时，Bot 仍能接收消息并执行 core/其它命令；
 - 失败命令不会留在可匹配候选表；
-- `.py` 或 link 失败不会使所有事件在路由入口 KeyError；
+- 若本提案选择把 `.py`/link 移出 core，它们失败时不会使所有事件在路由入口 KeyError；
 - 模块状态命令能显示 loaded/failed/disabled 和 incident；
 - 每完成一个 feature 迁移，就删除对应的 `main` 兼容导出。

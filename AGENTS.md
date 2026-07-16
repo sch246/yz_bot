@@ -5,6 +5,7 @@ This repository is a live personal QQ Bot connected to the device's NapCat insta
 ## Before changing anything
 
 - Start at [README.md](README.md). User-visible behavior is authoritative in [docs/interaction-model.md](docs/interaction-model.md); current implementation structure is in [docs/architecture.md](docs/architecture.md); deployment and test hazards are in [docs/runtime.md](docs/runtime.md).
+- For rewrites, module redesigns, or architecture proposals, read [docs/design-principles.md](docs/design-principles.md) before proposing a target structure. First distinguish user-visible invariants, proven small mechanisms, historical accidents, and unresolved choices. Do not infer that “rewrite from scratch” means adopting conventional layers, DTOs, managers, or class-based framework primitives.
 - Documents under `docs/working/proposals/` are unimplemented proposals, not current contracts. `docs/working/link-reactions.md` is a dated snapshot, not live authority.
 - Preserve unrelated working-tree changes. Never assume existing modifications are disposable.
 
