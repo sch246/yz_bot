@@ -370,6 +370,9 @@ def recv(msg:dict|None):
                 return
 
         if is_msg(msg):
+                chat_module = cmds.modules.get('chat')
+                if chat_module:
+                        chat_module.eager_cache_images(msg)
                 msg = _strip_reply(msg)
 
 

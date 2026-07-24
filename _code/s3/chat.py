@@ -9,6 +9,7 @@ import re
 from enum import Enum
 from termcolor import colored
 import traceback
+import threading
 from copy import deepcopy
 from datetime import date, timedelta
 
@@ -395,6 +396,8 @@ class LLMCilent:
     def __init__(self):
         self.config = self._load_or_create_config()
         self.clients = {}  # 缓存不同provider的客户端
+        self._description_inflight = {}
+        self._description_inflight_lock = threading.Lock()
         self._init_clients()
 
     def _load_or_create_config(self) -> dict:
@@ -699,24 +702,46 @@ class LLMCilent:
         description_cache: dict,
         log_indent: str = "",
     ) -> Optional[str]:
-        description = get_cached_description(description_cache, image_url)
-        if description is not None:
-            print(f"{log_indent}✅ 图片描述缓存命中: {image_url}")
-            print(f"{log_indent}    {description}")
+        cache_key = (id(description_cache), image_url)
+        with self._description_inflight_lock:
+            description = get_cached_description(description_cache, image_url)
+            if description is not None:
+                print(f"{log_indent}✅ 图片描述缓存命中: {image_url}")
+                print(f"{log_indent}    {description}")
+                return description
+
+            event = self._description_inflight.get(cache_key)
+            is_owner = event is None
+            if is_owner:
+                event = threading.Event()
+                self._description_inflight[cache_key] = event
+
+        if not is_owner:
+            event.wait()
+            with self._description_inflight_lock:
+                description = get_cached_description(description_cache, image_url)
+            if description is not None:
+                print(f"{log_indent}✅ 等待中的图片描述已缓存: {image_url}")
             return description
 
-        description = self.describe_image(
-            image_url,
-            model=vision_model,
-            convert_url=convert_url,
-        )
-        if description:
-            removed = cache_description(description_cache, image_url, description)
-            if removed:
-                print(f"{log_indent}🧹 已清理 {removed} 条过期图片描述缓存")
-        else:
-            print(f"{log_indent}⚠️ 未能为 {image_url} 生成描述，不进行缓存。")
-        return description
+        try:
+            description = self.describe_image(
+                image_url,
+                model=vision_model,
+                convert_url=convert_url,
+            )
+            if description:
+                with self._description_inflight_lock:
+                    removed = cache_description(description_cache, image_url, description)
+                if removed:
+                    print(f"{log_indent}🧹 已清理 {removed} 条过期图片描述缓存")
+            else:
+                print(f"{log_indent}⚠️ 未能为 {image_url} 生成描述，不进行缓存。")
+            return description
+        finally:
+            with self._description_inflight_lock:
+                self._description_inflight.pop(cache_key, None)
+                event.set()
 
     def _process_images(
             self,

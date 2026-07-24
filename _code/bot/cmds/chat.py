@@ -17,7 +17,7 @@ import tiktoken
 
 
 from main import sendmsg
-from main import cache, connect, msg_id, storage, str_tool
+from main import cache, connect, msg_id, storage, str_tool, to_thread
 from main import chatlog
 from main import settings, getchatstorage, chat_groups
 from main import is_msg, is_poke, has_at, find, getlog, msg2chat, chat2msg, getcmd, getgroupname, getname, lunar_time, 小六壬, sendmsg as _sendmsg
@@ -652,6 +652,76 @@ def get_prompt() -> list:
 max_token = storage.get('llm_system', 'config').get('max_token', 4000)
 max_msg = storage.get('llm_system', 'config').get('max_msg', 200)
 
+IMAGE_MODES = ('off', 'lazy', 'eager')
+IMAGE_MODE_ALIASES = {'0': 'off', '1': 'lazy', '2': 'eager'}
+
+
+def normalize_image_mode(value) -> str:
+    """兼容旧布尔值，并把无效值安全降级为 off。"""
+    if value is True:
+        return 'lazy'
+    if value is False or value is None:
+        return 'off'
+    normalized = str(value).lower()
+    normalized = IMAGE_MODE_ALIASES.get(normalized, normalized)
+    if normalized in IMAGE_MODES:
+        return normalized
+    return 'off'
+
+
+def get_image_mode(data: dict = None) -> str:
+    data = getchatstorage() if data is None else data
+    return normalize_image_mode(data.get('image'))
+
+
+def _get_message_chat_storage(msg: dict) -> dict:
+    if msg.get('group_id') is not None:
+        return storage.get('groups', str(msg['group_id']))
+    return storage.get('users', str(msg['user_id']))
+
+
+def _get_message_image_urls(msg: dict) -> list[str]:
+    chat_message = msg2chat(msg, msg.get('group_id') is not None)
+    content = chat_message.get('content', [])
+    parts = content if isinstance(content, list) else [content]
+    urls = []
+    for part in parts:
+        if not isinstance(part, dict) or part.get('type') not in ['image', 'image_url']:
+            continue
+        image_url_data = part.get('image_url', part.get('image', ''))
+        if isinstance(image_url_data, dict):
+            image_url = image_url_data.get('url', '')
+        elif isinstance(image_url_data, str):
+            image_url = image_url_data
+        else:
+            image_url = ''
+        if image_url and image_url not in urls:
+            urls.append(image_url)
+    return urls
+
+
+@to_thread(ret='None')
+def _eager_cache_images(msg: dict):
+    vision_model = llm_cilent.get_vision_model()
+    if not vision_model:
+        return
+    for image_url in _get_message_image_urls(msg):
+        llm_cilent._get_image_description(
+            image_url,
+            vision_model,
+            get_image_base64,
+            description_cache,
+            'eager: ',
+        )
+
+
+def eager_cache_images(msg: dict):
+    """在 eager 聊天窗口中后台预识别新收到的图片消息。"""
+    if not is_msg(msg) or '[CQ:image' not in msg.get('message', ''):
+        return
+    if get_image_mode(_get_message_chat_storage(msg)) == 'eager':
+        _eager_cache_images(msg.copy())
+
 
 def _is_context_poke(msg: dict, in_group: bool) -> bool:
     if in_group:
@@ -832,8 +902,7 @@ def init_chat(chat_client:Chat, messages=[]):
             *messages
             ])
 
-    data = getchatstorage()
-    chat_client.do_process_image = data.get('image', False)
+    chat_client.do_process_image = get_image_mode() != 'off'
     # if 'split' not in data: # 设置默认值
     #     data['split'] = True
     # chat_client.split = data['split'] #决定是否划分发送
@@ -1037,11 +1106,22 @@ def _(name:str, prompt:list)->str:
 @cm.register('image')
 def _()->str:
     '''
-    切换是否读取图片
+    查看当前图片读取档位
     '''
-    data = getchatstorage()
-    data['image'] = not data.get('image')
-    return f"image: {data['image']}"
+    return f"image: {get_image_mode()}"
+
+
+@cm.register('image <mode:str>')
+def _(mode: str)->str:
+    '''
+    设置图片读取档位: off/0、lazy/1 或 eager/2
+    '''
+    mode = mode.lower()
+    mode = IMAGE_MODE_ALIASES.get(mode, mode)
+    if mode not in IMAGE_MODES:
+        return '图片读取档位必须是 off/0、lazy/1 或 eager/2'
+    getchatstorage()['image'] = mode
+    return f'image: {mode}'
 
 
 # def get_balance(base_url, api_key):

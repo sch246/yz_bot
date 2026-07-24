@@ -39,7 +39,7 @@ class CommandManager:
             elif type_ == 'int':
                 return f'(?P<{name}>-?\\d+)'
             else:  # dict or any other type
-                return f'(?P<{name}>[\S\s]+)'
+                return rf'(?P<{name}>[\S\s]+)'
         return re.sub(r'<(\w+):(\w+)>', replace, pattern)
 
     def _convert_type(self, value: str, type_: str):
