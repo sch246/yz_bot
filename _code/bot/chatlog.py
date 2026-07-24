@@ -94,14 +94,10 @@ def write(msg):
             elif is_friend_recall(msg):
                 return _private_write(msg, user_id, _notice_str(t, f'{cache.get_user_name(user_id)}撤回了一条消息({msg["message_id"]})'))
             elif is_poke(msg):
-                target_id = int(msg['target_id'])
+                text = format_poke(msg)
                 if 'group_id' in msg.keys():
-                    _, target = cache.get_group_user_info(group_id, target_id)
-                    text = f'{name}({user_id})戳了戳{target}({target_id})'
                     return _group_write(msg, group_id, _notice_str(t, text))
                 else:
-                    target = cache.get_user_name(target_id)
-                    text = f'{name}戳了戳{target}'
                     return _private_write(msg, user_id, _notice_str(t, text))
             elif is_lucky_king(msg):
                 target = cache.get_user_name(int(msg['target_id']))
@@ -203,6 +199,21 @@ def _private_str(name: str, t: int, text: str, msg_id:str=''):
 
 def _notice_str(t: int, text: str):
     return f': {text} {time.strftime(r"%H:%M:%S", time.localtime(t))}\n'
+
+
+def format_poke(msg: dict) -> str:
+    """把戳一戳 notice 格式化为可供 chatlog 和 LLM 共用的事件文本。"""
+    user_id = int(msg['user_id'])
+    target_id = int(msg['target_id'])
+    if 'group_id' in msg:
+        group_id = int(msg['group_id'])
+        _, name = cache.get_group_user_info(group_id, user_id)
+        _, target = cache.get_group_user_info(group_id, target_id)
+        return f'{name}({user_id})戳了戳{target}({target_id})'
+
+    name = cache.get_user_name(user_id)
+    target = cache.get_user_name(target_id)
+    return f'{name}戳了戳{target}'
 
 
 def gettime(sec:int):

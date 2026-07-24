@@ -48,8 +48,11 @@ import bot.pages as pages
 import bot.cache as cache
 import bot.chatlog as chatlog
 
-from s3.chat import LLMCilent, Chat, sum_res, LLMResponse
-from s3.url_to_base64 import get_image_base64
+from s3.chat import (
+        LLMCilent, Chat, sum_res, LLMResponse, resolve_model,
+        get_cached_description, cache_description,
+)
+from s3.url_to_base64 import get_image_base64, get_image_file_base64
 
 from dotenv import load_dotenv
 
@@ -76,17 +79,21 @@ def transform_image_to_text(text: str):
                                 data = cq.load(part)['data']
                                 url = data['url']
 
-                                if url in description_dict:
-                                        print(f"✅ 图片描述缓存命中: {description_dict[url]}")
-                                        lst.append(description_dict[url])
+                                description = get_cached_description(description_dict, url)
+                                if description is not None:
+                                        print(f"✅ 图片描述缓存命中: {description}")
+                                        lst.append(description)
                                 else:
                                         res = llm_cilent.get_vision_model()
                                         if res:
-                                                vision_provider, vision_model = res
                                                 print(f"❌ 图片描述缓存未命中: {url}")
-                                                future = to_thread(llm_cilent._describe_image)(url, vision_provider, vision_model, get_image_base64)
+                                                future = to_thread(llm_cilent.describe_image)(
+                                                        url,
+                                                        model=res,
+                                                        convert_url=get_image_base64,
+                                                )
                                                 print(f'future: {future}')
-                                                lst.append(future)
+                                                lst.append((future, url))
                                         else:
                                                 lst.append("[图片: 解析失败]")
                         except Exception as e:
@@ -96,9 +103,17 @@ def transform_image_to_text(text: str):
                         lst.append(part)
 
         # 多线程（to_thread）将图片转换为描述
-        lst = [f"[图片:{future.result()}]" if isinstance(future, SimpleFuture) else future for future in lst]
+        resolved = []
+        for item in lst:
+                if isinstance(item, tuple) and isinstance(item[0], SimpleFuture):
+                        description = item[0].result()
+                        if description:
+                                cache_description(description_dict, item[1], description)
+                        resolved.append(f"[图片:{description or '解析失败'}]")
+                else:
+                        resolved.append(item)
 
-        return ''.join(lst)
+        return ''.join(resolved)
 
 
 __botdir__ = '/'.join(__file__.split('/')[:-2])

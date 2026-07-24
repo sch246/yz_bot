@@ -17,7 +17,8 @@ import tiktoken
 
 
 from main import sendmsg
-from main import cache, msg_id, storage, str_tool
+from main import cache, connect, msg_id, storage, str_tool
+from main import chatlog
 from main import settings, getchatstorage, chat_groups
 from main import is_msg, is_poke, has_at, find, getlog, msg2chat, chat2msg, getcmd, getgroupname, getname, lunar_time, 小六壬, sendmsg as _sendmsg
 from main import cq
@@ -25,7 +26,7 @@ from main import CommandManager
 
 import json
 
-from main import LLMCilent, Chat, sum_res, LLMResponse, get_image_base64
+from main import LLMCilent, Chat, sum_res, LLMResponse, get_image_base64, get_image_file_base64, resolve_model
 
 from main import memberlist
 
@@ -121,31 +122,34 @@ def get_caller():
 def inc_call_count():
     get_caller()[0] += 1
 
-def get_attr(provider:str, model:str):
-    return llm_config['providers'].get(provider, {}).get('models',{}).get(model,{})
+def get_attr(model:str):
+    try:
+        return resolve_model(llm_config, model)[2]
+    except ValueError:
+        return {}
 
-def get_prices(provider:str, model:str):
-    attr = get_attr(provider, model)
+def get_prices(model:str):
+    attr = get_attr(model)
     prompt_price = attr.get('prompt_price', 0)
     completion_price = attr.get('completion_price', 0)
     return (prompt_price, completion_price)
 
 cost_lock = threading.Lock()
-def inc_call_tokens_cost(provider, model, tokens: tuple[int, int]):
+def inc_call_tokens_cost(model, tokens: tuple[int, int]):
     with cost_lock:
         (prompt_tokens, completion_tokens) = tokens
-        (prompt_price, completion_price) = get_prices(provider, model)
+        (prompt_price, completion_price) = get_prices(model)
         price = (prompt_tokens*prompt_price + completion_tokens*completion_price)/1_000_000
         get_caller()[1] += price
 
-def inc_call_token_cost(provider, model, type:int, token:int):
-    prices = get_prices(provider, model)
+def inc_call_token_cost(model, type:int, token:int):
+    prices = get_prices(model)
     price = token*prices[type]/1_000_000
     get_caller()[1] += price
 
-def inc_call_text_cost(provider, model, type:int, text:str):
+def inc_call_text_cost(model, type:int, text:str):
     token = count_tokens(text)
-    inc_call_token_cost(provider, model, type, token)
+    inc_call_token_cost(model, type, token)
 
 def inc_call_image_cost(size:str, quality:str):
     price = 0.28
@@ -405,7 +409,7 @@ def set_user_data(user_id:int,key:str,value:str):
     except Exception as e:
         return str(e)
 
-def assign_tasks(prompt: str, tasks: str, tools: str, model: str = "deepseek-v3", max_workers: int = 5):
+def assign_tasks(prompt: str, tasks: str, tools: str, model: str = "deepseek/deepseek-v4-flash", max_workers: int = 5):
     '''
     使用多线程并发执行，用于分派子任务给其它AI，返回一个包含结果的列表，每个元素是一个元组 (task, result_text)
     当任务可以分解为上下文无关的独立子任务时，分派给其它AI模型，可以节省上下文和提升效率
@@ -414,7 +418,7 @@ def assign_tasks(prompt: str, tasks: str, tools: str, model: str = "deepseek-v3"
     当你是子AI时，并发数必须为1，否则很容易并发数过多
 
     @param
-    model: 调用的大语言模型
+    model: provider/model 格式的大语言模型
     prompt: 给每个子AI的统一提示词，如 prompt="搜索这个我的世界mod并总结内容:"
     tasks: 附加在统一提示词后面的内容，每行对应一个任务，如 tasks="acedium\\nalexs caves delight\\nArgentina s delight"
     tools: 分派给所有AI使用的工具，每行一个名称，不能重复，必须是你已有的工具，如 "search_mc_mod\\ncheck_mod"
@@ -454,14 +458,13 @@ def assign_tasks(prompt: str, tasks: str, tools: str, model: str = "deepseek-v3"
             if chunk.total_tokens:
                 # 调用线程安全的费用更新函数
                 inc_call_tokens_cost(
-                    chat_client.provider,
                     chat_client.model,
                     (chunk.prompt_tokens, chunk.completion_tokens),
                 )
 
         try:
             # 每个线程创建自己独立的 ChatClient 实例，这是非常重要的，可以避免状态混淆
-            chat_client = Chat(provider='openai', model=model, chat_client=llm_cilent)
+            chat_client = Chat(model=model, chat_client=llm_cilent)
 
             for tool_name in tool_list:
                 if tool_name in all_funcs:
@@ -600,6 +603,39 @@ all_funcs = {name:func for name, func in vars().items() if callable(func) and na
 prompts = storage.get('llm_system', 'prompts')
 
 
+# 这个工具依赖当前聊天上下文，因此定义在 all_funcs 快照之后，避免被
+# assign_tasks 分派给没有可靠 cache.thismsg() 上下文的子会话。
+def poke(user_id: int):
+    '''
+    戳一戳当前聊天中的用户。群聊只能在当前群内戳目标，私聊只能戳当前对话者。
+
+    @param
+    user_id: 要戳的用户 QQ 号
+    '''
+    msg = cache.thismsg() or {}
+    target_id = int(user_id)
+    group_id = msg.get('group_id')
+
+    if group_id is not None:
+        response = connect.call_api(
+            'send_poke',
+            group_id=int(group_id),
+            user_id=target_id,
+        )
+    else:
+        current_user_id = msg.get('user_id')
+        if current_user_id is None:
+            return '戳一戳失败：当前没有可用的聊天上下文'
+        if target_id != int(current_user_id):
+            return '戳一戳失败：私聊中只能戳当前对话者'
+        response = connect.call_api('send_poke', user_id=target_id)
+
+    if not isinstance(response, dict) or response.get('retcode') != 0:
+        wording = response.get('wording') if isinstance(response, dict) else None
+        return f'戳一戳失败：{wording or "接口未返回成功状态"}'
+    return f'已戳用户 {target_id}'
+
+
 def get_prompt() -> list:
     data = getchatstorage()
     name = data.get('prompt') #可能是name索引或者list
@@ -616,9 +652,15 @@ def get_prompt() -> list:
 max_token = storage.get('llm_system', 'config').get('max_token', 4000)
 max_msg = storage.get('llm_system', 'config').get('max_msg', 200)
 
+
+def _is_context_poke(msg: dict, in_group: bool) -> bool:
+    if in_group:
+        return is_poke(msg)
+    return is_poke(cache.qq)(msg)
+
+
 def get_msgs(max_token=max_token, return_token=False):
     in_group = cache.thismsg().get('group_id')
-    poke_target = cache.qq
 
     chat_logs = []
     for msg in getlog()[:max_msg]:
@@ -628,8 +670,7 @@ def get_msgs(max_token=max_token, return_token=False):
             if msg['message']=='聊天开始' or msg['message']=='聊天结束':
                 break
             chat_logs.append(msg)
-        elif is_poke(poke_target)(msg):
-            # 戳柚子的戳一戳事件也加入聊天记录
+        elif _is_context_poke(msg, in_group):
             chat_logs.append(msg)
 
     messages = []
@@ -657,22 +698,64 @@ def get_msgs(max_token=max_token, return_token=False):
                 break
 
             messages.insert(0, chat_msg)
-        elif is_poke(poke_target)(msg):
-            # 将戳一戳事件转换为 system 消息
-            user_id = msg.get('user_id', 0)
-            group_id = msg.get('group_id') if in_group else None
-            name = getname(user_id, group_id)
-            system_msg = {
-                'role': 'system',
-                'content': f'【事件】{name}({user_id})戳了戳柚子'
+        elif _is_context_poke(msg, in_group):
+            event_type = '群聊事件' if in_group else '私聊事件'
+            content = f'【{event_type}】{chatlog.format_poke(msg)}'
+            sum_token += count_tokens(content)
+            if sum_token > max_token:
+                break
+            event_msg = {
+                'role': 'user',
+                'content': content,
             }
-            messages.insert(0, system_msg)
+            messages.insert(0, event_msg)
 
     # 原有的补丁代码已移除，戳一戳事件现在会被正确记录
 
     if return_token:
         return messages, sum_token
     return messages
+
+
+def recognize_image(image_url: str, prompt: str = ""):
+    '''
+    按自定义要求识别网络图片。可用于描述、OCR、提取结构化信息或回答针对图片的问题；每次调用都会重新识别，不使用自动描述缓存。
+
+    @param
+    image_url: 完整的 HTTP(S) 图片 URL 或 data:image URI
+    prompt: 希望视觉模型针对图片完成的识别任务；留空时使用默认详细描述要求
+    '''
+    if not re.match(r'^(?:https?://|data:image/)', image_url, re.IGNORECASE):
+        return '图片识别失败：仅支持 HTTP(S) 图片 URL 或 data:image URI'
+
+    description = llm_cilent.describe_image(
+        image_url,
+        prompt=prompt,
+        convert_url=get_image_base64,
+    )
+    return description or '图片识别失败：视觉模型未返回描述'
+
+
+def recognize_image_file(path: str, prompt: str = ""):
+    '''
+    按自定义要求读取并识别本地图片文件。支持描述、OCR、结构化提取或回答针对图片的问题。
+
+    @param
+    path: 本地图片文件路径；相对路径以 Bot 当前工作目录为基准
+    prompt: 希望视觉模型针对图片完成的识别任务；留空时使用默认详细描述要求
+    '''
+    try:
+        image_data = get_image_file_base64(path)
+    except (OSError, ValueError) as error:
+        return f'图片文件读取失败：{error}'
+
+    description = llm_cilent.describe_image(
+        image_data,
+        prompt=prompt,
+    )
+    return description or '图片识别失败：视觉模型未返回描述'
+
+
 def init_chat(chat_client:Chat, messages=[]):
     '''
     添加工具，设定
@@ -681,6 +764,9 @@ def init_chat(chat_client:Chat, messages=[]):
     # chat.add_tool(get_location)
     chat_client.add_tool(get_time)
     chat_client.add_tool(exec_code)
+    chat_client.add_tool(poke)
+    chat_client.add_tool(recognize_image)
+    chat_client.add_tool(recognize_image_file)
     # chat_client.add_tool(read_data)
     # chat_client.add_tool(group_size)
     # chat_client.add_tool(group_members)
@@ -767,55 +853,68 @@ cm = CommandManager()
 def format_price(model: str, attr: dict) -> str:
     return f"{model}\n    {attr.get('prompt_price', '-')} {attr.get('completion_price', '-')} { '👀' if attr.get('vision') else ''} { '⚙️' if attr.get('function_calling') else ''}"
 
-@cm.register('provider')
-def get_provider() -> str:
-    '''
-    查看当前供应商
-    '''
-    return getchatstorage().get('provider', llm_config.get('default_provider', 'openai'))
+
+def get_model() -> str:
+    '''获取当前 provider/model 选择。'''
+    data = getchatstorage()
+    model = data.get('model', llm_config['default_model'])
+    try:
+        resolve_model(llm_config, model)
+    except ValueError:
+        data.pop('model', None)
+        model = llm_config['default_model']
+    return model
+
 
 @cm.register('model')
-def get_model() -> str:
+def _get_model_command() -> str:
     '''
     查看当前模型
     '''
-    return getchatstorage().get('model', llm_config.get('default_model', 'gpt-4o-mini'))
+    return get_model()
 
 @cm.register('models')
 def list_models() -> str:
     '''
     列出所有模型的价格
     '''
-    models = llm_config.get('providers', {}).get(get_provider(), {}).get('models', {})
-    return "\n".join(["模型 输入价格 输出价格 (单位: 元/(1m token)) 视觉识别 函数调用"]+[format_price(model, attr) for model, attr in models.items()])
+    provider = resolve_model(llm_config, get_model())[0]
+    models = llm_config.get('providers', {}).get(provider, {}).get('models', {})
+    return "\n".join(["模型 输入价格 输出价格 (单位: 元/(1m token)) 视觉识别 函数调用"]+[format_price(f'{provider}/{model}', attr) for model, attr in models.items()])
 
-@cm.register('model <model:str>')
-def list_specific_model(model: str) -> str:
+@cm.register('model <selection:str>')
+def list_specific_model(selection: str) -> str:
     '''
     列出特定模型的价格
     '''
-    model_attr = llm_config.get('providers', {}).get(get_provider(), {}).get('models', {}).get(model)
-    if model_attr:
-        return "模型 输入价格 输出价格 (单位: 元/(1k token)) 视觉识别 函数调用\n"+format_price(model, model_attr)
-    else:
-        return f"未找到模型: {model}"
+    try:
+        _, _, model_attr = resolve_model(llm_config, selection)
+    except ValueError as error:
+        return str(error)
+    return "模型 输入价格 输出价格 (单位: 元/(1m token)) 视觉识别 函数调用\n"+format_price(selection, model_attr)
 
 @cm.register('use_model')
 def _()->str:
     '''
     重置模型
     '''
-    if getchatstorage().get('model'):
-        del getchatstorage()['model']
+    data = getchatstorage()
+    data.pop('model', None)
     return '已重置模型'
 
-@cm.register('use_model <model:str>')
-def _(model:str)->str:
+@cm.register('use_model <selection:str>')
+def _(selection:str)->str:
     '''
-    使用模型
+    使用供应商下的模型，格式: provider/model
     '''
-    getchatstorage()['model'] = model
-    return f'模型设置为 {model}'
+    try:
+        resolve_model(llm_config, selection)
+    except ValueError as error:
+        return str(error)
+
+    data = getchatstorage()
+    data['model'] = selection
+    return f'模型设置为 {selection}'
 
 @cm.register('prompt')
 def _()->list:
@@ -1167,14 +1266,13 @@ def get_handler(chat_client:Chat):
 
         if chunk.total_tokens:
             inc_call_tokens_cost(
-                chat_client.provider,
                 chat_client.model,
                 (chunk.prompt_tokens, chunk.completion_tokens),
             )
     return handle_LLMResponse
 
 def chat(model=None):
-    chat_client = Chat(provider=get_provider(), model=model or get_model(), chat_client=llm_cilent)
+    chat_client = Chat(model=model or get_model(), chat_client=llm_cilent)
 
     # msg = cache.thismsg()
     # if 'group_id' in msg:
@@ -1286,14 +1384,14 @@ def chat(model=None):
 #     yield _rm_pre_text(text.getvalue())
 
 
-def run(body:str, model="gpt-3.5-turbo"):
+def run(body:str, model=None):
     '''询问柚子单句问题
 .chat <内容>
 多句请使用"柚子聊聊天"截断前文
 然后使用"柚子，"开头"'''
 
 
-    chat_client = Chat(provider=get_provider(),model=model or get_model(),chat_client=llm_cilent)
+    chat_client = Chat(model=model or get_model(), chat_client=llm_cilent)
     init_chat(chat_client, [
         {
             'role': 'assistant',
@@ -1306,7 +1404,6 @@ def run(body:str, model="gpt-3.5-turbo"):
             _sendmsg(chunk.content)
         if chunk.total_tokens:
             inc_call_tokens_cost(
-                chat_client.provider,
                 chat_client.model,
                 (
                     chunk.prompt_tokens,

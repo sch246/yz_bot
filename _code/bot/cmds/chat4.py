@@ -2,7 +2,7 @@
 
 from .chat import chat as _chat, run as _run
 
-model='gpt-4o-mini'
+model='openai/gpt-4o-mini'
 
 def chat():
     return _chat(model=model)

@@ -32,6 +32,38 @@ MIME_TO_EXTENSION = {
     'image/tiff': '.tif', # 或 .tiff
 }
 
+MAX_LOCAL_IMAGE_BYTES = 20 * 1024 * 1024
+
+
+def get_image_file_base64(path: str, max_bytes: int = MAX_LOCAL_IMAGE_BYTES) -> str:
+    """读取并验证本地图片文件，返回可发送给视觉模型的 data URI。"""
+    resolved_path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isfile(resolved_path):
+        raise ValueError('图片文件不存在或不是普通文件')
+
+    size = os.path.getsize(resolved_path)
+    if size > max_bytes:
+        raise ValueError(f'图片文件超过 {max_bytes // (1024 * 1024)} MiB 限制')
+
+    with open(resolved_path, 'rb') as image_file:
+        binary_data = image_file.read()
+
+    try:
+        with Image.open(io.BytesIO(binary_data)) as image:
+            image_format = image.format
+            image.verify()
+    except UnidentifiedImageError as error:
+        raise ValueError('文件不是可识别的图片') from error
+
+    mime_type = PIL_FORMAT_TO_MIME.get(image_format)
+    if not mime_type:
+        mime_type = mimetypes.guess_type(resolved_path)[0]
+    if not mime_type or not mime_type.startswith('image/'):
+        raise ValueError(f'不支持的图片格式: {image_format or "unknown"}')
+
+    encoded = base64.b64encode(binary_data).decode('ascii')
+    return f'data:{mime_type};base64,{encoded}'
+
 def get_image_base64(url, target_dir=TEMP_PATH):
     """
     下载图片（使用缓存）并转换为data URI格式，使用PIL判断类型。

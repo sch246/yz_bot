@@ -9,6 +9,8 @@ import re
 from enum import Enum
 from termcolor import colored
 import traceback
+from copy import deepcopy
+from datetime import date, timedelta
 
 # import html
 # import time
@@ -40,11 +42,177 @@ class ModelCapabilities:
     prompt_price: float = 0.0
     completion_price: float = 0.0
 
-@dataclass
-class ProviderConfig:
-    base_url: str
-    api_key: str
-    models: dict[str, ModelCapabilities]
+DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
+DEFAULT_VISION_MODEL = "bytecat/gpt-5.4-mini"
+
+BYTECAT_PROVIDER_CONFIG = {
+    "base_url": "BYTECAT_BASE_URL",
+    "api_key": "BYTECAT_API_KEY",
+    "models": {
+        "gpt-5.4-mini": {
+            "vision": True,
+            "function_calling": True,
+            "prompt_price": 0.075,
+            "completion_price": 0.45,
+        },
+        "gpt-5.4-openai-compact": {
+            "vision": True,
+            "function_calling": True,
+            "prompt_price": 0.5,
+            "completion_price": 3,
+        },
+        "gpt-5.5": {
+            "vision": True,
+            "function_calling": True,
+            "prompt_price": 0.5,
+            "completion_price": 3,
+        },
+        "gpt-5.5-openai-compact": {
+            "vision": True,
+            "function_calling": True,
+            "prompt_price": 1,
+            "completion_price": 8,
+        },
+        "gpt-5.6-luna": {
+            "vision": True,
+            "function_calling": True,
+            "prompt_price": 0.1,
+            "completion_price": 0.6,
+        },
+        "gpt-5.6-sol": {
+            "vision": True,
+            "function_calling": True,
+            "prompt_price": 1,
+            "completion_price": 6,
+        },
+        "gpt-5.6-terra": {
+            "vision": True,
+            "function_calling": True,
+            "prompt_price": 0.25,
+            "completion_price": 1.5,
+        },
+        "gpt-3.5-turbo-0613": {
+            "vision": True,
+            "function_calling": True,
+            "prompt_price": 1.5,
+            "completion_price": 3,
+        },
+        "gpt-5.3-codex-spark": {
+            "vision": True,
+            "function_calling": True,
+            "prompt_price": 0.7,
+            "completion_price": 5.6,
+        },
+    },
+}
+
+DESCRIPTION_CACHE_LIMIT = 500
+DESCRIPTION_CACHE_MAX_AGE_DAYS = 15
+
+DEFAULT_IMAGE_DESCRIPTION_PROMPT = """请详细描述图片内容，作为无视觉能力模型的上下文替代：
+
+- 主体与文字：指出图片类型（如表情包、软件截图、照片、图表等），并完整准确地转录图中所有清晰可见的文字。
+- 画面细节：描述画面中的主体、人物动作、表情、关键物体以及要素间的关系。
+- 情感与意图（若适用）：若图片为表情包、网络梗图或具有鲜明情绪倾向的图片，请说明其表达的核心情感（如讽刺、自嘲、崩溃等）或潜在梗意；若为普通客观图片则忽略此项。
+
+输出要求：直接输出客观描述结果。严禁任何前言、总结、自我介绍，严禁询问用户或提供后续格式化建议。"""
+
+
+def build_image_description_prompt(prompt: str = "") -> str:
+    """给默认任务和自定义任务统一附加禁止元话术的输出约束。"""
+    task = prompt.strip() if isinstance(prompt, str) else ""
+    if not task:
+        return DEFAULT_IMAGE_DESCRIPTION_PROMPT
+    return f"""请按以下任务识别图片：
+{task}
+
+只输出任务要求的图片识别结果。不要解释任务，不要提及视觉模型或无视觉模型，不要向用户提供后续服务，也不要询问是否需要整理成其它格式。"""
+
+
+def split_model_selection(selection: str) -> tuple[str, str]:
+    """按第一个斜杠拆分 provider/model。"""
+    if not isinstance(selection, str):
+        raise ValueError("模型必须使用 provider/model 格式")
+    provider, separator, model = selection.partition('/')
+    if not separator or not provider or not model:
+        raise ValueError("模型必须使用 provider/model 格式")
+    return provider, model
+
+
+def resolve_model(config: dict, selection: str) -> tuple[str, str, dict]:
+    """解析模型选择，并返回 provider、API 模型名和能力配置。"""
+    provider, model = split_model_selection(selection)
+    provider_config = config.get("providers", {}).get(provider)
+    if not isinstance(provider_config, dict):
+        raise ValueError(f"未找到供应商: {provider}")
+    models = provider_config.get("models", {})
+    if not isinstance(models, dict) or model not in models:
+        raise ValueError(f"供应商 {provider} 下未找到模型: {model}")
+    return provider, model, models[model]
+
+
+def _description_cache_entry(description: str, cached_at: date) -> dict:
+    return {
+        "description": description,
+        "cached_at": cached_at.isoformat(),
+    }
+
+
+def get_cached_description(cache: dict, image_url: str, today: date = None) -> Optional[str]:
+    """读取图片描述；旧字符串值在命中时原地升级为带日期的条目。"""
+    entry = cache.get(image_url)
+    if isinstance(entry, str):
+        cache[image_url] = _description_cache_entry(entry, today or date.today())
+        return entry
+    if isinstance(entry, dict) and isinstance(entry.get("description"), str):
+        return entry["description"]
+    return None
+
+
+def prune_description_cache(
+    cache: dict,
+    today: date = None,
+    limit: int = DESCRIPTION_CACHE_LIMIT,
+    max_age_days: int = DESCRIPTION_CACHE_MAX_AGE_DAYS,
+) -> int:
+    """缓存超过 limit 时删除年龄大于 max_age_days 的条目。"""
+    if len(cache) <= limit:
+        return 0
+
+    today = today or date.today()
+    cutoff = today - timedelta(days=max_age_days)
+    removed = 0
+
+    for image_url, entry in list(cache.items()):
+        if isinstance(entry, str):
+            cache[image_url] = _description_cache_entry(entry, today)
+            continue
+        if not isinstance(entry, dict) or not isinstance(entry.get("description"), str):
+            del cache[image_url]
+            removed += 1
+            continue
+        try:
+            cached_at = date.fromisoformat(entry["cached_at"])
+        except (KeyError, TypeError, ValueError):
+            entry["cached_at"] = today.isoformat()
+            continue
+        if cached_at < cutoff:
+            del cache[image_url]
+            removed += 1
+
+    return removed
+
+
+def cache_description(
+    cache: dict,
+    image_url: str,
+    description: str,
+    today: date = None,
+) -> int:
+    """写入带日期的图片描述，并在超过数量阈值时清理旧条目。"""
+    today = today or date.today()
+    cache[image_url] = _description_cache_entry(description, today)
+    return prune_description_cache(cache, today=today)
 
 @dataclass
 class LLMResponse:
@@ -265,13 +433,17 @@ class LLMCilent:
                             "deepseek-reasoner": {
                                 "vision": False,
                                 "function_calling": True
+                            },
+                            "deepseek-v4-flash": {
+                                "vision": False,
+                                "function_calling": True
                             }
                         }
-                    }
+                    },
+                    "bytecat": deepcopy(BYTECAT_PROVIDER_CONFIG),
                 },
-                "default_provider": "openai",
-                "default_model": "gpt-4o-mini",
-                "vision_model": "gpt-4o"
+                "default_model": DEFAULT_MODEL,
+                "vision_model": DEFAULT_VISION_MODEL,
             })
 
         return config
@@ -292,6 +464,11 @@ class LLMCilent:
 
             self.clients[provider] = OpenAI(**client_config)
 
+    def reload_clients(self):
+        """显式按当前内存配置重建 provider 客户端。"""
+        self.clients.clear()
+        self._init_clients()
+
     def _resolve_config_value(self, value: str) -> Optional[str]:
         """解析配置值，如果是环境变量名则获取环境变量"""
         if value.startswith("${") and value.endswith("}"):
@@ -301,50 +478,66 @@ class LLMCilent:
             return os.getenv(value)
         return value
 
-    def set_provider(self, provider: str, config: dict):
-        """更新provider配置"""
-        if provider not in self.config["providers"]:
-            self.config["providers"][provider] = config
-        else:
-            self.config["providers"][provider].update(config)
-
-        # 重新初始化客户端
-        self._init_clients()
-
-    def del_provider(self, provider: str, config: dict):
-        """删除provider"""
-        if provider not in self.config["providers"]:
-            raise ValueError(f"Provider {provider} not found")
-        else:
-            del self.config["providers"][provider]
-
-        # 重新初始化客户端
-        self._init_clients()
-
-    def set_model(self, provider: str, model: str, capabilities: dict):
-        """添加模型到provider"""
-        if provider not in self.config["providers"]:
-            raise ValueError(f"Provider {provider} not found")
-
-        self.config["providers"][provider]["models"][model] = capabilities
-
-    def del_model(self, provider: str, model: str):
-        """删除模型到provider"""
-        if provider not in self.config["providers"]:
-            raise ValueError(f"Provider {provider} not found")
-
-        del self.config["providers"][provider]["models"][model]
-
-    def get_model_capabilities(self, provider: str, model: str) -> ModelCapabilities:
+    def get_model_capabilities(self, model: str) -> ModelCapabilities:
         """获取模型能力"""
-        if provider not in self.config["providers"]:
+        try:
+            _, _, capabilities = resolve_model(self.config, model)
+        except ValueError:
             return ModelCapabilities()
+        return ModelCapabilities(**capabilities)
 
-        models = self.config["providers"][provider]["models"]
-        if model not in models:
-            return ModelCapabilities()
+    def _replace_images_with_text(
+        self,
+        messages: list[dict],
+        label: str = "图片",
+    ) -> list[dict]:
+        """把多模态 part 降级为带 URL 的文本，供模型按需调用识图工具。"""
+        markdown_image_pattern = r"!\[.*?\]\((.*?)\)"
+        processed_messages = []
 
-        return ModelCapabilities(**models[model])
+        def format_reference(image_url: str) -> str:
+            return f"[{label} URL: {image_url}]" if image_url else f"[{label}]"
+
+        def replace_markdown(match: re.Match) -> str:
+            return format_reference(match.group(1))
+
+        for message in messages:
+            new_message = message.copy()
+            content = message.get("content")
+
+            if isinstance(content, str):
+                new_message["content"] = re.sub(
+                    markdown_image_pattern,
+                    replace_markdown,
+                    content,
+                )
+            elif isinstance(content, list):
+                new_content = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") in ["image", "image_url"]:
+                        image_url_data = item.get("image_url", item.get("image", ""))
+                        if isinstance(image_url_data, dict):
+                            image_url = image_url_data.get("url", "")
+                        elif isinstance(image_url_data, str):
+                            image_url = image_url_data
+                        else:
+                            image_url = ""
+                        new_content.append({
+                            "type": "text",
+                            "text": format_reference(image_url),
+                        })
+                    elif isinstance(item, str):
+                        new_content.append({
+                            "type": "text",
+                            "text": re.sub(markdown_image_pattern, replace_markdown, item),
+                        })
+                    else:
+                        new_content.append(item)
+                new_message["content"] = new_content
+
+            processed_messages.append(new_message)
+
+        return processed_messages
 
     def _convert_images(
         self,
@@ -489,36 +682,57 @@ class LLMCilent:
     def get_vision_model(self):
         vision_model = self.config.get("vision_model", None)
         if not vision_model:
-            return # 如果没有视觉模型，直接返回，不处理
-        # 确保 providers 配置存在且是字典
-        providers_config = self.config.get("providers", {})
-        if isinstance(providers_config, dict):
-            for provider, config in providers_config.items():
-                # 确保 provider 的配置是字典，且包含 'models' key
-                if isinstance(config, dict) and "models" in config and isinstance(config["models"], dict):
-                     # 确保模型配置是字典，包含 vision key
-                    model_config = config["models"].get(vision_model)
-                    if isinstance(model_config, dict) and model_config.get("vision"):
-                        vision_provider = provider
-                        break
-        if not vision_provider:
-            return # 如果找不到提供者，也直接返回
-        return vision_provider, vision_model
+            return
+        try:
+            _, _, model_config = resolve_model(self.config, vision_model)
+        except ValueError:
+            return
+        if not model_config.get("vision"):
+            return
+        return vision_model
+
+    def _get_image_description(
+        self,
+        image_url: str,
+        vision_model: str,
+        convert_url: Callable[[str], str],
+        description_cache: dict,
+        log_indent: str = "",
+    ) -> Optional[str]:
+        description = get_cached_description(description_cache, image_url)
+        if description is not None:
+            print(f"{log_indent}✅ 图片描述缓存命中: {image_url}")
+            print(f"{log_indent}    {description}")
+            return description
+
+        description = self.describe_image(
+            image_url,
+            model=vision_model,
+            convert_url=convert_url,
+        )
+        if description:
+            removed = cache_description(description_cache, image_url, description)
+            if removed:
+                print(f"{log_indent}🧹 已清理 {removed} 条过期图片描述缓存")
+        else:
+            print(f"{log_indent}⚠️ 未能为 {image_url} 生成描述，不进行缓存。")
+        return description
 
     def _process_images(
             self,
             messages: list[dict],
             convert_url: Callable[[str], str],
-            description_cache: dict[str, str],
-            vision_model: str = None
+            description_cache: dict[str, str]
     ) -> list[dict]:
         """处理消息中的图片, 并添加缓存命中日志"""
-        res = self.get_vision_model()
-        if not res:
-            return messages
-        vision_provider, vision_model = res
+        vision_model = self.get_vision_model()
+        if not vision_model:
+            return self._replace_images_with_text(
+                messages,
+                "图片，未配置可用的视觉模型",
+            )
 
-        # print(f"使用 '{vision_provider}' 的 '{vision_model}' 处理图片...") # 可以加一个开始处理的日志
+        # print(f"使用 '{vision_model}' 处理图片...") # 可以加一个开始处理的日志
 
         processed_messages = []
         for message in messages:
@@ -540,23 +754,13 @@ class LLMCilent:
                 for image_url in image_matches:
                     print(f"    - 检查图片 URL: {image_url}")
                     try:
-                        # 调用视觉模型获取图片描述
-                        if image_url in description_cache:
-                            description = description_cache.get(image_url)
-                            # --- 添加缓存命中日志 ---
-                            print(f"    ✅ 图片描述缓存命中: {image_url}")
-                            print(f"        {description}")
-                        else:
-                            description = self._describe_image(
-                                image_url,
-                                vision_provider,
-                                vision_model,
-                                convert_url
-                            )
-                            if description: # 只有成功获取描述才缓存
-                                description_cache[image_url] = description
-                            else:
-                                print(f"    ⚠️ 未能为 {image_url} 生成描述，不进行缓存。")
+                        description = self._get_image_description(
+                            image_url,
+                            vision_model,
+                            convert_url,
+                            description_cache,
+                            "    ",
+                        )
 
                         replacement = f"[图片: {description}]" if description else "[图片: 图片解析失败]"
                         # 使用 re.escape 避免 URL 中的特殊字符影响替换
@@ -585,22 +789,13 @@ class LLMCilent:
                             for image_url in image_matches:
                                 print(f"      - 检查图片 URL: {image_url}")
                                 try:
-                                    if image_url in description_cache:
-                                        description = description_cache.get(image_url)
-                                        # --- 添加缓存命中日志 ---
-                                        print(f"      ✅ 图片描述缓存命中: {image_url}")
-                                        print(f"          {description}")
-                                    else:
-                                        description = self._describe_image(
-                                            image_url,
-                                            vision_provider,
-                                            vision_model,
-                                            convert_url
-                                        )
-                                        if description:
-                                            description_cache[image_url] = description
-                                        else:
-                                            print(f"      ⚠️ 未能为 {image_url} 生成描述，不进行缓存。")
+                                    description = self._get_image_description(
+                                        image_url,
+                                        vision_model,
+                                        convert_url,
+                                        description_cache,
+                                        "      ",
+                                    )
 
                                     replacement = f"[图片: {description}]" if description else "[图片: 图片解析失败]"
                                     markdown_tag = f"![]({image_url})"
@@ -616,7 +811,7 @@ class LLMCilent:
                     elif isinstance(item, dict):
                         item_type = item.get("type")
                         # 检查 image_url 结构 (兼容 OpenAI 格式)
-                        if item_type == "image_url":
+                        if item_type in ["image", "image_url"]:
                             image_url_data = item.get("image_url", {})
                             if isinstance(image_url_data, dict): # 标准格式
                                 image_url = image_url_data.get("url", "")
@@ -628,22 +823,13 @@ class LLMCilent:
                             if image_url:
                                 print(f"    - 处理 image_url 对象: {image_url}")
                                 try:
-                                    if image_url in description_cache:
-                                        description = description_cache.get(image_url)
-                                        # --- 添加缓存命中日志 ---
-                                        print(f"      ✅ 图片描述缓存命中: {image_url}")
-                                        print(f"          {description}")
-                                    else:
-                                        description = self._describe_image(
-                                            image_url,
-                                            vision_provider,
-                                            vision_model,
-                                            convert_url
-                                        )
-                                        if description:
-                                            description_cache[image_url] = description
-                                        else:
-                                             print(f"      ⚠️ 未能为 {image_url} 生成描述，不进行缓存。")
+                                    description = self._get_image_description(
+                                        image_url,
+                                        vision_model,
+                                        convert_url,
+                                        description_cache,
+                                        "      ",
+                                    )
 
                                     new_content_list.append({
                                         "type": "text",
@@ -680,27 +866,38 @@ class LLMCilent:
         # print("图片处理完成。") # 可以加一个结束的日志
         return processed_messages
 
-    def _describe_image(self, image_url: str, provider: str, model: str,
-        convert_url: Callable[[str], str]) -> Optional[str]:
-        """使用视觉模型描述图片"""
+    def describe_image(
+        self,
+        image_url: str,
+        prompt: str = "",
+        model: Optional[str] = None,
+        convert_url: Optional[Callable[[str], str]] = None,
+    ) -> Optional[str]:
+        """使用配置的视觉模型执行默认或自定义图片识别任务。"""
+        model = model or self.get_vision_model()
+        if not model:
+            return None
+        convert_url = convert_url or default_url_to_base64
+        provider, api_model, _ = resolve_model(self.config, model)
         client = self.clients[provider]
 
         try:
-            try:
-                # raise Exception()
-                image_data = convert_url(image_url)
-            except Exception as e:
+            if image_url.startswith("data:image/"):
                 image_data = image_url
+            else:
+                try:
+                    image_data = convert_url(image_url) or image_url
+                except Exception:
+                    image_data = image_url
             response = client.chat.completions.create(
-                model=model,
+                model=api_model,
                 messages=[{
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "请描述你能看到的这张图片的一切内容，以及其表达的情感倾向，这将替代图片发送给没有视觉能力的模型"},
+                        {"type": "text", "text": build_image_description_prompt(prompt)},
                         {"type": "image_url", "image_url": {"url": image_data}}
                     ]
-                }],
-                max_tokens=300
+                }]
             )
             description = response.choices[0].message.content
             print(f"      ✅ 视觉模型调用成功: {image_url}")
@@ -716,7 +913,6 @@ class LLMCilent:
         messages: list[dict],
         tools: Optional[list[Any]] = None,
         tool_choice: Optional[Union[str, dict]] = None,
-        provider: Optional[str] = None,
         model: Optional[str] = None,
         stream: bool = True,
         url_to_base64_func: Optional[Callable[[str], str]] = None,
@@ -724,19 +920,17 @@ class LLMCilent:
         do_process_image: Optional[bool] = None,
     ) -> Generator[LLMResponse, None, None]:
         """生成LLM响应"""
-        if not provider:
-            provider = self.config["default_provider"]
-
         if not model:
             model = self.config["default_model"]
 
+        provider, api_model, model_config = resolve_model(self.config, model)
         if provider not in self.clients:
             raise ValueError(f"Provider {provider} not configured")
 
         client = self.clients[provider]
 
         # 检查模型能力
-        capabilities = self.get_model_capabilities(provider, model)
+        capabilities = ModelCapabilities(**model_config)
 
         # 处理图片
         if url_to_base64_func is None:
@@ -749,6 +943,8 @@ class LLMCilent:
                 messages = self._process_images(messages, url_to_base64_func, description_cache)
             else:
                 messages = self._convert_images(messages, url_to_base64_func)
+        else:
+            messages = self._replace_images_with_text(messages)
 
         # print(messages)
 
@@ -759,7 +955,7 @@ class LLMCilent:
 
         # 准备请求参数
         request_params = {
-            "model": model,
+            "model": api_model,
             "messages": messages,
             "stream": stream,
         }
@@ -1008,29 +1204,25 @@ class LLMCilent:
         messages: list[dict],
         tools: Optional[list[Any]] = None,
         tool_choice: Optional[Union[str, dict]] = None,
-        provider: Optional[str] = None,
         model: Optional[str] = None,
         stream: bool = True,
         url_to_base64_func: Optional[Callable[[str], str]] = None,
-        description_cache: dict[str,str] = None,
+        description_cache: dict = None,
         do_process_image: Optional[bool] = None,
     ) -> Generator[LLMResponse, None, None]:
         """聊天接口"""
         # 应用默认值
-        if not provider:
-            provider = self.config["default_provider"]
         if not model:
             model = self.config["default_model"]
 
         while True:
             # 显示等待消息
-            print(colored(f"等待{provider}:{model}的响应...", "grey"))
+            print(colored(f"等待{model}的响应...", "grey"))
 
             response = self.generate_response(
                 messages=messages,
                 tools=tools,
                 tool_choice=tool_choice,
-                provider=provider,
                 model=model,
                 stream=stream,
                 url_to_base64_func=url_to_base64_func,
@@ -1147,27 +1339,24 @@ from typing import Optional, Union, Callable, Any, Generator
 import json
 from dataclasses import dataclass, field
 from enum import Enum
-from copy import deepcopy
 from tool import Tool
 
 class Chat:
     def __init__(
         self,
-        provider: str = "openai",
-        model: str = "gpt-4o-mini",
+        model: Optional[str] = None,
         messages: Optional[list[Union[str, dict, Callable, LLMResponse]]] = None,
         functions: Optional[Union[dict[str, Union[Tool, Callable]], list[Union[Tool, Callable]]]] = None,
         chat_client: Optional[LLMCilent] = None,
         recall_func: Callable = None,
         url_to_base64_func: Optional[Callable[[str], str]] = None,
-        description_cache: dict[str,str] = None,
+        description_cache: dict = None,
         do_process_image: Optional[bool] = None
     ):
         """初始化聊天会话
 
         Args:
-            provider: 供应商名称，默认为"openai"
-            model: 模型名称，默认为"gpt-4o-mini"
+            model: provider/model 格式的模型选择；省略时使用客户端默认模型
             messages: 初始消息列表，可以包含字符串、字典、可调用对象或者LLMResponse
             functions: 初始函数集合，可以是函数字典或函数列表
             chat_client: 可选的聊天客户端实例
@@ -1176,9 +1365,8 @@ class Chat:
             description_cache: 可选的描述缓存字典
         """
         # 基本属性初始化
-        self.provider = provider
-        self.model = model
         self.chat_client = chat_client
+        self.model = model or (chat_client.config["default_model"] if chat_client else None)
         self.do_process_image = do_process_image
 
         # 工具函数初始化
@@ -1285,18 +1473,15 @@ class Chat:
             for func in functions:
                 self.add_tool(func)
 
-    def change_model(self, provider: str = None, model: str = None):
+    def change_model(self, model: str):
         """
-        更改供应商和模型
+        更改 provider/model 格式的模型选择
 
         Args:
-            provider: 新的供应商名称
-            model: 新的模型名称
+            model: 新的模型选择
         """
-        if isinstance(provider, str):
-            self.provider = provider
-        if isinstance(model, str):
-            self.model = model
+        split_model_selection(model)
+        self.model = model
 
     def print_messages(self):
         # 输出消息
@@ -1377,7 +1562,6 @@ class Chat:
                 messages=self.messages,
                 tools=tools,
                 tool_choice=tool_choice,
-                provider=self.provider,
                 model=self.model,
                 stream=stream,
                 url_to_base64_func=effective_url_func,
@@ -1421,7 +1605,6 @@ class Chat:
         """返回会话的字符串表示"""
         return (
             f"Chat("
-            f"provider='{self.provider}', "
             f"model='{self.model}', "
             f"messages={len(self.messages)}, "
             f"functions={len(self.functions)}"
@@ -1432,7 +1615,6 @@ class Chat:
         """返回会话的用户友好字符串表示"""
         return (
             f"聊天会话 ["
-            f"供应商: {self.provider}, "
             f"模型: {self.model}, "
             f"消息数: {len(self.messages)}, "
             f"函数数: {len(self.functions)}"
@@ -1515,8 +1697,7 @@ if __name__ == "__main__":
     #     messages=messages,
     #     tools=[Tool(get_weather)],
     #     tool_choice="auto",
-    #     provider="openai",
-    #     model="gpt-4o",
+    #     model="openai/gpt-4o",
     #     # stream=False
     # )
 
@@ -1525,16 +1706,19 @@ if __name__ == "__main__":
 
     chat = Chat(
         chat_client=llm_client,
-        model='gpt-3.5-turbo',
+        model='openai/gpt-3.5-turbo',
         url_to_base64_func=get_image_base64,
     )
     chat.messages = messages
     chat.add_tool(get_weather)
     chat.print_messages()
-    models = storage.get("llm_system", "config")['providers']['openai']['models']
-    for model, attr in models.items():
-        if test(model, attr):
-            test_func(model, attr)
-            test_vision(model, attr)
+    providers = storage.get("llm_system", "config").get('providers', {})
+    for provider_name, provider_config in providers.items():
+        models = provider_config.get('models', {})
+        for model, attr in models.items():
+            selection = f'{provider_name}/{model}'
+            if test(selection, attr):
+                test_func(selection, attr)
+                test_vision(selection, attr)
     # chat.print_messages()
     # print(chat.chat(user_message='我超，好低的温度', stream=True))
