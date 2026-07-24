@@ -216,8 +216,15 @@ def group_members():
     '''
     return '\n'.join([f'{getname(msg["user_id"])}({msg["user_id"]}) 名片:"{msg["title"]}" sex:{msg["sex"]}' for msg in memberlist()])
 
+def make_captured_print(buffer):
+    """创建一个将输出写入缓冲区的print函数"""
+    def captured_print(*values, sep=' ', end='\n'):
+        buffer.write(sep.join(map(str, values)) + end)
+    return captured_print
+
+
 def exec_code(expr:str,code:str=''):
-    '''
+    """
     execute a real-time python code.
     若用python读取和编辑`data`字典，其中的数据会被持久化保存
 
@@ -225,10 +232,25 @@ def exec_code(expr:str,code:str=''):
     code: The code to execute
 
     expr: The value to be returned, eval after the code execute
-    '''
+    """
+    import io
     dic = getcmd('py').loc
-    exec(code,dic)
-    return repr(eval(expr,dic))
+    # 使用捕获缓冲区的print，避免输出被当成消息发送，同时保留输出内容
+    buf = io.StringIO()
+    captured_print = make_captured_print(buf)
+    orig_print = dic.get('print')
+    dic['print'] = captured_print
+    try:
+        exec(code, dic)
+        result = repr(eval(expr, dic))
+        output = buf.getvalue()
+        if output.strip():
+            return f'[print输出]\n{output.rstrip()}\n[结果] {result}'
+        return result
+    finally:
+        dic['print'] = orig_print
+        if orig_print:
+            dic['print'] = dic['_print']
 
 def read_data(key:str):
     '''
@@ -596,56 +618,61 @@ max_msg = storage.get('llm_system', 'config').get('max_msg', 200)
 
 def get_msgs(max_token=max_token, return_token=False):
     in_group = cache.thismsg().get('group_id')
+    poke_target = cache.qq
 
     chat_logs = []
     for msg in getlog()[:max_msg]:
-        if not is_msg(msg):
-            continue
-        if msg['message'].startswith('#'):
-            continue
-        if msg['message']=='聊天开始' or msg['message']=='聊天结束':
-            break
-        chat_logs.append(msg)
+        if is_msg(msg):
+            if msg['message'].startswith('#'):
+                continue
+            if msg['message']=='聊天开始' or msg['message']=='聊天结束':
+                break
+            chat_logs.append(msg)
+        elif is_poke(poke_target)(msg):
+            # 戳柚子的戳一戳事件也加入聊天记录
+            chat_logs.append(msg)
 
     messages = []
 
     sum_token = 0
     for msg in chat_logs:
-        chat_msg = msg2chat(msg, in_group)
+        if is_msg(msg):
+            chat_msg = msg2chat(msg, in_group)
 
-        content = chat_msg['content']
-        if isinstance(content, str):
-            sum_token += count_tokens(content)
-        elif isinstance(content, list):
-            for part in content:
-                if part.get('type')=='text':
-                    sum_token += count_tokens(part['text'])
-                elif part.get('type')=='image_url':
-                    sum_token += part.get('token_cost',0)
-                else:
-                    print(f"chat error: 消息中有text和image_url之外的对象: {part}")
-        else:
-            print(f"chat error: 消息列表中有非列表非字符串的对象: {repr(content)}")
+            content = chat_msg['content']
+            if isinstance(content, str):
+                sum_token += count_tokens(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if part.get('type')=='text':
+                        sum_token += count_tokens(part['text'])
+                    elif part.get('type')=='image_url':
+                        sum_token += part.get('token_cost',0)
+                    else:
+                        print(f"chat error: 消息中有text和image_url之外的对象: {part}")
+            else:
+                print(f"chat error: 消息列表中有非列表非字符串的对象: {repr(content)}")
 
-        if sum_token > max_token:
-            break
+            if sum_token > max_token:
+                break
 
-        messages.insert(0, chat_msg)
-        # if messages and chat_msg['role'] == messages[0]['role']:
-        #     #TODO 默认全是字符串
-        #     messages[0]['content'] = f'{content}\n\n{messages[0]["content"]}'
-        # else:
-        #     messages.insert(0, chat_msg)
+            messages.insert(0, chat_msg)
+        elif is_poke(poke_target)(msg):
+            # 将戳一戳事件转换为 system 消息
+            user_id = msg.get('user_id', 0)
+            group_id = msg.get('group_id') if in_group else None
+            name = getname(user_id, group_id)
+            system_msg = {
+                'role': 'system',
+                'content': f'【事件】{name}({user_id})戳了戳柚子'
+            }
+            messages.insert(0, system_msg)
 
-    if messages[-1]['role'] == 'assistant':
-        messages[-1]['prefix'] = True
-        messages.append({'role':'user','content':'（戳了戳你）'})
-      # messages.append({'role':'user','content':f'---\nsystem\n---\n这是为了防止报错而添加的分隔线'})
+    # 原有的补丁代码已移除，戳一戳事件现在会被正确记录
 
     if return_token:
         return messages, sum_token
     return messages
-
 def init_chat(chat_client:Chat, messages=[]):
     '''
     添加工具，设定
