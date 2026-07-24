@@ -10,21 +10,50 @@ root_path = 'data/storage/'
 
 os.makedirs(root_path,exist_ok=True)
 
-storage = {}
+_is_reload = 'storage' in globals()
+if not _is_reload:
+    storage = {}
 # 它的第一级为命名空间，作为文件路径
 # 第二级是作为文件名
 # 第三级开始才允许字符串以外的键
 
-def load():
+def _replace(name_space, name, value):
+    """原地替换已有容器，使其它模块持有的引用同步看到新内容。"""
+    namespace = storage.setdefault(name_space, {})
+    current = namespace.get(name)
+    if isinstance(current, dict) and isinstance(value, dict):
+        current.clear()
+        current.update(value)
+        return current
+    if isinstance(current, list) and isinstance(value, list):
+        current.clear()
+        current.extend(value)
+        return current
+    namespace[name] = value
+    return value
+
+
+def _load_one(name_space, name):
+    path = join(root_path, name_space, name + '.json')
+    return _replace(name_space, name, json_read(path))
+
+
+def load(name_space=None, name=None):
+    """从 JSON 文件覆盖内存。传入命名空间和名称时只加载一项；无参数时用于启动全量加载。"""
+    if name_space is not None or name is not None:
+        if not isinstance(name_space, str) or not isinstance(name, str):
+            raise TypeError('name_space 和 name 必须同时传入字符串')
+        return _load_one(name_space, name)
+
     for root, _, files in os.walk(root_path):
         name_space = root[len(root_path):].replace('\\','/')
-        storage[name_space] = {}
+        storage.setdefault(name_space, {})
         for file in files:
             name = file[:-5]
             path = join(root,file)
             if file.endswith('.json'):
                 try:
-                    storage[name_space][name] = json_read(path)
+                    _replace(name_space, name, json_read(path))
                 except:
                     # 懒
                     print(f'读取"{path}"时发生错误')
@@ -60,6 +89,7 @@ def get(name_space:str, name:str, default:Callable=dict):
     storage[name_space].setdefault(name,default())
     return storage[name_space][name]
 
-load()
-import atexit
-atexit.register(save)
+if not _is_reload:
+    load()
+    import atexit
+    atexit.register(lambda: save())

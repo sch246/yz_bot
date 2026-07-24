@@ -242,10 +242,11 @@ data/storage/              # 根目录
 ### 注意事项
 
 - `storage.get()` 返回的是**引用**，原地修改会自动反映到存储
+- `storage.load(namespace, name)` 从单个 JSON 文件原地覆盖对应内存 dict/list；它只在管理员显式调用时执行
 - 非字符串基本键（如 `int`）会被 JSON 转成字符串；tuple 等 JSON 不支持的键会被 `skipkeys=True` 跳过
 - 不可 JSON 序列化的值会被 `default=lambda x: None` 转为 null
-- storage 在启动时载入内存、退出时整文件保存；运行期间直接手改对应 JSON 不会自动 reload，并可能在退出时被内存旧值覆盖
-- 需要在线修改时优先通过函数操作内存并显式 `storage.save()`；需要人工改磁盘时应先停止实例或建立冲突检测
+- storage 在启动时载入内存、退出时整文件保存；运行期间直接手改对应 JSON 不会自动 reload，必须再显式调用 `storage.load(namespace, name)`，否则可能在退出时被内存旧值覆盖
+- `reload(storage)` 保留当前 storage 对象且不自动全量载入；模块更新后仍由管理员显式调用目标 `load`
 
 ### 当前消息与近期记录
 
