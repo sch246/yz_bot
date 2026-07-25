@@ -129,16 +129,17 @@ def build_image_description_prompt(prompt: str = "") -> str:
 
 
 def format_image_reference(image_uri: str, label: str = "图片") -> str:
-    """把原始图片 URI 保留为模型可见的文本引用。"""
+    """把原始图片 URI 保留为单个模型可见的图片引用。"""
     if not image_uri or image_uri.startswith('data:image/'):
         return f'[{label}]'
-    return f'[{label} URL: {image_uri}]'
+    return f'[{label}({image_uri})]'
 
 
 def format_image_description(image_uri: str, description: str = None) -> str:
-    reference = format_image_reference(image_uri)
-    detail = f'[图片: {description}]' if description else '[图片: 图片解析失败]'
-    return f'{reference}\n{detail}'
+    detail = description or '图片解析失败'
+    if not image_uri or image_uri.startswith('data:image/'):
+        return f'[图片: {detail}]'
+    return f'[图片({image_uri}): {detail}]'
 
 
 def split_model_selection(selection: str) -> tuple[str, str]:
@@ -333,26 +334,59 @@ def format_value_for_log(value, prefix_chars: int = DATA_URI_LOG_PREFIX_CHARS) -
     return _DATA_URI_LOG_PATTERN.sub(truncate, text)
 
 
+def format_content_for_log(content) -> str:
+    """按实际请求的 part 顺序格式化消息内容，图片 URI 仅在日志中截断。"""
+    if not isinstance(content, list):
+        return format_value_for_log(content)
+
+    parts = []
+    for item in content:
+        if not isinstance(item, dict):
+            parts.append(str(item))
+            continue
+        if item.get("type") == "text":
+            parts.append(str(item.get("text", "")))
+            continue
+        if item.get("type") in ["image", "image_url"]:
+            image_data = item.get("image_url", item.get("image", ""))
+            if isinstance(image_data, dict):
+                image_uri = image_data.get("url", "")
+            else:
+                image_uri = image_data
+            parts.append(f'[图片({image_uri})]' if image_uri else '[图片]')
+            continue
+        parts.append(json.dumps(item, ensure_ascii=False, default=str))
+    return format_value_for_log(''.join(parts))
+
+
 def print_colored(text, role, end='\n', flush=True, with_prefix=False):
     '''
     打印彩色字体
     大模型不会返回消息数组所以这里不需要兼容消息数组，但是为了通用性还是加上了
     '''
     color = ROLE_TO_COLOR.get(role, "white")
-    result = f'{role}: ' if with_prefix else ''
-    if isinstance(text, list):
-        # 处理列表格式的文本
-        for item in text:
-            if isinstance(item, dict):
-                if item.get("type") == "text":
-                    result += item['text']
-                elif item.get("type") in ["image", "image_url"]:
-                    result += "[图片]"
-            else:
-                result += str(item)
-    else:
-        result += str(text)
-    print(colored(format_value_for_log(result), color), end=end, flush=flush)
+    prefix = f'{role}: ' if with_prefix else ''
+    print(colored(prefix + format_content_for_log(text), color), end=end, flush=flush)
+
+
+def print_messages_for_log(messages: list[dict]):
+    """打印一次最终请求中的消息；调用方负责先完成所有请求转换。"""
+    for message in messages:
+        role = message.get("role", MessageRole.SYSTEM.value)
+        if role == MessageRole.ASSISTANT.value and message.get("tool_calls"):
+            content = '\n'.join(
+                tool_call['function']['name'] + tool_call['function']['arguments']
+                for tool_call in message["tool_calls"]
+            )
+            print(colored(f"{role}: ", ROLE_TO_COLOR.get(role, "white")), end="", flush=True)
+            print(colored(format_value_for_log(content), ROLE_TO_COLOR.get(MessageRole.TOOL.value, "white")))
+        elif role == MessageRole.TOOL.value:
+            print(colored(
+                format_value_for_log(f" -> {message.get('content', '')}"),
+                ROLE_TO_COLOR.get(role, "white"),
+            ))
+        else:
+            print_colored(message.get("content", ""), role, with_prefix=True)
 
 
 
@@ -456,14 +490,17 @@ class LLMCilent:
     def _replace_images_with_text(
         self,
         messages: list[dict],
-        label: str = "图片",
+        description: str = "",
     ) -> list[dict]:
         """把多模态 part 降级为带 URL 的文本，供模型按需调用识图工具。"""
         markdown_image_pattern = r"!\[.*?\]\((.*?)\)"
         processed_messages = []
 
         def replace_markdown(match: re.Match) -> str:
-            return format_image_reference(match.group(1), label)
+            image_uri = match.group(1)
+            if description:
+                return format_image_description(image_uri, description)
+            return format_image_reference(image_uri)
 
         for message in messages:
             new_message = message.copy()
@@ -488,7 +525,10 @@ class LLMCilent:
                             image_url = ""
                         new_content.append({
                             "type": "text",
-                            "text": format_image_reference(image_url, label),
+                            "text": (
+                                format_image_description(image_url, description)
+                                if description else format_image_reference(image_url)
+                            ),
                         })
                     elif isinstance(item, str):
                         new_content.append({
@@ -519,7 +559,7 @@ class LLMCilent:
             if image_uri and not image_uri.startswith('data:image/'):
                 parts.append({
                     "type": "text",
-                    "text": format_image_reference(image_uri),
+                    "text": f'[下方图片的原始链接: {image_uri}]',
                 })
         
         processed_messages = []
@@ -567,9 +607,10 @@ class LLMCilent:
                                     except Exception as e:
                                         print(f"图片处理失败: {e}")
                                         # 转换失败时，将图片标记替换为错误文本
-                                        text_parts.append(
-                                            f'{format_image_reference(img_url)}\n{IMAGE_LOAD_FAILED_TEXT}'
-                                        )
+                                        text_parts.append(format_image_description(
+                                            img_url,
+                                            IMAGE_LOAD_FAILED_TEXT.strip('[]'),
+                                        ))
 
                                 # 处理剩余文本
                                 if current_pos < len(item):
@@ -647,7 +688,10 @@ class LLMCilent:
                                 # 转换失败时用文本代替
                                 new_content.append({
                                     "type": "text",
-                                    "text": f'{format_image_reference(img_url)}\n{IMAGE_LOAD_FAILED_TEXT}',
+                                    "text": format_image_description(
+                                        img_url,
+                                        IMAGE_LOAD_FAILED_TEXT.strip('[]'),
+                                    ),
                                 })
 
                         if current_pos < len(content):
@@ -982,7 +1026,8 @@ class LLMCilent:
         else:
             messages = self._replace_images_with_text(messages)
 
-        # print(messages)
+        print(colored(f"发送给{model}的消息:", "grey"))
+        print_messages_for_log(messages)
 
         # 处理工具调用
         final_tools = None
@@ -1526,25 +1571,7 @@ class Chat:
         self.model = model
 
     def print_messages(self):
-        # 输出消息
-        for message in self.messages:
-            if message['role'] == 'assistant' and message.get('tool_calls'):
-                role = message["role"]
-                content = '\n'.join(tool_call['function']['name']+tool_call['function']['arguments']
-                                    for tool_call in message["tool_calls"])
-                print(colored(f"{role}: ", ROLE_TO_COLOR.get("assistant", "white")), end="", flush=True)
-                print(colored(format_value_for_log(content), ROLE_TO_COLOR.get("tool", "white")))
-            elif message["role"] == 'tool':
-                role = message["role"]
-                content = message["content"]
-                print(colored(
-                    format_value_for_log(f" -> {content}"),
-                    ROLE_TO_COLOR.get(role, "white"),
-                ))
-            else:
-                role = message["role"]
-                content = message["content"]
-                print_colored(content, role, with_prefix=True)
+        print_messages_for_log(self.messages)
 
     def chat(
         self,
@@ -1583,11 +1610,7 @@ class Chat:
 
         # 添加用户消息（如果有）
         if user_message is not None:
-            message = self.add_message(user_message)
-            role = message["role"]
-            content = message["content"]
-            # print(colored(f"{role}: {content}", ROLE_TO_COLOR.get(role, "white")))
-            print_colored(content, role, with_prefix=True)
+            self.add_message(user_message)
 
         # 准备工具函数列表
         tools = list(self.functions.values())

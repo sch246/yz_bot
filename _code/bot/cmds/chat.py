@@ -1520,7 +1520,6 @@ def chat(model=None):
 
     init_chat(chat_client, messages)
 
-    chat_client.print_messages()
     chat_client.chat(
         recall_func=get_handler(chat_client),
         url_to_base64_func=image_uri_to_data_uri,
@@ -1620,7 +1619,6 @@ def run(body:str, model=None):
                 ),
             )
 
-    chat_client.print_messages()
     chat_client.chat(
         recall_func=handle_LLMResponse,
         url_to_base64_func=image_uri_to_data_uri,
