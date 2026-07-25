@@ -28,7 +28,7 @@ from main import CommandManager
 
 import json
 
-from main import LLMCilent, Chat, sum_res, LLMResponse, get_image_base64, get_image_file_base64, resolve_image_uri, resolve_model
+from main import LLMCilent, Chat, sum_res, LLMResponse, image_uri_to_data_uri, resolve_image_uri, resolve_model
 
 from main import memberlist
 
@@ -854,16 +854,19 @@ def _eager_cache_images(msg: dict, model: str):
     except ValueError:
         return
     for image_url in _get_message_image_urls(msg):
-        if model_config.get('vision') or not vision_model:
-            get_image_base64(image_url)
-        elif vision_model:
-            llm_cilent._get_image_description(
-                image_url,
-                vision_model,
-                get_image_base64,
-                description_cache,
-                'eager: ',
-            )
+        try:
+            if model_config.get('vision') or not vision_model:
+                image_uri_to_data_uri(image_url)
+            elif vision_model:
+                llm_cilent._get_image_description(
+                    image_url,
+                    vision_model,
+                    image_uri_to_data_uri,
+                    description_cache,
+                    'eager: ',
+                )
+        except (OSError, ValueError) as error:
+            print(f'eager 图片预取失败: {error}')
 
 
 def eager_cache_images(msg: dict):
@@ -951,8 +954,7 @@ def recognize_image(image_uri: str, prompt: str = ""):
         return '图片识别失败：仅支持 http://、https:// 或 file:// 图片 URI'
 
     try:
-        image_path, _ = resolve_image_uri(image_uri)
-        image_data = get_image_file_base64(image_path)
+        image_data = image_uri_to_data_uri(image_uri)
     except (OSError, ValueError) as error:
         return f'图片识别失败：{error}'
     if not image_data:
@@ -1521,7 +1523,7 @@ def chat(model=None):
     chat_client.print_messages()
     chat_client.chat(
         recall_func=get_handler(chat_client),
-        url_to_base64_func=get_image_base64,
+        url_to_base64_func=image_uri_to_data_uri,
         description_cache=description_cache,
     )
 
@@ -1621,7 +1623,7 @@ def run(body:str, model=None):
     chat_client.print_messages()
     chat_client.chat(
         recall_func=handle_LLMResponse,
-        url_to_base64_func=get_image_base64,
+        url_to_base64_func=image_uri_to_data_uri,
         description_cache=description_cache,
     )
 

@@ -1,7 +1,5 @@
 import os
 import json
-import requests
-import base64
 from typing import Optional, Generator, Union, Any, Callable
 from dataclasses import dataclass
 from openai import OpenAI
@@ -20,6 +18,7 @@ from datetime import date, timedelta
 # logger = Logger(name='chat')
 
 from main import storage
+from s3.url_to_base64 import image_uri_to_data_uri
 
 class MessageRole(Enum):
     SYSTEM = "system"
@@ -273,79 +272,6 @@ class ToolCallResult:
     content: str
 
 
-# 默认的URL转base64函数
-def default_url_to_base64(url: str) -> str:
-    response = requests.get(url, timeout=3)
-    if response.status_code != 200:
-        raise ValueError(f"Failed to download image from {url}")
-
-    image_data = response.content
-    mime_type = response.headers.get('Content-Type', 'image/jpeg')
-    base64_data = base64.b64encode(image_data).decode('utf-8')
-    return f"data:{mime_type};base64,{base64_data}"
-
-import subprocess
-import base64
-import magic  # 需要安装 python-magic: pip install python-magic
-import mimetypes
-
-def get_image_base64(url):
-    """
-    下载图片并转换为data URI格式
-
-    Args:
-        url: 图片URL
-
-    Returns:
-        str: 完整的data URI格式字符串 "data:{mime_type};base64,{base64_data}"
-    """
-    curl_command = [
-        'curl',
-        '-k',          # 忽略SSL证书验证
-        '-L',          # 跟随重定向
-        '-s',          # 静默模式
-        '-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36 Edg/134.0.0.0',
-        url
-    ]
-
-    try:
-        # 执行curl命令并获取二进制输出
-        result = subprocess.run(curl_command, capture_output=True)
-
-        if result.returncode == 0:
-            binary_data = result.stdout
-
-            # 检测MIME类型
-            mime = magic.Magic(mime=True)
-            mime_type = mime.from_buffer(binary_data)
-
-            # 如果magic检测失败，尝试从URL推断
-            if not mime_type or mime_type == 'application/octet-stream':
-                mime_type = mimetypes.guess_type(url)[0] or 'application/octet-stream'
-            if 'json' in mime_type:
-                raise ValueError(f"错误的mine格式: {mime_type}")
-
-            # 转换为base64
-            base64_data = base64.b64encode(binary_data).decode('utf-8')
-
-            # 构造完整的data URI
-            data_uri = f"data:{mime_type};base64,{base64_data}"
-
-            print("✅ 转换成功！")
-            print(f"📊 Data URI长度: {len(data_uri)} 字符")
-            print(f"🎯 MIME类型: {mime_type}")
-
-            return data_uri
-        else:
-            print(f"❌ 下载失败")
-            if result.stderr:
-                print(f"错误信息: {result.stderr.decode()}")
-            return None
-
-    except Exception as e:
-        print(f"❌ 发生错误: {str(e)}")
-        return None
-
 def split_string_with_code_blocks(text: str):
     result = []
     lines = text.split('\n')
@@ -386,6 +312,27 @@ def split_string_with_code_blocks(text: str):
     return result
 
 
+_DATA_URI_LOG_PATTERN = re.compile(
+    r'data:[^;\s,]+;base64,[A-Za-z0-9+/=_-]+',
+    re.IGNORECASE,
+)
+DATA_URI_LOG_PREFIX_CHARS = 80
+
+
+def format_value_for_log(value, prefix_chars: int = DATA_URI_LOG_PREFIX_CHARS) -> str:
+    """截断日志中的 Data URI，保留类型、开头和被省略长度。"""
+    text = str(value)
+
+    def truncate(match: re.Match) -> str:
+        data_uri = match.group(0)
+        if len(data_uri) <= prefix_chars:
+            return data_uri
+        omitted = len(data_uri) - prefix_chars
+        return f'{data_uri[:prefix_chars]}…<省略 {omitted} 字符>'
+
+    return _DATA_URI_LOG_PATTERN.sub(truncate, text)
+
+
 def print_colored(text, role, end='\n', flush=True, with_prefix=False):
     '''
     打印彩色字体
@@ -404,8 +351,8 @@ def print_colored(text, role, end='\n', flush=True, with_prefix=False):
             else:
                 result += str(item)
     else:
-        result += text
-    print(colored(result, color), end=end, flush=flush)
+        result += str(text)
+    print(colored(format_value_for_log(result), color), end=end, flush=flush)
 
 
 
@@ -737,8 +684,11 @@ class LLMCilent:
         with self._description_inflight_lock:
             description = get_cached_description(description_cache, image_url)
             if description is not None:
-                print(f"{log_indent}✅ 图片描述缓存命中: {image_url}")
-                print(f"{log_indent}    {description}")
+                print(
+                    f"{log_indent}✅ 图片描述缓存命中: "
+                    f"{format_value_for_log(image_url)}"
+                )
+                print(f"{log_indent}    {format_value_for_log(description)}")
                 return description
 
             event = self._description_inflight.get(cache_key)
@@ -752,7 +702,10 @@ class LLMCilent:
             with self._description_inflight_lock:
                 description = get_cached_description(description_cache, image_url)
             if description is not None:
-                print(f"{log_indent}✅ 等待中的图片描述已缓存: {image_url}")
+                print(
+                    f"{log_indent}✅ 等待中的图片描述已缓存: "
+                    f"{format_value_for_log(image_url)}"
+                )
             return description
 
         try:
@@ -767,7 +720,10 @@ class LLMCilent:
                 if removed:
                     print(f"{log_indent}🧹 已清理 {removed} 条过期图片描述缓存")
             else:
-                print(f"{log_indent}⚠️ 未能为 {image_url} 生成描述，不进行缓存。")
+                print(
+                    f"{log_indent}⚠️ 未能为 {format_value_for_log(image_url)} "
+                    "生成描述，不进行缓存。"
+                )
             return description
         finally:
             with self._description_inflight_lock:
@@ -810,7 +766,7 @@ class LLMCilent:
                 for image_match in image_matches:
                     image_url = image_match.group(1)
                     markdown_tag = image_match.group(0)
-                    print(f"    - 检查图片 URL: {image_url}")
+                    print(f"    - 检查图片 URL: {format_value_for_log(image_url)}")
                     try:
                         description = self._get_image_description(
                             image_url,
@@ -824,7 +780,10 @@ class LLMCilent:
                         # 使用 re.escape 避免 URL 中的特殊字符影响替换
                         new_content = new_content.replace(markdown_tag, replacement, 1) # 每次只替换一个，防止 URL 相同导致问题
                     except Exception as e:
-                        print(f"    ❌ 图片处理失败 ({image_url}): {e}")
+                        print(
+                            "    ❌ 图片处理失败 "
+                            f"({format_value_for_log(image_url)}): {format_value_for_log(e)}"
+                        )
                         new_content = new_content.replace(
                             markdown_tag,
                             format_image_description(image_url),
@@ -849,7 +808,10 @@ class LLMCilent:
                             for image_match in image_matches:
                                 image_url = image_match.group(1)
                                 markdown_tag = image_match.group(0)
-                                print(f"      - 检查图片 URL: {image_url}")
+                                print(
+                                    "      - 检查图片 URL: "
+                                    f"{format_value_for_log(image_url)}"
+                                )
                                 try:
                                     description = self._get_image_description(
                                         image_url,
@@ -862,7 +824,11 @@ class LLMCilent:
                                     replacement = format_image_description(image_url, description)
                                     temp_content = temp_content.replace(markdown_tag, replacement, 1)
                                 except Exception as e:
-                                    print(f"      ❌ 图片处理失败 ({image_url}): {e}")
+                                    print(
+                                        "      ❌ 图片处理失败 "
+                                        f"({format_value_for_log(image_url)}): "
+                                        f"{format_value_for_log(e)}"
+                                    )
                                     temp_content = temp_content.replace(
                                         markdown_tag,
                                         format_image_description(image_url),
@@ -885,7 +851,10 @@ class LLMCilent:
                                 image_url = ""
 
                             if image_url:
-                                print(f"    - 处理 image_url 对象: {image_url}")
+                                print(
+                                    "    - 处理 image_url 对象: "
+                                    f"{format_value_for_log(image_url)}"
+                                )
                                 try:
                                     description = self._get_image_description(
                                         image_url,
@@ -900,7 +869,11 @@ class LLMCilent:
                                         "text": format_image_description(image_url, description),
                                     })
                                 except Exception as e:
-                                    print(f"      ❌ 图片处理失败 ({image_url}): {e}")
+                                    print(
+                                        "      ❌ 图片处理失败 "
+                                        f"({format_value_for_log(image_url)}): "
+                                        f"{format_value_for_log(e)}"
+                                    )
                                     new_content_list.append({
                                         "type": "text",
                                         "text": format_image_description(image_url),
@@ -941,7 +914,7 @@ class LLMCilent:
         model = model or self.get_vision_model()
         if not model:
             return None
-        convert_url = convert_url or default_url_to_base64
+        convert_url = convert_url or image_uri_to_data_uri
         provider, api_model, _ = resolve_model(self.config, model)
         client = self.clients[provider]
 
@@ -949,10 +922,9 @@ class LLMCilent:
             if image_url.startswith("data:image/"):
                 image_data = image_url
             else:
-                try:
-                    image_data = convert_url(image_url) or image_url
-                except Exception:
-                    image_data = image_url
+                image_data = convert_url(image_url)
+                if not image_data:
+                    raise ValueError('图片 URI 转换失败')
             response = client.chat.completions.create(
                 model=api_model,
                 messages=[{
@@ -964,12 +936,12 @@ class LLMCilent:
                 }]
             )
             description = response.choices[0].message.content
-            print(f"      ✅ 视觉模型调用成功: {image_url}")
-            print(f"          {description}")
+            print(f"      ✅ 视觉模型调用成功: {format_value_for_log(image_url)}")
+            print(f"          {format_value_for_log(description)}")
 
             return description
         except Exception as e:
-            print(f"      ❌ 视觉模型调用失败: {e}")
+            print(f"      ❌ 视觉模型调用失败: {format_value_for_log(e)}")
             return None
 
     def generate_response(
@@ -998,7 +970,7 @@ class LLMCilent:
 
         # 处理图片
         if url_to_base64_func is None:
-            url_to_base64_func = default_url_to_base64
+            url_to_base64_func = image_uri_to_data_uri
 
         if do_process_image:
             if not capabilities.vision:
@@ -1363,7 +1335,10 @@ class LLMCilent:
                                 tool_results.append(tool_result)
 
                                 # 按照期望格式输出工具调用
-                                print(colored(f" -> {result}", ROLE_TO_COLOR[chunk.role]))
+                                print(colored(
+                                    format_value_for_log(f" -> {result}"),
+                                    ROLE_TO_COLOR[chunk.role],
+                                ))
 
                             except Exception as e:
                                 # 处理工具调用异常
@@ -1376,7 +1351,10 @@ class LLMCilent:
                                 tool_results.append(error_result)
 
                                 # 输出错误信息
-                                print(colored(f" -> 错误: {str(e)}", "red"))
+                                print(colored(
+                                    format_value_for_log(f" -> 错误: {e}"),
+                                    "red",
+                                ))
                                 print(traceback.format_exc())
 
                                 yield LLMResponse(
@@ -1555,11 +1533,14 @@ class Chat:
                 content = '\n'.join(tool_call['function']['name']+tool_call['function']['arguments']
                                     for tool_call in message["tool_calls"])
                 print(colored(f"{role}: ", ROLE_TO_COLOR.get("assistant", "white")), end="", flush=True)
-                print(colored(content, ROLE_TO_COLOR.get("tool", "white")))
+                print(colored(format_value_for_log(content), ROLE_TO_COLOR.get("tool", "white")))
             elif message["role"] == 'tool':
                 role = message["role"]
                 content = message["content"]
-                print(colored(f" -> {content}", ROLE_TO_COLOR.get(role, "white")))
+                print(colored(
+                    format_value_for_log(f" -> {content}"),
+                    ROLE_TO_COLOR.get(role, "white"),
+                ))
             else:
                 role = message["role"]
                 content = message["content"]
@@ -1705,7 +1686,7 @@ def test_vision(model, attr):
     chat = Chat(
         chat_client=llm_client,
         model=model,
-        url_to_base64_func=get_image_base64,
+        url_to_base64_func=image_uri_to_data_uri,
     )
     try:
         chat.chat(user_message=[{'type':'text','text':'你看这里面是什么'},{'type': 'image_url', 'image_url': {'url': '''data:image/png;base64,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'''}}] , stream=True)
@@ -1716,7 +1697,7 @@ def test_func(model, attr):
     chat = Chat(
         chat_client=llm_client,
         model=model,
-        url_to_base64_func=get_image_base64,
+        url_to_base64_func=image_uri_to_data_uri,
     )
     chat.add_tool(get_weather)
     try:
@@ -1728,7 +1709,7 @@ def test(model, attr):
     chat = Chat(
         chat_client=llm_client,
         model=model,
-        url_to_base64_func=get_image_base64,
+        url_to_base64_func=image_uri_to_data_uri,
     )
     try:
         chat.chat(user_message=[{'type':'text','text':'你好呀'}])
@@ -1771,7 +1752,7 @@ if __name__ == "__main__":
     chat = Chat(
         chat_client=llm_client,
         model='openai/gpt-3.5-turbo',
-        url_to_base64_func=get_image_base64,
+        url_to_base64_func=image_uri_to_data_uri,
     )
     chat.messages = messages
     chat.add_tool(get_weather)

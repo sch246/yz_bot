@@ -52,7 +52,7 @@ from s3.chat import (
         LLMCilent, Chat, sum_res, LLMResponse, resolve_model,
         get_cached_description, cache_description,
 )
-from s3.url_to_base64 import get_image_base64, get_image_file_base64, resolve_image_uri
+from s3.url_to_base64 import image_uri_to_data_uri, resolve_image_uri
 
 from dotenv import load_dotenv
 
@@ -90,7 +90,7 @@ def transform_image_to_text(text: str):
                                                 future = to_thread(llm_cilent.describe_image)(
                                                         url,
                                                         model=res,
-                                                        convert_url=get_image_base64,
+                                                        convert_url=image_uri_to_data_uri,
                                                 )
                                                 print(f'future: {future}')
                                                 lst.append((future, url))
