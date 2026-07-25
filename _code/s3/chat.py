@@ -19,6 +19,7 @@ from datetime import date, timedelta
 
 from main import storage
 from s3.url_to_base64 import image_uri_to_data_uri
+from s3.vision_input import AUTO_IMAGE_SPLIT_PROMPT, split_long_image_data_uri
 
 class MessageRole(Enum):
     SYSTEM = "system"
@@ -561,6 +562,18 @@ class LLMCilent:
                     "type": "text",
                     "text": f'[下方图片的原始链接: {image_uri}]',
                 })
+
+        def append_vision_image(parts: list, image_data: str):
+            image_slices, was_split = split_long_image_data_uri(image_data)
+            parts.extend({
+                "type": "image_url",
+                "image_url": {"url": image_slice},
+            } for image_slice in image_slices)
+            if was_split:
+                parts.append({
+                    "type": "text",
+                    "text": AUTO_IMAGE_SPLIT_PROMPT,
+                })
         
         processed_messages = []
         markdown_image_pattern = r"!\[(.*?)\]\((.*?)\)"
@@ -600,10 +613,7 @@ class LLMCilent:
                                             text_parts = []
 
                                         append_reference(new_content, img_url)
-                                        new_content.append({
-                                            "type": "image_url",
-                                            "image_url": {"url": image_data}
-                                        })
+                                        append_vision_image(new_content, image_data)
                                     except Exception as e:
                                         print(f"图片处理失败: {e}")
                                         # 转换失败时，将图片标记替换为错误文本
@@ -638,16 +648,13 @@ class LLMCilent:
                                     if not url.startswith("data:"):
                                         try:
                                             converted_url = convert_url(url)
-                                            new_content.append({
-                                                **item,
-                                                "image_url": {"url": converted_url},
-                                            })
+                                            append_vision_image(new_content, converted_url)
                                         except Exception as e:
                                             print(f"图片URL转换失败: {e}")
                                             # 替换为错误文本而不是保留原始URL
                                             new_content.append({"type": "text", "text": IMAGE_LOAD_FAILED_TEXT})
                                     else:
-                                        new_content.append(item)
+                                        append_vision_image(new_content, url)
                                 else:
                                     # URL为空的情况也替换为错误文本
                                     new_content.append({"type": "text", "text": IMAGE_LOAD_FAILED_TEXT})
@@ -679,10 +686,7 @@ class LLMCilent:
                                     image_data = convert_url(img_url)
 
                                 append_reference(new_content, img_url)
-                                new_content.append({
-                                    "type": "image_url",
-                                    "image_url": {"url": image_data}
-                                })
+                                append_vision_image(new_content, image_data)
                             except Exception as e:
                                 print(f"图片处理失败: {e}")
                                 # 转换失败时用文本代替
@@ -969,13 +973,20 @@ class LLMCilent:
                 image_data = convert_url(image_url)
                 if not image_data:
                     raise ValueError('图片 URI 转换失败')
+            image_slices, was_split = split_long_image_data_uri(image_data)
+            image_prompt = build_image_description_prompt(prompt)
+            if was_split:
+                image_prompt = f'{image_prompt}\n\n{AUTO_IMAGE_SPLIT_PROMPT}'
             response = client.chat.completions.create(
                 model=api_model,
                 messages=[{
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": build_image_description_prompt(prompt)},
-                        {"type": "image_url", "image_url": {"url": image_data}}
+                        {"type": "text", "text": image_prompt},
+                        *(
+                            {"type": "image_url", "image_url": {"url": image_slice}}
+                            for image_slice in image_slices
+                        ),
                     ]
                 }]
             )
