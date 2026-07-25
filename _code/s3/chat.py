@@ -1070,7 +1070,8 @@ class LLMCilent:
         进行一次迭代，将输出按照assistant:content, assistant:tool, assistant:think 来分类
         同时按照双换行符划分
 
-        只调用一次，如果有tool会调用tool，即使tool有返回也不负责再调用
+        只调用一次；先完整消费模型流并产出普通文本，再产出工具调用。
+        这保证模型在工具前输出的可见文本会先于工具副作用交给上层。
 
         包含usage的信息必定为assistant，且content为空字符串
 
@@ -1079,10 +1080,9 @@ class LLMCilent:
         buffer: str = ""
         current_role = None
         tool_calls = []  # 存储正在构建中的工具调用
-        completed_tool_calls = set()  # 存储已完成的工具调用
         id_to_index = {}
         usage = None
-        status = 0 # 1think, 2content, 3tool
+        status = 0 # 1think, 2content
 
         try:
             stream = client.chat.completions.create(**params)
@@ -1131,10 +1131,6 @@ class LLMCilent:
 
                 # 处理工具调用
                 if delta_dict.get('tool_calls'):
-                    if status != 3:
-                        status = 3
-                        print_colored(f"{current_role}({model}): ", current_role, end='', flush=True)
-                    # 实时输出增量内容
                     if delta.tool_calls:
                         for tool_call in delta.tool_calls:
                             if tool_call.id is not None: # 假设每个第一次出现肯定带id
@@ -1157,24 +1153,8 @@ class LLMCilent:
 
                             if tool_call.function.name:
                                 tool_calls[index]["function"]["name"] = tool_call.function.name
-                                print_colored(tool_call.function.name, MessageRole.TOOL.value, end='', flush=True)
                             if tool_call.function.arguments:
                                 tool_calls[index]["function"]["arguments"] += tool_call.function.arguments
-                                print_colored(tool_call.function.arguments, MessageRole.TOOL.value, end='', flush=True)
-
-                    # 检查是否有工具调用可以返回
-                    for tool_call in tool_calls:
-                        if (tool_call["id"] and
-                            tool_call["function"]["name"] and
-                            tool_call["id"] not in completed_tool_calls and
-                            self._is_complete_json(tool_call["function"]["arguments"])):
-                            yield LLMResponse(
-                                content=json.dumps(tool_call, ensure_ascii=False),
-                                role=MessageRole.TOOL.value
-                            )
-
-                            completed_tool_calls.add(tool_call["id"])
-
 
             # 处理最终剩余的内容
             if buffer.strip():
@@ -1185,10 +1165,23 @@ class LLMCilent:
                     role=current_role or MessageRole.ASSISTANT.value,
                 )
 
+            # 工具可能产生发送消息等副作用。必须等当前模型流完整结束、
+            # 且上面的文本 buffer 已产出后，才把工具调用交给上层执行。
             for tool_call in tool_calls: #报错也传上去
                 if (tool_call["id"] and
-                    tool_call["function"]["name"] and
-                    tool_call["id"] not in completed_tool_calls):
+                    tool_call["function"]["name"]):
+                    tool_role = current_role or MessageRole.ASSISTANT.value
+                    print_colored(
+                        f"{tool_role}({model}): ",
+                        tool_role,
+                        end='',
+                        flush=True,
+                    )
+                    print_colored(
+                        tool_call["function"]["name"] + tool_call["function"]["arguments"],
+                        MessageRole.TOOL.value,
+                        flush=True,
+                    )
                     yield LLMResponse(
                         content=json.dumps(tool_call, ensure_ascii=False),
                         role=MessageRole.TOOL.value
@@ -1209,14 +1202,6 @@ class LLMCilent:
             print(traceback.format_exc())
             print_colored(f"\n{error_msg}", MessageRole.SYSTEM.value)
             raise
-
-    def _is_complete_json(self, json_str: str) -> bool:
-        """检查JSON字符串是否完整"""
-        try:
-            json.loads(json_str)
-            return True
-        except json.JSONDecodeError:
-            return False
 
     def _non_stream_response(
         self,
