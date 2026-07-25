@@ -3,14 +3,80 @@ import hashlib
 import subprocess
 import base64
 import mimetypes
+import re
+import threading
+import time
 from PIL import Image, UnidentifiedImageError # 导入PIL库
 import io # 用于将bytes包装成file-like对象
 
 # --- 配置 ---
 TEMP_PATH = 'data/tmp_files' # 缓存目录
+IMAGE_CACHE_MAX_IDLE_DAYS = 15
+IMAGE_CACHE_PRUNE_INTERVAL_SECONDS = 24 * 60 * 60
+
+_HASHED_CACHE_FILE = re.compile(r'^[0-9a-f]{32}(?:\.[A-Za-z0-9]+)?$')
+_cache_prune_lock = threading.Lock()
+_last_cache_prune = {}
 
 # 确保缓存目录存在
 os.makedirs(TEMP_PATH, exist_ok=True)
+
+
+def touch_image_cache(path: str, now: float = None) -> bool:
+    """刷新临时图片的最后使用时间。"""
+    timestamp = time.time() if now is None else now
+    try:
+        os.utime(path, (timestamp, timestamp))
+    except OSError:
+        return False
+    return True
+
+
+def prune_image_cache(
+    target_dir: str = TEMP_PATH,
+    now: float = None,
+    max_idle_days: int = IMAGE_CACHE_MAX_IDLE_DAYS,
+) -> int:
+    """删除超过指定天数未使用的哈希命名临时图片。"""
+    timestamp = time.time() if now is None else now
+    cutoff = timestamp - max_idle_days * 24 * 60 * 60
+    removed = 0
+
+    try:
+        entries = list(os.scandir(target_dir))
+    except OSError:
+        return 0
+
+    for entry in entries:
+        if not entry.is_file() or not _HASHED_CACHE_FILE.fullmatch(entry.name):
+            continue
+        try:
+            if entry.stat().st_mtime < cutoff:
+                os.remove(entry.path)
+                removed += 1
+        except OSError:
+            continue
+
+    return removed
+
+
+def maybe_prune_image_cache(target_dir: str = TEMP_PATH) -> int:
+    """有图片活动时至多每天清理一次临时图片缓存。"""
+    cache_dir = os.path.abspath(target_dir)
+    monotonic_now = time.monotonic()
+    with _cache_prune_lock:
+        last_prune = _last_cache_prune.get(cache_dir)
+        if (
+            last_prune is not None
+            and monotonic_now - last_prune < IMAGE_CACHE_PRUNE_INTERVAL_SECONDS
+        ):
+            return 0
+        removed = prune_image_cache(target_dir)
+        _last_cache_prune[cache_dir] = monotonic_now
+
+    if removed:
+        print(f"🧹 已清理 {removed} 个超过 {IMAGE_CACHE_MAX_IDLE_DAYS} 天未使用的临时图片")
+    return removed
 
 # PIL 格式到 MIME 类型的映射 (可以根据需要扩展)
 PIL_FORMAT_TO_MIME = {
@@ -82,6 +148,8 @@ def get_image_base64(url, target_dir=TEMP_PATH):
     mime_type = None
 
     try:
+        maybe_prune_image_cache(target_dir)
+
         # 1. --- 检查缓存 ---
         url_hash = hashlib.md5(url.encode('utf-8')).hexdigest()
         # 在缓存中寻找可能存在的文件（基于哈希，不限扩展名）
@@ -107,6 +175,7 @@ def get_image_base64(url, target_dir=TEMP_PATH):
                         print(f"⚠️ PIL 未知格式 '{pil_format}', 从扩展名推断为: {mime_type}")
                     else:
                          print(f"✅ PIL 从缓存内容识别格式: {pil_format} -> {mime_type}")
+                    touch_image_cache(cached_file_path)
 
                 except UnidentifiedImageError:
                     print(f"⚠️ 缓存文件 '{cached_file_path}' 不是有效图片格式 (PIL无法识别)。将尝试重新下载。")

@@ -7,6 +7,7 @@ import time
 from PIL import Image
 
 from main import str_tool, connect, to_thread
+from s3.url_to_base64 import maybe_prune_image_cache, touch_image_cache
 
 image_path = 'data/images'
 temp_path = 'data/tmp_files'
@@ -119,6 +120,8 @@ def download_img(picture_url, name=None, temp=True):
 
     # 检查并创建目标目录
     os.makedirs(target_dir, exist_ok=True)
+    if temp:
+        maybe_prune_image_cache(target_dir)
     # 如果提供了文件名，则检查文件是否已存在
     if name:
         potential_files = [name, name.rsplit('.', 1)[0] + '.jpg', 
@@ -127,6 +130,8 @@ def download_img(picture_url, name=None, temp=True):
         for fname in potential_files:
             file_path = os.path.join(target_dir, fname)
             if os.path.exists(file_path):
+                if temp:
+                    touch_image_cache(file_path)
                 return file_path
     # 如果未提供name，但是是临时的，使用url的哈希值作为缓存文件名
     elif temp:
@@ -135,7 +140,9 @@ def download_img(picture_url, name=None, temp=True):
         existing_files = [f for f in os.listdir(target_dir) if os.path.splitext(os.path.basename(f))[0]==url_hash]
         if existing_files:
             # 有缓存直接返回
-            return os.path.join(target_dir, existing_files[0])
+            file_path = os.path.join(target_dir, existing_files[0])
+            touch_image_cache(file_path)
+            return file_path
 
     # 下载
     headers = {

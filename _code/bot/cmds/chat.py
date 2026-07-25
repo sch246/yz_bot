@@ -701,26 +701,32 @@ def _get_message_image_urls(msg: dict) -> list[str]:
 
 
 @to_thread(ret='None')
-def _eager_cache_images(msg: dict):
+def _eager_cache_images(msg: dict, model: str):
     vision_model = llm_cilent.get_vision_model()
-    if not vision_model:
+    try:
+        _, _, model_config = resolve_model(llm_config, model)
+    except ValueError:
         return
     for image_url in _get_message_image_urls(msg):
-        llm_cilent._get_image_description(
-            image_url,
-            vision_model,
-            get_image_base64,
-            description_cache,
-            'eager: ',
-        )
+        if model_config.get('vision') or not vision_model:
+            get_image_base64(image_url)
+        elif vision_model:
+            llm_cilent._get_image_description(
+                image_url,
+                vision_model,
+                get_image_base64,
+                description_cache,
+                'eager: ',
+            )
 
 
 def eager_cache_images(msg: dict):
-    """在 eager 聊天窗口中后台预识别新收到的图片消息。"""
+    """在 eager 聊天窗口中后台预下载图片，并按当前模型能力决定是否预识别。"""
     if not is_msg(msg) or '[CQ:image' not in msg.get('message', ''):
         return
-    if get_image_mode(_get_message_chat_storage(msg)) == 'eager':
-        _eager_cache_images(msg.copy())
+    chat_storage = _get_message_chat_storage(msg)
+    if get_image_mode(chat_storage) == 'eager':
+        _eager_cache_images(msg.copy(), get_model(chat_storage))
 
 
 def _is_context_poke(msg: dict, in_group: bool) -> bool:
@@ -923,9 +929,9 @@ def format_price(model: str, attr: dict) -> str:
     return f"{model}\n    {attr.get('prompt_price', '-')} {attr.get('completion_price', '-')} { '👀' if attr.get('vision') else ''} { '⚙️' if attr.get('function_calling') else ''}"
 
 
-def get_model() -> str:
+def get_model(data: dict = None) -> str:
     '''获取当前 provider/model 选择。'''
-    data = getchatstorage()
+    data = getchatstorage() if data is None else data
     model = data.get('model', llm_config['default_model'])
     try:
         resolve_model(llm_config, model)

@@ -107,7 +107,6 @@ BYTECAT_PROVIDER_CONFIG = {
     },
 }
 
-DESCRIPTION_CACHE_LIMIT = 500
 DESCRIPTION_CACHE_MAX_AGE_DAYS = 15
 
 DEFAULT_IMAGE_DESCRIPTION_PROMPT = """请详细描述图片内容，作为无视觉能力模型的上下文替代：
@@ -160,12 +159,21 @@ def _description_cache_entry(description: str, cached_at: date) -> dict:
 
 
 def get_cached_description(cache: dict, image_url: str, today: date = None) -> Optional[str]:
-    """读取图片描述；旧字符串值在命中时原地升级为带日期的条目。"""
+    """读取图片描述，拒绝超过 15 天未命中的条目并刷新有效条目的日期。"""
+    today = today or date.today()
     entry = cache.get(image_url)
     if isinstance(entry, str):
-        cache[image_url] = _description_cache_entry(entry, today or date.today())
+        cache[image_url] = _description_cache_entry(entry, today)
         return entry
     if isinstance(entry, dict) and isinstance(entry.get("description"), str):
+        try:
+            cached_at = date.fromisoformat(entry["cached_at"])
+        except (KeyError, TypeError, ValueError):
+            cached_at = today
+        if cached_at < today - timedelta(days=DESCRIPTION_CACHE_MAX_AGE_DAYS):
+            del cache[image_url]
+            return None
+        entry["cached_at"] = today.isoformat()
         return entry["description"]
     return None
 
@@ -173,13 +181,9 @@ def get_cached_description(cache: dict, image_url: str, today: date = None) -> O
 def prune_description_cache(
     cache: dict,
     today: date = None,
-    limit: int = DESCRIPTION_CACHE_LIMIT,
     max_age_days: int = DESCRIPTION_CACHE_MAX_AGE_DAYS,
 ) -> int:
-    """缓存超过 limit 时删除年龄大于 max_age_days 的条目。"""
-    if len(cache) <= limit:
-        return 0
-
+    """删除超过 max_age_days 未命中的描述缓存。"""
     today = today or date.today()
     cutoff = today - timedelta(days=max_age_days)
     removed = 0
