@@ -229,7 +229,8 @@ data/storage/              # 根目录
 ├── namespace_a/
 │   └── data.json           # storage.get('namespace_a', 'data')
 └── llm_system/
-    └── description_cache.json
+    ├── description_cache.json
+    └── image_uri_aliases.json
 ```
 
 ### 保存时机

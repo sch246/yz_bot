@@ -9,7 +9,11 @@ import time
 from PIL import Image
 
 from main import str_tool, connect, to_thread
-from s3.url_to_base64 import maybe_prune_image_cache, touch_image_cache
+from s3.url_to_base64 import (
+    maybe_prune_image_cache,
+    resolve_image_uri,
+    touch_image_cache,
+)
 
 image_path = 'data/images'
 temp_path = 'data/tmp_files'
@@ -116,14 +120,16 @@ def generate_unique_filename(directory):
 import hashlib
 def download_img(picture_url, name=None, temp=True):
     if temp:
-        target_dir = temp_path
+        # Temporary network images share the content-addressed resolver used by
+        # vision and reference-image tools. ``name`` is intentionally ignored:
+        # a cache filename identifies bytes, not a caller-provided label.
+        file_path, _ = resolve_image_uri(picture_url, temp_path)
+        return file_path
     else:
         target_dir = image_path
 
     # 检查并创建目标目录
     os.makedirs(target_dir, exist_ok=True)
-    if temp:
-        maybe_prune_image_cache(target_dir)
     # 如果提供了文件名，则检查文件是否已存在
     if name:
         potential_files = [name, name.rsplit('.', 1)[0] + '.jpg', 
@@ -132,19 +138,7 @@ def download_img(picture_url, name=None, temp=True):
         for fname in potential_files:
             file_path = os.path.join(target_dir, fname)
             if os.path.exists(file_path):
-                if temp:
-                    touch_image_cache(file_path)
                 return file_path
-    # 如果未提供name，但是是临时的，使用url的哈希值作为缓存文件名
-    elif temp:
-        url_hash = hashlib.md5(picture_url.encode('utf-8')).hexdigest()
-        # 在缓存中寻找可能存在的文件，避免重复下载
-        existing_files = [f for f in os.listdir(target_dir) if os.path.splitext(os.path.basename(f))[0]==url_hash]
-        if existing_files:
-            # 有缓存直接返回
-            file_path = os.path.join(target_dir, existing_files[0])
-            touch_image_cache(file_path)
-            return file_path
 
     # 下载
     headers = {
@@ -167,10 +161,7 @@ def download_img(picture_url, name=None, temp=True):
         ext = ''
     # 生成图片名(如果没有)
     if name is None:
-        if temp: # 临时的 hash
-            name = url_hash
-        else: # 否则 按照序号排序
-            name = generate_unique_filename(target_dir)
+        name = generate_unique_filename(target_dir)
     # 修改拓展名
     name = name.rsplit('.', 1)[0] + ext
 

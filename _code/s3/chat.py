@@ -9,7 +9,6 @@ from termcolor import colored
 import traceback
 import threading
 from copy import deepcopy
-from datetime import date, timedelta
 
 # import html
 # import time
@@ -18,7 +17,18 @@ from datetime import date, timedelta
 # logger = Logger(name='chat')
 
 from main import storage
-from s3.url_to_base64 import image_uri_to_data_uri
+from s3.image_description_cache import (
+    AUTO_IMAGE_DESCRIPTION_VERSION,
+    cache_description,
+    get_cached_description,
+    maybe_prune_description_cache,
+)
+from s3.url_to_base64 import (
+    get_cached_image_digest,
+    image_uri_to_data_uri,
+    resolve_image_with_digest,
+)
+from s3.image_identity import intrinsic_image_description_identity
 from s3.vision_input import AUTO_IMAGE_SPLIT_PROMPT, split_long_image_data_uri
 
 class MessageRole(Enum):
@@ -107,8 +117,6 @@ BYTECAT_PROVIDER_CONFIG = {
     },
 }
 
-DESCRIPTION_CACHE_MAX_AGE_DAYS = 15
-
 DEFAULT_IMAGE_DESCRIPTION_PROMPT = """请详细描述图片内容，作为无视觉能力模型的上下文替代：
 
 - 主体与文字：指出图片类型（如表情包、软件截图、照片、图表等），并完整准确地转录图中所有清晰可见的文字。
@@ -137,10 +145,11 @@ def format_image_reference(image_uri: str, label: str = "图片") -> str:
 
 
 def format_image_description(image_uri: str, description: str = None) -> str:
+    """把图片 URI 与识别结果保留在一个无歧义的模型可见标记中。"""
     detail = description or '图片解析失败'
     if not image_uri or image_uri.startswith('data:image/'):
-        return f'[图片: {detail}]'
-    return f'[图片({image_uri}): {detail}]'
+        return f'[图片识别结果：{detail}]'
+    return f'[图片({image_uri})识别结果：{detail}]'
 
 
 def split_model_selection(selection: str) -> tuple[str, str]:
@@ -164,74 +173,6 @@ def resolve_model(config: dict, selection: str) -> tuple[str, str, dict]:
         raise ValueError(f"供应商 {provider} 下未找到模型: {model}")
     return provider, model, models[model]
 
-
-def _description_cache_entry(description: str, cached_at: date) -> dict:
-    return {
-        "description": description,
-        "cached_at": cached_at.isoformat(),
-    }
-
-
-def get_cached_description(cache: dict, image_url: str, today: date = None) -> Optional[str]:
-    """读取图片描述，拒绝超过 15 天未命中的条目并刷新有效条目的日期。"""
-    today = today or date.today()
-    entry = cache.get(image_url)
-    if isinstance(entry, str):
-        cache[image_url] = _description_cache_entry(entry, today)
-        return entry
-    if isinstance(entry, dict) and isinstance(entry.get("description"), str):
-        try:
-            cached_at = date.fromisoformat(entry["cached_at"])
-        except (KeyError, TypeError, ValueError):
-            cached_at = today
-        if cached_at < today - timedelta(days=DESCRIPTION_CACHE_MAX_AGE_DAYS):
-            del cache[image_url]
-            return None
-        entry["cached_at"] = today.isoformat()
-        return entry["description"]
-    return None
-
-
-def prune_description_cache(
-    cache: dict,
-    today: date = None,
-    max_age_days: int = DESCRIPTION_CACHE_MAX_AGE_DAYS,
-) -> int:
-    """删除超过 max_age_days 未命中的描述缓存。"""
-    today = today or date.today()
-    cutoff = today - timedelta(days=max_age_days)
-    removed = 0
-
-    for image_url, entry in list(cache.items()):
-        if isinstance(entry, str):
-            cache[image_url] = _description_cache_entry(entry, today)
-            continue
-        if not isinstance(entry, dict) or not isinstance(entry.get("description"), str):
-            del cache[image_url]
-            removed += 1
-            continue
-        try:
-            cached_at = date.fromisoformat(entry["cached_at"])
-        except (KeyError, TypeError, ValueError):
-            entry["cached_at"] = today.isoformat()
-            continue
-        if cached_at < cutoff:
-            del cache[image_url]
-            removed += 1
-
-    return removed
-
-
-def cache_description(
-    cache: dict,
-    image_url: str,
-    description: str,
-    today: date = None,
-) -> int:
-    """写入带日期的图片描述，并在超过数量阈值时清理旧条目。"""
-    today = today or date.today()
-    cache[image_url] = _description_cache_entry(description, today)
-    return prune_description_cache(cache, today=today)
 
 @dataclass
 class LLMResponse:
@@ -728,16 +669,42 @@ class LLMCilent:
         description_cache: dict,
         log_indent: str = "",
     ) -> Optional[str]:
-        cache_key = (id(description_cache), image_url)
+        image_digest = get_cached_image_digest(image_url)
+        description_identities = []
+        if image_digest is not None:
+            description_identities.append(image_digest)
+        intrinsic_identity = intrinsic_image_description_identity(image_url)
+        if intrinsic_identity and intrinsic_identity not in description_identities:
+            description_identities.append(intrinsic_identity)
+
         with self._description_inflight_lock:
-            description = get_cached_description(description_cache, image_url)
-            if description is not None:
-                print(
-                    f"{log_indent}✅ 图片描述缓存命中: "
-                    f"{format_value_for_log(image_url)}"
-                )
-                print(f"{log_indent}    {format_value_for_log(description)}")
-                return description
+            removed = maybe_prune_description_cache(description_cache)
+            if removed:
+                print(f"{log_indent}🧹 已清理 {removed} 条过期图片描述缓存")
+            for identity in description_identities:
+                description = get_cached_description(description_cache, identity)
+                if description is not None:
+                    algorithm = identity.partition(':')[0] if ':' in identity else 'sha256'
+                    print(f"{log_indent}✅ 图片描述缓存命中: {algorithm}")
+                    print(f"{log_indent}    {format_value_for_log(description)}")
+                    return description
+
+        if image_digest is None:
+            _, _, image_digest = resolve_image_with_digest(image_url)
+            description_identities.insert(0, image_digest)
+        cache_key = (
+            id(description_cache),
+            image_digest,
+            AUTO_IMAGE_DESCRIPTION_VERSION,
+        )
+        with self._description_inflight_lock:
+            for identity in description_identities:
+                description = get_cached_description(description_cache, identity)
+                if description is not None:
+                    algorithm = identity.partition(':')[0] if ':' in identity else 'sha256'
+                    print(f"{log_indent}✅ 图片描述缓存命中: {algorithm}")
+                    print(f"{log_indent}    {format_value_for_log(description)}")
+                    return description
 
             event = self._description_inflight.get(cache_key)
             is_owner = event is None
@@ -748,11 +715,11 @@ class LLMCilent:
         if not is_owner:
             event.wait()
             with self._description_inflight_lock:
-                description = get_cached_description(description_cache, image_url)
+                description = get_cached_description(description_cache, image_digest)
             if description is not None:
                 print(
                     f"{log_indent}✅ 等待中的图片描述已缓存: "
-                    f"{format_value_for_log(image_url)}"
+                    f"sha256:{image_digest[:12]}"
                 )
             return description
 
@@ -764,7 +731,11 @@ class LLMCilent:
             )
             if description:
                 with self._description_inflight_lock:
-                    removed = cache_description(description_cache, image_url, description)
+                    removed = cache_description(
+                        description_cache,
+                        image_digest,
+                        description,
+                    )
                 if removed:
                     print(f"{log_indent}🧹 已清理 {removed} 条过期图片描述缓存")
             else:

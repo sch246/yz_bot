@@ -42,7 +42,7 @@ import s3.params as params
 import s3.str_tool as str_tool
 read_params = str_tool.read_params
 import s3.thread as thread
-from s3.thread import to_thread, ctrlc_decorator, SimpleFuture
+from s3.thread import to_thread, ctrlc_decorator
 from s3.delay_func import call_delay
 import s3.mcrcon as mcrcon
 from s3.cache_args import cache_args
@@ -66,9 +66,13 @@ import bot.pages as pages
 import bot.cache as cache
 import bot.chatlog as chatlog
 
+import s3.url_to_base64 as image_cache
+
+image_uri_aliases = storage.get("llm_system", "image_uri_aliases")
+image_cache.configure_image_uri_aliases(image_uri_aliases)
+
 from s3.chat import (
         LLMCilent, Chat, sum_res, LLMResponse, resolve_model,
-        get_cached_description, cache_description,
 )
 from s3.url_to_base64 import image_uri_to_data_uri, resolve_image_uri
 
@@ -82,57 +86,6 @@ def gpt(settings, question):
         chat = Chat(chat_client=llm_cilent)
         chat.set_messages(settings)
         return sum_res(chat.chat(question)).content
-
-description_dict = storage.get("llm_system", "description_cache")
-
-def transform_image_to_text(text: str):
-        '''
-        将消息中的图片转换为描述
-        多线程将图片转换为描述，然后合并
-        '''
-        lst = []
-        for part in image_pattern.split(text):
-                if image_pattern.match(part):
-                        try:
-                                data = cq.load(part)['data']
-                                url = data['url']
-
-                                description = get_cached_description(description_dict, url)
-                                if description is not None:
-                                        print(f"✅ 图片描述缓存命中: {description}")
-                                        lst.append(description)
-                                else:
-                                        res = llm_cilent.get_vision_model()
-                                        if res:
-                                                print(f"❌ 图片描述缓存未命中: {url}")
-                                                future = to_thread(llm_cilent.describe_image)(
-                                                        url,
-                                                        model=res,
-                                                        convert_url=image_uri_to_data_uri,
-                                                )
-                                                print(f'future: {future}')
-                                                lst.append((future, url))
-                                        else:
-                                                lst.append("[图片: 解析失败]")
-                        except Exception as e:
-                                traceback.print_exc()
-                                lst.append("[图片: 解析失败]")
-                elif part.strip():  # 只添加非空文本
-                        lst.append(part)
-
-        # 多线程（to_thread）将图片转换为描述
-        resolved = []
-        for item in lst:
-                if isinstance(item, tuple) and isinstance(item[0], SimpleFuture):
-                        description = item[0].result()
-                        if description:
-                                cache_description(description_dict, item[1], description)
-                        resolved.append(f"[图片:{description or '解析失败'}]")
-                else:
-                        resolved.append(item)
-
-        return ''.join(resolved)
-
 
 __botdir__ = '/'.join(__file__.split('/')[:-2])
 
@@ -375,10 +328,6 @@ def recv(msg:dict|None):
                 return
 
         print(f'[{time.strftime(r"%H:%M:%S")}]【收到消息】',end='')
-
-        # # 转换收到消息的图片为描述
-        # if 'message' in msg:
-        #         msg['message'] = transform_image_to_text(msg['message'])
 
         cache.thismsg(msg)
         cache.msgs['last'] = msg
