@@ -646,7 +646,8 @@ def _start_worker() -> None:
     _worker.start()
 
 
-def _shutdown(*, flush: bool = True) -> None:
+def shutdown(*, flush: bool = True) -> None:
+    """停止热同步并按需强制落盘；可由显式退出路径和 atexit 重复调用。"""
     global _shutdown_started
     with _lock:
         if _shutdown_started:
@@ -665,4 +666,4 @@ def _shutdown(*, flush: bool = True) -> None:
 if not _is_reload:
     load()
     _start_worker()
-    atexit.register(_shutdown)
+    atexit.register(shutdown)

@@ -104,6 +104,7 @@ HTTP 200 只表示事件已被本地监听器接收，不表示命令或回复�
 
 - `.reboot` 只有在外层 `run.py` 监督时才会重新启动；直接运行 `_code/main.py` 会以 233 退出后停住。
 - `.shutdown` 以 0 正常退出，所以即使开启 `-a` 也不会被当作异常重新拉起。
+- 终端第一次 `Ctrl+C` 会让 `main` 进入显式退出路径；父进程只转发第一次 SIGINT，子进程忽略保存期间的重复 SIGINT。退出顺序固定为等待 scheduler 任务结束、停止 storage watcher/worker、强制保存全部 storage；各 shutdown 仍注册为幂等 `atexit` 兜底。`SIGKILL`、断电和 Python fatal error 不经过这条路径。
 - 退出前的“重启中/关闭中”会等待发送 Future 完成；下次启动的“重启完成/醒了”只排入发送队列，钩子文件随即删除，不保证 NapCat 已确认送达。
 - 反复打印连接错误通常先检查 NapCat 的 API 端口；监听端口被占用会在导入 HTTP 连接器时直接失败。
 - 某个命令导入失败会打印 traceback；若由 `.reboot` 发起且问候文件仍在，加载器还会把失败命令列表发回原窗口。

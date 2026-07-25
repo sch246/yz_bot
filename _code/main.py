@@ -2,6 +2,7 @@
 import re
 import sys,os
 import subprocess
+import signal
 from typing import Generator
 import time
 from typing import Any
@@ -9,10 +10,27 @@ from queue import Queue
 from inspect import getgeneratorstate, GEN_CREATED
 import random
 
+
+_sigint_received = False
+
+
+def _handle_sigint(sig, frame):
+        """第一次 SIGINT 发起退出；保存期间的重复信号不能中断落盘。"""
+        global _sigint_received
+        if _sigint_received:
+                return
+        _sigint_received = True
+        raise KeyboardInterrupt
+
+
+if __name__ == "__main__":
+        # 尽量在副作用模块导入前安装，缩小启动阶段收到重复 SIGINT 的窗口。
+        signal.signal(signal.SIGINT, _handle_sigint)
+
 from s3 import *
 from s3 import __logging
 # from s3.rag import hipporag
-from s3.scheduler import scheduler
+from s3.scheduler import scheduler, shutdown as shutdown_scheduler
 import s3.repl as repl
 from s3.command_manager import CommandManager
 import s3.config as config
@@ -424,12 +442,17 @@ print("加载funcs")
 from funcs import *
 
 if __name__=="__main__":
-        print("启动中")
-        _init_self()
-        cmds.load()
-        while True:
-                try:
+        try:
+                print("启动中")
+                _init_self()
+                cmds.load()
+                while True:
                         recv(connect.recv_msg())
-                except KeyboardInterrupt:
-                        print('bye.')
-                        exit(0)
+        except KeyboardInterrupt:
+                print('bye.')
+        finally:
+                # 先等待仍可能修改 storage 的计划任务结束，再停止同步并最终落盘。
+                try:
+                        shutdown_scheduler()
+                finally:
+                        storage.shutdown()

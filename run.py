@@ -28,10 +28,19 @@ def run(log_only, debug, auto_reboot, qq, port):
                 [sys.executable, './_code/main.py', *args]
             )
 
-            # 把 SIGINT 转发给子进程，让 main.py 优雅退出（触发 atexit → storage.save()）
-            # 而不是被 subprocess.run 内部的裸 except: 用 SIGKILL 杀死
+            # 终端可能已把 SIGINT 发给同一进程组里的子进程；父进程只补充
+            # 转发第一次，main.py 会忽略保存期间到达的重复 SIGINT。
+            sigint_forwarded = False
             def _forward_sigint(sig, frame):
-                process.send_signal(sig)
+                nonlocal sigint_forwarded
+                if sigint_forwarded:
+                    return
+                sigint_forwarded = True
+                if process.poll() is None:
+                    try:
+                        process.send_signal(sig)
+                    except ProcessLookupError:
+                        pass
 
             original_sigint = signal.signal(signal.SIGINT, _forward_sigint)
             try:

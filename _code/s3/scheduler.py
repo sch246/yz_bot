@@ -6,8 +6,11 @@ scheduler.start()
 
 import atexit
 
-def cleanup():
+def shutdown():
+    """停止接收新任务并等待正在执行的任务结束；可重复调用。"""
+    if not scheduler.running:
+        return
     print("Shutting down scheduler...")
-    scheduler.shutdown()
+    scheduler.shutdown(wait=True)
 
-atexit.register(cleanup)
+atexit.register(shutdown)
