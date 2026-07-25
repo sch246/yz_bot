@@ -11,6 +11,7 @@ pillow
 numpy
 matplotlib
 apscheduler
+watchdog
 python-magic
 httpx[socks]
 PyJWT

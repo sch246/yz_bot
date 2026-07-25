@@ -16,7 +16,7 @@
 - [LLM 聊天与工具调用](docs/llm.md)：上下文构建、模型配置、函数工具、自动调用循环和当前信任边界。
 - [运行边界与交互测试](docs/runtime.md)：NapCat 接入、真实消息路径，以及如何避免测试影响正在运行的实例。
 - [当前维护队列](docs/working/current-issues.md)：已经确认要修的缺陷、接受的现行约束，以及仍可选的加固项。
-- [未实现设计提案](docs/working/proposals/README.md)：Core 降级、Storage 热同步、异常日志、权限和多个独立 Bot 项目共存；这些内容不是当前契约。
+- [未实现设计提案](docs/working/proposals/README.md)：Core 降级、Storage 值校验与历史恢复、异常日志、权限和多个独立 Bot 项目共存；这些内容不是当前契约。
 - [当前 link 反应快照](docs/working/link-reactions.md)：`data/storage/links.json` 中当前动态反应的可读索引；它是会随在线配置变化的工作快照。
 - [命令开发指南](COMMANDS.md)：新增命令时使用的实现级资料。预期交互语义以交互文档为准，当前精确语法以命令 docstring/`.help` 为准；若代码与设计意图冲突，应记录差异，而不是静默任选一边。
 
