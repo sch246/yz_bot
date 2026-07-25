@@ -28,7 +28,7 @@ from main import CommandManager
 
 import json
 
-from main import LLMCilent, Chat, sum_res, LLMResponse, get_image_file_base64, resolve_image_uri, resolve_model
+from main import LLMCilent, Chat, sum_res, LLMResponse, get_image_base64, get_image_file_base64, resolve_image_uri, resolve_model
 
 from main import memberlist
 
