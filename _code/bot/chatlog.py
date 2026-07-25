@@ -226,29 +226,30 @@ def gettime(sec:int):
     return day, hour, minu, sec
 
 if __name__ == "__main__":
+    # 完全合成的 OneBot 事件示例，不对应真实账号或聊天。
     write({
         "anonymous": None,
         "font": 0,
-        "group_id": 0,
-        "message": "（（~",
-        "message_id": -1122407633,
-        "message_seq": 643019,
+        "group_id": 20001,
+        "message": "示例消息",
+        "message_id": -30001,
+        "message_seq": 1,
         "message_type": "group",
         "post_type": "message",
-        "raw_message": "（（~",
-        "self_id": 0,
+        "raw_message": "示例消息",
+        "self_id": 10001,
         "sender": {
             "age": 0,
             "area": "",
             "card": "",
             "level": "",
-            "nickname": "蜂蜜柚子茶",
+            "nickname": "示例用户",
             "role": "member",
             "sex": "unknown",
             "title": "",
-            "user_id": 0
+            "user_id": 10002
         },
         "sub_type": "normal",
-        "time": 1658807341,
-        "user_id": 0
+        "time": 0,
+        "user_id": 10002
     })

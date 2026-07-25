@@ -3,6 +3,7 @@ import re
 import os
 
 from main import storage, read_params, pages, str_tool, sendmsg
+from bot.cmds._bbx import phrase_allowed, source_log_dir
 
 prefix: list[str] = storage.get('bbxdw', 'prefix', list)
 suffix: list[str] = storage.get('bbxdw', 'suffix', list)
@@ -74,8 +75,13 @@ def run(body:str):
         results1 = []
         results2 = []
 
-        # 递归遍历指定目录
-        for root, dirs, files in os.walk('chatlog/group/0/'):
+        try:
+            log_dir = source_log_dir()
+        except ValueError as e:
+            return str(e)
+
+        # 递归遍历配置的群聊日志目录
+        for root, dirs, files in os.walk(log_dir):
             for file in files:
                 # 拼接完整的文件路径
                 path = os.path.join(root, file)
@@ -85,10 +91,11 @@ def run(body:str):
                     # 找到所有匹配项
                     matches1 = pattern1.findall(content)
                     matches2 = pattern2.findall(content)
-                    # 过滤掉超过16个字符的匹配项以及不合适的匹配项
-                    matches1 = [match.strip() for match in matches1 if len(match) <= 16 and '柚子' not in match and '狐' not in match and '”，改成“' not in match and '怎么把' not in match and '小豆猫' not in match and '。' not in match and '那新猫' not in match]
-                    # 过滤掉超过5个字符的匹配项
-                    matches2 = [match.strip() for match in matches2 if len(match) <= 5]
+                    try:
+                        matches1 = [match.strip() for match in matches1 if phrase_allowed(match, 16)]
+                        matches2 = [match.strip() for match in matches2 if phrase_allowed(match, 5)]
+                    except ValueError as e:
+                        return str(e)
                     # 分别添加到对应的结果集
                     results1.extend(matches1)
                     results2.extend(matches2)

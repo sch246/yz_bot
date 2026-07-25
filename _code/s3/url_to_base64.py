@@ -4,6 +4,7 @@ import subprocess
 import base64
 import mimetypes
 import re
+from urllib.parse import unquote, urlparse
 import threading
 import time
 from PIL import Image, UnidentifiedImageError # 导入PIL库
@@ -14,7 +15,7 @@ TEMP_PATH = 'data/tmp_files' # 缓存目录
 IMAGE_CACHE_MAX_IDLE_DAYS = 15
 IMAGE_CACHE_PRUNE_INTERVAL_SECONDS = 24 * 60 * 60
 
-_HASHED_CACHE_FILE = re.compile(r'^[0-9a-f]{32}(?:\.[A-Za-z0-9]+)?$')
+_HASHED_CACHE_FILE = re.compile(r'^(?:[0-9a-f]{32}|[0-9a-f]{64})(?:\.[A-Za-z0-9]+)?$')
 _cache_prune_lock = threading.Lock()
 _last_cache_prune = {}
 
@@ -101,8 +102,8 @@ MIME_TO_EXTENSION = {
 MAX_LOCAL_IMAGE_BYTES = 20 * 1024 * 1024
 
 
-def get_image_file_base64(path: str, max_bytes: int = MAX_LOCAL_IMAGE_BYTES) -> str:
-    """读取并验证本地图片文件，返回可发送给视觉模型的 data URI。"""
+def _validate_image_file(path: str, max_bytes: int = MAX_LOCAL_IMAGE_BYTES) -> tuple[str, str]:
+    """验证本地图片，返回绝对路径和 MIME 类型。"""
     resolved_path = os.path.abspath(os.path.expanduser(path))
     if not os.path.isfile(resolved_path):
         raise ValueError('图片文件不存在或不是普通文件')
@@ -127,8 +128,87 @@ def get_image_file_base64(path: str, max_bytes: int = MAX_LOCAL_IMAGE_BYTES) -> 
     if not mime_type or not mime_type.startswith('image/'):
         raise ValueError(f'不支持的图片格式: {image_format or "unknown"}')
 
+    return resolved_path, mime_type
+
+
+def get_image_file_base64(path: str, max_bytes: int = MAX_LOCAL_IMAGE_BYTES) -> str:
+    """读取并验证本地图片文件，返回可发送给视觉模型的 data URI。"""
+    resolved_path, mime_type = _validate_image_file(path, max_bytes)
+    with open(resolved_path, 'rb') as image_file:
+        binary_data = image_file.read()
+
     encoded = base64.b64encode(binary_data).decode('ascii')
     return f'data:{mime_type};base64,{encoded}'
+
+
+def _file_uri_to_path(uri: str) -> str:
+    parsed = urlparse(uri)
+    if parsed.scheme.lower() != 'file':
+        raise ValueError('不是 file:// 图片 URI')
+    if parsed.netloc not in ('', 'localhost'):
+        raise ValueError('file:// URI 不支持远程主机')
+    path = unquote(parsed.path)
+    if not os.path.isabs(path):
+        raise ValueError('file:// URI 必须使用绝对路径')
+    return path
+
+
+def _find_url_cache_file(url: str, target_dir: str = TEMP_PATH) -> str | None:
+    url_hash = hashlib.md5(url.encode('utf-8')).hexdigest()
+    try:
+        candidates = [
+            entry.path
+            for entry in os.scandir(target_dir)
+            if entry.is_file()
+            and os.path.splitext(entry.name)[0] == url_hash
+        ]
+    except OSError:
+        return None
+    return candidates[0] if candidates else None
+
+
+def resolve_image_uri(
+    uri: str,
+    target_dir: str = TEMP_PATH,
+    max_bytes: int = MAX_LOCAL_IMAGE_BYTES,
+) -> tuple[str, str]:
+    """把 http(s):// 或 file:// 图片 URI 解析为已验证的本地文件。"""
+    if not isinstance(uri, str) or not uri.strip():
+        raise ValueError('图片 URI 不能为空')
+    uri = uri.strip()
+
+    scheme = urlparse(uri).scheme.lower()
+    if scheme == 'file':
+        return _validate_image_file(_file_uri_to_path(uri), max_bytes)
+    if scheme not in {'http', 'https'}:
+        raise ValueError('图片 URI 只支持 http://、https:// 或 file://')
+
+    maybe_prune_image_cache(target_dir)
+    cached_path = _find_url_cache_file(uri, target_dir)
+    if cached_path is not None:
+        try:
+            resolved = _validate_image_file(cached_path, max_bytes)
+            touch_image_cache(cached_path)
+            return resolved
+        except ValueError:
+            try:
+                os.remove(cached_path)
+            except OSError:
+                pass
+
+    if get_image_base64(uri, target_dir) is None:
+        raise ValueError('网络图片下载或识别失败')
+    cached_path = _find_url_cache_file(uri, target_dir)
+    if cached_path is None:
+        raise ValueError('网络图片未能写入缓存')
+    try:
+        return _validate_image_file(cached_path, max_bytes)
+    except ValueError:
+        try:
+            os.remove(cached_path)
+        except OSError:
+            pass
+        raise
 
 def get_image_base64(url, target_dir=TEMP_PATH):
     """
@@ -142,6 +222,9 @@ def get_image_base64(url, target_dir=TEMP_PATH):
         str or None: 完整的data URI格式字符串 "data:{mime_type};base64,{base64_data}"
                      或在失败时返回 None
     """
+    if isinstance(url, str) and urlparse(url).scheme.lower() == 'file':
+        return get_image_file_base64(_file_uri_to_path(url))
+
     print(f"🔄 处理 URL: {url}")
     binary_data = None
     cached_file_path = None
@@ -337,8 +420,8 @@ def get_image_base64(url, target_dir=TEMP_PATH):
 
 # --- 示例用法 ---
 if __name__ == "__main__":
-    # 示例1: 一个有效的图片 URL
-    image_url_ok = "https://gchat.qpic.cn/gchatpic_new/0/0-0-5EF97D26F8726DCBC95B35019D5F9C8B/0"
+    # 示例1: 一个公开的测试图片 URL
+    image_url_ok = "https://httpbin.org/image/png"
     data_uri_ok = get_image_base64(image_url_ok)
     if data_uri_ok:
         print("\n--- 结果 (成功) ---")

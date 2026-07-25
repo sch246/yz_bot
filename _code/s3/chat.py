@@ -129,6 +129,19 @@ def build_image_description_prompt(prompt: str = "") -> str:
 只输出任务要求的图片识别结果。不要解释任务，不要提及视觉模型或无视觉模型，不要向用户提供后续服务，也不要询问是否需要整理成其它格式。"""
 
 
+def format_image_reference(image_uri: str, label: str = "图片") -> str:
+    """把原始图片 URI 保留为模型可见的文本引用。"""
+    if not image_uri or image_uri.startswith('data:image/'):
+        return f'[{label}]'
+    return f'[{label} URL: {image_uri}]'
+
+
+def format_image_description(image_uri: str, description: str = None) -> str:
+    reference = format_image_reference(image_uri)
+    detail = f'[图片: {description}]' if description else '[图片: 图片解析失败]'
+    return f'{reference}\n{detail}'
+
+
 def split_model_selection(selection: str) -> tuple[str, str]:
     """按第一个斜杠拆分 provider/model。"""
     if not isinstance(selection, str):
@@ -502,11 +515,8 @@ class LLMCilent:
         markdown_image_pattern = r"!\[.*?\]\((.*?)\)"
         processed_messages = []
 
-        def format_reference(image_url: str) -> str:
-            return f"[{label} URL: {image_url}]" if image_url else f"[{label}]"
-
         def replace_markdown(match: re.Match) -> str:
-            return format_reference(match.group(1))
+            return format_image_reference(match.group(1), label)
 
         for message in messages:
             new_message = message.copy()
@@ -531,7 +541,7 @@ class LLMCilent:
                             image_url = ""
                         new_content.append({
                             "type": "text",
-                            "text": format_reference(image_url),
+                            "text": format_image_reference(image_url, label),
                         })
                     elif isinstance(item, str):
                         new_content.append({
@@ -557,6 +567,13 @@ class LLMCilent:
         """
         # 定义错误提示文本
         IMAGE_LOAD_FAILED_TEXT = "[图片加载失败]"
+
+        def append_reference(parts: list, image_uri: str):
+            if image_uri and not image_uri.startswith('data:image/'):
+                parts.append({
+                    "type": "text",
+                    "text": format_image_reference(image_uri),
+                })
         
         processed_messages = []
         markdown_image_pattern = r"!\[(.*?)\]\((.*?)\)"
@@ -595,6 +612,7 @@ class LLMCilent:
                                             new_content.append({"type": "text", "text": "".join(text_parts)})
                                             text_parts = []
 
+                                        append_reference(new_content, img_url)
                                         new_content.append({
                                             "type": "image_url",
                                             "image_url": {"url": image_data}
@@ -602,7 +620,9 @@ class LLMCilent:
                                     except Exception as e:
                                         print(f"图片处理失败: {e}")
                                         # 转换失败时，将图片标记替换为错误文本
-                                        text_parts.append(IMAGE_LOAD_FAILED_TEXT)
+                                        text_parts.append(
+                                            f'{format_image_reference(img_url)}\n{IMAGE_LOAD_FAILED_TEXT}'
+                                        )
 
                                 # 处理剩余文本
                                 if current_pos < len(item):
@@ -626,11 +646,14 @@ class LLMCilent:
                                     item = {"type": "image_url", "image_url": {"url": url}}
 
                                 if url:
+                                    append_reference(new_content, url)
                                     if not url.startswith("data:"):
                                         try:
                                             converted_url = convert_url(url)
-                                            item["image_url"]["url"] = converted_url
-                                            new_content.append(item)
+                                            new_content.append({
+                                                **item,
+                                                "image_url": {"url": converted_url},
+                                            })
                                         except Exception as e:
                                             print(f"图片URL转换失败: {e}")
                                             # 替换为错误文本而不是保留原始URL
@@ -667,6 +690,7 @@ class LLMCilent:
                                 else:
                                     image_data = convert_url(img_url)
 
+                                append_reference(new_content, img_url)
                                 new_content.append({
                                     "type": "image_url",
                                     "image_url": {"url": image_data}
@@ -674,7 +698,10 @@ class LLMCilent:
                             except Exception as e:
                                 print(f"图片处理失败: {e}")
                                 # 转换失败时用文本代替
-                                new_content.append({"type": "text", "text": IMAGE_LOAD_FAILED_TEXT})
+                                new_content.append({
+                                    "type": "text",
+                                    "text": f'{format_image_reference(img_url)}\n{IMAGE_LOAD_FAILED_TEXT}',
+                                })
 
                         if current_pos < len(content):
                             remaining_text = content[current_pos:]
@@ -772,7 +799,7 @@ class LLMCilent:
             content: Union[str, list] = message["content"]
             if isinstance(content, str):
                 # 检查是否有图片标记
-                image_matches = re.findall(r'!\[.*?\]\((.*?)\)', content)
+                image_matches = list(re.finditer(r'!\[.*?\]\((.*?)\)', content))
                 if not image_matches:
                     processed_messages.append(message)
                     continue
@@ -780,7 +807,9 @@ class LLMCilent:
                 # 处理图片
                 new_content = content
                 print(f"  正在处理文本内容中的图片标记...")
-                for image_url in image_matches:
+                for image_match in image_matches:
+                    image_url = image_match.group(1)
+                    markdown_tag = image_match.group(0)
                     print(f"    - 检查图片 URL: {image_url}")
                     try:
                         description = self._get_image_description(
@@ -791,14 +820,16 @@ class LLMCilent:
                             "    ",
                         )
 
-                        replacement = f"[图片: {description}]" if description else "[图片: 图片解析失败]"
+                        replacement = format_image_description(image_url, description)
                         # 使用 re.escape 避免 URL 中的特殊字符影响替换
-                        markdown_tag = f"![]({image_url})" # 假设 alt text 为空
                         new_content = new_content.replace(markdown_tag, replacement, 1) # 每次只替换一个，防止 URL 相同导致问题
                     except Exception as e:
                         print(f"    ❌ 图片处理失败 ({image_url}): {e}")
-                        markdown_tag = f"![]({image_url})"
-                        new_content = new_content.replace(markdown_tag, "[图片: 图片解析失败]", 1)
+                        new_content = new_content.replace(
+                            markdown_tag,
+                            format_image_description(image_url),
+                            1,
+                        )
 
                 processed_message = message.copy()
                 processed_message["content"] = new_content
@@ -811,11 +842,13 @@ class LLMCilent:
                 for item in content:
                     if isinstance(item, str):
                          # 处理文本中的markdown图片
-                        image_matches = re.findall(r'!\[.*?\]\((.*?)\)', item)
+                        image_matches = list(re.finditer(r'!\[.*?\]\((.*?)\)', item))
                         if image_matches:
                             temp_content = item
                             print(f"    - 在列表文本项中发现图片标记...")
-                            for image_url in image_matches:
+                            for image_match in image_matches:
+                                image_url = image_match.group(1)
+                                markdown_tag = image_match.group(0)
                                 print(f"      - 检查图片 URL: {image_url}")
                                 try:
                                     description = self._get_image_description(
@@ -826,13 +859,15 @@ class LLMCilent:
                                         "      ",
                                     )
 
-                                    replacement = f"[图片: {description}]" if description else "[图片: 图片解析失败]"
-                                    markdown_tag = f"![]({image_url})"
+                                    replacement = format_image_description(image_url, description)
                                     temp_content = temp_content.replace(markdown_tag, replacement, 1)
                                 except Exception as e:
                                     print(f"      ❌ 图片处理失败 ({image_url}): {e}")
-                                    markdown_tag = f"![]({image_url})"
-                                    temp_content = temp_content.replace(markdown_tag, "[图片: 图片解析失败]", 1)
+                                    temp_content = temp_content.replace(
+                                        markdown_tag,
+                                        format_image_description(image_url),
+                                        1,
+                                    )
                             new_content_list.append({"type": "text", "text": temp_content})
                         else:
                             # 没有图片标记的文本项直接添加
@@ -862,13 +897,13 @@ class LLMCilent:
 
                                     new_content_list.append({
                                         "type": "text",
-                                        "text": f"[图片: {description}]" if description else "[图片: 图片解析失败]"
+                                        "text": format_image_description(image_url, description),
                                     })
                                 except Exception as e:
                                     print(f"      ❌ 图片处理失败 ({image_url}): {e}")
                                     new_content_list.append({
                                         "type": "text",
-                                        "text": "[图片: 图片解析失败]"
+                                        "text": format_image_description(image_url),
                                     })
                             else:
                                 # 如果 image_url 无效或缺失，可以选择跳过或添加占位符

@@ -2,6 +2,8 @@
 
 import time
 import re
+import os
+from contextlib import ExitStack
 from datetime import datetime
 from io import StringIO
 import traceback
@@ -26,7 +28,7 @@ from main import CommandManager
 
 import json
 
-from main import LLMCilent, Chat, sum_res, LLMResponse, get_image_base64, get_image_file_base64, resolve_model
+from main import LLMCilent, Chat, sum_res, LLMResponse, get_image_file_base64, resolve_image_uri, resolve_model
 
 from main import memberlist
 
@@ -151,13 +153,9 @@ def inc_call_text_cost(model, type:int, text:str):
     token = count_tokens(text)
     inc_call_token_cost(model, type, token)
 
-def inc_call_image_cost(size:str, quality:str):
-    price = 0.28
-    if size != "1024x1024":
-        price += 0.28
-    if quality == 'hd':
-        price += 0.28
-    get_caller()[1] += price
+def inc_call_image_cost(count: int):
+    with cost_lock:
+        get_caller()[1] += 0.13 * count
 
 def group_state(s=None):
     group_id = cache.thismsg().get('group_id')
@@ -350,23 +348,171 @@ def url2cq(url:str):
     return cq.url2cq(url)
 
 
-def create_image(prompt:str, size:str, quality:str):
+def create_image(
+    prompt: str,
+    size: str = "1024x1024",
+    quality: str = "auto",
+    n: int = 1,
+    output_format: str = "png",
+):
     '''
-    Create an image based on the description and return the cq code, pictures are automatically sent
-    Use the standard parameter whenever possible unless explicitly requested by the user
-    处于不可用状态
+    根据文字描述生成图片并自动发送。每张图片计费 0.13 元。
 
     @param
-    prompt: Description text used to create the image
-    size: Picture size
-        enum: ["1024x1024", "1024x1792", "1792x1024"]
-    quality: Image quality
-        enum: ["standard", "hd"]
+    prompt: 想要生成的图像描述
+    size: 输出图像尺寸，默认 1024x1024 enum: ["1024x1024"]
+    quality: 生成质量预设，默认 auto enum: ["auto", "low", "medium", "high"]
+    n: 生成图片数量，默认 1，范围 1 ~ 10
+    output_format: 输出图片格式，默认 png enum: ["png", "jpeg", "webp"]
     '''
-    # inc_call_image_cost(size, quality)
-    # picCQ = url2cq(chat_client.create_image(prompt, size, quality))
-    # sendmsg(picCQ)
-    # return picCQ
+    if not isinstance(prompt, str) or not prompt.strip():
+        return '生图失败：prompt 不能为空'
+    if size != '1024x1024':
+        return '生图失败：size 只支持 1024x1024'
+    if quality not in {'auto', 'low', 'medium', 'high'}:
+        return '生图失败：quality 只支持 auto、low、medium 或 high'
+    if not isinstance(n, int) or isinstance(n, bool) or not 1 <= n <= 10:
+        return '生图失败：n 必须是 1 ~ 10 的整数'
+    if output_format not in {'png', 'jpeg', 'webp'}:
+        return '生图失败：output_format 只支持 png、jpeg 或 webp'
+
+    base_url = os.getenv('BYTECAT_BASE_URL', '').rstrip('/')
+    api_key = os.getenv('BYTECAT_IMAGE_API_KEY')
+    if not base_url or not api_key:
+        return '生图失败：未配置 BYTECAT_BASE_URL 或 BYTECAT_IMAGE_API_KEY'
+
+    try:
+        response = requests.post(
+            f'{base_url}/images/generations',
+            headers={'Authorization': f'Bearer {api_key}'},
+            json={
+                'model': 'gpt-image-2',
+                'prompt': prompt.strip(),
+                'size': size,
+                'quality': quality,
+                'n': n,
+                'output_format': output_format,
+            },
+            timeout=(10, 300),
+        )
+    except requests.RequestException as error:
+        return f'生图失败：请求异常（{type(error).__name__}）'
+
+    return _send_image_response(response)
+
+
+def _send_image_response(response):
+    if not response.ok:
+        return f'生图失败：API 返回 HTTP {response.status_code}'
+
+    try:
+        data = response.json().get('data', [])
+        images = [
+            item['b64_json']
+            for item in data
+            if isinstance(item, dict) and item.get('b64_json')
+        ]
+    except (AttributeError, TypeError, ValueError):
+        return '生图失败：API 返回了无法解析的结果'
+
+    if not images:
+        return '生图失败：API 未返回 Base64 图片'
+
+    inc_call_image_cost(len(images))
+    sent = 0
+    for image_base64 in images:
+        try:
+            sendmsg(cq.base64_to_cq(image_base64))
+            sent += 1
+        except Exception:
+            traceback.print_exc()
+
+    if sent != len(images):
+        return f'已生成 {len(images)} 张图片，成功发送 {sent} 张'
+    return f'已生成并发送 {sent} 张图片'
+
+
+def _parse_image_uris(image_uris: str) -> list[str]:
+    if not isinstance(image_uris, str):
+        raise ValueError('image_uris 必须是字符串')
+    uris = [uri.strip() for uri in image_uris.splitlines() if uri.strip()]
+    if not uris:
+        raise ValueError('至少需要一个图片 URI')
+    return list(dict.fromkeys(uris))
+
+
+def create_image_from_references(
+    prompt: str,
+    image_uris: str,
+    size: str = "1024x1024",
+    quality: str = "auto",
+    n: int = 1,
+    output_format: str = "png",
+):
+    '''
+    使用一张或多张网络或本地图片作为参考生成新图并自动发送。
+
+    @param
+    prompt: 如何利用参考图生成新图的描述
+    image_uris: 参考图 URI，每行一个；网络图片使用 http:// 或 https://，本地图片使用 file:// 绝对路径
+    size: 输出图像尺寸，默认 1024x1024 enum: ["1024x1024"]
+    quality: 生成质量预设，默认 auto enum: ["auto", "low", "medium", "high"]
+    n: 生成图片数量，默认 1，范围 1 ~ 10
+    output_format: 输出图片格式，默认 png enum: ["png", "jpeg", "webp"]
+    '''
+    if not isinstance(prompt, str) or not prompt.strip():
+        return '参考图生图失败：prompt 不能为空'
+    if size != '1024x1024':
+        return '参考图生图失败：size 只支持 1024x1024'
+    if quality not in {'auto', 'low', 'medium', 'high'}:
+        return '参考图生图失败：quality 只支持 auto、low、medium 或 high'
+    if not isinstance(n, int) or isinstance(n, bool) or not 1 <= n <= 10:
+        return '参考图生图失败：n 必须是 1 ~ 10 的整数'
+    if output_format not in {'png', 'jpeg', 'webp'}:
+        return '参考图生图失败：output_format 只支持 png、jpeg 或 webp'
+
+    try:
+        reference_uris = _parse_image_uris(image_uris)
+    except ValueError as error:
+        return f'参考图生图失败：{error}'
+
+    base_url = os.getenv('BYTECAT_BASE_URL', '').rstrip('/')
+    api_key = os.getenv('BYTECAT_IMAGE_API_KEY')
+    if not base_url or not api_key:
+        return '参考图生图失败：未配置 BYTECAT_BASE_URL 或 BYTECAT_IMAGE_API_KEY'
+
+    try:
+        with ExitStack() as stack:
+            files = []
+            for index, image_uri in enumerate(reference_uris, 1):
+                file_path, mime_type = resolve_image_uri(image_uri)
+                image_file = stack.enter_context(open(file_path, 'rb'))
+                files.append((
+                    'image[]',
+                    (os.path.basename(file_path) or f'reference-{index}', image_file, mime_type),
+                ))
+            response = requests.post(
+                f'{base_url}/images/edits',
+                headers={'Authorization': f'Bearer {api_key}'},
+                data={
+                    'model': 'gpt-image-2',
+                    'prompt': prompt.strip(),
+                    'size': size,
+                    'quality': quality,
+                    'n': n,
+                    'output_format': output_format,
+                },
+                files=files,
+                timeout=(10, 300),
+            )
+    except requests.RequestException as error:
+        return f'参考图生图失败：请求异常（{type(error).__name__}）'
+    except ValueError as error:
+        return f'参考图生图失败：{error}'
+    except OSError as error:
+        return f'参考图生图失败：图片文件读取异常（{type(error).__name__}）'
+
+    return _send_image_response(response)
 
 def baidu_encyclopedia(object:str):
     '''
@@ -793,37 +939,24 @@ def get_msgs(max_token=max_token, return_token=False):
     return messages
 
 
-def recognize_image(image_url: str, prompt: str = ""):
+def recognize_image(image_uri: str, prompt: str = ""):
     '''
-    按自定义要求识别网络图片。可用于描述、OCR、提取结构化信息或回答针对图片的问题；每次调用都会重新识别，不使用自动描述缓存。
+    按自定义要求识别网络或本地图片。可用于描述、OCR、提取结构化信息或回答针对图片的问题；每次调用都会重新识别，不使用自动描述缓存。
 
     @param
-    image_url: 完整的 HTTP(S) 图片 URL 或 data:image URI
+    image_uri: 图片 URI；网络图片使用 http:// 或 https://，本地图片使用 file:// 绝对路径
     prompt: 希望视觉模型针对图片完成的识别任务；留空时使用默认详细描述要求
     '''
-    if not re.match(r'^(?:https?://|data:image/)', image_url, re.IGNORECASE):
-        return '图片识别失败：仅支持 HTTP(S) 图片 URL 或 data:image URI'
+    if not re.match(r'^(?:https?|file)://', image_uri, re.IGNORECASE):
+        return '图片识别失败：仅支持 http://、https:// 或 file:// 图片 URI'
 
-    description = llm_cilent.describe_image(
-        image_url,
-        prompt=prompt,
-        convert_url=get_image_base64,
-    )
-    return description or '图片识别失败：视觉模型未返回描述'
-
-
-def recognize_image_file(path: str, prompt: str = ""):
-    '''
-    按自定义要求读取并识别本地图片文件。支持描述、OCR、结构化提取或回答针对图片的问题。
-
-    @param
-    path: 本地图片文件路径；相对路径以 Bot 当前工作目录为基准
-    prompt: 希望视觉模型针对图片完成的识别任务；留空时使用默认详细描述要求
-    '''
     try:
-        image_data = get_image_file_base64(path)
+        image_path, _ = resolve_image_uri(image_uri)
+        image_data = get_image_file_base64(image_path)
     except (OSError, ValueError) as error:
-        return f'图片文件读取失败：{error}'
+        return f'图片识别失败：{error}'
+    if not image_data:
+        return '图片识别失败：图片下载或读取失败'
 
     description = llm_cilent.describe_image(
         image_data,
@@ -842,7 +975,6 @@ def init_chat(chat_client:Chat, messages=[]):
     chat_client.add_tool(exec_code)
     chat_client.add_tool(poke)
     chat_client.add_tool(recognize_image)
-    chat_client.add_tool(recognize_image_file)
     # chat_client.add_tool(read_data)
     # chat_client.add_tool(group_size)
     # chat_client.add_tool(group_members)
@@ -853,7 +985,8 @@ def init_chat(chat_client:Chat, messages=[]):
     chat_client.add_tool(later_add)
     # chat_client.add_tool(later_set)
     chat_client.add_tool(later_del)
-    # chat_client.add_tool(create_image)
+    chat_client.add_tool(create_image)
+    chat_client.add_tool(create_image_from_references)
     # chat_client.add_tool(chat_client.read_image)
     # chat_client.add_tool(url2cq)
     # chat_client.add_tool(muti_reply)
@@ -882,18 +1015,6 @@ def init_chat(chat_client:Chat, messages=[]):
     # data = getchatstorage()
 
     prompts['base'] = [
-#         {'role':'system', 'content':'''## 注意事项
-# - 你的昵称: 柚子
-# - 你的QQ号：0。at格式:"[CQ:at,qq=qq号]"(仅在群聊下有效)；reply格式:"[CQ:reply,id=message_id]"
-# - 你的回复需要严格按照以下XML格式输出，如果需要更新记忆，采用先删除，后添加的方式：
-# <message>
-#   <content>
-#     <text>你的回复内容</text>
-#   </content>
-# </message>
-
-# - 聊天中可能不会有明显的问题，扮演好角色即可
-# - 如无特殊要求，请用中文回复'''},
         {'role':'system', 'content':f'''## 注意事项
 - 你的昵称: 柚子
 - 你的QQ号：{cache.qq}。at格式:"[CQ:at,qq=qq号]"(仅在群聊下有效)；reply格式:"[CQ:reply,id=message_id]"

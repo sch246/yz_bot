@@ -1,4 +1,5 @@
 from urllib import parse
+import os
 import json,random,requests,re
 import inspect
 
@@ -820,26 +821,31 @@ import requests
 import json
 from pathlib import Path
 
-API_HOST = "ma4bj98cvh.re.qweatherapi.com"
-KEY_ID = "CNPKE8B4G8"
-PROJECT_ID = "2G877M3PJY"
 TOKEN_CACHE = Path.home() / ".qweather-token"
+
+
+def _require_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f'缺少环境变量: {name}')
+    return value
 
 # 内部工具函数
 def _load_private_key() -> str:
     """加载Ed25519私钥"""
+    private_key_file = os.getenv('QWEATHER_PRIVATE_KEY_FILE', 'ed25519-private.pem')
     try:
-        with open("ed25519-private.pem", "r") as f:
+        with open(private_key_file, "r") as f:
             return f.read()
     except Exception as e:
         raise RuntimeError(f"无法读取私钥文件: {e}")
 
-def _generate_token() -> str:
+def _generate_token(key_id: str, project_id: str) -> str:
     """生成JWT认证令牌"""
     private_key = _load_private_key()
     now = int(time.time())
-    payload = {'iat': now-30, 'exp': now+900, 'sub': PROJECT_ID}
-    return jwt.encode(payload, private_key, algorithm='EdDSA', headers={'kid': KEY_ID})
+    payload = {'iat': now-30, 'exp': now+900, 'sub': project_id}
+    return jwt.encode(payload, private_key, algorithm='EdDSA', headers={'kid': key_id})
 
 def _get_cached_token() -> Optional[str]:
     """获取缓存的JWT令牌"""
@@ -855,8 +861,11 @@ def _get_cached_token() -> Optional[str]:
 
 def _api_request(endpoint: str, params: Dict) -> Optional[Dict]:
     """执行API请求"""
-    token = _get_cached_token() or _generate_token()
-    url = f"https://{API_HOST}{endpoint}"
+    api_host = _require_env('QWEATHER_API_HOST')
+    key_id = _require_env('QWEATHER_KEY_ID')
+    project_id = _require_env('QWEATHER_PROJECT_ID')
+    token = _get_cached_token() or _generate_token(key_id, project_id)
+    url = f"https://{api_host}{endpoint}"
     
     try:
         response = requests.get(

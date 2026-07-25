@@ -36,9 +36,9 @@
 
 `init_chat()` 最终按以下顺序建立请求消息：当前窗口选择的提示词、内置 base 提示、当前群/私聊位置说明、聊天历史。提示词可以是全局 `settings`、`prompts` 中命名设定，或当前窗口直接保存的消息列表。
 
-图片读取是当前窗口的三档设置，使用 `#image <mode>` 修改，使用不带参数的 `#image` 查询当前档位。名称与数字别名分别为 `off/0`、`lazy/1`、`eager/2`；历史布尔值兼容为 `False → off`、`True → lazy`。`off` 会把历史消息中的图片 part 降级为 `[图片 URL: ...]` 文本：既避免把 `image_url` 发给纯文本模型，又让模型可以按需调用 `recognize_image`。`lazy` 只在 LLM 聊天实际触发时处理本轮上下文中的图片。`eager` 在图片消息到达时立即启动后台下载：当前聊天模型能直接读图时只缓存原图，纯文本模型才会同时预生成文字描述。同一 URL 若恰好同时被 eager 和聊天请求，描述生成会等待同一个进行中任务，避免重复计费。如果需要识别但没有可用的视觉模型，也会保留 URL 并降级为文字说明。
+图片读取是当前窗口的三档设置，使用 `#image <mode>` 修改，使用不带参数的 `#image` 查询当前档位。名称与数字别名分别为 `off/0`、`lazy/1`、`eager/2`；历史布尔值兼容为 `False → off`、`True → lazy`。`off` 会把历史消息中的图片 part 降级为 `[图片 URL: ...]` 文本：既避免把 `image_url` 发给纯文本模型，又让模型可以按需调用 `recognize_image`。`lazy` 只在 LLM 聊天实际触发时处理本轮上下文中的图片。`eager` 在图片消息到达时立即启动后台下载：当前聊天模型能直接读图时只缓存原图，纯文本模型才会同时预生成文字描述。同一 URL 若恰好同时被 eager 和聊天请求，描述生成会等待同一个进行中任务，避免重复计费。无论图片被转换成视觉 part、文字描述还是失败占位，原始非 Base64 URI 都会同时作为文本保留给模型；如果需要识别但没有可用的视觉模型，也会保留 URI 并降级为文字说明。
 
-自动描述使用固定 prompt，要求直接概括可见内容、转录重要文字、标明不确定项，并禁止“如果你愿意我还可以……”一类元话术。`recognize_image` 是通用网络图片分析工具：模型可以传入任意 HTTP(S) 图片 URL 或 `data:image` URI，以及自定义识别 prompt。`recognize_image_file` 提供相同的识别能力，但输入是本地图片路径；相对路径以 Bot 当前工作目录为基准，文件必须能被 PIL 识别且不超过 20 MiB。两种工具都不设置输出 token 上限，也不读写 URL-only 自动描述缓存，避免长文本识别被截断以及不同识别任务互相串用答案。
+自动描述使用固定 prompt，要求直接概括可见内容、转录重要文字、标明不确定项，并禁止“如果你愿意我还可以……”一类元话术。`recognize_image` 是统一的图片分析工具：模型可以传入任意 `http://`、`https://` 或本机 `file://` 绝对 URI，以及自定义识别 prompt。本地文件必须能被 PIL 识别且不超过 20 MiB；网络图片优先复用完整 URL 对应的本地缓存，未命中时才下载。该工具不设置输出 token 上限，也不读写 URL-only 自动描述缓存，避免长文本识别被截断以及不同识别任务互相串用答案。
 
 描述缓存以完整图片 URL 为键，值包含 `description` 和 `cached_at` ISO 日期。只有视觉调用成功才写入；lazy 和 eager 命中后直接复用文字而不再请求视觉模型。`cached_at` 在写入和命中时都刷新，超过 15 天未命中的描述会过期。历史字符串值仍可命中，在首次命中或清理时原地升级并以当天作为初始日期，避免上线时突然失效全部旧缓存。原图以 URL 哈希文件缓存在 `data/tmp_files`，命中时刷新文件时间，有图片活动时至多每天扫描一次并删除超过 15 天未使用的哈希图片。Cave 使用的 `data/images` 永久图片不参与这项清理。
 
@@ -77,8 +77,9 @@
 | `get_time` | 返回 Bot 所在设备的当前时间。 |
 | `exec_code` | 在 `.py` 的共享 `loc` 中先 `exec(code)`、再 `eval(expr)`；拥有与 `.py` 接近的进程和宿主机能力。 |
 | `poke` | 调用 NapCat 的 `send_poke`：群聊只能在触发本轮 LLM 的当前群内戳目标，私聊只能戳当前对话者。它不依赖模型输出 CQ 码，也不会分派给缺少可靠聊天上下文的子会话。 |
-| `recognize_image` | 使用视觉模型分析任意 HTTP(S) 图片或 `data:image` URI；支持自定义 prompt，不设置输出 token 上限，每次调用都会重新识别且不使用自动描述缓存。 |
-| `recognize_image_file` | 读取并验证不超过 20 MiB 的本地图片文件，再复用同一视觉模型分析入口；支持相对或绝对路径和自定义 prompt，不设置输出 token 上限。 |
+| `recognize_image` | 使用视觉模型分析任意 `http://`、`https://` 或本机 `file://` 绝对 URI；网络图片缓存优先，本地与网络图片都需通过图片格式和 20 MiB 上限校验。支持自定义 prompt，不设置输出 token 上限，每次调用都会重新识别且不使用自动描述缓存。 |
+| `create_image` | 调用 ByteCat 同 BASE URL 的独立 `gpt-image-2` 生图 API，支持一次生成 1–10 张 1024x1024 图片，质量可选 `auto/low/medium/high`；API 返回的 Base64 会写入临时图片缓存后自动发送，并按实际返回的图片数以每张 0.13 元记入当月 usage。 |
+| `create_image_from_references` | 接收每行一个的 `http://`、`https://` 或本机 `file://` 参考图 URI，以 multipart `image[]` 调用 `gpt-image-2` 的 `/images/edits`；网络图片缓存优先，URI 不限于聊天消息。 |
 | `later_add` | 在当前群/私聊添加延时任务。普通用户仍受 `.later` 的“只允许安全字符串表达式”检查，op 可安排 Python 表达式。 |
 | `later_del` | 按序号删除当前群/私聊中的延时任务；没有逐任务创建者检查。 |
 | `search_city` | 调用天气服务搜索城市、坐标或 Location ID。 |
@@ -91,7 +92,11 @@
 | `search_mc_mod` | 抓取 MC 百科搜索结果并截断到约 1000 字符。 |
 | `check_mod` | 按页面 ID 抓取 MC 百科详情。 |
 
-`sendmsg`、群成员读取、农历/小六壬、`later_list`/`later_set`、图片生成、百科、RAG 等函数虽然仍在源码中出现，但当前注册语句被注释，不能写成已经开放的工具。
+`sendmsg`、群成员读取、农历/小六壬、`later_list`/`later_set`、百科、RAG 等函数虽然仍在源码中出现，但当前注册语句被注释，不能写成已经开放的工具。
+
+`create_image` 使用 OpenAI 原生 `gpt-image-2` 的参数与返回形状，不传 DALL·E 的 `style`、`standard` 或 `response_format=url`。图片以 `b64_json` 返回，解码后使用 `data/tmp_files` 的现有临时图片缓存和过期清理机制；Base64 本身不会进入 QQ 消息或 chatlog。
+
+`create_image_from_references` 的 `image_uris` 参数每行接收一个 URI，并按完整 URI 去重。`http://` 和 `https://` 图片先查找完整 URL 对应的本地缓存，未命中才下载；`file://` 必须是本机绝对路径。所有参考图都需通过图片格式和 20 MiB 上限校验。`gpt-image-2` 会自动高保真处理参考图，请求不传 `input_fidelity`。供应商是否对参考图输入另行计费尚未实测；当前 usage 仍只按实际返回图片数以每张 0.13 元记录。若供应商不支持该端点，注释 `init_chat()` 中的工具注册即可禁用，不影响纯文本生图。
 
 ## 一轮工具调用怎样继续
 
@@ -138,9 +143,12 @@ Chat.chat
 - 延时任务会在未来执行并回到当前窗口；
 - `assign_tasks` 可以增加并发、费用和工具调用深度；
 - `poke` 会立即对当前会话产生外部可见的戳一戳动作；
-- `recognize_image` 会下载模型给出的网络图片，并把图片及识别要求发送给视觉供应商，产生额外网络访问和模型费用；
-- `recognize_image_file` 可以读取宿主机上模型指定的本地图片并发送给视觉供应商；
+- `recognize_image` 可以下载模型指定的网络图片，或读取模型指定的本机 `file://` 绝对路径，再把图片及识别要求发送给视觉供应商，产生额外网络访问、宿主机文件读取和模型费用；
+- `create_image` 会产生按张计费的外部 API 调用，并立即向当前 QQ 会话发送生成结果；
+- `create_image_from_references` 还会下载模型指定的网络图片或读取本机 `file://` 绝对路径，并作为 multipart 文件上传给生图供应商；
 - 天气和 MC 搜索会向外部站点发请求。
+
+账户相关配置不进入源码或 storage。`main.py` 启动时会加载 `_code/.env`：生图调用复用 `BYTECAT_BASE_URL` 并读取独立的 `BYTECAT_IMAGE_API_KEY`；天气调用分别读取 `QWEATHER_API_HOST`、`QWEATHER_KEY_ID`、`QWEATHER_PROJECT_ID` 和可选的 `QWEATHER_PRIVATE_KEY_FILE`。可从 [`.env.example`](../_code/.env.example) 复制空白模板。缺少必需值时，调用会显式失败，不会回退到硬编码账户。
 
 这是当前实现事实，但维护者当前接受这条信任模型，不把它列为近期高优先级缺陷：群聊中的 LLM 只应在手动选择的可信群启用，可信群中的聊天内容和外部模型共同处于允许调用这些工具的范围内。群白名单是主要运维控制面，不要求近期为每个工具增加确认、能力对象或独立沙箱。
 

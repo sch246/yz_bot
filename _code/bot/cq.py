@@ -1,5 +1,7 @@
 '''处理cq码相关的东西'''
 import re,os,io
+import base64
+import binascii
 import shutil
 import requests
 import threading
@@ -185,6 +187,48 @@ def url2cq(url:str,name:str=None, temp=True):
         'type':'image',
         'data':{
             'file':f'file://__botdir__/{img}'  # 设置一个魔术字符串
+        }
+    })
+
+def base64_to_cq(image_base64: str):
+    """把 API 返回的 Base64 图片缓存为本地临时文件并转为 CQ 码。"""
+    try:
+        image_bytes = base64.b64decode(image_base64, validate=True)
+    except (binascii.Error, TypeError, ValueError) as error:
+        raise ValueError('无效的 Base64 图片数据') from error
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            image_format = (image.format or '').lower()
+            image.verify()
+    except Exception as error:
+        raise ValueError('Base64 数据不是可识别的图片') from error
+
+    extensions = {
+        'jpeg': '.jpg',
+        'png': '.png',
+        'webp': '.webp',
+        'gif': '.gif',
+    }
+    extension = extensions.get(image_format)
+    if extension is None:
+        raise ValueError(f'不支持的图片格式: {image_format or "unknown"}')
+
+    maybe_prune_image_cache(temp_path)
+    filename = hashlib.sha256(image_bytes).hexdigest() + extension
+    file_path = os.path.join(temp_path, filename)
+    with lock:
+        if os.path.exists(file_path):
+            touch_image_cache(file_path)
+        else:
+            with open(file_path, 'wb') as file:
+                file.write(image_bytes)
+
+    cq_path = file_path.replace('\\', '/')
+    return dump({
+        'type': 'image',
+        'data': {
+            'file': f'file://__botdir__/{cq_path}'
         }
     })
 

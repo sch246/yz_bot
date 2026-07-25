@@ -22,8 +22,8 @@ app.log*
 ed25519-*.pem
 
 # 环境变量
-.env
-.env.save
+.env*
+!/_code/.env.example
 
 # 临时/测试文件
 /tmp.txt
@@ -156,7 +156,6 @@ celerybeat.pid
 *.sage.py
 
 # Environments
-.env
 .venv
 env/
 venv/

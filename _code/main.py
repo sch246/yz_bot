@@ -52,11 +52,11 @@ from s3.chat import (
         LLMCilent, Chat, sum_res, LLMResponse, resolve_model,
         get_cached_description, cache_description,
 )
-from s3.url_to_base64 import get_image_base64, get_image_file_base64
+from s3.url_to_base64 import get_image_base64, get_image_file_base64, resolve_image_uri
 
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 
 llm_cilent = LLMCilent()
 

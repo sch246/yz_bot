@@ -139,6 +139,13 @@ f'{getname()} 投了 {:r} 个 {:d} 面骰，总数为 {rd(int("{:r}"), int("{:d}
 
 这些功能常通过 link 获得无前缀入口，因此命令名不是它们唯一的用户界面。
 
+`.bbxm` 和 `.bbxdw` 从 `storage.get('bbxdw', 'settings')` 读取维护配置：
+
+- `source_group_id` 是语料来源群；未配置时命令会显式提示，不会猜测或回退到源码常量。
+- `excluded_fragments` 是可选的字符串列表；匹配到其中任意片段的语料会被排除。
+
+`.jrlp` 从 `storage.get('jrlp', 'settings')['disabled_groups']` 读取禁用群列表。该键必须显式配置；空列表表示不禁用任何群，缺失或类型错误时命令会拒绝继续，避免迁移时意外启用原本禁用的群。以上设置属于 Bot 实例级运行配置，修改内存对象后会随正常退出保存；需要立即落盘时由管理员调用 `storage.save()`。
+
 ## 时间与持续任务
 
 ### `.later`
