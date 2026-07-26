@@ -60,6 +60,8 @@ HTTP 连接器把 NapCat 推送的 OneBot JSON 解析为普通 Python `dict`，`
 
 两者都不代表当前已经存在 feature/core 降级系统。维护取舍与已确认缺陷见[当前维护队列](working/current-issues.md)。
 
+插件顶层是否连接外部服务同样会影响启动边界。`.jm` 仍在加载插件时导入 `jmcomic`，所以缺少依赖会进入普通的命令导入失败路径；但站点 client 已改为第一次执行 `.jm search` 时才创建并在进程内复用，不再仅因 Bot 启动就刷新站点域名。按本子 ID 下载走另一条线程路径：读取 `data/option.yml` 创建 option，并在需要时下载 PDF。这个改动只收窄了启动副作用，没有把 `.jm` 变成与依赖无关的可选模块。
+
 ## LLM 是函数能力的另一条入口
 
 LLM 聊天每次从当前窗口近期消息重建上下文，并把一组普通 Python 函数经薄 `Tool` 适配器转成 function-calling schema。模型产生的调用会在 Bot 进程内同步执行，结果回写会话后继续请求，直到模型不再调用工具。

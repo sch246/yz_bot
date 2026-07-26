@@ -235,19 +235,24 @@ data/storage/              # 根目录
 
 ### 保存时机
 
-- `atexit.register(save)` — 正常退出时自动保存
-- `exit(233)` — reboot 时触发 atexit → save
-- `storage.save()` — 手动触发（如 `.link load` 之后）
-- **Ctrl+C 安全性**：经过 `run.py` 修复后，现在 Ctrl+C 会转发 SIGINT 给子进程优雅退出
+- 后台同步线程把已载入对象的内存检查稳定分散在十分钟窗口内；每个 tick 最多同步一项，只有内容摘要相对 baseline 改变或文件需要重建时才写盘
+- `storage.save()` 强制把所有当前内存对象通过原子写入器保存，可用于 `.link load` 等需要立即落盘的操作
+- 正常退出时 `main.py` 先等待 scheduler 任务，再调用 `storage.shutdown()` 停止 watcher/worker 并强制保存；幂等的 `atexit` 钩子仍作为兜底
+- `.reboot` 的 233 退出码和 `.shutdown` 的正常退出都会经过上述显式退出路径
+- **Ctrl+C 安全性**：`run.py` 只转发第一次 SIGINT，子进程在保存期间忽略重复 SIGINT，降低半写退出风险
 
 ### 注意事项
 
 - `storage.get()` 返回的是**引用**，原地修改会自动反映到存储
-- `storage.load(namespace, name)` 从单个 JSON 文件原地覆盖对应内存 dict/list；它只在管理员显式调用时执行
+- 外部合法 JSON 变化会热同步进内存：安装 `watchdog` 时使用文件事件，否则降级为约两秒一轮的滚动 `stat` 检查；事件先等待约一秒稳定窗口
+- 文件热同步只有在内存仍等于上次共同 baseline 时才覆盖；若内存也已变化，则以内存为准并在后续同步时覆盖文件
+- `storage.load(namespace, name)` 是管理员明确选择“磁盘强制覆盖内存”的逃生入口；dict/list 根对象会原地替换以保留已有模块引用
+- 直接删除 JSON 文件只会保留内存并等待重建；空文件表示用当前内存立即恢复；文件内容为裸文本 `DELETE` 或调用 `storage.delete(namespace, name)` 才表示业务删除
+- 非法 JSON 不会替换内存。启动加载失败会记录错误，之后 `get()` 会拒绝用空默认值覆盖坏文件
 - 非字符串基本键（如 `int`）会被 JSON 转成字符串；tuple 等 JSON 不支持的键会被 `skipkeys=True` 跳过
 - 不可 JSON 序列化的值会被 `default=lambda x: None` 转为 null
-- storage 在启动时载入内存、退出时整文件保存；运行期间直接手改对应 JSON 不会自动 reload，必须再显式调用 `storage.load(namespace, name)`，否则可能在退出时被内存旧值覆盖
-- `reload(storage)` 保留当前 storage 对象且不自动全量载入；模块更新后仍由管理员显式调用目标 `load`
+- 写入使用同目录临时文件、`fsync()` 和 `os.replace()`；失败不会推进 baseline，并会同时写应用日志和终端
+- `reload(storage)` 保留当前 storage 对象、后台线程与已载入值且不自动全量载入；需要强制切换磁盘版本时仍由管理员显式调用目标 `load`
 
 ### 当前消息与近期记录
 
@@ -512,6 +517,12 @@ is_img(msg)           # 消息是否仅含一张图片
 
 ## 调试技巧
 
+### Linux 与换行符
+
+当前生产环境以 Linux 为主，仓库的 `.gitattributes` 固定追踪文本使用 LF。不要因为历史上在 Windows 运行过就把源码批量转回 CRLF；Git 识别出的二进制文件不参与文本换行转换。
+
+Python 语法检查应直接读取文件并调用 `compile()`，不要 import `_code/main.py`。若把 `SyntaxWarning` 提升为错误，可以同时发现普通字符串中的无效反斜杠转义；正则应优先使用 raw string。警告位置是 `<string>` 时，来源是 `eval()`/`exec()` 的动态源码，而不是可直接按路径定位的模块。
+
 ### 本地测试命令逻辑
 
 不要在临时脚本中直接 `import _code.main`：当前 import 会绑定 HTTP 监听端口、启动 scheduler、加载真实 storage，并注册退出保存器，不是隔离测试。
@@ -531,7 +542,7 @@ is_img(msg)           # 消息是否仅含一张图片
 ### 重启
 
 ```
-.reboot     # op 可用，正常重启（触发 atexit 保存）
+.reboot     # op 可用，正常重启（显式关闭 storage 并由 atexit 兜底）
 ```
 
 `.reboot` 会把发起消息保存为一次性钩子，重启后由命令插件向原聊天发送“重启完成”并删除钩子。`.shutdown` 同样留下只执行一次的下次启动问候。两者不仅是退出码封装，也是跨进程恢复交互的一部分。

@@ -61,7 +61,7 @@
 
 当前窗口可以用 `#model` 和 `#models` 查看当前选择及其模型列表。`#use_model <provider>/<model>` 会保存一个完整模型选择，并且只以参数中第一个 `/` 为分隔，所以模型名本身可以继续包含 `/`；不带参数的 `#use_model` 重置该选择。命令会拒绝配置中不存在的 provider/model 组合。源码内的默认配置只用于首次创建空配置，不能代表当前设备正在使用的服务。
 
-运行中人工修改 `data/storage/llm_system/config.json` 后，由管理员显式执行 `storage.load('llm_system', 'config')` 才会从文件原地覆盖内存字典。这一操作不会自动重建 provider 客户端；可以随后重启完成原子切换，或者对相关 `LLMCilent` 实例显式调用 `reload_clients()`。
+运行中人工修改 `data/storage/llm_system/config.json` 后，只要对应内存仍等于 storage baseline，文件 watcher/轮询会把合法 JSON 原地载入内存字典；内存同时被改过时则拒绝覆盖。管理员仍可用 `storage.load('llm_system', 'config')` 明确强制选择磁盘版本。无论自动还是显式载入，都不会自动重建已经派生出的 provider 客户端；可以随后重启完成原子切换，或者对相关 `LLMCilent` 实例显式调用 `reload_clients()`。
 
 ## 普通函数就是工具定义
 

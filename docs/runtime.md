@@ -2,7 +2,7 @@
 
 ## 当前部署
 
-当前设备上，柚子通过 NapCat/QQ 的 OneBot HTTP 接口运行。以下端口和进程状态观察于 2026-07-12，部署变化后应重新核对：
+当前设备上，柚子通过 NapCat/QQ 的 OneBot HTTP 接口运行。以下端口和进程状态重新核对于 2026-07-26，部署变化后应再次确认：
 
 ```text
 QQ / NapCat
@@ -16,11 +16,21 @@ QQ / NapCat
 
 调查时已观察到：`run.py -a` 和 `_code/main.py -a -q 5700 -p 5701` 正在运行，两个端口也分别由 QQ/NapCat 与 Python 进程监听。端口可以通过 `run.py -q/-p` 调整。
 
+当前部署以 Linux 为主，聊天 shell、GNU screen、固定解释器路径和部分编译命令也直接依赖 Linux 环境。仓库根的 `.gitattributes` 使用 `* text=auto eol=lf`，因此所有被 Git 识别为文本的追踪文件都以 LF 入库和检出；即使从 Windows 操作，也不应重新提交 CRLF。二进制文件仍由 `text=auto` 排除在换行转换之外。
+
 `run.py` 是生命周期监督者：子进程以特殊退出码请求重启，或在 `-a` 模式下异常退出时自动拉起。SIGINT 会转发给子进程，使退出保存器有机会落盘。
 
 常用启动形式是从仓库根运行 `python3 run.py -a`；`-l/--log-only` 只记录事件，`-q` 指定 OneBot API 端口，`-p` 指定事件监听端口。历史文档要求 Python 3.10 以上，但当前仓库没有锁定或验证唯一受支持版本，`requirements.txt` 也不能可靠重建本机环境，因此不要把该历史下限当成已经验证的现代安装说明。
 
 首次没有 `config.json` 时，Bot 会在终端输出四位验证码，等待某个私聊用户回传，以此设为首位 master；随后继续在私聊中设置 Bot 昵称。正常接通时终端会依次出现“连接完成”“加载完成”和账号启动信息。这个流程会读取真实 NapCat 事件，不能在生产账号上随意重演。
+
+## 源码语法检查与动态源码警告
+
+检查追踪 Python 源码时应读取文件并调用 `compile()`，不要为了检查语法导入 `_code/main.py`。当前追踪源码可以在把 `SyntaxWarning` 提升为错误的条件下完成纯编译；正则、替换模板和命令匹配中的反斜杠已经使用 raw string 或双反斜杠表达。
+
+终端中的警告位置需要区分：`某文件.py:<行号>` 指向普通源码；`<string>:1: SyntaxWarning: invalid escape sequence '\d'` 表示 `eval()`/`exec()` 正在编译动态字符串。后者可能来自聊天中的 `.py`/LLM 工具参数、link action，或 `data/pyload.py` 等以字符串方式执行的设备级源码，不能据此反推追踪文件仍有同一问题。正则中的数字模式应写成 `r'\d'`，需要普通字符串反斜杠时写成 `'\\d'`。
+
+`.jm` 插件仍会在加载时导入 `jmcomic`，但站点 client 已延迟到第一次 `.jm search` 才初始化。因而启动期不应再仅由该插件打印站点域名刷新日志；实际使用搜索或下载时，第三方库仍可能访问网络并输出自己的日志。
 
 ## 真实事件路径
 
@@ -123,7 +133,7 @@ HTTP 200 只表示事件已被本地监听器接收，不表示命令或回复�
 
 ## 未实现的运行提案
 
-Core 降级、多项目共存、热同步和异常日志等讨论统一收在[工作提案索引](working/proposals/README.md)。它们不描述当前可用的启动参数或恢复能力。
+Core 降级、多项目共存、storage 历史恢复和异常日志等讨论统一收在[工作提案索引](working/proposals/README.md)。Storage 文件热同步已经实现并记录在[运行架构](architecture.md#configcache-与-storage-的所有权)，不再属于未实现能力；提案中的值校验与历史版本仍未落地。
 
 ## 运行数据边界
 
