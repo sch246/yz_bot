@@ -174,10 +174,14 @@ def download_img(picture_url, name=None, temp=True):
 
 def url2cq(url:str,name:str=None, temp=True):
     img = download_img(url,name, temp).replace('\\','/')
+    if os.path.isabs(img):
+        file_uri = f'file://{img}'
+    else:
+        file_uri = f'file://__botdir__/{img}'
     return dump({
         'type':'image',
         'data':{
-            'file':f'file://__botdir__/{img}'  # 设置一个魔术字符串
+            'file':file_uri
         }
     })
 
