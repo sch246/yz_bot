@@ -1,5 +1,7 @@
 # [MC服务器终端](https://sch246.com/5-yz_bot/2-mc.html)
 
+> **历史文档：** 本文保留旧版 Minecraft 接入示例，示例值不应作为真实配置使用。当前能力来路与运行边界见[演进历史](../../docs/history.md)和[运行文档](../../docs/runtime.md)。
+
 柚子bot 可以作为 Minecraft 服务器的终端使用
 
 ## 设置

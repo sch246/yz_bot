@@ -12,6 +12,7 @@
 - [设计原则与重写判断](docs/design-principles.md)：维护者如何评估抽象、直接能力、数据透明性和从零重写；架构讨论应先读这里。
 - [运行架构](docs/architecture.md)：命令插件、`main` 的人工依赖编排、`funcs.py` 与 `data/pyload.py` 的不同角色。
 - [演进历史](docs/history.md)：从学习 OneBot、早期 `.py`/`.link` 到 HTTP、WebSocket、go-cqhttp 与 NapCat 的变迁，以及哪些旧设计已经被替换。
+- [原始历史文档](md/README.md)：旧仓库的开发记录、0.4 使用说明和背景文章；用于追溯，不作为当前契约。
 - [功能与命令目录](docs/commands.md)：按功能族说明公开命令、扩展运行环境和主要状态。
 - [LLM 聊天与工具调用](docs/llm.md)：上下文构建、模型配置、函数工具、自动调用循环和当前信任边界。
 - [运行边界与交互测试](docs/runtime.md)：NapCat 接入、真实消息路径，以及如何避免测试影响正在运行的实例。
@@ -23,3 +24,7 @@
 ## 一句话理解
 
 普通命令插件提供稳定入口，`.py` 和语言扩展提供临时计算环境，`.link` 把聊天变成可现场编程的反应网络，`.cave` 承载群体记忆，`.chat` 把整个聊天窗口变成 LLM 上下文，而 `.file`、`.edit`、`.reboot` 则让 Bot 能通过聊天修改并重新加载自身。
+
+## 许可证
+
+本项目按 [GNU General Public License v3.0](LICENCE) 发布。旧仓库使用的 `LICENCE` 文件名保持不变。

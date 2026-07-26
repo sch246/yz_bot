@@ -4,6 +4,8 @@ tags: [QQ, OneBot]
 date: 2022-05-17T23:40
 ---
 
+> **历史文档：** 本文按旧仓库内容保留，记录项目产生前的背景材料；不属于当前 Bot 的安装或使用文档。现行项目历史见[演进历史](../docs/history.md)。
+
 import Cover from '@site/src/components/cover/main';
 
 :::caution 这个玩意有一键安装的脚本
@@ -44,7 +46,7 @@ linux服务器，，之前在腾讯云74一年的还没到期，OK
 
 - [fork](https://github.com/114514huster/zhenxun_bot)
 
-- [README本站备份](/Other/bak/zhenxun_bot)
+- [README 本站历史备份](https://sch246.com/Other/bak/zhenxun_bot)
 
 ![](https://img1.imgtp.com/2022/05/18/GsmbaYl2.png)
 

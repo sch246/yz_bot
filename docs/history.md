@@ -49,4 +49,4 @@ Minecraft 管理长期依赖本机 `data/pyload.py`：screen 负责启动进程�
 
 ## 来源与许可历史
 
-旧仓库 README 曾声明 GPL，并引用 Barney Gale 的 MCRcon；当前 `_code/s3/mcrcon.py` 自身仍保留原项目来源和许可文本。当前仓库根没有受版本控制的 LICENSE 文件，因此本文只保存历史声明，不替代缺失的仓库级许可决定。
+旧仓库 README 声明 GPL，并引用 Barney Gale 的 MCRcon；当前 `_code/s3/mcrcon.py` 自身仍保留原项目来源和许可文本。仓库现已恢复旧版 [GNU General Public License v3.0](../LICENCE)，并保留原有 `LICENCE` 文件名。旧仓库的原始开发和使用文档也保存在 [`md/`](../md/README.md)，但其中已经过时的实现说明不替代当前文档。

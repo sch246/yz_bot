@@ -1,5 +1,7 @@
 # [柚子bot](https://sch246.com/5-yz_bot.html)
 
+> **历史文档：** 本文按旧仓库内容保留，其中客户端、命令和部署说明可能已经过时。当前使用入口见[功能与命令目录](../docs/commands.md)和[运行边界](../docs/runtime.md)。
+
 
 - [github项目地址](https://github.com/sch246/yz_bot)
 
@@ -161,7 +163,7 @@ get 和 send 和 to 用来发送和接收文件，不过似乎不怎么能用
 
 在多线程运行 python 代码，可以调用 bot 的几乎任何代码，发送和接收消息，管理数据
 
-可以直接调用这些文件内定义的东西: [py.py](/_code/bot/cmds/py.py) [main.py](/_code/main.py) [funcs.py](/_code/funcs.py) [pyload.py](/data/pyload.py)
+可以直接调用这些文件内定义的东西: [py.py](/_code/bot/cmds/py.py) [main.py](/_code/main.py) [funcs.py](/_code/funcs.py) 以及运行时的 `data/pyload.py`
 
 运行环境在一次运行期间是保存的，你可以先定义函数或者赋值，然后在之后的消息中使用它
 
@@ -405,7 +407,7 @@ setname('{:name}')
 
 ### [.mcf](/_code/bot/cmds/mcf.py)
 
-编辑 mcfunction 文件，需要[指定 Minecraft 文件夹路径](/data/pyload.py)
+编辑 mcfunction 文件，需要在运行时的 `data/pyload.py` 中指定 Minecraft 文件夹路径
 
 [服务器管理可以看这里](/md/use/mc.md)
 
