@@ -73,7 +73,7 @@ def get_pics(work):
         original = urls.get('original') or work['meta_single_page']['original_image_url']
         original = re.sub(
                 r'https://.+/(\d+)_p(\d+).(jpg|png|gif)',
-                'pixiv.re/\g<1>.\g<3>',
+                r'pixiv.re/\g<1>.\g<3>',
                 original)
         pics.append((medium, original))
     return pics

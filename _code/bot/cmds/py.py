@@ -80,7 +80,7 @@ def run(body:str, msg: dict = None, skip_op: bool = False, insert: dict = None):
         cache.thismsg(msg)
 
     if not skip_op and not msg['user_id'] in cache.ops:
-        if not cache.any_same(msg, '\.py'):
+        if not cache.any_same(msg, r'\.py'):
             sendmsg('权限不足(一定消息内将不再提醒)')
         return
 

@@ -14,7 +14,7 @@ def run(body: str):
     body = cq.unescape(body.strip())
 
     if not msg['user_id'] in cache.ops:
-        if not cache.any_same(msg, '\.hs'):
+        if not cache.any_same(msg, r'\.hs'):
             return '权限不足(一定消息内将不再提醒)'
 
     flag, value = repl.ensure([ghci_path, '--version'])

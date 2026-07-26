@@ -50,7 +50,7 @@ cond和action都是可执行的python代码, 但是环境不同, 执行流程是
 '''
     msg = cache.thismsg()
     if not msg['user_id'] in cache.ops:
-        if not cache.any_same(msg, '\.link'):
+        if not cache.any_same(msg, r'\.link'):
             return '权限不足(一定消息内将不再提醒)'
         return
 
@@ -161,7 +161,7 @@ def _set(name, type, link, params, parts):
         若type是字符串列表，则会变成(xx|xx|..)这样
     若name和type俱有，则以name创建命名组，type插入到命名组的匹配规则中
     若没有name，{:type}则直接插入
-    若没有type，{name}则根据name本身进行判断，若name开头为大写字母则为'[\S\s]+'否则为'\S+'
+    若没有type，{name}则根据name本身进行判断，若name开头为大写字母则为'[\\S\\s]+'否则为'\\S+'
     action使用{:name}进行替换，且最后一行作为表达式返回
     cond创建的命名组不进入.py的locals里
 while 可以设置它在哪条 link 通过或未通过时执行

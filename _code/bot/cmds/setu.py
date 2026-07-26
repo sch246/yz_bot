@@ -16,7 +16,7 @@ def run(body:str):
     original = urls['original']
     original = re.sub(
             r'https://.+/(\d+)_p(\d+).(jpg|png|gif)',
-            'pixiv.re/\g<1>.\g<3>',
+            r'pixiv.re/\g<1>.\g<3>',
             original)
     sendmsg(original)
     sendmsg(cq.url2cq(urls['regular'].replace('i.pximg.net','i.pixiv.re')))

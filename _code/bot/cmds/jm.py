@@ -3,7 +3,14 @@ from jmcomic import *
 import os
 from main import cache, cq, read_params, send, to_thread, pages
 
-client = JmOption.default().new_jm_client()
+client = None
+
+
+def get_client():
+    global client
+    if client is None:
+        client = JmOption.default().new_jm_client()
+    return client
 
 def run(body:str):
     '''禁漫获取
@@ -23,7 +30,7 @@ def run(body:str):
     return run.__doc__
 
 def search(param):
-    page: JmSearchPage = client.search_site(search_query=param, page=1)
+    page: JmSearchPage = get_client().search_site(search_query=param, page=1)
     print(f'结果总数: {page.total}, 分页大小: {page.page_size}，页数: {page.page_count}')
     return pages.display([f'[{album_id}]: {title}' for album_id, title in page])
 

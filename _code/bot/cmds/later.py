@@ -284,7 +284,7 @@ def later_add(texts, msg):
     seq, YMD_hms = enter(s_time, expr, msg)
     return f'{seq}: {YMD_hms} {expr}'
 
-re_num_or = re.compile('^\d+(\s*,\s*\d+)*')
+re_num_or = re.compile(r'^\d+(\s*,\s*\d+)*')
 def run(text:str,exec_id=None):
     '''延时任务，简单字符串以外的表达式需要管理员权限
 格式:

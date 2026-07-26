@@ -10,7 +10,7 @@ def run(body:str):
     msg = cache.thismsg()
     body = cq.unescape(body.strip())
     if not msg['user_id'] in cache.ops:
-        if not cache.any_same(msg, '\.nl'):
+        if not cache.any_same(msg, r'\.nl'):
             return '权限不足(一定消息内将不再提醒)'
 
     if not screen.check():
