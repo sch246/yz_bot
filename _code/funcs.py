@@ -479,7 +479,7 @@ def 小六壬(offset=0):
 
 
 def petpet(**kws):
-    result = cq.url2cq(f'http://127.0.0.1:2333/petpet?{dict2url(kws)}')
+    result = cq.url2cq(f'http://127.0.0.1:2334/petpet?{dict2url(kws)}')
     return result
 ###
 petpet_dic=storage.get('','petpet')
@@ -488,11 +488,12 @@ def petpet_trans(s:str):
         return petpet_dic[s]
     return s
 ###
-try:
-    lst=json.loads(requests.get('http://127.0.0.1:2333/petpet').content.decode())['petData']
-except:
-    lst = []
-petpet_keys=list(map(lambda x:x['key'], lst))
+def get_petpet_keys():
+    try:
+        lst=json.loads(requests.get('http://127.0.0.1:2334/petpet', timeout=3).content.decode())['petData']
+    except:
+        lst = []
+    return list(map(lambda x:x['key'], lst))
 ###
 def geocode(address):
     paramters = {'address': address, 'output': 'json'}
@@ -912,7 +913,7 @@ def get_hourly_forecast(location_id: str, hours: int = 24, unit: str = "m") -> O
     endpoint = f"/v7/weather/{valid_hours.get(hours, '24h')}"
     response = _api_request(endpoint, {"location": location_id, "unit": unit})
     return response.get('hourly') if response and response.get('code') == "200" else None
- 
+
 
 import tiktoken
 

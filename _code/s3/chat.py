@@ -352,246 +352,138 @@ class LLMCilent:
         convert_url: Callable[[str], str]
     ) -> list[dict]:
         """
-        处理消息中的图片，将Markdown格式或URL格式的图片转换为适合模型输入的列表格式（通常包含base64）。
-        增加日志输出以跟踪处理过程。
-
-        参数:
-            messages: 消息列表
-            convert_url: 用于将URL（或本地路径）转换为base64数据URI的函数
-
-        返回值:
-            处理后的消息列表
+        处理消息中的图片，将Markdown格式或URL格式的图片转换为适合模型输入的列表格式。
+        图片不可用时用文本代替。
         """
-        # print("-> 进入 _convert_images 函数...")
+        # 定义错误提示文本
+        IMAGE_LOAD_FAILED_TEXT = "[图片加载失败]"
+        
         processed_messages = []
-
-        # 正则表达式匹配Markdown格式的图片
         markdown_image_pattern = r"!\[(.*?)\]\((.*?)\)"
 
         for i, message in enumerate(messages):
-            # print(f"  正在处理消息 {i+1}/{len(messages)}...")
             new_message = message.copy()
 
-            # 只处理包含 "content" 键的消息
             if "content" in message:
                 content: Union[str, list] = message["content"]
-                original_content_type = type(content).__name__
-                # print(f"    原始内容类型: {original_content_type}")
 
-                # ---------------------------------------------------------
-                # 情形 1: 内容已经是列表（多模态格式）
-                # ---------------------------------------------------------
                 if isinstance(content, list):
-                    # print(f"    内容是列表. 正在处理 {len(content)} 项.")
                     new_content = []
-                    item_index = 0
                     for item in content:
-                        item_index += 1
-                        # print(f"      正在处理第 {item_index}/{len(content)} 项...")
-
-                        # -------------------------------------------------
-                        # 子情形 1.1: 列表项是字符串
-                        # -------------------------------------------------
                         if isinstance(item, str):
-                            # print(f"        项类型: 字符串. 正在检查Markdown图片...")
-                            matches = list(re.finditer(markdown_image_pattern, item))  # 使用 finditer 获取位置
+                            matches = list(re.finditer(markdown_image_pattern, item))
                             if matches:
-                                # print(f"        在字符串项中找到 {len(matches)} 个Markdown图片。")
                                 current_pos = 0
-                                text_parts = []  # 暂时存储图片前的文本部分
+                                text_parts = []
 
                                 for match in matches:
-                                    # 添加图片之前的文本
                                     if match.start() > current_pos:
                                         text_part = item[current_pos:match.start()]
-                                        # print(f"          添加前导文本部分: '{text_part[:50]}...'")
                                         text_parts.append(text_part)
 
                                     alt_text, img_url = match.groups()
                                     current_pos = match.end()
-                                    print(f"          正在处理Markdown图片URL: {img_url}")
 
-                                    # 如果有前导文本部分，现在以单个文本块添加它们
-                                    if text_parts:
-                                        new_content.append({"type": "text", "text": "".join(text_parts)})
-                                        text_parts = []  # 为下一个潜在文本部分重置
-
-                                    # 添加图片部分
                                     try:
                                         if img_url.startswith("data:"):
-                                            print(f"            图片URL已经是数据URI。")
                                             image_data = img_url
                                         else:
-                                            print(f"            尝试进行URL转换...")
-                                            # raise Exception("模拟转换错误")  # 注释以测试错误处理
                                             image_data = convert_url(img_url)
-                                            print(f"            ✅ URL转换成功。")  # 也许添加: {image_data[:40]}...
+
+                                        # 清空之前积累的文本部分
+                                        if text_parts:
+                                            new_content.append({"type": "text", "text": "".join(text_parts)})
+                                            text_parts = []
 
                                         new_content.append({
                                             "type": "image_url",
                                             "image_url": {"url": image_data}
                                         })
-                                        print(f"            添加了 image_url 字典。")
-
                                     except Exception as e:
-                                        print(f"            ❌ URL转换/处理失败: {e}")
-                                        print(f"            ⚠️ 保留原始Markdown标签作为文本。")
-                                        # 如果转换失败，将原始Markdown标签作为文本添加回来
-                                        text_parts.append(f"![{alt_text}]({img_url})")
+                                        print(f"图片处理失败: {e}")
+                                        # 转换失败时，将图片标记替换为错误文本
+                                        text_parts.append(IMAGE_LOAD_FAILED_TEXT)
 
-
-                                # 添加最后一张图像后的任何剩余文本
+                                # 处理剩余文本
                                 if current_pos < len(item):
                                     remaining_text = item[current_pos:]
-                                    # print(f"          添加尾随文本部分: '{remaining_text[:50]}...'")
                                     text_parts.append(remaining_text)
 
-                                # 如果任何文本部分存在（包括失败的图像），添加最终文本部分
                                 if text_parts:
                                     new_content.append({"type": "text", "text": "".join(text_parts)})
-
                             else:
-                                # 字符串项没有Markdown图像，按原样添加（或作为文本字典）
-                                # print(f"        字符串项包含没有Markdown图像。作为文本字典添加。")
                                 new_content.append({"type": "text", "text": item})
 
-                        # -------------------------------------------------
-                        # 子情形 1.2: 列表项是字典（可能是图像或文本）
-                        # -------------------------------------------------
                         elif isinstance(item, dict):
                             item_type = item.get("type")
-                            # print(f"        项类型: dict. 类型键: '{item_type}'。")
                             if item_type in ["image", "image_url"]:
                                 image_url_data = item.get("image_url", {})
                                 url = ""
                                 if isinstance(image_url_data, dict):
                                     url = image_url_data.get("url", "")
-                                    # print(f"          找到 image_url 字典，URL: {url}")
-                                elif isinstance(image_url_data, str):  # 处理 image_url 值只是URL字符串的情况
+                                elif isinstance(image_url_data, str):
                                     url = image_url_data
-                                    # print(f"          找到 image_url 字符串: {url}. 归一化为字典格式。")
-                                    # 归一化为标准字典结构
                                     item = {"type": "image_url", "image_url": {"url": url}}
 
                                 if url:
-                                    # 检查是否需要转换
                                     if not url.startswith("data:"):
-                                        print(f"            URL需要转换。正在尝试...")
                                         try:
-                                            # raise Exception("模拟转换错误")  # 注释以测试
                                             converted_url = convert_url(url)
-                                            item["image_url"]["url"] = converted_url  # 更新项中的URL
-                                            print(f"            ✅ URL转换成功。")
+                                            item["image_url"]["url"] = converted_url
+                                            new_content.append(item)
                                         except Exception as e:
-                                            print(f"            ❌ URL转换失败: {e}")
-                                            print(f"            ⚠️ 保留原始URL在字典中。")
-                                            # 如果转换失败，保留原始URL
-                                            pass
+                                            print(f"图片URL转换失败: {e}")
+                                            # 替换为错误文本而不是保留原始URL
+                                            new_content.append({"type": "text", "text": IMAGE_LOAD_FAILED_TEXT})
                                     else:
-                                        # print(f"            URL已经是数据URI。不需要转换。")
-                                        pass
-                                    new_content.append(item)  # 添加（可能已更新的）字典项
+                                        new_content.append(item)
                                 else:
-                                    print(f"          ⚠️ 找到图像字典，但'url'缺失或为空。跳过转换，按原样添加项。")
-                                    new_content.append(item)  # 按原样添加有缺陷的项
-                            elif item_type == "text":
-                                # print(f"          项是文本字典。按原样添加。")
-                                new_content.append(item)  # 保留文本字典
+                                    # URL为空的情况也替换为错误文本
+                                    new_content.append({"type": "text", "text": IMAGE_LOAD_FAILED_TEXT})
                             else:
-                                # print(f"          项是未知类型的字典'{item_type}'。按原样添加。")
-                                new_content.append(item)  # 保留其他字典类型
-
-                        # -------------------------------------------------
-                        # 子情形 1.3: 列表项是其他类型
-                        # -------------------------------------------------
+                                new_content.append(item)
                         else:
-                            item_type_name = type(item).__name__
-                            # print(f"        项类型: {item_type_name}。按原样添加。")
-                            new_content.append(item)  # 保持其他类型按原样添加
+                            new_content.append({"type": "text", "text": str(item)})
 
                     new_message["content"] = new_content
-                    # print(f"    列表内容处理完成。新内容包含 {len(new_content)} 项。")
 
-                # ---------------------------------------------------------
-                # 情形 2: 内容是一个简单的字符串
-                # ---------------------------------------------------------
                 elif isinstance(content, str):
-                    # print(f"    内容是字符串。检查Markdown图片...")
                     matches = list(re.finditer(markdown_image_pattern, content))
                     if matches:
-                        # print(f"    找到 {len(matches)} 个Markdown图像。将字符串内容转换为列表格式。")
-                        new_content = []  # 将保存新的列表结构
+                        new_content = []
                         current_pos = 0
 
                         for match in matches:
-                            # 添加图像之前的文本
                             if match.start() > current_pos:
                                 text_part = content[current_pos:match.start()]
-                                # print(f"      添加前导文本部分: '{text_part[:50]}...'")
                                 new_content.append({'type': 'text', 'text': text_part})
 
                             alt_text, img_url = match.groups()
                             current_pos = match.end()
-                            print(f"      正在处理Markdown图片URL: {img_url}")
 
-                            # 添加图片部分
                             try:
                                 if img_url.startswith("data:"):
-                                    print(f"        图片URL已经是数据URI。")
                                     image_data = img_url
                                 else:
-                                    print(f"        尝试进行URL转换...")
-                                    # raise Exception("模拟转换错误")  # 注释以测试
                                     image_data = convert_url(img_url)
-                                    print(f"        ✅ URL转换成功。")
 
                                 new_content.append({
                                     "type": "image_url",
                                     "image_url": {"url": image_data}
                                 })
-                                print(f"        添加了image_url字典。")
-
                             except Exception as e:
-                                print(f"        ❌ URL转换/处理失败: {e}")
-                                print(f"        ⚠️ 添加原始URL的图像（转换失败）。")
-                                # 如果转换失败，创建字典结构但使用原始URL
-                                new_content.append({
-                                    "type": "image_url",
-                                    "image_url": {"url": img_url}  # 在失败时使用原始URL
-                                })
+                                print(f"图片处理失败: {e}")
+                                # 转换失败时用文本代替
+                                new_content.append({"type": "text", "text": IMAGE_LOAD_FAILED_TEXT})
 
-                        # 添加最后一张图像后的任何剩余文本
                         if current_pos < len(content):
                             remaining_text = content[current_pos:]
-                            # print(f"      添加尾随文本部分: '{remaining_text[:50]}...'")
                             new_content.append({'type': 'text', 'text': remaining_text})
 
                         new_message["content"] = new_content
-                        # print(f"    字符串内容转换完成。新内容包含 {len(new_content)} 项。")
-                    else:
-                        # 字符串内容没有图像，消息内容无需更改
-                        # print(f"    字符串内容不包含Markdown图片。无需转换。")
-                        pass
-                        # 保持 new_message 原样（它是原始消息的副本）
-
-                # ---------------------------------------------------------
-                # 情形 3: 内容既不是字符串也不是列表
-                # ---------------------------------------------------------
-                else:
-                    pass
-                    # print(f"    内容类型 ({original_content_type}) 不是字符串或列表。跳过此消息的转换。")
-                    # 保持 new_message 原样
-
-            else:
-                # 消息没有 "content" 键
-                # print(f"    消息 {i+1} 没有 'content' 键。跳过。")
-                pass
-                # 保持 new_message 原样
 
             processed_messages.append(new_message)
-            # print(f"  完成处理消息 {i+1}。")
 
-        # print("<- 退出 _convert_images 函数。")
         return processed_messages
 
     def get_vision_model(self):

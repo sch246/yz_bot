@@ -592,13 +592,13 @@ def get_prompt() -> list:
         return []
 
 max_token = storage.get('llm_system', 'config').get('max_token', 4000)
-
+max_msg = storage.get('llm_system', 'config').get('max_msg', 200)
 
 def get_msgs(max_token=max_token, return_token=False):
     in_group = cache.thismsg().get('group_id')
 
     chat_logs = []
-    for msg in getlog():
+    for msg in getlog()[:max_msg]:
         if not is_msg(msg):
             continue
         if msg['message'].startswith('#'):

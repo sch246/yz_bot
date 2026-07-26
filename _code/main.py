@@ -142,16 +142,15 @@ def first_start():
         send('设置完毕！', user_id=master)
 
 def _init_self():
-
         while True:
                 try:
                         login_info = connect.call_api('get_login_info')['data']
                         break
                 except requests.exceptions.ConnectionError as e:
-                        print(f'连接错误: {connect.url}')
+                        print(f'连接错误: {connect.post_url}')
                         print('3秒后重试...')
                         time.sleep(3)
-
+        print("连接完成")
         # 加载设置
         if not os.path.isfile('config.json'):
                 first_start()
@@ -160,6 +159,7 @@ def _init_self():
                 cache.nicknames_load()
         except KeyError:
                 first_start()
+        print("加载完成")
 
         qq, name = login_info['user_id'], login_info['nickname']
         cache.set('qq',qq)
@@ -402,9 +402,11 @@ def recv(msg:dict|None):
                         cmd_py.exec_links(msg)
 
 
+print("加载funcs")
 from funcs import *
 
 if __name__=="__main__":
+        print("启动中")
         _init_self()
         cmds.load()
         while True:

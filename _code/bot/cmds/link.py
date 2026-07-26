@@ -67,8 +67,8 @@ cond和action都是可执行的python代码, 但是环境不同, 执行流程是
         else:
             # 否则得到[]或者[...]
             params = _params_from_whiles(whiles)
-            if (s:=check_while(name, params)):
-                return s
+            if (err:=check_while(name, params)):
+                return err
 
         link = get_link(name)
         if params==[]:
@@ -199,6 +199,8 @@ def _params_from_whiles(whiles=None):
 def _edit(name, type, cond, action, params=None):
     '''编辑已存在的链接
     params为None保持不变，设为[]以清空连接，设为['a', 'succ', 'b','fail',...]以设置连接'''
+    if type not in ('re', 'py'):
+        return f'link类型无效: "{type}"，只允许 re 或 py'
     link = get_link(name)
     if params is not None:
         set_while(link, params)
@@ -211,6 +213,8 @@ def _edit(name, type, cond, action, params=None):
 def _add(name, type, cond, action, params=None):
     '''添加链接
     params为None将无法触发，设为[]以清空连接，设为['a', 'succ', 'b','fail',...]以设置连接'''
+    if type not in ('re', 'py'):
+        return f'link类型无效: "{type}"，只允许 re 或 py'
     if params is None:
         # 默认链接
         links.insert(0,{

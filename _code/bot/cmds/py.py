@@ -234,6 +234,9 @@ def exec_link(link):
     succ = link['succ']
     fail = link['fail']
     action = link['action']
+    if type not in ('re', 'py'):
+        __print(f'link "{name}" 的 type 已损坏: {type!r}，跳过')
+        return
     if type=='py':
         out = exec_link_py(cond, action)
     else:
@@ -326,7 +329,13 @@ def _run_action_re(action, _loc, names:dict):
 
 def run_action(linkname, _loc, names={}):
     link = get_link(linkname)
-    if link['type']=='py':
+    if not link:
+        return
+    type_str = link.get('type')
+    if type_str not in ('re', 'py'):
+        __print(f'link "{linkname}" 的 type 已损坏: {type_str!r}，跳过action')
+        return
+    if type_str=='py':
         _run_action_py(link['action'], _loc)
     else:
         _run_action_re(link['action'], _loc, names)
@@ -334,7 +343,10 @@ do_action = run_action
 
 def formats_link(link:dict, mode=0):
     '''输出link的显示用字符串形式'''
-    lst = [link.get('type', 're')+' '+link['name']]
+    type_str = link.get('type')
+    if type_str not in ('re', 'py'):
+        type_str = f'(损坏:{type_str!r})'
+    lst = [type_str + ' ' + link['name']]
     if mode==0:
         if link['succ']:
             lst.append('    succ')

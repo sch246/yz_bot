@@ -22,21 +22,17 @@ happys = [
 '(≧◡≦) ♡',
 ]
 
-def my_zip(*lists):
-    if len(lists)==1:
-        return ([arg] for arg in lists[0])
-    return zip(*lists)
-
-def the_zip(*lists):
-    if not lists or not lists[0]:
-        return ()
-    length = min(len(lst) for lst in lists)
-    return ((lst[i] for lst in lists)
-            for i in range(length))
-
 re_num = re.compile(r'^(\d+(\.\d+)?)|(\.\d+)$')
 
-def get_jrxdw(personal_animal_types: list[list]|None):
+def fix(personal_animal_types: list[tuple[str, float]]|list[str]|None) -> list[tuple[str, float]]|None:
+    if not personal_animal_types:
+        return None
+    else:
+        return [(v, 1.0) if isinstance(v, str) else v
+                for v in personal_animal_types]
+
+
+def get_jrxdw(personal_animal_types: list[tuple[str, float]]|None):
     '''
     获取今日小动物
 
@@ -46,7 +42,7 @@ def get_jrxdw(personal_animal_types: list[list]|None):
     if not personal_animal_types:
         animal_type = random.choice(list(animal_types.keys()))
     else:
-        animals, weights = the_zip(*personal_animal_types)
+        animals, weights = zip(*personal_animal_types)
         animal_type = random.choices(animals, weights=weights)[0]
         if animal_type == '*':
             others = list(set(animal_types.keys()) - set(animals))
@@ -96,6 +92,8 @@ def run(body:str):
 
     user_data = getstorage()
     personal_animal_types = user_data.get('animal_types') #可能为None
+    personal_animal_types = fix(personal_animal_types)
+    user_data['animal_types'] = personal_animal_types
 
     jrxdw: dict = storage.get('','jrxdw')
     jrxdw.setdefault('dict', {})
