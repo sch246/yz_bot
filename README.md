@@ -10,20 +10,32 @@
 
 - [交互模型与设计哲学](docs/interaction-model.md)：命令优先级、上下文延续、状态范围，以及“修改后重启”为什么是有意的设计。
 - [设计原则与重写判断](docs/design-principles.md)：维护者如何评估抽象、直接能力、数据透明性和从零重写；架构讨论应先读这里。
-- [运行架构](docs/architecture.md)：命令插件、`main` 的人工依赖编排、`funcs.py` 与 `data/pyload.py` 的不同角色。
+- [运行架构](docs/architecture.md)：平级 `mods`、两阶段加载、命令注册、线性 link、动态环境和退出顺序。
 - [演进历史](docs/history.md)：从学习 OneBot、早期 `.py`/`.link` 到 HTTP、WebSocket、go-cqhttp 与 NapCat 的变迁，以及哪些旧设计已经被替换。
 - [原始历史文档](md/README.md)：旧仓库的开发记录、0.4 使用说明和背景文章；用于追溯，不作为当前契约。
 - [功能与命令目录](docs/commands.md)：按功能族说明公开命令、扩展运行环境和主要状态。
 - [LLM 聊天与工具调用](docs/llm.md)：上下文构建、模型配置、函数工具、自动调用循环和当前信任边界。
 - [运行边界与交互测试](docs/runtime.md)：NapCat 接入、真实消息路径，以及如何避免测试影响正在运行的实例。
 - [当前维护队列](docs/working/current-issues.md)：已经确认要修的缺陷、接受的现行约束，以及仍可选的加固项。
-- [未实现设计提案](docs/working/proposals/README.md)：Core 降级、Storage 值校验与历史恢复、异常日志、权限和多个独立 Bot 项目共存；这些内容不是当前契约。
+- [旧代码组织调查](docs/working/code-organization-analysis.md)：切换前 `main.py`、`funcs.py`、动态名称环境和 import 副作用的历史摘要。
+- [设计与迁移记录](docs/working/proposals/README.md)：已完成的 Mods 切换记录，以及仍未实现的 Storage 历史、异常日志、权限和多项目共存提案。
 - [当前 link 反应快照](docs/working/link-reactions.md)：`data/storage/links.json` 中当前动态反应的可读索引；它是会随在线配置变化的工作快照。
 - [命令开发指南](COMMANDS.md)：新增命令时使用的实现级资料。预期交互语义以交互文档为准，当前精确语法以命令 docstring/`.help` 为准；若代码与设计意图冲突，应记录差异，而不是静默任选一边。
 
 ## 一句话理解
 
 普通命令插件提供稳定入口，`.py` 和语言扩展提供临时计算环境，`.link` 把聊天变成可现场编程的反应网络，`.cave` 承载群体记忆，`.chat` 把整个聊天窗口变成 LLM 上下文，而 `.file`、`.edit`、`.reboot` 则让 Bot 能通过聊天修改并重新加载自身。
+
+## 启动
+
+在仓库根目录建立锁定环境并启动监督进程：
+
+```bash
+uv sync --frozen
+uv run --frozen python run.py -a
+```
+
+默认 OneBot API 端口是 `5700`，事件监听端口是 `5701`；`-q` 和 `-p` 可覆盖。生产数据、配置、聊天记录和密钥都属于本机运行状态，具体边界见[运行文档](docs/runtime.md)。
 
 ## 许可证
 

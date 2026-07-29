@@ -21,9 +21,9 @@ def rd(n, sides):
 
 这会持久化定义而不求值末行。持久化代码必须能够从干净启动环境运行，不能依赖只存在于本次进程的临时变量。
 
-它既是 REPL，也是现场修复和扩展入口。`^C` 能解除 `.py input()` 对后续消息的拦截，但当前不能唤醒已经阻塞在 Queue 上的执行线程；这与 yield 命令的真正放弃交互不同。
+它既是 REPL，也是现场修复和扩展入口。`^C` 会通过共享 continuation 机制唤醒并取消 `.py input()`，与 yield 命令使用同一条逃生路径。
 
-`data/pyload.py` 与 `_code/funcs.py` 都被设计为给 `.py`/link 提供名称，但前者是未受版本控制、通过 `exec` 注入的设备级扩展，引用关系难以追踪；后者才是可搜索的正式公共源码。当前加载顺序还使冷启动首条直接 `.py` 可能尚未同步到 `pyload.py` 新名称。新增长期复用能力时不要默认继续堆进 `pyload.py`，详见[运行架构](architecture.md)。
+`data/pyload.py` 是未受版本控制、通过 `exec` 注入的设备级输入。长期复用能力属于普通 `mods`，确有动态消费者的平铺名字由 `mods.py::DYNAMIC_EXPORTS` 显式维护。pyload 在候选环境中完整成功后才安装；失败不会留下半套名称。新增长期能力时不要继续堆进 pyload，详见[运行架构](architecture.md#pypyloadpy-与动态名称)。
 
 ### 其它语言环境
 
@@ -33,11 +33,11 @@ def rd(n, sides):
 |---|---|---|
 | `.js` | JavaScript | 长驻 Node REPL，`:bye` 关闭 |
 | `.cpp` | C++ | 写入临时源文件，用 g++ 编译后以可交互子进程运行 |
-| `.hs` | Haskell | 长驻 GHCi REPL，`:quit` 关闭；解释器路径当前是设备配置式硬编码 |
+| `.hs` | Haskell | 长驻 GHCi REPL，`:quit` 关闭；解释器路径可由 `GHCI_PATH` 配置 |
 | `.nim` | Nim | 写入临时源文件，每次 compile-and-run |
 | `.nl` | newLISP | 借 screen 保持一个 newLISP 会话 |
-| `.lua` | Lua | 写入临时文件后调用固定解释器路径 |
-| `.mcf` | Minecraft function/datapack | 直接创建或修改数据包函数与标签；当前实现没有和其它代码执行命令相同的显式 `.op` 检查 |
+| `.lua` | Lua | 写入临时文件，优先调用 PATH 中的解释器并设置执行超时 |
+| `.mcf` | Minecraft function/datapack | 直接创建或修改数据包函数与标签；属于管理员能力 |
 
 这些命令共享产品理念，不共享技术契约；维护时不必为了形式统一强行套一层抽象。
 
@@ -54,7 +54,7 @@ def rd(n, sides):
 | `.reboot` | 优雅退出并请求外层立即重启 | 管理员；保存发起消息，重启后插件钩子向原聊天发送“重启完成” |
 | `.shutdown` | 有意停止 Bot | 管理员；留下只执行一次的启动钩子，下次启动向原聊天发送“醒了” |
 | `.op` | 添加或移除管理员 | 仅管理员；首位 master 不可由普通删除流程移除 |
-| `.post` | 为当前群/私聊或指定目标切换 OneBot API 出站端口 | 与 `5701` 事件注入及假 API 端组合成调试通道；当前窗口可自助设置，指定其它窗口或清空全部映射需要管理员。当前私聊重定向有效，群映射因 `user_id=None` 覆盖缺陷不能可靠截获 `main.send()` |
+| `.post` | 为当前群/私聊或指定目标切换 OneBot API 出站端口 | 与 `5701` 事件注入及假 API 端组合成调试通道；当前窗口可自助设置，指定其它窗口或清空全部映射需要管理员 |
 
 典型维护流是 `.edit`/`.file`/`.py` 修改，确认磁盘状态，再 `.reboot`。这条路径比进程内热替换更可预测。
 
@@ -66,13 +66,13 @@ def rd(n, sides):
 
 ## 命令插件
 
-文件命令本身就是插件系统：在 `_code/bot/cmds/` 新增一个模块并提供 `run(body)`，启动时就会被扫描和加载。插件通过 `main` 获得几乎全部 Bot 能力，这使新增命令极其直接，也使依赖顺序成为 `main.py` 必须人工维护的架构约束。开发细节见 [COMMANDS.md](../COMMANDS.md)，权衡见[运行架构](architecture.md)。
+公开 Module 本身就是插件系统：在 `mods/` 新增一个模块，并用无参数 `@command` 装饰入口。`run(body)` 注册为 `.模块名`，其它函数注册为 `.模块名.函数名`。模块之间直接 import，loader 只负责生命周期和失败隔离。开发细节见 [COMMANDS.md](../COMMANDS.md)，边界见[运行架构](architecture.md)。
 
 ## 动态反应系统
 
 ### `.link`
 
-管理员可以查看、捕获、创建、编辑、连接、删除、导入和导出 link 节点。
+管理员可以查看、捕获、创建、编辑、移动、删除、导入和导出 link 节点。
 
 节点的两种类型不只有条件不同，action 返回语义也不同：
 
@@ -94,11 +94,11 @@ f'{getname()} 投了 {:r} 个 {:d} 面骰，总数为 {rd(int("{:r}"), int("{:d}
 
 这是配置即代码：插值最终生成 Python 源码，引用和转义必须按执行语境检查。
 
-节点成功时执行 action 和 `succ` 分支；失败时继续 `fail` 分支。默认新节点插入主链开头，并把旧入口作为失败后继。显式 `while <节点> succ|fail` 才把节点接到指定分支；空 `while` 会得到不可达节点。
+节点按 `links.json` 数组顺序检查；首个命中节点执行 action 后结束。默认新节点插入列表头，`.link move` 显式调整位置。持久格式不再包含 `succ`、`fail` 或 `while`。源码中的通用 `@capture` 可以定位在某个持久节点之前，或作为列表后的兜底，但不会写入该文件。
 
 `.link catch` 不执行 action，但会真实求值 cond。尤其 `py cond` 仍会运行其中的 Python 语句，所以它只是“抑制 action 的路径检查”，不是无副作用 dry-run。cond 约定上不应 send/recv、修改状态或主动调用 action，否则 catch 结果也不可信。
 
-当前 cond 报错会把 traceback 发到聊天，并把该条件视为失败后沿 `fail` 继续；action 报错也会回传 traceback，但该节点仍可能被视为成功并继续 `succ`。后者是已确认要修的现行缺陷：action 异常应使节点失败，不能继续成功后继；异常后的失败分支如何执行仍需在实现时结合半执行状态决定。重复报错节流和 `.link error off|on|status` 仍是[未实现提案](working/proposals/errors-and-logging.md)。
+cond 或 action 报错会写应用日志并把 traceback 回传当前聊天。cond 报错按未命中处理，继续后续线性节点；action 报错结束这次已经命中的反应。重复报错节流和统一 incident 仍是[未实现提案](working/proposals/errors-and-logging.md)。
 
 `.reply` 是当前 link 配置中的便捷反应：通过聊天内容生成一个静态回复节点，体现了“反应系统可以继续修改自己”。当前节点见 [link 快照](working/link-reactions.md)。
 
@@ -134,7 +134,6 @@ f'{getname()} 投了 {:r} 个 {:d} 面骰，总数为 {rd(int("{:r}"), int("{:d}
 | `.change` | 随机或指定数字的易经起卦 |
 | `.jm` | 搜索或获取漫画内容；当前没有 op 检查 |
 | `.setu` | 调用图片 API 返回随机图 |
-| `.kmmm` | 历史图片 API 功能，当前可能不可用 |
 | `.join` | 群内多人参与并随机选人 |
 
 这些功能常通过 link 获得无前缀入口，因此命令名不是它们唯一的用户界面。
@@ -199,7 +198,7 @@ LLM 当前还可以自动调用普通 Python 函数，包括戳一戳、按自�
 
 本机传统拓扑中，screen 负责启动 Minecraft 进程和读取控制台，RCON 负责快速发送服务器命令并取得返回；screen 能看到部分 RCON 不返回的控制台输出，但通常更慢、输出也可能更杂。Bot 重启会丢失内存中的 RCON 连接，需要重新连接；自动连接、路径、screen 名、RCON 地址和密码都属于 `data/pyload.py` 的设备配置。
 
-`.mcf` 直接创建/修改 datapack 中的函数与函数标签，依赖 `mc_path`、世界名和 pack format。link 中更具体的双反斜杠入口必须排在更宽的单反斜杠模式前，否则会被前者截断；这正是新 link 倒序优先的实际用例。当前 `.mcf` 没有显式 op 检查，使用边界比设计理念所期望的更宽。
+`.mcf` 直接创建/修改 datapack 中的函数与函数标签，依赖私有 Minecraft 设备配置，并显式要求 op。link 中更具体的双反斜杠入口必须排在更宽的单反斜杠模式前，否则会被前者截断；这正是线性 link 顺序属于行为的一例。
 
 ## 其它显式命令
 

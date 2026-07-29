@@ -1,0 +1,29 @@
+[project]
+name = "yuzu-bot"
+version = "0.1.0"
+description = "Personal QQ Bot with a module-based runtime"
+requires-python = ">=3.11"
+dependencies = [
+    "apscheduler",
+    "click",
+    "cryptography",
+    "httpx[socks]",
+    "jmcomic",
+    "lunardate",
+    "matplotlib",
+    "numpy",
+    "openai",
+    "pillow",
+    "pyjwt",
+    "python-dotenv",
+    "python-magic",
+    "requests",
+    "rsa",
+    "tenacity",
+    "termcolor",
+    "tiktoken",
+    "watchdog",
+]
+
+[tool.uv]
+package = false

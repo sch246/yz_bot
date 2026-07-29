@@ -2,7 +2,7 @@
 
 ## 当前部署
 
-当前设备上，柚子通过 NapCat/QQ 的 OneBot HTTP 接口运行。以下端口和进程状态重新核对于 2026-07-26，部署变化后应再次确认：
+当前设备上，柚子通过 NapCat/QQ 的 OneBot HTTP 接口运行。正式代码入口已于 2026-07-29 切换到仓库根的 module 架构；切换完成时 Bot 保持停止，需由维护者显式启动：
 
 ```text
 QQ / NapCat
@@ -11,22 +11,54 @@ QQ / NapCat
                          ↓
                     run.py -a
                          ↓
-                  _code/main.py
+                     main.py
+                         ↓
+                       mods/
 ```
 
-调查时已观察到：`run.py -a` 和 `_code/main.py -a -q 5700 -p 5701` 正在运行，两个端口也分别由 QQ/NapCat 与 Python 进程监听。端口可以通过 `run.py -q/-p` 调整。
+NapCat 的 API 默认位于 `5700`，Bot 的事件监听默认位于 `5701`。端口可通过 `run.py -q/-p` 调整；启动前应确认没有另一 Bot 进程占用同一账号、运行数据或监听端口。
 
 当前部署以 Linux 为主，聊天 shell、GNU screen、固定解释器路径和部分编译命令也直接依赖 Linux 环境。仓库根的 `.gitattributes` 使用 `* text=auto eol=lf`，因此所有被 Git 识别为文本的追踪文件都以 LF 入库和检出；即使从 Windows 操作，也不应重新提交 CRLF。二进制文件仍由 `text=auto` 排除在换行转换之外。
 
 `run.py` 是生命周期监督者：子进程以特殊退出码请求重启，或在 `-a` 模式下异常退出时自动拉起。SIGINT 会转发给子进程，使退出保存器有机会落盘。
 
-常用启动形式是从仓库根运行 `python3 run.py -a`；`-l/--log-only` 只记录事件，`-q` 指定 OneBot API 端口，`-p` 指定事件监听端口。历史文档要求 Python 3.10 以上，但当前仓库没有锁定或验证唯一受支持版本，`requirements.txt` 也不能可靠重建本机环境，因此不要把该历史下限当成已经验证的现代安装说明。
+环境由 `pyproject.toml` 和 `uv.lock` 锁定。常用启动形式是从仓库根执行 `uv sync --frozen`，再执行 `uv run --frozen python run.py -a`；`-l/--log-only` 只记录事件，`-q` 指定 OneBot API 端口，`-p` 指定事件监听端口。离线检查命令及退出码含义见下节。
 
 首次没有 `config.json` 时，Bot 会在终端输出四位验证码，等待某个私聊用户回传，以此设为首位 master；随后继续在私聊中设置 Bot 昵称。正常接通时终端会依次出现“连接完成”“加载完成”和账号启动信息。这个流程会读取真实 NapCat 事件，不能在生产账号上随意重演。
 
+## 离线检查命令与结果判读
+
+三个入口验证的范围不同，不能只看退出码并互相替代。
+
+### `run.py --check`
+
+```bash
+uv run --frozen python run.py --check
+```
+
+它读取并编译 `mods` 下的 Python 文件，同时检查公开单文件 Module 与同名 package 冲突；不会 import `main.py`/`mods`、不会执行生命周期、不会读取运行数据或绑定端口。退出 0 只证明这层静态结构通过。
+
+### `run.py --smoke`
+
+```bash
+uv run --frozen python run.py --smoke
+```
+
+它创建临时运行目录和假 OneBot API，然后真实执行 Module Import、Load 与逆序 Exit。loader 的成功条件是六个 required core——`bot`、`command`、`connect`、`context`、`message`、`storage`——全部可用；其它 Module 失败会被记录和隔离，但不会令 smoke 返回非零。这与生产启动允许可选功能降级的契约一致。
+
+终端中的 `smoke required core loaded; optional failures do not fail this check: X/Y` 表示：`Y` 个 Module Import 成功进入 `ctx`，其中 `X` 个完成 Load 进入 `available`。它不表示仓库总 Module 数，也不承诺 `X == Y`。后续 `optional import failures` / `optional load failures` 才说明缺失功能。
+
+临时 fixture 目前只提供最小 config/pyload，不复制设备配置。例如缺少 `data/device/minecraft.json` 时，`minecraft` 会失败，并可能使依赖其动态导出的 `mcf`、`py`、`link`、`later`、`todo` 连锁不可用；只要 required core 仍成立，退出码仍为 0。这证明核心闭环可启动，不证明这些设备功能失败，也不能据此判定生产迁移失败。
+
+若当前任务要求“所有 Module 都成功”，不能把现有 smoke 的退出 0 当作该断言；应检查失败列表，并为目标可选功能提供脱敏的临时设备 fixture，或另建明确的严格验证入口。
+
+### `run.py --smoke-migrated`
+
+该模式使用仓库根作为 runtime root，只把 OneBot API 换成假的。Module 仍会读取当前 config/storage/cache，并可能在 `on_exit()` 保存它们，所以它不是无副作用的临时 smoke。只有在 Bot 已停止、维护者明确授权使用当前运行状态时才能调用；日常静态检查优先使用 `--check`，核心生命周期检查使用临时 `--smoke`。
+
 ## 源码语法检查与动态源码警告
 
-检查追踪 Python 源码时应读取文件并调用 `compile()`，不要为了检查语法导入 `_code/main.py`。当前追踪源码可以在把 `SyntaxWarning` 提升为错误的条件下完成纯编译；正则、替换模板和命令匹配中的反斜杠已经使用 raw string 或双反斜杠表达。
+检查追踪 Python 源码时应读取文件并调用 `compile()`，或执行 `uv run --frozen python run.py --check`；不要为了语法检查 import `main.py` 或 `mods`，因为这会进入完整加载。当前追踪源码可以在把 `SyntaxWarning` 提升为错误的条件下完成纯编译；正则、替换模板和命令匹配中的反斜杠应使用 raw string 或双反斜杠表达。
 
 终端中的警告位置需要区分：`某文件.py:<行号>` 指向普通源码；`<string>:1: SyntaxWarning: invalid escape sequence '\d'` 表示 `eval()`/`exec()` 正在编译动态字符串。后者可能来自聊天中的 `.py`/LLM 工具参数、link action，或 `data/pyload.py` 等以字符串方式执行的设备级源码，不能据此反推追踪文件仍有同一问题。正则中的数字模式应写成 `r'\d'`，需要普通字符串反斜杠时写成 `'\\d'`。
 
@@ -36,7 +68,7 @@ QQ / NapCat
 
 1. NapCat 把 OneBot 事件 POST 到监听端口。
 2. HTTP 接收器解析事件并立即返回 200。
-3. `main.recv()` 记录当前消息和聊天日志。
+3. `mods.bot.recv()` 记录当前消息和聊天日志。
 4. reply 规范化、`^C` 删除 catch、延续式阻塞、普通命令、shell、link 按[完整入口优先级](interaction-model.md#入口有优先级)处理。
 5. 回复进入异步发送队列，再调用 NapCat 的 OneBot API。
 6. Bot 查询刚发送的消息并写入自己的聊天记录。
@@ -51,13 +83,13 @@ HTTP 200 只表示事件已被本地监听器接收，不表示命令或回复�
 
 但当前监听器没有测试命名空间或 dry-run：注入事件会被当成真实消息，可能写入聊天日志、修改 storage、执行 link action、调用 LLM、发送 QQ 消息，甚至触发宿主机管理能力。因此不要把正在运行实例的 `5701` 当作无副作用测试 API。
 
-代码内还有 `recvmsg()`，可从 `.py` 或 link action 递归构造一条消息进入 `main.recv()`。它同样走真实状态和真实副作用，只是省略了 NapCat 入站网络。
+代码内还有 `recvmsg()`，可从 `.py` 或 link action 递归构造一条消息进入 `mods.bot.recv()`。它同样走真实状态和真实副作用，只是省略了 NapCat 入站网络。
 
-`_code/portfunc/` 提供另一套 RSA 验证的远程函数调用协议；当前主启动路径没有把它注册成通用 Bot 测试入口。link 中出现的远端调用是特定运行配置，不等于测试框架。
+`mods.portfunc` 提供 RSA 验证的远程函数调用协议，`mods.server` 持有设备级惰性 client。它们不是通用 Bot 测试入口；地址和私钥路径只来自忽略的设备配置。
 
 ## `!` 命令行入口
 
-当前 Bot 的命令行入口就是 `main.recv()` 中的 `!` 分支。管理员发送 `!<命令>` 后，`_run_bash()` 在宿主机启动 shell 子进程并把输出发回原聊天；`#!<命令>` 只回报“将执行什么”，不实际启动进程。
+当前 Bot 的命令行入口就是 `mods.bot` 中的 `!` 分支。管理员发送 `!<命令>` 后，`_run_bash()` 在宿主机启动 shell 子进程并把输出发回原聊天；`#!<命令>` 只回报“将执行什么”，不实际启动进程。
 
 因此聊天中的 `!` 可以启动任意已经存在的命令行辅助程序，但 `!` 分支本身不实现虚拟群聊切换或发送截获。
 
@@ -72,19 +104,17 @@ HTTP 200 只表示事件已被本地监听器接收，不表示命令或回复�
 5. 此后该窗口产生的 `send_msg` 和 `get_msg` 请求应不再去 NapCat `5700`，而是进入假接收端；
 6. 继续向 `5701` 注入消息，即可观察真实命令、阻塞和 link 反应，同时截获默认回复。
 
-假的 API 端不能只记录 `send_msg`：当前 `main.send()` 在发送成功后还会调用 `get_msg` 取得刚发送的完整消息并写日志。测试端至少要为这两个 action 返回符合当前代码预期的 `retcode`、`data.message_id` 和消息 `data`。`.post <端口>` 的确认回复本身就会走新映射，所以假 API 必须先启动。
+假的 API 端不能只记录 `send_msg`：当前 `mods.message.send()` 在发送成功后还会调用 `get_msg` 取得刚发送的完整消息并写日志。测试端至少要为这两个 action 返回符合当前代码预期的 `retcode`、`data.message_id` 和消息 `data`。`.post <端口>` 的确认回复本身就会走新映射，所以假 API 必须先启动。
 
 当前窗口使用 `.post <端口>` 不要求 op；用 `.post g<群号>`、`.post u<用户号>` 操作其它窗口或用 `.post *` 清空全部映射需要 op。对当前窗口发送不带端口的 `.post` 可恢复默认路由。映射不持久化，进程重启后自动消失。在群里，“当前窗口”是整个群，因此任意成员当前都能改变群共享映射。
 
-不过，当前实现只可靠支持私聊重定向。群映射虽然会写入 `post_map`，但 `main.send()` 同时传入 `group_id=<群号>` 和 `user_id=None`；`call_api()` 先选中 `g<群号>`，随后又用不存在的 `uNone` 映射回退到默认 `5700`。在修复这一覆盖逻辑前，不能用生产群验证上述隔离流程；只传 `group_id` 且不带 `user_id` 的其它 API 调用仍可能命中群映射。
+群聊与私聊映射现在分别只选择 `g<群号>` 或 `u<用户号>`，不会再由 `user_id=None` 覆盖已经选中的群端口。但这只修复出站选择，不改变下述真实状态副作用和权限边界。
 
 这套方式隔离了 QQ 出站发送，却没有隔离 Bot 本体：虚拟事件仍会进入真实 chatlog、cache、storage、计划任务、LLM 和宿主机 action。测试应使用专用虚拟 ID、受控消息和假 API 端，不触发 `.py`、shell、服务器控制等高权限路径。
 
-## 历史 WebSocket 实现
+## 传输边界
 
-`_code/bot/connect_with_ws.py` 是 go-cqhttp 时代留下的 WebSocket 连接器，默认连接 `ws://localhost:6700`。文件自身已经注明，启用它需要调整 import 顺序和其它代码；当前主路径完全使用 HTTP，仓库也没有现成入口验证这份 WS 实现是否仍兼容 NapCat。因此它应视为废弃但尚未删除的历史实现，而不是可选的受支持传输。
-
-当前保留理由只有历史参考和可能存在的设备外调用，仓库内没有主路径消费者。删除/归档条件是：确认本机与其它部署没有直接 import 它，HTTP/NapCat 已覆盖仍需的通信行为，并把有价值的通信演进保留在[历史文档](history.md)；满足这些条件后不应继续把它留作无边界兼容路径。
+当前只支持 `mods.connect` 的 OneBot HTTP 路径。go-cqhttp 时代的 WebSocket connector 已随旧 `_code` 实现退出正式代码树；相关演进只保留在[历史文档](history.md)，不能作为可选运行入口。
 
 ## 推荐的测试层次
 
@@ -112,7 +142,7 @@ HTTP 200 只表示事件已被本地监听器接收，不表示命令或回复�
 
 ## 生命周期细节与常见故障
 
-- `.reboot` 只有在外层 `run.py` 监督时才会重新启动；直接运行 `_code/main.py` 会以 233 退出后停住。
+- `.reboot` 只有在外层 `run.py` 监督时才会重新启动；直接运行 `main.py` 会以 233 退出后停住。
 - `.shutdown` 以 0 正常退出，所以即使开启 `-a` 也不会被当作异常重新拉起。
 - 终端第一次 `Ctrl+C` 会让 `main` 进入显式退出路径；父进程只转发第一次 SIGINT，子进程忽略保存期间的重复 SIGINT。退出顺序固定为等待 scheduler 任务结束、停止 storage watcher/worker、强制保存全部 storage；各 shutdown 仍注册为幂等 `atexit` 兜底。`SIGKILL`、断电和 Python fatal error 不经过这条路径。
 - 退出前的“重启中/关闭中”会等待发送 Future 完成；下次启动的“重启完成/醒了”只排入发送队列，钩子文件随即删除，不保证 NapCat 已确认送达。
@@ -133,7 +163,7 @@ HTTP 200 只表示事件已被本地监听器接收，不表示命令或回复�
 
 ## 未实现的运行提案
 
-Core 降级、多项目共存、storage 历史恢复和异常日志等讨论统一收在[工作提案索引](working/proposals/README.md)。Storage 文件热同步已经实现并记录在[运行架构](architecture.md#configcache-与-storage-的所有权)，不再属于未实现能力；提案中的值校验与历史版本仍未落地。
+Mods 两阶段加载已经成为当前架构。多项目共存、storage 值校验与历史恢复、异常 incident/节流等剩余讨论统一收在[工作提案索引](working/proposals/README.md)。Storage 文件热同步已经实现并记录在[运行架构](architecture.md#storage-与设备状态)。
 
 ## 运行数据边界
 

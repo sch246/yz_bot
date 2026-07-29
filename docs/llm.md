@@ -1,6 +1,6 @@
 # LLM 聊天、上下文与工具调用
 
-本文描述当前源码中的 LLM 主路径。运行时供应商、模型、价格和提示词来自 storage，本页不复制设备上的真实配置、聊天内容、账号或密钥。工具启用状态以 `_code/bot/cmds/chat.py::init_chat()` 为当前代码权威；模型是否真正收到工具，还取决于 `llm_system/config` 中对应模型的 `function_calling` 标记。
+本文描述当前源码中的 LLM 主路径。运行时供应商、模型、价格和提示词来自 storage，本页不复制设备上的真实配置、聊天内容、账号或密钥。工具启用状态以 `mods/chat.py::init_chat()` 为当前代码权威；模型是否真正收到工具，还取决于 `llm_system/config` 中对应模型的 `function_calling` 标记。
 
 ## 入口与状态范围
 
@@ -156,7 +156,7 @@ Chat.chat
 - `create_image_from_references` 还会下载模型指定的网络图片或读取本机 `file://` 绝对路径，并作为 multipart 文件上传给生图供应商；
 - 天气和 MC 搜索会向外部站点发请求。
 
-账户相关配置不进入源码或 storage。`main.py` 启动时会加载 `_code/.env`：生图调用复用 `BYTECAT_BASE_URL` 并读取独立的 `BYTECAT_IMAGE_API_KEY`；天气调用分别读取 `QWEATHER_API_HOST`、`QWEATHER_KEY_ID`、`QWEATHER_PROJECT_ID` 和可选的 `QWEATHER_PRIVATE_KEY_FILE`。可从 [`.env.example`](../_code/.env.example) 复制空白模板。缺少必需值时，调用会显式失败，不会回退到硬编码账户。
+账户相关配置不进入源码或 storage。`main.py` 启动时加载仓库根的 `.env`：生图调用复用 `BYTECAT_BASE_URL` 并读取独立的 `BYTECAT_IMAGE_API_KEY`；天气调用分别读取 `QWEATHER_API_HOST`、`QWEATHER_KEY_ID`、`QWEATHER_PROJECT_ID` 和可选的 `QWEATHER_PRIVATE_KEY_FILE`。可从 [`.env.example`](../.env.example) 复制空白模板；缺少必需值时，调用会显式失败，不会回退到硬编码账户。
 
 这是当前实现事实，但维护者当前接受这条信任模型，不把它列为近期高优先级缺陷：群聊中的 LLM 只应在手动选择的可信群启用，可信群中的聊天内容和外部模型共同处于允许调用这些工具的范围内。群白名单是主要运维控制面，不要求近期为每个工具增加确认、能力对象或独立沙箱。
 

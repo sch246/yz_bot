@@ -11,7 +11,7 @@
 - `INFO`：启动/停止、模块加载汇总、模式切换和少量重要状态；
 - `DEBUG`：中间值和诊断采样，仅 `-d` 开启。
 
-默认终端显示 warning/error 和极少 core 生命周期摘要；滚动应用文件保存 info 以上，debug 模式扩展。按日滚动并限制保留天数，当前 7 天可作默认。聊天正文只进入 chatlog，不复制到应用日志或终端；完整 traceback 只记录一次，终端和聊天显示摘要与 incident ID。
+默认终端显示 warning/error 和极少启动摘要；滚动应用文件保存 info 以上，debug 模式扩展。按日滚动并限制保留天数，当前 7 天可作默认。聊天正文只进入 chatlog，不复制到应用日志或终端；完整 traceback 只记录一次，终端和聊天显示摘要与 incident ID。
 
 `report_exception(phase, component, exc, msg, fatal)` 生成短 incident ID，通过唯一 logger 写入时间、阶段、组件、异常类型、消息、完整 traceback 和最小聊天定位。不要记录正文、token、密钥、完整请求体或整条 OneBot JSON。
 
@@ -19,8 +19,8 @@
 
 | 边界 | 候选策略 |
 |---|---|
-| core 必要依赖 | 记录并终止 |
-| feature 初始化 | 标为 failed，其它 feature/core 继续 |
+| 模块 import / `on_load(ctx)` | 记录异常并继续其它模块 |
+| 模块 `on_exit()` | 记录异常并继续退出其它模块 |
 | 可选命令导入 | 禁用插件并移出候选表 |
 | 单条消息/命令 | 记录并向原窗口返回 incident，主循环继续 |
 | 后台线程/Future | 捕获处记录，再把异常放入 Future |

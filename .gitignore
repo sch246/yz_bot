@@ -23,7 +23,7 @@ ed25519-*.pem
 
 # 环境变量
 .env*
-!/_code/.env.example
+!/.env.example
 
 # 临时/测试文件
 /tmp.txt

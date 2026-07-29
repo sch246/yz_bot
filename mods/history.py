@@ -1,0 +1,201 @@
+"""Recent per-window OneBot event history."""
+
+from __future__ import annotations
+
+import ast
+import logging
+import os
+import re
+import tempfile
+from threading import RLock
+from typing import Any, Callable
+
+from mods import INFRA
+
+
+PHASE = INFRA
+LOAD_AFTER = ("storage",)
+MAX_LEN = 256
+CACHE_FILE = "data/cache_msgs"
+
+logger = logging.getLogger(__name__)
+_lock = RLock()
+
+
+def _empty() -> dict[str, Any]:
+    return {"group": {}, "private": {}, "bot": [], "last": None}
+
+
+msgs: dict[str, Any] = _empty()
+
+
+def add_msg(kind: str, uid: int | str, msg: dict[str, Any]) -> None:
+    if kind not in ("group", "private"):
+        raise ValueError(f"未知 history 类型：{kind}")
+    with _lock:
+        events = msgs[kind].setdefault(uid, [])
+        events.insert(0, msg)
+        msgs["last"] = msg
+        del events[MAX_LEN:]
+
+
+def add_self_msg(msg: dict[str, Any]) -> None:
+    with _lock:
+        events = msgs["bot"]
+        events.insert(0, msg)
+        del events[MAX_LEN:]
+
+
+def get_last() -> dict[str, Any] | None:
+    with _lock:
+        return msgs["last"]
+
+
+def _current() -> dict[str, Any]:
+    from mods import context
+
+    current = getattr(context, "current", None)
+    if callable(current):
+        return current()
+    thismsg = getattr(context, "thismsg", None)
+    if callable(thismsg):
+        return thismsg()
+    raise RuntimeError("context 未提供当前消息接口")
+
+
+def getlog(msg: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    if msg is None:
+        msg = _current()
+    with _lock:
+        if "group_id" in msg:
+            return msgs["group"].setdefault(msg["group_id"], [])
+        user_id = msg.get("user_id")
+        if user_id is not None:
+            return msgs["private"].setdefault(user_id, [])
+        return []
+
+
+def is_self(msg: dict[str, Any]) -> Callable[[dict[str, Any]], bool]:
+    user_id = msg.get("user_id")
+
+    def predicate(candidate: dict[str, Any]) -> bool:
+        return candidate.get("post_type") in ("message", "message_sent") and candidate.get("user_id") == user_id
+
+    return predicate
+
+
+def get_self_log(msg: dict[str, Any]) -> list[dict[str, Any]]:
+    return list(filter(is_self(msg), getlog(msg)))
+
+
+def _predicate(msg: dict[str, Any], value: Callable[[dict[str, Any]], bool] | str):
+    if callable(value):
+        return value
+    own = is_self(msg)
+    pattern = re.compile(value)
+    return lambda candidate: own(candidate) and pattern.match(str(candidate.get("message", ""))) is not None
+
+
+def same_times(
+    msg: dict[str, Any],
+    value: Callable[[dict[str, Any]], bool] | str,
+    count: int | None = None,
+) -> bool:
+    events = getlog(msg)
+    end = None if count is None else count + 1
+    if end is not None and len(events) < end:
+        return False
+    return all(_predicate(msg, value)(event) for event in events[1:end])
+
+
+def any_same(
+    msg: dict[str, Any],
+    value: Callable[[dict[str, Any]], bool] | str,
+    count: int | None = None,
+) -> bool:
+    end = None if count is None else count + 1
+    predicate = _predicate(msg, value)
+    return any(predicate(event) for event in getlog(msg)[1:end])
+
+
+def get_one(
+    msg: dict[str, Any],
+    predicate: Callable[[dict[str, Any]], bool],
+    count: int | None = None,
+) -> dict[str, Any] | None:
+    end = None if count is None else count + 1
+    return next((event for event in getlog(msg)[1:end] if predicate(event)), None)
+
+
+def remove_message(
+    message_id: int,
+    group_id: int | None = None,
+    user_id: int | None = None,
+) -> dict[str, Any] | None:
+    """Remove a recalled event from its recent window, if it is still cached."""
+    with _lock:
+        if group_id is not None:
+            candidates = [msgs["group"].get(group_id, [])]
+        elif user_id is not None:
+            candidates = [msgs["private"].get(user_id, [])]
+        else:
+            candidates = [*msgs["group"].values(), *msgs["private"].values()]
+        for events in candidates:
+            for index, event in enumerate(events):
+                is_message = event.get("post_type") in ("message", "message_sent") or (
+                    event.get("post_type") is None and "message" in event
+                )
+                if is_message and event.get("message_id") == message_id:
+                    return events.pop(index)
+    return None
+
+
+def _valid(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and isinstance(value.get("group"), dict)
+        and isinstance(value.get("private"), dict)
+        and isinstance(value.get("bot"), list)
+        and "last" in value
+    )
+
+
+def on_load(_ctx: dict[str, Any] | None = None) -> None:
+    global msgs
+    if not os.path.exists(CACHE_FILE):
+        return
+    try:
+        with open(CACHE_FILE, encoding="utf-8") as file:
+            value = ast.literal_eval(file.read())
+        if not _valid(value):
+            raise ValueError("cache_msgs 形状错误")
+    except Exception:
+        logger.exception("读取近期消息缓存失败，保留空 history")
+        return
+    with _lock:
+        msgs = value
+
+
+def on_exit() -> None:
+    directory = os.path.dirname(CACHE_FILE)
+    os.makedirs(directory, exist_ok=True)
+    with _lock:
+        text = repr(msgs)
+    fd, temporary = tempfile.mkstemp(
+        dir=directory,
+        prefix=".cache_msgs.",
+        suffix=".tmp",
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            file.write(text)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, CACHE_FILE)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise

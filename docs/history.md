@@ -18,16 +18,16 @@
 
 早期 `.py` 只是主循环里检测前缀后 `exec`，第一次重构把命令收进 Command 模块。那一代 `.py` 使用持久化的 `msg_locals.pkl` 保存可序列化变量；消息包装 `Msg` 负责在正确位置收发。当前实现已经改成进程内共享 `loc`，重启默认清空，只有 `###` 代码追加到 `data/pyload.py`，不应再按旧 pickle 模型理解。
 
-`.reboot` 从一开始就不只是退出：旧实现把一次性 `initfunc` 保存下来，下一进程启动、重新获得 Bot 连接后再向原窗口说“重启完成”。当前用 `data/reboot_greet.py` / `data/shutdown_greet.py` 完成同一种跨进程 continuation。实现换过，设计意图没有变。
+`.reboot` 从一开始就不只是退出：旧实现把一次性 `initfunc` 保存下来，下一进程启动、重新获得 Bot 连接后再向原窗口说“重启完成”。当前由 `mods.reboot` / `mods.shutdown` 保存一次性问候状态并完成同一种跨进程 continuation。实现换过，设计意图没有变。
 
-第一代 `.link` 更接近“输入 A 映射成输入 B”，用正则命名组和 `{name}` 替换符把自然语言改写成 `.py` 或其它命令，甚至能用 link 创造新的问答命令。当时还没有成熟权限系统，这使 link 间接触达 `.py` 的风险尤其明显。今天 link 已经演化成带 `cond`、`action`、`succ`、`fail` 和反向 `while` 的执行图，但“自然语言模式捕获后进入共同可编程环境”仍是核心。
+第一代 `.link` 更接近“输入 A 映射成输入 B”，用正则命名组和 `{name}` 替换符把自然语言改写成 `.py` 或其它命令，甚至能用 link 创造新的问答命令。当时还没有成熟权限系统，这使 link 间接触达 `.py` 的风险尤其明显。之后它曾演化成带 `cond`、`action`、`succ`、`fail` 和反向 `while` 的执行图；2026 年 Mods 切换又把实际近乎线性的主链收束成四字段有序列表和源码 capture。“自然语言模式捕获后进入共同可编程环境”始终是核心。
 
 ## 0.2、0.3 与 0.4
 
 - 0.2 时代命令是 class，并出现了整数 `level` 权限字段；当前函数插件没有保留统一 level 检查，但这也是未来“整数级别 + 少量正则/函数例外”并非凭空出现的原因。
 - 0.3 写到一半停止，甚至没有完整上传；它不是当前架构的直接祖先。
 - 0.4 重新以 HTTP 通信为基础编写，随后因长文本等判断改用 WebSocket，又发现问题并不来自 HTTP；WebSocket 封装曾保留，之后主路径再次回到 HTTP。
-- 老文档以 go-cqhttp 为客户端；当前设备已改由 NapCat 提供 OneBot HTTP API。`connect_with_ws.py` 是未接入当前启动路径的历史实现，兼容性未知。
+- 老文档以 go-cqhttp 为客户端；当前设备已改由 NapCat 提供 OneBot HTTP API。旧 `connect_with_ws.py` 已随架构切换退出正式代码树。
 
 这些往返不是单纯摇摆：HTTP 的同步字典接口更贴近当前简单主循环，WebSocket/async 的统一生命周期管理反而会增加整个项目的概念成本。当前局部使用线程承载耗时操作，没有为了吞吐量把全仓改成 async。
 
@@ -49,4 +49,4 @@ Minecraft 管理长期依赖本机 `data/pyload.py`：screen 负责启动进程�
 
 ## 来源与许可历史
 
-旧仓库 README 声明 GPL，并引用 Barney Gale 的 MCRcon；当前 `_code/s3/mcrcon.py` 自身仍保留原项目来源和许可文本。仓库现已恢复旧版 [GNU General Public License v3.0](../LICENCE)，并保留原有 `LICENCE` 文件名。旧仓库的原始开发和使用文档也保存在 [`md/`](../md/README.md)，但其中已经过时的实现说明不替代当前文档。
+旧仓库 README 声明 GPL，并引用 Barney Gale 的 MCRcon；当前 `mods/mcrcon.py` 仍保留原项目来源和许可文本。仓库现已恢复旧版 [GNU General Public License v3.0](../LICENCE)，并保留原有 `LICENCE` 文件名。旧仓库的原始开发和使用文档也保存在 [`md/`](../md/README.md)，但其中已经过时的实现说明不替代当前文档。
