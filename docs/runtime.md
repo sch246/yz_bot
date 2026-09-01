@@ -60,7 +60,7 @@ uv run --frozen python run.py --smoke
 
 检查追踪 Python 源码时应读取文件并调用 `compile()`，或执行 `uv run --frozen python run.py --check`；不要为了语法检查 import `main.py` 或 `mods`，因为这会进入完整加载。当前追踪源码可以在把 `SyntaxWarning` 提升为错误的条件下完成纯编译；正则、替换模板和命令匹配中的反斜杠应使用 raw string 或双反斜杠表达。
 
-终端中的警告位置需要区分：`某文件.py:<行号>` 指向普通源码；`<string>:1: SyntaxWarning: invalid escape sequence '\d'` 表示 `eval()`/`exec()` 正在编译动态字符串。后者可能来自聊天中的 `.py`/LLM 工具参数、link action，或 `data/pyload.py` 等以字符串方式执行的设备级源码，不能据此反推追踪文件仍有同一问题。`data/tools/<name>.py` 则以真实文件名编译；其语法、顶层执行或 schema 校验错误会在 `load_tools` 结果和应用日志中保留完整 traceback，旧活动版本继续服务。正则中的数字模式应写成 `r'\d'`，需要普通字符串反斜杠时写成 `'\\d'`。
+终端中的警告位置需要区分：`某文件.py:<行号>` 指向普通源码；`<string>:1: SyntaxWarning: invalid escape sequence '\d'` 表示 `eval()`/`exec()` 正在编译动态字符串。后者可能来自聊天中的 `.py`/LLM 工具参数、link action，或 `data/pyload.py` 等以字符串方式执行的设备级源码，不能据此反推追踪文件仍有同一问题。`mods/tools/<name>.py` 则以真实文件名编译；其语法、顶层执行或 schema 校验错误会在 `reload_tools` 结果和应用日志中保留完整 traceback，旧 last-good 版本继续服务。正则中的数字模式应写成 `r'\d'`，需要普通字符串反斜杠时写成 `'\\d'`。
 
 `.jm` 插件仍会在加载时导入 `jmcomic`，但站点 client 已延迟到第一次 `.jm search` 才初始化。因而启动期不应再仅由该插件打印站点域名刷新日志；实际使用搜索或下载时，第三方库仍可能访问网络并输出自己的日志。
 
@@ -169,7 +169,7 @@ Mods 两阶段加载已经成为当前架构。多项目共存、storage 值校�
 
 以下目录或文件属于真实运行状态，不是测试夹具：
 
-- `data/`：storage、`pyload.py`、自编工具与 skills、临时文件和功能数据；
+- `data/`：storage、`pyload.py`、临时文件和功能数据；
 - `chatlog/`：真实群聊和私聊记录；
 - `config.json`、`.env*`、密钥文件：账号、服务和模型配置；
 - `outputs/`、`woutputs/`：模型或 RAG 输出；

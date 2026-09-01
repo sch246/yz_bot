@@ -67,13 +67,15 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 动态代码只有在模块名本身运行期计算时才使用 `getmod(name)`。已知模块依赖直接 import；旧 `getcmd` 不再存在。旧根 `data.json` 已退役，动态环境中的 `data` 是 `storage.get("", "py_data")` 的直接引用。
 
-## 自编 LLM 工具与 Skill
+## 统一 LLM 工具模块
 
-`mods.self_tools` 持有一份 Bot 进程级活动函数映射，这是自编工具的唯一运行时权威。`data/tools/<name>.py` 只是候选源：改文件不会改活动函数，模型必须先用 `list_tools` 检查差异，再显式用 `load_tools` 逐名称加载。每个候选在独立 globals 中执行顶层定义并用现有 `Tool` 验证；只有全部成功才替换同名活动函数，失败继续使用旧版。没有 watcher、自动加载、会话级副本或变化 hint。
+`mods/tools/` 是工具和可按需载入说明的唯一目录，`mods.tools.ToolRegistry` 持有进程级 last-good 模块表。顶层 `foo.py` 和 `foo.md` 具有同一种模块语义：第一行是开局可见的模块描述，余下文本是激活后加入当前聊天 system 提示的内容；Markdown 模块没有函数，Python 模块通过 `__all__` 导出一组普通函数。Python 文件可以正常 import 第三方依赖、其它 `mods` 和同目录 `_helper.py`，导出函数仍由现有 `Tool` 校验，模型侧名称统一为 `foo__function`。
 
-`Chat` 持有固定工具，并在每次 LLM 子请求前从活动映射取一份动态快照。该快照同时决定请求 schema 和响应中工具名的 callable，所以加载只会影响当前任务的下一子请求及其它后续请求，不会改写已发出请求。
+首次使用 registry 时，每个顶层模块独立尝试进入 last-good；单模块失败只记录 traceback。之后修改磁盘不会自动改变运行版本：`list_tools` 查看差异，`reload_tools` 才逐模块读取、执行、校验并原子替换 last-good，失败保留旧版；`load_tools` 不读磁盘，只把 last-good 模块的说明和函数激活到当前 `Chat`。因此进程级“已应用源码”和聊天级“已激活能力”是两层状态，没有 watcher、变化 hint 或兼容旁路。
 
-`data/skills` 是另一条更简单的设备级输入：`init_chat()` 每次新建顶层聊天时按文件名读取顶层 `*.md` 并作为 system 消息组装。它不递归、不缓存、不同步，因此 Markdown 可以自行引用子目录附件。提示词也没有新增编辑管理器；`.py`/自编工具环境直接暴露现有可变 `prompts` 对象。
+`Chat` 只常驻 `exec_code`、`list_tools`、`reload_tools`、`load_tools` 四个基础工具。可用模块的第一行描述从一开始就在同一条 system 提示中；激活时原地更新这条既有消息，并修改当前 Chat 的工具映射。每个 LLM 子请求仍冻结一份工具快照，同一份快照同时决定请求 schema 和响应调用解析，所以加载或重载只从下一子请求起生效，不改写已发出的请求或同一响应中的其它调用。
+
+提示词没有新增编辑管理器；`.py` 共享环境继续暴露可变 `prompts` 对象，模型需要时可自己编写工具编辑它。
 
 ## 线性 link 与 capture
 
@@ -101,7 +103,7 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 ## LLM、图片与可观察输出
 
-`mods.llm/` 持有模型配置、client、流式响应与每请求工具快照；`mods.chat` 持有 QQ 窗口上下文、固定工具和聊天命令；`mods.self_tools` 持有自编工具活动映射；`mods.chat_skills` 只读取顶层 Markdown；`mods.image/` 持有图片身份、缓存和视觉输入。`llm` 和 `image` 采用文件夹 Module，是因为内部实现共同拥有明确状态和生命周期；其它职责仍保持小而直接的普通模块。
+`mods.llm/` 持有模型配置、client、流式响应与每请求工具快照；`mods.chat` 持有 QQ 窗口上下文、工具实现和聊天命令；`mods.tools` 持有统一模块 registry、当前 Chat 绑定和基础工具，目录中的其它文件只是按需模块；`mods.image/` 持有图片身份、缓存和视觉输入。`llm`、`tools` 和 `image` 采用文件夹 Module，是因为各自内部实现共同拥有明确状态；具体能力仍优先由普通函数表达。
 
 终端打印是实际运维界面的一部分：收发消息、流式 LLM 内容、工具调用、图片捕获/缓存、link/capture 命中、模块失败和生命周期进度都应保留可观察输出。应用 logger 记录诊断；chatlog 保存产品聊天历史，两者不是同一用途。
 

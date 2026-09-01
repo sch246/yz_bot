@@ -1,6 +1,6 @@
 # LLM 聊天、上下文与工具调用
 
-本文描述当前源码中的 LLM 主路径。运行时供应商、模型、价格和提示词来自 storage，本页不复制设备上的真实配置、聊天内容、账号或密钥。固定工具以 `mods/chat.py::_tools()` 为权威，自编工具以 `mods.self_tools` 的进程内活动映射为权威；模型是否真正收到工具，还取决于 `llm_system/config` 中对应模型的 `function_calling` 标记。
+本文描述当前源码中的 LLM 主路径。运行时供应商、模型、价格和提示词来自 storage，本页不复制设备上的真实配置、聊天内容、账号或密钥。工具模块以 `mods.tools` 的进程内 last-good registry 为权威，当前任务能调用哪些函数则由该 `Chat` 的模块绑定决定；模型是否真正收到工具，还取决于 `llm_system/config` 中对应模型的 `function_calling` 标记。
 
 ## 入口与状态范围
 
@@ -34,7 +34,7 @@
 4. 群聊中所有戳一戳、私聊中只有戳 Bot 的事件，会复用 chatlog 的姓名/群名片格式生成 `role=user` 的本地事件文本；
 5. 普通消息和戳一戳事件共同受 token 预算限制，超限时截断更早的内容。
 
-`init_chat()` 最终按以下顺序建立请求消息：当前窗口选择的提示词、内置 base 提示、`data/skills` 顶层 Markdown、当前群/私聊位置说明、聊天历史。提示词可以是全局 `settings`、`prompts` 中命名设定，或当前窗口直接保存的消息列表。Skill 文件每次新建顶层聊天时重新读取，按文件名排序且不递归；子目录只作为顶层 Markdown 可引用的附件。单文件读取失败只记录 traceback 并跳过该文件。
+`init_chat()` 最终按以下顺序建立请求消息：当前窗口选择的提示词、内置 base 提示、统一工具模块提示、当前群/私聊位置说明、聊天历史。工具模块提示从开局就列出每个 last-good 模块的名称和第一行描述；模块被 `load_tools` 激活后，其余内容原地加入同一条既有 system 消息，不会在 assistant tool call 与 tool result 之间插入新消息。提示词可以是全局 `settings`、`prompts` 中命名设定，或当前窗口直接保存的消息列表。
 
 图片读取是当前窗口的三档设置，使用 `#image <mode>` 修改，使用不带参数的 `#image` 查询当前档位。名称与数字别名分别为 `off/0`、`lazy/1`、`eager/2`；历史布尔值兼容为 `False → off`、`True → lazy`。`off` 会把历史消息中的图片 part 降级为 `[图片(URI)]` 文本：既避免把 `image_url` 发给纯文本模型，又让模型可以按需调用 `recognize_image`。`lazy` 只在 LLM 聊天实际触发时处理本轮上下文中的图片。`eager` 在图片消息到达时立即启动后台下载：当前聊天模型能直接读图时只缓存原图，纯文本模型才会同时预生成文字描述。同一来源若恰好同时被 eager 和聊天请求，描述生成会等待同一个进行中任务，避免重复计费。纯文本模型的识别结果统一压成一个 `[图片(URI)识别结果：描述]` 文本 part，明确 URL 与描述属于同一张图片；视觉模型收到的实际图片 part 前会保留一段“下方图片的原始链接”文本。图片加载失败或没有可用视觉模型时也使用同一个带 URI 的单段格式。
 
@@ -74,47 +74,49 @@
 - `str`、`int`、`float`、`bool`、容器和联合类型标注转换成 JSON schema；
 - 参数说明中的 `enum: [...]` 转成枚举。
 
-这延续了项目的函数优先风格：同一个函数可被 `.py`、link、其它 Python 代码和 LLM 复用，不需要继承工具基类。新增工具仍必须检查 `Tool` 生成的完整 schema；自编工具加载器会在激活前完成这项校验。
+这延续了项目的函数优先风格：同一个函数可被 `.py`、link、其它 Python 代码和 LLM 复用，不需要继承工具基类。Python 工具模块通过 `__all__` 明确导出函数，registry 在应用候选模块前逐个检查 `Tool` 生成的完整 schema；模型侧名称加模块命名空间，例如 `image__recognize_image`。
 
-## 当前启用的工具
+## 基础工具与现有模块
 
-以下列表来自 `init_chat()` 中未注释的 `add_tool()` 调用，不包括源码中仅定义、注释或实验中的工具。
+每个 `Chat` 开局只注册四个基础工具：
 
 | 工具 | 当前效果与边界 |
 |---|---|
-| `get_time` | 返回 Bot 所在设备的当前时间。 |
-| `exec_code` | 在 `.py` 的共享 `loc` 中先 `exec(code)`、再 `eval(expr)`；拥有与 `.py` 接近的进程和宿主机能力。 |
-| `poke` | 调用 NapCat 的 `send_poke`：群聊只能在触发本轮 LLM 的当前群内戳目标，私聊只能戳当前对话者。它不依赖模型输出 CQ 码，也不会分派给缺少可靠聊天上下文的子会话。 |
-| `recognize_image` | 使用视觉模型分析任意 `http://`、`https://` 或本机 `file://` 绝对 URI；网络图片缓存优先，本地与网络图片都需通过图片格式和 20 MiB 上限校验。支持自定义 prompt，不设置输出 token 上限，每次调用都会重新识别且不使用自动描述缓存。 |
-| `create_image` | 调用 ByteCat 同 BASE URL 的独立 `gpt-image-2` 生图 API，支持一次生成 1–10 张 1024x1024 图片，质量可选 `auto/low/medium/high`；API 返回的 Base64 会写入临时图片缓存后自动发送，并按实际返回的图片数以每张 0.13 元记入当月 usage。 |
-| `create_image_from_references` | 接收每行一个的 `http://`、`https://` 或本机 `file://` 参考图 URI，以 multipart `image[]` 调用 `gpt-image-2` 的 `/images/edits`；网络图片缓存优先，URI 不限于聊天消息。 |
-| `later_add` | 在当前群/私聊添加延时任务。普通用户仍受 `.later` 的“只允许安全字符串表达式”检查，op 可安排 Python 表达式。 |
-| `later_del` | 按序号删除当前群/私聊中的延时任务；没有逐任务创建者检查。 |
-| `search_city` | 调用天气服务搜索城市、坐标或 Location ID。 |
-| `get_realtime_weather` | 按 Location ID 获取实时天气。 |
-| `get_daily_forecast` | 获取 3/7/10/15/30 日预报，其它数值回退为 3 日。 |
-| `get_hourly_forecast` | 获取 24/72/168 小时预报，其它数值回退为 24 小时。 |
-| `get_user_data` | 按任意 user ID 读取该用户的整个 storage 字典并转成字符串。 |
-| `set_user_data` | 按任意 user ID 修改或删除键；value 使用 Python `eval()` 解析。 |
-| `assign_tasks` | 把多行任务并发分给新的 LLM 会话，并允许给子会话选择一组工具。 |
-| `search_mc_mod` | 抓取 MC 百科搜索结果并截断到约 1000 字符。 |
-| `check_mod` | 按页面 ID 抓取 MC 百科详情。 |
-| `list_tools` | 列出进程内已激活的自编工具，并主动扫描源文件相对活动版本的新增、修改和删除。 |
-| `load_tools` | 按函数名列表显式加载、更新或卸载自编工具，返回逐项成功和带 traceback 的失败结果。 |
+| `exec_code` | 在 `.py` 的共享 `loc` 中先 `exec(code)`、再 `eval(expr)`；调用时仍检查 op，拥有与 `.py` 接近的进程和宿主机能力。 |
+| `list_tools` | 列出 last-good 模块、当前 Chat 的激活状态、最近加载失败和磁盘源码相对 last-good 的新增、修改、删除。 |
+| `reload_tools` | 按模块名从磁盘显式应用、更新或删除模块；逐项返回成功和带完整 traceback 的失败结果，失败保留旧 last-good。 |
+| `load_tools` | 按模块名把现有 last-good 模块的内容和函数激活到当前 Chat；不读取磁盘。 |
 
-`sendmsg`、群成员读取、农历/小六壬、`later_list`/`later_set`、百科、RAG 等函数虽然仍在源码中出现，但当前注册语句被注释，不能写成已经开放的工具。
+仓库当前提供以下按需模块；函数只在对应模块激活后出现：
+
+| 模块 | 导出能力 |
+|---|---|
+| `common` | `common__get_time`、`common__poke` |
+| `image` | `image__recognize_image`、`image__create_image`、`image__create_image_from_references` |
+| `later` | `later__later_add`、`later__later_del` |
+| `user_data` | `user_data__get_user_data`、`user_data__set_user_data` |
+| `agents` | `agents__assign_tasks` |
+| `minecraft` | `minecraft__search_mc_mod`、`minecraft__check_mod` |
+| `weather` | `weather__search_city`、`weather__get_realtime_weather`、`weather__get_daily_forecast`、`weather__get_hourly_forecast` |
+
+这些文件只 re-export 已有 `mods.chat`/`mods.weather` 函数，原实现仍是行为权威。`sendmsg`、群成员读取、农历/小六壬、`later_list`/`later_set`、百科、RAG 等未进入任何模块，不能写成已经开放的工具。
 
 `create_image` 使用 OpenAI 原生 `gpt-image-2` 的参数与返回形状，不传 DALL·E 的 `style`、`standard` 或 `response_format=url`。图片以 `b64_json` 返回，解码后使用 `data/tmp_files` 的现有临时图片缓存和过期清理机制；Base64 本身不会进入 QQ 消息或 chatlog。
 
-`create_image_from_references` 的 `image_uris` 参数每行接收一个 URI，并在输入边界按完整 URI 去重。解析后复用统一的内容寻址文件缓存；`file://` 必须是本机绝对路径。所有参考图都需通过图片格式和 20 MiB 上限校验。`gpt-image-2` 会自动高保真处理参考图，请求不传 `input_fidelity`。供应商是否对参考图输入另行计费尚未实测；当前 usage 仍只按实际返回图片数以每张 0.13 元记录。若供应商不支持该端点，注释 `init_chat()` 中的工具注册即可禁用，不影响纯文本生图。
+`create_image_from_references` 的 `image_uris` 参数每行接收一个 URI，并在输入边界按完整 URI 去重。解析后复用统一的内容寻址文件缓存；`file://` 必须是本机绝对路径。所有参考图都需通过图片格式和 20 MiB 上限校验。`gpt-image-2` 会自动高保真处理参考图，请求不传 `input_fidelity`。供应商是否对参考图输入另行计费尚未实测；当前 usage 仍只按实际返回图片数以每张 0.13 元记录。
 
-## 自编工具与显式热加载
+## 统一模块格式与两种加载
 
-`data/tools/<name>.py` 是设备级自编工具源。目录只扫描顶层 Python 文件；每个文件必须导出恰好一个公开同名函数，其签名、类型标注和 docstring 必须能由现有 `Tool` 生成完整 schema。候选文件拥有与 `.py` 相同信任域的 Python 环境，包括模块、宿主机能力和可变 `prompts` 对象；它不是沙箱。
+`mods/tools/` 只扫描顶层、不以下划线开头的 `*.py` 和 `*.md`。同 stem 的 Python 与 Markdown 文件冲突；子目录不递归扫描，可以由顶层内容引用或由 Python 正常 import。两种文件共享以下最小格式：第一行是总会出现在模块目录中的描述，后续全部是激活后内容，不设 front matter、summary 或另一套 skill 协议。Markdown 到此结束；Python 还必须显式声明 `__all__`，其中可列零个或多个同步函数。
 
-修改文件不会自动生效。`list_tools` 在被调用时才扫描文件，并把源码相对活动版本的新增、修改和删除列在输出末尾；自编工具系统不设 watcher，也不向普通请求自动注入变化 hint。只有显式调用 `load_tools(names)` 才会逐文件编译、执行顶层定义并校验 schema。加载时不调用导出函数，但顶层 import 和语句会执行，因此文件顶层应只放 import、常量和定义。
+Python 候选作为正常模块执行，可以 import 第三方依赖、其它 `mods` 和同目录下划线 helper。每个导出函数都必须有可用的签名、参数类型标注和 docstring，并通过现有 `Tool` schema 校验；模块内任一导出失败，整个模块都不替换。加载候选不会调用导出函数，但会执行顶层 import 和其它顶层语句，所以这里与 `.py`、命令、link 和宿主机操作属于同一信任域，不是沙箱；顶层应只放 import、常量和定义。
 
-每个名称独立更新：只有候选版本全部成功才原子替换该名称的进程内活动函数；失败会记录完整 traceback、返回给模型并继续使用旧活动版本，其它文件和 Bot 不受影响。源文件删除后显式加载同名函数会卸载活动版本。固定内置工具名不能被覆盖。
+首次创建模块目录提示时，registry 会独立尝试每个文件，成功者成为进程级 last-good，失败者记录 traceback 而不阻断其它模块或 Bot。运行中有两种不同操作：
+
+- `reload_tools(names)` 读取磁盘并逐模块应用变化。成功才原子替换 last-good；失败保留旧版。源文件已删除时，显式 reload 同名模块才删除 last-good。
+- `load_tools(names)` 完全不读磁盘，只把 last-good 模块激活到当前 `Chat`。其余模块内容和函数保持不可见。
+
+因此改文件本身不生效，也不会自动产生末尾 hint。`list_tools` 只在被调用时报告 last-good、当前 Chat 激活状态和磁盘差异；没有 watcher。Markdown 与 Python 服从完全相同的手动应用生命周期。活动模块被成功 reload 时，当前 Chat 的内容和工具映射一起更新；其它 Chat 的激活投影不被偷偷改写。
 
 ## 一轮工具调用怎样继续
 
@@ -131,11 +133,11 @@ Chat.chat
   → 直到某轮不再调用工具
 ```
 
-只有模型配置声明 `function_calling=true` 时，工具 schema 才会随请求发送。每次子请求发送前，循环从固定工具和当前活动自编工具组装一份快照；同一份快照同时用于请求 schema 和该响应返回的调用解析。因此 `load_tools` 在当前任务中执行后，新版本从下一个模型子请求起生效；已经发出的请求不变，同一模型响应中已解析的其它调用仍使用原快照。
+只有模型配置声明 `function_calling=true` 时，工具 schema 才会随请求发送。每次子请求发送前，循环从当前 `Chat.functions` 冻结一份快照；同一份快照同时用于请求 schema 和该响应返回的调用解析。因此 `load_tools` 或 `reload_tools` 在当前任务中执行后，新映射从下一个模型子请求起生效；已经发出的请求不变，同一模型响应中的其它调用仍使用原快照。
 
 流式响应会逐段拼接工具名和 JSON arguments；当前轮模型流完整结束并产出所有普通文本后，才会把收集到的工具调用交给执行层。一次模型响应中的多个工具按收到顺序在当前线程同步执行，不使用事务。
 
-工具返回值统一 `str(result)` 后作为 `role=tool` 消息回传模型。工具抛出异常时，异常文本和完整 traceback 也作为工具结果回传，让模型有机会解释或改用其它参数；这同时意味着本地路径和内部实现细节可能被发送给外部供应商。
+工具返回值统一 `str(result)` 后作为 `role=tool` 消息回传模型。普通工具抛出异常时，类型和错误文本作为工具结果回传，完整 traceback 写应用日志；`reload_tools` 的校验失败则有意把完整 traceback 放进返回值，让模型能够修正模块源码。
 
 每个供应商子响应结束后，完整 `content`、可选 `reasoning_content` 和 `tool_calls` 会合并为一条 assistant 消息加入当前 `Chat.messages`；随后才执行工具并追加 tool result，供下一次模型请求使用。流式文本仍由回调逐段发送：双换行分段会在流中提前产出，末段在流结束时产出，但这些显示片段不再分别写成多条 assistant 历史。工具调用一定在所有可见文本产出之后才执行，因此模型放在工具前的说明会先进入 QQ 发送队列；后续工具失败不会回滚已发文本。assistant 工具消息和 tool result 不会作为独立 QQ 消息写入 chatlog。
 
@@ -145,11 +147,11 @@ Chat.chat
 
 ## `assign_tasks` 的子模型分派
 
-`assign_tasks()` 是工具系统内再创建工具系统的高阶能力：父模型传入公共 prompt、多行 tasks、工具名列表、模型名和 `max_workers`，函数为每个 task 新建独立 `Chat`，在线程池中并发运行，最后按原任务顺序返回 `(task, result)`。
+`assign_tasks()` 是工具系统内再创建工具系统的高阶能力：父模型传入公共 prompt、多行 tasks、模块名列表、模型名和 `max_workers`，函数为每个 task 新建独立 `Chat`，在线程池中并发运行，最后按原任务顺序返回 `(task, result)`。
 
-子会话只获得父模型明确列出的工具名：固定工具在子会话创建时注册，已列出的自编工具则在每个子请求重新从活动映射取快照。它不自动继承父会话完整工具集、聊天历史、base 提示或窗口提示词。子会话的模型使用父模型传入的 `provider/model` 字符串，不再另有固定 provider。工具列表可以再次包含 `assign_tasks`，但代码没有强制递归深度、并发上限或全局预算。
+子会话和顶层聊天一样获得四个基础工具与模块目录提示，并预先激活父模型明确列出的 last-good 模块；它不自动继承父会话其它活动模块、聊天历史、base 提示或窗口提示词。子会话的模型使用父模型传入的 `provider/model` 字符串，不再另有固定 provider。模块列表可以包含 `agents`，但代码没有强制递归深度、并发上限或全局预算。
 
-函数捕获了原始消息，并在处理子模型响应的回调中恢复 `cache.thismsg(msg)`；但在子工具真正开始执行前没有统一安装上下文。依赖当前聊天事件的子工具可能在工作线程中看到缺失或陈旧上下文，这是现行缺口。
+函数捕获原始消息，并在每个工作线程运行子 `Chat` 前安装为当前 context，结束时清除；依赖当前窗口的工具因此沿用父任务的聊天事件。子会话仍不拥有父会话的提示词和历史消息。
 
 顶层 `init_chat()` 会增加一次调用计数；子会话不经过 `init_chat()`，因此不会增加同一种顶层次数，但响应 usage 仍会累加 token 成本。`.chattop` 的“调用次数”不能简单理解成实际向供应商发出的全部 HTTP 请求数，工具循环和子任务都可能令一次顶层聊天产生多次请求。
 
@@ -160,7 +162,7 @@ Chat.chat
 这使以下能力处于同一条提示注入路径上：
 
 - `exec_code` 可访问 `.py loc`，本质上接近任意代码执行；
-- `load_tools` 可以在进程内激活 `data/tools` 中的受信任 Python；候选顶层代码在校验期间就会执行；
+- `reload_tools` 可以在进程内执行并应用 `mods/tools` 中的受信任 Python；候选顶层代码在校验期间就会执行；`load_tools` 可以把任意 last-good 模块交给当前模型；
 - `set_user_data` 可读取模型生成的 Python 表达式并修改任意用户 storage；
 - `get_user_data` 可把任意用户数据发送给模型供应商；
 - 延时任务会在未来执行并回到当前窗口；
@@ -182,6 +184,6 @@ Chat.chat
 
 当前自动工具循环没有最大轮数、总时限或副作用回滚，`assign_tasks` 也没有强制递归深度和全局预算。维护者接受通过 `.reboot` 恢复极端失控调用的运维取舍，暂不据此引入完整预算系统；若真实发生无法靠重启方便恢复的事故，再以该事故为证据增加最小限制。
 
-工具异常的完整 traceback 会作为结果发给模型供应商。维护者使用可信的正规供应商，并认为 traceback 对模型分析故障有实际价值，因此当前保留这一行为，不把内部路径随请求发送本身列为待修缺陷。密钥、聊天正文或额外运行数据仍不应被无意加入异常文本。
+模块 reload 失败的完整 traceback 会作为结果发给模型供应商。维护者使用可信的正规供应商，并认为 traceback 对模型修正工具有实际价值，因此当前保留这一行为，不把内部路径随请求发送本身列为待修缺陷。普通工具异常只回传类型和错误文本。密钥、聊天正文或额外运行数据仍不应被无意加入异常文本。
 
 值得保留的是：普通函数、签名和 docstring 组成一个可直接复用的能力面。未来若调整边界，应优先修改入口、启用范围或少量检查，而不是仅因工具锋利就建立庞大的工具对象宇宙。
