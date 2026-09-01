@@ -3,18 +3,12 @@
 from __future__ import annotations
 
 import ast
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack
 from datetime import datetime
-import os
 import re
-import threading
 import time
 from typing import Callable
 
-import requests
-
-from mods import chatlog, connect, context, cq, history, identity, image, llm, message, msgs, op, storage, text, thread, tools as tool_modules
+from mods import chatlog, context, cq, history, identity, image, llm, message, msgs, storage, text, thread, tools as tool_modules
 from mods.command import command
 from mods.capture import capture
 
@@ -199,261 +193,17 @@ def inc_call_tokens_cost(model: str, tokens: tuple[int, int]) -> None:
     prompt_price = attributes.get("prompt_price", 0)
     completion_price = attributes.get("completion_price", 0)
     price = (tokens[0] * prompt_price + tokens[1] * completion_price) / 1_000_000
+    inc_usage_cost(price)
+
+
+def inc_usage_cost(price: float) -> None:
+    """Add one externally calculated cost to the current user's usage."""
     # A storage list is the authority; only this read-modify-write needs a lock.
     if _cost_lock is None:
         _usage_entry()[1] += price
     else:
         with _cost_lock:
             _usage_entry()[1] += price
-
-
-def get_time() -> str:
-    """获取当前时间。"""
-    return time.strftime("现在是%Y年%m月%d日%H时%M分%S秒")
-
-
-def poke(user_id: int) -> str:
-    """戳一戳当前聊天中的用户。
-
-    @param
-    user_id: 目标用户 QQ 号
-    """
-    event = context.current() or {}
-    group_id = event.get("group_id")
-    if group_id is None and int(user_id) != int(event.get("user_id", -1)):
-        return "戳一戳失败：私聊中只能戳当前对话者"
-    params = {"user_id": int(user_id)}
-    if group_id is not None:
-        params["group_id"] = int(group_id)
-    result = connect.call_api("send_poke", **params)
-    return f"已戳用户 {user_id}" if result.get("retcode") == 0 else f"戳一戳失败：{result.get('wording', '接口失败')}"
-
-
-def recognize_image(image_uri: str, prompt: str = "") -> str:
-    """按要求识别网络或本地图片。
-
-    @param
-    image_uri: http://、https:// 或 file:// 图片 URI
-    prompt: 希望视觉模型完成的任务
-    """
-    if not re.match(r"^(?:https?|file)://", image_uri, re.I):
-        return "图片识别失败：仅支持 http://、https:// 或 file:// 图片 URI"
-    if image_uri.lower().startswith("file://") and not op.require_op(context.current()):
-        return "图片识别失败：本地文件需要管理员权限"
-    try:
-        result = llm.get_client().describe_image(image_uri, prompt)
-    except (OSError, ValueError) as error:
-        return f"图片识别失败：{error}"
-    return result or "图片识别失败：视觉模型未返回描述"
-
-
-def later_add(time: str, code: str, expr: str) -> str:
-    """添加延时任务。
-
-    @param
-    time: 相对或绝对时间
-    code: 到时先执行的代码
-    expr: 到时求值并发送的表达式
-    """
-    from mods import later
-
-    return later.run(f" add {time} {code}\n{expr}", exec_id=identity.bot_id())
-
-
-def later_del(seqs: str) -> str:
-    """按序号删除延时任务。
-
-    @param
-    seqs: 逗号分隔的序号或 *
-    """
-    from mods import later
-
-    return later.run(f" del {seqs}", exec_id=identity.bot_id())
-
-
-def _validate_generation(prompt: str, size: str, quality: str, n: int, output_format: str, prefix: str) -> str | None:
-    if not isinstance(prompt, str) or not prompt.strip():
-        return f"{prefix}失败：prompt 不能为空"
-    if size != "1024x1024" or quality not in {"auto", "low", "medium", "high"} or output_format not in {"png", "jpeg", "webp"}:
-        return f"{prefix}失败：参数不受支持"
-    if not isinstance(n, int) or isinstance(n, bool) or not 1 <= n <= 10:
-        return f"{prefix}失败：n 必须是 1 ~ 10 的整数"
-    return None
-
-
-def _send_generated_images(response: requests.Response) -> str:
-    if not response.ok:
-        return f"生图失败：API 返回 HTTP {response.status_code}"
-    try:
-        images = [item["b64_json"] for item in response.json().get("data", []) if isinstance(item, dict) and item.get("b64_json")]
-    except (AttributeError, TypeError, ValueError):
-        return "生图失败：API 返回了无法解析的结果"
-    for value in images:
-        message.sendmsg(cq.base64_to_cq(value))
-    if images:
-        if _cost_lock is None:
-            _usage_entry()[1] += 0.13 * len(images)
-        else:
-            with _cost_lock:
-                _usage_entry()[1] += 0.13 * len(images)
-    return f"已生成并发送 {len(images)} 张图片" if images else "生图失败：API 未返回图片"
-
-
-def create_image(prompt: str, size: str = "1024x1024", quality: str = "auto", n: int = 1, output_format: str = "png") -> str:
-    """根据文字描述生成图片并发送。
-
-    @param
-    prompt: 图像描述
-    size: 图片尺寸 enum: ["1024x1024"]
-    quality: 质量 enum: ["auto", "low", "medium", "high"]
-    n: 图片数量
-    output_format: 格式 enum: ["png", "jpeg", "webp"]
-    """
-    if error := _validate_generation(prompt, size, quality, n, output_format, "生图"):
-        return error
-    base_url, api_key = os.getenv("BYTECAT_BASE_URL", "").rstrip("/"), os.getenv("BYTECAT_IMAGE_API_KEY")
-    if not base_url or not api_key:
-        return "生图失败：未配置图片 API"
-    try:
-        response = requests.post(f"{base_url}/images/generations", headers={"Authorization": f"Bearer {api_key}"}, json={"model": "gpt-image-2", "prompt": prompt.strip(), "size": size, "quality": quality, "n": n, "output_format": output_format}, timeout=(10, 300))
-    except requests.RequestException as error:
-        return f"生图失败：请求异常（{type(error).__name__}）"
-    return _send_generated_images(response)
-
-
-def create_image_from_references(prompt: str, image_uris: str, size: str = "1024x1024", quality: str = "auto", n: int = 1, output_format: str = "png") -> str:
-    """使用参考图片生成新图并发送。
-
-    @param
-    prompt: 新图描述
-    image_uris: 每行一个图片 URI
-    size: 图片尺寸 enum: ["1024x1024"]
-    quality: 质量 enum: ["auto", "low", "medium", "high"]
-    n: 图片数量
-    output_format: 格式 enum: ["png", "jpeg", "webp"]
-    """
-    if error := _validate_generation(prompt, size, quality, n, output_format, "参考图生图"):
-        return error
-    uris = list(dict.fromkeys(uri.strip() for uri in image_uris.splitlines() if uri.strip()))
-    if not uris:
-        return "参考图生图失败：至少需要一个图片 URI"
-    if any(uri.lower().startswith("file://") for uri in uris) and not op.require_op(context.current()):
-        return "参考图生图失败：本地文件需要管理员权限"
-    base_url, api_key = os.getenv("BYTECAT_BASE_URL", "").rstrip("/"), os.getenv("BYTECAT_IMAGE_API_KEY")
-    if not base_url or not api_key:
-        return "参考图生图失败：未配置图片 API"
-    try:
-        with ExitStack() as stack:
-            files = []
-            for index, uri in enumerate(uris, 1):
-                path, mime = image.resolve_image_uri(uri)
-                stream = stack.enter_context(open(path, "rb"))
-                files.append(("image[]", (os.path.basename(path) or f"reference-{index}", stream, mime)))
-            response = requests.post(f"{base_url}/images/edits", headers={"Authorization": f"Bearer {api_key}"}, data={"model": "gpt-image-2", "prompt": prompt.strip(), "size": size, "quality": quality, "n": n, "output_format": output_format}, files=files, timeout=(10, 300))
-    except (requests.RequestException, OSError, ValueError) as error:
-        return f"参考图生图失败：{error}"
-    return _send_generated_images(response)
-
-
-def get_user_data(user_id: int) -> str:
-    """查询用户数据。
-
-    @param
-    user_id: 用户 QQ 号
-    """
-    return str(identity.getstorage(user_id))
-
-
-def set_user_data(user_id: int, key: str, value: str) -> str:
-    """编辑用户数据。
-
-    @param
-    user_id: 用户 QQ 号
-    key: 数据键
-    value: Python 表达式，del 表示删除
-    """
-    current = context.current() or {}
-    if int(user_id) != int(current.get("user_id", -1)) and not op.require_op(current):
-        return "权限不足"
-    target = identity.getstorage(user_id)
-    if value == "del":
-        target.pop(key, None)
-    else:
-        import ast
-
-        target[key] = ast.literal_eval(value)
-    return "done"
-
-
-def search_mc_mod(name: str) -> str:
-    """搜索 Minecraft Mod。
-
-    @param
-    name: Mod 名称关键字
-    """
-    from bs4 import BeautifulSoup
-
-    response = requests.get(f"https://search.mcmod.cn/s?key={name}", timeout=15)
-    result = "\n".join(item.get_text().strip() for item in BeautifulSoup(response.text, "html.parser").find_all(class_="search-result-list"))
-    return result[:1000] + ("..." if len(result) > 1000 else "")
-
-
-def check_mod(id: int) -> str:
-    """按 mcmod ID 查询 Mod。
-
-    @param
-    id: mcmod class ID
-    """
-    from bs4 import BeautifulSoup
-
-    response = requests.get(f"https://www.mcmod.cn/class/{id}.html", timeout=15)
-    return "\n".join(item.get_text().strip() for item in BeautifulSoup(response.text, "html.parser").find_all(class_="text-area"))
-
-
-def assign_tasks(prompt: str, tasks: str, tools: str, model: str = "deepseek/deepseek-v4-flash", max_workers: int = 5) -> str:
-    """并发分派互不依赖的 LLM 子任务。
-
-    @param
-    prompt: 每个子任务共享的提示
-    tasks: 每行一个任务
-    tools: 每行一个要激活的工具模块名
-    model: provider/model 模型名
-    max_workers: 最大并发数
-    """
-    task_list = [value.strip() for value in tasks.splitlines() if value.strip()]
-    requested = list(dict.fromkeys(value.strip() for value in tools.splitlines() if value.strip()))
-    workers = max(1, min(int(max_workers), 5))
-    origin = context.current()
-
-    def execute(task_value: str) -> tuple[str, str]:
-        context.set_current(origin)
-        worker_id = threading.get_ident()
-        print(f"线程 {worker_id}: 开始处理 LLM 子任务", flush=True)
-        try:
-            session = llm.Chat(model=model, chat_client=llm.get_client())
-            tool_context = tool_modules.create_context_message()
-            session.set_messages([tool_context, f"{prompt}\n{task_value}"])
-            tool_modules.bind_session(session, tool_context, requested)
-            pieces = []
-
-            def collect(chunk: llm.LLMResponse) -> None:
-                if chunk.role == "assistant" and chunk.content:
-                    pieces.append(str(chunk.content))
-                if chunk.total_tokens:
-                    inc_call_tokens_cost(model, (chunk.prompt_tokens, chunk.completion_tokens))
-
-            session.chat(recall_func=collect)
-            print(f"线程 {worker_id}: LLM 子任务完成", flush=True)
-            return task_value, "".join(pieces).strip()
-        except Exception as error:
-            print(f"线程 {worker_id}: LLM 子任务失败：{error}", flush=True)
-            return task_value, f"ERROR: {error}"
-        finally:
-            context.clear_current()
-
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        results = list(executor.map(execute, task_list))
-    return repr(results)
 
 
 def _base_prompt() -> list[dict]:
