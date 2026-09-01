@@ -78,7 +78,7 @@
 
 ## 基础工具与现有模块
 
-每个 `Chat` 开局只注册四个基础工具：
+每个 `Chat` 开局默认激活标准 Python 模块 `meta.py`。它的完整模块说明进入工具 system 提示，并导出四个保持无前缀的恢复入口：
 
 | 工具 | 当前效果与边界 |
 |---|---|
@@ -99,7 +99,9 @@
 | `minecraft` | `minecraft__search_mc_mod`、`minecraft__check_mod` |
 | `weather` | `weather__search_city`、`weather__get_realtime_weather`、`weather__get_daily_forecast`、`weather__get_hourly_forecast` |
 
-这些文件只 re-export 已有 `mods.chat`/`mods.weather` 函数，原实现仍是行为权威。`sendmsg`、群成员读取、农历/小六壬、`later_list`/`later_set`、百科、RAG 等未进入任何模块，不能写成已经开放的工具。
+除 `weather` 继续投影可用的 `mods.weather` 函数外，这些文件持有各自工具的真实实现，不再从 `mods.chat` re-export。图片和子任务模块只惰性复用 `mods.chat` 的 usage/cost 入口，计费状态仍只有一份。
+
+历史源码中有实现、但 `add_tool` 注册被明确注释的 `read_data`、群成员、农历/小六壬、跨窗口发送、`later_list/later_set`、URL 转 CQ 和百科工具，整理在 `mods/tools/disable/`。registry 不递归扫描该目录，所以它们不会进入 last-good、目录提示或任何 Chat；RAG 等只有残缺草稿或死名字的项只记录原因，不伪造可调用空壳。
 
 `create_image` 使用 OpenAI 原生 `gpt-image-2` 的参数与返回形状，不传 DALL·E 的 `style`、`standard` 或 `response_format=url`。图片以 `b64_json` 返回，解码后使用 `data/tmp_files` 的现有临时图片缓存和过期清理机制；Base64 本身不会进入 QQ 消息或 chatlog。
 
@@ -109,7 +111,7 @@
 
 `mods/tools/` 只扫描顶层、不以下划线开头的 `*.py` 和 `*.md`。同 stem 的 Python 与 Markdown 文件冲突；子目录不递归扫描，可以由顶层内容引用或由 Python 正常 import。两种文件共享以下最小格式：第一行是总会出现在模块目录中的描述，后续全部是激活后内容，不设 front matter、summary 或另一套 skill 协议。Markdown 到此结束；Python 还必须显式声明 `__all__`，其中可列零个或多个同步函数。
 
-`mods/tools/__init__.py` 是已经激活的基础工具模块，因此它的模块 docstring 全文从开局就进入同一条工具 system 提示；其中说明 `list_tools`、`reload_tools`、`load_tools` 的增删查改流程。其它顶层模块仍只默认显示第一行，显式激活后才加入余下内容。
+`mods/tools/__init__.py` 是 loader/registry 包，不是工具格式。`meta.py` 才是已经激活的基础模块：它和其它 Python 模块一样使用第一行 summary、后续说明、普通函数与 `__all__`，但作为必需恢复入口从开局就激活全文，四个函数名不加 `meta__` 前缀。其它顶层模块仍只默认显示第一行，显式激活后才加入余下内容。`meta` 必须精确导出四个恢复函数；删除其磁盘文件后 reload 会失败并继续保留旧 last-good，而不是卸掉恢复入口。
 
 Python 候选作为正常模块执行，可以 import 第三方依赖、其它 `mods` 和同目录下划线 helper。每个导出函数都必须有可用的签名、参数类型标注和 docstring，并通过现有 `Tool` schema 校验；模块内任一导出失败，整个模块都不替换。加载候选不会调用导出函数，但会执行顶层 import 和其它顶层语句，所以这里与 `.py`、命令、link 和宿主机操作属于同一信任域，不是沙箱；顶层应只放 import、常量和定义。
 
