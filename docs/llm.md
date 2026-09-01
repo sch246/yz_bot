@@ -125,7 +125,9 @@ Chat.chat
 
 工具返回值统一 `str(result)` 后作为 `role=tool` 消息回传模型。工具抛出异常时，异常文本和完整 traceback 也作为工具结果回传，让模型有机会解释或改用其它参数；这同时意味着本地路径和内部实现细节可能被发送给外部供应商。
 
-每轮产生的 assistant `tool_calls` 和 tool result 会加入当前 `Chat.messages`，供下一次模型请求使用；它们不会作为独立 QQ 消息写入 chatlog。普通 assistant 文本由回调发送：双换行分段会在流中提前产出，末段在流结束时产出。工具调用一定在这些可见文本产出之后才执行，因此模型放在工具前的说明会先进入 QQ 发送队列；后续工具失败不会回滚已发文本。
+每个供应商子响应结束后，完整 `content`、可选 `reasoning_content` 和 `tool_calls` 会合并为一条 assistant 消息加入当前 `Chat.messages`；随后才执行工具并追加 tool result，供下一次模型请求使用。流式文本仍由回调逐段发送：双换行分段会在流中提前产出，末段在流结束时产出，但这些显示片段不再分别写成多条 assistant 历史。工具调用一定在所有可见文本产出之后才执行，因此模型放在工具前的说明会先进入 QQ 发送队列；后续工具失败不会回滚已发文本。assistant 工具消息和 tool result 不会作为独立 QQ 消息写入 chatlog。
+
+若供应商在工具调用响应中返回 `reasoning_content`，流式路径会完整拼接该字段，非流式路径会直接读取它，并把它保留在对应的 assistant `tool_calls` 消息中供所有后续子请求原样回传。这满足 DeepSeek thinking mode 的工具调用协议；思考内容仍只在终端显示，不作为 QQ 回复或独立 chatlog 消息。
 
 循环当前没有最大工具轮数、总执行时限、确认步骤或副作用回滚。模型持续产生工具调用时会继续请求；外部 API、storage 写入、延时任务和代码执行都在工具被调用时立即发生。
 

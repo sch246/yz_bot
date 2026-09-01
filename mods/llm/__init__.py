@@ -177,6 +177,9 @@ class LLMClient:
 
         result = []
         for source in messages:
+            if source.get("role") != "user":
+                result.extend(LLMClient._replace_images_with_text([source]))
+                continue
             message = source.copy()
             if "content" not in source:
                 result.append(message)
@@ -288,6 +291,9 @@ class LLMClient:
                 result.append(message)
                 continue
             content = source.get("content")
+            if content is None:
+                result.append(message)
+                continue
             parts = content if isinstance(content, list) else [content]
             output = []
             for part in parts:
@@ -370,8 +376,10 @@ class LLMClient:
         return self._non_stream_response(client, params, selection)
 
     @staticmethod
-    def _stream_response(client: OpenAI, params: dict, model: str) -> Generator[LLMResponse, None, None]:
+    def _stream_response(client: OpenAI, params: dict, model: str) -> Generator[LLMResponse, None, LLMResponse]:
         buffer = ""
+        assistant_content = ""
+        reasoning_content: str | None = None
         role = MessageRole.ASSISTANT.value
         tool_calls: list[dict] = []
         usage = None
@@ -386,11 +394,15 @@ class LLMClient:
                 if getattr(delta, "role", None):
                     role = delta.role
                 data = delta.to_dict(exclude_unset=False)
-                if reasoning := data.get("reasoning_content"):
-                    output.chunk(reasoning, role, MessageRole.THINK.value)
-                if content := data.get("content"):
-                    output.chunk(content, role)
-                    buffer += content
+                reasoning = data.get("reasoning_content")
+                if reasoning is not None:
+                    reasoning_content = (reasoning_content or "") + reasoning
+                    if reasoning:
+                        output.chunk(reasoning, role, MessageRole.THINK.value)
+                if content_delta := data.get("content"):
+                    output.chunk(content_delta, role)
+                    assistant_content += content_delta
+                    buffer += content_delta
                     if "\n\n" in buffer:
                         parts = split_string_with_code_blocks(buffer)
                         if len(parts) > 1:
@@ -418,36 +430,61 @@ class LLMClient:
                         call["function"]["name"],
                         call["function"]["arguments"],
                     )
-                    yield LLMResponse(json.dumps(call, ensure_ascii=False), MessageRole.TOOL.value)
+                    yield LLMResponse(
+                        json.dumps(call, ensure_ascii=False),
+                        MessageRole.TOOL.value,
+                    )
             if usage:
                 yield LLMResponse("", role, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens)
+            return LLMResponse(
+                assistant_content,
+                role,
+                reasoning_content=reasoning_content,
+            )
         except Exception as error:
             output.finish()
             console.error(f"流式响应处理失败：{error}")
             raise
 
     @staticmethod
-    def _non_stream_response(client: OpenAI, params: dict, model: str) -> Generator[LLMResponse, None, None]:
+    def _non_stream_response(client: OpenAI, params: dict, model: str) -> Generator[LLMResponse, None, LLMResponse]:
         response = client.chat.completions.create(**params)
         message = response.choices[0].message
+        reasoning_content = getattr(message, "reasoning_content", None)
         for call in message.tool_calls or []:
             console.write(f"{message.role or MessageRole.ASSISTANT.value}({model}): ", message.role or MessageRole.ASSISTANT.value, end="")
             console.write(call.function.name + call.function.arguments, MessageRole.TOOL.value)
-            yield LLMResponse(json.dumps({"id": call.id, "type": "function", "function": {"name": call.function.name, "arguments": call.function.arguments}}, ensure_ascii=False), MessageRole.TOOL.value)
+            yield LLMResponse(
+                json.dumps({"id": call.id, "type": "function", "function": {"name": call.function.name, "arguments": call.function.arguments}}, ensure_ascii=False),
+                MessageRole.TOOL.value,
+            )
         if message.content:
             console.write(f"{message.role or MessageRole.ASSISTANT.value}({model}): ", message.role or MessageRole.ASSISTANT.value, end="")
             console.write(message.content, message.role or MessageRole.ASSISTANT.value)
             yield LLMResponse(message.content, message.role or MessageRole.ASSISTANT.value)
         if response.usage:
             yield LLMResponse("", MessageRole.ASSISTANT.value, response.usage.prompt_tokens, response.usage.completion_tokens, response.usage.total_tokens)
+        return LLMResponse(
+            message.content or "",
+            message.role or MessageRole.ASSISTANT.value,
+            reasoning_content=reasoning_content,
+        )
 
     def chat(self, messages: list[dict], tools: list[Tool] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None) -> Generator[LLMResponse, None, None]:
         while True:
             console.notice(f"等待 {model or self.config['default_model']} 的响应…")
-            response = self.generate_response(messages, tools, tool_choice, model, stream, description_cache, do_process_image)
+            response = iter(self.generate_response(messages, tools, tool_choice, model, stream, description_cache, do_process_image))
             mapping = {tool.description["function"]["name"]: tool for tool in tools or []}
-            results: list[ToolCallResult] = []
-            for chunk in response:
+            pending_calls = []
+            # Yielded chunks remain the live display/tool stream.  The return
+            # value supplies response-wide content fields; this loop combines
+            # them with collected tool calls into the one history message.
+            while True:
+                try:
+                    chunk = next(response)
+                except StopIteration as completed:
+                    assistant = completed.value or LLMResponse("", MessageRole.ASSISTANT.value)
+                    break
                 if chunk.role != MessageRole.TOOL.value:
                     yield chunk
                     continue
@@ -456,24 +493,32 @@ class LLMClient:
                     function = call["function"]
                     tool = mapping[function["name"]]
                     arguments = json.loads(function["arguments"] or "{}")
-                    try:
-                        content = str(tool.call(**arguments))
-                    except Exception as error:
-                        content = f"工具调用失败: {type(error).__name__}: {error}"
-                        console.error(f" -> {content}")
-                    else:
-                        console.write(f" -> {content}", MessageRole.TOOL.value)
-                    results.append(ToolCallResult(call["id"], function["name"], function["arguments"], content))
+                    pending_calls.append((call, tool, arguments))
                 except Exception as error:
                     _log.exception("failed to process LLM tool call")
                     console.error(f"工具调用处理失败：{error}")
                     yield chunk
-            if not results:
+
+            assistant_message = {"role": assistant.role, "content": assistant.content}
+            if assistant.reasoning_content is not None:
+                assistant_message["reasoning_content"] = assistant.reasoning_content
+            if pending_calls:
+                assistant_message["tool_calls"] = [call for call, _, _ in pending_calls]
+            messages.append(assistant_message)
+
+            if not pending_calls:
                 return
-            messages.append({"role": "assistant", "tool_calls": [
-                {"id": result.tool_call_id, "type": "function", "function": {"name": result.name, "arguments": result.arguments}}
-                for result in results
-            ]})
+            results: list[ToolCallResult] = []
+            for call, tool, arguments in pending_calls:
+                function = call["function"]
+                try:
+                    content = str(tool.call(**arguments))
+                except Exception as error:
+                    content = f"工具调用失败: {type(error).__name__}: {error}"
+                    console.error(f" -> {content}")
+                else:
+                    console.write(f" -> {content}", MessageRole.TOOL.value)
+                results.append(ToolCallResult(call["id"], function["name"], function["arguments"], content))
             messages.extend({"role": "tool", "tool_call_id": result.tool_call_id, "content": result.content} for result in results)
 
 
@@ -543,8 +588,6 @@ class Chat:
             )
             results = []
             for chunk in response:
-                if chunk.role == MessageRole.ASSISTANT.value and chunk.content:
-                    self.add_message(chunk)
                 if callback:
                     callback(chunk)
                 results.append(chunk)

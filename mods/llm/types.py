@@ -29,6 +29,7 @@ class LLMResponse:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    reasoning_content: str | None = None
 
     def __add__(self, other: "LLMResponse") -> "LLMResponse":
         if isinstance(self.content, list) or isinstance(other.content, list):
@@ -38,12 +39,19 @@ class LLMResponse:
         else:
             separator = "\n\n" if self.content and other.content else ""
             content = f"{self.content}{separator}{other.content}"
+        reasoning_content = None
+        if self.reasoning_content is not None or other.reasoning_content is not None:
+            reasoning_content = (
+                (self.reasoning_content or "")
+                + (other.reasoning_content or "")
+            )
         return LLMResponse(
             content=content,
             role=self.role,
             prompt_tokens=self.prompt_tokens + other.prompt_tokens,
             completion_tokens=self.completion_tokens + other.completion_tokens,
             total_tokens=self.total_tokens + other.total_tokens,
+            reasoning_content=reasoning_content,
         )
 
 
