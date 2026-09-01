@@ -131,6 +131,15 @@ __all__ = ["calculate"]
         self.assertEqual(module.content, "第一段\n\n第二段\n")
         self.assertEqual(dict(module.tools), {})
 
+    def test_base_context_contains_module_authoring_instructions(self) -> None:
+        context = self.tools.create_context_message(registry=self.registry())
+
+        self.assertTrue(context["content"].startswith(
+            "指导模型增删查改统一工具与 Skill 模块"
+        ))
+        self.assertIn("## 新增 Python 工具模块", context["content"])
+        self.assertIn("## 新增 Markdown Skill", context["content"])
+
     def test_first_use_loads_last_good_and_isolates_failures_and_conflicts(self) -> None:
         self.write("good.md", "可用描述\n正文")
         self.write("broken.py", '"""损坏模块"""\nraise RuntimeError("boom")\n__all__ = []\n')
