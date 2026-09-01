@@ -67,6 +67,14 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 动态代码只有在模块名本身运行期计算时才使用 `getmod(name)`。已知模块依赖直接 import；旧 `getcmd` 不再存在。旧根 `data.json` 已退役，动态环境中的 `data` 是 `storage.get("", "py_data")` 的直接引用。
 
+## 自编 LLM 工具与 Skill
+
+`mods.self_tools` 持有一份 Bot 进程级活动函数映射，这是自编工具的唯一运行时权威。`data/tools/<name>.py` 只是候选源：改文件不会改活动函数，模型必须先用 `list_tools` 检查差异，再显式用 `load_tools` 逐名称加载。每个候选在独立 globals 中执行顶层定义并用现有 `Tool` 验证；只有全部成功才替换同名活动函数，失败继续使用旧版。没有 watcher、自动加载、会话级副本或变化 hint。
+
+`Chat` 持有固定工具，并在每次 LLM 子请求前从活动映射取一份动态快照。该快照同时决定请求 schema 和响应中工具名的 callable，所以加载只会影响当前任务的下一子请求及其它后续请求，不会改写已发出请求。
+
+`data/skills` 是另一条更简单的设备级输入：`init_chat()` 每次新建顶层聊天时按文件名读取顶层 `*.md` 并作为 system 消息组装。它不递归、不缓存、不同步，因此 Markdown 可以自行引用子目录附件。提示词也没有新增编辑管理器；`.py`/自编工具环境直接暴露现有可变 `prompts` 对象。
+
 ## 线性 link 与 capture
 
 `data/storage/links.json` 的权威格式是有序 JSON 数组，每项只有：
@@ -93,7 +101,7 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 ## LLM、图片与可观察输出
 
-`mods.llm/` 持有模型配置、client、流式响应与工具调用；`mods.chat` 持有 QQ 窗口上下文和聊天命令；`mods.image/` 持有图片身份、缓存和视觉输入。它们采用文件夹 Module，是因为内部实现共同拥有明确状态和生命周期，而外部只依赖 package 公开面。
+`mods.llm/` 持有模型配置、client、流式响应与每请求工具快照；`mods.chat` 持有 QQ 窗口上下文、固定工具和聊天命令；`mods.self_tools` 持有自编工具活动映射；`mods.chat_skills` 只读取顶层 Markdown；`mods.image/` 持有图片身份、缓存和视觉输入。`llm` 和 `image` 采用文件夹 Module，是因为内部实现共同拥有明确状态和生命周期；其它职责仍保持小而直接的普通模块。
 
 终端打印是实际运维界面的一部分：收发消息、流式 LLM 内容、工具调用、图片捕获/缓存、link/capture 命中、模块失败和生命周期进度都应保留可观察输出。应用 logger 记录诊断；chatlog 保存产品聊天历史，两者不是同一用途。
 
