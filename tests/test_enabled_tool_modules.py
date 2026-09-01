@@ -122,7 +122,10 @@ class EnabledToolModuleTests(unittest.TestCase):
 
         self.assertEqual(
             set(modules),
-            {"agents", "common", "image", "later", "minecraft", "user_data", "weather"},
+            {
+                "agents", "common", "image", "later", "meta",
+                "minecraft", "user_data", "weather",
+            },
         )
         self.assertEqual(
             set(modules["image"].tools),

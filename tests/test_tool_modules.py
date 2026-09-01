@@ -6,7 +6,6 @@ import sys
 import tempfile
 from types import ModuleType, SimpleNamespace
 import unittest
-from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -69,6 +68,9 @@ class ToolModuleTests(unittest.TestCase):
         return path
 
     def registry(self):
+        meta = self.root / "meta.py"
+        if not meta.exists():
+            meta.write_bytes((ROOT / "mods" / "tools" / "meta.py").read_bytes())
         return self.tools.ToolRegistry(self.root)
 
     def test_python_imports_explicit_exports_and_namespacing(self) -> None:
@@ -132,11 +134,11 @@ __all__ = ["calculate"]
         self.assertEqual(dict(module.tools), {})
 
     def test_base_context_contains_module_authoring_instructions(self) -> None:
-        context = self.tools.create_context_message(registry=self.registry())
+        registry = self.registry()
+        context = self.tools.create_context_message(registry=registry)
+        self.tools.bind_session(FakeChat(), context, registry=registry)
 
-        self.assertTrue(context["content"].startswith(
-            "指导模型增删查改统一工具与 Skill 模块"
-        ))
+        self.assertIn("meta: 指导模型增删查改统一工具与 Skill 模块", context["content"])
         self.assertIn("## 新增 Python 工具模块", context["content"])
         self.assertIn("## 新增 Markdown Skill", context["content"])
 
@@ -147,7 +149,7 @@ __all__ = ["calculate"]
         self.write("duo.md", "Markdown 版本")
         registry = self.registry()
 
-        self.assertEqual(set(registry.modules), {"good"})
+        self.assertEqual(set(registry.modules), {"good", "meta"})
         self.assertEqual(set(registry.failures), {"broken", "duo"})
         self.assertIn("RuntimeError: boom", registry.failures["broken"])
         self.assertIn("conflicting sources", registry.failures["duo"])
@@ -301,6 +303,68 @@ __all__ = ["run"]
         self.assertEqual(result, "[print输出]\nhello\n[结果] 7")
         self.assertEqual(denied, "权限不足")
         self.assertNotIn("print", fake_py.loc)
+        with self.assertRaisesRegex(RuntimeError, "outside a bound Chat"):
+            self.tools.current_binding()
+
+    def test_meta_is_standard_unprefixed_required_module(self) -> None:
+        registry = self.registry()
+        meta = registry.modules["meta"]
+
+        self.assertEqual(set(meta.tools), {
+            "exec_code", "list_tools", "reload_tools", "load_tools",
+        })
+        (self.root / "meta.py").unlink()
+        result = registry.reload(["meta"])["meta"]
+        self.assertFalse(result.ok)
+        self.assertIs(registry.get("meta"), meta)
+
+    def test_meta_tools_resolve_their_own_session_binding(self) -> None:
+        self.write("guide.md", "指南模块\n会话 A 的说明")
+        registry = self.registry()
+        context_a = self.tools.create_context_message(registry=registry)
+        context_b = self.tools.create_context_message(registry=registry)
+        session_a, session_b = FakeChat(), FakeChat()
+        binding_a = self.tools.bind_session(session_a, context_a, registry=registry)
+        self.tools.bind_session(session_b, context_b, registry=registry)
+        binding_a.load(["guide"])
+
+        listed_a = session_a.functions["list_tools"].call()
+        listed_b = session_b.functions["list_tools"].call()
+
+        self.assertIn("- guide: 指南模块（已激活）", listed_a)
+        self.assertNotIn("- guide: 指南模块（已激活）", listed_b)
+        with self.assertRaisesRegex(RuntimeError, "outside a bound Chat"):
+            self.tools.current_binding()
+
+    def test_meta_can_reload_itself_for_the_next_snapshot(self) -> None:
+        registry = self.registry()
+        context = self.tools.create_context_message(registry=registry)
+        session = FakeChat()
+        self.tools.bind_session(session, context, registry=registry)
+        old_list_tool = session.functions["list_tools"]
+        path = self.root / "meta.py"
+        source = path.read_text(encoding="utf-8")
+        path.write_text(
+            source.replace(
+                "指导模型增删查改统一工具与 Skill 模块",
+                "指导模型维护统一工具与 Skill 模块",
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+        result = session.functions["reload_tools"].call(["meta"])
+
+        self.assertIn("已重载", result)
+        self.assertIsNot(session.functions["list_tools"], old_list_tool)
+        self.assertIn("meta: 指导模型维护统一工具与 Skill 模块", context["content"])
+
+    def test_bind_session_requires_a_valid_meta_module(self) -> None:
+        registry = self.tools.ToolRegistry(self.root)
+        context = self.tools.create_context_message(registry=registry)
+
+        with self.assertRaisesRegex(RuntimeError, "meta is unavailable"):
+            self.tools.bind_session(FakeChat(), context, registry=registry)
 
     def test_active_reload_replaces_content_and_tools_for_next_snapshot(self) -> None:
         path = self.write(
@@ -406,56 +470,6 @@ __all__ = ["run"]
 
         self.assertIn("已激活", text)
         self.assertEqual(session.functions["alpha__run"].call(), 1)
-
-    def test_version_control_wrappers_only_reexport_existing_functions(self) -> None:
-        chat = ModuleType("mods.chat")
-        weather = ModuleType("mods.weather")
-
-        def make_function(name):
-            def function(value: str = "") -> str:
-                """测试替身函数。"""
-                return f"{name}:{value}"
-
-            function.__name__ = name
-            return function
-
-        chat_names = {
-            "get_time", "poke", "recognize_image", "create_image",
-            "create_image_from_references", "later_add", "later_del",
-            "get_user_data", "set_user_data", "assign_tasks",
-            "search_mc_mod", "check_mod",
-        }
-        weather_names = {
-            "search_city", "get_realtime_weather", "get_daily_forecast",
-            "get_hourly_forecast",
-        }
-        for name in chat_names:
-            setattr(chat, name, make_function(name))
-        for name in weather_names:
-            setattr(weather, name, make_function(name))
-        self.mods.get_available = lambda name: weather if name == "weather" else None
-
-        try:
-            with mock.patch.dict(
-                sys.modules,
-                {"mods.chat": chat, "mods.weather": weather},
-            ):
-                registry = self.tools.ToolRegistry(ROOT / "mods" / "tools")
-                modules = registry.modules
-        finally:
-            del self.mods.get_available
-
-        self.assertEqual(
-            set(modules),
-            {"agents", "common", "image", "later", "minecraft", "user_data", "weather"},
-        )
-        self.assertTrue(all(module.description for module in modules.values()))
-        self.assertIs(modules["common"].tools["common__get_time"].call, chat.get_time)
-        self.assertIs(
-            modules["weather"].tools["weather__search_city"].call,
-            weather.search_city,
-        )
-
 
 if __name__ == "__main__":
     unittest.main()
