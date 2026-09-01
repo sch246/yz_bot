@@ -6,7 +6,6 @@ import ast
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from datetime import datetime
-import io
 import os
 import re
 import threading
@@ -15,7 +14,7 @@ from typing import Callable
 
 import requests
 
-from mods import chat_skills, chatlog, connect, context, cq, history, identity, image, llm, message, msgs, op, self_tools, storage, text, thread
+from mods import chatlog, connect, context, cq, history, identity, image, llm, message, msgs, op, storage, text, thread, tools as tool_modules
 from mods.command import command
 from mods.capture import capture
 
@@ -211,34 +210,6 @@ def inc_call_tokens_cost(model: str, tokens: tuple[int, int]) -> None:
 def get_time() -> str:
     """获取当前时间。"""
     return time.strftime("现在是%Y年%m月%d日%H时%M分%S秒")
-
-
-def exec_code(expr: str, code: str = "") -> str:
-    """执行实时 Python 代码。
-
-    @param
-    expr: 在 code 后求值并返回的表达式
-    code: 先执行的 Python 代码
-    """
-    event = context.current()
-    if not op.require_op(event):
-        return "权限不足"
-    from mods import py
-
-    buffer = io.StringIO()
-    missing = object()
-    original = py.loc.get("print", missing)
-    py.loc["print"] = lambda *values, sep=" ", end="\n": buffer.write(sep.join(map(str, values)) + end)
-    try:
-        exec(code, py.loc)
-        result = repr(eval(expr, py.loc))
-    finally:
-        if original is missing:
-            py.loc.pop("print", None)
-        else:
-            py.loc["print"] = original
-    printed = buffer.getvalue().rstrip()
-    return f"[print输出]\n{printed}\n[结果] {result}" if printed else result
 
 
 def poke(user_id: int) -> str:
@@ -439,57 +410,13 @@ def check_mod(id: int) -> str:
     return "\n".join(item.get_text().strip() for item in BeautifulSoup(response.text, "html.parser").find_all(class_="text-area"))
 
 
-def list_tools() -> str:
-    """列出当前已加载的自编工具，并检查 data/tools 中尚未加载的源码变化。"""
-    active = sorted(self_tools.list())
-    changes = self_tools.scan()
-    lines = ["当前已加载函数:", *(f"- {name}" for name in active)]
-    if not active:
-        lines.append("- (无)")
-    lines.append("相对活动版本的源码变化:")
-    labels = {"added": "新增", "modified": "修改", "deleted": "删除"}
-    changed = False
-    for kind in ("added", "modified", "deleted"):
-        names = changes[kind]
-        if names:
-            changed = True
-            lines.append(f"- {labels[kind]}: {', '.join(names)}")
-    if not changed:
-        lines.append("- (无)")
-    return "\n".join(lines)
-
-
-def load_tools(names: list[str]) -> str:
-    """显式热加载或卸载 data/tools 中指定的自编工具。
-
-    @param
-    names: 要处理的函数名列表；文件已删除时会卸载对应活动函数
-    """
-    reserved = {function.__name__ for function in _tools()}
-    results = self_tools.load(names, reserved_names=reserved)
-    succeeded = []
-    failed = []
-    action_labels = {"loaded": "已加载", "unloaded": "已卸载"}
-    for name, result in results.items():
-        if result.ok:
-            succeeded.append(f"- {name}: {action_labels.get(result.action, result.action)}")
-        else:
-            failed.append(f"- {name}:\n{result.error or '未知错误'}")
-    return "\n".join([
-        "成功:",
-        *(succeeded or ["- (无)"]),
-        "失败:",
-        *(failed or ["- (无)"]),
-    ])
-
-
 def assign_tasks(prompt: str, tasks: str, tools: str, model: str = "deepseek/deepseek-v4-flash", max_workers: int = 5) -> str:
     """并发分派互不依赖的 LLM 子任务。
 
     @param
     prompt: 每个子任务共享的提示
     tasks: 每行一个任务
-    tools: 每行一个允许的工具名
+    tools: 每行一个要激活的工具模块名
     model: provider/model 模型名
     max_workers: 最大并发数
     """
@@ -497,8 +424,6 @@ def assign_tasks(prompt: str, tasks: str, tools: str, model: str = "deepseek/dee
     requested = list(dict.fromkeys(value.strip() for value in tools.splitlines() if value.strip()))
     workers = max(1, min(int(max_workers), 5))
     origin = context.current()
-    available = {function.__name__: function for function in _tools()}
-    requested_names = frozenset(requested)
 
     def execute(task_value: str) -> tuple[str, str]:
         context.set_current(origin)
@@ -506,15 +431,9 @@ def assign_tasks(prompt: str, tasks: str, tools: str, model: str = "deepseek/dee
         print(f"线程 {worker_id}: 开始处理 LLM 子任务", flush=True)
         try:
             session = llm.Chat(model=model, chat_client=llm.get_client())
-            for name in requested:
-                if name in available:
-                    session.add_tool(available[name])
-            session.set_tool_provider(lambda: {
-                name: function
-                for name, function in self_tools.list().items()
-                if name in requested_names
-            })
-            session.set_messages([f"{prompt}\n{task_value}"])
+            tool_context = tool_modules.create_context_message()
+            session.set_messages([tool_context, f"{prompt}\n{task_value}"])
+            tool_modules.bind_session(session, tool_context, requested)
             pieces = []
 
             def collect(chunk: llm.LLMResponse) -> None:
@@ -537,16 +456,6 @@ def assign_tasks(prompt: str, tasks: str, tools: str, model: str = "deepseek/dee
     return repr(results)
 
 
-def _tools() -> list[Callable]:
-    tools = [get_time, exec_code, poke, recognize_image, later_add, later_del, create_image, create_image_from_references, get_user_data, set_user_data, assign_tasks, search_mc_mod, check_mod, list_tools, load_tools]
-    from mods import get_available
-
-    weather = get_available("weather")
-    if weather is not None:
-        tools.extend([weather.search_city, weather.get_realtime_weather, weather.get_daily_forecast, weather.get_hourly_forecast])
-    return tools
-
-
 def _base_prompt() -> list[dict]:
     return [{"role": "system", "content": f"""## 注意事项
 - 你的昵称: {identity.bot_name()}
@@ -557,13 +466,12 @@ def _base_prompt() -> list[dict]:
 
 def init_chat(session: llm.Chat, messages: list | None = None) -> None:
     inc_call_count()
-    for tool_function in _tools():
-        session.add_tool(tool_function)
-    session.set_tool_provider(self_tools.list)
     prompts["base"] = _base_prompt()
     group = context.current().get("group_id") if context.current() else None
     state = {"role": "system", "content": f"当前所在群聊:{identity.getgroupname(group)}({group})"} if group is not None else {"role": "system", "content": f"当前在私聊:{identity.getname()}({context.current().get('user_id')})"}
-    session.set_messages([*get_prompt(), *prompts["base"], *chat_skills.load_skill_messages(), state, *(messages or [])])
+    tool_context = tool_modules.create_context_message()
+    session.set_messages([*get_prompt(), *prompts["base"], tool_context, state, *(messages or [])])
+    tool_modules.bind_session(session, tool_context)
     session.do_process_image = get_image_mode() != "off"
 
 
@@ -840,7 +748,6 @@ def on_load(ctx) -> None:
     if missing:
         raise RuntimeError("chat requires available mods: " + ", ".join(missing))
 
-    self_tools.reserve(function.__name__ for function in _tools())
     settings = storage.get("", "settings", list)
     prompts = storage.get("llm_system", "prompts")
     chat_groups = storage.get("", "chat_groups", list)

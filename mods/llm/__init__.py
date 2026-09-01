@@ -473,8 +473,8 @@ class LLMClient:
     def chat(self, messages: list[dict], tools: list[Tool] | Callable[[], list[Tool]] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None) -> Generator[LLMResponse, None, None]:
         while True:
             # Freeze one tool snapshot for both the request schema and the
-            # calls returned by that request.  A tool may change the provider;
-            # the new snapshot is then observed by the next loop iteration.
+            # calls returned by that request. A tool may mutate this Chat's
+            # mapping; the new snapshot is observed by the next iteration.
             tools_snapshot = tools() if callable(tools) else list(tools or [])
             console.notice(f"等待 {model or self.config['default_model']} 的响应…")
             response = iter(self.generate_response(messages, tools_snapshot, tool_choice, model, stream, description_cache, do_process_image))
@@ -535,7 +535,6 @@ class Chat:
         self.do_process_image = do_process_image
         self.messages: list[dict] = []
         self.functions: dict[str, Tool] = {}
-        self.tool_provider: Callable[[], dict | list] | None = None
         if messages is not None:
             self.set_messages(messages)
         if functions is not None:
@@ -571,24 +570,9 @@ class Chat:
         for name, function in functions.items() if isinstance(functions, dict) else ((None, value) for value in functions):
             self.add_tool(function, name)
 
-    def set_tool_provider(self, provider: Callable[[], dict | list] | None) -> None:
-        """Set the live source merged with this session's fixed tools."""
-        self.tool_provider = provider
-
     def get_tools(self) -> list[Tool]:
         """Build the current request's frozen tool snapshot."""
-        tools = dict(self.functions)
-        if self.tool_provider is None:
-            return list(tools.values())
-        provided = self.tool_provider()
-        items = provided.items() if isinstance(provided, dict) else ((None, value) for value in provided)
-        for name, function in items:
-            name = name or (function.description["function"]["name"] if isinstance(function, Tool) else function.__name__)
-            tool = function if isinstance(function, Tool) else Tool(function, name)
-            if name in tools and tools[name].call is not tool.call:
-                raise KeyError(f"同名函数 {name} 已存在")
-            tools[name] = tool
-        return list(tools.values())
+        return list(self.functions.values())
 
     def change_model(self, model: str) -> None:
         split_model_selection(model)

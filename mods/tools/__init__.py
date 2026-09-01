@@ -259,7 +259,11 @@ class ToolRegistry:
 def _requested_names(names: str | Iterable[str]) -> tuple[object, ...]:
     if isinstance(names, str):
         return (names,)
-    return tuple(dict.fromkeys(names))
+    requested = []
+    for name in names:
+        if name not in requested:
+            requested.append(name)
+    return tuple(requested)
 
 
 def _validate_module_name(name: object) -> str:

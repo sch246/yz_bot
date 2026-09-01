@@ -246,9 +246,8 @@ def _client(completions):
 
 
 class ReasoningContentRoundTripTests(unittest.TestCase):
-    def test_tool_provider_is_frozen_per_request_and_reloaded_next_round(self):
+    def test_session_tools_are_frozen_per_request_and_reloaded_next_round(self):
         completions = _DynamicToolCompletions()
-        active = {}
         calls = []
 
         def dynamic_tool() -> str:
@@ -258,13 +257,12 @@ class ReasoningContentRoundTripTests(unittest.TestCase):
 
         def load_dynamic_tool() -> str:
             """Install the dynamic tool for the next model request."""
-            active["dynamic_tool"] = dynamic_tool
+            session.add_tool(dynamic_tool)
             return "loaded"
 
         session = llm.Chat(model="deepseek/model", chat_client=_client(completions))
         session.set_messages([{"role": "user", "content": "加载工具"}])
         session.add_tool(load_dynamic_tool)
-        session.set_tool_provider(lambda: active)
 
         responses = session.chat()
 

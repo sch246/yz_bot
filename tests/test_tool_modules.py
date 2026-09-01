@@ -424,13 +424,17 @@ __all__ = ["run"]
             setattr(chat, name, make_function(name))
         for name in weather_names:
             setattr(weather, name, make_function(name))
+        self.mods.get_available = lambda name: weather if name == "weather" else None
 
-        with mock.patch.dict(
-            sys.modules,
-            {"mods.chat": chat, "mods.weather": weather},
-        ):
-            registry = self.tools.ToolRegistry(ROOT / "mods" / "tools")
-            modules = registry.modules
+        try:
+            with mock.patch.dict(
+                sys.modules,
+                {"mods.chat": chat, "mods.weather": weather},
+            ):
+                registry = self.tools.ToolRegistry(ROOT / "mods" / "tools")
+                modules = registry.modules
+        finally:
+            del self.mods.get_available
 
         self.assertEqual(
             set(modules),
