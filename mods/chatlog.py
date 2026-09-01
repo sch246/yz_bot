@@ -141,12 +141,11 @@ def gettime(seconds: int) -> tuple[int, int, int, int]:
 
 def format_poke(msg: dict[str, Any]) -> str:
     user_id, target_id = int(msg["user_id"]), int(msg["target_id"])
+    name = identity.getname(user_id)
+    target = identity.getname(target_id)
     if "group_id" in msg:
-        group_id = int(msg["group_id"])
-        name = identity.get_group_user_info(group_id, user_id)[1]
-        target = identity.get_group_user_info(group_id, target_id)[1]
         return f"{name}({user_id})戳了戳{target}({target_id})"
-    return f"{identity.get_user_name(user_id)}戳了戳{identity.get_user_name(target_id)}"
+    return f"{name}戳了戳{target}"
 
 
 def _message(msg: dict[str, Any]) -> str:
