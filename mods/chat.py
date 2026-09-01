@@ -15,7 +15,7 @@ from typing import Callable
 
 import requests
 
-from mods import chatlog, connect, context, cq, history, identity, image, llm, message, msgs, op, storage, text, thread
+from mods import chat_skills, chatlog, connect, context, cq, history, identity, image, llm, message, msgs, op, self_tools, storage, text, thread
 from mods.command import command
 from mods.capture import capture
 
@@ -439,6 +439,50 @@ def check_mod(id: int) -> str:
     return "\n".join(item.get_text().strip() for item in BeautifulSoup(response.text, "html.parser").find_all(class_="text-area"))
 
 
+def list_tools() -> str:
+    """列出当前已加载的自编工具，并检查 data/tools 中尚未加载的源码变化。"""
+    active = sorted(self_tools.list())
+    changes = self_tools.scan()
+    lines = ["当前已加载函数:", *(f"- {name}" for name in active)]
+    if not active:
+        lines.append("- (无)")
+    lines.append("相对活动版本的源码变化:")
+    labels = {"added": "新增", "modified": "修改", "deleted": "删除"}
+    changed = False
+    for kind in ("added", "modified", "deleted"):
+        names = changes[kind]
+        if names:
+            changed = True
+            lines.append(f"- {labels[kind]}: {', '.join(names)}")
+    if not changed:
+        lines.append("- (无)")
+    return "\n".join(lines)
+
+
+def load_tools(names: list[str]) -> str:
+    """显式热加载或卸载 data/tools 中指定的自编工具。
+
+    @param
+    names: 要处理的函数名列表；文件已删除时会卸载对应活动函数
+    """
+    reserved = {function.__name__ for function in _tools()}
+    results = self_tools.load(names, reserved_names=reserved)
+    succeeded = []
+    failed = []
+    action_labels = {"loaded": "已加载", "unloaded": "已卸载"}
+    for name, result in results.items():
+        if result.ok:
+            succeeded.append(f"- {name}: {action_labels.get(result.action, result.action)}")
+        else:
+            failed.append(f"- {name}:\n{result.error or '未知错误'}")
+    return "\n".join([
+        "成功:",
+        *(succeeded or ["- (无)"]),
+        "失败:",
+        *(failed or ["- (无)"]),
+    ])
+
+
 def assign_tasks(prompt: str, tasks: str, tools: str, model: str = "deepseek/deepseek-v4-flash", max_workers: int = 5) -> str:
     """并发分派互不依赖的 LLM 子任务。
 
@@ -454,6 +498,7 @@ def assign_tasks(prompt: str, tasks: str, tools: str, model: str = "deepseek/dee
     workers = max(1, min(int(max_workers), 5))
     origin = context.current()
     available = {function.__name__: function for function in _tools()}
+    requested_names = frozenset(requested)
 
     def execute(task_value: str) -> tuple[str, str]:
         context.set_current(origin)
@@ -464,6 +509,11 @@ def assign_tasks(prompt: str, tasks: str, tools: str, model: str = "deepseek/dee
             for name in requested:
                 if name in available:
                     session.add_tool(available[name])
+            session.set_tool_provider(lambda: {
+                name: function
+                for name, function in self_tools.list().items()
+                if name in requested_names
+            })
             session.set_messages([f"{prompt}\n{task_value}"])
             pieces = []
 
@@ -488,7 +538,7 @@ def assign_tasks(prompt: str, tasks: str, tools: str, model: str = "deepseek/dee
 
 
 def _tools() -> list[Callable]:
-    tools = [get_time, exec_code, poke, recognize_image, later_add, later_del, create_image, create_image_from_references, get_user_data, set_user_data, assign_tasks, search_mc_mod, check_mod]
+    tools = [get_time, exec_code, poke, recognize_image, later_add, later_del, create_image, create_image_from_references, get_user_data, set_user_data, assign_tasks, search_mc_mod, check_mod, list_tools, load_tools]
     from mods import get_available
 
     weather = get_available("weather")
@@ -509,10 +559,11 @@ def init_chat(session: llm.Chat, messages: list | None = None) -> None:
     inc_call_count()
     for tool_function in _tools():
         session.add_tool(tool_function)
+    session.set_tool_provider(self_tools.list)
     prompts["base"] = _base_prompt()
     group = context.current().get("group_id") if context.current() else None
     state = {"role": "system", "content": f"当前所在群聊:{identity.getgroupname(group)}({group})"} if group is not None else {"role": "system", "content": f"当前在私聊:{identity.getname()}({context.current().get('user_id')})"}
-    session.set_messages([*get_prompt(), *prompts["base"], state, *(messages or [])])
+    session.set_messages([*get_prompt(), *prompts["base"], *chat_skills.load_skill_messages(), state, *(messages or [])])
     session.do_process_image = get_image_mode() != "off"
 
 
@@ -789,6 +840,7 @@ def on_load(ctx) -> None:
     if missing:
         raise RuntimeError("chat requires available mods: " + ", ".join(missing))
 
+    self_tools.reserve(function.__name__ for function in _tools())
     settings = storage.get("", "settings", list)
     prompts = storage.get("llm_system", "prompts")
     chat_groups = storage.get("", "chat_groups", list)

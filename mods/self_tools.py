@@ -11,13 +11,16 @@ import builtins
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 import inspect
+import logging
 from pathlib import Path
 import threading
 import traceback as traceback_module
-from types import UnionType
-from typing import get_args, get_origin, get_type_hints, Union
+from typing import get_type_hints
 
 from mods.llm.tools import Tool
+
+
+_logger = logging.getLogger(__name__)
 
 
 EnvironmentFactory = Callable[[], Mapping[str, object]]
@@ -71,19 +74,29 @@ class SelfToolLoader:
                 for name, active in sorted(self._active.items())
             }
 
+    def reserve(self, names: Iterable[str]) -> None:
+        """Permanently protect names owned by fixed tools."""
+        with self._lock:
+            self._reserved_names = self._reserved_names.union(names)
+
     def scan(self) -> dict[str, builtins.list[str]]:
         """Report source changes relative to the active in-process versions."""
         with self._lock:
             files = self._source_files()
             active_names = set(self._active)
             file_names = set(files)
+            modified = []
+            for name in sorted(file_names & active_names):
+                try:
+                    changed = files[name].read_bytes() != self._active[name].source
+                except Exception:
+                    _logger.exception("failed to inspect self tool %r", name)
+                    changed = True
+                if changed:
+                    modified.append(name)
             return {
                 "added": sorted(file_names - active_names),
-                "modified": sorted(
-                    name
-                    for name in file_names & active_names
-                    if files[name].read_bytes() != self._active[name].source
-                ),
+                "modified": modified,
                 "deleted": sorted(active_names - file_names),
             }
 
@@ -125,11 +138,13 @@ class SelfToolLoader:
                     results[name] = LoadResult(True, "loaded", function=function)
                 except Exception:
                     previous = self._active.get(str(name))
+                    error = traceback_module.format_exc()
+                    _logger.error("failed to load self tool %r\n%s", name, error)
                     results[str(name)] = LoadResult(
                         False,
                         "failed",
                         function=previous.function if previous is not None else None,
-                        error=traceback_module.format_exc(),
+                        error=error,
                     )
         return results
 
@@ -215,9 +230,6 @@ class SelfToolLoader:
         ]
         if missing:
             raise TypeError("tool parameters require type annotations: " + ", ".join(missing))
-        for parameter in signature.parameters:
-            _validate_annotation(hints[parameter], parameter)
-
         if not inspect.getdoc(function):
             raise ValueError("tool function requires a docstring")
 
@@ -244,34 +256,17 @@ class SelfToolLoader:
         ):
             raise ValueError("Tool produced an incomplete function schema")
 
-
-def _validate_annotation(annotation: object, parameter: str) -> None:
-    origin = get_origin(annotation)
-    if origin in (Union, UnionType):
-        values = get_args(annotation)
-        if not values:
-            raise TypeError(f"unsupported annotation for {parameter}: {annotation!r}")
-        for value in values:
-            if value is not type(None):
-                _validate_annotation(value, parameter)
-        return
-    if origin in (builtins.list, tuple, set):
-        values = get_args(annotation)
-        if values:
-            _validate_annotation(values[0], parameter)
-        return
-    if origin is dict:
-        return
-    if annotation not in (str, int, float, bool, builtins.list, dict):
-        raise TypeError(f"unsupported annotation for {parameter}: {annotation!r}")
-
-
 _default_loader = SelfToolLoader()
 
 
 def list() -> dict[str, Callable]:
     """Return the default loader's active tools."""
     return _default_loader.list()
+
+
+def reserve(names: Iterable[str]) -> None:
+    """Protect fixed tool names in the default loader."""
+    _default_loader.reserve(names)
 
 
 def scan() -> dict[str, builtins.list[str]]:

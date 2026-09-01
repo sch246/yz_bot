@@ -43,6 +43,9 @@ _EXPORT_SPECS = {
     "getstorage": ("identity", "getstorage"),
     "getgroupstorage": ("identity", "getgroupstorage"),
     "getgroupname": ("identity", "getgroupname"),
+    # Self-authored tools may edit named prompt objects through the same
+    # trusted Python surface instead of requiring a dedicated prompt editor.
+    "prompts": ("chat", "prompts"),
     "headshot": ("identity", "headshot"),
     "headshot_url": ("identity", "headshot_url"),
     "memberlist": ("identity", "memberlist"),

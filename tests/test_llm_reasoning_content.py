@@ -13,6 +13,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _load_llm_module():
     """Load mods.llm without booting the production mods package."""
+    for name in tuple(sys.modules):
+        if name == "mods.llm" or name.startswith("mods.llm."):
+            sys.modules.pop(name, None)
     mods = ModuleType("mods")
     mods.__path__ = [str(ROOT / "mods")]
     image = ModuleType("mods.image")
@@ -195,6 +198,26 @@ class _StrictVisionCompletions:
         return iter([_stream_chunk(role="assistant", content="完成。")])
 
 
+class _DynamicToolCompletions:
+    def __init__(self):
+        self.requests = []
+
+    def create(self, **params):
+        self.requests.append(params)
+        names = [tool["function"]["name"] for tool in params.get("tools", [])]
+        if len(self.requests) == 1:
+            if names != ["load_dynamic_tool"]:
+                raise AssertionError(f"unexpected initial tools: {names!r}")
+            return iter([
+                _stream_chunk(tool_calls=[
+                    _tool_delta("call_load", "load_dynamic_tool"),
+                ]),
+            ])
+        if names != ["load_dynamic_tool", "dynamic_tool"]:
+            raise AssertionError(f"reloaded tool missing from next request: {names!r}")
+        return iter([_stream_chunk(content="已看到新工具。")])
+
+
 def _inspect_dir():
     """Inspect the current directory."""
     return "README.md\nmain.py\nrun.py"
@@ -223,6 +246,32 @@ def _client(completions):
 
 
 class ReasoningContentRoundTripTests(unittest.TestCase):
+    def test_tool_provider_is_frozen_per_request_and_reloaded_next_round(self):
+        completions = _DynamicToolCompletions()
+        active = {}
+        calls = []
+
+        def dynamic_tool() -> str:
+            """A dynamically loaded tool that must not run during loading."""
+            calls.append("called")
+            return "ran"
+
+        def load_dynamic_tool() -> str:
+            """Install the dynamic tool for the next model request."""
+            active["dynamic_tool"] = dynamic_tool
+            return "loaded"
+
+        session = llm.Chat(model="deepseek/model", chat_client=_client(completions))
+        session.set_messages([{"role": "user", "content": "加载工具"}])
+        session.add_tool(load_dynamic_tool)
+        session.set_tool_provider(lambda: active)
+
+        responses = session.chat()
+
+        self.assertEqual(len(completions.requests), 2)
+        self.assertEqual(calls, [])
+        self.assertEqual(responses[-1].content, "已看到新工具。")
+
     def test_vision_request_sends_images_only_in_user_messages(self):
         completions = _StrictVisionCompletions()
         client = _client(completions)

@@ -228,11 +228,6 @@ def greet(name: str, /) -> str:
     """Greet a person."""
     return name
 ''',
-            "unsupported_type": '''\
-def greet(name: object) -> str:
-    """Greet a person."""
-    return str(name)
-''',
             "missing_docstring": '''\
 def greet(name: str) -> str:
     return name
@@ -273,6 +268,16 @@ async def greet(name: str) -> str:
         reader.join()
 
         self.assertEqual(errors, [])
+
+    def test_reserved_names_can_be_installed_on_the_loader(self):
+        self.write("greet", VALID_V1)
+        self.loader.reserve(["greet"])
+
+        result = self.loader.load("greet")["greet"]
+
+        self.assertFalse(result.ok)
+        self.assertIn("tool name is reserved", result.error)
+        self.assertEqual(self.loader.list(), {})
 
 
 if __name__ == "__main__":
