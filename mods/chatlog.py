@@ -31,6 +31,8 @@ def on_load(_ctx: dict[str, Any] | None = None) -> None:
 
     marker = storage.get(rootfile, "format", lambda: {})
     marker.setdefault("v1_since", int(time.time()))
+    windows, records = _restore_history()
+    logger.info("从 chatlog 重建近期消息：%d 个窗口 %d 条", windows, records)
 
 
 def search_current(pattern: str) -> str:
@@ -576,6 +578,14 @@ def _day_bounds(day: tuple[int, int, int]) -> tuple[int, int]:
     return start, end
 
 
+def _bot_id() -> int | None:
+    """The Bot's own id, or ``None`` before login -- ``post_type`` then stays unknown."""
+    try:
+        return identity.bot_id()
+    except Exception:
+        return None
+
+
 def _switch_moment() -> int | None:
     from mods import storage
 
@@ -629,10 +639,7 @@ def read_range(
     if not directory.is_dir():
         return []
     if bot_id is None:
-        try:
-            bot_id = identity.bot_id()
-        except Exception:
-            bot_id = None
+        bot_id = _bot_id()
     switch = _switch_moment()
     records: list[dict[str, Any]] = []
     for path in sorted(directory.rglob("*.log")):
@@ -666,3 +673,76 @@ def read_range(
             records.append(record)
     records.reverse()
     return records
+
+
+# --- rebuilding recent history at boot --------------------------------------
+#
+# This replaces ``data/cache_msgs``, which was a second write authority for the
+# same events and cost about a second of ``literal_eval`` at every boot -- more
+# than rebuilding the whole tree.  Only **v1 message records** are restored:
+#
+# - a v0 body is a display projection, and a v0 private record has no sender at
+#   all, so ``chat.msg2chat`` would read the Bot's own past lines as the peer's;
+# - a notice rebuilds as opaque prose with no ``notice_type``, so it is not an
+#   event any consumer here can read.
+#
+# The floor is therefore the switch moment, which also bounds the walk: it stops
+# at the first day file entirely older than the switch instead of the archive.
+
+
+def _restore_window(kind: str, target: int, count: int, floor: int) -> list[dict[str, Any]]:
+    """The newest *count* v1 message records of one window, newest first."""
+    got: list[dict[str, Any]] = []
+    for path in sorted(window_path(kind, target).rglob("*.log"), reverse=True):
+        day = day_of(path)
+        if day is None:
+            continue
+        start, end = _day_bounds(day)
+        if end <= floor:
+            break
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError:
+            logger.exception("重建近期窗口时读取失败：%s", path)
+            continue
+        parsed = parse_log(
+            content,
+            kind=kind,
+            target=target,
+            day=day,
+            bot_id=_bot_id(),
+            version=_day_version(start, end, floor),
+        )
+        got = [record for record in parsed if record.get("_version") == V1] + got
+        if len(got) >= count:
+            break
+    return list(reversed(got[-count:]))
+
+
+def _restore_history() -> tuple[int, int]:
+    """Fill ``history.msgs`` from the files, and report how much was restored.
+
+    Nothing is restored before the switch has any days behind it, which is the
+    honest outcome rather than a failure: the older records exist and stay
+    readable through the range query, they are just not faithful enough to be
+    handed to consumers that expect live events.
+    """
+    floor = _switch_moment()
+    if floor is None:
+        return 0, 0
+    windows = records = 0
+    for kind in ("group", "private"):
+        base = Path(rootfile) / kind
+        if not base.is_dir():
+            continue
+        for entry in sorted(base.iterdir()):
+            if not (entry.is_dir() and entry.name.isdigit()):
+                continue
+            got = _restore_window(kind, int(entry.name), history.MAX_LEN, floor)
+            if not got:
+                continue
+            with history.lock():
+                history.msgs[kind][int(entry.name)] = got
+            windows += 1
+            records += len(got)
+    return windows, records

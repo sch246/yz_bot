@@ -1,14 +1,16 @@
-"""Recent per-window OneBot event history."""
+"""Recent per-window OneBot event history.
+
+Pure memory.  It used to persist itself to ``data/cache_msgs``, which made it a
+second write authority for events ``chatlog`` had already written down; the
+files are the authority now, and ``chatlog.on_load`` refills this at boot.
+"""
 
 from __future__ import annotations
 
-import ast
-import logging
-import os
 import re
-import tempfile
+from contextlib import contextmanager
 from threading import RLock
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from mods import INFRA
 
@@ -16,10 +18,15 @@ from mods import INFRA
 PHASE = INFRA
 LOAD_AFTER = ("storage",)
 MAX_LEN = 256
-CACHE_FILE = "data/cache_msgs"
 
-logger = logging.getLogger(__name__)
 _lock = RLock()
+
+
+@contextmanager
+def lock() -> Iterator[None]:
+    """Guard a direct write to ``msgs``; only ``chatlog``'s boot rebuild needs it."""
+    with _lock:
+        yield
 
 
 def _empty() -> dict[str, Any]:
@@ -204,54 +211,3 @@ def remove_message(
                 if is_message and event.get("message_id") == message_id:
                     return events.pop(index)
     return None
-
-
-def _valid(value: Any) -> bool:
-    return (
-        isinstance(value, dict)
-        and isinstance(value.get("group"), dict)
-        and isinstance(value.get("private"), dict)
-        and isinstance(value.get("bot"), list)
-        and "last" in value
-    )
-
-
-def on_load(_ctx: dict[str, Any] | None = None) -> None:
-    global msgs
-    if not os.path.exists(CACHE_FILE):
-        return
-    try:
-        with open(CACHE_FILE, encoding="utf-8") as file:
-            value = ast.literal_eval(file.read())
-        if not _valid(value):
-            raise ValueError("cache_msgs 形状错误")
-    except Exception:
-        logger.exception("读取近期消息缓存失败，保留空 history")
-        return
-    with _lock:
-        msgs = value
-
-
-def on_exit() -> None:
-    directory = os.path.dirname(CACHE_FILE)
-    os.makedirs(directory, exist_ok=True)
-    with _lock:
-        text = repr(msgs)
-    fd, temporary = tempfile.mkstemp(
-        dir=directory,
-        prefix=".cache_msgs.",
-        suffix=".tmp",
-        text=True,
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as file:
-            file.write(text)
-            file.flush()
-            os.fsync(file.fileno())
-        os.replace(temporary, CACHE_FILE)
-    except BaseException:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
-        raise
