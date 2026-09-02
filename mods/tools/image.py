@@ -1,4 +1,23 @@
-"""提供图片识别、文字生图和参考图生图能力。"""
+"""识别图片、按文字描述生成图片、按参考图生成图片。
+
+## 图片 URI 从哪来
+
+`image_uri` / `image_uris` 只接受 `http://`、`https://` 或 `file://` 开头的完整 URI。用户在聊天里发的图片，进入模型时已经由 CQ 码转成了图片链接，直接把那个链接原样传进来，不要自己拼接、猜测或改写。`file://` 必须是宿主机上的绝对路径，且只有管理员可用。
+
+## 识别
+
+`recognize_image` 把一张图交给视觉模型并返回文字结果。`prompt` 决定它做什么：留空只得到笼统描述，需要具体信息就明确写出来，例如"把图里的文字全部转成文本"、"这张表第三列的数值分别是多少"、"图中有几个人"。一次只处理一张图，多张图分别调用。
+
+## 生成
+
+两个生成函数**不会把图片返回给你**，而是直接发送到当前聊天，返回值只是"已生成并发送 N 张图片"之类的回执。你看不到成品，所以不要在回复里描述生成结果长什么样，也不要为了"看看效果"重复生成。
+
+`create_image_from_references` 用 `image_uris`（每行一个 URI）提供参考的人物、风格或待修改的原图，`prompt` 写想要的新画面；没有参考图时用 `create_image`。
+
+生成是收费操作（每张约 0.13 元）并且要等几十秒：`n` 默认 1，用户没明确要多张就别改；`quality` 越高越慢越贵，一般保持 `auto`；`size` 目前只支持 `1024x1024`。
+
+失败时返回以"生图失败："或"参考图生图失败："开头的原因，同样的参数重试一般还是失败，如实转告用户即可。
+"""
 
 from contextlib import ExitStack
 import os
@@ -11,11 +30,11 @@ from mods import context, cq, image as image_mod, llm, message, op
 
 
 def recognize_image(image_uri: str, prompt: str = "") -> str:
-    """按要求识别网络或本地图片。
+    """按要求识别一张网络或本地图片，返回视觉模型给出的文字结果。
 
     @param
-    image_uri: http://、https:// 或 file:// 图片 URI
-    prompt: 希望视觉模型完成的任务
+    image_uri: 完整图片 URI；聊天里的图片直接用消息中给出的链接，file:// 需要管理员权限
+    prompt: 希望视觉模型完成的任务，例如"提取图中所有文字"；留空则给出笼统描述
     """
     if not re.match(r"^(?:https?|file)://", image_uri, re.I):
         return "图片识别失败：仅支持 http://、https:// 或 file:// 图片 URI"
@@ -65,14 +84,14 @@ def _send_generated_images(response: requests.Response) -> str:
 
 
 def create_image(prompt: str, size: str = "1024x1024", quality: str = "auto", n: int = 1, output_format: str = "png") -> str:
-    """根据文字描述生成图片并发送。
+    """根据文字描述生成图片并直接发送到当前聊天，返回发送回执而不是图片本身。
 
     @param
-    prompt: 图像描述
+    prompt: 图像描述，写清主体、风格、构图、色调，越具体越好
     size: 图片尺寸 enum: ["1024x1024"]
-    quality: 质量 enum: ["auto", "low", "medium", "high"]
-    n: 图片数量
-    output_format: 格式 enum: ["png", "jpeg", "webp"]
+    quality: 生成质量，越高越慢越贵 enum: ["auto", "low", "medium", "high"]
+    n: 生成张数，1 到 10；每张单独计费，没有特别要求就用 1
+    output_format: 图片格式 enum: ["png", "jpeg", "webp"]
     """
     if error := _validate_generation(prompt, size, quality, n, output_format, "生图"):
         return error
@@ -87,15 +106,15 @@ def create_image(prompt: str, size: str = "1024x1024", quality: str = "auto", n:
 
 
 def create_image_from_references(prompt: str, image_uris: str, size: str = "1024x1024", quality: str = "auto", n: int = 1, output_format: str = "png") -> str:
-    """使用参考图片生成新图并发送。
+    """以一张或多张参考图生成新图并直接发送到当前聊天，返回发送回执而不是图片本身。
 
     @param
-    prompt: 新图描述
-    image_uris: 每行一个图片 URI
+    prompt: 新图描述，说明要在参考图基础上得到什么
+    image_uris: 参考图 URI，每行一个；聊天里的图片直接用消息中给出的链接，file:// 需要管理员权限
     size: 图片尺寸 enum: ["1024x1024"]
-    quality: 质量 enum: ["auto", "low", "medium", "high"]
-    n: 图片数量
-    output_format: 格式 enum: ["png", "jpeg", "webp"]
+    quality: 生成质量，越高越慢越贵 enum: ["auto", "low", "medium", "high"]
+    n: 生成张数，1 到 10；每张单独计费，没有特别要求就用 1
+    output_format: 图片格式 enum: ["png", "jpeg", "webp"]
     """
     if error := _validate_generation(prompt, size, quality, n, output_format, "参考图生图"):
         return error
