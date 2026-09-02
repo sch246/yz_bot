@@ -188,12 +188,17 @@ def gettime(seconds: int) -> tuple[int, int, int, int]:
 
 
 def format_poke(msg: dict[str, Any]) -> str:
+    """Render a poke, with ids in both windows.
+
+    A private line used to carry names only, which is the same asymmetry v1
+    closed for private message records: with no ids the line cannot say which
+    side poked, and the two candidates are only distinguishable by a nickname
+    anyone can change.  Now both windows render alike, and ``_recognise_notice``
+    reads this back exactly -- which is all a rebuilt poke has to be, because
+    ``chat.get_msgs`` hands the event straight back to this function.
+    """
     user_id, target_id = int(msg["user_id"]), int(msg["target_id"])
-    name = identity.getname(user_id)
-    target = identity.getname(target_id)
-    if "group_id" in msg:
-        return f"{name}({user_id})戳了戳{target}({target_id})"
-    return f"{name}戳了戳{target}"
+    return f"{identity.getname(user_id)}({user_id})戳了戳{identity.getname(target_id)}({target_id})"
 
 
 def _message(msg: dict[str, Any]) -> str:
@@ -341,6 +346,10 @@ V1 = "v1"
 _TIME_SUFFIX = re.compile(r"(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})$")
 _SENDER_SUFFIX = re.compile(r"\((?P<user_id>\d+)\)$")
 _TITLED = re.compile(r"^【(?P<title>.*)】(?P<name>.*)$", re.DOTALL)
+# The two notice families with an actual consumer.  Both end in ids this file
+# wrote itself, and both are matched right to left like every other head here.
+_POKE = re.compile(r"^(?P<who>.*)\((?P<user_id>\d+)\)戳了戳(?P<whom>.*)\((?P<target_id>\d+)\)$", re.DOTALL)
+_RECALL = re.compile(r"撤回了(?:.*的)?一条消息\((?P<message_id>-?\d+)\)$", re.DOTALL)
 _DAY_NAME = re.compile(r"(?P<day>\d{2})\.log$")
 _MONTH_NAME = re.compile(r"(?P<year>\d{4})-(?P<month>\d{2})$")
 
@@ -487,6 +496,44 @@ def _message_record(head: dict[str, Any], body: str, kind: str, target: int, day
     return record
 
 
+def _recognise_notice(record: dict[str, Any]) -> None:
+    """Recover the machine fields of the two notice families that have consumers.
+
+    This is not the general reversal of notice prose the proposal rules out.
+    Those two shapes end in ids the formatter itself wrote, so the id -- the only
+    thing either consumer needs -- is read off the right end, not inferred from
+    the sentence around it.  A poke needs ``user_id``/``target_id`` because
+    ``chat.get_msgs`` re-renders it through ``format_poke``, so the round trip is
+    against this file's own formatter and current identity, exactly as a live
+    event would be: a rebuilt poke is not a degraded one.  A recall needs only
+    the id of the message it took back, so that the boot rebuild does not put a
+    recalled message back into memory; it stays opaque text otherwise.
+
+    A line that does not match is left alone.  So a wording change makes one of
+    these go missing rather than wrong, which is the direction the version
+    detection already takes.
+    """
+    poke = _POKE.fullmatch(record["text"])
+    if poke is not None:
+        record["_kind"] = "poke"
+        record.update(
+            {
+                "post_type": "notice",
+                "notice_type": "notify",
+                "sub_type": "poke",
+                "user_id": int(poke["user_id"]),
+                "target_id": int(poke["target_id"]),
+            }
+        )
+        record["_derived"] += ["post_type", "notice_type", "sub_type", "user_id", "target_id"]
+        return
+    recall = _RECALL.search(record["text"])
+    if recall is not None:
+        record["_kind"] = "recall"
+        record["message_id"] = int(recall["message_id"])
+        record["_derived"].append("message_id")
+
+
 def parse_log(
     content: str,
     *,
@@ -531,6 +578,7 @@ def parse_log(
                 record["group_id"] = target
             elif kind == "private":
                 record["user_id"] = target
+            _recognise_notice(record)
             records.append(record)
             continue
         head = _split_head(line)
@@ -679,20 +727,25 @@ def read_range(
 #
 # This replaces ``data/cache_msgs``, which was a second write authority for the
 # same events and cost about a second of ``literal_eval`` at every boot -- more
-# than rebuilding the whole tree.  Only **v1 message records** are restored:
+# than rebuilding the whole tree.
 #
-# - a v0 body is a display projection, and a v0 private record has no sender at
-#   all, so ``chat.msg2chat`` would read the Bot's own past lines as the peer's;
-# - a notice rebuilds as opaque prose with no ``notice_type``, so it is not an
-#   event any consumer here can read.
+# What goes back in is **v1 message records and pokes**.  A v0 body is a display
+# projection and a v0 private record has no sender at all, so ``chat.msg2chat``
+# would read the Bot's own past lines as the peer's -- hence the floor at the
+# switch moment, which also bounds the walk: it stops at the first day file
+# entirely older than the switch instead of walking the archive.  A poke has no
+# such gap, because its only consumer re-renders it through ``format_poke``.
 #
-# The floor is therefore the switch moment, which also bounds the walk: it stops
-# at the first day file entirely older than the switch instead of the archive.
+# Recalled messages are dropped.  Walking backwards means the recall notice is
+# always read before the message it took back, so one pass is enough.  This is
+# the rebuild only: ``read_range`` still returns them, because the archive's
+# answer to "what happened" includes what was later taken back.
 
 
 def _restore_window(kind: str, target: int, count: int, floor: int) -> list[dict[str, Any]]:
-    """The newest *count* v1 message records of one window, newest first."""
+    """The newest *count* rebuildable events of one window, newest first."""
     got: list[dict[str, Any]] = []
+    recalled: set[int] = set()
     for path in sorted(window_path(kind, target).rglob("*.log"), reverse=True):
         day = day_of(path)
         if day is None:
@@ -713,7 +766,13 @@ def _restore_window(kind: str, target: int, count: int, floor: int) -> list[dict
             bot_id=_bot_id(),
             version=_day_version(start, end, floor),
         )
-        got = [record for record in parsed if record.get("_version") == V1] + got
+        recalled.update(record["message_id"] for record in parsed if record.get("_kind") == "recall")
+        got = [
+            record
+            for record in parsed
+            if (record.get("_version") == V1 and record.get("message_id") not in recalled)
+            or record.get("_kind") == "poke"
+        ] + got
         if len(got) >= count:
             break
     return list(reversed(got[-count:]))
