@@ -11,7 +11,7 @@ from threading import Event, RLock, Thread
 import time
 from typing import Any, Callable
 
-from mods import INFRA
+from mods import INFRA, log
 from .codec import digest as _digest
 from .codec import phase as _phase
 from .codec import read_file as _read_file
@@ -20,7 +20,7 @@ from .codec import serialize as _serialize
 
 PHASE = INFRA
 
-logger = logging.getLogger(__name__)
+logger = log.stream("storage")
 root_path = "data/storage/"
 DELETE_MARKER = "DELETE"
 
@@ -54,8 +54,9 @@ _shutdown_started = False
 
 
 def _report(message: str, level: int = logging.WARNING) -> None:
+    # One record, one exit: the ``[storage]`` tag it used to print by hand is
+    # now the stream name, and the terminal decides whether to show it.
     logger.log(level, message)
-    print(f"[storage] {message}")
 
 
 def _key_label(namespace: str, name: str) -> str:

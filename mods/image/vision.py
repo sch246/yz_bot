@@ -6,6 +6,11 @@ import time
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+from mods import log
+
+
+_stream = log.stream("image")
+
 
 AUTO_IMAGE_SPLIT_PROMPT = (
     "【自动图片切割】同一张原始长截图已按从上到下的顺序切割为连续片段，"
@@ -52,12 +57,11 @@ def split_long_image_data_uri(data_uri: str) -> tuple[list[str], bool]:
                 break
             top += base_height
     except (OSError, ValueError) as error:
-        print(f"⚠️ 长图自动切割失败，改用原图：{error}", flush=True)
+        _stream.info(f"⚠️ 长图自动切割失败，改用原图：{error}")
         return [data_uri], False
     elapsed_ms = round((time.perf_counter() - started_at) * 1000)
-    print(
+    _stream.info(
         f"✂️ 自动切割长图：{width}x{height} -> {len(slices)} 片，"
-        f"基础片高={base_height}，重叠={overlap}，耗时={elapsed_ms}ms",
-        flush=True,
+        f"基础片高={base_height}，重叠={overlap}，耗时={elapsed_ms}ms"
     )
     return slices, True

@@ -52,11 +52,11 @@ def _unescape(text: Any) -> str:
 
 
 def _append(path: str, text: str) -> str:
+    """Append to the log file and hand the text back for the caller to echo."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "a", encoding="utf-8") as file:
         file.write(text)
         file.flush()
-    print(text, end="" if text.endswith("\n") else "\n")
     return text
 
 

@@ -225,9 +225,9 @@ def image_reply(event):
 uv run --frozen python run.py --check
 ```
 
-它不会 import `mods`，不会绑定 `5701`。不要为语法检查直接 import `main.py` 或 `mods`；Import `mods` 就会执行完整 Import/Load，读取真实状态并绑定真实 listener。
+它会 import `mods` 读取同一套模块名规则，但不会调用 `mods.boot()`，因此不绑定 `5701`、不起线程、不读真实 storage。不要为语法检查 import `main.py` 或调用 `mods.boot()`。
 
-运行时观察重点包括：模块 Import/Load 汇总、收到/发送消息、link/capture 命中、LLM 流输出与工具调用、图片捕获/缓存、scheduler/storage 退出。终端输出是运维界面的一部分，不要把现有打印当作无用噪声删除。
+运行时观察重点包括：模块 Import/Load 汇总、收到/发送消息、link/capture 命中、LLM 流输出与工具调用、图片捕获/缓存、scheduler/storage 退出。终端输出是运维界面的一部分，不要把现有输出当作无用噪声删除。新增可观察输出时选一条流：`mods.log.stream("<名字>").info(...)`，不要新写 `print`——`print` 绕开订阅集和 `app.log`，只在启动摘要、首次配置和 LLM 逐字输出这三处是有意为之。
 
 新增 Module 的最小核对：
 

@@ -11,7 +11,7 @@ import re
 import time
 import traceback
 
-from mods import LATE, command, context, cq, file, message, op, thread
+from mods import LATE, command, context, cq, file, log, message, op, thread
 
 
 PHASE = LATE
@@ -21,6 +21,7 @@ PHASE = LATE
 # a valid dynamic interface.
 DYNAMIC_EXPORTS: dict[str, object] = {}
 loc: dict[str, object] = {}
+_stream = log.stream("py")
 
 
 _EXPORT_SPECS = {
@@ -206,10 +207,10 @@ def on_load(loaded):
                 if name in candidate and candidate[name] is not value
             )
             if overridden:
-                print("pyload.py 覆盖动态导出: " + ", ".join(overridden))
+                _stream.info("pyload.py 覆盖动态导出: " + ", ".join(overridden))
         except Exception:
             traceback.print_exc()
-            print("pyload.py 执行失败，本次仅安装版本控制内的动态环境")
+            _stream.info("pyload.py 执行失败，本次仅安装版本控制内的动态环境")
             candidate = base
     loc.clear()
     loc.update(candidate)

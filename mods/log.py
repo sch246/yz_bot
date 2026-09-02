@@ -1,9 +1,19 @@
-"""The process-wide application logger configuration."""
+"""The process-wide logger configuration, and the streams the terminal shows.
+
+Two independent axes meet here.  *Severity* decides whether something is an
+incident: it selects the level and is what ``app.log`` is a record of.  *Stream*
+decides which subsystem a record belongs to: it selects the logger name and is
+what the terminal subscribes to.  Neither substitutes for the other, and mixing
+them is what made every producer invent its own ``print``.
+
+See docs/working/proposals/log-streams.md.
+"""
 
 from __future__ import annotations
 
 import logging
 from logging.handlers import TimedRotatingFileHandler
+import re
 import sys
 import threading
 import time
@@ -11,6 +21,7 @@ import time
 from termcolor import colored
 
 from mods import INFRA
+from mods.command import command
 
 
 PHASE = INFRA
@@ -23,6 +34,17 @@ LOAD_BEFORE = ("connect", "history", "storage")
 # expire and stops blocking everyone else.
 LINE_LEASE = 5.0
 
+# Streams share one root so that a subscription prefix can never accidentally
+# select a severity-axis module logger, and so ``.log`` can tell the two apart.
+STREAM_ROOT = "yz"
+# Everything that used to print straight to stdout now belongs to some stream
+# under the root, so subscribing the root alone reproduces the terminal as it
+# was.  Narrowing is then a deliberate act rather than a later discovery.
+DEFAULT_SUBSCRIPTIONS = (STREAM_ROOT,)
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+_STREAM_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.]*")
+
 _handler: TimedRotatingFileHandler | None = None
 _console_handler: logging.StreamHandler | None = None
 _stdout: _LineAtomicStream | None = None
@@ -30,6 +52,58 @@ _lock = threading.Lock()
 # Held for the length of one terminal write, by both the wrapped stdout and the
 # console log handler, so the two can never split each other's output.
 _output_lock = threading.RLock()
+# Logger names seen since start.  Producers need no registration: appearing once
+# is what makes a stream listable, so ``.log`` can show one nobody subscribed.
+_seen: set[str] = set()
+
+
+def stream(name: str) -> logging.Logger:
+    """Return the logger for one output stream, e.g. ``stream("llm.request")``.
+
+    The name is an exit, not a severity: it says which stream a record belongs
+    to, so the terminal can drop some of them and a future consumer can follow
+    one.  Choosing a name is the whole cost of adding a producer.
+    """
+    return logging.getLogger(f"{STREAM_ROOT}.{name}")
+
+
+def _stored_entries() -> list[str] | None:
+    """The live subscription list from storage, or ``None`` when unavailable."""
+    from mods import get_available
+
+    storage = get_available("storage")
+    if storage is None:
+        return None
+    try:
+        return storage.get("log", "terminal", lambda: list(DEFAULT_SUBSCRIPTIONS))
+    except Exception:
+        # A terminal that cannot read its subscription still has to print.
+        return None
+
+
+def entries() -> list[str]:
+    stored = _stored_entries()
+    return list(DEFAULT_SUBSCRIPTIONS) if stored is None else stored
+
+
+def _bare(entry: str) -> str:
+    return entry[1:] if entry.startswith("-") else entry
+
+
+def subscribed(name: str) -> bool:
+    """Whether the terminal shows *name* at INFO; the longest prefix decides.
+
+    ``yz`` subscribes everything and ``-yz.storage`` then carves one stream back
+    out, so narrowing a broad subscription does not mean listing what remains.
+    """
+    best, result = -1, False
+    for entry in entries():
+        prefix = _bare(entry)
+        if name != prefix and not name.startswith(prefix + "."):
+            continue
+        if len(prefix) > best:
+            best, result = len(prefix), not entry.startswith("-")
+    return result
 
 
 class _LineAtomicStream:
@@ -135,6 +209,13 @@ class _LineAtomicStream:
         return getattr(self._stream, name)
 
 
+class _FileFormatter(logging.Formatter):
+    """Keep the file plain: producers colour for the terminal, not for evidence."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return _ANSI.sub("", super().format(record))
+
+
 class _ConsoleFormatter(logging.Formatter):
     COLORS = {
         logging.WARNING: "light_yellow",
@@ -143,6 +224,10 @@ class _ConsoleFormatter(logging.Formatter):
     }
 
     def format(self, record: logging.LogRecord) -> str:
+        if record.levelno < logging.WARNING:
+            # A stream record keeps whatever shape its producer chose: these
+            # were plain prints and must still read as one line of output.
+            return record.getMessage()
         # The rotating file keeps full tracebacks.  The live terminal is a
         # status surface, so one failing periodic network call stays one line.
         exc_info, exc_text = record.exc_info, record.exc_text
@@ -156,18 +241,70 @@ class _ConsoleFormatter(logging.Formatter):
         return colored(value, self.COLORS.get(record.levelno, "light_cyan"))
 
 
-class _LockedStreamHandler(logging.StreamHandler):
-    """Take the shared terminal lock so a warning cannot land mid-line."""
-
-    def emit(self, record: logging.LogRecord) -> None:
-        with _output_lock:
-            super().emit(record)
-
-
 class _ConsoleFilter(logging.Filter):
+    """Subscribed streams from INFO up, plus WARNING and up from everywhere.
+
+    The floor is not subscribable: unsubscribing controls INFO traffic, and must
+    never be able to silence a failure.  Nothing is lost either way -- app.log
+    keeps the record whether or not the terminal showed it.
+    """
+
     def filter(self, record: logging.LogRecord) -> bool:
-        # Storage already emits its own concise terminal report.
-        return record.name != "mods.storage"
+        _seen.add(record.name)
+        return record.levelno >= logging.WARNING or subscribed(record.name)
+
+
+def _listing() -> str:
+    lines = ["终端订阅：" + (" ".join(entries()) or "（空）")]
+    lines.extend(
+        f'  {"✓" if subscribed(name) else "×"} {name}' for name in sorted(_seen)
+    )
+    if len(lines) == 1:
+        lines.append("  （启动以来还没有流产出过记录）")
+    return "\n".join(lines)
+
+
+@command
+def run(body: str) -> str | None:
+    """管理终端订阅的日志流（管理员）。
+
+    .log                列出启动以来出现过的流，以及当前订阅集
+    .log on <前缀>…     订阅，按 logger 名前缀匹配（yz.llm 含 yz.llm.request）
+    .log off <前缀>…    退订，可以从更宽的订阅里挖掉一条
+    .log only <前缀>…   整体替换订阅集，不给前缀表示清空
+
+    WARNING 以上不受订阅集影响，始终进终端；退订也不影响 app.log 的记录。
+    """
+    from mods import op
+
+    if not op.require_op():
+        return None
+    parts = body.split()
+    if not parts:
+        return _listing()
+    action, names = parts[0], parts[1:]
+    if action not in ("on", "off", "only"):
+        return run.__doc__
+    if not names and action != "only":
+        return run.__doc__
+    # ``only`` writes the set literally, so it is the one verb that may spell a
+    # negated entry; ``on`` and ``off`` carry the polarity in the verb itself.
+    invalid = [
+        name
+        for name in names
+        if not _STREAM_NAME.fullmatch(_bare(name) if action == "only" else name)
+    ]
+    if invalid:
+        return "流名无效：" + " ".join(invalid)
+    stored = _stored_entries()
+    if stored is None:
+        return "storage 不可用，订阅集暂时无法修改"
+    if action == "only":
+        stored[:] = names
+    else:
+        kept = [entry for entry in stored if _bare(entry) not in names]
+        stored[:] = kept + [name if action == "on" else f"-{name}" for name in names]
+    return _listing()
 
 
 def on_load(ctx) -> None:
@@ -188,12 +325,15 @@ def on_load(ctx) -> None:
             encoding="utf-8",
         )
         handler.setFormatter(
-            logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+            _FileFormatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         )
         root.addHandler(handler)
         _handler = handler
-        console_handler = _LockedStreamHandler()
-        console_handler.setLevel(logging.WARNING)
+        # The console handler writes through the wrapped stdout rather than to
+        # stderr, so a warning obeys the same line ownership as everything else
+        # instead of splicing itself into a reply being typed.
+        console_handler = logging.StreamHandler(_stdout)
+        console_handler.setLevel(logging.INFO)
         console_handler.addFilter(_ConsoleFilter())
         console_handler.setFormatter(
             _ConsoleFormatter("[%(levelname)s] %(name)s: %(message)s")

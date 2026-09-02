@@ -14,12 +14,14 @@ from mods import command
 from mods import connect
 from mods import context
 from mods import cq
+from mods import log
 from mods import message
 from mods import msgs
 from mods import thread
 
 
 _log = logging.getLogger(__name__)
+_stream = log.stream("msg")
 _reply = re.compile(r"^(\[CQ:reply,[^\]]+\])([\S\s]*)")
 
 
@@ -143,12 +145,12 @@ def _route(event: dict) -> str | None:
     context.set_current(event)
     chatlog = _optional("chatlog")
     if chatlog is not None:
-        print(
-            f'[{time.strftime("%H:%M:%S")}]【收到消息】',
-            end="",
-            flush=True,
-        )
-        chatlog.write(event)
+        # The prefix and the body chatlog formats are one line of terminal
+        # output, so they are one record rather than two racing writes.
+        written = chatlog.write(event)
+        if written is not None:
+            body = written.removesuffix("\n")
+            _stream.info(f'[{time.strftime("%H:%M:%S")}]【收到消息】{body}')
     if any(value in sys.argv[1:] for value in ("-l", "--log-only", "log_only")):
         return "log-only"
 

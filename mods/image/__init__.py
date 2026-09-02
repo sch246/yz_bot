@@ -26,10 +26,13 @@ from .identity import (
     valid_description_identity,
     valid_image_digest,
 )
+from mods import log
 from .vision import AUTO_IMAGE_SPLIT_PROMPT, split_long_image_data_uri
 
 
 LOAD_AFTER = ("storage",)
+
+_stream = log.stream("image")
 
 TEMP_PATH = "data/tmp_files"
 IMAGE_CACHE_MAX_IDLE_DAYS = 15
@@ -186,10 +189,9 @@ def maybe_prune_image_cache(target_dir: str = TEMP_PATH) -> int:
         aliases_removed = prune_image_uri_aliases()
         _last_cache_prune[directory] = now
         if removed or aliases_removed:
-            print(
+            _stream.info(
                 f"🧹 已清理 {removed} 个图片缓存文件、"
-                f"{aliases_removed} 条 URI alias",
-                flush=True,
+                f"{aliases_removed} 条 URI alias"
             )
         return removed
 
@@ -275,7 +277,7 @@ def _store_content_image(content: bytes, mime: str, digest: str, target_dir: str
 
 
 def _download_image_to_cache(uri: str, target_dir: str, max_bytes: int) -> tuple[str, str, str]:
-    print(f"⬇️ 正在下载图片：{_display_uri(uri)}", flush=True)
+    _stream.info(f"⬇️ 正在下载图片：{_display_uri(uri)}")
     try:
         result = subprocess.run(
             ["curl", "-k", "-L", "-s", "-H", "User-Agent: Mozilla/5.0", "--max-time", "15", "--max-filesize", str(max_bytes), uri],
@@ -288,7 +290,7 @@ def _download_image_to_cache(uri: str, target_dir: str, max_bytes: int) -> tuple
     mime, digest = _validate_image_bytes(result.stdout, max_bytes)
     resolved = _store_content_image(result.stdout, mime, digest, target_dir, max_bytes)
     cache_image_uri_digest(uri, digest)
-    print(f"✅ 图片已缓存：{_cache_summary(*resolved)}", flush=True)
+    _stream.info(f"✅ 图片已缓存：{_cache_summary(*resolved)}")
     return resolved
 
 
@@ -306,7 +308,7 @@ def _resolve_cached_network_image(uri: str, target_dir: str, max_bytes: int) -> 
             pass
         return None
     touch_image_cache(path)
-    print(f"✅ 图片内容缓存命中：{_cache_summary(path, mime, digest)}", flush=True)
+    _stream.info(f"✅ 图片内容缓存命中：{_cache_summary(path, mime, digest)}")
     return path, mime, digest
 
 
@@ -320,7 +322,7 @@ def resolve_image_with_digest(uri: str, target_dir: str = TEMP_PATH, max_bytes: 
         path, mime = _validate_image_file(file_uri_to_path(uri), max_bytes)
         digest = hash_file(path)
         cache_image_uri_digest(uri, digest)
-        print(f"✅ 本地图片已解析：{_cache_summary(path, mime, digest)}", flush=True)
+        _stream.info(f"✅ 本地图片已解析：{_cache_summary(path, mime, digest)}")
         return path, mime, digest
     if scheme not in {"http", "https"}:
         raise ValueError("图片 URI 只支持 http://、https:// 或 file://")
@@ -339,7 +341,7 @@ def resolve_image_with_digest(uri: str, target_dir: str = TEMP_PATH, max_bytes: 
                 owner = False
         if owner:
             break
-        print(f"⏳ 等待同一图片的下载任务：{_display_uri(uri)}", flush=True)
+        _stream.info(f"⏳ 等待同一图片的下载任务：{_display_uri(uri)}")
         event.wait()
         cached = _resolve_cached_network_image(uri, target_dir, max_bytes)
         if cached is not None:

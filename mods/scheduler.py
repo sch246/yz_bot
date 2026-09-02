@@ -9,11 +9,13 @@ from typing import Any
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from mods import INFRA
+from mods import INFRA, log
 
 
 PHASE = INFRA
 LOAD_AFTER = ("message", "storage")
+
+_stream = log.stream("scheduler")
 
 scheduler: BackgroundScheduler | None = None
 
@@ -35,5 +37,5 @@ def on_exit() -> None:
     global scheduler
     instance, scheduler = scheduler, None
     if instance is not None and instance.running:
-        print("Shutting down scheduler...")
+        _stream.info("正在停止 scheduler…")
         instance.shutdown(wait=True)

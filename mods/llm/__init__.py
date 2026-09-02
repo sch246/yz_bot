@@ -381,16 +381,21 @@ class LLMClient:
         message = response.choices[0].message
         reasoning_content = getattr(message, "reasoning_content", None)
         for call in message.tool_calls or []:
-            console.write(f"{message.role or 'assistant'}({model}): ", message.role or "assistant", end="")
-            console.write(call.function.name + call.function.arguments, "tool")
+            role = message.role or "assistant"
+            console.message(
+                call.function.name + call.function.arguments,
+                "tool",
+                label=f"{role}({model}): ",
+                label_role=role,
+            )
             yield LLMResponse(
                 json.dumps({"id": call.id, "type": "function", "function": {"name": call.function.name, "arguments": call.function.arguments}}, ensure_ascii=False),
                 "tool",
             )
         if message.content:
-            console.write(f"{message.role or 'assistant'}({model}): ", message.role or "assistant", end="")
-            console.write(message.content, message.role or "assistant")
-            yield LLMResponse(message.content, message.role or "assistant")
+            role = message.role or "assistant"
+            console.message(message.content, role, label=f"{role}({model}): ", label_role=role)
+            yield LLMResponse(message.content, role)
         if response.usage:
             yield LLMResponse("", "assistant", response.usage.prompt_tokens, response.usage.completion_tokens, response.usage.total_tokens)
         return LLMResponse(
@@ -453,7 +458,7 @@ class LLMClient:
                     content = f"工具调用失败: {type(error).__name__}: {error}"
                     console.error(f" -> {content}")
                 else:
-                    console.write(f" -> {content}", "tool")
+                    console.message(f" -> {content}", "tool")
                 results.append(ToolCallResult(call["id"], function["name"], function["arguments"], content))
             messages.extend({"role": "tool", "tool_call_id": result.tool_call_id, "content": result.content} for result in results)
             logged = len(messages)
