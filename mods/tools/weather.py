@@ -21,48 +21,10 @@ _weather = get_available("weather")
 if _weather is None:
     raise RuntimeError("weather module is unavailable")
 
-
-def search_city(location: str, adm: str = "", lang: str = "zh") -> list | None:
-    """检索地点，返回候选列表；其中的 id 字段是其余天气函数所需的 location ID。
-
-    @param
-    location: 地名或"经度,纬度"，例如 "杭州"、"西湖区"、"116.41,39.92"
-    adm: 上级行政区，用来消歧同名地点，例如 location="朝阳" 时传 "北京"；不需要时传空字符串
-    lang: 返回语言 enum: ["zh", "en"]
-    """
-    return _weather.search_city(location, adm, lang)
-
-
-def get_realtime_weather(location_id: str, unit: str = "m") -> dict | None:
-    """按 location ID 查询该地实时天气，返回含温度、体感、天气现象、风向风力、湿度等字段的 dict。
-
-    @param
-    location_id: search_city 返回的 id，不是地名
-    unit: 单位制，m 公制、i 英制 enum: ["m", "i"]
-    """
-    return _weather.get_realtime_weather(location_id, unit)
-
-
-def get_daily_forecast(location_id: str, days: int = 3, unit: str = "m") -> list | None:
-    """按 location ID 查询逐日预报，返回每天一项的列表，含日期、最高最低温、白天夜间天气。
-
-    @param
-    location_id: search_city 返回的 id，不是地名
-    days: 预报天数，只支持 3、7、10、15、30；其它值会被静默按 3 处理
-    unit: 单位制，m 公制、i 英制 enum: ["m", "i"]
-    """
-    return _weather.get_daily_forecast(location_id, days, unit)
-
-
-def get_hourly_forecast(location_id: str, hours: int = 24, unit: str = "m") -> list | None:
-    """按 location ID 查询逐小时预报，返回每小时一项的列表，含时间、温度、天气现象、降水概率。
-
-    @param
-    location_id: search_city 返回的 id，不是地名
-    hours: 预报小时数，只支持 24、72、168；其它值会被静默按 24 处理
-    unit: 单位制，m 公制、i 英制 enum: ["m", "i"]
-    """
-    return _weather.get_hourly_forecast(location_id, hours, unit)
+search_city = _weather.search_city
+get_realtime_weather = _weather.get_realtime_weather
+get_daily_forecast = _weather.get_daily_forecast
+get_hourly_forecast = _weather.get_hourly_forecast
 
 
 __all__ = [
