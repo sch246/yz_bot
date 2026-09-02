@@ -99,7 +99,7 @@
 | `minecraft` | `minecraft__search_mc_mod`、`minecraft__check_mod` |
 | `weather` | `weather__search_city`、`weather__get_realtime_weather`、`weather__get_daily_forecast`、`weather__get_hourly_forecast` |
 
-除 `weather` 继续投影可用的 `mods.weather` 函数外，这些文件持有各自工具的真实实现，不再从 `mods.chat` re-export。图片和子任务模块只惰性复用 `mods.chat` 的 usage/cost 入口，计费状态仍只有一份。
+除 `weather` 继续以同签名薄包装投影可用的 `mods.weather` 函数（包装只负责面向模型的描述，返回值原样透传，失败仍是 `None`）外，这些文件持有各自工具的真实实现，不再从 `mods.chat` re-export。图片和子任务模块只惰性复用 `mods.chat` 的 usage/cost 入口，计费状态仍只有一份。
 
 历史源码中有实现、但 `add_tool` 注册被明确注释的 `read_data`、群成员、农历/小六壬、跨窗口发送、`later_list/later_set`、URL 转 CQ 和百科工具，整理在 `mods/tools/disable/`。registry 不递归扫描该目录，所以它们不会进入 last-good、目录提示或任何 Chat；RAG 等只有残缺草稿或死名字的项只记录原因，不伪造可调用空壳。
 

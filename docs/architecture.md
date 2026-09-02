@@ -105,7 +105,7 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 ## LLM、图片与可观察输出
 
-`mods.llm/` 持有模型配置、client、流式响应与每请求工具快照；`mods.chat` 持有 QQ 窗口上下文、提示和聊天命令；`mods.tools` 持有统一 registry、当前 Chat 绑定以及按职责分类的真实工具实现，天气模块只投影现有 `mods.weather`；`mods.image/` 持有图片身份、缓存和视觉输入。图片与子任务工具只惰性调用 `mods.chat` 的既有 usage/cost 入口，不复制计费状态。`llm`、`tools` 和 `image` 采用文件夹 Module，是因为各自内部实现共同拥有明确状态；具体能力仍优先由普通函数表达。
+`mods.llm/` 持有模型配置、client、流式响应与每请求工具快照；`mods.chat` 持有 QQ 窗口上下文、提示和聊天命令；`mods.tools` 持有统一 registry、当前 Chat 绑定以及按职责分类的真实工具实现，天气模块只用薄包装投影现有 `mods.weather`，不复制请求逻辑，只补上面向模型的中文说明和参数约束；`mods.image/` 持有图片身份、缓存和视觉输入。图片与子任务工具只惰性调用 `mods.chat` 的既有 usage/cost 入口，不复制计费状态。`llm`、`tools` 和 `image` 采用文件夹 Module，是因为各自内部实现共同拥有明确状态；具体能力仍优先由普通函数表达。
 
 终端打印是实际运维界面的一部分：收发消息、流式 LLM 内容、工具调用、图片捕获/缓存、link/capture 命中、模块失败和生命周期进度都应保留可观察输出。应用 logger 记录诊断；chatlog 保存产品聊天历史，两者不是同一用途。
 

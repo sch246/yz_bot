@@ -1,4 +1,14 @@
-'''指导模型增删查改统一工具与 Skill 模块，并说明 last-good、显式应用和当前会话激活原理。
+'''在 Bot 进程内直接执行 Python，并增删查改统一工具与 Skill 模块。
+
+## 直接执行 Python
+
+`exec_code(expr, code)` 用的是 `.py` 命令那份共享环境：先 `exec(code)`，再 `eval(expr)`，返回 `repr(结果)`。`code` 里的 `print` 输出会被捕获后一起回传，不会发进聊天。环境跨调用持久，上一次定义的变量和函数下一次仍然在。
+
+只有当前发送者是管理员时可用，否则返回"权限不足"。
+
+环境里预置了 Bot 的全部动态导出名：`send`/`sendmsg` 发消息，`getname`/`setname`/`getstorage`/`getgroupstorage`/`memberlist` 读写身份与存储，`data` 是持久字典，`prompts` 是提示词集合，`run_action` 触发 link 动作，还有 `os`、`json`、`re`、`time`、`random`、`math`、`datetime` 等标准库；`ctx` 是模块名到模块对象的字典，各个 `mods` 模块也能直接按名字使用。不确定有什么就先自查，例如 `exec_code("sorted(k for k in globals() if not k.startswith('_'))")`。
+
+它与 Bot 共享同一个宿主信任域，不是沙箱：会真实发消息、读写磁盘、改动运行中的状态。用之前先确认没有现成工具能做这件事，并避免 `input(...)`（会阻塞等待聊天回复）和长时间运行的代码。异常以 traceback 回传，可据此修正重试。需要反复使用的能力应当沉淀成下面的工具模块，而不是每次都 `exec_code`。
 
 ## 工具模块的三层状态
 
@@ -83,11 +93,11 @@ from mods.tools import current_binding
 
 
 def exec_code(expr: str, code: str = "") -> str:
-    """执行实时 Python 代码。
+    """在 Bot 进程的共享 Python 环境中先执行 code、再求值 expr，返回 repr 结果和被捕获的 print 输出；需要管理员权限。
 
     @param
-    expr: 在 code 后求值并返回的表达式
-    code: 先执行的 Python 代码
+    expr: 在 code 之后求值并返回的单个表达式；只想执行 code、不关心返回值时传字符串 None
+    code: 先执行的 Python 语句，可以多行；不需要时传空字符串
     """
     from mods import context, op, py
 
@@ -112,24 +122,24 @@ def exec_code(expr: str, code: str = "") -> str:
 
 
 def list_tools() -> str:
-    """列出 last-good 工具模块、当前激活状态与磁盘源码变化。"""
+    """列出全部 last-good 工具模块及其一句话描述、当前聊天已激活的模块、磁盘相对 last-good 的新增/修改/删除，以及最近的加载失败 traceback。想知道有哪些模块名可用时先调用它。"""
     return current_binding().list_text()
 
 
 def reload_tools(names: list[str]) -> str:
-    """从磁盘重新加载指定模块；失败时继续保留旧 last-good 版本。
+    """从磁盘读取并应用指定模块的源码改动，逐个模块返回成功或完整 traceback；失败的模块继续沿用旧 last-good 版本。改完文件必须调用它，改动才会生效。
 
     @param
-    names: 要重新加载或显式删除的模块名
+    names: 模块名列表，不带 .py/.md 后缀，也不带 模块名__ 前缀；源文件已删除的模块要显式列在这里才会被卸载
     """
     return _format_results(current_binding().reload(names))
 
 
 def load_tools(names: list[str]) -> str:
-    """把指定 last-good 模块激活到当前聊天，不读取磁盘。
+    """把已有的 last-good 模块激活到当前聊天，让它的说明和整组函数可用；不读磁盘，因此不会应用刚改的源码。新激活的工具从下一次模型请求起才可调用。
 
     @param
-    names: 要在当前聊天中激活的模块名
+    names: 模块名列表，不带 .py/.md 后缀，也不带 模块名__ 前缀；名字来自 list_tools
     """
     return _format_results(current_binding().load(names))
 
