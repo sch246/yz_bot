@@ -8,15 +8,13 @@ from urllib.parse import urlsplit, urlunsplit
 
 from termcolor import colored
 
-from .types import MessageRole
-
 
 ROLE_COLORS = {
-    MessageRole.SYSTEM.value: "red",
-    MessageRole.USER.value: "green",
-    MessageRole.THINK.value: "yellow",
-    MessageRole.ASSISTANT.value: "blue",
-    MessageRole.TOOL.value: "magenta",
+    "system": "red",
+    "user": "green",
+    "think": "yellow",
+    "assistant": "blue",
+    "tool": "magenta",
 }
 
 _DATA_URI = re.compile(
@@ -91,15 +89,15 @@ def error(value) -> None:
 def print_request(model: str, messages: list[dict]) -> None:
     notice(f"发送给 {model} 的消息：")
     for message in messages:
-        role = message.get("role", MessageRole.SYSTEM.value)
-        if role == MessageRole.ASSISTANT.value and message.get("tool_calls"):
+        role = message.get("role", "system")
+        if role == "assistant" and message.get("tool_calls"):
             content = "\n".join(
                 call["function"]["name"] + call["function"].get("arguments", "")
                 for call in message["tool_calls"]
             )
             write(f"{role}: ", role, end="")
-            write(content, MessageRole.TOOL.value)
-        elif role == MessageRole.TOOL.value:
+            write(content, "tool")
+        elif role == "tool":
             write(f" -> {message.get('content', '')}", role)
         else:
             write(message.get("content", ""), role, prefix=True)
@@ -128,4 +126,4 @@ class StreamPrinter:
     def tool_call(self, role: str, name: str, arguments: str) -> None:
         self.finish()
         write(f"{role}({self.model}): ", role, end="")
-        write(name + arguments, MessageRole.TOOL.value)
+        write(name + arguments, "tool")

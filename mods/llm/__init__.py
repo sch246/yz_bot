@@ -22,7 +22,7 @@ from .models import (
     split_model_selection,
 )
 from .tools import Tool
-from .types import LLMResponse, MessageRole, ModelCapabilities, ToolCallResult
+from .types import LLMResponse, ModelCapabilities, ToolCallResult
 
 
 LOAD_AFTER = ("image", "storage")
@@ -380,7 +380,7 @@ class LLMClient:
         buffer = ""
         assistant_content = ""
         reasoning_content: str | None = None
-        role = MessageRole.ASSISTANT.value
+        role = "assistant"
         tool_calls: list[dict] = []
         usage = None
         output = console.StreamPrinter(model)
@@ -398,7 +398,7 @@ class LLMClient:
                 if reasoning is not None:
                     reasoning_content = (reasoning_content or "") + reasoning
                     if reasoning:
-                        output.chunk(reasoning, role, MessageRole.THINK.value)
+                        output.chunk(reasoning, role, "think")
                 if content_delta := data.get("content"):
                     output.chunk(content_delta, role)
                     assistant_content += content_delta
@@ -432,7 +432,7 @@ class LLMClient:
                     )
                     yield LLMResponse(
                         json.dumps(call, ensure_ascii=False),
-                        MessageRole.TOOL.value,
+                        "tool",
                     )
             if usage:
                 yield LLMResponse("", role, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens)
@@ -452,21 +452,21 @@ class LLMClient:
         message = response.choices[0].message
         reasoning_content = getattr(message, "reasoning_content", None)
         for call in message.tool_calls or []:
-            console.write(f"{message.role or MessageRole.ASSISTANT.value}({model}): ", message.role or MessageRole.ASSISTANT.value, end="")
-            console.write(call.function.name + call.function.arguments, MessageRole.TOOL.value)
+            console.write(f"{message.role or 'assistant'}({model}): ", message.role or "assistant", end="")
+            console.write(call.function.name + call.function.arguments, "tool")
             yield LLMResponse(
                 json.dumps({"id": call.id, "type": "function", "function": {"name": call.function.name, "arguments": call.function.arguments}}, ensure_ascii=False),
-                MessageRole.TOOL.value,
+                "tool",
             )
         if message.content:
-            console.write(f"{message.role or MessageRole.ASSISTANT.value}({model}): ", message.role or MessageRole.ASSISTANT.value, end="")
-            console.write(message.content, message.role or MessageRole.ASSISTANT.value)
-            yield LLMResponse(message.content, message.role or MessageRole.ASSISTANT.value)
+            console.write(f"{message.role or 'assistant'}({model}): ", message.role or "assistant", end="")
+            console.write(message.content, message.role or "assistant")
+            yield LLMResponse(message.content, message.role or "assistant")
         if response.usage:
-            yield LLMResponse("", MessageRole.ASSISTANT.value, response.usage.prompt_tokens, response.usage.completion_tokens, response.usage.total_tokens)
+            yield LLMResponse("", "assistant", response.usage.prompt_tokens, response.usage.completion_tokens, response.usage.total_tokens)
         return LLMResponse(
             message.content or "",
-            message.role or MessageRole.ASSISTANT.value,
+            message.role or "assistant",
             reasoning_content=reasoning_content,
         )
 
@@ -487,9 +487,9 @@ class LLMClient:
                 try:
                     chunk = next(response)
                 except StopIteration as completed:
-                    assistant = completed.value or LLMResponse("", MessageRole.ASSISTANT.value)
+                    assistant = completed.value or LLMResponse("", "assistant")
                     break
-                if chunk.role != MessageRole.TOOL.value:
+                if chunk.role != "tool":
                     yield chunk
                     continue
                 try:
@@ -521,7 +521,7 @@ class LLMClient:
                     content = f"工具调用失败: {type(error).__name__}: {error}"
                     console.error(f" -> {content}")
                 else:
-                    console.write(f" -> {content}", MessageRole.TOOL.value)
+                    console.write(f" -> {content}", "tool")
                 results.append(ToolCallResult(call["id"], function["name"], function["arguments"], content))
             messages.extend({"role": "tool", "tool_call_id": result.tool_call_id, "content": result.content} for result in results)
 
@@ -603,7 +603,7 @@ class Chat:
         except Exception as error:
             _log.exception("LLM chat failed")
             console.error(f"LLM 聊天失败：{error}")
-            result = LLMResponse(f"# {error}", MessageRole.ASSISTANT.value)
+            result = LLMResponse(f"# {error}", "assistant")
             if callback:
                 callback(result)
             return [result]
