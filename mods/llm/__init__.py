@@ -51,6 +51,75 @@ def format_image_description(uri: str, description: str | None = None) -> str:
     return f"[图片识别结果：{detail}]" if not uri or uri.startswith("data:image/") else f"[图片({uri})识别结果：{detail}]"
 
 
+_MARKDOWN_IMAGE = re.compile(r"!\[.*?\]\((.*?)\)")
+
+
+def _text_part(value: str) -> dict:
+    return {"type": "text", "text": value}
+
+
+def _image_part_uri(part: dict) -> str:
+    value = part.get("image_url", part.get("image", ""))
+    return value.get("url", "") if isinstance(value, dict) else str(value)
+
+
+def _rewrite_text_images(value: str, replace: Callable[[str], list[dict]]) -> tuple[list[dict], int]:
+    """Split one text block at its markdown images; also report how many it replaced."""
+    parts: list[dict] = []
+    position = 0
+    replaced = 0
+    for match in _MARKDOWN_IMAGE.finditer(value):
+        if match.start() > position:
+            parts.append(_text_part(value[position:match.start()]))
+        parts.extend(replace(match.group(1)))
+        replaced += 1
+        position = match.end()
+    if position < len(value) or not parts:
+        parts.append(_text_part(value[position:]))
+    if all(part.get("type") == "text" for part in parts):
+        return [_text_part("".join(part["text"] for part in parts))], replaced
+    return parts, replaced
+
+
+def _rewrite_message_images(
+    message: dict,
+    replace: Callable[[str], list[dict]],
+    *,
+    collapse_text: bool = True,
+) -> dict:
+    """Copy one message with every image, markdown or part, replaced by ``replace(uri)``.
+
+    ``collapse_text`` keeps string content a string when the result is only text,
+    which is what a text-for-image substitution wants.  The vision path passes
+    False so that a message which did contain an image stays in parts form even
+    when preparing one of them failed.
+    """
+    result = message.copy()
+    content = message.get("content")
+    if not isinstance(content, (str, list)):
+        return result
+    parts: list[dict] = []
+    replaced = 0
+    for source in content if isinstance(content, list) else [content]:
+        if isinstance(source, str):
+            text_parts, count = _rewrite_text_images(source, replace)
+            parts.extend(text_parts)
+            replaced += count
+        elif isinstance(source, dict) and source.get("type") in ("image", "image_url"):
+            parts.extend(replace(_image_part_uri(source)))
+            replaced += 1
+        else:
+            parts.append(source)
+    keep_string = (
+        isinstance(content, str)
+        and len(parts) == 1
+        and parts[0].get("type") == "text"
+        and (collapse_text or not replaced)
+    )
+    result["content"] = parts[0]["text"] if keep_string else parts
+    return result
+
+
 def split_string_with_code_blocks(value: str) -> list[str]:
     result: list[str] = []
     current: list[str] = []
@@ -125,47 +194,26 @@ class LLMClient:
 
     @staticmethod
     def _replace_images_with_text(messages: list[dict], description: str = "") -> list[dict]:
-        markdown = re.compile(r"!\[.*?\]\((.*?)\)")
-        result = []
+        def replace(uri: str) -> list[dict]:
+            if description:
+                return [_text_part(format_image_description(uri, description))]
+            return [_text_part(format_image_reference(uri))]
 
-        def replace(match: re.Match) -> str:
-            uri = match.group(1)
-            return format_image_description(uri, description) if description else format_image_reference(uri)
-
-        for source in messages:
-            message = source.copy()
-            content = source.get("content")
-            if isinstance(content, str):
-                message["content"] = markdown.sub(replace, content)
-            elif isinstance(content, list):
-                parts = []
-                for part in content:
-                    if isinstance(part, str):
-                        parts.append({"type": "text", "text": markdown.sub(replace, part)})
-                    elif isinstance(part, dict) and part.get("type") in ("image", "image_url"):
-                        value = part.get("image_url", part.get("image", ""))
-                        uri = value.get("url", "") if isinstance(value, dict) else str(value)
-                        parts.append({"type": "text", "text": format_image_description(uri, description) if description else format_image_reference(uri)})
-                    else:
-                        parts.append(part)
-                message["content"] = parts
-            result.append(message)
-        return result
+        return [_rewrite_message_images(message, replace) for message in messages]
 
     @staticmethod
     def _convert_images(messages: list[dict], convert_url: Callable[[str], str]) -> list[dict]:
-        markdown = re.compile(r"!\[(.*?)\]\((.*?)\)")
-
-        def append_image(parts: list, uri: str) -> None:
+        def replace(uri: str) -> list[dict]:
+            parts: list[dict] = []
             try:
                 console.notice(f"🖼️ 正在准备视觉图片：{console.format_uri(uri)}")
                 data_uri = uri if uri.startswith("data:") else convert_url(uri)
                 if uri and not uri.startswith("data:"):
-                    parts.append({"type": "text", "text": f"[下方图片的原始链接: {uri}]"})
+                    parts.append(_text_part(f"[下方图片的原始链接: {uri}]"))
                 slices, split = image.split_long_image_data_uri(data_uri)
                 parts.extend({"type": "image_url", "image_url": {"url": value}} for value in slices)
                 if split:
-                    parts.append({"type": "text", "text": image.AUTO_IMAGE_SPLIT_PROMPT})
+                    parts.append(_text_part(image.AUTO_IMAGE_SPLIT_PROMPT))
                     console.notice(f"✅ 长图已切分为 {len(slices)} 张视觉输入")
                 else:
                     console.notice("✅ 视觉图片已准备")
@@ -173,155 +221,34 @@ class LLMClient:
                 console.error(
                     f"❌ 图片处理失败（{console.format_uri(uri)}）：{error}"
                 )
-                parts.append({"type": "text", "text": format_image_description(uri)})
+                parts.append(_text_part(format_image_description(uri)))
+            return parts
 
         result = []
-        for source in messages:
-            if source.get("role") != "user":
-                result.extend(LLMClient._replace_images_with_text([source]))
+        for message in messages:
+            # Only user messages may carry real image parts to the provider.
+            if message.get("role") != "user":
+                result.extend(LLMClient._replace_images_with_text([message]))
                 continue
-            message = source.copy()
-            if "content" not in source:
-                result.append(message)
-                continue
-            content = source.get("content")
-            source_parts = content if isinstance(content, list) else [content]
-            output = []
-            changed = False
-            for part in source_parts:
-                if isinstance(part, str):
-                    position = 0
-                    matches = list(markdown.finditer(part))
-                    for match in matches:
-                        if match.start() > position:
-                            output.append({"type": "text", "text": part[position:match.start()]})
-                        append_image(output, match.group(2))
-                        position = match.end()
-                    if matches:
-                        changed = True
-                        if position < len(part):
-                            output.append({"type": "text", "text": part[position:]})
-                    else:
-                        output.append({"type": "text", "text": part})
-                elif isinstance(part, dict) and part.get("type") in ("image", "image_url"):
-                    value = part.get("image_url", part.get("image", ""))
-                    uri = value.get("url", "") if isinstance(value, dict) else str(value)
-                    append_image(output, uri)
-                    changed = True
-                else:
-                    output.append(part)
-            if isinstance(content, list) or changed:
-                message["content"] = output
-            result.append(message)
+            result.append(_rewrite_message_images(message, replace, collapse_text=False))
         return result
-
-    def _get_image_description(self, uri: str, vision_model: str, description_cache: dict) -> str | None:
-        identities = []
-        digest = image.get_cached_image_digest(uri)
-        if digest:
-            identities.append(digest)
-        intrinsic = image.intrinsic_image_description_identity(uri)
-        if intrinsic and intrinsic not in identities:
-            identities.append(intrinsic)
-        with self._description_lock:
-            removed = image.maybe_prune_description_cache(description_cache)
-            if removed:
-                console.notice(f"🧹 已清理 {removed} 条过期图片描述缓存")
-            for identity in identities:
-                cached = image.get_cached_description(description_cache, identity)
-                if cached is not None:
-                    algorithm = identity.partition(":")[0] if ":" in identity else "sha256"
-                    console.notice(f"✅ 图片描述缓存命中：{algorithm}")
-                    console.notice(f"    {cached}")
-                    return cached
-        if digest is None:
-            console.notice(f"🔎 正在解析图片内容：{console.format_uri(uri)}")
-            _, _, digest = image.resolve_image_with_digest(uri)
-            identities.insert(0, digest)
-        key = (id(description_cache), digest, image.AUTO_IMAGE_DESCRIPTION_VERSION)
-        with self._description_lock:
-            for identity in identities:
-                cached = image.get_cached_description(description_cache, identity)
-                if cached is not None:
-                    algorithm = identity.partition(":")[0] if ":" in identity else "sha256"
-                    console.notice(f"✅ 图片描述缓存命中：{algorithm}")
-                    console.notice(f"    {cached}")
-                    return cached
-            event = self._description_inflight.get(key)
-            owner = event is None
-            if owner:
-                event = threading.Event()
-                self._description_inflight[key] = event
-        if not owner:
-            console.notice(f"⏳ 等待同一图片的描述任务：sha256:{digest[:12]}")
-            event.wait()
-            with self._description_lock:
-                description = image.get_cached_description(description_cache, digest)
-            if description is not None:
-                console.notice(f"✅ 等待中的图片描述已缓存：sha256:{digest[:12]}")
-                console.notice(f"    {description}")
-            return description
-        try:
-            console.notice(f"👁️ 使用 {vision_model} 生成图片描述…")
-            description = self.describe_image(uri, model=vision_model)
-            if description:
-                with self._description_lock:
-                    removed = image.cache_description(description_cache, digest, description)
-                console.notice(f"✅ 图片描述已缓存：sha256:{digest[:12]}")
-                if removed:
-                    console.notice(f"🧹 已清理 {removed} 条过期图片描述缓存")
-            else:
-                console.error("⚠️ 视觉模型未返回图片描述，本次不缓存")
-            return description
-        finally:
-            with self._description_lock:
-                self._description_inflight.pop(key, None)
-                event.set()
 
     def _describe_images(self, messages: list[dict], cache: dict) -> list[dict]:
         vision_model = self.get_vision_model()
         if not vision_model:
             console.error("⚠️ 目标模型不支持视觉，且未配置可用的图片描述模型")
             return self._replace_images_with_text(messages, "图片，未配置可用的视觉模型")
-        markdown = re.compile(r"!\[.*?\]\((.*?)\)")
-        result = []
-        for source in messages:
-            message = source.copy()
-            if "content" not in source:
-                result.append(message)
-                continue
-            content = source.get("content")
-            if content is None:
-                result.append(message)
-                continue
-            parts = content if isinstance(content, list) else [content]
-            output = []
-            for part in parts:
-                if isinstance(part, str):
-                    def replace(match: re.Match) -> str:
-                        uri = match.group(1)
-                        console.notice(f"🖼️ 检查图片：{console.format_uri(uri)}")
-                        try:
-                            return format_image_description(uri, self._get_image_description(uri, vision_model, cache))
-                        except Exception as error:
-                            console.error(f"❌ 图片描述失败：{error}")
-                            return format_image_description(uri)
-                    output.append({"type": "text", "text": markdown.sub(replace, part)})
-                elif isinstance(part, dict) and part.get("type") in ("image", "image_url"):
-                    value = part.get("image_url", part.get("image", ""))
-                    uri = value.get("url", "") if isinstance(value, dict) else str(value)
-                    console.notice(f"🖼️ 检查图片：{console.format_uri(uri)}")
-                    try:
-                        description = self._get_image_description(uri, vision_model, cache)
-                    except Exception as error:
-                        console.error(f"❌ 图片描述失败：{error}")
-                        description = None
-                    output.append({"type": "text", "text": format_image_description(uri, description)})
-                else:
-                    output.append(part)
-            message["content"] = output if isinstance(content, list) else output[0]["text"]
-            result.append(message)
-        return result
+
+        def replace(uri: str) -> list[dict]:
+            console.notice(f"🖼️ 检查图片：{console.format_uri(uri)}")
+            try:
+                description = self._get_image_description(uri, vision_model, cache)
+            except Exception as error:
+                console.error(f"❌ 图片描述失败：{error}")
+                description = None
+            return [_text_part(format_image_description(uri, description))]
+
+        return [_rewrite_message_images(message, replace) for message in messages]
 
     def describe_image(self, uri: str, prompt: str = "", model: str | None = None) -> str | None:
         selection = model or self.get_vision_model()
