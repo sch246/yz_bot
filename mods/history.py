@@ -75,23 +75,40 @@ def getlog(msg: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         return []
 
 
-def is_self(msg: dict[str, Any]) -> Callable[[dict[str, Any]], bool]:
-    user_id = msg.get("user_id")
+def author(event: dict[str, Any]) -> Any:
+    """Who actually sent an event.
+
+    ``user_id`` cannot answer this.  A group event carries the sender there, but
+    a private one carries the window's peer -- including for the Bot's own
+    messages, which ``mods.message`` stamps with the peer's id -- so in a private
+    window ``user_id`` makes the Bot and the person indistinguishable.  ``sender``
+    is the field that names the author in both windows, on live events and on
+    records rebuilt from chatlog alike.
+    """
+    sender = event.get("sender")
+    if isinstance(sender, dict) and sender.get("user_id") is not None:
+        return sender["user_id"]
+    return event.get("user_id")
+
+
+def same_author(msg: dict[str, Any]) -> Callable[[dict[str, Any]], bool]:
+    """Match the messages written by whoever wrote *msg*."""
+    who = author(msg)
 
     def predicate(candidate: dict[str, Any]) -> bool:
-        return candidate.get("post_type") in ("message", "message_sent") and candidate.get("user_id") == user_id
+        return candidate.get("post_type") in ("message", "message_sent") and author(candidate) == who
 
     return predicate
 
 
 def get_self_log(msg: dict[str, Any]) -> list[dict[str, Any]]:
-    return list(filter(is_self(msg), getlog(msg)))
+    return list(filter(same_author(msg), getlog(msg)))
 
 
 def _predicate(msg: dict[str, Any], value: Callable[[dict[str, Any]], bool] | str):
     if callable(value):
         return value
-    own = is_self(msg)
+    own = same_author(msg)
     pattern = re.compile(value)
     return lambda candidate: own(candidate) and pattern.match(str(candidate.get("message", ""))) is not None
 
