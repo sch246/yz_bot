@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 from logging.handlers import TimedRotatingFileHandler
+import os
 import re
 import sys
 import threading
@@ -42,10 +43,18 @@ STREAM_ROOT = "yz"
 # was.  Narrowing is then a deliberate act rather than a later discovery.
 DEFAULT_SUBSCRIPTIONS = (STREAM_ROOT,)
 
+# One rotating file per top-level stream, so ``tail -f log/llm.log`` in a tmux
+# window is a stream and nothing else.  Sub-streams share their parent's file:
+# they exist to be subscribed separately, not to be tailed separately, and the
+# full logger name is on every line for grepping.
+LOG_ROOT = "log"
+BACKUP_DAYS = 7
+
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 _STREAM_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.]*")
 
 _handler: TimedRotatingFileHandler | None = None
+_stream_handler: _StreamFileHandler | None = None
 _console_handler: logging.StreamHandler | None = None
 _stdout: _LineAtomicStream | None = None
 _lock = threading.Lock()
@@ -209,10 +218,110 @@ class _LineAtomicStream:
         return getattr(self._stream, name)
 
 
+def _is_stream(name: str) -> bool:
+    return name == STREAM_ROOT or name.startswith(STREAM_ROOT + ".")
+
+
+def _stream_file(name: str) -> str | None:
+    """The file a stream record belongs in: ``yz.llm.request`` -> ``llm``."""
+    if not _is_stream(name):
+        return None
+    parts = name.split(".")
+    return parts[1] if len(parts) > 1 else STREAM_ROOT
+
+
+class _AttributionFilter(logging.Filter):
+    """Tag every record with the interaction its thread is currently serving.
+
+    The identity is read from ``context``, so existing and future log calls
+    carry it without one call site passing an argument.  That is the whole
+    reason this is a filter and not a parameter.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.interaction = _interaction()
+        return True
+
+
+def _interaction() -> str:
+    from mods import context
+
+    try:
+        event = context.current()
+        if event is None or event.get("user_id") is None:
+            return ""
+        group_id, user_id = context.interaction_key(event)
+    except Exception:
+        # Attribution is a convenience; never let it drop a record.
+        return ""
+    return f" [u{user_id}]" if group_id is None else f" [g{group_id} u{user_id}]"
+
+
+class _StreamFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return _is_stream(record.name)
+
+
+class _AppFilter(logging.Filter):
+    """app.log stays the severity record now that streams have their own files."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno >= logging.WARNING or not _is_stream(record.name)
+
+
+class _StreamFileHandler(logging.Handler):
+    """Fan stream records out to one rotating file each, opened on first use.
+
+    Producers register nothing: a stream gets a file the first time it says
+    anything, the same way it becomes listable in ``.log``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._files: dict[str, TimedRotatingFileHandler] = {}
+
+    def emit(self, record: logging.LogRecord) -> None:
+        name = _stream_file(record.name)
+        if name is None:
+            return
+        try:
+            self._for(name).emit(record)
+        except Exception:
+            self.handleError(record)
+
+    def _for(self, name: str) -> TimedRotatingFileHandler:
+        # ``logging`` holds this handler's lock across emit, so the map needs
+        # no lock of its own.
+        handler = self._files.get(name)
+        if handler is None:
+            os.makedirs(LOG_ROOT, exist_ok=True)
+            handler = TimedRotatingFileHandler(
+                os.path.join(LOG_ROOT, name + ".log"),
+                when="midnight",
+                interval=1,
+                backupCount=BACKUP_DAYS,
+                encoding="utf-8",
+            )
+            handler.setFormatter(self.formatter)
+            self._files[name] = handler
+        return handler
+
+    def flush(self) -> None:
+        for handler in self._files.values():
+            handler.flush()
+
+    def close(self) -> None:
+        while self._files:
+            _, handler = self._files.popitem()
+            handler.close()
+        super().close()
+
+
 class _FileFormatter(logging.Formatter):
     """Keep the file plain: producers colour for the terminal, not for evidence."""
 
     def format(self, record: logging.LogRecord) -> str:
+        record.interaction = getattr(record, "interaction", "")
         return _ANSI.sub("", super().format(record))
 
 
@@ -308,7 +417,7 @@ def run(body: str) -> str | None:
 
 
 def on_load(ctx) -> None:
-    global _handler, _console_handler, _stdout
+    global _handler, _stream_handler, _console_handler, _stdout
     with _lock:
         if _handler is not None:
             return
@@ -317,18 +426,28 @@ def on_load(ctx) -> None:
             sys.stdout = _stdout
         root = logging.getLogger()
         root.setLevel(logging.INFO)
+        attribution = _AttributionFilter()
+        formatter = _FileFormatter(
+            "%(asctime)s - %(name)s - %(levelname)s -%(interaction)s %(message)s"
+        )
         handler = TimedRotatingFileHandler(
             "app.log",
             when="midnight",
             interval=1,
-            backupCount=7,
+            backupCount=BACKUP_DAYS,
             encoding="utf-8",
         )
-        handler.setFormatter(
-            _FileFormatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-        )
+        handler.addFilter(attribution)
+        handler.addFilter(_AppFilter())
+        handler.setFormatter(formatter)
         root.addHandler(handler)
         _handler = handler
+        stream_handler = _StreamFileHandler()
+        stream_handler.addFilter(attribution)
+        stream_handler.addFilter(_StreamFilter())
+        stream_handler.setFormatter(formatter)
+        root.addHandler(stream_handler)
+        _stream_handler = stream_handler
         # The console handler writes through the wrapped stdout rather than to
         # stderr, so a warning obeys the same line ownership as everything else
         # instead of splicing itself into a reply being typed.
@@ -343,9 +462,10 @@ def on_load(ctx) -> None:
 
 
 def on_exit() -> None:
-    global _handler, _console_handler, _stdout
+    global _handler, _stream_handler, _console_handler, _stdout
     with _lock:
         handler, _handler = _handler, None
+        stream_handler, _stream_handler = _stream_handler, None
         console_handler, _console_handler = _console_handler, None
         stream, _stdout = _stdout, None
     if stream is not None:
@@ -355,8 +475,10 @@ def on_exit() -> None:
     if console_handler is not None:
         logging.getLogger().removeHandler(console_handler)
         console_handler.close()
-    if handler is None:
-        return
-    logging.getLogger().removeHandler(handler)
-    handler.flush()
-    handler.close()
+    root = logging.getLogger()
+    for closing in (stream_handler, handler):
+        if closing is None:
+            continue
+        root.removeHandler(closing)
+        closing.flush()
+        closing.close()
