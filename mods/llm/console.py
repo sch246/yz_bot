@@ -86,9 +86,13 @@ def error(value) -> None:
     print(colored(format_value(value), "red"), flush=True)
 
 
-def print_request(model: str, messages: list[dict]) -> None:
-    notice(f"发送给 {model} 的消息：")
-    for message in messages:
+def print_request(model: str, messages: list[dict], start: int = 0) -> None:
+    """Log the request; ``start`` skips what an earlier round already logged."""
+    pending = messages[start:]
+    if not pending:
+        return
+    notice(f"发送给 {model} 的{'新增' if start else ''}消息：")
+    for message in pending:
         role = message.get("role", "system")
         if role == "assistant" and message.get("tool_calls"):
             content = "\n".join(

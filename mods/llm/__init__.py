@@ -278,7 +278,7 @@ class LLMClient:
             console.notice(f"    {description}")
         return description
 
-    def generate_response(self, messages: list[dict], tools: list[Tool] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None):
+    def generate_response(self, messages: list[dict], tools: list[Tool] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None, logged: int = 0):
         selection = model or self.config["default_model"]
         provider, api_model, raw_capabilities = resolve_model(self.config, selection)
         client = self.clients.get(provider)
@@ -291,7 +291,9 @@ class LLMClient:
             messages = self._convert_images(messages, image.image_uri_to_data_uri) if capabilities.vision else self._describe_images(messages, description_cache or {})
         else:
             messages = self._replace_images_with_text(messages)
-        console.print_request(selection, messages)
+        # Image conversion is one output message per input message, so the
+        # caller's count still lines up with what is about to be sent.
+        console.print_request(selection, messages, logged)
         params = {"model": api_model, "messages": messages, "stream": stream}
         if capabilities.function_calling and tools:
             params["tools"] = [tool.description for tool in tools]
@@ -398,13 +400,16 @@ class LLMClient:
         )
 
     def chat(self, messages: list[dict], tools: list[Tool] | Callable[[], list[Tool]] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None) -> Generator[LLMResponse, None, None]:
+        # Every message appended below is printed live as it happens, so each
+        # further round only logs what it has not shown yet -- usually nothing.
+        logged = 0
         while True:
             # Freeze one tool snapshot for both the request schema and the
             # calls returned by that request. A tool may mutate this Chat's
             # mapping; the new snapshot is observed by the next iteration.
             tools_snapshot = tools() if callable(tools) else list(tools or [])
             console.notice(f"等待 {model or self.config['default_model']} 的响应…")
-            response = iter(self.generate_response(messages, tools_snapshot, tool_choice, model, stream, description_cache, do_process_image))
+            response = iter(self.generate_response(messages, tools_snapshot, tool_choice, model, stream, description_cache, do_process_image, logged))
             mapping = {tool.description["function"]["name"]: tool for tool in tools_snapshot}
             pending_calls = []
             # Yielded chunks remain the live display/tool stream.  The return
@@ -451,6 +456,7 @@ class LLMClient:
                     console.write(f" -> {content}", "tool")
                 results.append(ToolCallResult(call["id"], function["name"], function["arguments"], content))
             messages.extend({"role": "tool", "tool_call_id": result.tool_call_id, "content": result.content} for result in results)
+            logged = len(messages)
 
 
 class Chat:
