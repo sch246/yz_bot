@@ -6,6 +6,7 @@ import logging
 from logging.handlers import TimedRotatingFileHandler
 import sys
 import threading
+import time
 
 from termcolor import colored
 
@@ -17,9 +18,9 @@ PHASE = INFRA
 # performs its final save.
 LOAD_BEFORE = ("connect", "history", "storage")
 
-# One runaway producer must not hold the terminal hostage; past this many
-# characters without a newline the partial text goes out as it is.
-LINE_CAP = 1 << 16
+# A line held this long gives way: waiting output must not be stuck behind one
+# slow or hung producer.
+HOLD_LIMIT = 5.0
 
 _handler: TimedRotatingFileHandler | None = None
 _console_handler: logging.StreamHandler | None = None
@@ -31,56 +32,98 @@ _output_lock = threading.RLock()
 
 
 class _LineAtomicStream:
-    """Hold each thread's partial writes until they form whole lines.
+    """Let one thread type its line live while everyone else waits its end.
 
-    Several threads share this one terminal: the LLM stream writes deltas with
-    no newline, the listener writes a received-message prefix before chatlog
+    Several threads share this terminal: the LLM stream writes deltas with no
+    newline, the listener writes a received-message prefix before chatlog
     appends the body, and subtask workers report progress.  Writing straight
     through lets an arriving message splice itself into the middle of a model's
-    sentence.  Buffering per thread keeps every producer's line intact without
-    any of them knowing about the others, and costs the character-by-character
-    typing effect, which is a terminal affordance rather than a record.
+    sentence.
+
+    So the thread holding an unfinished line owns the terminal and keeps writing
+    through it -- the character-by-character effect is the point and survives
+    intact -- while other threads' finished lines queue up and go out the moment
+    that line ends.  Deferring the interrupters rather than buffering the writer
+    is what keeps live typing; the cost is that background lines can appear a
+    little late, and after the reply they arrived during.
+
+    A line held past ``HOLD_LIMIT`` is cut short so nothing waits indefinitely.
+    That check runs on each write, which is enough because the owner writes
+    continuously; if it stops writing entirely, the next output of any kind
+    releases the queue.
     """
 
     def __init__(self, stream) -> None:
         self._stream = stream
-        self._pending: dict[int, str] = {}
+        self._owner: int | None = None
+        self._owner_since = 0.0
+        self._tail = ""                       # the owner's unfinished line
+        self._pending: dict[int, str] = {}    # other threads' unfinished lines
+        self._queue: list[str] = []           # finished lines awaiting the owner
 
     def write(self, value: str) -> int:
         if not value:
             return 0
         with _output_lock:
             key = threading.get_ident()
-            pending = self._pending.get(key, "") + value
-            head, separator, tail = pending.rpartition("\n")
-            if separator:
-                text, pending = head + separator, tail
-            elif len(pending) >= LINE_CAP:
-                text, pending = pending, ""
+            if self._owner is None or self._owner == key:
+                self._write_through(key, value)
             else:
-                text = ""
-            if pending:
-                self._pending[key] = pending
-            else:
-                self._pending.pop(key, None)
-            if text:
-                self._stream.write(text)
-                self._stream.flush()
+                self._hold(key, value)
+            self._break_stale_line()
         return len(value)
 
+    def _write_through(self, key: int, value: str) -> None:
+        self._stream.write(value)
+        self._stream.flush()
+        self._tail = (self._tail + value).rpartition("\n")[2]
+        if not self._tail:
+            self._owner = None
+            self._release()
+        elif self._owner is None:
+            self._owner, self._owner_since = key, time.monotonic()
+
+    def _hold(self, key: int, value: str) -> None:
+        head, separator, tail = (self._pending.get(key, "") + value).rpartition("\n")
+        if separator:
+            self._queue.append(head + separator)
+        if tail:
+            self._pending[key] = tail
+        else:
+            self._pending.pop(key, None)
+
+    def _release(self) -> None:
+        if not self._queue:
+            return
+        self._stream.write("".join(self._queue))
+        self._stream.flush()
+        self._queue.clear()
+
+    def _break_stale_line(self) -> None:
+        if not self._queue or self._owner is None:
+            return
+        if time.monotonic() - self._owner_since < HOLD_LIMIT:
+            return
+        # End the held line here and let its writer continue on the next one.
+        self._stream.write("\n")
+        self._tail = ""
+        self._owner = None
+        self._release()
+
     def flush(self) -> None:
-        # A partial line stays pending: flushing it is what this class exists
-        # to prevent.  Only the underlying stream is pushed along.
         with _output_lock:
             self._stream.flush()
 
     def drain(self) -> None:
-        """Emit what never reached a newline, so exiting loses nothing."""
+        """Finish the held line and send everything still waiting."""
         with _output_lock:
+            if self._tail:
+                self._stream.write("\n")
+                self._tail = ""
+            self._owner = None
             for key in sorted(self._pending):
-                text = self._pending.pop(key)
-                if text:
-                    self._stream.write(text + "\n")
+                self._queue.append(self._pending.pop(key) + "\n")
+            self._release()
             self._stream.flush()
 
     def __getattr__(self, name: str):

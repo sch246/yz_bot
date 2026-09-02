@@ -60,7 +60,7 @@ uv run --frozen python run.py --smoke
 
 检查追踪 Python 源码时应读取文件并调用 `compile()`，或执行 `uv run --frozen python run.py --check`。import `mods` 本身不再触发加载，可以安全地 import 子模块调用纯函数；但仍然不要 import `main.py` 或调用 `mods.boot()`，那才是真正绑定监听端口、起调度线程、载入真实 storage 并注册退出写入的一步。当前追踪源码可以在把 `SyntaxWarning` 提升为错误的条件下完成纯编译；正则、替换模板和命令匹配中的反斜杠应使用 raw string 或双反斜杠表达。
 
-终端输出按行原子：`mods.log` 在加载时把 `sys.stdout` 换成按线程缓冲的包装，每个产出者的部分写入攒到换行才落屏，日志的 console handler 共享同一把锁。因此多线程（监听、聊天、子任务、storage 同步）不会再互相插进对方的半行里，代价是模型回复不再逐字出现，而是成行出现；退出时会把没有换行的残留补一行输出。
+终端输出按行原子：`mods.log` 在加载时包装 `sys.stdout`，让正在写半行的线程独占终端并继续直写——模型回复仍然逐字出现——其余线程写完整的行先排队，等这一行结束再输出；日志的 console handler 共享同一把锁。因此多线程（监听、聊天、子任务、storage 同步）不会再互相插进对方的半行里，代价是后台的行可能稍晚出现，且排在它们到达时那条回复之后。一行被持有超过 `mods.log.HOLD_LIMIT`（默认 5 秒）时会就地断行让路，回复在下一行继续；退出时会把没有换行的残留补完。
 
 终端中的警告位置需要区分：`某文件.py:<行号>` 指向普通源码；`<string>:1: SyntaxWarning: invalid escape sequence '\d'` 表示 `eval()`/`exec()` 正在编译动态字符串。后者可能来自聊天中的 `.py`/LLM 工具参数、link action，或 `data/pyload.py` 等以字符串方式执行的设备级源码，不能据此反推追踪文件仍有同一问题。`mods/tools/<name>.py` 则以真实文件名编译；其语法、顶层执行或 schema 校验错误会在 `reload_tools` 结果和应用日志中保留完整 traceback，旧 last-good 版本继续服务。正则中的数字模式应写成 `r'\d'`，需要普通字符串反斜杠时写成 `'\\d'`。
 
