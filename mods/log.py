@@ -18,9 +18,10 @@ PHASE = INFRA
 # performs its final save.
 LOAD_BEFORE = ("connect", "history", "storage")
 
-# A line held this long gives way: waiting output must not be stuck behind one
-# slow or hung producer.
-HOLD_LIMIT = 5.0
+# Every write renews the holder's lease on the terminal.  A slow but still
+# typing producer keeps renewing and keeps its line; a stuck one lets the lease
+# expire and stops blocking everyone else.
+LINE_LEASE = 5.0
 
 _handler: TimedRotatingFileHandler | None = None
 _console_handler: logging.StreamHandler | None = None
@@ -47,50 +48,69 @@ class _LineAtomicStream:
     is what keeps live typing; the cost is that background lines can appear a
     little late, and after the reply they arrived during.
 
-    A line held past ``HOLD_LIMIT`` is cut short so nothing waits indefinitely.
-    That check runs on each write, which is enough because the owner writes
-    continuously; if it stops writing entirely, the next output of any kind
-    releases the queue.
+    Holding is a lease that every write renews for ``LINE_LEASE``: a slow but
+    still typing holder keeps its line, while a stuck one lets the lease run out
+    and gives way to whatever is waiting.  A holder that died mid-line gives way
+    immediately.  Both are noticed on the next write by another thread, which is
+    the first moment anyone is waiting to be seen.  The holder is tracked by
+    thread object rather than by ``get_ident()``, whose values are recycled once
+    a thread exits -- a new thread inheriting the number would otherwise be
+    taken for the old one and write into its abandoned line.
     """
 
     def __init__(self, stream) -> None:
         self._stream = stream
-        self._owner: int | None = None
-        self._owner_since = 0.0
-        self._tail = ""                       # the owner's unfinished line
-        self._pending: dict[int, str] = {}    # other threads' unfinished lines
-        self._queue: list[str] = []           # finished lines awaiting the owner
+        self._owner: threading.Thread | None = None
+        self._lease_until = 0.0                          # renewed by each write
+        self._tail = ""                                  # the holder's unfinished line
+        self._pending: dict[threading.Thread, str] = {}  # other threads' unfinished lines
+        self._queue: list[str] = []                      # finished lines awaiting the holder
 
     def write(self, value: str) -> int:
         if not value:
             return 0
         with _output_lock:
-            key = threading.get_ident()
-            if self._owner is None or self._owner == key:
-                self._write_through(key, value)
+            thread = threading.current_thread()
+            if self._owner is None or self._owner is thread:
+                self._write_through(thread, value)
             else:
-                self._hold(key, value)
-            self._break_stale_line()
+                self._hold(thread, value)
+                self._expire()
         return len(value)
 
-    def _write_through(self, key: int, value: str) -> None:
+    def _write_through(self, thread: threading.Thread, value: str) -> None:
         self._stream.write(value)
         self._stream.flush()
         self._tail = (self._tail + value).rpartition("\n")[2]
-        if not self._tail:
+        if self._tail:
+            self._owner = thread
+            self._lease_until = time.monotonic() + LINE_LEASE
+        else:
             self._owner = None
             self._release()
-        elif self._owner is None:
-            self._owner, self._owner_since = key, time.monotonic()
 
-    def _hold(self, key: int, value: str) -> None:
-        head, separator, tail = (self._pending.get(key, "") + value).rpartition("\n")
+    def _hold(self, thread: threading.Thread, value: str) -> None:
+        head, separator, tail = (self._pending.get(thread, "") + value).rpartition("\n")
         if separator:
             self._queue.append(head + separator)
         if tail:
-            self._pending[key] = tail
+            self._pending[thread] = tail
         else:
-            self._pending.pop(key, None)
+            self._pending.pop(thread, None)
+
+    def _expire(self) -> None:
+        """End the held line when its holder is gone, or stuck with output waiting."""
+        alive = self._owner.is_alive()
+        if alive and (time.monotonic() < self._lease_until or not self._queue):
+            return
+        self._cut()
+
+    def _cut(self) -> None:
+        if self._tail:
+            self._stream.write("\n")
+            self._tail = ""
+        self._owner = None
+        self._release()
 
     def _release(self) -> None:
         if not self._queue:
@@ -99,17 +119,6 @@ class _LineAtomicStream:
         self._stream.flush()
         self._queue.clear()
 
-    def _break_stale_line(self) -> None:
-        if not self._queue or self._owner is None:
-            return
-        if time.monotonic() - self._owner_since < HOLD_LIMIT:
-            return
-        # End the held line here and let its writer continue on the next one.
-        self._stream.write("\n")
-        self._tail = ""
-        self._owner = None
-        self._release()
-
     def flush(self) -> None:
         with _output_lock:
             self._stream.flush()
@@ -117,13 +126,9 @@ class _LineAtomicStream:
     def drain(self) -> None:
         """Finish the held line and send everything still waiting."""
         with _output_lock:
-            if self._tail:
-                self._stream.write("\n")
-                self._tail = ""
-            self._owner = None
-            for key in sorted(self._pending):
-                self._queue.append(self._pending.pop(key) + "\n")
-            self._release()
+            for thread in list(self._pending):
+                self._queue.append(self._pending.pop(thread) + "\n")
+            self._cut()
             self._stream.flush()
 
     def __getattr__(self, name: str):
