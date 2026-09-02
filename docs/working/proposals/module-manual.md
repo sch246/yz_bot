@@ -67,7 +67,7 @@
 | `thread.py` | `to_thread`、`SimpleFuture` 和受 Ctrl+C 控制的线程包装 | 不启动后台业务任务 | `_code/s3/thread.py` | 纯定义 |
 | `log.py` | 进程日志格式和唯一 handler 配置 | 不写 QQ 聊天记录 | `_code/s3/__logging.py`；旧 `_code/s3/log.py` 不保留第二套实现 | `PHASE = INFRA`；`on_load` 安装 handler，`on_exit` flush/close |
 | `context.py` | 当前线程事件、最近一条事件、交互线 key 与等待下一次输入的 continuation | 不保存窗口历史，不查询用户资料 | `_code/bot/cache.py` 的 `msgs_this`、`thismsg`、`catches`；`_code/main.py` 的 `msg_id` | 纯内存状态；generator 与 `.py input()` 共用可取消的等待登记 |
-| `history.py` | 每群/私聊最近 256 条消息、退出恢复缓存、`getlog`/`same_times`/`any_same`/`get_one` | 不写完整聊天日志，不保存 LLM 会话对象 | `_code/bot/cache.py` 的 `msgs` 与查询；`_code/funcs.py` 的 `match`、`getlog`、`msglog` | `PHASE = INFRA`；在 storage 后恢复，使退出时先保存近期缓存、再保存 storage，日志最后关闭 |
+| `history.py` | 每群/私聊最近 256 条消息、退出恢复缓存、窗口键 `window`、作者 `author`、`getlog`（带 `since`/`until` 时转 `chatlog.read_range` 读文件）/`same_times`/`any_same`/`get_one` | 不写完整聊天日志，不解析日志文件，不保存 LLM 会话对象 | `_code/bot/cache.py` 的 `msgs` 与查询；`_code/funcs.py` 的 `match`、`getlog`、`msglog` | `PHASE = INFRA`；在 storage 后恢复，使退出时先保存近期缓存、再保存 storage，日志最后关闭 |
 | `identity.py` | Bot 自身资料、用户/群资料缓存、名字与群名、群成员、用户/群 storage 便捷函数 | 不决定管理员权限 | `_code/bot/cache.py` 的资料缓存；`_code/funcs.py` 的 `ensure_*`、`get/setname`、`get/setgroupname`、`memberlist`、`headshot` | `PHASE = INFRA`，在 `connect` 后完成登录与首次昵称配置 |
 | `message.py` | `send()`、当前窗口 `sendmsg()`、内部事件 `recvmsg()`、发送节流，以及发送后的日志回写 | 不决定路由优先级 | `_code/main.py` 的 `send`；`_code/funcs.py` 的 `sendmsg`、`recvmsg`；`_code/s3/delay_func.py` | `PHASE = INFRA`；发送线程仍按需启动，生命周期顺序只保证 scheduler 先停、队列再排空、storage 最后保存 |
 | `chatlog.py` | 按群/私聊写完整聊天日志、格式化 notice、把事件加入近期历史 | 不提供近期查询和 LLM 上下文裁剪 | `_code/bot/chatlog.py` | 无后台任务 |

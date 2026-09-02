@@ -78,14 +78,41 @@ def window(event: dict[str, Any]) -> tuple[str, Any] | None:
     return ("private", user_id) if user_id is not None else None
 
 
-def getlog(msg: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    if msg is None:
-        msg = _current()
-    key = window(msg)
+def getlog(
+    msg: dict[str, Any] | tuple[str, Any] | None = None,
+    *,
+    since: int | None = None,
+    until: int | None = None,
+) -> list[dict[str, Any]]:
+    """One window's events, newest first.
+
+    Without a range this is what it has always been: one dict lookup returning
+    the live in-memory list, which the hot callers (``op``, ``post``, ``link``,
+    ``.py``) depend on being free.
+
+    With ``since`` and/or ``until`` -- inclusive epoch seconds -- it reads the
+    chatlog files instead and returns a **new** list of rebuilt records.  The
+    files are the authority: ``chatlog`` appends before it calls ``add_msg``, so
+    disk is never behind memory and there is nothing to merge.  Rebuilt records
+    carry ``_source``/``_derived``/``_missing`` and so are distinguishable from
+    live events; they also still include messages that were later recalled,
+    because the tree is append-only.  Reading files can raise ``OSError``, which
+    is exactly why the range is spelled out in the call and not inferred.
+
+    *msg* may be an event, a ``window()`` key, or omitted for the current event.
+    """
+    if isinstance(msg, tuple):
+        key: tuple[str, Any] | None = msg
+    else:
+        key = window(_current() if msg is None else msg)
     if key is None:
         return []
-    with _lock:
-        return msgs[key[0]].setdefault(key[1], [])
+    if since is None and until is None:
+        with _lock:
+            return msgs[key[0]].setdefault(key[1], [])
+    from mods import chatlog
+
+    return chatlog.read_range(key[0], key[1], since=since, until=until)
 
 
 def author(event: dict[str, Any]) -> Any:

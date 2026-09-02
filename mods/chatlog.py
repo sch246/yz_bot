@@ -546,3 +546,123 @@ def parse_log(
             _message_record(head, _deltab("\n".join(body)), kind, target, day, bot_id, _version_of(head, kind, version))
         )
     return records
+
+
+# --- range reading ----------------------------------------------------------
+#
+# The file tree is the authority: ``_group_write`` appends before
+# ``history.add_msg``, so every event that ever reached memory is on disk first.
+# A range query therefore reads files only -- there is nothing to merge, and no
+# window boundary to get wrong.
+
+
+def window_path(kind: str, target: int | str | None = None, root: str | os.PathLike | None = None) -> Path:
+    """The directory one window's day files live in; the inverse of ``window_of``."""
+    base = Path(rootfile if root is None else root)
+    if kind == "bot":
+        return base / "bot"
+    if kind not in ("group", "private"):
+        raise ValueError(f"未知窗口类型：{kind}")
+    return base / kind / str(target)
+
+
+def _day_bounds(day: tuple[int, int, int]) -> tuple[int, int]:
+    """The local-time half-open interval one day file covers."""
+    year, month, number = day
+    # mktime normalises an out-of-range day number, so ``number + 1`` rolls the
+    # month over on its own, and a DST day is 23 or 25 hours as it should be.
+    start = int(time.mktime((year, month, number, 0, 0, 0, 0, 0, -1)))
+    end = int(time.mktime((year, month, number + 1, 0, 0, 0, 0, 0, -1)))
+    return start, end
+
+
+def _switch_moment() -> int | None:
+    from mods import storage
+
+    value = storage.get(rootfile, "format", lambda: {}).get("v1_since")
+    return int(value) if value is not None else None
+
+
+def _day_version(start: int, end: int, switch: int | None) -> str | None:
+    """Which format a whole day file is in, or ``None`` when it straddles.
+
+    A straddling day gets no hint, which means group records in it are read as
+    v0 -- their body marked a projection when part of the day's is raw.  That is
+    the safe direction (under-claiming fidelity) and it affects the single day
+    the switch happened on; private records still tell the reader themselves.
+    """
+    if switch is None:
+        return V0
+    if start >= switch:
+        return V1
+    if end <= switch:
+        return V0
+    return None
+
+
+def read_range(
+    kind: str,
+    target: int | str | None = None,
+    *,
+    since: int | None = None,
+    until: int | None = None,
+    bot_id: int | None = None,
+    root: str | os.PathLike | None = None,
+) -> list[dict[str, Any]]:
+    """Rebuild one window's records for a time range, newest first.
+
+    The order is the append order reversed, not a sort by ``time``: the log
+    means "this was written after that", and a record the parser could not
+    timestamp still has a place in it.  Bounds are inclusive epoch seconds;
+    ``None`` means open.  Records the parser
+    could not place in time (an unstamped legacy line) are dropped as soon as
+    either bound is set -- a time range cannot answer for them -- and kept when
+    both are open, which applies no filter at all.
+
+    Everything returned carries ``_source``/``_derived``/``_missing``, so a
+    caller can tell a rebuilt record from a live event.  Two differences from
+    ``history.getlog()`` are inherent to reading files rather than memory:
+    recalled messages are still here (the tree is append-only; the recall is a
+    separate notice line), and notices are the opaque prose ``write`` produced.
+    """
+    directory = window_path(kind, target, root)
+    if not directory.is_dir():
+        return []
+    if bot_id is None:
+        try:
+            bot_id = identity.bot_id()
+        except Exception:
+            bot_id = None
+    switch = _switch_moment()
+    records: list[dict[str, Any]] = []
+    for path in sorted(directory.rglob("*.log")):
+        day = day_of(path)
+        if day is None:
+            continue
+        start, end = _day_bounds(day)
+        if since is not None and end <= since:
+            continue
+        if until is not None and start > until:
+            continue
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError:
+            logger.exception("读取 chatlog 文件失败：%s", path)
+            continue
+        parsed = parse_log(
+            content,
+            kind=kind,
+            target=None if kind == "bot" else int(target),
+            day=day,
+            bot_id=bot_id,
+            version=_day_version(start, end, switch),
+        )
+        for record in parsed:
+            when = record.get("time")
+            if since is not None and (when is None or when < since):
+                continue
+            if until is not None and (when is None or when > until):
+                continue
+            records.append(record)
+    records.reverse()
+    return records
