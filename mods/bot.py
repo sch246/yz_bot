@@ -149,7 +149,7 @@ def _route(event: dict) -> str | None:
         # output, so they are one record rather than two racing writes.
         written = chatlog.write(event)
         if written is not None:
-            body = written.removesuffix("\n")
+            body = chatlog.display(written).removesuffix("\n")
             _stream.info(f'[{time.strftime("%H:%M:%S")}]【收到消息】{body}')
     if any(value in sys.argv[1:] for value in ("-l", "--log-only", "log_only")):
         return "log-only"

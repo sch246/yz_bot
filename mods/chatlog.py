@@ -14,9 +14,23 @@ from mods import cq, history, identity
 
 
 PHASE = INFRA
-LOAD_AFTER = ("history", "identity")
+LOAD_AFTER = ("storage", "history", "identity")
 rootfile = "chatlog"
 logger = logging.getLogger(__name__)
+
+
+def on_load(_ctx: dict[str, Any] | None = None) -> None:
+    """Stamp the moment v1 writing began.
+
+    Every record from this boot on stores the raw body and a private sender id;
+    everything before it does not.  Only this moment knows where the line falls,
+    so it is written down now even though the reader (the range query) does not
+    exist yet -- afterwards the fact is unrecoverable.
+    """
+    from mods import storage
+
+    marker = storage.get(rootfile, "format", lambda: {})
+    marker.setdefault("v1_since", int(time.time()))
 
 
 def search_current(pattern: str) -> str:
@@ -38,8 +52,9 @@ def search_current(pattern: str) -> str:
         try:
             with path.open(encoding="utf-8") as stream:
                 for line_number, line in enumerate(stream, 1):
-                    if expression.search(line):
-                        matches.append(f"{path}:{line_number}:{line.rstrip()}")
+                    shown = display(line)
+                    if expression.search(shown):
+                        matches.append(f"{path}:{line_number}:{shown.rstrip()}")
         except OSError:
             continue
     return "\n".join(matches)
@@ -49,6 +64,20 @@ def _unescape(text: Any) -> str:
     value = str(text)
     unescape = getattr(cq, "unescape", None)
     return unescape(value) if callable(unescape) else value
+
+
+def display(record: str) -> str:
+    """The reader-facing projection of stored records: bodies unescaped.
+
+    v1 stores the raw OneBot body, because unescaping destroys the difference
+    between a real CQ code and a user typing one.  Everything that shows a
+    record to a person -- the terminal echo, ``.search`` -- goes through here,
+    so what a reader sees is unchanged while the file keeps the fact.
+
+    Only indented body lines are unescaped; a record head is the formatter's
+    own text and never carries entities of its own.
+    """
+    return "\n".join(_unescape(line) if line.startswith("    ") else line for line in record.split("\n"))
 
 
 def _append(path: str, text: str) -> str:
@@ -173,23 +202,16 @@ def _message(msg: dict[str, Any]) -> str:
         msg["sender"] = sender
     identity.update(msg)
     sender_id = int(sender.get("user_id", msg["user_id"]))
-    text = _unescape(msg.get("message", ""))
-    message_id = msg.get("message_id", "")
     if "group_id" in msg:
         group_id = int(msg["group_id"])
         title, display = identity.get_group_user_info(group_id, sender_id)
-        return _group_write(
-            msg,
-            group_id,
-            _group_str(title, display, sender_id, timestamp, text, message_id),
-        )
+        return _group_write(msg, group_id, format_message(msg, display, title))
     window_user = int(msg.get("user_id", sender_id))
     display = identity.get_user_name(sender_id)
-    return _private_write(
-        msg,
-        window_user,
-        _private_str(display, timestamp, text, message_id),
-    )
+    # v1: a private record carries the sender the way a group record always did.
+    # Without it the Bot's own line and the peer's line differ only by a nickname
+    # anyone can change, so a private window has no reliable author at all.
+    return _private_write(msg, window_user, format_message(msg, display))
 
 
 def _notice(msg: dict[str, Any]) -> str | None:

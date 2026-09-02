@@ -54,7 +54,7 @@ def _chatlog_write(event: dict) -> None:
     if chatlog is not None:
         written = chatlog.write(event)
         if written is not None:
-            body = written.removesuffix("\n")
+            body = chatlog.display(written).removesuffix("\n")
             _stream.info(f'[{time.strftime("%H:%M:%S")}]【发送消息】{body}')
 
 

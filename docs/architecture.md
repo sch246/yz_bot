@@ -44,6 +44,8 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 当前事件与等待下一条输入由 `mods.context` 持有；近期 256 条窗口事件由 `mods.history` 持有；完整可读聊天历史由 `mods.chatlog` 追加写入。三者职责不同，不能相互替代。
 
+`chatlog` 的记录形状是「记录头顶格、正文缩进 4 格」：`【头衔】名字(QQ号) 时:分:秒 | 消息号`，私聊同形但没有 `【头衔】`。正文存 OneBot 原始串，末尾空白按规则清除；`chatlog.display()` 是唯一的显示投影，终端回显和 `.search` 都经过它把正文 unescape 回可读形式，因此人看到的内容与切换前一致，而文件保留的是事实。`format_message` 与 `parse_log` 是互逆的一对纯函数，`parse_log` 同时能读切换前的旧记录并用 `_derived`/`_missing` 标出哪些字段是推导值、哪些根本没写下来。切换时刻记在 `storage` 的 `chatlog/format`。历史记录只读，不重写；旧记录缺私聊发送者身份，这一缺口的确切大小和其余取舍见[统一消息模型](working/proposals/message-model.md)。
+
 ## 命令：函数就是入口
 
 命令由无参数 `@command` 注册。命令名从模块名和函数名机械派生：
