@@ -75,7 +75,7 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 `meta.py` 是唯一默认激活的必需模块，保存工具维护说明并导出 `exec_code`、`list_tools`、`reload_tools`、`load_tools` 四个无前缀恢复入口。`__init__.py` 只持有 registry、last-good 和 per-Chat binding 机制；它不再伪装成工具格式。`meta` 调用通过一次调用范围内的 `ContextVar` 取得当前 binding，多 Chat 和 `assign_tasks` 工作线程不会共享错误会话；磁盘删除 `meta.py` 的 reload 会失败并保留旧 last-good。
 
-可用模块的第一行描述从一开始就在同一条 system 提示中；激活时原地更新这条既有消息，并修改当前 Chat 的工具映射。每个 LLM 子请求仍冻结一份工具快照，同一份快照同时决定请求 schema 和响应调用解析，所以加载或重载只从下一子请求起生效，不改写已发出的请求或同一响应中的其它调用。`mods/tools/disable/` 保存有实现但被历史注册明确禁用的标准模块；顶层 scanner 不递归，因此这些文件不会进入 registry 或 Chat。
+可用模块的第一行描述从一开始就在同一条 system 提示中；激活时原地更新这条既有消息，并修改当前 Chat 的工具映射。每个 LLM 子请求仍冻结一份工具快照，同一份快照同时决定请求 schema 和响应调用解析，所以加载或重载只从下一子请求起生效，不改写已发出的请求或同一响应中的其它调用。`mods/tools/disable/README.md` 只保存历史上被明确禁用的工具的决策记录，不再保存它们的实现。
 
 提示词没有新增编辑管理器；`.py` 共享环境继续暴露可变 `prompts` 对象，模型需要时可自己编写工具编辑它。
 
