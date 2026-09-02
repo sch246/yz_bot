@@ -66,7 +66,12 @@ def latest() -> dict | None:
 
 
 def interaction_key(event: dict | None = None) -> tuple[Any, Any]:
-    """Return ``(group, user)``; private conversations use ``None`` as group."""
+    """Return ``(group, user)``; private conversations use ``None`` as group.
+
+    One line of interaction, not one chat window: two people in the same group
+    have different keys here, which is what lets a ``yield`` wait for the right
+    person.  ``history.window`` is the other one, and keys the shared history.
+    """
     event = current() if event is None else event
     if event is None or event.get("user_id") is None:
         raise RuntimeError("the current event has no interaction line")

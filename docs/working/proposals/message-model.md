@@ -1,6 +1,6 @@
 # 统一消息模型：窗口、正文与双向转换
 
-> 状态：第 1-3 步已实施，第 4-7 步未实现。当前事实见[运行架构](../../architecture.md)，用户可见语义见[交互模型](../../interaction-model.md)。
+> 状态：第 1-4 步已实施，第 5-7 步未实现。当前事实见[运行架构](../../architecture.md)，用户可见语义见[交互模型](../../interaction-model.md)。
 > 本篇取代 [Storage 加载校验与历史恢复](storage-and-history.md#chatlog-双向恢复) 里那一节的概述；那篇继续负责 storage 的加载校验。
 
 一句话：`chatlog` 已经是聊天历史的唯一写入点，但它写下去的东西还不足以再读回来。本篇定义读回来所需的**最小事实集**，并据此收掉一份重复的持久化。
@@ -146,7 +146,11 @@
 1. ~~**修 `cq.unescape` 的替换顺序。**~~（已实施）`mods/text.py` 的 `replace_by_dic2` 改为倒序遍历——这正是「撤销 `replace_by_dic`」的定义，`&amp;` 因此最后还原。`escape` 方向不变。实测 `unescape(escape(x)) == x` 对字面文本全部成立，包括先前会塌成 `[` 的 `&#91;`。
 2. **纵向切片：`format_message` 与 `parse_log` 两个纯函数**（已实施；差分已跑过一轮，分类待复跑）。`mods/chatlog.py` 末尾新增，`write()` 一行未动，因此运行行为不变。合成往返 68/68 精确，覆盖伪造记录头的正文、字面 CQ 文本、`&amp;#91;`、内部空行、空正文、相邻空正文记录和末尾空行；v0 行可读且如实标注缺口。真实数据的结果见下节。
 3. ~~**切到 v1 写入**~~（已实施）：`_message` 改为唯一走 `format_message`，私聊行补 id，正文存原始形式；`chatlog.display()` 承担显示投影，终端回显与 `.search` 都经过它，`.search` 因此仍按用户看到的文本匹配。`on_load` 把切换时刻记进 `storage` 的 `chatlog/format`——只有这一刻知道分界线在哪，事后无法恢复。差分：群聊终端回显 8/8 与切换前逐字相同（末尾空白除外，那正是规则）；文件字节只在正文含 `&`/`[`/`]` 时改变。
-4. **窗口键**：把 `history` 的 `(kind, uid)` 与 `chatlog` 的路径收敛成一处，同时修 `history.is_self` 在私聊里的语义。
+4. ~~**窗口键**~~（已实施）：`history.window(event)` 成为窗口的唯一推导，`getlog`、`remove_message` 和 `chatlog._message` 都用它，顺带修掉 `group_id` 存在但为 `None` 时旧的 `"group_id" in msg` 会崩的边角。`context.interaction_key` 的 docstring 补上与它的对照，两者不合并。
+
+   同一步把 `is_self` 改名 `same_author` 并改按 `sender` 判定作者：`user_id` 在私聊里是窗口对端而不是发送者，Bot 自己的消息也带对端 id，因此私聊窗口里两者无法区分。**用户可见的变化只有一处**：私聊里 `.cave addn -<n>` 之前会把柚子的回复合并进回声洞、并漏掉最早的一条，现在只收发起者自己的消息；群聊逐字不变。
+
+   这个缺陷不是迁移引入的。迁移前 `_code/main.py` 的发送路径（私聊 `self_msg['user_id'] = user_id`）、`_code/bot/cache.py` 的 `IsSelf`（`m['user_id'] == msg['user_id']`）和 `_code/bot/cmds/cave.py` 的 `addn` 与现在逐字同构，所以私聊的 `.cave addn -<n>` 一直是坏的；`.cave add` 与 `.cave addn <正数>` 不走这条路径，始终正常。
 5. **范围查询**：`getlog(window, since=..., until=...)`，重建结果带来源标记。
 6. **`cache_msgs` 降级或删除**，以第 5 步的实际启动耗时决定。
 7. **search 改为按记录返回**，随后才谈是否给 LLM 开只读工具。

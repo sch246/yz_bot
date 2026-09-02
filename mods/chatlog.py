@@ -202,11 +202,12 @@ def _message(msg: dict[str, Any]) -> str:
         msg["sender"] = sender
     identity.update(msg)
     sender_id = int(sender.get("user_id", msg["user_id"]))
-    if "group_id" in msg:
-        group_id = int(msg["group_id"])
+    kind, target = history.window(msg) or ("private", sender_id)
+    if kind == "group":
+        group_id = int(target)
         title, display = identity.get_group_user_info(group_id, sender_id)
         return _group_write(msg, group_id, format_message(msg, display, title))
-    window_user = int(msg.get("user_id", sender_id))
+    window_user = int(target)
     display = identity.get_user_name(sender_id)
     # v1: a private record carries the sender the way a group record always did.
     # Without it the Bot's own line and the peer's line differ only by a nickname

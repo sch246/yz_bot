@@ -63,16 +63,29 @@ def _current() -> dict[str, Any]:
     raise RuntimeError("context 未提供当前消息接口")
 
 
+def window(event: dict[str, Any]) -> tuple[str, Any] | None:
+    """The chat window an event belongs to: one group, or one private peer.
+
+    This is the key both the recent-history dict and the chatlog directory tree
+    are organised by, and it used to be spelled out separately in each.  It is
+    *not* ``context.interaction_key``, which identifies one line of interaction
+    -- a single person inside a window -- so that a ``yield`` knows whose next
+    message it is waiting for.  A window has many lines.
+    """
+    if event.get("group_id") is not None:
+        return "group", event["group_id"]
+    user_id = event.get("user_id")
+    return ("private", user_id) if user_id is not None else None
+
+
 def getlog(msg: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     if msg is None:
         msg = _current()
-    with _lock:
-        if "group_id" in msg:
-            return msgs["group"].setdefault(msg["group_id"], [])
-        user_id = msg.get("user_id")
-        if user_id is not None:
-            return msgs["private"].setdefault(user_id, [])
+    key = window(msg)
+    if key is None:
         return []
+    with _lock:
+        return msgs[key[0]].setdefault(key[1], [])
 
 
 def author(event: dict[str, Any]) -> Any:
@@ -150,11 +163,10 @@ def remove_message(
     user_id: int | None = None,
 ) -> dict[str, Any] | None:
     """Remove a recalled event from its recent window, if it is still cached."""
+    key = window({"group_id": group_id, "user_id": user_id})
     with _lock:
-        if group_id is not None:
-            candidates = [msgs["group"].get(group_id, [])]
-        elif user_id is not None:
-            candidates = [msgs["private"].get(user_id, [])]
+        if key is not None:
+            candidates = [msgs[key[0]].get(key[1], [])]
         else:
             candidates = [*msgs["group"].values(), *msgs["private"].values()]
         for events in candidates:

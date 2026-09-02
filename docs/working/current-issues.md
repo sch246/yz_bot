@@ -18,11 +18,11 @@
 
 影响面曾覆盖所有把消息正文当源码读的入口：`.py`、`.link`、`.hs`、`.js` 等 13 处 `cq.unescape(body)`，以及 `chatlog` 的正文写入。
 
-### 私聊窗口里 `is_self` 会把 Bot 自己的消息算成对端的
+### ~~私聊窗口里 `is_self` 会把 Bot 自己的消息算成对端的~~（已修）
 
-`mods/message.py:95` 让 Bot 自发的私聊消息带上对端的 `user_id`（群聊则是 `mods/message.py:97`，带 Bot 自己的），而 `history.is_self`（`mods/history.py:82`）用顶层 `user_id` 判断「同一个人」。于是在私聊里，两者无法区分。
+`mods/message.py:95` 让 Bot 自发的私聊消息带上对端的 `user_id`（群聊则带 Bot 自己的），而旧的 `history.is_self` 用顶层 `user_id` 判断「同一个人」，于是私聊里两者无法区分。已改为 `history.same_author`，按 `sender` 判定作者——那是两种窗口下都指向作者的字段。
 
-`mods/op.py:45`、`mods/post.py:62` 的提醒节流和 `mods/cave.py:168` 的 `get_self_log` 都建在这个谓词上。`chat.msg2chat`（`mods/chat.py:122`）读的是 `sender.user_id`，是对的——同一个问题在仓库里已经有两套读法。修法与窗口/发送者的拆分是同一件事，见提案的第 4 步。
+实际影响过 `mods/op.py:45`、`mods/post.py:62` 的提醒节流和 `mods/cave.py:168` 的 `get_self_log`；其中只有后者会产生用户可见的错误内容（私聊 `.cave addn -<n>` 会把 Bot 的回复合并进回声洞）。缺陷是原生的而不是迁移引入的，取证见[统一消息模型](proposals/message-model.md)的第 4 步。
 
 ## 接受的现行约束与取舍
 
