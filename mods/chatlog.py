@@ -471,26 +471,35 @@ def _version_of(head: dict[str, Any], kind: str, hint: str | None) -> str:
     return V0
 
 
-def _guess_private_sender(name: str, kind: str, target: int, bot_names: dict[str, int]) -> int | None:
+def _guess_private_sender(
+    name: str,
+    kind: str,
+    target: int,
+    bot_names: dict[str, int],
+    names_complete: bool,
+) -> int | None:
     """Which of a private window's two participants wrote a v0 line, or nobody.
 
-    **Positive evidence on both sides, never elimination.**  A private window has
-    two participants and the path names the peer, so "not the Bot, therefore the
-    peer" looks free -- and it would be, if the Bot had always been one account
-    under one name.  It has not: after a QQ number change, a line written under
-    the old account's name matches nothing here, and elimination would hand it
-    to the peer without a trace.  So an unrecognised name stays ``_missing``.
+    A private window has two participants and the path names the peer, so once
+    the Bot's names are known exhaustively, "not the Bot" *is* "the peer" -- one
+    rule, every line covered, and the only failure left is a peer who once
+    displayed exactly one of the Bot's names.
 
-    The Bot side is the declared identity map.  The peer side is the peer's
-    current nickname, which is what a v0 private line recorded -- cheap, no
-    corpus, and wrong only for a peer who has renamed since, where it declines
-    to answer rather than guessing.
+    That reasoning is only as good as the map, which is why it is gated on
+    *names_complete*.  With an incomplete map elimination is not merely weaker,
+    it is wrong in a way that leaves no trace: a line the Bot wrote under an old
+    account's name matches nothing and gets handed to the peer.  So without the
+    assertion the peer side needs its own positive evidence -- the peer's current
+    nickname, which is what a v0 line recorded -- and an unrecognised name stays
+    ``_missing`` rather than being attributed to anyone.
     """
     if kind != "private":
         return None
     owner = bot_names.get(name)
     if owner is not None:
         return owner
+    if names_complete:
+        return target
     try:
         if name == identity.get_user_name(target):
             return target
@@ -508,6 +517,7 @@ def _message_record(
     bot_ids: set[int],
     version: str,
     bot_names: dict[str, int] | None = None,
+    names_complete: bool = False,
 ) -> dict[str, Any]:
     derived = ["message_type", "time"]
     missing: list[str] = []
@@ -526,7 +536,7 @@ def _message_record(
     if sender_id is None:
         record["user_id"] = target
         derived.append("user_id")
-        author = _guess_private_sender(head["name"], kind, target, bot_names or {})
+        author = _guess_private_sender(head["name"], kind, target, bot_names or {}, names_complete)
         if author is None:
             missing.append("sender")
         else:
@@ -612,6 +622,7 @@ def parse_log(
     bot_id: int | None = None,
     version: str | None = None,
     bot_names: dict[str, int] | None = None,
+    names_complete: bool = False,
 ) -> list[dict[str, Any]]:
     """Read one day's log back into records, marking what is fact and what is not.
 
@@ -621,7 +632,9 @@ def parse_log(
     today only the sender of a v0 private line, and only when *bot_names* is
     given).  *bot_id* names the current account and *bot_names* maps each of the
     Bot's historical display names to the account behind it; together they are
-    what tells a line the Bot wrote from one it received.
+    what tells a line the Bot wrote from one it received.  *names_complete* says
+    the map covers every name the Bot has ever displayed, which is what licenses
+    attributing an unrecognised private name to the window's peer.
     Consumers read raw OneBot fields, so a record that quietly lacked one would
     degrade instead of failing; the marks are what keep that visible.
 
@@ -678,6 +691,7 @@ def parse_log(
                 bot_ids,
                 _version_of(head, kind, version),
                 bot_names,
+                names_complete,
             )
         )
     return records
@@ -719,25 +733,30 @@ def _bot_id() -> int | None:
         return None
 
 
-def _bot_identities() -> dict[str, int]:
-    """Historical display name -> the account that wrote under it.
+def _bot_identities() -> tuple[dict[str, int], bool]:
+    """Historical display name -> account, and whether that map is complete.
 
     The Bot has changed QQ number, so "is this the Bot" is not one id and "what
-    was it called" is not one name.  Neither fact is derivable from a log line,
-    so this is the one place they are written down: ``chatlog/format`` may carry
-    a ``bot_names`` map from each historical display name to the account behind
-    it.  Unset, it degrades to the current account alone, which is correct for
-    everything after the change and simply unknown before it.
+    was it called" is not one name.  Neither is derivable from a log line, so
+    ``chatlog/format`` may carry a ``bot_names`` map from each historical display
+    name to the account behind it.
+
+    Completeness is not a second setting: **configuring the map at all is the
+    assertion**.  Writing it down means someone looked at which names the archive
+    actually contains, and that is exactly what makes elimination sound below.
+    The fallback -- the current account's current nickname -- is known to be
+    missing everything from before the number change, so it is returned as
+    incomplete and nothing may be concluded from a name it fails to match.
     """
     from mods import storage
 
     override = storage.get(rootfile, "format", lambda: {}).get("bot_names")
     if isinstance(override, dict) and override:
-        return {str(name): int(user_id) for name, user_id in override.items()}
+        return {str(name): int(user_id) for name, user_id in override.items()}, True
     try:
-        return {identity.get_user_name(identity.bot_id()): identity.bot_id()}
+        return {identity.get_user_name(identity.bot_id()): identity.bot_id()}, False
     except Exception:
-        return {}
+        return {}, False
 
 
 def _switch_moment() -> int | None:
@@ -795,6 +814,7 @@ def read_range(
     if bot_id is None:
         bot_id = _bot_id()
     switch = _switch_moment()
+    bot_names, names_complete = _bot_identities()
     records: list[dict[str, Any]] = []
     for path in sorted(directory.rglob("*.log")):
         day = day_of(path)
@@ -817,7 +837,8 @@ def read_range(
             day=day,
             bot_id=bot_id,
             version=_day_version(start, end, switch),
-            bot_names=_bot_identities(),
+            bot_names=bot_names,
+            names_complete=names_complete,
         )
         for record in parsed:
             when = record.get("time")
