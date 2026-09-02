@@ -162,6 +162,11 @@ class _LineAtomicStream:
         return len(value)
 
     def _write_through(self, thread: threading.Thread, value: str) -> None:
+        # A thread that started a line while someone else held the terminal
+        # rejoins it here: whatever it buffered belongs in front of what it is
+        # writing now.  Without this the line goes out beheaded and its start
+        # only surfaces at ``drain``, after everything it preceded.
+        value = self._pending.pop(thread, "") + value
         self._stream.write(value)
         self._stream.flush()
         self._tail = (self._tail + value).rpartition("\n")[2]

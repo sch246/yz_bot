@@ -233,6 +233,69 @@ class LLMClient:
             result.append(_rewrite_message_images(message, replace, collapse_text=False))
         return result
 
+    def _get_image_description(self, uri: str, vision_model: str, description_cache: dict) -> str | None:
+        identities = []
+        digest = image.get_cached_image_digest(uri)
+        if digest:
+            identities.append(digest)
+        intrinsic = image.intrinsic_image_description_identity(uri)
+        if intrinsic and intrinsic not in identities:
+            identities.append(intrinsic)
+        with self._description_lock:
+            removed = image.maybe_prune_description_cache(description_cache)
+            if removed:
+                console.notice(f"🧹 已清理 {removed} 条过期图片描述缓存")
+            for identity in identities:
+                cached = image.get_cached_description(description_cache, identity)
+                if cached is not None:
+                    algorithm = identity.partition(":")[0] if ":" in identity else "sha256"
+                    console.notice(f"✅ 图片描述缓存命中：{algorithm}")
+                    console.notice(f"    {cached}")
+                    return cached
+        if digest is None:
+            console.notice(f"🔎 正在解析图片内容：{console.format_uri(uri)}")
+            _, _, digest = image.resolve_image_with_digest(uri)
+            identities.insert(0, digest)
+        key = (id(description_cache), digest, image.AUTO_IMAGE_DESCRIPTION_VERSION)
+        with self._description_lock:
+            for identity in identities:
+                cached = image.get_cached_description(description_cache, identity)
+                if cached is not None:
+                    algorithm = identity.partition(":")[0] if ":" in identity else "sha256"
+                    console.notice(f"✅ 图片描述缓存命中：{algorithm}")
+                    console.notice(f"    {cached}")
+                    return cached
+            event = self._description_inflight.get(key)
+            owner = event is None
+            if owner:
+                event = threading.Event()
+                self._description_inflight[key] = event
+        if not owner:
+            console.notice(f"⏳ 等待同一图片的描述任务：sha256:{digest[:12]}")
+            event.wait()
+            with self._description_lock:
+                description = image.get_cached_description(description_cache, digest)
+            if description is not None:
+                console.notice(f"✅ 等待中的图片描述已缓存：sha256:{digest[:12]}")
+                console.notice(f"    {description}")
+            return description
+        try:
+            console.notice(f"👁️ 使用 {vision_model} 生成图片描述…")
+            description = self.describe_image(uri, model=vision_model)
+            if description:
+                with self._description_lock:
+                    removed = image.cache_description(description_cache, digest, description)
+                console.notice(f"✅ 图片描述已缓存：sha256:{digest[:12]}")
+                if removed:
+                    console.notice(f"🧹 已清理 {removed} 条过期图片描述缓存")
+            else:
+                console.error("⚠️ 视觉模型未返回图片描述，本次不缓存")
+            return description
+        finally:
+            with self._description_lock:
+                self._description_inflight.pop(key, None)
+                event.set()
+
     def _describe_images(self, messages: list[dict], cache: dict) -> list[dict]:
         vision_model = self.get_vision_model()
         if not vision_model:
