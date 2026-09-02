@@ -9,7 +9,7 @@ import threading
 import time
 from typing import Callable
 
-from mods import chatlog, context, cq, history, identity, image, llm, log, message, msgs, storage, text, thread, tools as tool_modules
+from mods import context, cq, history, identity, image, llm, log, message, msgs, storage, text, thread, tools as tool_modules
 from mods.command import command
 from mods.capture import capture
 
@@ -140,6 +140,22 @@ def msg2chat(event: dict, in_group: bool = True) -> dict:
     return {"role": role, "content": content}
 
 
+def _poke_text(event: dict) -> str:
+    """The model's view of a poke: the same names it sees on every message.
+
+    Deliberately not ``chatlog.format_poke``.  That one renders the log, where
+    the QQ-side identity is right because a record of what happened must not be
+    rewritten by a display preference.  Here the opposite holds: ``msg2chat``
+    already names people with ``identity.getname``, so a poke rendered any other
+    way would be the one place the model sees two names for one person.
+    """
+    group_id = event.get("group_id")
+    user_id, target_id = event.get("user_id"), event.get("target_id")
+    name = identity.getname(user_id, group_id)
+    target = identity.getname(target_id, group_id)
+    return f"{name}({user_id})戳了戳{target}({target_id})"
+
+
 def _is_context_poke(event: dict, in_group: bool) -> bool:
     if not msgs.is_poke(event):
         return False
@@ -171,7 +187,7 @@ def get_msgs(token_limit: int | None = None, return_token: bool = False):
             cost = sum(count_tokens(part.get("text", "")) for part in content if isinstance(part, dict) and part.get("type") == "text")
         else:
             kind = "群聊事件" if in_group else "私聊事件"
-            converted = {"role": "user", "content": f"【{kind}】{chatlog.format_poke(event)}"}
+            converted = {"role": "user", "content": f"【{kind}】{_poke_text(event)}"}
             cost = count_tokens(converted["content"])
         used += cost
         if used > token_limit:

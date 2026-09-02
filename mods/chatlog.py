@@ -471,9 +471,47 @@ def _version_of(head: dict[str, Any], kind: str, hint: str | None) -> str:
     return V0
 
 
-def _message_record(head: dict[str, Any], body: str, kind: str, target: int, day, bot_id: int | None, version: str) -> dict[str, Any]:
+def _guess_private_sender(name: str, kind: str, target: int, bot_names: dict[str, int]) -> int | None:
+    """Which of a private window's two participants wrote a v0 line, or nobody.
+
+    **Positive evidence on both sides, never elimination.**  A private window has
+    two participants and the path names the peer, so "not the Bot, therefore the
+    peer" looks free -- and it would be, if the Bot had always been one account
+    under one name.  It has not: after a QQ number change, a line written under
+    the old account's name matches nothing here, and elimination would hand it
+    to the peer without a trace.  So an unrecognised name stays ``_missing``.
+
+    The Bot side is the declared identity map.  The peer side is the peer's
+    current nickname, which is what a v0 private line recorded -- cheap, no
+    corpus, and wrong only for a peer who has renamed since, where it declines
+    to answer rather than guessing.
+    """
+    if kind != "private":
+        return None
+    owner = bot_names.get(name)
+    if owner is not None:
+        return owner
+    try:
+        if name == identity.get_user_name(target):
+            return target
+    except Exception:
+        pass
+    return None
+
+
+def _message_record(
+    head: dict[str, Any],
+    body: str,
+    kind: str,
+    target: int,
+    day,
+    bot_ids: set[int],
+    version: str,
+    bot_names: dict[str, int] | None = None,
+) -> dict[str, Any]:
     derived = ["message_type", "time"]
     missing: list[str] = []
+    guessed: list[str] = []
     sender_id = head["sender_id"]
     record: dict[str, Any] = {
         "_source": rootfile,
@@ -486,9 +524,16 @@ def _message_record(head: dict[str, Any], body: str, kind: str, target: int, day
         record["group_id"] = target
         derived.append("group_id")
     if sender_id is None:
-        missing.append("sender")
         record["user_id"] = target
         derived.append("user_id")
+        author = _guess_private_sender(head["name"], kind, target, bot_names or {})
+        if author is None:
+            missing.append("sender")
+        else:
+            record["sender"] = {"user_id": author, "nickname": head["name"]}
+            record["post_type"] = "message_sent" if author in bot_ids else "message"
+            derived.append("post_type")
+            guessed.append("sender")
     else:
         record["user_id"] = sender_id if kind == "group" else target
         sender: dict[str, Any] = {"user_id": sender_id, "nickname": head["name"]}
@@ -497,10 +542,12 @@ def _message_record(head: dict[str, Any], body: str, kind: str, target: int, day
             sender["title"] = head["title"]
         record["sender"] = sender
         derived.append("sender")
-        if bot_id is None:
+        if not bot_ids:
             missing.append("post_type")
         else:
-            record["post_type"] = "message_sent" if sender_id == bot_id else "message"
+            # Every account the Bot has ever used, so that lines from before the
+            # QQ number change are not read as someone else's.
+            record["post_type"] = "message_sent" if sender_id in bot_ids else "message"
             derived.append("post_type")
     message_id = head["message_id"]
     if message_id is None or message_id == "":
@@ -514,6 +561,7 @@ def _message_record(head: dict[str, Any], body: str, kind: str, target: int, day
         derived.append("message")
     record["_derived"] = derived
     record["_missing"] = missing
+    record["_guessed"] = guessed
     return record
 
 
@@ -563,11 +611,17 @@ def parse_log(
     day: tuple[int, int, int],
     bot_id: int | None = None,
     version: str | None = None,
+    bot_names: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
     """Read one day's log back into records, marking what is fact and what is not.
 
     Every record carries ``_source``, ``_derived`` (computed from the path, the
-    body or ``bot_id``) and ``_missing`` (never written down, so unrecoverable).
+    body or ``bot_id``), ``_missing`` (never written down, so unrecoverable) and
+    ``_guessed`` (recovered under a stated assumption that could be wrong --
+    today only the sender of a v0 private line, and only when *bot_names* is
+    given).  *bot_id* names the current account and *bot_names* maps each of the
+    Bot's historical display names to the account behind it; together they are
+    what tells a line the Bot wrote from one it received.
     Consumers read raw OneBot fields, so a record that quietly lacked one would
     degrade instead of failing; the marks are what keep that visible.
 
@@ -575,6 +629,7 @@ def parse_log(
     back into ``notice_type``/``sub_type``/``duration`` would break silently on
     the next wording change, so they are timestamped opaque text by definition.
     """
+    bot_ids = set((bot_names or {}).values()) | ({bot_id} if bot_id is not None else set())
     records: list[dict[str, Any]] = []
     lines = content.split("\n")
     index = 0
@@ -614,7 +669,16 @@ def parse_log(
             while body and body[-1] == "":
                 body.pop()
         records.append(
-            _message_record(head, _deltab("\n".join(body)), kind, target, day, bot_id, _version_of(head, kind, version))
+            _message_record(
+                head,
+                _deltab("\n".join(body)),
+                kind,
+                target,
+                day,
+                bot_ids,
+                _version_of(head, kind, version),
+                bot_names,
+            )
         )
     return records
 
@@ -653,6 +717,27 @@ def _bot_id() -> int | None:
         return identity.bot_id()
     except Exception:
         return None
+
+
+def _bot_identities() -> dict[str, int]:
+    """Historical display name -> the account that wrote under it.
+
+    The Bot has changed QQ number, so "is this the Bot" is not one id and "what
+    was it called" is not one name.  Neither fact is derivable from a log line,
+    so this is the one place they are written down: ``chatlog/format`` may carry
+    a ``bot_names`` map from each historical display name to the account behind
+    it.  Unset, it degrades to the current account alone, which is correct for
+    everything after the change and simply unknown before it.
+    """
+    from mods import storage
+
+    override = storage.get(rootfile, "format", lambda: {}).get("bot_names")
+    if isinstance(override, dict) and override:
+        return {str(name): int(user_id) for name, user_id in override.items()}
+    try:
+        return {identity.get_user_name(identity.bot_id()): identity.bot_id()}
+    except Exception:
+        return {}
 
 
 def _switch_moment() -> int | None:
@@ -732,6 +817,7 @@ def read_range(
             day=day,
             bot_id=bot_id,
             version=_day_version(start, end, switch),
+            bot_names=_bot_identities(),
         )
         for record in parsed:
             when = record.get("time")
