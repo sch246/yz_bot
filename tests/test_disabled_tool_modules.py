@@ -149,13 +149,12 @@ class DisabledToolModuleTests(unittest.TestCase):
         message = SimpleNamespace(
             sendmsg=lambda text, **target: sends.append((text, target))
         )
-        identity = SimpleNamespace(bot_id=lambda: 99)
         later = SimpleNamespace(
-            run=lambda command, exec_id=None: runs.append((command, exec_id)) or f"ran:{command}"
+            run=lambda command: runs.append(command) or f"ran:{command}"
         )
         with mock.patch.object(self.mods, "message", message, create=True), mock.patch.object(
-            self.mods, "identity", identity, create=True
-        ), mock.patch.object(self.mods, "later", later, create=True):
+            self.mods, "later", later, create=True
+        ):
             send = self.registry.modules["send_message"].tools["send_message__sendmsg"].call
             list_tasks = self.registry.modules["later_manage"].tools["later_manage__later_list"].call
             set_task = self.registry.modules["later_manage"].tools["later_manage__later_set"].call
@@ -167,7 +166,7 @@ class DisabledToolModuleTests(unittest.TestCase):
             self.assertEqual(set_task(3, "10m", "'ready'"), "ran: set 3 10m 'ready'")
 
         self.assertEqual(sends, [("hello", {"user_id": None, "group_id": 5})])
-        self.assertEqual(runs, [("", 99), (" set 3 10m 'ready'", 99)])
+        self.assertEqual(runs, ["", " set 3 10m 'ready'"])
 
     @mock.patch("requests.get")
     def test_baidu_wrapper_keeps_historical_response_contract(self, get) -> None:

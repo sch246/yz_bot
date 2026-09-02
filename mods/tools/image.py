@@ -3,6 +3,7 @@
 from contextlib import ExitStack
 import os
 import re
+import traceback
 
 import requests
 
@@ -44,14 +45,23 @@ def _send_generated_images(response: requests.Response) -> str:
         images = [item["b64_json"] for item in response.json().get("data", []) if isinstance(item, dict) and item.get("b64_json")]
     except (AttributeError, TypeError, ValueError):
         return "生图失败：API 返回了无法解析的结果"
-    for value in images:
-        message.sendmsg(cq.base64_to_cq(value))
-    if images:
-        # chat remains the sole owner of the usage entry and its cost lock.
-        from mods import chat
+    if not images:
+        return "生图失败：API 未返回图片"
 
-        chat.inc_usage_cost(0.13 * len(images))
-    return f"已生成并发送 {len(images)} 张图片" if images else "生图失败：API 未返回图片"
+    # chat remains the sole owner of the usage entry and its cost lock.
+    from mods import chat
+
+    chat.inc_usage_cost(0.13 * len(images))
+    sent = 0
+    for value in images:
+        try:
+            message.sendmsg(cq.base64_to_cq(value))
+            sent += 1
+        except Exception:
+            traceback.print_exc()
+    if sent != len(images):
+        return f"已生成 {len(images)} 张图片，成功发送 {sent} 张"
+    return f"已生成并发送 {sent} 张图片"
 
 
 def create_image(prompt: str, size: str = "1024x1024", quality: str = "auto", n: int = 1, output_format: str = "png") -> str:

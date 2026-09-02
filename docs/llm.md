@@ -167,9 +167,9 @@ Chat.chat
 
 - `exec_code` 可访问 `.py loc`，本质上接近任意代码执行；
 - `reload_tools` 可以在进程内执行并应用 `mods/tools` 中的受信任 Python；候选顶层代码在校验期间就会执行；`load_tools` 可以把任意 last-good 模块交给当前模型；
-- `set_user_data` 可读取模型生成的 Python 表达式并修改任意用户 storage；
+- `set_user_data` 可读取模型生成的 Python 字面量并修改任意用户 storage；
 - `get_user_data` 可把任意用户数据发送给模型供应商；
-- 延时任务会在未来执行并回到当前窗口；
+- 延时任务会在未来执行并回到当前窗口，创建和修改沿用当前发送者权限，不借用 Bot 管理员身份；
 - `assign_tasks` 可以增加并发、费用和工具调用深度；
 - `poke` 会立即对当前会话产生外部可见的戳一戳动作；
 - `recognize_image` 可以下载模型指定的网络图片，或读取模型指定的本机 `file://` 绝对路径，再把图片及识别要求发送给视觉供应商，产生额外网络访问、宿主机文件读取和模型费用；

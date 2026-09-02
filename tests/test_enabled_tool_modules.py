@@ -182,21 +182,18 @@ class EnabledToolModuleTests(unittest.TestCase):
 
         self.assertEqual(calls, [("send_poke", {"user_id": 8, "group_id": 9})])
 
-    def test_later_preserves_bot_executor_identity_and_command_text(self) -> None:
+    def test_later_preserves_command_text(self) -> None:
         calls = []
-        later = SimpleNamespace(
-            run=lambda body, **kwargs: calls.append((body, kwargs)) or "done"
-        )
-        identity = SimpleNamespace(bot_id=lambda: 42)
-        with load_tool("later", later=later, identity=identity) as tool:
+        later = SimpleNamespace(run=lambda body: calls.append(body) or "done")
+        with load_tool("later", later=later) as tool:
             self.assertEqual(tool.later_add("1h", "x = 1", "x"), "done")
             self.assertEqual(tool.later_del("1,2"), "done")
 
         self.assertEqual(
             calls,
             [
-                (" add 1h x = 1\nx", {"exec_id": 42}),
-                (" del 1,2", {"exec_id": 42}),
+                " add 1h x = 1\nx",
+                " del 1,2",
             ],
         )
 

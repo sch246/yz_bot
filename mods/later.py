@@ -298,11 +298,15 @@ def print_list(tasks: list[dict[str, Any]]) -> str:
 
 
 def is_safe(expr: str) -> bool:
-    try:
-        value = eval(expr, {"__builtins__": {}}, {})
-    except Exception:
-        return False
-    return isinstance(value, str)
+    if expr.startswith("'"):
+        expr = expr.replace("\\'", "")
+        if "'" not in expr[1:-1]:
+            return True
+    if expr.startswith('"'):
+        expr = expr.replace('\\"', "")
+        if '"' not in expr[1:-1]:
+            return True
+    return False
 
 
 def _split_once(text: str) -> tuple[str, str]:
@@ -311,11 +315,13 @@ def _split_once(text: str) -> tuple[str, str]:
 
 
 def _read_time_expr(text: str) -> tuple[str, str]:
-    parts = text.strip().split()
-    if len(parts) >= 3 and re_abstime.fullmatch(" ".join(parts[:2])):
-        return " ".join(parts[:2]), " ".join(parts[2:])
-    if len(parts) >= 2 and (re_reltime.fullmatch(parts[0]) or re_abstime.fullmatch(parts[0])):
-        return parts[0], " ".join(parts[1:])
+    first, rest = _split_once(text)
+    second, tail = _split_once(rest)
+    combined = f"{first} {second}"
+    if second and re_abstime.fullmatch(combined):
+        return combined, tail
+    if rest and (re_reltime.fullmatch(first) or re_abstime.fullmatch(first)):
+        return first, rest
     raise SyntaxError("时间格式不符")
 
 
@@ -330,7 +336,7 @@ def later_add(text: str, msg: dict[str, Any]) -> str:
 
 
 @command
-def run(text: str, exec_id: int | None = None) -> str:
+def run(text: str) -> str:
     """设置发送回当前群或私聊的一次性定时消息。
 
     示例：.later 10m '十分钟后提醒我'；.later 21:30 '晚上提醒我'。add 可以省略。
@@ -366,8 +372,7 @@ def run(text: str, exec_id: int | None = None) -> str:
             when_text, expr = _read_time_expr(rest)
             if not expr.strip():
                 raise SyntaxError("表达式为空")
-            actor = msg["user_id"] if exec_id is None else exec_id
-            if not op.is_op(int(actor)) and not is_safe(expr):
+            if not op.is_op(msg) and not is_safe(expr):
                 return "字符串以外的任务需要管理员权限"
             when = change(int(sequence_text), when_text, expr, msg)
             return "没有找到任务" if when is None else f"{sequence_text}: {when} {expr}"

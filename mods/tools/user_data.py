@@ -20,7 +20,7 @@ def set_user_data(user_id: int, key: str, value: str) -> str:
     @param
     user_id: 用户 QQ 号
     key: 数据键
-    value: Python 表达式，del 表示删除
+    value: Python 字面量，del 表示删除
     """
     current = context.current() or {}
     if int(user_id) != int(current.get("user_id", -1)) and not op.require_op(current):
