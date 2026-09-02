@@ -70,14 +70,20 @@ def _addtab(text: str) -> str:
 
 
 def _deltab(text: str) -> str:
-    """Undo ``_addtab``.
+    """Undo ``_addtab``, dropping the trailing blanks the rule says carry nothing.
 
     Trailing newlines and whitespace are gone for good, and that is deliberate:
     the QQ client strips them too, and a chat message whose meaning lives in its
     trailing blanks does not occur.  Everything else survives, including the
     interior blank lines ``_addtab`` renders as four spaces.
+
+    The ``rstrip`` is what makes the pair exact.  ``_addtab`` alone is not
+    injective -- it renders both ``"a"`` and ``"a\n"`` as ``"    a"`` -- and a v0
+    body ending in a blank line was written as a stray ``"    "`` line that no
+    re-render can reproduce.  Stripping here parses such a body into what v1
+    would have stored, which is the same message under the rule.
     """
-    return "\n".join(line[4:] if line.startswith("    ") else line for line in text.split("\n"))
+    return "\n".join(line[4:] if line.startswith("    ") else line for line in text.split("\n")).rstrip()
 
 
 def _group_str(
@@ -352,6 +358,11 @@ def format_message(event: dict[str, Any], name: str, title: str = "") -> str:
     rather than its unescaped display form.  Unescaping is what makes a body
     unreadable back into an event -- a user typing ``[CQ:at,qq=1]`` and a real at
     code are the same bytes afterwards -- so it belongs to display, not storage.
+
+    The body is stripped of trailing whitespace on the way in, which is the rule
+    v0 only half applied: it dropped the final newline but rendered any earlier
+    trailing blank as a ``"    "`` line.  Applying it fully is what makes this
+    function and ``parse_log`` exact inverses.
     """
     sender = event.get("sender") if isinstance(event.get("sender"), dict) else {}
     sender_id = int(sender.get("user_id", event.get("user_id", 0)))
@@ -359,7 +370,7 @@ def format_message(event: dict[str, Any], name: str, title: str = "") -> str:
     head = f"{name}({sender_id})"
     if event.get("group_id") is not None:
         head = f"【{title}】{head}"
-    return f"{head} {stamp} | {event.get('message_id', '')}\n{_addtab(str(event.get('message', '')))}\n"
+    return f"{head} {stamp} | {event.get('message_id', '')}\n{_addtab(str(event.get('message', '')).rstrip())}\n"
 
 
 def _epoch(day: tuple[int, int, int], match: re.Match) -> int:
