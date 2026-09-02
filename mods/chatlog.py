@@ -137,10 +137,17 @@ def _private_str(
     timestamp: int | float,
     text: str,
     message_id: int | str = "",
+    user_id: int | None = None,
 ) -> str:
+    """A message-shaped private record.  Pass *user_id* whenever the head is a person.
+
+    The heads that are not a person -- ``其它消息``, ``未捕获消息``, a friend
+    request whose head is already a full sentence -- leave it out.
+    """
     suffix = f" | {message_id}" if message_id != "" else ""
+    head = name if user_id is None else f"{name}({user_id})"
     return (
-        f'{name} {time.strftime("%H:%M:%S", time.localtime(timestamp))}{suffix}\n'
+        f'{head} {time.strftime("%H:%M:%S", time.localtime(timestamp))}{suffix}\n'
         f"{_addtab(text)}\n"
     )
 
@@ -196,9 +203,23 @@ def format_poke(msg: dict[str, Any]) -> str:
     anyone can change.  Now both windows render alike, and ``_recognise_notice``
     reads this back exactly -- which is all a rebuilt poke has to be, because
     ``chat.get_msgs`` hands the event straight back to this function.
+
+    The names come from the QQ side, like every other record here: the group
+    card in a group, the account nickname in private.  Not ``identity.getname``,
+    which the migration put here and which differs twice over -- it layers the
+    ``.setname`` override on top, so a display preference would rewrite the
+    record of what happened, and it reads ``context.current()`` for the window,
+    so the same event rendered from a rebuild or from another window would come
+    out differently.  A formatter has to be a function of its event alone.
     """
     user_id, target_id = int(msg["user_id"]), int(msg["target_id"])
-    return f"{identity.getname(user_id)}({user_id})戳了戳{identity.getname(target_id)}({target_id})"
+    group_id = msg.get("group_id")
+    if group_id is not None:
+        name = identity.get_group_user_info(int(group_id), user_id)[1]
+        target = identity.get_group_user_info(int(group_id), target_id)[1]
+    else:
+        name, target = identity.get_user_name(user_id), identity.get_user_name(target_id)
+    return f"{name}({user_id})戳了戳{target}({target_id})"
 
 
 def _message(msg: dict[str, Any]) -> str:
@@ -245,7 +266,7 @@ def _notice(msg: dict[str, Any]) -> str | None:
     if notice_type == "group_upload" and group_id is not None:
         return _group_write(msg, group_id, _group_str(title, name, user_id or 0, timestamp, _file_str(msg["file"]), ""))
     if notice_type in ("offline_file", "private_upload") and user_id is not None:
-        return _private_write(msg, user_id, _private_str(name, timestamp, _file_str(msg["file"])))
+        return _private_write(msg, user_id, _private_str(name, timestamp, _file_str(msg["file"]), user_id=user_id))
     if notice_type == "group_admin" and group_id is not None:
         text = f"{name}({user_id})被设为了管理员" if sub_type == "set" else f"{name}({user_id})被移除了管理员"
     elif notice_type == "group_decrease" and group_id is not None:
@@ -278,7 +299,7 @@ def _notice(msg: dict[str, Any]) -> str | None:
         else:
             text = f"{operator}({operator_id})撤回了{name}({user_id})的一条消息({msg['message_id']})"
     elif notice_type == "friend_recall" and user_id is not None:
-        return _private_write(msg, user_id, _notice_str(timestamp, f"{name}撤回了一条消息({msg['message_id']})"))
+        return _private_write(msg, user_id, _notice_str(timestamp, f"{name}({user_id})撤回了一条消息({msg['message_id']})"))
     elif notice_type == "notify" and sub_type == "poke":
         text = format_poke(msg)
     elif notice_type == "notify" and sub_type == "lucky_king":
