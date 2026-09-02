@@ -9,7 +9,8 @@
 ```text
 run.py
   → .venv/bin/python main.py
-      → import mods
+      → import mods          （只取得生命周期函数，不启动任何东西）
+      → mods.boot()
           → Import 全部公开 mod
           → 按生命周期 Load
       → mods.bot.run()
@@ -29,7 +30,7 @@ from mods import storage
 from mods.command import command
 ```
 
-loader 先按名称导入全部公开 Module，再按 `INFRA → FEATURE → LATE` 执行 `on_load(ctx)`。同阶段可通过 `LOAD_BEFORE` / `LOAD_AFTER` 声明少量顺序。完整顺序会在执行钩子前计算，未知阶段、反向跨阶段关系和循环会使启动失败。
+加载由入口显式调用的 `mods.boot()` 触发，import 本身没有副作用：loader 先按名称导入全部公开 Module，再按 `INFRA → FEATURE → LATE` 执行 `on_load(ctx)`。因此语法检查、脚本和工具可以正常 import `mods` 及其子模块并直接调用其中的纯函数，不会绑定端口、起线程或读写运行数据；`mods.module_names()` 是文件/包模块命名规则的唯一实现，`run.py --check` 复用它而不是抄一份。`boot()` 中途失败会先执行已加载模块的退出钩子再抛出。同阶段可通过 `LOAD_BEFORE` / `LOAD_AFTER` 声明少量顺序。完整顺序会在执行钩子前计算，未知阶段、反向跨阶段关系和循环会使启动失败。
 
 `ctx` 保存 Import 成功的模块；`available` 只包含 Load 成功的模块。可选模块失败会记录并隔离，其命令和 capture 不会继续暴露。`bot`、`command`、`connect`、`context`、`message`、`storage` 是最小运行闭环，任一不可用都会阻止启动。退出时，成功加载模块的 `on_exit()` 按逆序执行；单个退出失败不阻止后续清理。
 

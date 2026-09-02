@@ -32,25 +32,15 @@ def check() -> int:
     for path in paths:
         compile(path.read_text(), str(path), "exec")
 
-    files = {
-        path.stem
-        for path in (ROOT / "mods").glob("*.py")
-        if path.name != "__init__.py" and not path.name.startswith("_")
-    }
-    packages = {
-        path.name
-        for path in (ROOT / "mods").iterdir()
-        if path.is_dir()
-        and not path.name.startswith("_")
-        and (path / "__init__.py").is_file()
-    }
-    collisions = sorted(files & packages)
-    if collisions:
-        raise RuntimeError("file/package collisions: " + ", ".join(collisions))
-    print(
-        f"check passed: {len(paths)} Python files, "
-        f"{len(files | packages)} public modules"
-    )
+    # Importing mods no longer boots the Bot, so the module scan has one owner
+    # and this check reads the same rule the runtime will apply.
+    import sys
+
+    sys.path.insert(0, str(ROOT))
+    import mods
+
+    names = mods.module_names()
+    print(f"check passed: {len(paths)} Python files, {len(names)} public modules")
     return 0
 
 
