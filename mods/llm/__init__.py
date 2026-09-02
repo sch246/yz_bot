@@ -609,13 +609,7 @@ class Chat:
             return [result]
 
 
-def sum_res(values: list[LLMResponse], role: str = "assistant", content: str = "") -> LLMResponse:
-    return sum(values, start=LLMResponse(content=content, role=role))
-
-
 client: LLMClient | None = None
-llm_client: LLMClient | None = None
-LLMCilent = LLMClient
 
 
 def get_client() -> LLMClient:
@@ -625,11 +619,10 @@ def get_client() -> LLMClient:
 
 
 def on_load(ctx) -> None:
-    global client, llm_client
+    global client
     from mods import storage
 
     config = storage.get("llm_system", "config")
     if not config:
         config.update(_default_config())
     client = LLMClient(config)
-    llm_client = client

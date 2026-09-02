@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 from datetime import datetime
 import re
+import threading
 import time
 from typing import Callable
 
@@ -25,7 +26,7 @@ description_cache: dict = {}
 llm_config: dict = {}
 max_token = 4000
 max_msg = 200
-_cost_lock = None
+_cost_lock = threading.Lock()
 
 
 def getchatstorage(event: dict | None = None) -> dict:
@@ -199,11 +200,8 @@ def inc_call_tokens_cost(model: str, tokens: tuple[int, int]) -> None:
 def inc_usage_cost(price: float) -> None:
     """Add one externally calculated cost to the current user's usage."""
     # A storage list is the authority; only this read-modify-write needs a lock.
-    if _cost_lock is None:
+    with _cost_lock:
         _usage_entry()[1] += price
-    else:
-        with _cost_lock:
-            _usage_entry()[1] += price
 
 
 def _base_prompt() -> list[dict]:
@@ -490,8 +488,7 @@ def run(body: str, model: str | None = None):
 
 
 def on_load(ctx) -> None:
-    global settings, prompts, chat_groups, description_cache, llm_config, max_token, max_msg, _cost_lock
-    import threading
+    global settings, prompts, chat_groups, description_cache, llm_config, max_token, max_msg
     from mods import is_available
 
     missing = [name for name in ("identity", "image", "llm", "storage") if not is_available(name)]
@@ -505,4 +502,3 @@ def on_load(ctx) -> None:
     llm_config = llm.get_client().config
     max_token = int(llm_config.get("max_token", 4000))
     max_msg = int(llm_config.get("max_msg", 200))
-    _cost_lock = threading.Lock()
