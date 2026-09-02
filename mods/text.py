@@ -22,7 +22,14 @@ def replace_by_dic(value: str, replacements: dict[str, str]) -> str:
 
 
 def replace_by_dic2(value: str, replacements: dict[str, str]) -> str:
-    for source, target in replacements.items():
+    """Undo ``replace_by_dic``, which means walking the pairs backwards.
+
+    Escaping has to expand ``&`` first so that the entities it then writes are
+    not re-escaped; undoing it therefore has to restore ``&`` *last*, or a
+    literal ``&#91;`` typed by a user (which arrives as ``&amp;#91;``) becomes
+    ``&#91;`` and is then mistaken for an entity and collapsed into ``[``.
+    """
+    for source, target in reversed(list(replacements.items())):
         value = value.replace(target, source)
     return value
 

@@ -69,6 +69,17 @@ def _addtab(text: str) -> str:
     return "\n".join("    " + line for line in text.splitlines())
 
 
+def _deltab(text: str) -> str:
+    """Undo ``_addtab``.
+
+    Trailing newlines and whitespace are gone for good, and that is deliberate:
+    the QQ client strips them too, and a chat message whose meaning lives in its
+    trailing blanks does not occur.  Everything else survives, including the
+    interior blank lines ``_addtab`` renders as four spaces.
+    """
+    return "\n".join(line[4:] if line.startswith("    ") else line for line in text.split("\n"))
+
+
 def _group_str(
     title: str,
     name: str,
@@ -283,3 +294,221 @@ def write(msg: dict[str, Any]) -> str | None:
         except Exception:
             logger.exception("写入 chatlog 兜底记录失败")
             return None
+
+
+# --- v0/v1 round trip -------------------------------------------------------
+#
+# A vertical slice: two pure functions, nothing wired into ``write`` yet.  See
+# docs/working/proposals/message-model.md for the minimal fact set and for why
+# v0 lines are read but never rewritten.
+
+V0 = "v0"
+V1 = "v1"
+
+# Parsed right to left, because the display name is the one field a user can set
+# (``identity.setname``) and could otherwise be crafted to fake a separator.
+_TIME_SUFFIX = re.compile(r"(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})$")
+_SENDER_SUFFIX = re.compile(r"\((?P<user_id>\d+)\)$")
+_TITLED = re.compile(r"^【(?P<title>.*)】(?P<name>.*)$", re.DOTALL)
+_DAY_NAME = re.compile(r"(?P<day>\d{2})\.log$")
+_MONTH_NAME = re.compile(r"(?P<year>\d{4})-(?P<month>\d{2})$")
+
+
+def window_of(path: str | os.PathLike, root: str | os.PathLike = rootfile) -> tuple[str, int | None] | None:
+    """The window a log file belongs to, read off its path below *root*."""
+    try:
+        rest = Path(path).relative_to(root).parts
+    except ValueError:
+        # An absolute path against a relative root: fall back to the last
+        # segment that names the root directory.
+        parts, anchor = Path(path).parts, Path(root).parts[-1]
+        if anchor not in parts:
+            return None
+        rest = parts[len(parts) - 1 - parts[::-1].index(anchor) + 1:]
+    if not rest:
+        return None
+    if rest[0] == "bot":
+        return "bot", None
+    if rest[0] in ("group", "private") and len(rest) > 1 and rest[1].isdigit():
+        return rest[0], int(rest[1])
+    return None
+
+
+def day_of(path: str | os.PathLike) -> tuple[int, int, int] | None:
+    """The calendar day a log file covers, read off its path."""
+    candidate = Path(path)
+    day = _DAY_NAME.fullmatch(candidate.name)
+    month = _MONTH_NAME.fullmatch(candidate.parent.name)
+    if day is None or month is None:
+        return None
+    return int(month["year"]), int(month["month"]), int(day["day"])
+
+
+def format_message(event: dict[str, Any], name: str, title: str = "") -> str:
+    """Render one message event as its v1 record.
+
+    Two things separate v1 from v0: a private record carries the sender's id the
+    way a group record always did, and the body is the raw OneBot ``message``
+    rather than its unescaped display form.  Unescaping is what makes a body
+    unreadable back into an event -- a user typing ``[CQ:at,qq=1]`` and a real at
+    code are the same bytes afterwards -- so it belongs to display, not storage.
+    """
+    sender = event.get("sender") if isinstance(event.get("sender"), dict) else {}
+    sender_id = int(sender.get("user_id", event.get("user_id", 0)))
+    stamp = time.strftime("%H:%M:%S", time.localtime(event.get("time", 0)))
+    head = f"{name}({sender_id})"
+    if event.get("group_id") is not None:
+        head = f"【{title}】{head}"
+    return f"{head} {stamp} | {event.get('message_id', '')}\n{_addtab(str(event.get('message', '')))}\n"
+
+
+def _epoch(day: tuple[int, int, int], match: re.Match) -> int:
+    """Local time, as everywhere else here; the device is not expected to move."""
+    year, month, number = day
+    return int(time.mktime((year, month, number, int(match["hour"]), int(match["minute"]), int(match["second"]), 0, 0, -1)))
+
+
+def _split_head(line: str) -> dict[str, Any] | None:
+    """Peel ``【头衔】名字(id) 时:分:秒 | 消息号`` from the right."""
+    left, separator, message_id = line.rpartition(" | ")
+    if not separator:
+        left, message_id = line, None
+    stamp = _TIME_SUFFIX.search(left)
+    if stamp is None:
+        return None
+    head = left[: stamp.start()].rstrip()
+    sender = _SENDER_SUFFIX.search(head)
+    sender_id = None
+    if sender is not None:
+        sender_id = int(sender["user_id"])
+        head = head[: sender.start()]
+    titled = _TITLED.fullmatch(head)
+    title, name = (titled["title"], titled["name"]) if titled else ("", head)
+    return {"stamp": stamp, "sender_id": sender_id, "title": title, "name": name, "message_id": message_id}
+
+
+def _version_of(head: dict[str, Any], kind: str, hint: str | None) -> str:
+    """Which format a record was written in, and therefore whether its body is fact.
+
+    A private record announces itself: only v1 carries the sender id.  A group
+    record cannot -- it always carried one -- so without the caller's hint the
+    honest answer is v0, the version whose body is only a display projection.
+    Under-claiming fidelity is the safe direction, and the hint (a switch
+    timestamp in storage) is what removes the guess.  It also settles the one
+    case a private line gets wrong on its own: a v0 display name ending in
+    ``(12345)``.
+    """
+    if hint is not None:
+        return hint
+    if kind == "private" and head["sender_id"] is not None:
+        return V1
+    return V0
+
+
+def _message_record(head: dict[str, Any], body: str, kind: str, target: int, day, bot_id: int | None, version: str) -> dict[str, Any]:
+    derived = ["message_type", "time"]
+    missing: list[str] = []
+    sender_id = head["sender_id"]
+    record: dict[str, Any] = {
+        "_source": rootfile,
+        "_version": version,
+        "time": _epoch(day, head["stamp"]),
+        "message_type": kind,
+        "message": body,
+    }
+    if kind == "group":
+        record["group_id"] = target
+        derived.append("group_id")
+    if sender_id is None:
+        missing.append("sender")
+        record["user_id"] = target
+        derived.append("user_id")
+    else:
+        record["user_id"] = sender_id if kind == "group" else target
+        sender: dict[str, Any] = {"user_id": sender_id, "nickname": head["name"]}
+        if kind == "group":
+            sender["card"] = head["name"]
+            sender["title"] = head["title"]
+        record["sender"] = sender
+        derived.append("sender")
+        if bot_id is None:
+            missing.append("post_type")
+        else:
+            record["post_type"] = "message_sent" if sender_id == bot_id else "message"
+            derived.append("post_type")
+    message_id = head["message_id"]
+    if message_id is None or message_id == "":
+        # ``group_upload`` and friends borrow the message shape with no id.
+        missing.append("message_id")
+    else:
+        record["message_id"] = int(message_id) if message_id.lstrip("-").isdigit() else message_id
+    if version == V0:
+        # A v0 body went through ``_unescape`` on the way in, so it is the
+        # display projection and not the bytes OneBot sent.
+        derived.append("message")
+    record["_derived"] = derived
+    record["_missing"] = missing
+    return record
+
+
+def parse_log(
+    content: str,
+    *,
+    kind: str,
+    target: int | None,
+    day: tuple[int, int, int],
+    bot_id: int | None = None,
+    version: str | None = None,
+) -> list[dict[str, Any]]:
+    """Read one day's log back into records, marking what is fact and what is not.
+
+    Every record carries ``_source``, ``_derived`` (computed from the path, the
+    body or ``bot_id``) and ``_missing`` (never written down, so unrecoverable).
+    Consumers read raw OneBot fields, so a record that quietly lacked one would
+    degrade instead of failing; the marks are what keep that visible.
+
+    Notices stay the prose ``write`` produced.  Reversing a localized sentence
+    back into ``notice_type``/``sub_type``/``duration`` would break silently on
+    the next wording change, so they are timestamped opaque text by definition.
+    """
+    records: list[dict[str, Any]] = []
+    lines = content.split("\n")
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        index += 1
+        if line == "" or line.startswith("    "):
+            continue
+        if kind == "bot" or line.startswith(":"):
+            stamp = _TIME_SUFFIX.search(line)
+            record = {
+                "_source": rootfile,
+                "_kind": "bot" if kind == "bot" else "notice",
+                "_derived": ["time"] if stamp else [],
+                "_missing": [] if stamp else ["time"],
+                "text": line[2:].rstrip() if line.startswith(": ") else line,
+            }
+            if stamp is not None:
+                record["time"] = _epoch(day, stamp)
+                record["text"] = line[2: stamp.start()].rstrip() if line.startswith(": ") else line
+            if kind == "group":
+                record["group_id"] = target
+            elif kind == "private":
+                record["user_id"] = target
+            records.append(record)
+            continue
+        head = _split_head(line)
+        if head is None:
+            records.append({"_source": rootfile, "_kind": "unparsed", "_derived": [], "_missing": ["time"], "text": line})
+            continue
+        body: list[str] = []
+        while index < len(lines) and (lines[index] == "" or lines[index].startswith("    ")):
+            body.append(lines[index])
+            index += 1
+        if body != [""]:
+            while body and body[-1] == "":
+                body.pop()
+        records.append(
+            _message_record(head, _deltab("\n".join(body)), kind, target, day, bot_id, _version_of(head, kind, version))
+        )
+    return records
