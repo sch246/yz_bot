@@ -21,7 +21,10 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import threading
 
-from mods import context, llm, tools as tool_modules
+from mods import context, llm, log, tools as tool_modules
+
+
+_stream = log.stream("agent")
 
 
 def assign_tasks(prompt: str, tasks: str, tools: str, model: str = "deepseek/deepseek-v4-flash", max_workers: int = 5) -> str:
@@ -42,7 +45,7 @@ def assign_tasks(prompt: str, tasks: str, tools: str, model: str = "deepseek/dee
     def execute(task_value: str) -> tuple[str, str]:
         context.set_current(origin)
         worker_id = threading.get_ident()
-        print(f"线程 {worker_id}: 开始处理 LLM 子任务", flush=True)
+        _stream.info(f"线程 {worker_id}: 开始处理 LLM 子任务")
         try:
             session = llm.Chat(model=model, chat_client=llm.get_client())
             tool_context = tool_modules.create_context_message()
@@ -60,10 +63,10 @@ def assign_tasks(prompt: str, tasks: str, tools: str, model: str = "deepseek/dee
                     chat.inc_call_tokens_cost(model, (chunk.prompt_tokens, chunk.completion_tokens))
 
             session.chat(recall_func=collect)
-            print(f"线程 {worker_id}: LLM 子任务完成", flush=True)
+            _stream.info(f"线程 {worker_id}: LLM 子任务完成")
             return task_value, "".join(pieces).strip()
         except Exception as error:
-            print(f"线程 {worker_id}: LLM 子任务失败：{error}", flush=True)
+            _stream.info(f"线程 {worker_id}: LLM 子任务失败：{error}")
             return task_value, f"ERROR: {error}"
         finally:
             context.clear_current()

@@ -62,6 +62,10 @@ uv run --frozen python run.py --smoke
 
 终端输出按行原子：`mods.log` 在加载时包装 `sys.stdout`，让正在写半行的线程独占终端并继续直写——模型回复仍然逐字出现——其余线程写完整的行先排队，等这一行结束再输出；日志的 console handler 共享同一把锁。因此多线程（监听、聊天、子任务、storage 同步）不会再互相插进对方的半行里，代价是后台的行可能稍晚出现，且排在它们到达时那条回复之后。持有终端是一份由每次写入续租的租约（`mods.log.LINE_LEASE`，默认 5 秒）：写得慢但还在写的持有者一直续租、保住整行，卡住不写的等租约到期就断行让路，回复在下一行继续；持有者中途死掉则立即让路。持有者按线程对象而非 `get_ident()` 记录，因为线程退出后 id 会被复用，否则新线程会被当成旧线程续写它遗留的半行；退出时会把没有换行的残留补完。
 
+终端输出按流分组：产出者不再直接 `print`，而是选一条流名（`mods.log.stream("msg")` 即 logger `yz.msg`），由终端决定看不看。当前的流有 `yz.msg`（收发消息）、`yz.llm`（视觉准备、等待、失败提示）、`yz.llm.request`（整条请求栈）、`yz.llm.message`（非流式的完整消息与工具结果）、`yz.image`、`yz.storage`、`yz.link`、`yz.agent`、`yz.mc`、`yz.jm`、`yz.py`、`yz.scheduler`。终端的实际内容是「已订阅流的 INFO 及以上」∪「所有 logger 的 WARNING 及以上」——退订只减少 INFO 流量，永远不能让故障静音，也不影响 `app.log`：无论是否订阅，记录都照常落盘。订阅集用 `.log` 命令改（见[功能与命令目录](commands.md)），存在 `data/storage/log/terminal.json`，重启不重置，默认 `["yz"]` 即全订，与迁移前的终端一致。
+
+LLM 的逐字输出不是流，而是终端的交互效果：它仍然直写 `sys.stdout`，因此 `.log` 退订 `yz.llm.request` 只会让请求栈消失，模型仍然逐字出现在终端。`main.py` 的启动/退出摘要和 `identity` 的首次配置验证码同样不走流——恢复入口不可被订阅集关掉。
+
 终端中的警告位置需要区分：`某文件.py:<行号>` 指向普通源码；`<string>:1: SyntaxWarning: invalid escape sequence '\d'` 表示 `eval()`/`exec()` 正在编译动态字符串。后者可能来自聊天中的 `.py`/LLM 工具参数、link action，或 `data/pyload.py` 等以字符串方式执行的设备级源码，不能据此反推追踪文件仍有同一问题。`mods/tools/<name>.py` 则以真实文件名编译；其语法、顶层执行或 schema 校验错误会在 `reload_tools` 结果和应用日志中保留完整 traceback，旧 last-good 版本继续服务。正则中的数字模式应写成 `r'\d'`，需要普通字符串反斜杠时写成 `'\\d'`。
 
 `.jm` 插件仍会在加载时导入 `jmcomic`，但站点 client 已延迟到第一次 `.jm search` 才初始化。因而启动期不应再仅由该插件打印站点域名刷新日志；实际使用搜索或下载时，第三方库仍可能访问网络并输出自己的日志。

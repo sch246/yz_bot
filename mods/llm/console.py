@@ -1,4 +1,10 @@
-"""Human-readable, streaming terminal output for live LLM calls."""
+"""Human-readable terminal output for live LLM calls.
+
+Whole messages are records on the ``llm`` streams, so the terminal can drop the
+request stack without losing it.  The delta stream stays a direct write: live
+typing is a terminal effect rather than a record, and buffering it to a line
+would destroy the one thing worth watching in real time.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +13,8 @@ import re
 from urllib.parse import urlsplit, urlunsplit
 
 from termcolor import colored
+
+from mods.log import stream
 
 
 ROLE_COLORS = {
@@ -22,6 +30,10 @@ _DATA_URI = re.compile(
     re.IGNORECASE,
 )
 _DATA_URI_PREFIX = 80
+
+_notices = stream("llm")
+_requests = stream("llm.request")
+_messages = stream("llm.message")
 
 
 def format_value(value) -> str:
@@ -69,21 +81,30 @@ def format_content(content) -> str:
     return format_value("".join(parts))
 
 
-def write(value, role: str, *, end: str = "\n", prefix: bool = False) -> None:
+def paint(value, role: str, *, prefix: bool = False) -> str:
     label = f"{role}: " if prefix else ""
-    print(
-        colored(label + format_content(value), ROLE_COLORS.get(role, "white")),
-        end=end,
-        flush=True,
-    )
+    return colored(label + format_content(value), ROLE_COLORS.get(role, "white"))
+
+
+def write(value, role: str, *, end: str = "\n") -> None:
+    """Paint straight to the terminal; only the live delta stream uses this."""
+    print(paint(value, role), end=end, flush=True)
 
 
 def notice(value) -> None:
-    print(colored(format_value(value), "light_grey"), flush=True)
+    _notices.info(colored(format_value(value), "light_grey"))
 
 
 def error(value) -> None:
-    print(colored(format_value(value), "red"), flush=True)
+    # A handled failure the caller recovered from: red, but the same stream and
+    # the same level.  Real incidents still go through ``logger.exception``.
+    _notices.info(colored(format_value(value), "red"))
+
+
+def message(value, role: str, *, label: str = "", label_role: str = "") -> None:
+    """Emit one complete, already finished message as a single record."""
+    head = paint(label, label_role or role) if label else ""
+    _messages.info(head + paint(value, role))
 
 
 def print_request(model: str, messages: list[dict], start: int = 0) -> None:
@@ -91,20 +112,21 @@ def print_request(model: str, messages: list[dict], start: int = 0) -> None:
     pending = messages[start:]
     if not pending:
         return
-    notice(f"发送给 {model} 的{'新增' if start else ''}消息：")
-    for message in pending:
-        role = message.get("role", "system")
-        if role == "assistant" and message.get("tool_calls"):
+    lines = [colored(f"发送给 {model} 的{'新增' if start else ''}消息：", "light_grey")]
+    for entry in pending:
+        role = entry.get("role", "system")
+        if role == "assistant" and entry.get("tool_calls"):
             content = "\n".join(
                 call["function"]["name"] + call["function"].get("arguments", "")
-                for call in message["tool_calls"]
+                for call in entry["tool_calls"]
             )
-            write(f"{role}: ", role, end="")
-            write(content, "tool")
+            lines.append(paint(f"{role}: ", role) + paint(content, "tool"))
         elif role == "tool":
-            write(f" -> {message.get('content', '')}", role)
+            lines.append(paint(f" -> {entry.get('content', '')}", role))
         else:
-            write(message.get("content", ""), role, prefix=True)
+            lines.append(paint(entry.get("content", ""), role, prefix=True))
+    # One request is one record: the whole stack goes out or none of it does.
+    _requests.info("\n".join(lines))
 
 
 class StreamPrinter:
@@ -128,6 +150,7 @@ class StreamPrinter:
             self._display_role = None
 
     def tool_call(self, role: str, name: str, arguments: str) -> None:
+        # Already complete when the provider hands it over, so it is a message
+        # record rather than part of the delta stream.
         self.finish()
-        write(f"{role}({self.model}): ", role, end="")
-        write(name + arguments, "tool")
+        message(name + arguments, "tool", label=f"{role}({self.model}): ", label_role=role)

@@ -6,7 +6,7 @@ import os
 import re
 import traceback
 
-from mods import LATE, context, cq, is_available, message, msgs, op, pages, py, storage, text, thread
+from mods import LATE, context, cq, is_available, log, message, msgs, op, pages, py, storage, text, thread
 from mods.capture import items as capture_items
 from mods.command import command
 from .schema import snapshot as _snapshot
@@ -30,6 +30,7 @@ def CQ_at(qq):
 links: list[dict] = []
 _startup_snapshot = "[]"
 _logger = logging.getLogger(__name__)
+_stream = log.stream("link")
 
 
 def on_load(_ctx) -> None:
@@ -102,8 +103,7 @@ def _action_re(name: str, action: str, environment: dict, captures: dict) -> boo
 
 
 def _announce_link(name: str) -> None:
-    print(f"触发 link：{name}", flush=True)
-    _logger.info('triggered link "%s"', name)
+    _stream.info(f"触发 link：{name}")
 
 
 def _evaluate(item: dict, perform_action: bool = True, announce: bool = False) -> tuple[bool, bool]:
@@ -155,8 +155,7 @@ def _dispatch(event):
                 continue
             try:
                 if function(event):
-                    print(f"触发 capture：{name}", flush=True)
-                    _logger.info('triggered capture "%s"', name)
+                    _stream.info(f"触发 capture：{name}")
                     return name
             except Exception:
                 _report_error(name, "capture")

@@ -13,6 +13,7 @@ from typing import Any
 
 from mods import INFRA, connect
 from mods import context
+from mods import log
 from mods.thread import SimpleFuture
 
 
@@ -22,6 +23,7 @@ PHASE = INFRA
 LOAD_AFTER = ("storage",)
 
 _log = logging.getLogger(__name__)
+_stream = log.stream("msg")
 _BOT_DIR = Path(__file__).resolve().parent.parent
 _STOP = object()
 _queue: Queue = Queue(maxsize=20)
@@ -50,17 +52,15 @@ def _chatlog_write(event: dict) -> None:
 
     chatlog = get_available("chatlog")
     if chatlog is not None:
-        print(
-            f'[{time.strftime("%H:%M:%S")}]【发送消息】',
-            end="",
-            flush=True,
-        )
-        chatlog.write(event)
+        written = chatlog.write(event)
+        if written is not None:
+            body = written.removesuffix("\n")
+            _stream.info(f'[{time.strftime("%H:%M:%S")}]【发送消息】{body}')
 
 
 def _send_now(text: Any, user_id=None, group_id=None, **params) -> int | None:
     if "-d" in sys.argv or "--debug" in sys.argv:
-        print("【准备发送消息】", flush=True)
+        _stream.info("【准备发送消息】")
     text = str(text).replace("__botdir__", str(_BOT_DIR))
     params.pop("message", None)
     if group_id is not None:

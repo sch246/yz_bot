@@ -9,7 +9,7 @@ import threading
 import time
 from typing import Callable
 
-from mods import chatlog, context, cq, history, identity, image, llm, message, msgs, storage, text, thread, tools as tool_modules
+from mods import chatlog, context, cq, history, identity, image, llm, log, message, msgs, storage, text, thread, tools as tool_modules
 from mods.command import command
 from mods.capture import capture
 
@@ -27,6 +27,8 @@ llm_config: dict = {}
 max_token = 4000
 max_msg = 200
 _cost_lock = threading.Lock()
+# Eager capture is image work reported on the image stream, not chat traffic.
+_image_stream = log.stream("image")
 
 
 def getchatstorage(event: dict | None = None) -> dict:
@@ -459,7 +461,7 @@ def _eager_cache_images(event: dict, model: str) -> None:
             else:
                 llm.get_client()._get_image_description(uri, vision_model, description_cache)
         except Exception as error:
-            print(f"❌ eager 图片捕获失败：{error}", flush=True)
+            _image_stream.info(f"❌ eager 图片捕获失败：{error}")
 
 
 def eager_cache_images(event: dict) -> None:
@@ -468,7 +470,7 @@ def eager_cache_images(event: dict) -> None:
         if get_image_mode(data) == "eager":
             model = get_model(data)
             count = len(_message_image_urls(event))
-            print(f"🖼️ eager 图片捕获：{count} 张，目标模型 {model}", flush=True)
+            _image_stream.info(f"🖼️ eager 图片捕获：{count} 张，目标模型 {model}")
             _eager_cache_images(event.copy(), model)
 
 

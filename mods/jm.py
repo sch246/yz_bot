@@ -5,10 +5,11 @@ import threading
 
 from jmcomic import JmOption, create_option_by_file
 
-from mods import context, cq, message, pages, text, thread
+from mods import context, cq, log, message, pages, text, thread
 from mods.command import command
 
 
+_stream = log.stream("jm")
 _client = None
 _client_lock = threading.Lock()
 
@@ -24,9 +25,8 @@ def get_client():
 @thread.to_thread
 def search(query):
     page = get_client().search_site(search_query=query, page=1)
-    print(
-        f"结果总数: {page.total}, 分页大小: {page.page_size}，页数: {page.page_count}",
-        flush=True,
+    _stream.info(
+        f"结果总数: {page.total}, 分页大小: {page.page_size}，页数: {page.page_count}"
     )
     return pages.display(
         [f"[{album_id}]: {title}" for album_id, title in page]

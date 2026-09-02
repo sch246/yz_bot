@@ -4,7 +4,7 @@ import logging
 
 import requests
 
-from mods import context, is_available, message, scheduler, storage, thread
+from mods import context, is_available, log, message, scheduler, storage, thread
 from mods.command import command
 
 
@@ -12,6 +12,7 @@ LOAD_AFTER = ("scheduler", "storage")
 MANIFEST_URL = "https://launchermeta.mojang.com/mc/game/version_manifest.json"
 
 _logger = logging.getLogger(__name__)
+_stream = log.stream("mc")
 ver = {}
 subscribes = []
 
@@ -26,7 +27,7 @@ def _latest():
 
 
 def check_latest_version():
-    print("检查 Minecraft 版本…", flush=True)
+    _stream.info("检查 Minecraft 版本…")
     try:
         latest = _latest()
         if ver.get("snapshot") != latest["snapshot"]:
@@ -43,10 +44,7 @@ def check_latest_version():
                 )
     except Exception:
         _logger.exception("检查 Minecraft 版本失败")
-    print(
-        f"当前版本 {ver.get('snapshot', '')}({ver.get('release', '')})",
-        flush=True,
-    )
+    _stream.info(f"当前版本 {ver.get('snapshot', '')}({ver.get('release', '')})")
 
 
 def on_load(_ctx):
