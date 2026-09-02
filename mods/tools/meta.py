@@ -153,14 +153,14 @@ def _format_results(results: Mapping) -> str:
         "replaced": "已替换",
     }
     succeeded = [
-        f"- {name}: {action_labels.get(result.action, result.action)}"
+        f"- {name}: {action_labels.get(result['action'], result['action'])}"
         for name, result in results.items()
-        if result.ok
+        if "error" not in result
     ]
     failed = [
-        f"- {name}:\n{result.error or '未知错误'}"
+        f"- {name}:\n{result['error']}"
         for name, result in results.items()
-        if not result.ok
+        if "error" in result
     ]
     return "\n".join([
         "成功:",
