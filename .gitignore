@@ -12,6 +12,7 @@
 
 # 日志
 app.log*
+/log/
 
 # 配置文件（含敏感信息）
 /config.json
