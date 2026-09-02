@@ -9,7 +9,8 @@
 ```text
 run.py
   → .venv/bin/python main.py
-      → import mods
+      → import mods          （只取得生命周期函数，不启动任何东西）
+      → mods.boot()
           → Import 全部公开 mod
           → 按生命周期 Load
       → mods.bot.run()
@@ -29,7 +30,7 @@ from mods import storage
 from mods.command import command
 ```
 
-loader 先按名称导入全部公开 Module，再按 `INFRA → FEATURE → LATE` 执行 `on_load(ctx)`。同阶段可通过 `LOAD_BEFORE` / `LOAD_AFTER` 声明少量顺序。完整顺序会在执行钩子前计算，未知阶段、反向跨阶段关系和循环会使启动失败。
+加载由入口显式调用的 `mods.boot()` 触发，import 本身没有副作用：loader 先按名称导入全部公开 Module，再按 `INFRA → FEATURE → LATE` 执行 `on_load(ctx)`。因此语法检查、脚本和工具可以正常 import `mods` 及其子模块并直接调用其中的纯函数，不会绑定端口、起线程或读写运行数据；`mods.module_names()` 是文件/包模块命名规则的唯一实现，`run.py --check` 复用它而不是抄一份。`boot()` 中途失败会先执行已加载模块的退出钩子再抛出。同阶段可通过 `LOAD_BEFORE` / `LOAD_AFTER` 声明少量顺序。完整顺序会在执行钩子前计算，未知阶段、反向跨阶段关系和循环会使启动失败。
 
 `ctx` 保存 Import 成功的模块；`available` 只包含 Load 成功的模块。可选模块失败会记录并隔离，其命令和 capture 不会继续暴露。`bot`、`command`、`connect`、`context`、`message`、`storage` 是最小运行闭环，任一不可用都会阻止启动。退出时，成功加载模块的 `on_exit()` 按逆序执行；单个退出失败不阻止后续清理。
 
@@ -75,7 +76,7 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 `meta.py` 是唯一默认激活的必需模块，保存工具维护说明并导出 `exec_code`、`list_tools`、`reload_tools`、`load_tools` 四个无前缀恢复入口。`__init__.py` 只持有 registry、last-good 和 per-Chat binding 机制；它不再伪装成工具格式。`meta` 调用通过一次调用范围内的 `ContextVar` 取得当前 binding，多 Chat 和 `assign_tasks` 工作线程不会共享错误会话；磁盘删除 `meta.py` 的 reload 会失败并保留旧 last-good。
 
-可用模块的第一行描述从一开始就在同一条 system 提示中；激活时原地更新这条既有消息，并修改当前 Chat 的工具映射。每个 LLM 子请求仍冻结一份工具快照，同一份快照同时决定请求 schema 和响应调用解析，所以加载或重载只从下一子请求起生效，不改写已发出的请求或同一响应中的其它调用。`mods/tools/disable/` 保存有实现但被历史注册明确禁用的标准模块；顶层 scanner 不递归，因此这些文件不会进入 registry 或 Chat。
+可用模块的第一行描述从一开始就在同一条 system 提示中；激活时原地更新这条既有消息，并修改当前 Chat 的工具映射。每个 LLM 子请求仍冻结一份工具快照，同一份快照同时决定请求 schema 和响应调用解析，所以加载或重载只从下一子请求起生效，不改写已发出的请求或同一响应中的其它调用。`mods/tools/disable/README.md` 只保存历史上被明确禁用的工具的决策记录，不再保存它们的实现。
 
 提示词没有新增编辑管理器；`.py` 共享环境继续暴露可变 `prompts` 对象，模型需要时可自己编写工具编辑它。
 
@@ -105,7 +106,7 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 ## LLM、图片与可观察输出
 
-`mods.llm/` 持有模型配置、client、流式响应与每请求工具快照；`mods.chat` 持有 QQ 窗口上下文、提示和聊天命令；`mods.tools` 持有统一 registry、当前 Chat 绑定以及按职责分类的真实工具实现，天气模块只用薄包装投影现有 `mods.weather`，不复制请求逻辑，只补上面向模型的中文说明和参数约束；`mods.image/` 持有图片身份、缓存和视觉输入。图片与子任务工具只惰性调用 `mods.chat` 的既有 usage/cost 入口，不复制计费状态。`llm`、`tools` 和 `image` 采用文件夹 Module，是因为各自内部实现共同拥有明确状态；具体能力仍优先由普通函数表达。
+`mods.llm/` 持有模型配置、client、流式响应与每请求工具快照；`mods.chat` 持有 QQ 窗口上下文、提示和聊天命令；`mods.tools` 持有统一 registry、当前 Chat 绑定以及按职责分类的真实工具实现，天气模块只投影现有 `mods.weather`；`mods.image/` 持有图片身份、缓存和视觉输入。图片与子任务工具只惰性调用 `mods.chat` 的既有 usage/cost 入口，不复制计费状态。`llm`、`tools` 和 `image` 采用文件夹 Module，是因为各自内部实现共同拥有明确状态；具体能力仍优先由普通函数表达。
 
 终端打印是实际运维界面的一部分：收发消息、流式 LLM 内容、工具调用、图片捕获/缓存、link/capture 命中、模块失败和生命周期进度都应保留可观察输出。应用 logger 记录诊断；chatlog 保存产品聊天历史，两者不是同一用途。
 

@@ -49,6 +49,7 @@ def main() -> int:
         import mods
 
         loaded = mods
+        mods.boot()
         if arguments.smoke:
             print(
                 "smoke required core loaded; optional failures do not fail this check: "

@@ -99,9 +99,9 @@
 | `minecraft` | `minecraft__search_mc_mod`、`minecraft__check_mod` |
 | `weather` | `weather__search_city`、`weather__get_realtime_weather`、`weather__get_daily_forecast`、`weather__get_hourly_forecast` |
 
-除 `weather` 继续以同签名薄包装投影可用的 `mods.weather` 函数（包装只负责面向模型的描述，返回值原样透传，失败仍是 `None`）外，这些文件持有各自工具的真实实现，不再从 `mods.chat` re-export。图片和子任务模块只惰性复用 `mods.chat` 的 usage/cost 入口，计费状态仍只有一份。
+除 `weather` 继续投影可用的 `mods.weather` 函数（其 schema 描述来自 `mods.weather` 函数自身的 docstring，与命令的 `-h` 帮助同源）外，这些文件持有各自工具的真实实现，不再从 `mods.chat` re-export。图片和子任务模块只惰性复用 `mods.chat` 的 usage/cost 入口，计费状态仍只有一份。
 
-历史源码中有实现、但 `add_tool` 注册被明确注释的 `read_data`、群成员、农历/小六壬、跨窗口发送、`later_list/later_set`、URL 转 CQ 和百科工具，整理在 `mods/tools/disable/`。registry 不递归扫描该目录，所以它们不会进入 last-good、目录提示或任何 Chat；RAG 等只有残缺草稿或死名字的项只记录原因，不伪造可调用空壳。
+历史源码中有实现、但 `add_tool` 注册被明确注释的 `read_data`、群成员、农历/小六壬、跨窗口发送、`later_list/later_set`、URL 转 CQ 和百科工具，只在 `mods/tools/disable/README.md` 留有决策记录：说明它们当时是什么、现在等价能力在哪里、以及 RAG 等只剩草稿或死名字的项为什么不复活。仓库不保存永不运行的实现；要启用就按现有模块格式在 `mods/tools/` 顶层重写。
 
 `create_image` 使用 OpenAI 原生 `gpt-image-2` 的参数与返回形状，不传 DALL·E 的 `style`、`standard` 或 `response_format=url`。图片以 `b64_json` 返回，解码后使用 `data/tmp_files` 的现有临时图片缓存和过期清理机制；Base64 本身不会进入 QQ 消息或 chatlog。
 

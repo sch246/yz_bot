@@ -47,16 +47,6 @@ class ToolModule:
     source: bytes
 
 
-@dataclass(frozen=True)
-class OperationResult:
-    """Outcome of one independently committed module operation."""
-
-    ok: bool
-    action: str
-    module: ToolModule | None = None
-    error: str | None = None
-
-
 class ToolRegistry:
     """Keep validated tool modules as an explicit in-process last-good set."""
 
@@ -65,33 +55,34 @@ class ToolRegistry:
         self._modules: dict[str, ToolModule] = {}
         self._failures: dict[str, str] = {}
         self._initialized = False
-        self._lock = threading.RLock()
+        # A binding holds this for the length of one prepare/commit pair.
+        self.lock = threading.RLock()
         self._import_package = f"{__name__}._registry_{id(self):x}"
 
     @property
     def modules(self) -> dict[str, ToolModule]:
         """Return a sorted snapshot of all last-good modules."""
         self._ensure_initialized()
-        with self._lock:
+        with self.lock:
             return dict(sorted(self._modules.items()))
 
     @property
     def failures(self) -> dict[str, str]:
         """Return full tracebacks from the most recent failed loads."""
         self._ensure_initialized()
-        with self._lock:
+        with self.lock:
             return dict(sorted(self._failures.items()))
 
     def get(self, name: str) -> ToolModule | None:
         """Read one last-good module without consulting the disk."""
         self._ensure_initialized()
-        with self._lock:
+        with self.lock:
             return self._modules.get(name)
 
     def scan(self) -> dict[str, list[str]]:
         """Derive source changes without applying any of them."""
         self._ensure_initialized()
-        with self._lock:
+        with self.lock:
             paths = self._source_paths()
             disk_names = set(paths)
             loaded_names = set(self._modules)
@@ -118,57 +109,43 @@ class ToolRegistry:
                 "deleted": sorted(loaded_names - disk_names),
             }
 
-    def reload(
-        self,
-        names: str | Iterable[str],
-        *,
-        before_replace: Callable[[str, ToolModule | None], None] | None = None,
-    ) -> dict[str, OperationResult]:
-        """Reload or delete requested modules, committing each independently.
+    def prepare(self, name: str) -> ToolModule | None:
+        """Validate one module from disk without committing it.
 
-        ``before_replace`` participates in the per-module commit.  A binding
-        uses it to prove that an already-active module can be replaced before
-        the registry changes its last-good entry.
+        ``None`` means the source is gone and the last-good entry should go with
+        it.  Raising leaves both disk and last-good untouched.
         """
         self._ensure_initialized()
-        requested = _requested_names(names)
-        results: dict[str, OperationResult] = {}
-        with self._lock:
-            for requested_name in requested:
-                result_name = requested_name if isinstance(requested_name, str) else repr(requested_name)
-                try:
-                    name = _validate_module_name(requested_name)
-                    paths = self._source_paths().get(name, [])
-                    previous = self._modules.get(name)
-                    if not paths:
-                        if name == _BASE_MODULE_NAME:
-                            raise FileNotFoundError("required tool module source does not exist: meta")
-                        if previous is None:
-                            raise FileNotFoundError(f"tool module source does not exist: {name}")
-                        if before_replace is not None:
-                            before_replace(name, None)
-                        del self._modules[name]
-                        self._failures.pop(name, None)
-                        results[name] = OperationResult(True, "deleted")
-                        continue
+        with self.lock:
+            paths = self._source_paths().get(name, [])
+            if paths:
+                return self._load_candidate(name, paths)
+            if name == _BASE_MODULE_NAME:
+                raise FileNotFoundError("required tool module source does not exist: meta")
+            if self._modules.get(name) is None:
+                raise FileNotFoundError(f"tool module source does not exist: {name}")
+            return None
 
-                    candidate = self._load_candidate(name, paths)
-                    if before_replace is not None:
-                        before_replace(name, candidate)
-                    self._modules[name] = candidate
-                    self._failures.pop(name, None)
-                    action = "reloaded" if previous is not None else "loaded"
-                    results[name] = OperationResult(True, action, candidate)
-                except Exception:
-                    error = traceback_module.format_exc()
-                    _log.error("failed to reload tool module %r\n%s", requested_name, error)
-                    previous = self._modules.get(requested_name) if isinstance(requested_name, str) else None
-                    self._failures[result_name] = error
-                    results[result_name] = OperationResult(False, "failed", previous, error)
-        return results
+    def commit(self, name: str, module: ToolModule | None) -> str:
+        """Swap one last-good entry and report the action taken."""
+        with self.lock:
+            previous = self._modules.get(name)
+            if module is None:
+                del self._modules[name]
+                action = "deleted"
+            else:
+                self._modules[name] = module
+                action = "reloaded" if previous is not None else "loaded"
+            self._failures.pop(name, None)
+            return action
+
+    def record_failure(self, name: str, error: str) -> None:
+        """Keep one full traceback for ``list_tools`` to show."""
+        with self.lock:
+            self._failures[name] = error
 
     def _ensure_initialized(self) -> None:
-        with self._lock:
+        with self.lock:
             if self._initialized:
                 return
             for name, paths in self._source_paths().items():
@@ -283,6 +260,17 @@ def _requested_names(names: str | Iterable[str]) -> tuple[object, ...]:
         if name not in requested:
             requested.append(name)
     return tuple(requested)
+
+
+def _result_name(requested_name: object) -> str:
+    return requested_name if isinstance(requested_name, str) else repr(requested_name)
+
+
+def _failure(log_message: str, requested_name: object) -> dict:
+    """Log the current exception and describe it for the calling model."""
+    error = traceback_module.format_exc()
+    _log.error(log_message + "\n%s", requested_name, error)
+    return {"action": "failed", "error": error}
 
 
 def _validate_module_name(name: object) -> str:
@@ -432,13 +420,11 @@ class SessionBinding:
         self._activate(meta)
         self._render()
 
-    def load(self, names: str | Iterable[str]) -> dict[str, OperationResult]:
+    def load(self, names: str | Iterable[str]) -> dict[str, dict]:
         """Activate only in-memory last-good modules in this session."""
-        requested = _requested_names(names)
-        results: dict[str, OperationResult] = {}
+        results: dict[str, dict] = {}
         with self._lock:
-            for requested_name in requested:
-                result_name = requested_name if isinstance(requested_name, str) else repr(requested_name)
+            for requested_name in _requested_names(names):
                 try:
                     name = _validate_module_name(requested_name)
                     module = self.registry.get(name)
@@ -446,25 +432,41 @@ class SessionBinding:
                         raise KeyError(f"no last-good tool module: {name}")
                     previous = self.active.get(name)
                     self._activate(module)
-                    results[name] = OperationResult(
-                        True,
-                        "replaced" if previous is not None else "activated",
-                        module,
-                    )
+                    results[name] = {"action": "replaced" if previous is not None else "activated"}
                 except Exception:
-                    error = traceback_module.format_exc()
-                    _log.error("failed to activate tool module %r\n%s", requested_name, error)
-                    previous = self.active.get(requested_name) if isinstance(requested_name, str) else None
-                    results[result_name] = OperationResult(False, "failed", previous, error)
+                    results[_result_name(requested_name)] = _failure(
+                        "failed to activate tool module %r", requested_name
+                    )
             self._render()
         return results
 
-    def reload(self, names: str | Iterable[str]) -> dict[str, OperationResult]:
-        """Reload last-good modules and refresh those active in this session."""
-        with self._lock:
-            results = self.registry.reload(names, before_replace=self._replace_if_active)
+    def reload(self, names: str | Iterable[str]) -> dict[str, dict]:
+        """Apply each module's disk source, keeping this session's projection in step.
+
+        A module is committed to last-good only after an already-active copy of
+        it has been replaced here, so a Chat never keeps tools the registry no
+        longer has.  Every module is independent: one failure leaves that
+        module's old last-good and old active version serving.
+        """
+        results: dict[str, dict] = {}
+        with self._lock, self.registry.lock:
+            for requested_name in _requested_names(names):
+                try:
+                    name = _validate_module_name(requested_name)
+                    candidate = self.registry.prepare(name)
+                    if name in self.active:
+                        if candidate is None:
+                            self._deactivate(name)
+                        else:
+                            self._activate(candidate)
+                    results[name] = {"action": self.registry.commit(name, candidate)}
+                except Exception:
+                    result_name = _result_name(requested_name)
+                    failure = _failure("failed to reload tool module %r", requested_name)
+                    self.registry.record_failure(result_name, failure["error"])
+                    results[result_name] = failure
             self._render()
-            return results
+        return results
 
     def list_text(self) -> str:
         """Describe last-good, active, failed, and changed modules."""
@@ -552,14 +554,6 @@ class SessionBinding:
             functions.pop(tool_name)
         del self.active[name]
 
-    def _replace_if_active(self, name: str, module: ToolModule | None) -> None:
-        if name not in self.active:
-            return
-        if module is None:
-            self._deactivate(name)
-        else:
-            self._activate(module)
-
     def _render(self) -> None:
         self.context_message["content"] = _render_context(self.registry, self.active)
 
@@ -587,7 +581,6 @@ def bind_session(
 
 
 __all__ = [
-    "OperationResult",
     "SessionBinding",
     "ToolModule",
     "ToolRegistry",

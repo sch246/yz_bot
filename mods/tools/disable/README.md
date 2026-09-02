@@ -1,42 +1,27 @@
-# 未启用的历史工具模块
+# 未启用的历史工具
 
-本目录保存历史源码中曾实现、但其 `add_tool` 注册被明确注释掉的工具。
-`mods.tools.ToolRegistry` 只扫描 `mods/tools/` 的顶层 `.py` / `.md` 文件，
-不会递归进入本目录，所以这里的代码不会出现在 last-good registry，也不会
-被任何 Chat 激活。不要把“源码已整理”理解成“工具已开放”。
+本目录只保存一份决策记录：历史源码中曾实现、但 `add_tool` 注册被明确注释掉的工具，
+为什么至今没有成为 `mods/tools/` 的正式模块。这里不再保存它们的 `.py` —— 一份永不
+被 registry 扫描、也永不运行的实现，只会成为需要跟着改的死重量。需要旧代码时从 git
+历史取回（整理版本见 `8c4385e`，删除见其后的清理提交）。
 
-目录中的 `.py` 都遵循正常工具模块格式，并把运行依赖延迟到函数调用时：
-
-| 模块 | 已整理工具 | 语义来源 |
+| 历史工具 | 当时的语义 | 现在的位置 |
 |---|---|---|
-| `context_data.py` | `read_data` | 动态环境的 `data`，现由 `storage.get("", "py_data")` 唯一持有 |
-| `group_info.py` | `group_size`, `group_members` | 当前群的实时成员列表 |
-| `calendar_fortune.py` | `lunar_date`, `xiaoliu` | 当前 `mods.lunar` 的历法与六态算法 |
-| `send_message.py` | `sendmsg` | 当前窗口或显式群/私聊目标的异步发送队列 |
-| `later_manage.py` | `later_list`, `later_set` | 当前窗口的持久延时任务命令 |
-| `image_url.py` | `url2cq` | 当前共享的图片下载和 CQ 转换路径 |
-| `baidu.py` | `baidu_encyclopedia` | 历史第三方百科接口 |
+| `read_data` | 动态环境的 `data` | `storage.get("", "py_data")` 唯一持有，`.py` 里直接可读 |
+| `group_size`, `group_members` | 当前群实时成员列表 | `identity.memberlist`，`.py` 里直接可读 |
+| `lunar_date`, `xiaoliu` | 历法与小六壬 | `mods.lunar`，并有 `.jrlp` 等命令 |
+| `sendmsg` | 向当前窗口或显式目标发送 | `message.sendmsg`；旧说明称 `user_id`/`group_id` 冲突却会一起下传，是真 bug |
+| `later_list`, `later_set` | 列出与修改延时任务 | `.later` 命令；旧 `later_set` 签名里的 `code` 从未进入实际命令 |
+| `url2cq` | URL 转图片 CQ | `mods.image` 的统一内容寻址缓存 |
+| `baidu_encyclopedia` | 第三方百科接口 | 依赖 `api.wer.plus`，非官方 API，可用性不明 |
 
-两处明显无效的历史接口没有继续伪装成可用能力：
+三个只剩名字、没有可恢复实现的项：
 
-- `later_set` 旧签名中的 `code` 从未进入实际命令，当前延时任务也只保存
-  `expr`；整理后的签名删除了 `code`。
-- `sendmsg` 的旧说明称 `user_id` 与 `group_id` 冲突，却会把两者一起交给
-  发送层；整理后的函数明确拒绝同时提供两个目标。返回“已发送”仍只表示
-  已排队，不承诺最终送达。
+- `rag_search` 只有整体被注释的草稿，它引用的 HippoRAG 模块会在导入时初始化 LLM、
+  embedding 和 Neo4j 并注册退出保存，且实现已从仓库删除；
+- `get_location` 与拼写如此的 `muti_reply` 在历史中找不到函数定义；
+- `read_image` 是已删除 `Chat` 客户端上的绑定方法，当前视觉能力只有
+  `image__recognize_image` 一条路径，复活它会形成第二套视觉客户端职责。
 
-## 没有迁成函数的名字
-
-- `rag_search` 只有一段被整体注释的函数草稿。它引用的旧 HippoRAG 模块
-  会在导入时初始化 LLM、embedding 和 Neo4j 并注册退出保存，随后整套实现
-  已从仓库删除；现有证据不足以恢复一个可运行、无副作用的惰性工具，因此
-  本目录不伪造同名空壳。
-- `get_location` 与拼写如此的 `muti_reply` 只有注释掉的注册名，历史中没有
-  找到函数定义。
-- `read_image` 并非纯死名字：旧实现是已删除 `Chat` 客户端上的绑定方法，
-  直接调用当时的 OpenAI vision completion。当前图片识别已有唯一的
-  `recognize_image` 路径；复制旧方法会形成第二套视觉客户端职责，所以未迁。
-
-若未来决定启用某项能力，应把对应文件移动或合并到 `mods/tools/` 顶层，
-再按 registry 的显式 `reload_tools` / `load_tools` 流程应用。单纯编辑本目录
-永远不会改变运行中的 Bot。
+要启用其中任何一项，就在 `mods/tools/` 顶层按现有模块格式重新写一个，
+再走 `reload_tools` / `load_tools`；不要为了"先留着"把实现搬回本目录。

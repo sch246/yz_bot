@@ -182,7 +182,7 @@ cond 或 action 报错会写应用日志并把 traceback 回传当前聊天。co
 
 当前 `#` 控制面包括查看或切换模型、查看模型列表、查看/追加/保存/应用提示词设定，以及设置图片读取档位。`#use_model <provider>/<model>` 会保存一个完整模型选择，provider 不再是独立聊天状态。参数只以第一个 `/` 为分隔，因此模型名中可以包含 `/`；不带参数时重置当前窗口的模型选择。`#image` 查询当前档位，`#image off|lazy|eager` 负责设置，也可分别简写为 `#image 0|1|2`；lazy 在聊天触发时处理图片，eager 在收到图片时后台预下载，并只为不能直接读图的聊天模型预生成文字描述。聊天历史从当前窗口近期消息重建，并以“聊天开始/聊天结束”标记截断。
 
-LLM 开局默认激活 `meta` 模块，直接获得一个 `.py` 共享环境执行工具和三个工具模块管理工具。system 提示会列出 `mods/tools` 中每个 last-good Python/Markdown 模块的第一行描述；模型用 `load_tools` 把所需模块的余下说明与整组函数激活到当前任务，用 `list_tools` 查看活动状态和磁盘差异，用 `reload_tools` 显式应用修改。现有模块覆盖戳一戳、图片、时间、延时任务、天气、用户 storage、子模型任务分派和 MC 百科查询；不会自动热加载或注入变化提示。历史上明确禁用但仍有实现的工具整理在非递归扫描的 `mods/tools/disable/`，不会进入模型上下文。工具 schema、模块格式、循环回写和高权限边界见独立的 [LLM 文档](llm.md)。
+LLM 开局默认激活 `meta` 模块，直接获得一个 `.py` 共享环境执行工具和三个工具模块管理工具。system 提示会列出 `mods/tools` 中每个 last-good Python/Markdown 模块的第一行描述；模型用 `load_tools` 把所需模块的余下说明与整组函数激活到当前任务，用 `list_tools` 查看活动状态和磁盘差异，用 `reload_tools` 显式应用修改。现有模块覆盖戳一戳、图片、时间、延时任务、天气、用户 storage、子模型任务分派和 MC 百科查询；不会自动热加载或注入变化提示。历史上明确禁用的工具只在 `mods/tools/disable/README.md` 留有决策记录，仓库中没有对应实现。工具 schema、模块格式、循环回写和高权限边界见独立的 [LLM 文档](llm.md)。
 
 ## Minecraft 与宿主服务
 

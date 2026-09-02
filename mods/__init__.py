@@ -1,6 +1,9 @@
 """Discover, load, and stop the flat :mod:`mods` module set.
 
-Importing this package performs the one application load pass.  Business
+Importing this package only makes the lifecycle helpers available; the one
+application load pass happens when the entry point calls :func:`boot`.  So a
+syntax check, a tool, or a script may import ``mods`` and its submodules
+without binding ports, starting threads or touching runtime data.  Business
 modules remain ordinary Python modules; this file only owns lifecycle state.
 """
 
@@ -53,7 +56,7 @@ def get_available(name: str) -> ModuleType | None:
     return ctx.get(name) if name in available else None
 
 
-def _module_names() -> list[str]:
+def module_names() -> list[str]:
     root = Path(__file__).parent
     files = {
         path.stem
@@ -76,7 +79,7 @@ def _module_names() -> list[str]:
 
 
 def _import_all() -> None:
-    for name in _module_names():
+    for name in module_names():
         try:
             ctx[name] = importlib.import_module(f"{__name__}.{name}")
         except Exception:
@@ -202,19 +205,28 @@ def _load_all(order: list[str]) -> None:
             activate(name)
 
 
-def _boot() -> None:
-    _import_all()
-    order = _calculate_load_order()
-    _load_all(order)
-    missing = sorted(REQUIRED_MODULES - available)
-    if missing:
-        failed_imports = ", ".join(sorted(import_failures)) or "none"
-        failed_loads = ", ".join(sorted(load_failures)) or "none"
-        raise RuntimeError(
-            "required mods unavailable: "
-            + ", ".join(missing)
-            + f" (import failures: {failed_imports}; load failures: {failed_loads})"
-        )
+def boot() -> None:
+    """Import every module, run the load hooks once, and verify the core.
+
+    Any failure runs the exit hooks of whatever already loaded, so a half-booted
+    process never survives with unsaved state.
+    """
+    try:
+        _import_all()
+        order = _calculate_load_order()
+        _load_all(order)
+        missing = sorted(REQUIRED_MODULES - available)
+        if missing:
+            failed_imports = ", ".join(sorted(import_failures)) or "none"
+            failed_loads = ", ".join(sorted(load_failures)) or "none"
+            raise RuntimeError(
+                "required mods unavailable: "
+                + ", ".join(missing)
+                + f" (import failures: {failed_imports}; load failures: {failed_loads})"
+            )
+    except BaseException:
+        exit()
+        raise
 
 
 def exit() -> None:
@@ -233,10 +245,3 @@ def exit() -> None:
             hook()
         except Exception:
             _log.exception("failed to exit mod %s", name)
-
-
-try:
-    _boot()
-except BaseException:
-    exit()
-    raise

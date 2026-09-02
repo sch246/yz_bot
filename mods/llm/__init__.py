@@ -22,7 +22,7 @@ from .models import (
     split_model_selection,
 )
 from .tools import Tool
-from .types import LLMResponse, MessageRole, ModelCapabilities, ToolCallResult
+from .types import LLMResponse, ModelCapabilities, ToolCallResult
 
 
 LOAD_AFTER = ("image", "storage")
@@ -49,6 +49,75 @@ def format_image_reference(uri: str, label: str = "图片") -> str:
 def format_image_description(uri: str, description: str | None = None) -> str:
     detail = description or "图片解析失败"
     return f"[图片识别结果：{detail}]" if not uri or uri.startswith("data:image/") else f"[图片({uri})识别结果：{detail}]"
+
+
+_MARKDOWN_IMAGE = re.compile(r"!\[.*?\]\((.*?)\)")
+
+
+def _text_part(value: str) -> dict:
+    return {"type": "text", "text": value}
+
+
+def _image_part_uri(part: dict) -> str:
+    value = part.get("image_url", part.get("image", ""))
+    return value.get("url", "") if isinstance(value, dict) else str(value)
+
+
+def _rewrite_text_images(value: str, replace: Callable[[str], list[dict]]) -> tuple[list[dict], int]:
+    """Split one text block at its markdown images; also report how many it replaced."""
+    parts: list[dict] = []
+    position = 0
+    replaced = 0
+    for match in _MARKDOWN_IMAGE.finditer(value):
+        if match.start() > position:
+            parts.append(_text_part(value[position:match.start()]))
+        parts.extend(replace(match.group(1)))
+        replaced += 1
+        position = match.end()
+    if position < len(value) or not parts:
+        parts.append(_text_part(value[position:]))
+    if all(part.get("type") == "text" for part in parts):
+        return [_text_part("".join(part["text"] for part in parts))], replaced
+    return parts, replaced
+
+
+def _rewrite_message_images(
+    message: dict,
+    replace: Callable[[str], list[dict]],
+    *,
+    collapse_text: bool = True,
+) -> dict:
+    """Copy one message with every image, markdown or part, replaced by ``replace(uri)``.
+
+    ``collapse_text`` keeps string content a string when the result is only text,
+    which is what a text-for-image substitution wants.  The vision path passes
+    False so that a message which did contain an image stays in parts form even
+    when preparing one of them failed.
+    """
+    result = message.copy()
+    content = message.get("content")
+    if not isinstance(content, (str, list)):
+        return result
+    parts: list[dict] = []
+    replaced = 0
+    for source in content if isinstance(content, list) else [content]:
+        if isinstance(source, str):
+            text_parts, count = _rewrite_text_images(source, replace)
+            parts.extend(text_parts)
+            replaced += count
+        elif isinstance(source, dict) and source.get("type") in ("image", "image_url"):
+            parts.extend(replace(_image_part_uri(source)))
+            replaced += 1
+        else:
+            parts.append(source)
+    keep_string = (
+        isinstance(content, str)
+        and len(parts) == 1
+        and parts[0].get("type") == "text"
+        and (collapse_text or not replaced)
+    )
+    result["content"] = parts[0]["text"] if keep_string else parts
+    return result
 
 
 def split_string_with_code_blocks(value: str) -> list[str]:
@@ -125,47 +194,26 @@ class LLMClient:
 
     @staticmethod
     def _replace_images_with_text(messages: list[dict], description: str = "") -> list[dict]:
-        markdown = re.compile(r"!\[.*?\]\((.*?)\)")
-        result = []
+        def replace(uri: str) -> list[dict]:
+            if description:
+                return [_text_part(format_image_description(uri, description))]
+            return [_text_part(format_image_reference(uri))]
 
-        def replace(match: re.Match) -> str:
-            uri = match.group(1)
-            return format_image_description(uri, description) if description else format_image_reference(uri)
-
-        for source in messages:
-            message = source.copy()
-            content = source.get("content")
-            if isinstance(content, str):
-                message["content"] = markdown.sub(replace, content)
-            elif isinstance(content, list):
-                parts = []
-                for part in content:
-                    if isinstance(part, str):
-                        parts.append({"type": "text", "text": markdown.sub(replace, part)})
-                    elif isinstance(part, dict) and part.get("type") in ("image", "image_url"):
-                        value = part.get("image_url", part.get("image", ""))
-                        uri = value.get("url", "") if isinstance(value, dict) else str(value)
-                        parts.append({"type": "text", "text": format_image_description(uri, description) if description else format_image_reference(uri)})
-                    else:
-                        parts.append(part)
-                message["content"] = parts
-            result.append(message)
-        return result
+        return [_rewrite_message_images(message, replace) for message in messages]
 
     @staticmethod
     def _convert_images(messages: list[dict], convert_url: Callable[[str], str]) -> list[dict]:
-        markdown = re.compile(r"!\[(.*?)\]\((.*?)\)")
-
-        def append_image(parts: list, uri: str) -> None:
+        def replace(uri: str) -> list[dict]:
+            parts: list[dict] = []
             try:
                 console.notice(f"🖼️ 正在准备视觉图片：{console.format_uri(uri)}")
                 data_uri = uri if uri.startswith("data:") else convert_url(uri)
                 if uri and not uri.startswith("data:"):
-                    parts.append({"type": "text", "text": f"[下方图片的原始链接: {uri}]"})
+                    parts.append(_text_part(f"[下方图片的原始链接: {uri}]"))
                 slices, split = image.split_long_image_data_uri(data_uri)
                 parts.extend({"type": "image_url", "image_url": {"url": value}} for value in slices)
                 if split:
-                    parts.append({"type": "text", "text": image.AUTO_IMAGE_SPLIT_PROMPT})
+                    parts.append(_text_part(image.AUTO_IMAGE_SPLIT_PROMPT))
                     console.notice(f"✅ 长图已切分为 {len(slices)} 张视觉输入")
                 else:
                     console.notice("✅ 视觉图片已准备")
@@ -173,155 +221,34 @@ class LLMClient:
                 console.error(
                     f"❌ 图片处理失败（{console.format_uri(uri)}）：{error}"
                 )
-                parts.append({"type": "text", "text": format_image_description(uri)})
+                parts.append(_text_part(format_image_description(uri)))
+            return parts
 
         result = []
-        for source in messages:
-            if source.get("role") != "user":
-                result.extend(LLMClient._replace_images_with_text([source]))
+        for message in messages:
+            # Only user messages may carry real image parts to the provider.
+            if message.get("role") != "user":
+                result.extend(LLMClient._replace_images_with_text([message]))
                 continue
-            message = source.copy()
-            if "content" not in source:
-                result.append(message)
-                continue
-            content = source.get("content")
-            source_parts = content if isinstance(content, list) else [content]
-            output = []
-            changed = False
-            for part in source_parts:
-                if isinstance(part, str):
-                    position = 0
-                    matches = list(markdown.finditer(part))
-                    for match in matches:
-                        if match.start() > position:
-                            output.append({"type": "text", "text": part[position:match.start()]})
-                        append_image(output, match.group(2))
-                        position = match.end()
-                    if matches:
-                        changed = True
-                        if position < len(part):
-                            output.append({"type": "text", "text": part[position:]})
-                    else:
-                        output.append({"type": "text", "text": part})
-                elif isinstance(part, dict) and part.get("type") in ("image", "image_url"):
-                    value = part.get("image_url", part.get("image", ""))
-                    uri = value.get("url", "") if isinstance(value, dict) else str(value)
-                    append_image(output, uri)
-                    changed = True
-                else:
-                    output.append(part)
-            if isinstance(content, list) or changed:
-                message["content"] = output
-            result.append(message)
+            result.append(_rewrite_message_images(message, replace, collapse_text=False))
         return result
-
-    def _get_image_description(self, uri: str, vision_model: str, description_cache: dict) -> str | None:
-        identities = []
-        digest = image.get_cached_image_digest(uri)
-        if digest:
-            identities.append(digest)
-        intrinsic = image.intrinsic_image_description_identity(uri)
-        if intrinsic and intrinsic not in identities:
-            identities.append(intrinsic)
-        with self._description_lock:
-            removed = image.maybe_prune_description_cache(description_cache)
-            if removed:
-                console.notice(f"🧹 已清理 {removed} 条过期图片描述缓存")
-            for identity in identities:
-                cached = image.get_cached_description(description_cache, identity)
-                if cached is not None:
-                    algorithm = identity.partition(":")[0] if ":" in identity else "sha256"
-                    console.notice(f"✅ 图片描述缓存命中：{algorithm}")
-                    console.notice(f"    {cached}")
-                    return cached
-        if digest is None:
-            console.notice(f"🔎 正在解析图片内容：{console.format_uri(uri)}")
-            _, _, digest = image.resolve_image_with_digest(uri)
-            identities.insert(0, digest)
-        key = (id(description_cache), digest, image.AUTO_IMAGE_DESCRIPTION_VERSION)
-        with self._description_lock:
-            for identity in identities:
-                cached = image.get_cached_description(description_cache, identity)
-                if cached is not None:
-                    algorithm = identity.partition(":")[0] if ":" in identity else "sha256"
-                    console.notice(f"✅ 图片描述缓存命中：{algorithm}")
-                    console.notice(f"    {cached}")
-                    return cached
-            event = self._description_inflight.get(key)
-            owner = event is None
-            if owner:
-                event = threading.Event()
-                self._description_inflight[key] = event
-        if not owner:
-            console.notice(f"⏳ 等待同一图片的描述任务：sha256:{digest[:12]}")
-            event.wait()
-            with self._description_lock:
-                description = image.get_cached_description(description_cache, digest)
-            if description is not None:
-                console.notice(f"✅ 等待中的图片描述已缓存：sha256:{digest[:12]}")
-                console.notice(f"    {description}")
-            return description
-        try:
-            console.notice(f"👁️ 使用 {vision_model} 生成图片描述…")
-            description = self.describe_image(uri, model=vision_model)
-            if description:
-                with self._description_lock:
-                    removed = image.cache_description(description_cache, digest, description)
-                console.notice(f"✅ 图片描述已缓存：sha256:{digest[:12]}")
-                if removed:
-                    console.notice(f"🧹 已清理 {removed} 条过期图片描述缓存")
-            else:
-                console.error("⚠️ 视觉模型未返回图片描述，本次不缓存")
-            return description
-        finally:
-            with self._description_lock:
-                self._description_inflight.pop(key, None)
-                event.set()
 
     def _describe_images(self, messages: list[dict], cache: dict) -> list[dict]:
         vision_model = self.get_vision_model()
         if not vision_model:
             console.error("⚠️ 目标模型不支持视觉，且未配置可用的图片描述模型")
             return self._replace_images_with_text(messages, "图片，未配置可用的视觉模型")
-        markdown = re.compile(r"!\[.*?\]\((.*?)\)")
-        result = []
-        for source in messages:
-            message = source.copy()
-            if "content" not in source:
-                result.append(message)
-                continue
-            content = source.get("content")
-            if content is None:
-                result.append(message)
-                continue
-            parts = content if isinstance(content, list) else [content]
-            output = []
-            for part in parts:
-                if isinstance(part, str):
-                    def replace(match: re.Match) -> str:
-                        uri = match.group(1)
-                        console.notice(f"🖼️ 检查图片：{console.format_uri(uri)}")
-                        try:
-                            return format_image_description(uri, self._get_image_description(uri, vision_model, cache))
-                        except Exception as error:
-                            console.error(f"❌ 图片描述失败：{error}")
-                            return format_image_description(uri)
-                    output.append({"type": "text", "text": markdown.sub(replace, part)})
-                elif isinstance(part, dict) and part.get("type") in ("image", "image_url"):
-                    value = part.get("image_url", part.get("image", ""))
-                    uri = value.get("url", "") if isinstance(value, dict) else str(value)
-                    console.notice(f"🖼️ 检查图片：{console.format_uri(uri)}")
-                    try:
-                        description = self._get_image_description(uri, vision_model, cache)
-                    except Exception as error:
-                        console.error(f"❌ 图片描述失败：{error}")
-                        description = None
-                    output.append({"type": "text", "text": format_image_description(uri, description)})
-                else:
-                    output.append(part)
-            message["content"] = output if isinstance(content, list) else output[0]["text"]
-            result.append(message)
-        return result
+
+        def replace(uri: str) -> list[dict]:
+            console.notice(f"🖼️ 检查图片：{console.format_uri(uri)}")
+            try:
+                description = self._get_image_description(uri, vision_model, cache)
+            except Exception as error:
+                console.error(f"❌ 图片描述失败：{error}")
+                description = None
+            return [_text_part(format_image_description(uri, description))]
+
+        return [_rewrite_message_images(message, replace) for message in messages]
 
     def describe_image(self, uri: str, prompt: str = "", model: str | None = None) -> str | None:
         selection = model or self.get_vision_model()
@@ -351,7 +278,7 @@ class LLMClient:
             console.notice(f"    {description}")
         return description
 
-    def generate_response(self, messages: list[dict], tools: list[Tool] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None):
+    def generate_response(self, messages: list[dict], tools: list[Tool] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None, logged: int = 0):
         selection = model or self.config["default_model"]
         provider, api_model, raw_capabilities = resolve_model(self.config, selection)
         client = self.clients.get(provider)
@@ -364,7 +291,9 @@ class LLMClient:
             messages = self._convert_images(messages, image.image_uri_to_data_uri) if capabilities.vision else self._describe_images(messages, description_cache or {})
         else:
             messages = self._replace_images_with_text(messages)
-        console.print_request(selection, messages)
+        # Image conversion is one output message per input message, so the
+        # caller's count still lines up with what is about to be sent.
+        console.print_request(selection, messages, logged)
         params = {"model": api_model, "messages": messages, "stream": stream}
         if capabilities.function_calling and tools:
             params["tools"] = [tool.description for tool in tools]
@@ -380,7 +309,7 @@ class LLMClient:
         buffer = ""
         assistant_content = ""
         reasoning_content: str | None = None
-        role = MessageRole.ASSISTANT.value
+        role = "assistant"
         tool_calls: list[dict] = []
         usage = None
         output = console.StreamPrinter(model)
@@ -398,7 +327,7 @@ class LLMClient:
                 if reasoning is not None:
                     reasoning_content = (reasoning_content or "") + reasoning
                     if reasoning:
-                        output.chunk(reasoning, role, MessageRole.THINK.value)
+                        output.chunk(reasoning, role, "think")
                 if content_delta := data.get("content"):
                     output.chunk(content_delta, role)
                     assistant_content += content_delta
@@ -432,7 +361,7 @@ class LLMClient:
                     )
                     yield LLMResponse(
                         json.dumps(call, ensure_ascii=False),
-                        MessageRole.TOOL.value,
+                        "tool",
                     )
             if usage:
                 yield LLMResponse("", role, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens)
@@ -452,32 +381,35 @@ class LLMClient:
         message = response.choices[0].message
         reasoning_content = getattr(message, "reasoning_content", None)
         for call in message.tool_calls or []:
-            console.write(f"{message.role or MessageRole.ASSISTANT.value}({model}): ", message.role or MessageRole.ASSISTANT.value, end="")
-            console.write(call.function.name + call.function.arguments, MessageRole.TOOL.value)
+            console.write(f"{message.role or 'assistant'}({model}): ", message.role or "assistant", end="")
+            console.write(call.function.name + call.function.arguments, "tool")
             yield LLMResponse(
                 json.dumps({"id": call.id, "type": "function", "function": {"name": call.function.name, "arguments": call.function.arguments}}, ensure_ascii=False),
-                MessageRole.TOOL.value,
+                "tool",
             )
         if message.content:
-            console.write(f"{message.role or MessageRole.ASSISTANT.value}({model}): ", message.role or MessageRole.ASSISTANT.value, end="")
-            console.write(message.content, message.role or MessageRole.ASSISTANT.value)
-            yield LLMResponse(message.content, message.role or MessageRole.ASSISTANT.value)
+            console.write(f"{message.role or 'assistant'}({model}): ", message.role or "assistant", end="")
+            console.write(message.content, message.role or "assistant")
+            yield LLMResponse(message.content, message.role or "assistant")
         if response.usage:
-            yield LLMResponse("", MessageRole.ASSISTANT.value, response.usage.prompt_tokens, response.usage.completion_tokens, response.usage.total_tokens)
+            yield LLMResponse("", "assistant", response.usage.prompt_tokens, response.usage.completion_tokens, response.usage.total_tokens)
         return LLMResponse(
             message.content or "",
-            message.role or MessageRole.ASSISTANT.value,
+            message.role or "assistant",
             reasoning_content=reasoning_content,
         )
 
     def chat(self, messages: list[dict], tools: list[Tool] | Callable[[], list[Tool]] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None) -> Generator[LLMResponse, None, None]:
+        # Every message appended below is printed live as it happens, so each
+        # further round only logs what it has not shown yet -- usually nothing.
+        logged = 0
         while True:
             # Freeze one tool snapshot for both the request schema and the
             # calls returned by that request. A tool may mutate this Chat's
             # mapping; the new snapshot is observed by the next iteration.
             tools_snapshot = tools() if callable(tools) else list(tools or [])
             console.notice(f"等待 {model or self.config['default_model']} 的响应…")
-            response = iter(self.generate_response(messages, tools_snapshot, tool_choice, model, stream, description_cache, do_process_image))
+            response = iter(self.generate_response(messages, tools_snapshot, tool_choice, model, stream, description_cache, do_process_image, logged))
             mapping = {tool.description["function"]["name"]: tool for tool in tools_snapshot}
             pending_calls = []
             # Yielded chunks remain the live display/tool stream.  The return
@@ -487,9 +419,9 @@ class LLMClient:
                 try:
                     chunk = next(response)
                 except StopIteration as completed:
-                    assistant = completed.value or LLMResponse("", MessageRole.ASSISTANT.value)
+                    assistant = completed.value or LLMResponse("", "assistant")
                     break
-                if chunk.role != MessageRole.TOOL.value:
+                if chunk.role != "tool":
                     yield chunk
                     continue
                 try:
@@ -521,9 +453,10 @@ class LLMClient:
                     content = f"工具调用失败: {type(error).__name__}: {error}"
                     console.error(f" -> {content}")
                 else:
-                    console.write(f" -> {content}", MessageRole.TOOL.value)
+                    console.write(f" -> {content}", "tool")
                 results.append(ToolCallResult(call["id"], function["name"], function["arguments"], content))
             messages.extend({"role": "tool", "tool_call_id": result.tool_call_id, "content": result.content} for result in results)
+            logged = len(messages)
 
 
 class Chat:
@@ -603,19 +536,13 @@ class Chat:
         except Exception as error:
             _log.exception("LLM chat failed")
             console.error(f"LLM 聊天失败：{error}")
-            result = LLMResponse(f"# {error}", MessageRole.ASSISTANT.value)
+            result = LLMResponse(f"# {error}", "assistant")
             if callback:
                 callback(result)
             return [result]
 
 
-def sum_res(values: list[LLMResponse], role: str = "assistant", content: str = "") -> LLMResponse:
-    return sum(values, start=LLMResponse(content=content, role=role))
-
-
 client: LLMClient | None = None
-llm_client: LLMClient | None = None
-LLMCilent = LLMClient
 
 
 def get_client() -> LLMClient:
@@ -625,11 +552,10 @@ def get_client() -> LLMClient:
 
 
 def on_load(ctx) -> None:
-    global client, llm_client
+    global client
     from mods import storage
 
     config = storage.get("llm_system", "config")
     if not config:
         config.update(_default_config())
     client = LLMClient(config)
-    llm_client = client
