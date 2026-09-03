@@ -62,7 +62,11 @@ uv run --frozen python run.py --smoke
 
 终端输出按行原子：`mods.log` 在加载时包装 `sys.stdout`，让正在写半行的线程独占终端并继续直写——模型回复仍然逐字出现——其余线程写完整的行先排队，等这一行结束再输出；日志的 console handler 共享同一把锁。因此多线程（监听、聊天、子任务、storage 同步）不会再互相插进对方的半行里，代价是后台的行可能稍晚出现，且排在它们到达时那条回复之后。持有终端是一份由每次写入续租的租约（`mods.log.LINE_LEASE`，默认 5 秒）：写得慢但还在写的持有者一直续租、保住整行，卡住不写的等租约到期就断行让路，回复在下一行继续；持有者中途死掉则立即让路。持有者按线程对象而非 `get_ident()` 记录，因为线程退出后 id 会被复用，否则新线程会被当成旧线程续写它遗留的半行；退出时会把没有换行的残留补完。
 
-终端输出按流分组：产出者不再直接 `print`，而是选一条流名（`mods.log.stream("msg")` 即 logger `yz.msg`），由终端决定看不看。当前的流有 `yz.msg`（收发消息）、`yz.llm`（视觉准备、等待、失败提示）、`yz.llm.request`（整条请求栈）、`yz.llm.message`（非流式的完整消息与工具结果）、`yz.image`、`yz.storage`、`yz.link`、`yz.agent`、`yz.mc`、`yz.jm`、`yz.py`、`yz.scheduler`。终端的实际内容是「已订阅流的 INFO 及以上」∪「所有 logger 的 WARNING 及以上」——退订只减少 INFO 流量，永远不能让故障静音，也不影响 `app.log`：无论是否订阅，记录都照常落盘。订阅集用 `.log` 命令改（见[功能与命令目录](commands.md)），存在 `data/storage/log/terminal.json`，重启不重置，默认 `["yz"]` 即全订，与迁移前的终端一致。
+终端输出按流分组：产出者不再直接 `print`，而是选一条流名（`mods.log.stream("msg")` 即 logger `yz.msg`），由终端决定看不看。当前的流有 `yz.msg`（收发消息）、`yz.llm`（视觉准备、等待、失败提示）、`yz.llm.request`（整条请求栈）、`yz.llm.message`（非流式的完整消息与工具结果）、`yz.image`、`yz.storage`、`yz.link`、`yz.agent`、`yz.mc`、`yz.jm`、`yz.py`、`yz.scheduler`。终端的实际内容是「已订阅流的 INFO 及以上」∪「所有 logger 的 WARNING 及以上」——退订只减少 INFO 流量，永远不能让故障静音，也不影响落盘：无论是否订阅，记录都照常写进那条流自己的文件。订阅集用 `.log` 命令改（见[功能与命令目录](commands.md)），存在 `data/storage/log/terminal.json`，重启不重置，默认 `["yz"]` 即全订，与迁移前的终端一致。
+
+三个落盘出口各管一件事：`log/<流>.log` 是每条流自己的证据，按顶层流名一个文件（`yz.llm.request` 和 `yz.llm` 同写 `log/llm.log`，子流是订阅粒度不是文件粒度，完整 logger 名在每行上可以 grep），第一次产出时才建，午夜轮转保留 7 天，`tmux` 开窗口 `tail -f log/llm.log` 就是在看一条流；`app.log` 回到只记严重程度——所有 logger 的 WARNING 以上，加上非流 logger 的 INFO 以上；`chatlog` 仍是产品聊天历史。`log/` 与 `app.log*` 都已在 `.gitignore` 内。
+
+落盘的每行都带归属：一个 filter 在写文件前从 `context` 读当前事件，群聊补 `[g<群号> u<QQ>]`、私聊补 `[u<QQ>]`，没有当前事件就什么都不补（行的形状与之前一致）。**没有任何调用点需要传参**，现有和以后的日志调用都自动带上，这也是它做成 filter 而不是参数的原因。终端不显示归属：终端是状态面，保持产出者自己选的形状。
 
 LLM 的逐字输出不是流，而是终端的交互效果：它仍然直写 `sys.stdout`，因此 `.log` 退订 `yz.llm.request` 只会让请求栈消失，模型仍然逐字出现在终端。`main.py` 的启动/退出摘要和 `identity` 的首次配置验证码同样不走流——恢复入口不可被订阅集关掉。
 

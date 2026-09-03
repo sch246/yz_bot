@@ -11,7 +11,7 @@ This repository is a live personal QQ Bot connected to the device's NapCat insta
 
 ## Production and privacy boundaries
 
-- Do not inspect, modify, delete, migrate, or commit `data/`, `chatlog/`, `config.json`, `.env*`, key files, model outputs, local virtual environments, or other ignored runtime state unless the task explicitly requires that exact data.
+- Do not inspect, modify, delete, migrate, or commit `data/`, `chatlog/`, `log/`, `app.log*`, `config.json`, `.env*`, key files, model outputs, local virtual environments, or other ignored runtime state unless the task explicitly requires that exact data. `log/llm.log` carries chat bodies, prompts and tool arguments, and every stream file carries the interaction ids of the chats it served; treat them exactly as `chatlog/`.
 - Never copy account IDs, group IDs, chat content, credentials, private endpoints, or machine-specific secrets into documentation, scratch scripts, logs, or responses.
 - Do not POST synthetic events to the running `5701` listener, change `.post` routing, send QQ messages, restart the Bot, or exercise host-control commands unless explicitly authorized.
 
