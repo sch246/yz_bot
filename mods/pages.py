@@ -49,7 +49,7 @@ def display(content, page_size=10, init_page=1):
     while True:
         if not msgs.is_msg(reply):
             return "非消息，翻页终止"
-        value = reply["message"].strip().lower()
+        value = msgs.body(reply).strip().lower()
         if value in ("q", "quit", "exit", "退出"):
             return "翻页已结束"
         if value in ("n", "next", "下一页"):

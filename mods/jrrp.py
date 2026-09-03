@@ -50,7 +50,7 @@ def run(body: str):
         elif score < 5:
             data["jrrp"] = f"{score}\n{getran(大失败)}"
             reply = yield TIP
-            show = msgs.is_msg(reply) and reply["message"].strip() == ".jrrp"
+            show = msgs.is_msg(reply) and msgs.body(reply).strip() == ".jrrp"
         else:
             data["jrrp"] = str(score)
     if show:

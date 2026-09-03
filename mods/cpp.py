@@ -54,7 +54,7 @@ def _interact(process):
                 continue
             if process.poll() is not None:
                 break
-            process.stdin.write(reply["message"] + "\n")
+            process.stdin.write(msgs.body(reply) + "\n")
             process.stdin.flush()
         remaining_output, remaining_error = process.communicate()
         if remaining_output:

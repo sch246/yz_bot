@@ -57,7 +57,7 @@
 
 | 目标模块 | 负责 | 不再负责 | 当前来源 | 生命周期与顺序 |
 |---|---|---|---|---|
-| `bot.py` | 唯一消息循环；保持命令、shell、link、notice 和阻塞交互的现有优先级；处理 generator 返回值 | 不导出其它模块名称，不加载具体功能 | `_code/main.py` 的 `recv`、`_strip_reply`、`_set_catches`、`_iter_ret`、`_cmd_ret`、`_run_bash` 和循环 | `run()` 在全部 Load 完成后由 `main.py` 调用 |
+| `bot.py` | 唯一消息循环；保持命令、shell、link、notice 和阻塞交互的现有优先级；处理 generator 返回值 | 不导出其它模块名称，不加载具体功能 | `_code/main.py` 的 `recv`、`_strip_reply`（后已删除，改为 `msgs.body()` 现算）、`_set_catches`、`_iter_ret`、`_cmd_ret`、`_run_bash` 和循环 | `run()` 在全部 Load 完成后由 `main.py` 调用 |
 | `command.py` | 无参数 `@command`、模块/函数派生命令名、点命令匹配、`params`、`grouponly`、帮助查询 | 不接受手写命令名，不扫描第二个命令目录 | `_code/bot/cmds/__init__.py` | Import 阶段声明；`bar.run → .bar`，`bar.foo → .bar.foo`；分发时过滤不可用模块 |
 | `capture.py` | 进程内 `@capture` 声明、可选持久节点前定位和 Load 后激活 | 不读取或写入 links storage，不执行条件/action 字符串 | 新架构能力 | Import 只收集；所属模块 Load 成功后激活；默认作为末尾兜底，已证明的旧优先级用 `before` 合并进同一条线性顺序 |
 | `connect.py` | OneBot HTTP 入站 socket、`recv_msg()`、`call_api()`、出站端口映射 | 不发送业务消息，不启动消息循环 | `_code/bot/connect_with_http.py` | `PHASE = INFRA`；`on_load` 才 bind/listen；`on_exit` 关闭 socket |

@@ -128,7 +128,7 @@ def _evaluate(item: dict, perform_action: bool = True, announce: bool = False) -
         if not msgs.is_msg(event):
             return False, True
         try:
-            captures = text.stc_get(condition)(cq.unescape(event["message"]), py.loc)
+            captures = text.stc_get(condition)(cq.unescape(msgs.body(event)), py.loc)
         except Exception:
             _report_error(name, "cond")
             return False, True
@@ -237,14 +237,14 @@ def _set(name: str, kind: str, parts: list[str]):
         reply = yield "输入cond"
         if not msgs.is_msg(reply):
             return "操作终止"
-        condition = reply["message"].strip()
+        condition = msgs.body(reply).strip()
     if parts and parts[0]:
         action = parts.pop(0)
     else:
         reply = yield "输入action"
         if not msgs.is_msg(reply):
             return "操作终止"
-        action = reply["message"].strip()
+        action = msgs.body(reply).strip()
     return set_link(name, kind, condition, action)
 
 
@@ -258,7 +258,7 @@ def _save_links(path: str):
             pass
     if _snapshot(links) != _startup_snapshot:
         reply = yield f"当前 links 与启动时不同（{len(links)} 条），确认覆盖 {path}？(y/n)"
-        if not (msgs.is_msg(reply) and reply["message"].strip().lower() == "y"):
+        if not (msgs.is_msg(reply) and msgs.body(reply).strip().lower() == "y"):
             return "操作取消"
     parent = os.path.dirname(path)
     if parent:
@@ -281,7 +281,7 @@ def _load_links(path: str):
     if errors:
         return "验证失败，保留当前配置:\n" + "\n".join(errors[:10])
     reply = yield f"将用 {len(incoming)} 条 link 替换当前 {len(links)} 条，确认？(y/n)"
-    if not (msgs.is_msg(reply) and reply["message"].strip().lower() == "y"):
+    if not (msgs.is_msg(reply) and msgs.body(reply).strip().lower() == "y"):
         return "操作取消"
     links[:] = incoming
     storage.save()

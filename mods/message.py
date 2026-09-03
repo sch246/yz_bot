@@ -189,8 +189,6 @@ def recvmsg(text: str, sender_id=None, private: bool | None = None, **values):
     else:
         event["message_type"] = "private"
         event.setdefault("sub_type", "friend")
-    event.pop("reply", None)
-    event.pop("at_cq", None)
 
     from mods import bot
 
@@ -214,8 +212,8 @@ def get_reply(event, predicate=lambda _value: True):
     if not msgs.is_msg(event):
         return {}
     try:
-        text = event["message"]
-        reply = event.get("reply")
+        text = msgs.body(event)
+        reply = msgs.reply_cq(event)
         if not (predicate(text) and reply):
             return {}
         message_id = cq.load(reply)["data"]["id"]

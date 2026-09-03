@@ -153,7 +153,7 @@ def run(body: str):
         if session["owner"] != owner:
             return f'当前文件正被 {session["owner"]} 编辑中'
 
-        user_input = reply["message"]
+        user_input = msgs.body(reply)
         value = user_input.strip().lower()
         previous_invalid = session["last_input_was_invalid"]
         session["last_input_was_invalid"] = False
