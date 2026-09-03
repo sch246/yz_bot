@@ -161,7 +161,7 @@
 | `game2048.py` | 2048 移动和随机生成 | `_code/funcs.py` 的 `fills` 至 `d2048` | 保留；live link 仍调用 |
 | `latex.py` | LaTeX 转图片 | `_code/funcs.py` 的 `latex2img` | 保留为显式动态工具 |
 | `image_tools.py` | GIF/图片缩放 `deal_img` | `_code/funcs.py` 的 `deal_img` | 保留；live link 仍调用 |
-| `search.py` | `.search` 当前窗口日志正则搜索与 5 行交互翻页 | 旧 `search` link 的 shell `grep` + `prints(..., 5)` | 直接升格为命令；读取由 `chatlog.search_current()` 持有，不再保留 `/search` link |
+| `search.py` | `.search` 当前窗口日志正则搜索，命中整条记录、5 条交互翻页 | 旧 `search` link 的 shell `grep` + `prints(..., 5)` | 直接升格为命令；读取由 `chatlog.search_current()` 持有，不再保留 `/search` link |
 | `weather.py` | 和风天气鉴权、城市/经纬查询与预报 | `_code/funcs.py` 的 `geocode`、`_require_env` 至 `get_hourly_forecast` | 保留；chat 工具和 live link 仍调用 |
 | `dao.py` | 《道德经》静态文本 | `_code/funcs.py` 的 `道德经` | 保留；live link 仍调用 |
 | `screen.py` | GNU screen 操作 | `_code/s3/linux_screen.py` | 保留；`nl`、MC 和 live link 仍使用 |

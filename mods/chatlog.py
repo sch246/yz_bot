@@ -35,8 +35,38 @@ def on_load(_ctx: dict[str, Any] | None = None) -> None:
     logger.info("从 chatlog 重建近期消息：%d 个窗口 %d 条", windows, records)
 
 
-def search_current(pattern: str) -> str:
-    """Search the current window's log without invoking a shell."""
+def _file_records(lines: list[str]) -> list[tuple[int, int]]:
+    """Split one file's lines into records as ``(start, end)`` index pairs.
+
+    The record shape is the whole rule: a head is unindented, its body lines
+    carry four spaces.  A notice is a head with no body, so it comes out as a
+    one-line record and searching it is unchanged.  A file that somehow starts
+    with a body line still yields a record rather than dropping those lines.
+    """
+    heads = [index for index, line in enumerate(lines) if not line.startswith("    ")]
+    if not heads or heads[0] != 0:
+        heads.insert(0, 0)
+    return list(zip(heads, heads[1:] + [len(lines)]))
+
+
+def search_current(pattern: str) -> list[str]:
+    """Search the current window's log without invoking a shell, by record.
+
+    Matching stays per line, but a hit returns the **whole record** it belongs
+    to, under a ``path:line`` locator naming the record's first line.  Per-line
+    results were wrong in the normal case rather than an edge one: searching
+    what was said hits an indented body line and loses the sender, timestamp
+    and message id sitting on the head above it, while searching who said it
+    hits the head and loses what was said.
+
+    Results are the stored record put through ``display``, never re-rendered
+    from parsed fields -- the file line is already the best rendering for a
+    reader, so round-tripping it through ``parse_log`` could only lose the
+    locator and invent what v0 never wrote down.
+
+    Raises ``re.error`` for an invalid pattern; phrasing that for the user
+    belongs to the command, not here.
+    """
     from mods import context
 
     event = context.current()
@@ -45,21 +75,18 @@ def search_current(pattern: str) -> str:
         directory = Path(rootfile) / "group" / str(group_id)
     else:
         directory = Path(rootfile) / "private" / str(event["user_id"])
-    try:
-        expression = re.compile(pattern)
-    except re.error as error:
-        return f"搜索表达式无效: {error}"
+    expression = re.compile(pattern)
     matches = []
     for path in sorted(directory.rglob("*.log")) if directory.is_dir() else []:
         try:
-            with path.open(encoding="utf-8") as stream:
-                for line_number, line in enumerate(stream, 1):
-                    shown = display(line)
-                    if expression.search(shown):
-                        matches.append(f"{path}:{line_number}:{shown.rstrip()}")
+            lines = path.read_text(encoding="utf-8").splitlines()
         except OSError:
             continue
-    return "\n".join(matches)
+        for start, end in _file_records(lines):
+            shown = display("\n".join(lines[start:end])).rstrip()
+            if any(expression.search(line) for line in shown.split("\n")):
+                matches.append(f"{path}:{start + 1}\n{shown}")
+    return matches
 
 
 def _unescape(text: Any) -> str:
