@@ -1,11 +1,11 @@
 '''易经起卦'''
 import random
 
-from mods import storage
+from mods import context, history, msgs, storage
 from mods.command import command
 
 
-LOAD_AFTER = ("storage",)
+LOAD_AFTER = ("storage", "history")
 准6 = []
 
 
@@ -47,22 +47,32 @@ def get(i,j,k):
 
 @command
 def run(body: str):
-    """随机进行易经起卦，或指定三个整数。
+    """按当下的聊天起卦，或指定三个整数。
 
     格式：.change [上卦数 下卦数 爻数]
-    不带参数时全部随机；指定时必须恰好提供三个整数，卦和爻按有效范围取模。
+    不带参数时取往上数第 1/2/3 条消息的字数成卦，某一位没有对应消息时该位随机；
+    指定时必须恰好提供三个整数。卦和爻都按有效范围取模。
     """
     if body.strip():
         params = body.strip().split(' ')
         i,j,k = map(int,params)
     else:
-        # i = msglog(1)
-        # j = msglog(2)
-        # k = msglog(3)
-        # i = len(msglog(1))-1 if i is not None else random.randint(0,7)
-        # j = len(msglog(2))-1 if j is not None else random.randint(0,7)
-        # k = len(msglog(3))-1 if k is not None else random.randint(0,5)
-        i = random.randint(0,7)
-        j = random.randint(0,7)
-        k = random.randint(0,5)
+        # WHY: 用最近三条消息的字数起卦，不是纯随机。梅花易数本来就是拿眼前的数
+        # (时辰、字数、笔画)取模成卦，所以卦象跟着当时的聊天走才是这个命令想做的事；
+        # 中间有一段时间改成了 randint，那是图省事，不是判断。
+        # 旧代码写作 msglog(N)——从当前消息往上数第 N 条，触发命令的那条自己不算。
+        # 索引从 1 起就是这个意思，不是多跳了一位：bot._route 先 chatlog.write(事件)
+        # 再派发命令，而 write 内部就调 history.add_msg，所以命令执行时 getlog()[0]
+        # 恒是这条 .change 自己(getlog 最新在前)。从 0 起会让上卦位永远取 ".change"
+        # 的字数，也就是恒为 6——一个不会报错、只是让起卦失去意义的改动。
+        # 字数减一是把 1 字消息对到 0；卦和爻各自的取模在 get() 里做，这里不重复。
+        # 消息不够时只有那一位退回随机，不让整次起卦失败——不够的位本来就没有"当下的数"。
+        events = [event for event in history.getlog(context.current()) if msgs.is_msg(event)]
+
+        def 字数(n: int, bound: int) -> int:
+            if len(events) <= n:
+                return random.randint(0, bound)
+            return len(msgs.body(events[n])) - 1
+
+        i, j, k = 字数(1, 7), 字数(2, 7), 字数(3, 5)
     return get(i,j,k)

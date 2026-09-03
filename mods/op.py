@@ -42,6 +42,9 @@ def require_op(msg: dict[str, Any] | None = None, remind: bool = True) -> bool:
         msg = _current()
     if is_op(msg):
         return True
+    # WHY: 这是全仓库的提醒节流约定——同一窗口最近若干条里已经出现过同类尝试，就不再
+    # 重复提醒，否则一个人连点几次会把群刷满。判据是聊天记录而不是计时器或计数器，因为
+    # 记录本来就在，不需要再引入一份状态。post.py 的 .post 提醒用的是同一个模式。
     if remind and not history.any_same(msg, r"^(?:!|\.op)"):
         from mods import message
 

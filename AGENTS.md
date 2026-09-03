@@ -9,6 +9,38 @@ This repository is a live personal QQ Bot connected to the device's NapCat insta
 - Documents under `docs/working/proposals/` are unimplemented proposals, not current contracts. `docs/working/link-reactions.md` is a dated snapshot, not live authority.
 - Preserve unrelated working-tree changes. Never assume existing modifications are disposable.
 
+## Why the code is shaped this way
+
+Four years of this system predate its git history: it was squashed into the mods
+switch, so `git blame` dates every line to the same import and explains nothing.
+The reasons live in inline comments, and nowhere else.
+
+- `# WHY:` records what a shape protects — an accident, a deliberate asymmetry,
+  an accepted inconsistency, or a place where weakness is the correct choice.
+  Treat it as a constraint on your edit, not as prose. Several of them exist
+  specifically because the code reads like an oversight and is not one: a
+  fixed `sleep`, a skipped permission check, a short unvalidated code, a unit
+  bug left unfixed. Do not "clean up" what a `WHY:` defends; if you believe it
+  is wrong, say so and let the maintainer decide.
+- `# WHY?:` is an open question — the shape is unexplained and nobody has
+  confirmed whether it is intentional. `grep -rn "WHY?:" mods/` is the queue.
+  Answer one by asking the maintainer, then rewrite it as a `WHY:`. Never
+  silently resolve one by guessing, and never delete one to tidy the file.
+- Some `WHY?:` entries say a shape arrived in an assisted refactor and the
+  maintainer never ruled on it. Those are the ones this file exists for: an
+  agent wrote a mechanism its own defaults liked, it works, and nobody chose
+  it. Do not treat "it is already here and passes" as the argument — the
+  question is the one `docs/design-principles.md` asks of any abstraction,
+  which problem it was observed to solve. A mechanism that answers "none at
+  this scale" is a candidate for removal even though nothing is broken, and
+  saying so is more useful than leaving it in place because it is tidy.
+- Write a new `WHY:` only for what the code cannot show: the reason it exists,
+  the fact it protects, or the condition under which it may be deleted. A
+  comment restating the statement below it is noise. When you learn a reason
+  while working — from the maintainer, from a bug, from a differential run —
+  leave it next to the code rather than in `docs/`, which the next person
+  editing that line will not be reading.
+
 ## Production and privacy boundaries
 
 - Do not inspect, modify, delete, migrate, or commit `data/`, `chatlog/`, `log/`, `app.log*`, `config.json`, `.env*`, key files, model outputs, local virtual environments, or other ignored runtime state unless the task explicitly requires that exact data. `log/llm.log` carries chat bodies, prompts and tool arguments, and every stream file carries the interaction ids of the chats it served; treat them exactly as `chatlog/`.

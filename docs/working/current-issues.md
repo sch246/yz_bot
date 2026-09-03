@@ -5,7 +5,6 @@
 ## 需要运行观察
 
 - 新入口首次由维护者启动后，观察 Module Import/Load 汇总、管理员初始化/恢复提示、link/capture 命中打印、LLM stream/工具调用、图片捕获缓存和 Ctrl+C 有序退出。
-- `mods.server` 的协议和所有权已经迁移；具体设备地址与私钥路径只应来自忽略的 `data/device/server.json`。若设备配置缺失，依赖 `%` 反应的首次调用会明确失败，不应回退到源码常量。
 - `.setu` 的网络访问已延迟到调用时；link helper 对多页图片 URL 的旧改写语义尚未决定，本轮保持现状。
 
 ## 已确认的缺陷

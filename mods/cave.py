@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from random import randint
 import re
@@ -14,6 +15,8 @@ from mods.command import command
 from mods.message import sendmsg
 from mods.randoms import getran
 
+
+_log = logging.getLogger(__name__)
 
 LOAD_AFTER = ("storage", "identity", "op")
 CAVE_MSG_REQUIRED_KEYS = ("sender", "qq", "time", "text")
@@ -46,6 +49,9 @@ class Cave:
             if selected is None:
                 return ""
             position, index = selected
+            # WHY: 抽中后只有 2/3 概率移出 pool。必删(纯轮换)会让每条严格等距出现，
+            # 太机械；留下 1/3 制造"偶尔连着抽到同一条"的手感，更像真的漂流瓶。
+            # 这是刻意的重放曲线，不是没写完的去重。
             if randint(0, 2):
                 del self.pool[position]
         if index.startswith("-"):
@@ -174,7 +180,13 @@ def run(body: str):
             if not msgs.is_msg(reply):
                 return "非消息，执行终止"
             value += msgs.body(reply)
-        return state.set(state.empty(), value) if value else "不知道为啥消息为空"
+        if not value:
+            # WHY: 占位符。前面每条 reply 都过了 is_msg，理论上到不了这里，但确实发生过。
+            # 不抛异常是因为一条空记录不值得让命令崩掉；打印调用栈是为了下次发生时能
+            # 知道是从哪条路径进来的——光靠这句文案查不出任何东西。
+            _log.warning("cave addn 收到空正文", stack_info=True)
+            return "不知道为啥消息为空"
+        return state.set(state.empty(), value)
     if operation == "search":
         keyword = rest.strip()
         return state.search(keyword) if keyword else "请输入要搜索的关键词"

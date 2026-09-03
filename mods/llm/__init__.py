@@ -17,6 +17,7 @@ from .models import (
     BYTECAT_PROVIDER_CONFIG,
     DEFAULT_MODEL,
     DEFAULT_VISION_MODEL,
+    DEFAULT_REQUEST_TIMEOUT,
     default_config as _default_config,
     resolve_model,
     split_model_selection,
@@ -145,16 +146,38 @@ def split_string_with_code_blocks(value: str) -> list[str]:
     return result
 
 
+class _DescriptionTask:
+    """One in-flight vision description, and its result for the waiters.
+
+    WHY: 结果挂在任务上而不是让等待方回读自己的缓存。去重键因此不需要缓存身份，
+    见 LLMClient._get_image_description 里的说明。
+    """
+
+    __slots__ = ("event", "description")
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.description: str | None = None
+
+
 class LLMClient:
     def __init__(self, config: dict) -> None:
         self.config = config
         self.clients: dict[str, OpenAI] = {}
-        self._description_inflight: dict[tuple, threading.Event] = {}
+        self._description_inflight: dict[tuple[str, object], _DescriptionTask] = {}
         self._description_lock = threading.Lock()
         self.reload_clients()
 
     @staticmethod
     def _resolve_config_value(value) -> str | None:
+        """Read a config value which may name an environment variable.
+
+        WHY: 裸字符串先当环境变量名查，是**主机制**而不是宽松兜底——models.py 的
+        default_config() 里每个 provider 写的都是 "OPENAI_BASE_URL" 这样的裸名字，
+        ``${VAR}`` 只是需要显式区分时的备用写法。所以密钥和地址从来不进版本控制。
+        代价是一个恰好与环境变量同名的字面值会被静默替换。这个风险有意接受：撞车概率
+        很低，而且现有配置很可能已经在用裸名字这个特性了，改掉会直接弄坏它们。
+        """
         if not isinstance(value, str):
             return value
         if value.startswith("${") and value.endswith("}"):
@@ -167,6 +190,9 @@ class LLMClient:
             base_url = self._resolve_config_value(config.get("base_url"))
             api_key = self._resolve_config_value(config.get("api_key"))
             options = {key: value for key, value in {"base_url": base_url, "api_key": api_key}.items() if value is not None}
+            # 超时设在 client 上，所以 generate_response、流式读取和 describe_image
+            # 全都继承它；见 models.DEFAULT_REQUEST_TIMEOUT。
+            options["timeout"] = self.config.get("request_timeout") or DEFAULT_REQUEST_TIMEOUT
             self.clients[provider] = OpenAI(**options)
 
     def get_model_capabilities(self, model: str) -> ModelCapabilities:
@@ -256,7 +282,15 @@ class LLMClient:
             console.notice(f"🔎 正在解析图片内容：{console.format_uri(uri)}")
             _, _, digest = image.resolve_image_with_digest(uri)
             identities.insert(0, digest)
-        key = (id(description_cache), digest, image.AUTO_IMAGE_DESCRIPTION_VERSION)
+        # WHY: 去重键只有内容摘要和描述版本，不含缓存身份。原先是
+        # (id(description_cache), digest, version)——用字典的内存地址做键，而 id() 在
+        # 对象被回收后会被复用，新的 cache 可能拿到同一个地址并撞上残留键。
+        # 同一个仓库里有正确写法可对照：image.maybe_prune_description_cache 也按 id(cache)
+        # 索引，但它把 cache 对象本身一起存下来并用 `is` 校验，所以能识破地址复用。
+        # 这里选的是更直接的路：既然键里不再区分缓存，去重就跨聊天空间生效——同一张图
+        # 在两个群同时出现只调一次视觉模型。代价是等待方的缓存里没有这一条，所以结果由
+        # _DescriptionTask 持有，等待方拿到后各自写进自己的缓存，而不是回读。
+        key = (digest, image.AUTO_IMAGE_DESCRIPTION_VERSION)
         with self._description_lock:
             for identity in identities:
                 cached = image.get_cached_description(description_cache, identity)
@@ -265,19 +299,23 @@ class LLMClient:
                     console.notice(f"✅ 图片描述缓存命中：{algorithm}")
                     console.notice(f"    {cached}")
                     return cached
-            event = self._description_inflight.get(key)
-            owner = event is None
+            task = self._description_inflight.get(key)
+            owner = task is None
             if owner:
-                event = threading.Event()
-                self._description_inflight[key] = event
+                task = _DescriptionTask()
+                self._description_inflight[key] = task
         if not owner:
             console.notice(f"⏳ 等待同一图片的描述任务：sha256:{digest[:12]}")
-            event.wait()
+            task.event.wait()
+            description = task.description
+            if description is None:
+                return None
             with self._description_lock:
-                description = image.get_cached_description(description_cache, digest)
-            if description is not None:
-                console.notice(f"✅ 等待中的图片描述已缓存：sha256:{digest[:12]}")
-                console.notice(f"    {description}")
+                removed = image.cache_description(description_cache, digest, description)
+            console.notice(f"✅ 等待中的图片描述已缓存：sha256:{digest[:12]}")
+            console.notice(f"    {description}")
+            if removed:
+                console.notice(f"🧹 已清理 {removed} 条过期图片描述缓存")
             return description
         try:
             console.notice(f"👁️ 使用 {vision_model} 生成图片描述…")
@@ -290,11 +328,14 @@ class LLMClient:
                     console.notice(f"🧹 已清理 {removed} 条过期图片描述缓存")
             else:
                 console.error("⚠️ 视觉模型未返回图片描述，本次不缓存")
+            task.description = description
             return description
         finally:
+            # 先摘掉登记再放行：新来的请求会开一个新任务，而不是拿到这个已完成的。
+            # 异常路径同样走到这里，此时 description 仍是 None，等待方据此回退。
             with self._description_lock:
                 self._description_inflight.pop(key, None)
-                event.set()
+                task.event.set()
 
     def _describe_images(self, messages: list[dict], cache: dict) -> list[dict]:
         vision_model = self.get_vision_model()
@@ -471,6 +512,28 @@ class LLMClient:
         # Every message appended below is printed live as it happens, so each
         # further round only logs what it has not shown yet -- usually nothing.
         logged = 0
+        # WHY: 工具循环有意没有最大轮数、总时限、确认步骤或副作用回滚，恢复手段是
+        # .reboot。取舍与它暴露在同一条提示注入路径上的能力都记在 docs/llm.md 的
+        # 「当前信任边界与维护取舍」一节——加限制前先读那里，这不是漏了。
+        #
+        # WHY?: 缺插话与 ^C 打断。方向已定，尚未实现——实现时按下面这套来，别另起一套。
+        #
+        # 先记清现状，免得被误判成"收不到消息"：入站没有被生成挡住，link.dispatch 是
+        # thread.to_thread(None)，每条消息都在自己的线程上派发。现在的问题是第二条 at
+        # 会**再起一轮并发的 chat()**，两轮各自读 get_msgs()、各自发言。
+        #
+        # 已定的设计：
+        # - 按**窗口**登记，不按 (窗口, 用户)。插话和 ^C 都是任何人可用：LLM 上下文本来
+        #   就是整个窗口共享的，只让触发者能停会让群里其他人无法制止一轮跑偏的生成。
+        #   注意这与 context.interaction_key 的粒度不同，需要单独的窗口级登记。
+        # - 插话走队列：中途到达的消息进队尾，在本轮返回后、或下一次调用模型前(例如现在
+        #   工具返回后自动续问的那一步)一并带入，而不是打断当前请求。
+        # - 分级：只有原本就会触发聊天的消息(at、link 命中)才**触发**一次新的插话调用；
+        #   普通消息只**进队列**不触发。这样既让模型看到更多上下文，又不会让普通闲聊无限
+        #   续聊下去。
+        # - ^C 打断：本循环需要在每轮之间检查窗口级取消标记(InteractionCancelled 已存在)，
+        #   理想情况下还要能中断流式读取。bot._route 的 ^C 分支本身在生成期间是能跑的，
+        #   缺的只是这个循环没有登记可被 context.cancel 唤醒的东西。
         while True:
             # Freeze one tool snapshot for both the request schema and the
             # calls returned by that request. A tool may mutate this Chat's
@@ -602,8 +665,12 @@ class Chat:
                 results.append(chunk)
             return results
         except Exception as error:
+            # WHY: 有意吞掉所有异常并把错误变成一条 assistant 消息。Bot 在聊天里必须
+            # 说点什么——静默死掉是最糟的失败方式，群里没人知道发生了什么。完整
+            # traceback 进 _log，聊天里只留一行；那一行带 `#` 所以不会回流进上下文。
             _log.exception("LLM chat failed")
             console.error(f"LLM 聊天失败：{error}")
+            # `#` 前缀让这条错误不回流进 LLM 上下文，见 chat.get_msgs 的说明。
             result = LLMResponse(f"# {error}", "assistant")
             if callback:
                 callback(result)

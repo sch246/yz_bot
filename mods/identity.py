@@ -232,6 +232,12 @@ def _receive_private(*, user_id: int | None = None, text: str | None = None) -> 
 
 
 def _first_configuration(login_name: str) -> dict[str, Any]:
+    # WHY: 4 位、无超时、无重试限制，都是有意的。这个验证码做的是**身份确认**而不是
+    # 安全：它只在裸机首次启动、config.json 还不存在的那十几秒里有效，只出现在控制台，
+    # 而正盯着控制台的主人一旦看到不是自己发的，立刻关掉就行。
+    # 因此越简单越好。不要"顺手加固"成 6 位、限流或过期——那只增加复杂度，不增加任何
+    # 这个场景下真实存在的保护。
+    # 也不直接取第一个发消息的人：Bot 仍可能被加群/加好友而随机收到无关消息。
     code = str(random.randint(1000, 9999))
     print("未检测到 config.json，开始首次配置", flush=True)
     print("请私聊 Bot 发送下面的验证码；发送账号将成为 master：", flush=True)

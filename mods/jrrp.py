@@ -43,6 +43,9 @@ def run(body: str):
         if time.strftime("%m-%d") != "04-01":
             data["jrrp_date"] = date
         else:
+            # WHY: 愚人节把上限提到一百万，并且故意不写 jrrp_date——当天可以反复刷。
+            # 两件事都是玩笑的一部分：不锁定才能让那个夸张的数反复出现。
+            # 这个分支跳过日期写入是有意的，不是漏了。
             score = 0 if set_zero else rd(1, 1_000_001) - 1
             data["jrrp_"] = score
         if score > 95:

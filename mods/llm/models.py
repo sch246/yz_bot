@@ -6,6 +6,12 @@ from copy import deepcopy
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
 DEFAULT_VISION_MODEL = "bytecat/gpt-5.4-mini"
 
+# WHY: OpenAI SDK 不给超时就是 600 秒，对聊天来说等于挂死——一次卡住的视觉识别会让
+# 那条 link 线程一直占着，而它在 get_msgs -> 请求的同步路径上。这个值是 httpx 的
+# 单次操作超时，流式响应每收到一个 chunk 就重新计时，所以长回复不会被它切断；它拦的
+# 是"对端不再说话"。可用 llm_system/config 的 request_timeout 覆盖。
+DEFAULT_REQUEST_TIMEOUT = 120.0
+
 BYTECAT_PROVIDER_CONFIG = {
     "base_url": "BYTECAT_BASE_URL",
     "api_key": "BYTECAT_API_KEY",
@@ -59,4 +65,5 @@ def default_config() -> dict:
         },
         "default_model": DEFAULT_MODEL,
         "vision_model": DEFAULT_VISION_MODEL,
+        "request_timeout": DEFAULT_REQUEST_TIMEOUT,
     }

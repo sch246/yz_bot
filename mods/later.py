@@ -101,6 +101,10 @@ def _action(sequence: int, expr: str, msg: dict[str, Any]) -> None:
     future = py.run(
         expr,
         msg,
+        # WHY: 权限在 later_add / later_set 创建时就检查过一次(op.is_op 或 is_safe)，
+        # 执行时不再检查，也不借用 Bot 管理员身份——任务不能因为被推迟到未来执行就
+        # 获得比创建者更高的权限。skip_op=True 看起来像漏检，实际是这个不变量的实现，
+        # 别"补上"。同一条也记在 docs/llm.md 的当前信任边界一节。
         skip_op=True,
         insert={"later_repeat": repeat_here, "repeat": repeat_here},
     )

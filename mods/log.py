@@ -48,6 +48,12 @@ DEFAULT_SUBSCRIPTIONS = (STREAM_ROOT,)
 # they exist to be subscribed separately, not to be tailed separately, and the
 # full logger name is on every line for grepping.
 LOG_ROOT = "log"
+# WHY: TimedRotatingFileHandler 的 backupCount——每天轮转一份，保留最近 7 份。
+# 意图是"能留就留，用来事后 debug"，轮转只是为了不让它无限增长，所以这个数是可用磁盘
+# 的函数，不是保密期。
+# 但它有个副作用值得知道：log/llm.log 带聊天正文、提示词和工具参数，每个流文件还带它
+# 服务过的聊天 id(AGENTS.md 要求按 chatlog/ 同等对待)，所以这个数同时决定了这些内容
+# 在磁盘上留多久。哪天出于隐私而不是磁盘去调它，改的也是这里。
 BACKUP_DAYS = 7
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")

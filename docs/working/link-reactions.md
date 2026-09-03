@@ -92,10 +92,12 @@
 | `reply` | `.reply <名称> ...` | 调用 `.link` 内部能力创建静态回复节点 |
 | `iex` | `.iex ...` | 调用 `pyload` 运行环境提供的 `iex` 辅助函数；具体后端不在受控源码中定义 |
 | `vcs0`、`vcs` | `.vcs` | 调用 `pyload` 运行环境提供的 `vcs` 辅助函数；具体语义以运行配置为准 |
-| `server` | `% ...` | 调用已连接的远端函数服务 |
 | `ls-repo`、`new-repo`、`del-repo`、`gitadd` | 仓库维护短命令 | 通过宿主机/远端 shell 管理仓库或授权信息 |
 
 这些节点具有宿主机或远端副作用。它们虽然位于 link 中，但不应被当作普通娱乐反应测试。
+
+原有的 `server` 节点（`% ...`）已经不存在：它依赖的远端服务器过期后，`mods.portfunc`
+与 `mods.server` 一并删除，link 本身也已从运行配置中移除。`%` 现在不再是被占用的前缀。
 
 ### Minecraft 与服务控制
 
@@ -113,7 +115,7 @@ haoye → search → 道德经 → encode → decode → 叫nm → 清静经 →
 → zml → ls-repo → del-repo → new-repo → gitadd → del_msg → trans_img
 → setname → 午 → 晚 → mytest → 百变小猫 → iex → vcs0 → vcs
 → bottles_guess → bottles_init → ？ → 狐狸叫 → ping → chatend → recall
-→ shownotice → chatting → chatstart → server → 2048_fast → 2048 → doge
+→ shownotice → chatting → chatstart → 2048_fast → 2048 → doge
 → 6 → 好耶 → petpet2 → yggktk → petpet → reply → restartmc → stopmc
 → startmc → 真太阳时 → 查询经纬 → 经纬 → 不可以 → 柚子亲亲 → 柚子憨憨
 → r1d100 → mc命令2 → 获取他人名字 → 答案之书 → mc命令 → 吗？

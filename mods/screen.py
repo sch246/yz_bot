@@ -69,6 +69,9 @@ def send(name: str, command: str):
     )
     if result.returncode:
         return result.stderr.strip()
+    # WHY: 0.2 是试出来的，不是有依据的常量——这里根本没有同步机制，只是赌 screen
+    # 在这段时间内把输出写完了，实际完全取决于当时机器的负载。命令慢于此会读到空或
+    # 半截。这是已知的脆弱点而不是可以放心调的旋钮；真要修得改成轮询日志到稳定为止。
     time.sleep(0.2)
     return pop(name)
 
