@@ -67,7 +67,7 @@
 | `thread.py` | `to_thread`、`SimpleFuture` 和受 Ctrl+C 控制的线程包装 | 不启动后台业务任务 | `_code/s3/thread.py` | 纯定义 |
 | `log.py` | 进程日志格式和唯一 handler 配置 | 不写 QQ 聊天记录 | `_code/s3/__logging.py`；旧 `_code/s3/log.py` 不保留第二套实现 | `PHASE = INFRA`；`on_load` 安装 handler，`on_exit` flush/close |
 | `context.py` | 当前线程事件、最近一条事件、交互线 key 与等待下一次输入的 continuation | 不保存窗口历史，不查询用户资料 | `_code/bot/cache.py` 的 `msgs_this`、`thismsg`、`catches`；`_code/main.py` 的 `msg_id` | 纯内存状态；generator 与 `.py input()` 共用可取消的等待登记 |
-| `history.py` | 每群/私聊最近 256 条消息、退出恢复缓存、`getlog`/`same_times`/`any_same`/`get_one` | 不写完整聊天日志，不保存 LLM 会话对象 | `_code/bot/cache.py` 的 `msgs` 与查询；`_code/funcs.py` 的 `match`、`getlog`、`msglog` | `PHASE = INFRA`；在 storage 后恢复，使退出时先保存近期缓存、再保存 storage，日志最后关闭 |
+| `history.py` | 每群/私聊最近 256 条消息、窗口键 `window`、作者 `author`、`getlog`（带 `since`/`until` 时转 `chatlog.read_range` 读文件）/`same_times`/`any_same`/`get_one` | 不写完整聊天日志，不解析日志文件，不自己持久化，不保存 LLM 会话对象 | `_code/bot/cache.py` 的 `msgs` 与查询；`_code/funcs.py` 的 `match`、`getlog`、`msglog` | `PHASE = INFRA`；纯内存，启动时由 `chatlog.on_load` 从日志重建，退出时无需保存 |
 | `identity.py` | Bot 自身资料、用户/群资料缓存、名字与群名、群成员、用户/群 storage 便捷函数 | 不决定管理员权限 | `_code/bot/cache.py` 的资料缓存；`_code/funcs.py` 的 `ensure_*`、`get/setname`、`get/setgroupname`、`memberlist`、`headshot` | `PHASE = INFRA`，在 `connect` 后完成登录与首次昵称配置 |
 | `message.py` | `send()`、当前窗口 `sendmsg()`、内部事件 `recvmsg()`、发送节流，以及发送后的日志回写 | 不决定路由优先级 | `_code/main.py` 的 `send`；`_code/funcs.py` 的 `sendmsg`、`recvmsg`；`_code/s3/delay_func.py` | `PHASE = INFRA`；发送线程仍按需启动，生命周期顺序只保证 scheduler 先停、队列再排空、storage 最后保存 |
 | `chatlog.py` | 按群/私聊写完整聊天日志、格式化 notice、把事件加入近期历史 | 不提供近期查询和 LLM 上下文裁剪 | `_code/bot/chatlog.py` | 无后台任务 |
@@ -161,7 +161,7 @@
 | `game2048.py` | 2048 移动和随机生成 | `_code/funcs.py` 的 `fills` 至 `d2048` | 保留；live link 仍调用 |
 | `latex.py` | LaTeX 转图片 | `_code/funcs.py` 的 `latex2img` | 保留为显式动态工具 |
 | `image_tools.py` | GIF/图片缩放 `deal_img` | `_code/funcs.py` 的 `deal_img` | 保留；live link 仍调用 |
-| `search.py` | `.search` 当前窗口日志正则搜索与 5 行交互翻页 | 旧 `search` link 的 shell `grep` + `prints(..., 5)` | 直接升格为命令；读取由 `chatlog.search_current()` 持有，不再保留 `/search` link |
+| `search.py` | `.search` 当前窗口日志正则搜索，命中整条记录、5 条交互翻页 | 旧 `search` link 的 shell `grep` + `prints(..., 5)` | 直接升格为命令；读取由 `chatlog.search_current()` 持有，不再保留 `/search` link |
 | `weather.py` | 和风天气鉴权、城市/经纬查询与预报 | `_code/funcs.py` 的 `geocode`、`_require_env` 至 `get_hourly_forecast` | 保留；chat 工具和 live link 仍调用 |
 | `dao.py` | 《道德经》静态文本 | `_code/funcs.py` 的 `道德经` | 保留；live link 仍调用 |
 | `screen.py` | GNU screen 操作 | `_code/s3/linux_screen.py` | 保留；`nl`、MC 和 live link 仍使用 |

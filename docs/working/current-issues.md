@@ -8,6 +8,22 @@
 - `mods.server` 的协议和所有权已经迁移；具体设备地址与私钥路径只应来自忽略的 `data/device/server.json`。若设备配置缺失，依赖 `%` 反应的首次调用会明确失败，不应回退到源码常量。
 - `.setu` 的网络访问已延迟到调用时；link helper 对多页图片 URL 的旧改写语义尚未决定，本轮保持现状。
 
+## 已确认的缺陷
+
+以下两条在读代码时确认，并已实测复现；它们独立于[统一消息模型](proposals/message-model.md)，但那篇提案的实施依赖它们先修好。
+
+### ~~`cq.unescape` 的替换顺序把实体还原了两次~~（已修）
+
+`mods/text.py` 的 `replace_by_dic2` 原本按字典序遍历，于是 `cq.unescape` 先把 `&amp;` 还原成 `&`，再把得到的 `&#91;` 当成实体还原成 `[`。用户字面输入 `&#91;` 会被吞掉。已改为倒序遍历——「撤销 `replace_by_dic`」本来就是倒着走，`&amp;` 因此最后还原；`escape` 方向（先 `&`）本来就是对的，未动。
+
+影响面曾覆盖所有把消息正文当源码读的入口：`.py`、`.link`、`.hs`、`.js` 等 13 处 `cq.unescape(body)`，以及 `chatlog` 的正文写入。
+
+### ~~私聊窗口里 `is_self` 会把 Bot 自己的消息算成对端的~~（已修）
+
+`mods/message.py:95` 让 Bot 自发的私聊消息带上对端的 `user_id`（群聊则带 Bot 自己的），而旧的 `history.is_self` 用顶层 `user_id` 判断「同一个人」，于是私聊里两者无法区分。已改为 `history.same_author`，按 `sender` 判定作者——那是两种窗口下都指向作者的字段。
+
+实际影响过 `mods/op.py:45`、`mods/post.py:62` 的提醒节流和 `mods/cave.py:168` 的 `get_self_log`；其中只有后者会产生用户可见的错误内容（私聊 `.cave addn -<n>` 会把 Bot 的回复合并进回声洞）。缺陷是原生的而不是迁移引入的，取证见[统一消息模型](proposals/message-model.md)的第 4 步。
+
 ## 接受的现行约束与取舍
 
 ### LLM 以可信聊天范围为主要边界
