@@ -28,8 +28,11 @@ DELETE_MARKER = "DELETE"
 # 不丢，所以这个窗口只在 SIGKILL、断电、fatal error 时兑现。调它是产品决定。
 # FILE_SETTLE_DELAY 是文件事件后等多久再读：编辑器常常多次写或写临时文件再 rename，
 # 立刻读会读到半个文件。
-# WHY?: 其余四个没有出处，维护者没有选过它们，来自同一次辅助重构。它们目前没有已知
-# 问题，但也没有理由；改动前不必当成经过判断的值。
+# 其余四个同样是经验值，来自那次辅助重构，维护者复核后确认照现在这样跑没出过问题，
+# 不必再当成待办。它们仍然只是"够用"而不是算出来的：真要调，先看它们各自决定什么——
+# WORKER_TICK 是文件改动的响应下限(与 FILE_SETTLE_DELAY 相加才是实际延迟)，
+# FILE_SCAN_WINDOW 是 watchdog 漏事件时 stat 兜底的周期，DISCOVERY_INTERVAL 是发现
+# 新文件/新 key 的周期，RETRY_DELAY 是序列化失败后的重试间隔。
 MEMORY_SCAN_WINDOW = 10 * 60.0   # 手定：非正常终止的最大丢失窗口
 FILE_SCAN_WINDOW = 2.0
 DISCOVERY_INTERVAL = 30.0
