@@ -86,6 +86,12 @@ _EXPORT_SPECS = {
     "decode_dict": ("codec", "decode_dict"),
     "encode_dict": ("codec", "encode_dict"),
     "get_reply": ("message", "get_reply"),
+    # The reply/at projections used to be keys planted on the event dict; they
+    # are pure functions now, so live reactions reach them by name.
+    "is_reply": ("msgs", "is_reply"),
+    "reply_cq": ("msgs", "reply_cq"),
+    "at_cq": ("msgs", "at_cq"),
+    "msg_body": ("msgs", "body"),
     "iex": ("screen", "iex"),
     "is_valid_ssh_pubkey": ("portfunc", "is_valid_ssh_pubkey"),
     "isfloat": ("text", "isfloat"),
@@ -253,9 +259,11 @@ def ls(value):
 
 
 def match(pattern):
+    from mods import msgs
+
     event = context.current()
-    if isinstance(event, dict) and "message" in event:
-        return re.match(pattern, event["message"])
+    if msgs.is_msg(event):
+        return re.match(pattern, msgs.body(event))
     return None
 
 

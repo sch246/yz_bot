@@ -189,7 +189,7 @@ def download(url: str, path: str, event=None):
 def recv_img(event, path):
     if not msgs.is_img(event):
         return "目标msg不是单个图片"
-    item = cq.load(event["message"])
+    item = cq.load(msgs.body(event))
     download(item["data"]["url"], path, event)
     return f"正在将图片保存到\n{path}"
 
@@ -197,7 +197,7 @@ def recv_img(event, path):
 def _recv_file(event, path):
     if not msgs.is_file(event):
         return "发送的不是文件，操作终止"
-    item = cq.load(cq.find_all(event["message"])[0])
+    item = cq.load(cq.find_all(msgs.body(event))[0])
     result = connect.call_api("get_file", file_id=item["data"]["file_id"])
     if result.get("retcode") != 0:
         return result.get("wording", "获取文件失败")
@@ -207,7 +207,7 @@ def _recv_file(event, path):
 
 
 def _confirmed(event) -> bool:
-    return msgs.is_msg(event) and event["message"] in (
+    return msgs.is_msg(event) and msgs.body(event) in (
         "是", "确定", "y", "Y", "yes", "Yes", "YES", "OK", "ok", "Ok"
     )
 

@@ -79,7 +79,7 @@ LLM 的逐字输出不是流，而是终端的交互效果：它仍然直写 `sy
 1. NapCat 把 OneBot 事件 POST 到监听端口。
 2. HTTP 接收器解析事件并立即返回 200。
 3. `mods.bot.recv()` 记录当前消息和聊天日志。
-4. reply 规范化、`^C` 删除 catch、延续式阻塞、普通命令、shell、link 按[完整入口优先级](interaction-model.md#入口有优先级)处理。
+4. reply 投影（不改写事件）、`^C` 删除 catch、延续式阻塞、普通命令、shell、link 按[完整入口优先级](interaction-model.md#入口有优先级)处理。
 5. 回复进入异步发送队列，再调用 NapCat 的 OneBot API。
 6. Bot 查询刚发送的消息并写入自己的聊天记录。
 

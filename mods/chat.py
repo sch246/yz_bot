@@ -169,7 +169,7 @@ def get_msgs(token_limit: int | None = None, return_token: bool = False):
     selected = []
     for event in history.getlog(current)[:max_msg]:
         if msgs.is_msg(event):
-            value = event.get("message", "")
+            value = msgs.body(event)
             if value.startswith("#"):
                 continue
             if value in ("聊天开始", "聊天结束"):
@@ -226,6 +226,7 @@ def _base_prompt() -> list[dict]:
     return [{"role": "system", "content": f"""## 注意事项
 - 你的昵称: {identity.bot_name()}
 - 你的QQ号: {identity.bot_id()}；群聊 at 格式为 [CQ:at,qq=qq号]，reply 格式为 [CQ:reply,id=message_id]
+- 你收到的消息原样带着这两种 CQ 码。reply 里的 message_id 与上文各条消息 <metadata> 中的 <message_id> 对应，据此判断对方在回复哪一条
 - 聊天中可能不会有明显的问题，扮演好角色即可
 - 如无特殊要求，请用中文回复"""}]
 
@@ -411,7 +412,7 @@ def cond() -> Callable | bool:
     if group_id is not None and group_id not in chat_groups:
         return False
     if msgs.is_msg(event):
-        value = event.get("message", "")
+        value = msgs.body(event)
         if has_at(identity.bot_id())(event) or value.startswith(f"{identity.bot_name()}，") or value.startswith("柚子，"):
             return True
         if value.startswith("#"):
@@ -446,7 +447,7 @@ def capture_addressed_fallback(event: dict) -> bool:
     if not msgs.is_msg(event):
         return False
     captures = text.stc_get(r"{:identity.names}[,，\s]+{Text}")(
-        cq.unescape(event.get("message", "")),
+        cq.unescape(msgs.body(event)),
         {"identity": identity},
     )
     if captures is None:

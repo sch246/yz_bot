@@ -42,6 +42,8 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 `mods.bot` 持有唯一事件循环。OneBot 事件始终以普通 `dict` 在系统中传递，不建立 DTO 或消息 class 层级。当前入口顺序由[交互模型](interaction-model.md#入口有优先级)记录：日志、延续式交互、点命令、shell、线性 link/capture 共用一条明确路径。
 
+路由不改写事件字典。`message` 从 NapCat 送来是什么，写进 chatlog、进 `history`、送到模型面前就还是什么；回复关系、去掉回复后的正文和 at 列表是它的三个投影，由 `mods.msgs` 的纯函数 `reply_cq()` / `body()` / `at_cq()` 现算。这不只是风格：`bot` 曾在写完日志之后就地剥掉开头的 reply CQ 并挂上 `reply` / `at_cq` 两个键，于是实时事件和从同一份文件重建出来的那条事件不一样——重建的带着 reply CQ、却没有那两个键，模型因此只在重启后看见字面的 `[CQ:reply,...]`。派生值不落在数据里，这个差别就无从产生。规则是：**解释**消息的地方（`^C`、`.` 命令、shell 前缀、link 条件、延续式回答、单 CQ 判定）读 `msgs.body()`，**存储和显示**消息的地方读原始 `message`。
+
 当前事件与等待下一条输入由 `mods.context` 持有；近期 256 条窗口事件由 `mods.history` 持有；完整可读聊天历史由 `mods.chatlog` 追加写入。三者职责不同，不能相互替代。
 
 `chatlog` 的行格式是协议，逐条写在[chatlog 记录格式](chatlog-format.md)里，改动即破坏性变更。记录形状是「记录头顶格、正文缩进 4 格」：`【头衔】名字(QQ号) 时:分:秒 | 消息号`，私聊同形但没有 `【头衔】`。正文存 OneBot 原始串，末尾空白按规则清除；`chatlog.display()` 是唯一的显示投影，终端回显和 `.search` 都经过它把正文 unescape 回可读形式，因此人看到的内容与切换前一致，而文件保留的是事实。`.search` 也按这个形状分组：命中任何一行都返回它所属的整条记录，附 `path:line` 定位头（通知没有正文，是一条单行记录），所以搜正文能看到是谁说的、搜人名能看到说了什么；结果是记录原文，不经过 `parse_log`。`format_message` 与 `parse_log` 是互逆的一对纯函数，`parse_log` 同时能读切换前的旧记录并用 `_derived`/`_missing` 标出哪些字段是推导值、哪些根本没写下来。切换时刻记在 `storage` 的 `chatlog/format`。历史记录只读，不重写；旧记录缺私聊发送者身份，这一缺口的确切大小和其余取舍见[统一消息模型](working/proposals/message-model.md)。

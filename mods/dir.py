@@ -38,7 +38,7 @@ def get(path: str):
 
 
 def _receive(event, destination):
-    item = cq.load(cq.find_all(event["message"])[0])
+    item = cq.load(cq.find_all(msgs.body(event))[0])
     result = connect.call_api("get_file", file_id=item["data"]["file_id"])
     if result.get("retcode") != 0:
         return result.get("wording", "获取文件失败")

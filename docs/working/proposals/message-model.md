@@ -79,7 +79,7 @@
 | `self_id` | `identity.bot_id()`；全仓库只出现在 `mods/msgs.py:12` 的键名清单里，无行为消费者 |
 | `raw_message`、`font` | 同 `message` / 常量垃圾；同样只出现在 `mods/msgs.py:13` |
 | `sub_type`（消息的 `friend`/`normal`/`anonymous`） | `msgs.is_friend`、`msgs.is_anonymous` 在 `mods/` 内无调用者，不予恢复 |
-| `reply` / `reply_cq` | 正文里的 `[CQ:reply,id=...]`。`mods/bot.py:150` 的 `chatlog.write` 发生在 `_strip_reply` 之前，回复关系原样留在正文里 |
+| `reply` / `reply_cq` | 正文里的 `[CQ:reply,id=...]`，无需恢复。这两个键后来被删掉了：路由不再改写正文，回复关系改由 `msgs.reply_cq()` 现算，重建结果与实时事件因此逐字相同 |
 | `sender.nickname` / `card` / `title` | 行内渲染的 `【头衔】名字`（写入当时的历史值），或 `identity` 的当前值 |
 
 `sender` 在重建结果里必须存在且带 `user_id`——`chat.msg2chat` 只认这一处。其余 `sender` 字段按上表填入并标为推导值。

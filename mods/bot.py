@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from inspect import getgeneratorstate, GEN_CREATED
 import logging
-import re
 import subprocess
 import sys
 import time
@@ -22,27 +21,12 @@ from mods import thread
 
 _log = logging.getLogger(__name__)
 _stream = log.stream("msg")
-_reply = re.compile(r"^(\[CQ:reply,[^\]]+\])([\S\s]*)")
 
 
 def _optional(name: str):
     from mods import get_available
 
     return get_available(name)
-
-
-def _strip_reply(event: dict) -> dict:
-    value = event["message"]
-    event["reply"] = None
-    match = _reply.match(value)
-    if match:
-        event["reply"], value = match.groups()
-    event["message"] = value
-    event["at_cq"] = [
-        item for item in cq.find_all(value)
-        if cq.load(item)["type"] == "at"
-    ]
-    return event
 
 
 def _report_error(error: BaseException) -> None:
@@ -158,9 +142,11 @@ def _route(event: dict) -> str | None:
         chat = _optional("chat")
         if chat is not None:
             chat.eager_cache_images(event)
-        _strip_reply(event)
         key = context.interaction_key(event)
-        value = event["message"]
+        # ``message`` stays exactly what NapCat sent, all the way into the chat
+        # log and history; the reply-stripped form is derived here for dispatch
+        # only, so a rebuilt event and a live one route identically.
+        value = msgs.body(event)
 
         if value.rstrip() in ("^C", "^c"):
             context.cancel(key)

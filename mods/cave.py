@@ -154,7 +154,7 @@ def run(body: str):
             reply = yield "发送一条消息，^C以取消"
             if not msgs.is_msg(reply):
                 return "非消息，执行终止"
-            value = reply["message"]
+            value = msgs.body(reply)
         return state.set(state.empty(), value)
     if operation == "addn":
         count_text, _ = text.read_params(rest)
@@ -166,14 +166,14 @@ def run(body: str):
             return "n不能为0"
         if count < 0:
             events = history.get_self_log(context.current())[1 : -count + 1]
-            value = "".join(event["message"] for event in reversed(events))
+            value = "".join(msgs.body(event) for event in reversed(events))
             return state.set(state.empty(), value)
         value = ""
         for index in range(count):
             reply = yield f"接下来的{count}条消息将会被合并为1条记录" if index == 0 else None
             if not msgs.is_msg(reply):
                 return "非消息，执行终止"
-            value += reply["message"]
+            value += msgs.body(reply)
         return state.set(state.empty(), value) if value else "不知道为啥消息为空"
     if operation == "search":
         keyword = rest.strip()
@@ -196,7 +196,7 @@ def _save_cave(path: str):
         return f"序列化失败: {error}"
     if _cave_startup_snapshot != current:
         reply = yield f"当前 cave 与启动时不同（{len(state.msgs)} 条），确认覆盖 {path}？(y/n)"
-        if not (msgs.is_msg(reply) and reply["message"].strip().lower() == "y"):
+        if not (msgs.is_msg(reply) and msgs.body(reply).strip().lower() == "y"):
             return "操作取消"
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as file:
@@ -232,7 +232,7 @@ def _load_cave(path: str):
         suffix = f"\n... 共 {len(errors)} 处错误" if len(errors) > 10 else ""
         return f"验证失败，保留当前数据 ({len(state.msgs)} 条):\n" + "\n".join(errors[:10]) + suffix
     reply = yield f'将用 {len(data["msgs"])} 条替换当前 {len(state.msgs)} 条，确认？(y/n)'
-    if not (msgs.is_msg(reply) and reply["message"].strip().lower() == "y"):
+    if not (msgs.is_msg(reply) and msgs.body(reply).strip().lower() == "y"):
         return "操作取消"
     state.msgs.clear()
     state.msgs.update(data["msgs"])

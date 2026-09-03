@@ -1,6 +1,8 @@
-"""Predicates over raw OneBot event dictionaries."""
+"""Predicates and pure projections over raw OneBot event dictionaries."""
 
 from __future__ import annotations
+
+import re
 
 from mods import cq
 
@@ -40,6 +42,41 @@ def is_msg(msg: dict) -> bool:
     return isinstance(msg, dict) and "message" in msg
 
 
+_reply_head = re.compile(r"^(\[CQ:reply,[^\]]+\])([\S\s]*)")
+
+
+def reply_cq(msg: dict) -> str | None:
+    """The leading reply CQ code of a message, or ``None``.
+
+    A reply is a fact about the text, so it is read from the text rather than
+    from a key someone remembered to set.  That keeps a message rebuilt from
+    the chat log identical to the same message live: the file and memory hold
+    exactly what NapCat sent, and every derived view is computed on demand.
+    """
+    if not is_msg(msg):
+        return None
+    match = _reply_head.match(msg["message"])
+    return match.group(1) if match else None
+
+
+def body(msg: dict) -> str:
+    """The message with its leading reply CQ code removed.
+
+    Anything that *interprets* a message -- command prefixes, link conditions,
+    continuation answers -- wants this; anything that stores or shows it wants
+    the raw ``message``.
+    """
+    if not is_msg(msg):
+        return ""
+    match = _reply_head.match(msg["message"])
+    return match.group(2) if match else msg["message"]
+
+
+def at_cq(msg: dict) -> list[str]:
+    """Every at CQ code in the message body, in order."""
+    return [item for item in cq.find_all(body(msg)) if cq.load(item)["type"] == "at"]
+
+
 def is_group_msg(msg: dict) -> bool:
     return is_msg(msg) and msg.get("group_id") is not None
 
@@ -55,16 +92,16 @@ def is_anonymous(msg: dict) -> bool:
 def is_cq(msg: dict) -> bool:
     if not is_msg(msg):
         return False
-    value = msg["message"]
-    return cq.find_all(value) == [value]
+    value = body(msg)
+    return bool(value) and cq.find_all(value) == [value]
 
 
 def is_img(msg: dict) -> bool:
-    return is_cq(msg) and cq.load(msg["message"])["type"] == "image"
+    return is_cq(msg) and cq.load(body(msg))["type"] == "image"
 
 
 def is_reply(msg: dict) -> bool:
-    return is_msg(msg) and (msg.get("reply") is not None or "reply_cq" in msg)
+    return reply_cq(msg) is not None
 
 
 def is_req(msg: dict) -> bool:
@@ -84,7 +121,7 @@ def is_notice(msg: dict) -> bool:
 
 
 def is_file(msg: dict) -> bool:
-    return is_cq(msg) and cq.load(msg["message"])["type"] == "file"
+    return is_cq(msg) and cq.load(body(msg))["type"] == "file"
 
 
 def is_group_file(msg: dict) -> bool:
