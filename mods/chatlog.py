@@ -206,6 +206,12 @@ def _file_str(file_info: dict[str, Any]) -> str:
 
 
 def _get_size(size: int) -> str:
+    # WHY: 阈值 1000、除数 1024、单位写 KB，三者不自洽——1000~1023 B 渲染成 "0.98KB"
+    # 而不是 B，且与 image/__init__.py 的 KiB(/1024) 不一致。已知，不修。
+    # 这行的输出直接进 chatlog 文件行(_file_str)，而 chatlog 是协议不是描述。解析侧
+    # 不读回大小所以改了不会崩，但会在唯一写入权威里留下第二次静默的格式漂移，且不像
+    # v0/v1 那样带标注——正是 chatlog-format.md 拒绝写转换脚本时给的理由。要改就得
+    # 连同版本标注一起设计，不能当成顺手的单位订正。
     value = float(size)
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if value < 1000:
