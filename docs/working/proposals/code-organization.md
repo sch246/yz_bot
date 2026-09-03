@@ -234,7 +234,7 @@ re 节点 action 中的 `{:name}` 保留历史的原样文本替换，用于已�
 
 旧 `chatting` 和“吗？”节点由有审计锚点的 chat capture 承载；`shownotice` 只是临时 raw notice 调试反应，明确删除而不升格为 capture。`trans_img` 直接使用 `file`，`reply` 直接使用 `link.set_literal()`，不经过命令 registry 取模块。
 
-`.search` 保留的行为边界是“当前窗口全部日志匹配→CQ 转义→每 5 行交互式翻页”；内部从 shell `grep` 改成 Python 搜索不允许顺便删掉分页、截断为固定条数或改变无结果时的分页反馈。它已从 `/search` 持久 link 直接升格为 `search.py` 命令，不保留双入口。
+`.search` 保留的行为边界是“当前窗口全部日志匹配→CQ 转义→每 5 行交互式翻页”；内部从 shell `grep` 改成 Python 搜索不允许顺便删掉分页、截断为固定条数或改变无结果时的分页反馈。它已从 `/search` 持久 link 直接升格为 `search.py` 命令，不保留双入口。（这条边界后来被有意改动：翻页单位从 5 **行**变成 5 **条记录**，因为按行返回会让命中正文时丢掉发送者、命中记录头时丢掉正文。分页、无结果反馈和单一入口都保留，理由见[统一消息模型](message-model.md)的 search 一节。）
 
 LLM 聊天的 `#` 管理子命令保留旧版已注册的 model/models/use_model、prompt/add_prompt、setting/use_setting/set_setting/del_setting、image 和 help 行为。特别地，`#model <selection>` 只查询模型信息，只有 `#use_model <selection>` 修改当前窗口的模型。
 
