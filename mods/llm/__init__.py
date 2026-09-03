@@ -17,6 +17,7 @@ from .models import (
     BYTECAT_PROVIDER_CONFIG,
     DEFAULT_MODEL,
     DEFAULT_VISION_MODEL,
+    DEFAULT_REQUEST_TIMEOUT,
     default_config as _default_config,
     resolve_model,
     split_model_selection,
@@ -155,6 +156,14 @@ class LLMClient:
 
     @staticmethod
     def _resolve_config_value(value) -> str | None:
+        """Read a config value which may name an environment variable.
+
+        WHY: 裸字符串先当环境变量名查，是**主机制**而不是宽松兜底——models.py 的
+        default_config() 里每个 provider 写的都是 "OPENAI_BASE_URL" 这样的裸名字，
+        ``${VAR}`` 只是需要显式区分时的备用写法。所以密钥和地址从来不进版本控制。
+        代价是一个恰好与环境变量同名的字面值会被静默替换。这个风险有意接受：撞车概率
+        很低，而且现有配置很可能已经在用裸名字这个特性了，改掉会直接弄坏它们。
+        """
         if not isinstance(value, str):
             return value
         if value.startswith("${") and value.endswith("}"):
@@ -167,6 +176,9 @@ class LLMClient:
             base_url = self._resolve_config_value(config.get("base_url"))
             api_key = self._resolve_config_value(config.get("api_key"))
             options = {key: value for key, value in {"base_url": base_url, "api_key": api_key}.items() if value is not None}
+            # 超时设在 client 上，所以 generate_response、流式读取和 describe_image
+            # 全都继承它；见 models.DEFAULT_REQUEST_TIMEOUT。
+            options["timeout"] = self.config.get("request_timeout") or DEFAULT_REQUEST_TIMEOUT
             self.clients[provider] = OpenAI(**options)
 
     def get_model_capabilities(self, model: str) -> ModelCapabilities:
@@ -256,6 +268,13 @@ class LLMClient:
             console.notice(f"🔎 正在解析图片内容：{console.format_uri(uri)}")
             _, _, digest = image.resolve_image_with_digest(uri)
             identities.insert(0, digest)
+        # WHY?: 辅助重构引入，维护者没有印象。用 id() 做键的一部分是不安全的：对象被
+        # 回收后地址会被复用，新的 description_cache 可能拿到同一个地址并撞上残留键。
+        # 这与 log.py 明确避开的那件事是同一类问题("持有者按线程对象而非 get_ident()
+        # 记录，因为线程退出后 id 会被复用")，那边选对了，这里没有。
+        # 待定的是修法：去掉 id(cache) 改成按 digest 全局去重最简单，但语义会变——缓存
+        # 本身是按聊天空间分的，跨空间去重会让一个空间等另一个空间的结果，然后在自己的
+        # 缓存里查不到。也可以给每个 cache 存一个稳定 token 当身份。先记下不动。
         key = (id(description_cache), digest, image.AUTO_IMAGE_DESCRIPTION_VERSION)
         with self._description_lock:
             for identity in identities:
@@ -471,6 +490,23 @@ class LLMClient:
         # Every message appended below is printed live as it happens, so each
         # further round only logs what it has not shown yet -- usually nothing.
         logged = 0
+        # WHY: 工具循环有意没有最大轮数、总时限、确认步骤或副作用回滚，恢复手段是
+        # .reboot。取舍与它暴露在同一条提示注入路径上的能力都记在 docs/llm.md 的
+        # 「当前信任边界与维护取舍」一节——加限制前先读那里，这不是漏了。
+        #
+        # WHY?: 但确实缺两件东西，维护者已确认是问题，只是还没设计完：
+        # 1) 插话——一轮生成中途到达的消息进不了这一轮。注意入站没有被挡住：
+        #    link.dispatch 是 thread.to_thread(None)，所以每条消息都在自己的线程上派发，
+        #    生成期间消息照样能到。现状不是"收不到"，而是第二条 at 会**再起一轮并发的
+        #    chat()**，两轮各自读 get_msgs()、各自发言。要做插话，缺的是让运行中的
+        #    Chat 按窗口登记自己，新消息追加进它的 messages 而不是另开一轮。
+        # 2) ^C 打断——bot._route 里的 ^C 分支能在生成期间跑(它在入站线程上)，但
+        #    context.cancel 只唤醒登记过的 waiter，而这个循环没登记，所以 ^C 对它无效。
+        #    要做打断，这个循环需要每轮之间检查一个取消标记(InteractionCancelled 已经
+        #    存在)，理想情况下还要能中断流式读取。
+        # 两者共用一个未决问题：context.interaction_key 是 (窗口, 用户)，而 LLM 上下文
+        # 是整个窗口共享的。所以要先决定"谁的 ^C 能停掉群里这一轮"——按窗口登记意味着
+        # 任何人都能停，按用户登记意味着只有触发者能停，而别人插话又该进哪一轮。
         while True:
             # Freeze one tool snapshot for both the request schema and the
             # calls returned by that request. A tool may mutate this Chat's
@@ -602,8 +638,12 @@ class Chat:
                 results.append(chunk)
             return results
         except Exception as error:
+            # WHY: 有意吞掉所有异常并把错误变成一条 assistant 消息。Bot 在聊天里必须
+            # 说点什么——静默死掉是最糟的失败方式，群里没人知道发生了什么。完整
+            # traceback 进 _log，聊天里只留一行；那一行带 `#` 所以不会回流进上下文。
             _log.exception("LLM chat failed")
             console.error(f"LLM 聊天失败：{error}")
+            # `#` 前缀让这条错误不回流进 LLM 上下文，见 chat.get_msgs 的说明。
             result = LLMResponse(f"# {error}", "assistant")
             if callback:
                 callback(result)

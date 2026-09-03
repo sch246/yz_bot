@@ -321,6 +321,7 @@ def _execute(body: str, msg=None, skip_op=False, insert=None):
     except context.InteractionCancelled:
         return None
     except Exception:
+        # `#` 前缀让 traceback 不回流进 LLM 上下文，见 chat.get_msgs 的说明。
         message.sendmsg("#" + "".join(traceback.format_exc().splitlines(True)[3:]).strip())
     return None
 

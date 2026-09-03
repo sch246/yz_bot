@@ -24,6 +24,10 @@ prompts: dict = {}
 chat_groups: list = []
 description_cache: dict = {}
 llm_config: dict = {}
+# WHY: 这两个是 LLM 刚出现时定的，那时模型上下文上限本身就很小——max_msg 早期是 20
+# 甚至更少，因为太容易超限。现在的模型早已宽松得多，这组默认值只是没人回头调过，不是
+# 出于省钱的判断。两者都可以被 storage 里的 llm_config 覆盖(见 on_load)，所以要放宽
+# 优先改配置而不是改这里的默认值。
 max_token = 4000
 max_msg = 200
 _cost_lock = threading.Lock()
@@ -169,6 +173,19 @@ def get_msgs(token_limit: int | None = None, return_token: bool = False):
     for event in history.getlog(current)[:max_msg]:
         if msgs.is_msg(event):
             value = msgs.body(event)
+            # WHY: `#` 开头的消息一律不进 LLM 上下文。这是一条跨模块的约定，且这里是
+            # 唯一的消费端——所有生产端都指回这里：
+            #   llm.Chat.chat      LLM 失败信息  f"# {error}"
+            #   py.run             .py 的 traceback
+            #   link._traceback_text  link action 的 traceback
+            #   chat.call          #子命令的输出
+            # 目的是让调试输出不回流进模型：它们对模型无意义，占 token，还会让模型看到
+            # 自己的错误堆栈然后试图"解释"它。过滤对所有发送者一视同仁，Bot 自己发的也
+            # 一样被排除；用户发的 `#help` 等子命令因此也不进上下文，这同样是想要的。
+            # 改任何一个生产端的前缀(比如统一成 console 的 ❌ 图标)都会让那类输出开始
+            # 回流，而且不会报错——只会悄悄变贵变糟。
+            # 注意别和 py/link 里"最后一行以 # 开头就不 eval"混为一谈：那是 Python 的
+            # 注释语义，只是恰好同一个字符。
             if value.startswith("#"):
                 continue
             if value in ("聊天开始", "聊天结束"):
@@ -425,6 +442,7 @@ def cond() -> Callable | bool:
 
 def call(data: Callable | bool):
     if callable(data):
+        # `#` 前缀让子命令的输出不回流进 LLM 上下文，见 get_msgs 的说明。
         return "#" + cq.escape(str(data()))
     return chat()
 

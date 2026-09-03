@@ -58,6 +58,7 @@ def del_link(name: str) -> bool:
 
 
 def _traceback_text() -> str:
+    # `#` 前缀让 traceback 不回流进 LLM 上下文，见 chat.get_msgs 的说明。
     return "#" + "".join(traceback.format_exc().splitlines(True)[3:]).strip()
 
 

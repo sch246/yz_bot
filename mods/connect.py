@@ -201,9 +201,11 @@ def on_load(ctx) -> None:
         try:
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server.bind(listen)
-            # WHY: 100 是任意值。backlog 是"已完成握手但还没 accept 的连接"的排队上限，
-            # 而入站只有本机一个 NapCat 在推事件，队列几乎不会有第二个——这个规模下
-            # 5 和 100 没有可观察差别。不用查它的来历，也不值得调。
+            # WHY: 100 是任意值。backlog 是"已完成握手但还没 accept 的连接"的排队上限。
+            # 队列确实会积累——bot._route 在派发前是同步的(chatlog 写入、命令执行都在
+            # 入站线程上)，一条慢命令期间 NapCat 推来的事件就排在这里；只有 link 派发是
+            # 独立线程。但 NapCat 的事件速率很低，这个规模下 5 和 100 没有可观察差别。
+            # 不用查它的来历，也不值得调。
             server.listen(100)
         except Exception:
             server.close()
