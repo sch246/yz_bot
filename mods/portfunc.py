@@ -3,6 +3,22 @@
 No socket or remote instance is created at import time.  Trusted device code
 must explicitly construct a :class:`Client`, :class:`Server`, or call a
 function wrapped by :func:`listen`.
+
+WHY?: 这个模块的出身是探索加密通信的练手，不是被需求逼出来的，维护者也在考虑删掉它。
+在删之前要知道它并非没有消费者：``mods.server`` 是它唯一的真实使用者，而 server 是
+``%`` link 的客户端(见 docs/working/link-reactions.md 里名为 ``server`` 的那条)。
+``py.py`` 另外把 ``is_valid_ssh_pubkey`` 暴露进动态环境。
+
+删除判断依据(需要看被忽略的运行时文件，只有维护者能查)：
+- ``data/storage/links.json`` 里那条 ``%`` link 是否还在、还用不用；
+- ``data/device/server.json`` 是否还指向一台活着的机器。
+两个都否，就可以连 ``mods.server`` 一起删；否则它是活路径，别当死码清理。
+
+它的密码学形状没有被审过，也不该假装审过：RSA 1024、SHA-1 签名、AES-CBC 零填充无
+MAC，且客户端签的是自己生成的 nonce(服务端不出挑战，签名可重放)；``Server.bind``
+每次启动新生成密钥对而客户端不校验服务端公钥，所以只认证客户端、不认证服务端。
+这些在"自己的机器、私钥只在自己手上、端口不对公网"的前提下是够用的，但那个前提没有
+在代码里写下来过——所以这是待确认而不是已接受。要保留就先把前提写明，要么就删。
 """
 
 import getpass
@@ -147,6 +163,14 @@ def _send(sock: socket.socket, value: bytes):
 
 
 def _receive(sock: socket.socket) -> bytes:
+    """Read one message, framed by "a short read means the end".
+
+    WHY: 这个分帧是不可靠的，属于已知脆弱点。``_send`` 在长度正好是 1024 的整数倍时
+    补 ``_END``，补的只是"整除"这一种情况；TCP 本身不保证 ``recv(1024)`` 收满，一个
+    大消息中途返回 800 字节同样会被当成结束，于是 ``decode`` 拿到截断的密文而报错。
+    实际没遇到过，是因为消息小、走的是自己的机器。要真正修就得加长度前缀，那会同时
+    改掉两端的协议——在这个模块的去留定下来之前不值得做。
+    """
     chunks = []
     while True:
         value = sock.recv(1024)

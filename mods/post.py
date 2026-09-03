@@ -6,6 +6,9 @@ from mods import connect, context, history, op, text
 from mods.command import command
 
 
+# WHY: 有意的方向选择——post 写，connect 只读。映射本身住在 connect 里，因为出站
+# 选路(_target_port)必须能用它；但改它的入口在这里。反过来让 connect 去 import post
+# 会让 INFRA 依赖 FEATURE，破坏相位顺序。所以这不是"没做完的封装"，别收回去。
 post_map = connect.post_map
 LOAD_AFTER = ("op", "history", "connect")
 re_int = re.compile(r"\d+$")
@@ -59,6 +62,7 @@ def run(body: str) -> str | None:
     group_match, user_match = re_group.fullmatch(operation), re_user.fullmatch(operation)
     if operation == "*" or group_match or user_match:
         if not op.is_op(event):
+            # 同 op.require_op 的提醒节流约定，理由写在那里。
             if not history.any_same(event, r"\.post"):
                 return "权限不足(一定消息内将不再提醒)"
             return None
