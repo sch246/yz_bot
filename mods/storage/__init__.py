@@ -24,10 +24,17 @@ logger = log.stream("storage")
 root_path = "data/storage/"
 DELETE_MARKER = "DELETE"
 
-MEMORY_SCAN_WINDOW = 10 * 60.0
+# WHY: 只有两个是维护者手定的，都是经验值而不是算出来的，但含义明确：
+# MEMORY_SCAN_WINDOW 是"非正常终止最多丢多少改动"——正常退出走 on_exit -> save()
+# 不丢，所以这个窗口只在 SIGKILL、断电、fatal error 时兑现。调它是产品决定。
+# FILE_SETTLE_DELAY 是文件事件后等多久再读：编辑器常常多次写或写临时文件再 rename，
+# 立刻读会读到半个文件。
+# WHY?: 其余四个没有出处，维护者没有选过它们，很可能和 phase()/due_memory[0] 一样
+# 来自同一次辅助重构。它们目前没有已知问题，但也没有理由；改动前不必当成经过判断的值。
+MEMORY_SCAN_WINDOW = 10 * 60.0   # 手定：非正常终止的最大丢失窗口
 FILE_SCAN_WINDOW = 2.0
 DISCOVERY_INTERVAL = 30.0
-FILE_SETTLE_DELAY = 1.0
+FILE_SETTLE_DELAY = 1.0          # 手定：等编辑器写完
 WORKER_TICK = 0.2
 RETRY_DELAY = 30.0
 
@@ -76,6 +83,15 @@ def _disk_signature(path: str) -> tuple[int, int] | None:
 
 
 def _replace(namespace: str, name: str, value: Any) -> Any:
+    """Refill the existing container instead of rebinding the name.
+
+    WHY: 承重不变量，别改成 ``values[name] = value``。模块持有的是活引用——
+    ``cave.Cave.__init__`` 就把 ``storage.get("", "cave")`` 存进了 ``self.msgs``——
+    重新绑定只会换掉这里的字典，所有持有者继续看着旧对象，磁盘上的改动对它们永远不
+    可见，而且它们的写入还会被下一轮同步当成"内存变了"再写回去。
+    原地 clear+update 让"文件改了，运行中的功能立刻看到"这件事成立，这正是文件可编辑
+    的意义所在。类型不同(dict 换成 list)时才退回绑定，因为那时本来就没有容器可复用。
+    """
     values = storage.setdefault(namespace, {})
     current = values.get(name)
     if isinstance(current, dict) and isinstance(value, dict):
@@ -141,13 +157,37 @@ def _write_snapshot(namespace: str, name: str, text: str, digest: str) -> None:
         load_errors.pop((namespace, name), None)
 
 
+def _serialize_reporting(value: Any) -> tuple[str, str, dict[str, int]]:
+    """``_serialize`` plus what it silently turned into ``null``."""
+    dropped: dict[str, int] = {}
+
+    def note(obj: Any) -> None:
+        label = type(obj).__name__
+        dropped[label] = dropped.get(label, 0) + 1
+
+    text, value_digest = _serialize(value, on_drop=note)
+    return text, value_digest, dropped
+
+
+def _report_dropped(namespace: str, name: str, dropped: dict[str, int]) -> None:
+    # 只在真正写盘时报，不在每轮变化检测时报——否则同一个坏值每个窗口都会刷一条。
+    if not dropped:
+        return
+    detail = "、".join(f"{label}×{count}" for label, count in sorted(dropped.items()))
+    _report(
+        f'保存"{_key_label(namespace, name)}"时有值无法序列化，已写成 null：{detail}',
+        logging.WARNING,
+    )
+
+
 def _write_one(namespace: str, name: str) -> Any:
     with _lock:
         try:
             value = storage[namespace][name]
         except KeyError:
             raise KeyError(f'storage "{_key_label(namespace, name)}" 不存在')
-        text, digest = _serialize(value)
+        text, digest, dropped = _serialize_reporting(value)
+    _report_dropped(namespace, name, dropped)
     _write_snapshot(namespace, name, text, digest)
     return value
 
@@ -254,6 +294,10 @@ def get_namespace(namespace: str) -> dict[str, Any]:
 def get(namespace: str, name: str, default: Callable[[], Any] = dict) -> Any:
     key = namespace, name
     with _lock:
+        # WHY: 文件加载失败且内存里也没有时，宁可抛异常也不返回一个新的空默认值。
+        # 返回默认值看起来更友好，但下一次 save() 就会把这个空值写回去，把"文件损坏但
+        # 内容还在"变成"内容真的没了"。抛异常让损坏停在可修的状态：文件还在原地，
+        # 人可以去看、去改、去恢复。别为了"让 get 不抛异常"把这条去掉。
         if key in load_errors and name not in storage.get(namespace, {}):
             raise ValueError(
                 f'storage "{_key_label(*key)}" 的文件加载失败，拒绝用默认值覆盖'
@@ -369,13 +413,14 @@ def _sync_memory_key(key: tuple[str, str], now: float) -> None:
             return
         state.next_memory_check = _phase(key, MEMORY_SCAN_WINDOW, now + 0.001)
         try:
-            text, digest = _serialize(storage[key[0]][key[1]])
+            text, digest, dropped = _serialize_reporting(storage[key[0]][key[1]])
         except Exception as error:
             state.next_memory_check = now + RETRY_DELAY
             _report(f'检查"{_key_label(*key)}"内存变化失败：{error}', logging.ERROR)
             return
         should_write = digest != state.baseline_digest or state.repair_disk
     if should_write:
+        _report_dropped(*key, dropped)
         try:
             _write_snapshot(*key, text, digest)
         except Exception as error:
@@ -411,6 +456,11 @@ def _worker_loop() -> None:
                 except Exception as error:
                     _report(f'处理文件变化"{path}"失败：{error}', logging.ERROR)
         if due_memory:
+            # WHY?: 同 codec.phase——辅助重构引入，维护者没有判断过。due_memory 是列表
+            # 却只取第一个，于是每个 tick 最多同步一个 key，配合 WORKER_TICK=0.2 就是
+            # 5 key/秒的上限。正常情况下靠 phase() 错峰，同时到期的很少，所以看不出来；
+            # 但积压时(比如刚启动、或一批 key 同时被改)排空速率就是这个数，而这个上限
+            # 不是谁定的。要改的话这里应该是循环，不是取 [0]。
             _sync_memory_key(due_memory[0], now)
         _stop_event.wait(WORKER_TICK)
 

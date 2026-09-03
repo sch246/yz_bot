@@ -26,6 +26,14 @@ The reasons live in inline comments, and nowhere else.
   confirmed whether it is intentional. `grep -rn "WHY?:" mods/` is the queue.
   Answer one by asking the maintainer, then rewrite it as a `WHY:`. Never
   silently resolve one by guessing, and never delete one to tidy the file.
+- Some `WHY?:` entries say a shape arrived in an assisted refactor and the
+  maintainer never ruled on it. Those are the ones this file exists for: an
+  agent wrote a mechanism its own defaults liked, it works, and nobody chose
+  it. Do not treat "it is already here and passes" as the argument — the
+  question is the one `docs/design-principles.md` asks of any abstraction,
+  which problem it was observed to solve. A mechanism that answers "none at
+  this scale" is a candidate for removal even though nothing is broken, and
+  saying so is more useful than leaving it in place because it is tidy.
 - Write a new `WHY:` only for what the code cannot show: the reason it exists,
   the fact it protects, or the condition under which it may be deleted. A
   comment restating the statement below it is noise. When you learn a reason
