@@ -60,8 +60,11 @@ def run(body: str):
         # WHY: 用最近三条消息的字数起卦，不是纯随机。梅花易数本来就是拿眼前的数
         # (时辰、字数、笔画)取模成卦，所以卦象跟着当时的聊天走才是这个命令想做的事；
         # 中间有一段时间改成了 randint，那是图省事，不是判断。
-        # 旧代码写作 msglog(N)——从当前消息往上数第 N 条。getlog() 最新在前，且当前这条
-        # .change 自己已经在里面(事件先写日志再分发)，所以 msglog(N) 就是过滤后的第 N 项。
+        # 旧代码写作 msglog(N)——从当前消息往上数第 N 条，触发命令的那条自己不算。
+        # 索引从 1 起就是这个意思，不是多跳了一位：bot._route 先 chatlog.write(事件)
+        # 再派发命令，而 write 内部就调 history.add_msg，所以命令执行时 getlog()[0]
+        # 恒是这条 .change 自己(getlog 最新在前)。从 0 起会让上卦位永远取 ".change"
+        # 的字数，也就是恒为 6——一个不会报错、只是让起卦失去意义的改动。
         # 字数减一是把 1 字消息对到 0；卦和爻各自的取模在 get() 里做，这里不重复。
         # 消息不够时只有那一位退回随机，不让整次起卦失败——不够的位本来就没有"当下的数"。
         events = [event for event in history.getlog(context.current()) if msgs.is_msg(event)]
