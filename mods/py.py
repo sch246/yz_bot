@@ -235,7 +235,9 @@ def chat_input(prompt: str = "", recv_all=False):
         context.pop_waiter(key)
     if recv_all:
         return reply
-    return reply.get("message") if isinstance(reply, dict) else None
+    from mods import msgs
+
+    return msgs.body(reply) if msgs.is_msg(reply) else None
 
 
 def chat_print(*values, sep=" ", end="\n", file=None, flush=False):

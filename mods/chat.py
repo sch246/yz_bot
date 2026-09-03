@@ -84,16 +84,15 @@ def count_tokens(value: str) -> int:
 
 def has_at(user_id: int):
     def predicate(event: dict) -> bool:
-        if not msgs.is_msg(event):
-            return False
-        for code in cq.find_all(event.get("message", "")):
-            parsed = cq.load(code)
-            if parsed["type"] == "at" and parsed["data"].get("qq") not in (None, "all"):
-                try:
-                    if int(parsed["data"]["qq"]) == int(user_id):
-                        return True
-                except ValueError:
-                    pass
+        for code in msgs.at_cq(event):
+            qq = cq.load(code)["data"].get("qq")
+            if qq in (None, "all"):
+                continue
+            try:
+                if int(qq) == int(user_id):
+                    return True
+            except ValueError:
+                pass
         return False
 
     return predicate

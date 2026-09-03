@@ -42,7 +42,9 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 `mods.bot` 持有唯一事件循环。OneBot 事件始终以普通 `dict` 在系统中传递，不建立 DTO 或消息 class 层级。当前入口顺序由[交互模型](interaction-model.md#入口有优先级)记录：日志、延续式交互、点命令、shell、线性 link/capture 共用一条明确路径。
 
-路由不改写事件字典。`message` 从 NapCat 送来是什么，写进 chatlog、进 `history`、送到模型面前就还是什么；回复关系、去掉回复后的正文和 at 列表是它的三个投影，由 `mods.msgs` 的纯函数 `reply_cq()` / `body()` / `at_cq()` 现算。这不只是风格：`bot` 曾在写完日志之后就地剥掉开头的 reply CQ 并挂上 `reply` / `at_cq` 两个键，于是实时事件和从同一份文件重建出来的那条事件不一样——重建的带着 reply CQ、却没有那两个键，模型因此只在重启后看见字面的 `[CQ:reply,...]`。派生值不落在数据里，这个差别就无从产生。规则是：**解释**消息的地方（`^C`、`.` 命令、shell 前缀、link 条件、延续式回答、单 CQ 判定）读 `msgs.body()`，**存储和显示**消息的地方读原始 `message`。
+路由不改写事件字典。`message` 从 NapCat 送来是什么，写进 chatlog、进 `history`、送到模型面前就还是什么；回复关系、去掉回复后的正文和 at 列表是它的三个投影，由 `mods.msgs` 的纯函数 `reply_cq()` / `body()` / `at_cq()` 现算。这不只是风格：`bot` 曾在写完日志之后就地剥掉开头的 reply CQ 并挂上 `reply` / `at_cq` 两个键，于是实时事件和从同一份文件重建出来的那条事件不一样——重建的带着 reply CQ、却没有那两个键，模型因此只在重启后看见字面的 `[CQ:reply,...]`。派生值不落在数据里，这个差别就无从产生。规则是：**解释**消息的地方（`^C`、`.` 命令、shell 前缀、唤醒词、link 条件、延续式回答、`.py` 的 `input()`、重复提醒判定、单 CQ 判定）读 `msgs.body()`，**存储和显示**消息的地方（chatlog、history、模型上下文、图片预缓存）读原始 `message`。
+
+`body()` 去掉的不只是 reply。QQ 客户端引用回复时会紧接着插一个 at，只去 reply 会留下 `[CQ:at,qq=…] .cave add`，而下游全是前缀判定，于是「引用着发命令」静默失效——这是旧 `_strip_reply` 留下的缺陷，不是新的。因此 `body()` 连开头的 at 一起去掉，并清理它们带的空白；**只去开头的**，命令后面当参数用的 at 原样保留。at 列表则由 `at_cq()` 读一个只去了 reply 的内部投影，否则「谁 at 了我」会随 at 的位置而变——`chat.has_at` 正是靠这一点在 `body()` 已经把 at 去掉之后仍然认得唤醒。
 
 当前事件与等待下一条输入由 `mods.context` 持有；近期 256 条窗口事件由 `mods.history` 持有；完整可读聊天历史由 `mods.chatlog` 追加写入。三者职责不同，不能相互替代。
 

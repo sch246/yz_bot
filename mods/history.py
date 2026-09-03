@@ -157,7 +157,9 @@ def _predicate(msg: dict[str, Any], value: Callable[[dict[str, Any]], bool] | st
         return value
     own = same_author(msg)
     pattern = re.compile(value)
-    return lambda candidate: own(candidate) and pattern.match(str(candidate.get("message", ""))) is not None
+    from mods import msgs
+
+    return lambda candidate: own(candidate) and pattern.match(msgs.body(candidate)) is not None
 
 
 def same_times(
