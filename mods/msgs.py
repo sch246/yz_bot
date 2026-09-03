@@ -42,7 +42,8 @@ def is_msg(msg: dict) -> bool:
     return isinstance(msg, dict) and "message" in msg
 
 
-_reply_head = re.compile(r"^(\[CQ:reply,[^\]]+\])([\S\s]*)")
+_reply_head = re.compile(r"^\[CQ:reply,[^\]]+\]")
+_at_head = re.compile(r"^\[CQ:at,[^\]]+\]")
 
 
 def reply_cq(msg: dict) -> str | None:
@@ -56,25 +57,49 @@ def reply_cq(msg: dict) -> str | None:
     if not is_msg(msg):
         return None
     match = _reply_head.match(msg["message"])
-    return match.group(1) if match else None
+    return match.group(0) if match else None
 
 
-def body(msg: dict) -> str:
-    """The message with its leading reply CQ code removed.
+def _after_reply(msg: dict) -> str:
+    """The body with only the reply envelope removed -- at codes untouched.
 
-    Anything that *interprets* a message -- command prefixes, link conditions,
-    continuation answers -- wants this; anything that stores or shows it wants
-    the raw ``message``.
+    ``at_cq`` reads this rather than ``body``: the at that a reply drags along
+    is still an at, and "did anyone at me" must not depend on where in the
+    message it sits.
     """
     if not is_msg(msg):
         return ""
-    match = _reply_head.match(msg["message"])
-    return match.group(2) if match else msg["message"]
+    return _reply_head.sub("", msg["message"], count=1)
+
+
+def body(msg: dict) -> str:
+    """The message as an entry point should read it.
+
+    A QQ client that quotes a message inserts an at right behind the quote, so
+    stripping only the reply leaves ``[CQ:at,qq=...] .cave add`` and every
+    prefix test downstream (``^C``, ``.``, ``!``, ``#!``, the wake word, a link
+    condition anchored with ``^``) silently fails on a quoted message.  Leading
+    at codes therefore come off too, along with the whitespace they carry.
+
+    Only *leading* ones: a command that takes an at as an argument keeps it,
+    because that at is not at the front.  Consecutive leading ats all come off
+    -- quoting one person while atting another must not resurrect the same
+    failure one at further in.
+
+    Anything that *interprets* a message wants this; anything that stores or
+    shows it wants the raw ``message``.
+    """
+    value = _after_reply(msg).lstrip()
+    while True:
+        match = _at_head.match(value)
+        if match is None:
+            return value
+        value = value[match.end():].lstrip()
 
 
 def at_cq(msg: dict) -> list[str]:
-    """Every at CQ code in the message body, in order."""
-    return [item for item in cq.find_all(body(msg)) if cq.load(item)["type"] == "at"]
+    """Every at CQ code in the message, in order, including a leading one."""
+    return [item for item in cq.find_all(_after_reply(msg)) if cq.load(item)["type"] == "at"]
 
 
 def is_group_msg(msg: dict) -> bool:

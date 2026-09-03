@@ -144,8 +144,9 @@ def _route(event: dict) -> str | None:
             chat.eager_cache_images(event)
         key = context.interaction_key(event)
         # ``message`` stays exactly what NapCat sent, all the way into the chat
-        # log and history; the reply-stripped form is derived here for dispatch
-        # only, so a rebuilt event and a live one route identically.
+        # log and history; the entry-point form -- reply and leading ats off --
+        # is derived here for dispatch only, so a rebuilt event and a live one
+        # route identically.
         value = msgs.body(event)
 
         if value.rstrip() in ("^C", "^c"):
