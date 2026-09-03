@@ -95,7 +95,6 @@ HTTP 200 只表示事件已被本地监听器接收，不表示命令或回复�
 
 代码内还有 `recvmsg()`，可从 `.py` 或 link action 递归构造一条消息进入 `mods.bot.recv()`。它同样走真实状态和真实副作用，只是省略了 NapCat 入站网络。
 
-`mods.portfunc` 提供 RSA 验证的远程函数调用协议，`mods.server` 持有设备级惰性 client。它们不是通用 Bot 测试入口；地址和私钥路径只来自忽略的设备配置。
 
 ## `!` 命令行入口
 

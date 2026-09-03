@@ -13,7 +13,6 @@ from typing import Any, Callable
 
 from mods import INFRA, log
 from .codec import digest as _digest
-from .codec import phase as _phase
 from .codec import read_file as _read_file
 from .codec import serialize as _serialize
 
@@ -29,8 +28,8 @@ DELETE_MARKER = "DELETE"
 # 不丢，所以这个窗口只在 SIGKILL、断电、fatal error 时兑现。调它是产品决定。
 # FILE_SETTLE_DELAY 是文件事件后等多久再读：编辑器常常多次写或写临时文件再 rename，
 # 立刻读会读到半个文件。
-# WHY?: 其余四个没有出处，维护者没有选过它们，很可能和 phase()/due_memory[0] 一样
-# 来自同一次辅助重构。它们目前没有已知问题，但也没有理由；改动前不必当成经过判断的值。
+# WHY?: 其余四个没有出处，维护者没有选过它们，来自同一次辅助重构。它们目前没有已知
+# 问题，但也没有理由；改动前不必当成经过判断的值。
 MEMORY_SCAN_WINDOW = 10 * 60.0   # 手定：非正常终止的最大丢失窗口
 FILE_SCAN_WINDOW = 2.0
 DISCOVERY_INTERVAL = 30.0
@@ -120,8 +119,8 @@ def _ensure_state(
         state = _EntryState(
             baseline_digest,
             signature,
-            _phase(key, MEMORY_SCAN_WINDOW, now),
-            _phase(key, FILE_SCAN_WINDOW, now),
+            now + MEMORY_SCAN_WINDOW,
+            now + FILE_SCAN_WINDOW,
         )
         _states[key] = state
     return state
@@ -411,7 +410,7 @@ def _sync_memory_key(key: tuple[str, str], now: float) -> None:
         state = _states.get(key)
         if state is None:
             return
-        state.next_memory_check = _phase(key, MEMORY_SCAN_WINDOW, now + 0.001)
+        state.next_memory_check = now + MEMORY_SCAN_WINDOW
         try:
             text, digest, dropped = _serialize_reporting(storage[key[0]][key[1]])
         except Exception as error:
@@ -443,7 +442,7 @@ def _worker_loop() -> None:
         with _lock:
             for key, state in list(_states.items()):
                 if state.next_file_check <= now:
-                    state.next_file_check = _phase(key, FILE_SCAN_WINDOW, now + 0.001)
+                    state.next_file_check = now + FILE_SCAN_WINDOW
                     path = _path(*key)
                     if _disk_signature(path) != state.disk_signature:
                         _pending_file_events.setdefault(os.path.abspath(path), now + FILE_SETTLE_DELAY)
@@ -455,13 +454,14 @@ def _worker_loop() -> None:
                     _process_file_path(path)
                 except Exception as error:
                     _report(f'处理文件变化"{path}"失败：{error}', logging.ERROR)
-        if due_memory:
-            # WHY?: 同 codec.phase——辅助重构引入，维护者没有判断过。due_memory 是列表
-            # 却只取第一个，于是每个 tick 最多同步一个 key，配合 WORKER_TICK=0.2 就是
-            # 5 key/秒的上限。正常情况下靠 phase() 错峰，同时到期的很少，所以看不出来；
-            # 但积压时(比如刚启动、或一批 key 同时被改)排空速率就是这个数，而这个上限
-            # 不是谁定的。要改的话这里应该是循环，不是取 [0]。
-            _sync_memory_key(due_memory[0], now)
+        # WHY: 一次处理完所有到期项，不限流。这里曾经只取 due_memory[0]，配上 codec
+        # 里一个按 key 哈希错峰的 phase()，合起来是 5 key/秒的上限——两者互为理由，而
+        # 那个"惊群"在本项目的规模上不存在：storage 是几十项的量级，几十个小 JSON 的
+        # 序列化是毫秒级的。两个机制一起删掉了。
+        # 代价是所有 key 会逐渐收敛到同一个 tick 一起同步(各自的下次检查都是 now+窗口)，
+        # 这是有意接受的：每 10 分钟一次几毫秒的锁竞争，换掉一整套调度。
+        for due_key in due_memory:
+            _sync_memory_key(due_key, now)
         _stop_event.wait(WORKER_TICK)
 
 

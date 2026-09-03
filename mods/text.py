@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Iterable
 import re
 
@@ -131,6 +132,39 @@ def limit(value: str, length: int) -> str:
 
 
 LASTLINE = "\33[1A\r\33[K"
+
+
+def is_valid_ssh_pubkey(pubkey: str) -> bool:
+    """Whether a string has the shape of an OpenSSH public key line.
+
+    WHY: 它原本住在 mods.portfunc 里，只是因为那个模块也和密钥打交道；它本身跟加密
+    RPC 无关，是个纯字符串形状校验。portfunc 删掉时它留了下来，因为 .py 动态环境按
+    这个名字暴露着它(见 py.py 的 _EXPORTS)，删掉会让引用它的现场代码或 link 失效。
+    """
+    parts = pubkey.strip().split()
+    valid_key_types = {
+        "ssh-rsa",
+        "ssh-dss",
+        "ssh-ed25519",
+        "ecdsa-sha2-nistp256",
+        "ecdsa-sha2-nistp384",
+        "ecdsa-sha2-nistp521",
+        "sk-ecdsa-sha2-nistp256@openssh.com",
+        "sk-ssh-ed25519@openssh.com",
+        "ssh-rsa-cert-v01@openssh.com",
+        "ssh-dss-cert-v01@openssh.com",
+        "ssh-ed25519-cert-v01@openssh.com",
+        "ecdsa-sha2-nistp256-cert-v01@openssh.com",
+        "ecdsa-sha2-nistp384-cert-v01@openssh.com",
+        "ecdsa-sha2-nistp521-cert-v01@openssh.com",
+    }
+    if len(parts) < 2 or parts[0] not in valid_key_types:
+        return False
+    try:
+        base64.b64decode(parts[1])
+    except Exception:
+        return False
+    return True
 
 
 def is_num(value: str) -> bool:

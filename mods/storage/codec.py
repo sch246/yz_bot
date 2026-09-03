@@ -1,29 +1,7 @@
-"""Pure JSON projection encoding and deterministic sync scheduling."""
+"""Pure JSON projection encoding."""
 
 import hashlib
 import json
-
-
-def phase(key: tuple[str, str], window: float, now: float) -> float:
-    """Deterministic per-key offset inside a scan window.
-
-    WHY?: 这是某次辅助重构引入的，维护者没有对它做过判断。它做的事是：用 key 的
-    sha256 在窗口内取一个稳定偏移，使几百个 key 不会在同一个 tick 一起序列化。
-    问题是这个"惊群"在本项目的规模上并不存在——storage 项数是几十的量级，几十个小
-    JSON 的序列化是微秒级的。按 docs/design-principles.md 的标准(抽象要由已经发生的
-    问题挣得)，它目前答不上"解决了哪个观察到的问题"。
-    它同时是 _worker_loop 里 due_memory[0] 那个每 tick 只同步一个 key 的前提：错峰
-    使正常情况下同时到期的很少。两者互为理由，而两者都没被人选过。
-    没坏，所以不急着动；但要动的话，方向是"去掉错峰 + 循环处理所有到期项"，而不是
-    在它上面继续加东西。
-    """
-    if window <= 0:
-        return now
-    raw = hashlib.sha256("\0".join(key).encode()).digest()[:8]
-    offset = int.from_bytes(raw, "big") / 2**64 * window
-    start = now - now % window
-    due = start + offset
-    return due if due > now else due + window
 
 
 def serialize(value, on_drop=None) -> tuple[str, str]:

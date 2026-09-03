@@ -93,7 +93,7 @@ _EXPORT_SPECS = {
     "at_cq": ("msgs", "at_cq"),
     "msg_body": ("msgs", "body"),
     "iex": ("screen", "iex"),
-    "is_valid_ssh_pubkey": ("portfunc", "is_valid_ssh_pubkey"),
+    "is_valid_ssh_pubkey": ("text", "is_valid_ssh_pubkey"),
     "isfloat": ("text", "isfloat"),
     "setu": ("setu", "link_image"),
     "time_between": ("timeutils", "time_between"),
