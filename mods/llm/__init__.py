@@ -282,13 +282,6 @@ class LLMClient:
             console.notice(f"🔎 正在解析图片内容：{console.format_uri(uri)}")
             _, _, digest = image.resolve_image_with_digest(uri)
             identities.insert(0, digest)
-        # WHY?: 辅助重构引入，维护者没有印象。用 id() 做键的一部分是不安全的：对象被
-        # 回收后地址会被复用，新的 description_cache 可能拿到同一个地址并撞上残留键。
-        # 这与 log.py 明确避开的那件事是同一类问题("持有者按线程对象而非 get_ident()
-        # 记录，因为线程退出后 id 会被复用")，那边选对了，这里没有。
-        # 待定的是修法：去掉 id(cache) 改成按 digest 全局去重最简单，但语义会变——缓存
-        # 本身是按聊天空间分的，跨空间去重会让一个空间等另一个空间的结果，然后在自己的
-        # 缓存里查不到。也可以给每个 cache 存一个稳定 token 当身份。先记下不动。
         # WHY: 去重键只有内容摘要和描述版本，不含缓存身份。原先是
         # (id(description_cache), digest, version)——用字典的内存地址做键，而 id() 在
         # 对象被回收后会被复用，新的 cache 可能拿到同一个地址并撞上残留键。
