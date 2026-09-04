@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterable
 import json
 import logging
 import os
@@ -512,7 +512,7 @@ class LLMClient:
             reasoning_content=reasoning_content,
         )
 
-    def chat(self, messages: list[dict], tools: list[Tool] | Callable[[], list[Tool]] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None, on_round: Callable[[], list[dict]] | None = None, should_stop: Callable[[], bool] | None = None, hints: Callable[[], list[dict]] | None = None) -> Generator[LLMResponse, None, None]:
+    def chat(self, messages: list[dict], tools: list[Tool] | Callable[[], list[Tool]] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None, on_round: Callable[[], list[dict]] | None = None, should_stop: Callable[[], bool] | None = None, hints: Callable[[], list[dict]] | None = None, keep_reasoning: bool = True, on_tool_result: Callable[[ToolCallResult], str | None] | None = None) -> Generator[LLMResponse, None, None]:
         # Every message appended below is printed live as it happens, so each
         # further round only logs what it has not shown yet -- usually nothing.
         logged = 0
@@ -520,22 +520,14 @@ class LLMClient:
         # .reboot。取舍与它暴露在同一条提示注入路径上的能力都记在 docs/llm.md 的
         # 「当前信任边界与维护取舍」一节——加限制前先读那里，这不是漏了。
         #
-        # WHY?: 操作历史是一条缺失的平行轨道，方向已定、尚未实现。
-        # 现状：本轮的 assistant(tool_calls) 与 tool result 只活在这个 messages 列表里，
-        # 不写 chatlog，chat.get_msgs 也不重建它们。所以**下一轮开始时模型完全不知道自己
-        # 上一轮干了什么**——改过哪个文件、发过什么请求、加载过哪个模块，一概不知，只能靠
-        # 它自己把结论说进聊天正文才留得下来。这不是省 token 的取舍，是能力缺口。
-        # 方向：单独一条平行轨道记操作历史，不混进 chatlog 的聊天消息。
-        # 但直接全量保留是不行的：工具调用通常是为某个目的服务的，结论一旦得出，中间过程
-        # 就该压缩掉。主流 agent 普遍用子代理绕开这件事，而不是正面解决。
-        # 因此要配一个**结论收缩工具**：对那些输出只起局部作用的调用，把前面几条工具调用
-        # 从上下文里隐去，只留一条结论。
-        # 这推出两个前提，缺一不可：
-        #   1. 工具需要有操作上下文的能力（现在工具只能读 cache.thismsg，不能改上下文）；
-        #   2. 模型必须能看到自己每条消息和每次工具调用的上下文 id(cid)，否则它无法指名
-        #      要收缩哪几条。
-        # 实现时按这套来，别另起一套；也别退化成"到 N 轮就自动截断"，那会在结论产出之前
-        # 把前提砍掉。
+        # WHY: on_tool_result 是操作历史那条平行轨道的采集点，见 mods/oplog。
+        # 要解决的是这个：本轮的 assistant(tool_calls) 与 tool result 只活在这个 messages
+        # 列表里，不写 chatlog，chat.get_msgs 也不重建它们，所以下一轮开始时模型不知道自己
+        # 上一轮干了什么。轨道单独存，不混进 chatlog 的聊天消息。
+        # 钩子返回该次调用的 cid，返回值会加到 tool result 内容前面——模型必须看得见 cid，
+        # 否则它无法指名要收缩哪几条。收缩本身是 Chat.condense_calls 加 meta.condense_ops。
+        # 不要退化成"到 N 轮就自动截断"：那会在结论产出之前把前提砍掉。压缩由模型在得出
+        # 结论时显式发起，这正是主流 agent 用子代理绕开、而没有正面解决的那件事。
         #
         # WHY: on_round 是"追加式上下文"的唯一入口，在每次子请求**之前**调用。放这里
         # 而不是让调用方直接改 messages，是因为工具执行发生在 assistant(tool_calls) 与
@@ -606,19 +598,15 @@ class LLMClient:
                     yield chunk
 
             assistant_message = {"role": assistant.role, "content": assistant.content}
-            # WHY?: 轮内是否带回思考内容，应当可切换（尚未实现）。现状是原样带回，
-            # docs/llm.md 记着这满足 DeepSeek thinking mode 的工具调用协议。
-            # 省 token 的做法是置成空字符串，**已实跑验证被接受**（deepseek-v4-flash,
-            # 2026-09-04）；同一次验证里删掉整个字段也被接受，两条路都通，随便挑一条。
-            # 注意范围：思考本来就不跨轮——chat.get_msgs 从 chatlog 重建，chatlog 里没有
-            # reasoning。所以这里讨论的只是一次工具循环之内要不要一直背着它。
-            # 开关怎么做不用再设计，仓库里已有成熟先例，照抄别另起一套：`#` 子命令 +
-            # getchatstorage() 的按窗口设置。见 chat._subcommand 的 image 一支——`#image`
-            # 无参读当前值、带参写入，读取端 get_image_mode 负责 normalize；use_model 一支
-            # 还示范了失效自愈（get_model 发现存的值解析不了就 pop 回默认）。按窗口存是对的，
-            # 模型选择本来就是按窗口的。
+            # WHY: keep_reasoning=False 时置成空字符串而不是删掉字段。两种写法都实跑
+            # 验证过被接受（deepseek-v4-flash, 2026-09-04），选空串是因为它诚实：这一轮
+            # 确实思考过，只是没往下带；删掉字段看起来像"根本没思考"。
+            # 保留 reasoning 满足 DeepSeek thinking mode 的工具调用协议，所以默认是 True，
+            # 关掉只为省一次工具循环内反复重发思考的 token。
+            # 范围只在一次工具循环之内——思考本来就不跨轮：chat.get_msgs 从 chatlog 重建，
+            # chatlog 里没有 reasoning。开关按窗口存，见 chat.get_reasoning_mode。
             if assistant.reasoning_content is not None:
-                assistant_message["reasoning_content"] = assistant.reasoning_content
+                assistant_message["reasoning_content"] = assistant.reasoning_content if keep_reasoning else ""
             if pending_calls:
                 assistant_message["tool_calls"] = [call for call, _, _ in pending_calls]
             messages.append(assistant_message)
@@ -635,7 +623,19 @@ class LLMClient:
                     console.error(f" -> {content}")
                 else:
                     console.message(f" -> {content}", "tool")
-                results.append(ToolCallResult(call["id"], function["name"], function["arguments"], content))
+                result = ToolCallResult(call["id"], function["name"], function["arguments"], content)
+                if on_tool_result is not None:
+                    # WHY: 先记录原始 content，再把 cid 前缀加到发给模型的那一份上。轨道里
+                    # 存的是这次调用真正返回了什么，不该混进只为模型寻址而加的前缀。
+                    try:
+                        cid = on_tool_result(result)
+                    except Exception:
+                        # 记账坏掉不该让工具调用失败：轨道是补充，不是主体。
+                        _log.exception("operation log hook failed")
+                        cid = None
+                    if cid:
+                        result = ToolCallResult(result.tool_call_id, result.name, result.arguments, f"[{cid}] {content}")
+                results.append(result)
             messages.extend({"role": "tool", "tool_call_id": result.tool_call_id, "content": result.content} for result in results)
             logged = len(messages)
 
@@ -661,6 +661,12 @@ class Chat:
         # 它和 system 提示词一样支持用函数生成，只是重置时机不同：system 在建会话时定一次，
         # hint 每个子请求重来一次。
         self.hints: list[Callable[[], str] | str] = []
+        # WHY: 默认原样带回思考内容（DeepSeek thinking mode 的工具调用协议这么要求）。
+        # 置 False 会把它换成空串，只影响一次工具循环之内，见 LLMClient.chat 里的说明。
+        self.keep_reasoning: bool = True
+        # 每次工具调用出结果时回调一次，返回该次调用的 cid（没有就返回 None）。
+        # 操作历史轨道靠它采集，见 mods/oplog。
+        self.on_tool_result: Callable[[ToolCallResult], str | None] | None = None
         if messages is not None:
             self.set_messages(messages)
         if functions is not None:
@@ -733,6 +739,68 @@ class Chat:
                 collected.append(value if isinstance(value, dict) else {"role": "user", "content": str(value)})
         return collected
 
+    def condense_calls(self, tool_call_ids: Iterable[str], conclusion: str) -> int:
+        """Replace finished tool-call rounds with one conclusion; return messages removed.
+
+        WHY: 这是"结论收缩"真正生效的地方。工具调用往往是为某个目的服务的，结论一旦得出，
+        中间过程就只剩噪音。主流 agent 用子代理绕开这件事——让子代理跑完只回一句结论，
+        于是主上下文从没见过中间过程。这里是正面解决：让模型自己在得出结论时把过程收掉。
+
+        WHY: 按**整轮**收缩，不按单条。一条 assistant 消息可以并发多个 tool_calls，而协议
+        要求它的每个 id 都有对应 tool 消息。只删其中一条会拆散这一对，请求直接被拒。所以
+        某轮只要有一个 id 被点名，这一轮的 id 就必须全部被点名，否则宁可报错也不动手。
+
+        WHY: 拒绝收缩正在进行的那一轮——tool result 还没补齐的轮次。此刻工具正在执行，
+        assistant(tool_calls) 已在 messages 里、结果还没追加；把它删掉，调用返回时那些
+        结果就会挂在一条不存在的 assistant 上。
+
+        WHY: 这会让前缀缓存从收缩点之后全部失效——删消息必然如此。这是自愿付的代价：
+        收缩换来的是后面每一轮都更短。追加式上下文那套"绝不回头改写"的纪律是为了保住
+        缓存，而这里是明确地用缓存换长度，两者不矛盾，但别把它变成自动行为。
+        """
+        requested = {str(value) for value in tool_call_ids if str(value)}
+        if not requested:
+            return 0
+        groups: list[tuple[int, set[str]]] = []
+        for index, message in enumerate(self.messages):
+            calls = message.get("tool_calls") if isinstance(message, dict) else None
+            if not calls:
+                continue
+            ids = {str(call.get("id")) for call in calls}
+            if ids & requested:
+                groups.append((index, ids))
+        # 点名的调用可能全部来自更早的轮次——那时它们本就不在这一轮的 messages 里。
+        # 这不是错误，只是当前上下文没什么可删的，轨道那边照常收缩。
+        if not groups:
+            return 0
+
+        missing = {name for _index, ids in groups for name in ids} - requested
+        if missing:
+            raise ValueError("同一轮里的调用必须一起收缩，还差: " + ", ".join(sorted(missing)))
+
+        drop: set[int] = set()
+        for index, ids in groups:
+            answered = {
+                position
+                for position, message in enumerate(self.messages)
+                if isinstance(message, dict)
+                and message.get("role") == "tool"
+                and str(message.get("tool_call_id")) in ids
+            }
+            if len(answered) != len(ids):
+                raise ValueError("这一轮还没执行完，不能收缩正在进行的调用")
+            drop.add(index)
+            drop.update(answered)
+
+        first = min(drop)
+        kept = [message for index, message in enumerate(self.messages) if index not in drop]
+        kept.insert(first, {
+            "role": "system",
+            "content": f"[已收缩的操作] {conclusion}",
+        })
+        self.messages[:] = kept
+        return len(drop)
+
     def get_tools(self) -> list[Tool]:
         """Build the current request's frozen tool snapshot."""
         return list(self.functions.values())
@@ -759,6 +827,8 @@ class Chat:
                 self._collect_context,
                 self.should_stop,
                 self.render_hints,
+                self.keep_reasoning,
+                self.on_tool_result,
             )
             results = []
             for chunk in response:

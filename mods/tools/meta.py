@@ -79,6 +79,14 @@ Markdown 不需要 front matter、额外 summary 字段或同步机制，也不�
 
 先确认精确模块名和源文件，再删除对应的单个 `mods/tools/foo.py` 或 `.md`，不要宽泛递归删除。随后调用 `reload_tools(["foo"])`；registry 发现源文件缺失后才删除 last-good，并从当前 Chat 移除模块内容和函数。只删文件但不 reload 时，旧 last-good 仍然有效。`meta.py` 是恢复入口，不能删除。删除 helper 前要先检查并 reload 所有受影响模块。
 
+## 操作历史与结论收缩
+
+每次工具调用的结果开头都有一个 `[opN]`，那是这次调用的上下文 id（cid）。这些调用会记进本窗口的操作历史，**跨轮保留**：下一轮开始时你能看到自己上一轮改过什么、加载过什么，而聊天记录里并没有这些。
+
+历史不该无限增长。一组调用往往是为某个目的服务的，结论一旦得出，中间过程就只剩噪音——查完资料、确认完状态、修完一个文件之后，调用 `condense_ops(["op3", "op4"], "结论")` 把它们收成一条结论。它同时缩短两处：跨轮的操作历史，以及当前上下文里那几轮 assistant/tool 消息。
+
+两条规则：同一条 assistant 消息里并发的多个调用必须一起点名收缩，只点其中一个会被拒绝；正在执行、结果还没回来的那一轮不能收缩。
+
 ## 原子性与请求边界
 
 每个模块单独校验和提交：任一导出失败，整个模块保留旧版；一次 reload 多个名称时，其它成功模块仍可独立提交。单个 LLM 子请求发送前会冻结工具 schema 与 callable 的同一份快照，所以 load/reload 只从下一次模型子请求起生效，不改变已发请求，也不改变同一响应中的其它工具调用。
@@ -144,6 +152,28 @@ def load_tools(names: list[str]) -> str:
     return _format_results(current_binding().load(names))
 
 
+def condense_ops(cids: list[str], conclusion: str) -> str:
+    """把已经得出结论的几次工具调用收缩成一条结论，同时缩短当前上下文和跨轮的操作历史。查完资料、确认完状态、修完一个文件之后调用它，只留下结论。
+
+    @param
+    cids: 要收缩的调用 id 列表，形如 ["op3", "op4"]；每条工具结果开头的 [opN] 就是它
+    conclusion: 这几次调用最终得出的结论，写成后面还用得上的一句话
+    """
+    from mods import context, history, oplog
+
+    window = history.window(context.current() or {})
+    if window is None:
+        return "当前不在聊天窗口里，没有操作历史"
+    if not cids:
+        return "没有指定要收缩的调用"
+    tool_call_ids, unknown = oplog.call_ids(window, cids)
+    if unknown:
+        return f"操作历史里找不到: {', '.join(unknown)}"
+    removed = current_binding().session.condense_calls(tool_call_ids, conclusion)
+    replaced = oplog.condense(window, cids, conclusion)
+    return f"已收缩 {replaced} 条操作历史，当前上下文移除 {removed} 条消息"
+
+
 def _format_results(results: Mapping) -> str:
     action_labels = {
         "loaded": "已加载",
@@ -170,4 +200,4 @@ def _format_results(results: Mapping) -> str:
     ])
 
 
-__all__ = ["exec_code", "list_tools", "reload_tools", "load_tools"]
+__all__ = ["exec_code", "list_tools", "reload_tools", "load_tools", "condense_ops"]

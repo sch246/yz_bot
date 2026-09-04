@@ -9,15 +9,26 @@ import threading
 import time
 from typing import Callable
 
-from mods import context, cq, history, identity, image, llm, log, message, msgs, storage, text, thread, tools as tool_modules
+from mods import context, cq, history, identity, image, llm, log, message, msgs, oplog, storage, text, thread, tools as tool_modules
 from mods.command import command
 from mods.capture import capture
 
 
-LOAD_AFTER = ("history", "identity", "image", "llm", "storage")
+LOAD_AFTER = ("history", "identity", "image", "llm", "oplog", "storage")
 
 IMAGE_MODES = ("off", "lazy", "eager")
 IMAGE_MODE_ALIASES = {"0": "off", "1": "lazy", "2": "eager"}
+
+# WHY: keep=原样带回思考内容(默认，满足 DeepSeek thinking mode 的工具调用协议)，
+# drop=在工具循环内把它换成空串省 token。只影响一次工具循环之内，思考本来就不跨轮。
+REASONING_MODES = ("keep", "drop")
+REASONING_ALIASES = {"on": "keep", "off": "drop", "1": "keep", "0": "drop"}
+
+# WHY: append=工具变动追加进上下文(默认，进历史、可回放、不打断前缀缓存)，
+# ui=整个工具状态作为一整块 hint 挂在末尾(只有一个权威副本，且明确位于所有修改之后，
+# 代价是每次子请求都是未命中缓存的新 token)。两者的取舍见 tools._state_hint。
+TOOLS_MODES = ("append", "ui")
+TOOLS_MODE_ALIASES = {"0": "append", "1": "ui", "hint": "ui"}
 
 settings: list = []
 prompts: dict = {}
@@ -55,6 +66,26 @@ def normalize_image_mode(value) -> str:
 
 def get_image_mode(data: dict | None = None) -> str:
     return normalize_image_mode((getchatstorage() if data is None else data).get("image"))
+
+
+# WHY: 下面两组照 image 那一套写：normalize 负责把存坏的值拉回默认，读取端永远拿得到
+# 合法值，所以旧存储里的遗留值不会让聊天崩掉。别改成直接读原值。
+def normalize_reasoning_mode(value) -> str:
+    normalized = REASONING_ALIASES.get(str(value).lower(), str(value).lower())
+    return normalized if normalized in REASONING_MODES else "keep"
+
+
+def get_reasoning_mode(data: dict | None = None) -> str:
+    return normalize_reasoning_mode((getchatstorage() if data is None else data).get("reasoning"))
+
+
+def normalize_tools_mode(value) -> str:
+    normalized = TOOLS_MODE_ALIASES.get(str(value).lower(), str(value).lower())
+    return normalized if normalized in TOOLS_MODES else "append"
+
+
+def get_tools_mode(data: dict | None = None) -> str:
+    return normalize_tools_mode((getchatstorage() if data is None else data).get("tools"))
 
 
 def get_prompt() -> list:
@@ -265,10 +296,25 @@ def init_chat(session: llm.Chat, messages: list | None = None) -> None:
     prompts["base"] = _base_prompt()
     group = context.current().get("group_id") if context.current() else None
     state = {"role": "system", "content": f"当前所在群聊:{identity.getgroupname(group)}({group})"} if group is not None else {"role": "system", "content": f"当前在私聊:{identity.getname()}({context.current().get('user_id')})"}
-    tool_context = tool_modules.create_context_message()
-    session.set_messages([*get_prompt(), *prompts["base"], tool_context, state, *(messages or [])])
-    tool_modules.bind_session(session, tool_context)
+    ui_mode = get_tools_mode() == "ui"
+    tool_context = tool_modules.create_context_message(ui_mode=ui_mode)
+    # WHY: 操作历史放在 state 之后、聊天消息之前。它记的是模型自己过去干了什么，属于
+    # "你是谁、你在哪、你做过什么"这一组交代，不是对话的一部分——混进聊天消息里会让模型
+    # 把自己的工具调用当成有人说过的话。
+    window = history.window(context.current() or {})
+    operations = oplog.render(window)
+    session.set_messages([
+        *get_prompt(),
+        *prompts["base"],
+        tool_context,
+        state,
+        *([{"role": "system", "content": operations}] if operations else []),
+        *(messages or []),
+    ])
+    tool_modules.bind_session(session, tool_context, ui_mode=ui_mode)
     session.do_process_image = get_image_mode() != "off"
+    session.keep_reasoning = get_reasoning_mode() == "keep"
+    session.on_tool_result = _oplog_recorder(window)
 
 
 def get_handler(session: llm.Chat):
@@ -279,6 +325,13 @@ def get_handler(session: llm.Chat):
             inc_call_tokens_cost(session.model, (chunk.prompt_tokens, chunk.completion_tokens))
 
     return handle
+
+
+def _oplog_recorder(window):
+    """Record each finished tool call and hand back the cid the model can name."""
+    def record(result) -> str | None:
+        return oplog.record(window, result.name, result.arguments, result.content, result.tool_call_id)
+    return record
 
 
 def _interject_provider(turn, in_group: bool):
@@ -340,6 +393,9 @@ _SUBCOMMAND_HELP = (
     ("set_setting <name> [list]", "保存当前或给定设定"),
     ("del_setting <name>", "删除设定"),
     ("image [off|lazy|eager]", "查看或设置图片读取档位"),
+    ("reasoning [keep|drop]", "查看或设置工具循环内是否带回思考内容"),
+    ("tools [append|ui]", "查看或设置工具状态的呈现方式"),
+    ("ops [clear]", "查看或清空本窗口的操作历史"),
 )
 _SUBCOMMAND_NAMES = {pattern.partition(" ")[0] for pattern, _description in _SUBCOMMAND_HELP}
 
@@ -411,6 +467,36 @@ def _subcommand(value: str):
             return "图片读取档位必须是 off/0、lazy/1 或 eager/2"
         data["image"] = mode
         return f"image: {mode}"
+    if name == "reasoning" and not tail:
+        return f"reasoning: {get_reasoning_mode(data)}"
+    if name == "reasoning" and tail:
+        mode, remaining = _first_argument(tail)
+        if remaining.strip():
+            return "reasoning 参数过多"
+        mode = REASONING_ALIASES.get(mode.lower(), mode.lower())
+        if mode not in REASONING_MODES:
+            return "reasoning 必须是 keep/on 或 drop/off"
+        data["reasoning"] = mode
+        return f"reasoning: {mode}"
+    if name == "tools" and not tail:
+        return f"tools: {get_tools_mode(data)}"
+    if name == "tools" and tail:
+        mode, remaining = _first_argument(tail)
+        if remaining.strip():
+            return "tools 参数过多"
+        mode = TOOLS_MODE_ALIASES.get(mode.lower(), mode.lower())
+        if mode not in TOOLS_MODES:
+            return "tools 必须是 append 或 ui"
+        data["tools"] = mode
+        return f"tools: {mode}"
+    if name == "ops" and not tail:
+        # WHY: 操作历史是新加的一份持久存储，人必须能看见它、也能重置它。轨道写歪了
+        # (记进了不该记的东西、或者收缩坏了)时，这是唯一不用改代码就能恢复的入口。
+        window = history.window(context.current() or {})
+        return oplog.render(window) or "本窗口还没有操作历史"
+    if name == "ops" and tail.strip() == "clear":
+        oplog.clear(history.window(context.current() or {}))
+        return "已清空本窗口的操作历史"
     if name == "prompt" and not tail:
         selected = data.get("prompt")
         if selected is None:
