@@ -151,6 +151,15 @@ def _route(event: dict) -> str | None:
 
         if value.rstrip() in ("^C", "^c"):
             context.cancel(key)
+            # WHY: ^C 同时打断这条交互线上的 waiter 和这个**窗口**正在跑的那轮 LLM。
+            # 两个粒度不同，所以是两次取消：waiter 按 (窗口, 用户) 登记，只有等它的人
+            # 能收回自己的 yield；LLM 上下文按窗口共享，群里任何人都该能制止一轮跑偏的
+            # 生成，不然只有触发者能停，其他人只能看着。
+            history = _optional("history")
+            if history is not None:
+                window = history.window(event)
+                if window is not None:
+                    context.cancel_turn(window)
 
         waiter = context.pop_waiter(key)
         if waiter is not None:

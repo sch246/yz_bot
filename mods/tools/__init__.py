@@ -7,8 +7,8 @@
 #    显示用于索引，激活后展开全部，展开后还能按需继续索引子文件夹内容。
 #    _split_description、_render_context、_source_paths 合起来已经是这个形状。
 # 2. 让模型能随时改自己的工具，并主动察觉到工具可更新；更新后立即可用，失败则拿到错误栈。
-#    reload_tools + registry._failures 已经覆盖"立即可用/拿到错误栈"，
-#    "主动察觉"还差一层（见 _render_context 上方的 WHY?:）。
+#    reload_tools + registry._failures 已经覆盖"立即可用/拿到错误栈"；变化的通告走
+#    _announce 追加到上下文末尾，见那里的说明。
 # 3. meta.py 是这套东西的使用说明书，给模型看的。
 #
 # 因此判断这里的代码时，标准不是"它已经在这儿而且能跑"，而是 docs/design-principles.md
@@ -408,16 +408,23 @@ def _validated_tool(function: Callable, schema_name: str) -> Tool:
     return tool
 
 
-# WHY?: 工具变动应该以追加的方式进入上下文，方向已定、尚未实现——实现时按这套来。
-# 现状：整个模块目录塞在一条 system 消息里，由 SessionBinding._render 就地改写；而
-# chat.init_chat 把它放在全部历史之前。最爱变的一段坐在最前面，每次 reload/load 都让它
-# 之后的全部前缀缓存失效；模型也只有主动调 list_tools 才知道磁盘变了。
-# 目标形状（参考 deepseek-harness 的 packages/context/*：它的上下文插件不改动已有消息，
-# 而是往历史里追加带来源的 user 消息，首次注入完整基线、之后只追加变更列表，内容包在
-# 插件自己拥有的 <system-reminder> 框架里，且仓库文本中字面的结束标记会被转义）：
-# 工具变动同样应作为一种 context 条目**追加**到末尾，前面的部分一个字都不动，模型据此
-# 得知磁盘变了。因为是普通历史消息，它可回放、可压缩、可从会话日志重建。
-# 注意别和 hint 混为一谈：hint 是更轻的一层，用于被动提醒，不承载工具目录这种重内容。
+_REMINDER_CLOSE = "</system-reminder>"
+
+
+def _framed(body: str) -> str:
+    """Wrap one announcement in the frame this module owns.
+
+    WHY: 模块正文是模型自己写的——reload_tools 应用的就是它刚写进磁盘的文件。所以正文里
+    字面的结束标记必须转义，否则模型可以提前关掉这层框架，让后面它自己写的内容看起来像
+    是系统说的。框架归本模块所有，被框住的内容不许碰它。这一条抄自 deepseek-harness 的
+    agent-instructions：那里同样是"插件拥有框架、工作区文本中的结束标记被转义"。
+    """
+    escaped = body.replace(_REMINDER_CLOSE, "<\\/system-reminder>")
+    return f"<system-reminder>\n{escaped}\n{_REMINDER_CLOSE}"
+
+
+# WHY: 这是**基线**，只在 bind 时渲染一次，之后永不改写。工具变动走 _announce 追加到
+# 上下文末尾，见那边的说明。
 def _render_context(
     registry: ToolRegistry,
     active: Mapping[str, ToolModule],
@@ -439,7 +446,7 @@ def _render_context(
 def create_context_message(
     *, registry: ToolRegistry | None = None
 ) -> dict[str, str]:
-    """Create the one system message later updated in place by a binding."""
+    """Create the baseline module catalog; later changes are appended, not rewritten."""
     selected = default_registry if registry is None else registry
     return {"role": "system", "content": _render_context(selected, {})}
 
@@ -467,13 +474,19 @@ class SessionBinding:
         if meta is None:
             failure = self.registry.failures.get(_BASE_MODULE_NAME)
             raise RuntimeError("required tool module meta is unavailable" + (f"\n{failure}" if failure else ""))
+        self._announcements: list[str] = []
         self._activate(meta)
-        self._render()
+        # 基线：bind 时写一次，之后这条消息不再变。
+        self.context_message["content"] = _render_context(self.registry, self.active)
+        register = getattr(session, "add_context_provider", None)
+        if callable(register):
+            register(self._take_announcements)
 
     def load(self, names: str | Iterable[str]) -> dict[str, dict]:
         """Activate only in-memory last-good modules in this session."""
         results: dict[str, dict] = {}
         with self._lock:
+            before = self._capture()
             for requested_name in _requested_names(names):
                 try:
                     name = _validate_module_name(requested_name)
@@ -487,7 +500,7 @@ class SessionBinding:
                     results[_result_name(requested_name)] = _failure(
                         "failed to activate tool module %r", requested_name
                     )
-            self._render()
+            self._announce(before)
         return results
 
     def reload(self, names: str | Iterable[str]) -> dict[str, dict]:
@@ -500,6 +513,7 @@ class SessionBinding:
         """
         results: dict[str, dict] = {}
         with self._lock, self.registry.lock:
+            before = self._capture()
             for requested_name in _requested_names(names):
                 try:
                     name = _validate_module_name(requested_name)
@@ -515,7 +529,7 @@ class SessionBinding:
                     failure = _failure("failed to reload tool module %r", requested_name)
                     self.registry.record_failure(result_name, failure["error"])
                     results[result_name] = failure
-            self._render()
+            self._announce(before)
         return results
 
     def list_text(self) -> str:
@@ -604,8 +618,66 @@ class SessionBinding:
             functions.pop(tool_name)
         del self.active[name]
 
-    def _render(self) -> None:
-        self.context_message["content"] = _render_context(self.registry, self.active)
+    def _capture(self) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+        """Snapshot everything the model can currently see about tool modules."""
+        return (
+            {name: module.content for name, module in self.active.items()},
+            {name: module.description for name, module in self.registry.modules.items()},
+            dict(self.registry.failures),
+        )
+
+    def _announce(self, before: tuple[dict[str, str], dict[str, str], dict[str, str]]) -> None:
+        """Queue one appended notice describing what changed, if anything did.
+
+        WHY: 这里只往队列里放，不直接改 session.messages。工具是在 assistant(tool_calls)
+        与 tool result 之间执行的，此刻插一条 user 消息会拆散这一对，供应商会拒。队列由
+        llm.Chat 的 context provider 在下一次子请求前取走，那时 tool result 已经补齐。
+        """
+        before_active, before_catalog, before_failures = before
+        after_active, after_catalog, after_failures = self._capture()
+
+        def joined(label: str, names) -> str | None:
+            listed = sorted(names)
+            return f"- {label}：{', '.join(listed)}" if listed else None
+
+        new_failures = {
+            name: error
+            for name, error in after_failures.items()
+            if before_failures.get(name) != error
+        }
+        lines = [
+            joined("目录新增", set(after_catalog) - set(before_catalog)),
+            joined("目录移除", set(before_catalog) - set(after_catalog)),
+            joined("目录描述更新", {
+                name for name in set(after_catalog) & set(before_catalog)
+                if after_catalog[name] != before_catalog[name]
+            }),
+            joined("已激活", set(after_active) - set(before_active)),
+            joined("已停用", set(before_active) - set(after_active)),
+            joined("已激活模块内容更新", {
+                name for name in set(after_active) & set(before_active)
+                if after_active[name] != before_active[name]
+            }),
+            joined("加载失败", new_failures),
+        ]
+        body = [line for line in lines if line]
+        if not body:
+            return
+
+        sections = ["工具模块已变化（本条由系统追加，不是用户发言）：", *body]
+        for name in sorted(after_active):
+            content = after_active[name]
+            if content and before_active.get(name) != content:
+                sections.append(f"\n## 已激活模块 {name}\n{content}")
+        for name, error in sorted(new_failures.items()):
+            sections.append(f"\n## 加载失败 {name}\n{error}")
+        self._announcements.append(_framed("\n".join(sections)))
+
+    def _take_announcements(self) -> list[dict]:
+        """Hand queued notices to llm.Chat as appended user messages."""
+        with self._lock:
+            queued, self._announcements = self._announcements, []
+        return [{"role": "user", "content": text} for text in queued]
 
 
 default_registry = ToolRegistry()

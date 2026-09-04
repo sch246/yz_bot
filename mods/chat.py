@@ -165,6 +165,26 @@ def _is_context_poke(event: dict, in_group: bool) -> bool:
     return bool(in_group) or event.get("target_id") == identity.bot_id()
 
 
+def event2chat(event: dict, in_group: bool) -> dict:
+    """Convert one history event into the single shape the model sees.
+
+    WHY: 插话与 get_msgs 必须走同一条转换。中途插进来的消息如果换个形状(比如只塞纯
+    文本)，模型就会看到同一个人在同一轮里忽然换了说话格式，而且图片、回复引用这些都会
+    丢。这里是唯一的转换点。
+    """
+    if msgs.is_msg(event):
+        return msg2chat(event, in_group)
+    kind = "群聊事件" if in_group else "私聊事件"
+    return {"role": "user", "content": f"【{kind}】{_poke_text(event)}"}
+
+
+def _message_cost(converted: dict) -> int:
+    content = converted["content"]
+    if isinstance(content, str):
+        return count_tokens(content)
+    return sum(count_tokens(part.get("text", "")) for part in content if isinstance(part, dict) and part.get("type") == "text")
+
+
 def get_msgs(token_limit: int | None = None, return_token: bool = False):
     token_limit = max_token if token_limit is None else token_limit
     current = context.current() or {}
@@ -197,15 +217,8 @@ def get_msgs(token_limit: int | None = None, return_token: bool = False):
     output = []
     used = 0
     for event in selected:
-        if msgs.is_msg(event):
-            converted = msg2chat(event, in_group)
-            content = converted["content"]
-            cost = sum(count_tokens(part.get("text", "")) for part in content if isinstance(part, dict) and part.get("type") == "text")
-        else:
-            kind = "群聊事件" if in_group else "私聊事件"
-            converted = {"role": "user", "content": f"【{kind}】{_poke_text(event)}"}
-            cost = count_tokens(converted["content"])
-        used += cost
+        converted = event2chat(event, in_group)
+        used += _message_cost(converted)
         if used > token_limit:
             break
         output.insert(0, converted)
@@ -268,9 +281,49 @@ def get_handler(session: llm.Chat):
     return handle
 
 
+def _interject_provider(turn, in_group: bool):
+    """Drain the window's queue into messages appended before the next request."""
+    def provide() -> list[dict]:
+        return [event2chat(event, in_group) for event in turn.take_pending()]
+    return provide
+
+
 def chat(model: str | None = None) -> None:
+    event = context.current() or {}
+    window = history.window(event)
+    if window is None:
+        _run_chat(model, None, event.get("group_id") is not None)
+        return
+    turn, owner = context.begin_turn(window)
+    if not owner:
+        # WHY: 一个窗口同时只跑一轮。以前第二条 at 会再起一轮并发的 chat()，两轮各自读
+        # get_msgs()、各自发言，像两个人抢着回答。现在只登记"还要再跑一轮"，事件本身已经
+        # 在 history 里，下一轮重建上下文时自然会读到。
+        turn.mark_trigger()
+        return
+    in_group = event.get("group_id") is not None
+    try:
+        while True:
+            _run_chat(model, turn, in_group)
+            if turn.cancelled:
+                return
+            if not context.finish_turn(window, turn):
+                return
+    finally:
+        context.end_turn(window, turn)
+
+
+def _run_chat(model: str | None, turn, in_group: bool) -> None:
     session = llm.Chat(model=model or get_model(), chat_client=llm.get_client())
     init_chat(session, get_msgs())
+    if turn is not None:
+        # WHY: 先建上下文再清队列，顺序不能反。get_msgs 已经从 history 读到了此刻为止
+        # 的全部消息，队列里同一批就是重复；反过来先清再读，则清掉之后、读到之前到达的
+        # 消息会两头落空。这个方向漏掉的消息只是本轮不追加——它仍在 history 里，而且
+        # take_pending 不动 trigger 标记，该再跑一轮还是会跑。
+        turn.take_pending()
+        session.add_context_provider(_interject_provider(turn, in_group))
+        session.should_stop = lambda: turn.cancelled
     session.chat(recall_func=get_handler(session), description_cache=description_cache)
 
 
@@ -448,8 +501,26 @@ def call(data: Callable | bool):
 
 
 @capture(before="chatstart")
-def capture_chat(_event: dict) -> bool:
+def capture_chat(event: dict) -> bool:
     matched = cond()
+    if callable(matched):
+        # `#` 子命令不调模型也不进上下文，跟插话无关，照旧就地执行。
+        result = call(matched)
+        if result is not None:
+            message.sendmsg(result)
+        return True
+    window = history.window(event)
+    turn = context.get_turn(window) if window is not None else None
+    if turn is not None:
+        # WHY: 分级在这里。这个窗口正跑着一轮，任何进得了上下文的消息都入队(让模型看到
+        # 更多，而不是等这轮结束才发现群里已经聊了十句)，但只有原本就会触发聊天的那种
+        # 才置 trigger 让它再跑一轮。否则普通闲聊会把 Bot 拖进无限续聊。
+        # `#` 开头的一律不入队，理由与 get_msgs 的过滤完全相同。
+        if msgs.is_msg(event) and not msgs.body(event).startswith("#"):
+            turn.interject(event, trigger=bool(matched))
+        elif matched:
+            turn.interject(event, trigger=True)
+        return bool(matched)
     if not matched:
         return False
     result = call(matched)

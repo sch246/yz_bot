@@ -512,7 +512,7 @@ class LLMClient:
             reasoning_content=reasoning_content,
         )
 
-    def chat(self, messages: list[dict], tools: list[Tool] | Callable[[], list[Tool]] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None) -> Generator[LLMResponse, None, None]:
+    def chat(self, messages: list[dict], tools: list[Tool] | Callable[[], list[Tool]] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None, on_round: Callable[[], list[dict]] | None = None, should_stop: Callable[[], bool] | None = None) -> Generator[LLMResponse, None, None]:
         # Every message appended below is printed live as it happens, so each
         # further round only logs what it has not shown yet -- usually nothing.
         logged = 0
@@ -520,25 +520,17 @@ class LLMClient:
         # .reboot。取舍与它暴露在同一条提示注入路径上的能力都记在 docs/llm.md 的
         # 「当前信任边界与维护取舍」一节——加限制前先读那里，这不是漏了。
         #
-        # WHY?: 缺插话与 ^C 打断。方向已定，尚未实现——实现时按下面这套来，别另起一套。
-        #
-        # 先记清现状，免得被误判成"收不到消息"：入站没有被生成挡住，link.dispatch 是
-        # thread.to_thread(None)，每条消息都在自己的线程上派发。现在的问题是第二条 at
-        # 会**再起一轮并发的 chat()**，两轮各自读 get_msgs()、各自发言。
-        #
-        # 已定的设计：
-        # - 按**窗口**登记，不按 (窗口, 用户)。插话和 ^C 都是任何人可用：LLM 上下文本来
-        #   就是整个窗口共享的，只让触发者能停会让群里其他人无法制止一轮跑偏的生成。
-        #   注意这与 context.interaction_key 的粒度不同，需要单独的窗口级登记。
-        # - 插话走队列：中途到达的消息进队尾，在本轮返回后、或下一次调用模型前(例如现在
-        #   工具返回后自动续问的那一步)一并带入，而不是打断当前请求。
-        # - 分级：只有原本就会触发聊天的消息(at、link 命中)才**触发**一次新的插话调用；
-        #   普通消息只**进队列**不触发。这样既让模型看到更多上下文，又不会让普通闲聊无限
-        #   续聊下去。
-        # - ^C 打断：本循环需要在每轮之间检查窗口级取消标记(InteractionCancelled 已存在)，
-        #   理想情况下还要能中断流式读取。bot._route 的 ^C 分支本身在生成期间是能跑的，
-        #   缺的只是这个循环没有登记可被 context.cancel 唤醒的东西。
+        # WHY: on_round 是"追加式上下文"的唯一入口，在每次子请求**之前**调用。放这里
+        # 而不是让调用方直接改 messages，是因为工具执行发生在 assistant(tool_calls) 与
+        # tool result 之间：那时候插一条 user 消息会拆散这一对，供应商会拒。等到这里，
+        # tool result 已经追加完毕，新内容落在一个合法的边界上。
+        # 两个生产者都走它：mods/tools 的模块变化通告，和 mods/chat 的插话队列。
+        # 它只追加，从不改写已有消息——前缀缓存因此不会被打断。
         while True:
+            if should_stop is not None and should_stop():
+                return
+            if on_round is not None:
+                messages.extend(on_round())
             # Freeze one tool snapshot for both the request schema and the
             # calls returned by that request. A tool may mutate this Chat's
             # mapping; the new snapshot is observed by the next iteration.
@@ -551,6 +543,14 @@ class LLMClient:
             # value supplies response-wide content fields; this loop combines
             # them with collected tool calls into the one history message.
             while True:
+                if should_stop is not None and should_stop():
+                    # WHY: 逐 chunk 检查是 ^C 能真正打断生成的地方；close() 关掉底层
+                    # HTTP 流，不然请求会一直读到模型自己说完。已经 yield 出去的段落
+                    # 已经发进 QQ 了，收不回来；这里剩下的半条 assistant 消息直接丢弃，
+                    # 因为 chat.chat 每轮都从 history 重建 messages，本轮的列表是一次性的。
+                    # 仍有一个够不到的窗口：卡在等待第一个 chunk 时无法打断，要等它到达。
+                    response.close()
+                    return
                 try:
                     chunk = next(response)
                 except StopIteration as completed:
@@ -603,6 +603,12 @@ class Chat:
         self.do_process_image = do_process_image
         self.messages: list[dict] = []
         self.functions: dict[str, Tool] = {}
+        # WHY: 追加式上下文。每个 provider 在每次模型子请求前被调用一次，返回要追加到
+        # 末尾的消息；前面的消息一个字都不改，所以前缀缓存不会失效。这是模块目录、插话
+        # 这类"会中途变化的东西"进入上下文的唯一正路——不要回到就地改写头部消息的老做法。
+        self.context_providers: list[Callable[[], list[dict]]] = []
+        # 返回 True 表示这一轮应当就地停下（^C 打断）。
+        self.should_stop: Callable[[], bool] | None = None
         if messages is not None:
             self.set_messages(messages)
         if functions is not None:
@@ -638,6 +644,24 @@ class Chat:
         for name, function in functions.items() if isinstance(functions, dict) else ((None, value) for value in functions):
             self.add_tool(function, name)
 
+    def add_context_provider(self, provider: Callable[[], list[dict]]):
+        """Register one source of messages appended before each sub-request."""
+        self.context_providers.append(provider)
+        return provider
+
+    def _collect_context(self) -> list[dict]:
+        collected: list[dict] = []
+        for provider in self.context_providers:
+            try:
+                produced = provider() or []
+            except Exception:
+                # 一个 provider 坏掉不该让整轮聊天失败：它提供的是补充上下文，不是主体。
+                _log.exception("context provider failed")
+                continue
+            for value in produced:
+                collected.append(value if isinstance(value, dict) else {"role": "user", "content": str(value)})
+        return collected
+
     def get_tools(self) -> list[Tool]:
         """Build the current request's frozen tool snapshot."""
         return list(self.functions.values())
@@ -661,6 +685,8 @@ class Chat:
                 stream,
                 self.description_cache if description_cache is None else description_cache,
                 self.do_process_image if do_process_image is None else do_process_image,
+                self._collect_context,
+                self.should_stop,
             )
             results = []
             for chunk in response:
