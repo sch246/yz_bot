@@ -550,7 +550,11 @@ def _subcommand(value: str):
         return f"tools: {mode}"
     if name == "ops" and not tail:
         # WHY: 操作历史是新加的一份持久存储，人必须能看见它、也能重置它。轨道写歪了
-        # (记进了不该记的东西、或者收缩坏了)时，这是唯一不用改代码就能恢复的入口。
+        # (记进了不该记的东西、或者收缩坏了)时，这是不用改代码就能恢复的入口。
+        # WHY: clear 的适用面比它看起来窄。操作记录依附聊天窗口，而 _selected_events 撞上
+        # 「聊天开始」/「聊天结束」就 break——所以重开一次聊天，地板抬到新起点，旧记录下
+        # 一轮自然被 sweep 扫掉。clear 真正管的是**聊天进行中途**要清轨道又不想断对话的
+        # 情况。别因为"反正重开聊天也能清"就删掉它，那是另一个代价。
         window = history.window(context.current() or {})
         return oplog.render(window) or "本窗口还没有操作历史"
     if name == "ops" and tail.strip() == "clear":
