@@ -530,6 +530,16 @@ class LLMClient:
             if should_stop is not None and should_stop():
                 return
             if on_round is not None:
+                # WHY?: 追加进去的是 role="user"，于是线上会出现 tool 消息紧跟 user 消息、
+                # 中间没有 assistant 的序列。按 OpenAI 的工具协议这是合法的——硬性要求只是
+                # assistant.tool_calls 的每个 id 都要有对应的 tool 消息，而它们在这之前就
+                # 已经补齐——但这是本仓库里唯一会产生这种形状的地方，而且**没有对真实供应商
+                # 验证过**：已有的验证都用假 client 跑，只证明了顺序逻辑，没证明 deepseek /
+                # openai / bytecat 的校验器和 chat template 都接受它。
+                # 真出问题时的两条退路，别现在就改：
+                #   1. 换成 role="system"（大多数实现允许中途 system，但同样没验证过）；
+                #   2. 只对工具通告，把内容并进最后一条 tool result 的 content，消息序列
+                #      完全不变——插话没法这么办，它不依附于任何 tool_call。
                 messages.extend(on_round())
             # Freeze one tool snapshot for both the request schema and the
             # calls returned by that request. A tool may mutate this Chat's
