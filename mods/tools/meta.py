@@ -175,6 +175,11 @@ def condense_ops(cids: list[str], conclusion: str) -> str:
     tool_call_ids, unknown = oplog.call_ids(window, cids)
     if unknown:
         return f"没有可收缩的（已经收缩过，或已随聊天滚出窗口）: {', '.join(unknown)}"
+    # WHY: 要写两处，因为"上下文"在这一刻有两副身体：当前这轮的 Chat.messages 是活的、
+    # 正在被工具循环追加，而 oplog 是明天重建时读的那份。只动 store 的话，这一轮不会变短
+    # ——而长工具循环恰恰是最需要当场省下 token 的场景；只动 messages 的话，明天重建又
+    # 把它们原样搬回来。所以先按 cid 查出协议 id 去动活的那份，再去 store 上打标记，顺序
+    # 不能反（标记之后就查不到 tool_call_id 了）。
     removed = current_binding().session.condense_calls(tool_call_ids)
     dropped = oplog.condense(window, cids)
     # 这里刻意不回显 conclusion：它已经在这次调用的 arguments 里，回显就是第二个副本。
