@@ -109,6 +109,11 @@ def record(
         cid = f"op{state['next']}"
         state["next"] = state["next"] + 1
         state["entries"].append({
+            # WHY: cid 存在条目里，它是 recall/condense 的查找键。渲染时贴到 tool 结果开头的
+            # "[opN] " 只是这个字段的一个视图——别反过来理解成"cid 是算出来的"。前缀不烤进
+            # content 是因为 content 要保持工具当时真正输出的原文：recall_ops 取回的就是它，
+            # 烤进去等于让原文里多一句工具从没说过的话。计数器 next 同样要存，否则重启后
+            # 归零、cid 会指到别的调用上。
             "cid": cid,
             # 同一条 assistant 消息里并发的调用共用一个 round，重建时据此还原分组。
             "round": str(round_id or tool_call_id),
