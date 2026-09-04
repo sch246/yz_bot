@@ -1,5 +1,21 @@
 """Registry and per-Chat binding for Python and Markdown tool modules."""
 
+# WHY: 这一整套是从更早的 tool 系统迁移过来的，迁移由 GPT 执行，所以文件里有若干形状
+# 并未经过维护者裁决（见下面几处指向本注释的标记）。维护者对这套东西的期望是：
+#
+# 1. tool 与 skill 本质二合一：Python 的模块 docstring 就相当于 Markdown 全文，首行始终
+#    显示用于索引，激活后展开全部，展开后还能按需继续索引子文件夹内容。
+#    _split_description、_render_context、_source_paths 合起来已经是这个形状。
+# 2. 让模型能随时改自己的工具，并主动察觉到工具可更新；更新后立即可用，失败则拿到错误栈。
+#    "更新后立即可用/拿到错误栈"由 reload_tools + registry._failures 覆盖，结果以追加
+#    的方式进上下文，见 _announce。"主动察觉磁盘变了"由 _drift_hint 覆盖：它是末尾 hint，
+#    每次子请求重算、不进历史。两者别混——_announce 是显式 reload/load 的结果，_drift_hint
+#    是磁盘状态的探测，而且只报告不加载。
+# 3. meta.py 是这套东西的使用说明书，给模型看的。
+#
+# 因此判断这里的代码时，标准不是"它已经在这儿而且能跑"，而是 docs/design-principles.md
+# 对任何抽象的那个提问：它被观察到解决了哪个问题。整体重写是被允许的。
+
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
@@ -21,6 +37,7 @@ from mods.llm.tools import Tool
 _log = logging.getLogger(__name__)
 _SOURCE_SUFFIXES = frozenset({".py", ".md"})
 _BASE_MODULE_NAME = "meta"
+# 恢复入口：meta 必须导出这四个，少一个模型就没法自救。可以多导出别的。
 _BASE_TOOL_NAMES = ("exec_code", "list_tools", "reload_tools", "load_tools")
 _current_binding_var: ContextVar[SessionBinding | None] = ContextVar(
     "tool_session_binding", default=None
@@ -57,6 +74,11 @@ class ToolRegistry:
         self._initialized = False
         # A binding holds this for the length of one prepare/commit pair.
         self.lock = threading.RLock()
+        # WHY: 用 id(self) 拼包名是为了让多个 registry 的候选互不串扰。查下来不是 bug
+        # （活着的两个 registry 地址必不相同；registry 被回收后 sys.modules 里只剩这个包
+        # 本身，_prepare_import_package 会把 __path__ 重新指向新的 source_dir），但生产
+        # 自始至终只有一个 default_registry——这是迁移带来的形状，不是为解决观察到的问题
+        # 而写的。见模块顶部注释；重写时不必保留。
         self._import_package = f"{__name__}._registry_{id(self):x}"
 
     @property
@@ -158,6 +180,10 @@ class ToolRegistry:
             self._initialized = True
 
     def _source_paths(self) -> dict[str, list[Path]]:
+        # WHY: 只 iterdir 顶层是有意的分层，不是漏了递归。模块目录是常驻上下文，递归扫描
+        # 会让子文件夹里的东西一开局就全部占位；只列顶层，子文件夹的内容就变成"展开之后
+        # 按需索引"的一层——由激活后的模块正文引用，或由 Python 正常 import 取用。
+        # 这与首行/全文的分层是同一个道理，往下再多一级而已。加递归会破坏这个性质。
         if not self.source_dir.is_dir():
             return {}
         grouped: dict[str, list[Path]] = {}
@@ -204,6 +230,11 @@ class ToolRegistry:
             "__builtins__": __builtins__,
         })
 
+        # WHY: 这段存取还原让候选模块的下划线 helper 跟着候选一起重新加载。执行前清空
+        # package.* 下的所有条目，候选里的 `from ._helper import x` 就必须重新读盘；执行后
+        # 再把新产生的条目摘掉、把原有的放回去，进程里不会留下候选的半成品子模块（实测：
+        # 改 _helper.py 后 reload_tools 立刻拿到新值，sys.modules 里只剩包本身）。
+        # 删掉它，reload_tools 会对已缓存的 helper 视而不见——源码改了却不生效，而且不报错。
         prefix = package + "."
         previous_children = {
             module_name: module
@@ -214,6 +245,12 @@ class ToolRegistry:
             sys.modules.pop(module_name, None)
         sys.modules[candidate_name] = candidate
         try:
+            # WHY: 这一行就是信任边界本身——校验候选模块的唯一方式是执行它的顶层代码。
+            # 没有沙箱，也不打算加：docs/llm.md 的"当前信任边界与维护取舍"记录了维护者
+            # 接受这条模型的理由（群白名单是主要运维控制面），meta.py 的模块手册则要求
+            # 顶层只放 import、常量和定义。所以 reload_tools 与 .py、exec_code、宿主机
+            # 操作同属一个信任域，不要在这里加"先静态检查再执行"之类的半吊子防线：它挡不住
+            # 顶层副作用，只会让人误以为这里是安全的。
             exec(compile(source, str(path), "exec"), candidate.__dict__)
         finally:
             for module_name in tuple(sys.modules):
@@ -223,10 +260,16 @@ class ToolRegistry:
 
         description, content = _split_description(candidate.__doc__, path)
         exports = _explicit_exports(candidate, path)
-        if name == _BASE_MODULE_NAME and tuple(exports) != _BASE_TOOL_NAMES:
-            raise ValueError(
-                "meta.py.__all__ must be exactly: " + ", ".join(_BASE_TOOL_NAMES)
-            )
+        # WHY: 只要求四个恢复入口都在，不再要求 __all__ 与它完全相等。原先是相等（含顺序），
+        # 那是迁移带来的附带收紧；承重的一直只有"少一个模型就没法自救"，docs/llm.md 记的
+        # 也是这条。放宽是给 meta 加 condense_ops 时逼出来的：相等的写法让 meta 多导出一个
+        # 函数就整个加载失败，而那正是恢复入口所在的模块，失败等于全盘瘫痪。
+        if name == _BASE_MODULE_NAME:
+            absent = [tool_name for tool_name in _BASE_TOOL_NAMES if tool_name not in exports]
+            if absent:
+                raise ValueError(
+                    "meta.py.__all__ must contain: " + ", ".join(absent)
+                )
         tools: dict[str, Tool] = {}
         for export_name, function in exports.items():
             schema_name = export_name if name == _BASE_MODULE_NAME else f"{name}__{export_name}"
@@ -345,6 +388,9 @@ def _validated_tool(function: Callable, schema_name: str) -> Tool:
     if not inspect.getdoc(function):
         raise ValueError(f"tool {schema_name} requires a docstring")
 
+    # WHY: 下面这段把 Tool 刚从同一个 signature 生成的 schema 又逐项校验了一遍。它防的
+    # 不是模块作者写错（上面的检查已覆盖），而是 Tool._load 自身回归。这是迁移留下的
+    # 形状，没有对应的真实事故。见模块顶部注释；重写时可以删。
     tool = Tool(function, schema_name)
     schema = tool.description
     function_schema = schema.get("function")
@@ -368,6 +414,23 @@ def _validated_tool(function: Callable, schema_name: str) -> Tool:
     return tool
 
 
+_REMINDER_CLOSE = "</system-reminder>"
+
+
+def _framed(body: str) -> str:
+    """Wrap one announcement in the frame this module owns.
+
+    WHY: 模块正文是模型自己写的——reload_tools 应用的就是它刚写进磁盘的文件。所以正文里
+    字面的结束标记必须转义，否则模型可以提前关掉这层框架，让后面它自己写的内容看起来像
+    是系统说的。框架归本模块所有，被框住的内容不许碰它。这一条抄自 deepseek-harness 的
+    agent-instructions：那里同样是"插件拥有框架、工作区文本中的结束标记被转义"。
+    """
+    escaped = body.replace(_REMINDER_CLOSE, "<\\/system-reminder>")
+    return f"<system-reminder>\n{escaped}\n{_REMINDER_CLOSE}"
+
+
+# WHY: 这是**基线**，只在 bind 时渲染一次，之后永不改写。工具变动走 _announce 追加到
+# 上下文末尾，见那边的说明。
 def _render_context(
     registry: ToolRegistry,
     active: Mapping[str, ToolModule],
@@ -386,11 +449,23 @@ def _render_context(
     return result
 
 
+# WHY: UI 模式下这条 system 消息**不放**工具状态，只放一个指路条。整套 UI 模式的
+# 卖点就是"工具只有一个权威副本，而且它明确位于所有修改之后"；这里再留一份目录，
+# 上下文里就又有两个说法了，等于白切。
+_UI_POINTER = (
+    "## 可用工具模块\n"
+    "工具状态不在这里。当前的模块目录、已激活模块正文和磁盘变化统一放在上下文**末尾**的"
+    "工具状态块里，那里是唯一权威，并且位于你所有修改之后。"
+)
+
+
 def create_context_message(
-    *, registry: ToolRegistry | None = None
+    *, registry: ToolRegistry | None = None, ui_mode: bool = False
 ) -> dict[str, str]:
-    """Create the one system message later updated in place by a binding."""
+    """Create the baseline module catalog; later changes are appended, not rewritten."""
     selected = default_registry if registry is None else registry
+    if ui_mode:
+        return {"role": "system", "content": _UI_POINTER}
     return {"role": "system", "content": _render_context(selected, {})}
 
 
@@ -403,6 +478,7 @@ class SessionBinding:
         context_message: dict,
         *,
         registry: ToolRegistry,
+        ui_mode: bool = False,
     ) -> None:
         if not isinstance(context_message, dict) or context_message.get("role") != "system":
             raise TypeError("context_message must be an existing system message dict")
@@ -417,13 +493,29 @@ class SessionBinding:
         if meta is None:
             failure = self.registry.failures.get(_BASE_MODULE_NAME)
             raise RuntimeError("required tool module meta is unavailable" + (f"\n{failure}" if failure else ""))
+        self._announcements: list[str] = []
+        self.ui_mode = bool(ui_mode)
         self._activate(meta)
-        self._render()
+        add_hint = getattr(session, "add_hint", None)
+        if self.ui_mode:
+            # UI 模式：整块状态挂末尾，前面那条 system 只留指路条。
+            self.context_message["content"] = _UI_POINTER
+            if callable(add_hint):
+                add_hint(self._state_hint)
+            return
+        # 追加模式：基线在 bind 时写一次，之后这条消息不再变，变动走 _announce 追加。
+        self.context_message["content"] = _render_context(self.registry, self.active)
+        register = getattr(session, "add_context_provider", None)
+        if callable(register):
+            register(self._take_announcements)
+        if callable(add_hint):
+            add_hint(self._drift_hint)
 
     def load(self, names: str | Iterable[str]) -> dict[str, dict]:
         """Activate only in-memory last-good modules in this session."""
         results: dict[str, dict] = {}
         with self._lock:
+            before = self._capture()
             for requested_name in _requested_names(names):
                 try:
                     name = _validate_module_name(requested_name)
@@ -437,7 +529,7 @@ class SessionBinding:
                     results[_result_name(requested_name)] = _failure(
                         "failed to activate tool module %r", requested_name
                     )
-            self._render()
+            self._announce(before)
         return results
 
     def reload(self, names: str | Iterable[str]) -> dict[str, dict]:
@@ -450,6 +542,7 @@ class SessionBinding:
         """
         results: dict[str, dict] = {}
         with self._lock, self.registry.lock:
+            before = self._capture()
             for requested_name in _requested_names(names):
                 try:
                     name = _validate_module_name(requested_name)
@@ -465,8 +558,90 @@ class SessionBinding:
                     failure = _failure("failed to reload tool module %r", requested_name)
                     self.registry.record_failure(result_name, failure["error"])
                     results[result_name] = failure
-            self._render()
+            self._announce(before)
         return results
+
+    def _drift_hint(self) -> str:
+        """Report disk sources that differ from last-good, as an end-of-context hint.
+
+        WHY: 这是"被动提醒"那一层，对应维护者期望里"模型能主动察觉工具可更新"的一半。
+        以前 registry.scan() 的差异只有模型**自己调 list_tools** 才看得到，改了文件不说
+        就没人知道。
+
+        WHY: 它是 hint 不是 provider——每次子请求重算，不进历史。磁盘差异正是那种"随时
+        可以重算、而且只有当前值有意义"的状态：文件改回去，提醒就该消失，而不是在上下文
+        里留着一条"曾经改过"。
+
+        WHY: 它只报告，不加载。发现变化与决定应用是两步，理由见 _announce 的 WHY——磁盘
+        上的模块随时可能正被写到一半。所以这里也不承载模块正文，只给名字。
+
+        WHY: 每次都真读磁盘，没有节流。一次 scan 是十来个小文件的 read_bytes，相对一次
+        模型往返可以忽略；加缓存反而会让"刚改完就问"读到旧值，那正是这条提醒要解决的场景。
+        """
+        try:
+            changes = self.registry.scan()
+        except Exception:
+            _log.exception("failed to scan tool sources for the drift hint")
+            return ""
+        labels = (("added", "新增"), ("modified", "修改"), ("deleted", "删除"))
+        parts = [
+            f"{label} {', '.join(changes[kind])}"
+            for kind, label in labels
+            if changes.get(kind)
+        ]
+        if not parts:
+            return ""
+        return _framed(
+            "工具模块的磁盘源与已加载版本不一致，尚未应用：\n"
+            + "\n".join(f"- {part}" for part in parts)
+            + "\n需要时用 reload_tools 显式应用；不应用则当前生效的仍是上面目录里的版本。"
+        )
+
+    def _state_hint(self) -> str:
+        """Render the whole tool state as one end-of-context block (UI mode).
+
+        WHY: UI 模式的全部意义是注意力：工具只剩**一个**权威副本，而且它明确位于所有
+        修改之后。就地改写头部做不到这一点（会丢掉"改过"这件事，还打断前缀缓存），
+        追加式也做不到——上下文里同时留着某模块的旧正文和新正文，模型可能以为修改之前
+        的工具就长那样。整块挂末尾则没有歧义：末尾这一份就是现在的样子。
+
+        WHY: 代价是这一整块每次子请求都是未命中缓存的新 token，工具循环越长付得越多。
+        所以它是**可切换**的而不是替换掉追加模式，默认仍走追加。开关见
+        chat.get_tools_mode，按窗口存。
+
+        WHY: 它连磁盘变化一起报，所以 UI 模式下不再单独挂 _drift_hint——那会是同一件事
+        的第二个说法。仍然只报告不加载，理由和 _announce 那条完全相同。
+        """
+        try:
+            changes = self.registry.scan()
+        except Exception:
+            _log.exception("failed to scan tool sources for the state hint")
+            changes = {}
+        modules = self.registry.modules
+        lines = ["当前工具状态（本块位于你所有修改之后，是唯一权威）：", "", "## 可用工具模块"]
+        if modules:
+            lines.extend(
+                f"- {name}: {module.description}" + ("（已激活）" if name in self.active else "")
+                for name, module in modules.items()
+            )
+        else:
+            lines.append("- (无)")
+        for name in sorted(self.active):
+            content = self.active[name].content
+            if content:
+                lines.append(f"\n## 已激活模块 {name}\n{content}")
+        drift = [
+            f"- {label} {', '.join(changes[kind])}"
+            for kind, label in (("added", "新增"), ("modified", "修改"), ("deleted", "删除"))
+            if changes.get(kind)
+        ]
+        if drift:
+            lines.append("\n## 磁盘源与已加载版本不一致（尚未应用）")
+            lines.extend(drift)
+            lines.append("需要时用 reload_tools 显式应用。")
+        for name, error in sorted(self.registry.failures.items()):
+            lines.append(f"\n## 加载失败 {name}\n{error}")
+        return _framed("\n".join(lines))
 
     def list_text(self) -> str:
         """Describe last-good, active, failed, and changed modules."""
@@ -554,8 +729,83 @@ class SessionBinding:
             functions.pop(tool_name)
         del self.active[name]
 
-    def _render(self) -> None:
-        self.context_message["content"] = _render_context(self.registry, self.active)
+    def _capture(self) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+        """Snapshot everything the model can currently see about tool modules."""
+        return (
+            {name: module.content for name, module in self.active.items()},
+            {name: module.description for name, module in self.registry.modules.items()},
+            dict(self.registry.failures),
+        )
+
+    def _announce(self, before: tuple[dict[str, str], dict[str, str], dict[str, str]]) -> None:
+        """Queue one appended notice describing what changed, if anything did.
+
+        WHY: 这里只往队列里放，不直接改 session.messages。工具是在 assistant(tool_calls)
+        与 tool result 之间执行的，此刻插一条 user 消息会拆散这一对，供应商会拒。队列由
+        llm.Chat 的 context provider 在下一次子请求前取走，那时 tool result 已经补齐。
+
+        WHY: 这是**显式 load/reload 的结果报告**，不是磁盘变化探测器。调用链只有一条：
+        模型调 meta 的 reload_tools/load_tools → SessionBinding.reload/load → 这里。
+        没有 watcher，改文件本身仍然不生效——这一条不要"顺手补上"：磁盘上的模块随时
+        可能正被写到一半（模型自己也在写），自动加载等于把半个文件当成新版本，而
+        registry 的 last-good 只在校验通过后才替换，正是为了让这种时刻不影响正在跑的
+        会话。想让模型知道磁盘变了，用 list_tools 报告差异，或者末尾的 _drift_hint
+        （UI 模式下是 _state_hint），都不是在这里加扫描。
+
+        WHY: 通告是**累积**的，靠顺序而不是替换生效——上下文里会同时留着某模块的旧正文
+        和后来追加的新正文，后者在后面。这是追加式的必然代价，deepseek-harness 的
+        baseline+refresh 也是如此。换成回头改写旧消息就等于放弃前缀缓存，而那正是这套
+        东西存在的理由。同一轮内的多次变动各自成条、按发生顺序交付，不互相覆盖。
+        """
+        if self.ui_mode:
+            # UI 模式不产生通告：状态整块挂在末尾，每次子请求重新渲染，本来就是最新的。
+            # 再追加一条"变了什么"就又回到了两个副本并存。
+            return
+        before_active, before_catalog, before_failures = before
+        after_active, after_catalog, after_failures = self._capture()
+
+        def joined(label: str, names) -> str | None:
+            listed = sorted(names)
+            return f"- {label}：{', '.join(listed)}" if listed else None
+
+        new_failures = {
+            name: error
+            for name, error in after_failures.items()
+            if before_failures.get(name) != error
+        }
+        lines = [
+            joined("目录新增", set(after_catalog) - set(before_catalog)),
+            joined("目录移除", set(before_catalog) - set(after_catalog)),
+            joined("目录描述更新", {
+                name for name in set(after_catalog) & set(before_catalog)
+                if after_catalog[name] != before_catalog[name]
+            }),
+            joined("已激活", set(after_active) - set(before_active)),
+            joined("已停用", set(before_active) - set(after_active)),
+            joined("已激活模块内容更新", {
+                name for name in set(after_active) & set(before_active)
+                if after_active[name] != before_active[name]
+            }),
+            joined("加载失败", new_failures),
+        ]
+        body = [line for line in lines if line]
+        if not body:
+            return
+
+        sections = ["工具模块已变化（本条由系统追加，不是用户发言）：", *body]
+        for name in sorted(after_active):
+            content = after_active[name]
+            if content and before_active.get(name) != content:
+                sections.append(f"\n## 已激活模块 {name}\n{content}")
+        for name, error in sorted(new_failures.items()):
+            sections.append(f"\n## 加载失败 {name}\n{error}")
+        self._announcements.append(_framed("\n".join(sections)))
+
+    def _take_announcements(self) -> list[dict]:
+        """Hand queued notices to llm.Chat as appended user messages."""
+        with self._lock:
+            queued, self._announcements = self._announcements, []
+        return [{"role": "user", "content": text} for text in queued]
 
 
 default_registry = ToolRegistry()
@@ -567,12 +817,14 @@ def bind_session(
     initial_modules: Iterable[str] = (),
     *,
     registry: ToolRegistry | None = None,
+    ui_mode: bool = False,
 ) -> SessionBinding:
     """Bind base tools and explicit module activation to an existing Chat."""
     binding = SessionBinding(
         session,
         context_message,
         registry=default_registry if registry is None else registry,
+        ui_mode=ui_mode,
     )
     initial = tuple(initial_modules)
     if initial:

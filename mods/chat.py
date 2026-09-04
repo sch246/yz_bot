@@ -9,15 +9,26 @@ import threading
 import time
 from typing import Callable
 
-from mods import context, cq, history, identity, image, llm, log, message, msgs, storage, text, thread, tools as tool_modules
+from mods import context, cq, history, identity, image, llm, log, message, msgs, oplog, storage, text, thread, tools as tool_modules
 from mods.command import command
 from mods.capture import capture
 
 
-LOAD_AFTER = ("history", "identity", "image", "llm", "storage")
+LOAD_AFTER = ("history", "identity", "image", "llm", "oplog", "storage")
 
 IMAGE_MODES = ("off", "lazy", "eager")
 IMAGE_MODE_ALIASES = {"0": "off", "1": "lazy", "2": "eager"}
+
+# WHY: keep=原样带回思考内容(默认，满足 DeepSeek thinking mode 的工具调用协议)，
+# drop=在工具循环内把它换成空串省 token。只影响一次工具循环之内，思考本来就不跨轮。
+REASONING_MODES = ("keep", "drop")
+REASONING_ALIASES = {"on": "keep", "off": "drop", "1": "keep", "0": "drop"}
+
+# WHY: append=工具变动追加进上下文(默认，进历史、可回放、不打断前缀缓存)，
+# ui=整个工具状态作为一整块 hint 挂在末尾(只有一个权威副本，且明确位于所有修改之后，
+# 代价是每次子请求都是未命中缓存的新 token)。两者的取舍见 tools._state_hint。
+TOOLS_MODES = ("append", "ui")
+TOOLS_MODE_ALIASES = {"0": "append", "1": "ui", "hint": "ui"}
 
 settings: list = []
 prompts: dict = {}
@@ -55,6 +66,26 @@ def normalize_image_mode(value) -> str:
 
 def get_image_mode(data: dict | None = None) -> str:
     return normalize_image_mode((getchatstorage() if data is None else data).get("image"))
+
+
+# WHY: 下面两组照 image 那一套写：normalize 负责把存坏的值拉回默认，读取端永远拿得到
+# 合法值，所以旧存储里的遗留值不会让聊天崩掉。别改成直接读原值。
+def normalize_reasoning_mode(value) -> str:
+    normalized = REASONING_ALIASES.get(str(value).lower(), str(value).lower())
+    return normalized if normalized in REASONING_MODES else "keep"
+
+
+def get_reasoning_mode(data: dict | None = None) -> str:
+    return normalize_reasoning_mode((getchatstorage() if data is None else data).get("reasoning"))
+
+
+def normalize_tools_mode(value) -> str:
+    normalized = TOOLS_MODE_ALIASES.get(str(value).lower(), str(value).lower())
+    return normalized if normalized in TOOLS_MODES else "append"
+
+
+def get_tools_mode(data: dict | None = None) -> str:
+    return normalize_tools_mode((getchatstorage() if data is None else data).get("tools"))
 
 
 def get_prompt() -> list:
@@ -165,10 +196,54 @@ def _is_context_poke(event: dict, in_group: bool) -> bool:
     return bool(in_group) or event.get("target_id") == identity.bot_id()
 
 
+def event2chat(event: dict, in_group: bool) -> dict:
+    """Convert one history event into the single shape the model sees.
+
+    WHY: 插话与 get_msgs 必须走同一条转换。中途插进来的消息如果换个形状(比如只塞纯
+    文本)，模型就会看到同一个人在同一轮里忽然换了说话格式，而且图片、回复引用这些都会
+    丢。这里是唯一的转换点。
+    """
+    if msgs.is_msg(event):
+        return msg2chat(event, in_group)
+    kind = "群聊事件" if in_group else "私聊事件"
+    return {"role": "user", "content": f"【{kind}】{_poke_text(event)}"}
+
+
+def _message_cost(converted: dict) -> int:
+    content = converted["content"]
+    if isinstance(content, str):
+        return count_tokens(content)
+    return sum(count_tokens(part.get("text", "")) for part in content if isinstance(part, dict) and part.get("type") == "text")
+
+
+def _within_budget(events: list[dict], in_group: bool, token_limit: int) -> tuple[list[tuple[float, dict]], int]:
+    """The chat messages that fit, oldest first, each with its timestamp.
+
+    WHY: 截断只有这一处实现。get_msgs 和 build_context 都从这里取，操作记录再依附到它的
+    结果上——三处各写一遍"留多少"，改一处就会静默地分叉。
+    """
+    picked: list[tuple[float, dict]] = []
+    used = 0
+    for event in events:
+        converted = event2chat(event, in_group)
+        used += _message_cost(converted)
+        if used > token_limit:
+            break
+        picked.insert(0, (float(event.get("time") or 0.0), converted))
+    return picked, used
+
+
 def get_msgs(token_limit: int | None = None, return_token: bool = False):
-    token_limit = max_token if token_limit is None else token_limit
     current = context.current() or {}
     in_group = current.get("group_id") is not None
+    picked, used = _within_budget(_selected_events(current, in_group), in_group,
+                                  max_token if token_limit is None else token_limit)
+    output = [converted for _at, converted in picked]
+    return (output, used) if return_token else output
+
+
+def _selected_events(current: dict, in_group: bool) -> list[dict]:
+    """Walk recent history newest-first and keep what may enter the model context."""
     selected = []
     for event in history.getlog(current)[:max_msg]:
         if msgs.is_msg(event):
@@ -193,23 +268,7 @@ def get_msgs(token_limit: int | None = None, return_token: bool = False):
             selected.append(event)
         elif _is_context_poke(event, in_group):
             selected.append(event)
-
-    output = []
-    used = 0
-    for event in selected:
-        if msgs.is_msg(event):
-            converted = msg2chat(event, in_group)
-            content = converted["content"]
-            cost = sum(count_tokens(part.get("text", "")) for part in content if isinstance(part, dict) and part.get("type") == "text")
-        else:
-            kind = "群聊事件" if in_group else "私聊事件"
-            converted = {"role": "user", "content": f"【{kind}】{_poke_text(event)}"}
-            cost = count_tokens(converted["content"])
-        used += cost
-        if used > token_limit:
-            break
-        output.insert(0, converted)
-    return (output, used) if return_token else output
+    return selected
 
 
 def _usage_entry() -> list:
@@ -247,15 +306,72 @@ def _base_prompt() -> list[dict]:
 - 如无特殊要求，请用中文回复"""}]
 
 
+def build_context(token_limit: int | None = None) -> list:
+    """Chat history, with the rebuilt tool rounds that belong inside it.
+
+    WHY: 只有**一套**截断规则，就是聊天消息那套（max_msg + max_token）。操作记录不再自己
+    算预算、也没有自己的保留期，它依附于聊天窗口：留下来的最老那条消息之后发生的工具轮才
+    进上下文。两套规则曾经并存过，拆了——它们描述的是同一件事"多早以前的事情还算数"，
+    答案有两个就意味着两处调参、两处解释，而且总有一处会先漂。
+
+    WHY: 代价是工具轮不占预算，调用密集时上下文会超出 max_token。这是知情的选择：压住它
+    的是 condense_ops，由模型在得出结论时自己收缩，而不是由这里按大小乱砍——按大小砍会在
+    结论产出之前砍掉前提。真要封顶的话，是在这里给工具轮也记一份成本，别去给它加保留期。
+
+    WHY: 归并单位是一轮。assistant(tool_calls) 和它的 tool 结果之间插进一条聊天消息就拆散
+    了这一对，请求会被拒，所以每轮带一个时间、整体落位。
+
+    WHY: 同一时刻聊天排在工具轮前面。工具调用是被某条消息触发的，触发它的那句话在它之前；
+    秒级时间戳里两者常常相等，靠这个平手规则维持因果。
+
+    WHY: 顺序不保证与当时完全一致：一轮里几个并发调用完成时间不同，工具执行期间到达的
+    消息其真实先后也无法从一个时间点还原。这是明知的近似。
+
+    WHY: 没载入的部分不列清单。曾经这里插过一行"更早还有 N 次工具调用未载入（op1–op12）"，
+    拆掉了：真正需要重新打开的是被自己收缩掉的那些，它们的 cid 就写在 condense_ops 调用的
+    arguments 里、跟着重建回到上下文中——入口已经在了，不用再指一次。
+    """
+    token_limit = max_token if token_limit is None else token_limit
+    current = context.current() or {}
+    in_group = current.get("group_id") is not None
+    window = history.window(current)
+    events = _selected_events(current, in_group)
+    picked, _used = _within_budget(events, in_group, token_limit)
+    if not picked:
+        # 没有聊天做锚点时不载入任何操作记录：孤零零摆着，模型无从判断它当时在回应什么。
+        return []
+    # WHY: 回收也依附于聊天。events 已经按 max_msg 截过，比它最老那条还早、又没人引用的
+    # 操作再也够不着了，这里顺手让 oplog 扫掉——门槛用 max_msg 窗口而不是本轮预算，因为
+    # 预算每轮可松可紧（`.chat` 就传别的值），拿它当删除门槛会删掉下一轮还够得着的记录。
+    # "又没人引用"那半句在 oplog.sweep 里：被窗口内的 condense_ops 点过名的调用要留着，
+    # 否则上下文里那个 cid 就成了指向空处的断号。
+    oplog.sweep(window, float(events[-1].get("time") or 0.0))
+    items: list[tuple[float, int, list]] = [(at, 0, [converted]) for at, converted in picked]
+    floor = picked[0][0]
+    items.extend((at, 1, batch) for at, batch in oplog.build_rounds(window) if at >= floor)
+    items.sort(key=lambda item: (item[0], item[1]))
+    return [message for item in items for message in item[2]]
+
+
 def init_chat(session: llm.Chat, messages: list | None = None) -> None:
     inc_call_count()
     prompts["base"] = _base_prompt()
     group = context.current().get("group_id") if context.current() else None
     state = {"role": "system", "content": f"当前所在群聊:{identity.getgroupname(group)}({group})"} if group is not None else {"role": "system", "content": f"当前在私聊:{identity.getname()}({context.current().get('user_id')})"}
-    tool_context = tool_modules.create_context_message()
-    session.set_messages([*get_prompt(), *prompts["base"], tool_context, state, *(messages or [])])
-    tool_modules.bind_session(session, tool_context)
+    ui_mode = get_tools_mode() == "ui"
+    tool_context = tool_modules.create_context_message(ui_mode=ui_mode)
+    window = history.window(context.current() or {})
+    session.set_messages([
+        *get_prompt(),
+        *prompts["base"],
+        tool_context,
+        state,
+        *(messages or []),
+    ])
+    tool_modules.bind_session(session, tool_context, ui_mode=ui_mode)
     session.do_process_image = get_image_mode() != "off"
+    session.keep_reasoning = get_reasoning_mode() == "keep"
+    session.on_tool_result = _oplog_recorder(window)
 
 
 def get_handler(session: llm.Chat):
@@ -268,9 +384,58 @@ def get_handler(session: llm.Chat):
     return handle
 
 
+def _oplog_recorder(window):
+    """Record each finished tool call and hand back the cid the model can name."""
+    def record(result, round_id: str) -> str | None:
+        return oplog.record(window, result.name, result.arguments, result.content, result.tool_call_id, round_id)
+    return record
+
+
+def _interject_provider(turn, in_group: bool):
+    """Drain the window's queue into messages appended before the next request."""
+    def provide() -> list[dict]:
+        return [event2chat(event, in_group) for event in turn.take_pending()]
+    return provide
+
+
 def chat(model: str | None = None) -> None:
+    event = context.current() or {}
+    window = history.window(event)
+    if window is None:
+        _run_chat(model, None, event.get("group_id") is not None)
+        return
+    turn, owner = context.begin_turn(window)
+    if not owner:
+        # WHY: 一个窗口同时只跑一轮。以前第二条 at 会再起一轮并发的 chat()，两轮各自读
+        # get_msgs()、各自发言，像两个人抢着回答。现在只登记"还要再跑一轮"，事件本身已经
+        # 在 history 里，下一轮重建上下文时自然会读到。
+        turn.mark_trigger()
+        return
+    in_group = event.get("group_id") is not None
+    try:
+        while True:
+            _run_chat(model, turn, in_group)
+            if turn.cancelled:
+                return
+            if not context.finish_turn(window, turn):
+                return
+    finally:
+        context.end_turn(window, turn)
+
+
+def _run_chat(model: str | None, turn, in_group: bool) -> None:
     session = llm.Chat(model=model or get_model(), chat_client=llm.get_client())
-    init_chat(session, get_msgs())
+    # WHY: 聊天历史与重建出的工具调用记录由 build_context 一起装配，共用一份 token
+    # 预算。`.chat` 单句请求走的是另一条路：它本来就不读聊天历史，也就不载入工具记录。
+    init_chat(session, build_context())
+    if turn is not None:
+        # WHY: 先建上下文再清队列，顺序不能反。get_msgs 已经从 history 读到了此刻为止
+        # 的全部消息，队列里同一批就是重复；反过来先清再读，则清掉之后、读到之前到达的
+        # 消息会两头落空。这个方向漏掉的消息只是本轮不追加——它仍在 history 里，而且
+        # take_pending 不动 trigger 标记，该再跑一轮还是会跑。
+        turn.take_pending()
+        session.add_context_provider(_interject_provider(turn, in_group))
+        session.should_stop = lambda: turn.cancelled
     session.chat(recall_func=get_handler(session), description_cache=description_cache)
 
 
@@ -287,6 +452,9 @@ _SUBCOMMAND_HELP = (
     ("set_setting <name> [list]", "保存当前或给定设定"),
     ("del_setting <name>", "删除设定"),
     ("image [off|lazy|eager]", "查看或设置图片读取档位"),
+    ("reasoning [keep|drop]", "查看或设置工具循环内是否带回思考内容"),
+    ("tools [append|ui]", "查看或设置工具状态的呈现方式"),
+    ("ops [clear]", "查看或清空本窗口的操作历史"),
 )
 _SUBCOMMAND_NAMES = {pattern.partition(" ")[0] for pattern, _description in _SUBCOMMAND_HELP}
 
@@ -358,6 +526,36 @@ def _subcommand(value: str):
             return "图片读取档位必须是 off/0、lazy/1 或 eager/2"
         data["image"] = mode
         return f"image: {mode}"
+    if name == "reasoning" and not tail:
+        return f"reasoning: {get_reasoning_mode(data)}"
+    if name == "reasoning" and tail:
+        mode, remaining = _first_argument(tail)
+        if remaining.strip():
+            return "reasoning 参数过多"
+        mode = REASONING_ALIASES.get(mode.lower(), mode.lower())
+        if mode not in REASONING_MODES:
+            return "reasoning 必须是 keep/on 或 drop/off"
+        data["reasoning"] = mode
+        return f"reasoning: {mode}"
+    if name == "tools" and not tail:
+        return f"tools: {get_tools_mode(data)}"
+    if name == "tools" and tail:
+        mode, remaining = _first_argument(tail)
+        if remaining.strip():
+            return "tools 参数过多"
+        mode = TOOLS_MODE_ALIASES.get(mode.lower(), mode.lower())
+        if mode not in TOOLS_MODES:
+            return "tools 必须是 append 或 ui"
+        data["tools"] = mode
+        return f"tools: {mode}"
+    if name == "ops" and not tail:
+        # WHY: 操作历史是新加的一份持久存储，人必须能看见它、也能重置它。轨道写歪了
+        # (记进了不该记的东西、或者收缩坏了)时，这是唯一不用改代码就能恢复的入口。
+        window = history.window(context.current() or {})
+        return oplog.render(window) or "本窗口还没有操作历史"
+    if name == "ops" and tail.strip() == "clear":
+        oplog.clear(history.window(context.current() or {}))
+        return "已清空本窗口的操作历史"
     if name == "prompt" and not tail:
         selected = data.get("prompt")
         if selected is None:
@@ -448,8 +646,26 @@ def call(data: Callable | bool):
 
 
 @capture(before="chatstart")
-def capture_chat(_event: dict) -> bool:
+def capture_chat(event: dict) -> bool:
     matched = cond()
+    if callable(matched):
+        # `#` 子命令不调模型也不进上下文，跟插话无关，照旧就地执行。
+        result = call(matched)
+        if result is not None:
+            message.sendmsg(result)
+        return True
+    window = history.window(event)
+    turn = context.get_turn(window) if window is not None else None
+    if turn is not None:
+        # WHY: 分级在这里。这个窗口正跑着一轮，任何进得了上下文的消息都入队(让模型看到
+        # 更多，而不是等这轮结束才发现群里已经聊了十句)，但只有原本就会触发聊天的那种
+        # 才置 trigger 让它再跑一轮。否则普通闲聊会把 Bot 拖进无限续聊。
+        # `#` 开头的一律不入队，理由与 get_msgs 的过滤完全相同。
+        if msgs.is_msg(event) and not msgs.body(event).startswith("#"):
+            turn.interject(event, trigger=bool(matched))
+        elif matched:
+            turn.interject(event, trigger=True)
+        return bool(matched)
     if not matched:
         return False
     result = call(matched)

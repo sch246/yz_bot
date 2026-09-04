@@ -50,7 +50,7 @@ def lookup(query: str, limit: int = 10) -> str:
 __all__ = ["lookup"]
 ```
 
-一个文件可以通过 `__all__` 导出多个同步函数，也可导出空列表、只提供说明。每个参数都要有类型标注，函数要有 docstring，签名必须能按关键字调用；不要使用位置专用参数、`*args`、`**kwargs` 或异步函数。模型侧函数名带模块命名空间，例如 `foo__lookup`。`meta` 是始终激活的保留模块，其四个恢复工具不加前缀。
+一个文件可以通过 `__all__` 导出多个同步函数，也可导出空列表、只提供说明。每个参数都要有类型标注，函数要有 docstring，签名必须能按关键字调用；不要使用位置专用参数、`*args`、`**kwargs` 或异步函数。模型侧函数名带模块命名空间，例如 `foo__lookup`。`meta` 是始终激活的保留模块，它导出的工具不加前缀。
 
 Python 模块可以正常 import 第三方依赖、其它 `mods`，也可以 `from ._helper import value` 引用同目录以下划线开头的 helper。候选加载会执行顶层代码，所以顶层只放 import、常量和定义；它与 Bot 处在同一宿主信任域，不是沙箱。
 
@@ -78,6 +78,20 @@ Markdown 不需要 front matter、额外 summary 字段或同步机制，也不�
 ## 删除
 
 先确认精确模块名和源文件，再删除对应的单个 `mods/tools/foo.py` 或 `.md`，不要宽泛递归删除。随后调用 `reload_tools(["foo"])`；registry 发现源文件缺失后才删除 last-good，并从当前 Chat 移除模块内容和函数。只删文件但不 reload 时，旧 last-good 仍然有效。`meta.py` 是恢复入口，不能删除。删除 helper 前要先检查并 reload 所有受影响模块。
+
+## 操作历史与结论收缩
+
+每次工具调用的结果开头都有一个 `[opN]`，那是这次调用的上下文 id（cid）。这些调用会记进本窗口的操作历史，**跨轮保留**：下一轮开始时你能看到自己上一轮改过什么、加载过什么，而聊天记录里并没有这些。
+
+这些记录会以**原样的调用记录**重建，不是摘要，所以上下文会随调用增长。压缩靠你自己：一组调用往往是为某个目的服务的，结论一旦得出中间过程就只剩噪音——查完资料、确认完状态、修完一个文件之后，调用 `condense_ops(["op3", "op4"], "结论")` 把它们移除。
+
+结论写在 `conclusion` 参数里就够了，工具不会把它再返回一遍：这次调用本身留在上下文里，参数里的结论就是它的记录。
+
+收缩是**可逆**的：被收缩的调用只是离开上下文，原文继续留着。你那次 `condense_ops` 调用会跟着重建回到后面每一轮的上下文里，`cids` 参数里写的就是被收掉的那几个 cid——什么时候觉得当初的结论不够用、或者要核对当初到底看到了什么，用 `recall_ops(["op3"])` 按 cid 把完整原文取回来。所以收缩不必犹豫，它不销毁任何东西。
+
+三条规则：同一条 assistant 消息里并发的多个调用必须一起点名收缩，只点其中一个会被拒绝；正在执行、结果还没回来的那一轮不能收缩；后来的收缩可以把更早那次 `condense_ops` 也收掉，那次的结论随之从上下文消失——需要保留就在新结论里带上。
+
+操作记录跟着聊天窗口走：留在上下文里的最老那条聊天消息之后发生的调用才会载入，更早的随聊天一起滚出去、也就取不回来了。没载入的不会有清单列给你，量太大，列出来本身就是浪费。
 
 ## 原子性与请求边界
 
@@ -144,6 +158,60 @@ def load_tools(names: list[str]) -> str:
     return _format_results(current_binding().load(names))
 
 
+def condense_ops(cids: list[str], conclusion: str) -> str:
+    """把已经得出结论的几次工具调用移出上下文，只留下你在 conclusion 里写的结论。查完资料、确认完状态、修完一个文件之后调用它。原文不会被删除，之后可以用 recall_ops 按同样的 cid 取回。
+
+    @param
+    cids: 要收缩的调用 id 列表，形如 ["op3", "op4"]；每条工具结果开头的 [opN] 就是它
+    conclusion: 这几次调用得出的结论，写成后面还用得上的一句话；它留在这次调用里，不会被再返回一遍
+    """
+    from mods import context, history, oplog
+
+    window = history.window(context.current() or {})
+    if window is None:
+        return "当前不在聊天窗口里，没有操作历史"
+    if not cids:
+        return "没有指定要收缩的调用"
+    tool_call_ids, unknown = oplog.call_ids(window, cids)
+    if unknown:
+        return f"操作历史里找不到（已随聊天滚出窗口，或从未存在）: {', '.join(unknown)}"
+    # WHY: 要写两处，因为"上下文"在这一刻有两副身体：当前这轮的 Chat.messages 是活的、
+    # 正在被工具循环追加，而 oplog 是明天重建时读的那份。只动 store 的话，这一轮不会变短
+    # ——而长工具循环恰恰是最需要当场省下 token 的场景；只动 messages 的话，明天重建又
+    # 把它们原样搬回来。两步没有先后要求：call_ids 看的是全量条目，不受标记影响。
+    dropped = oplog.condense(window, cids)
+    if not dropped:
+        # 已经收缩过：当前上下文里那几条早就不在了，不必再去动活的那份。
+        return "这几次调用已经收缩过了"
+    removed = current_binding().session.condense_calls(tool_call_ids)
+    # 这里刻意不回显 conclusion：它已经在这次调用的 arguments 里，回显就是第二个副本。
+    return f"已收缩 {dropped} 条操作，当前上下文移除 {removed} 条消息；需要时可用 recall_ops 取回原文"
+
+
+def recall_ops(cids: list[str]) -> str:
+    """按 cid 取回工具调用的完整原文，包括已经被 condense_ops 收缩掉的、以及因为时间太早而没有载入的那些。需要核对某次收缩当初到底看到了什么时用它，cid 就写在那次 condense_ops 调用的 cids 参数里。
+
+    @param
+    cids: 要取回的调用 id 列表，形如 ["op3", "op4"]
+    """
+    from mods import context, history, oplog
+
+    window = history.window(context.current() or {})
+    if window is None:
+        return "当前不在聊天窗口里，没有操作历史"
+    if not cids:
+        return "没有指定要取回的调用"
+    found, unknown = oplog.recall(window, cids)
+    lines = [
+        f"[{entry['cid']}]{'(已收缩)' if entry.get('condensed') else ''} "
+        f"{entry['name']}({entry['arguments']})\n{entry['content']}"
+        for entry in found
+    ]
+    if unknown:
+        lines.append(f"找不到（已随聊天滚出窗口，或从未存在）: {', '.join(unknown)}")
+    return "\n\n".join(lines) if lines else "没有取回任何内容"
+
+
 def _format_results(results: Mapping) -> str:
     action_labels = {
         "loaded": "已加载",
@@ -170,4 +238,4 @@ def _format_results(results: Mapping) -> str:
     ])
 
 
-__all__ = ["exec_code", "list_tools", "reload_tools", "load_tools"]
+__all__ = ["exec_code", "list_tools", "reload_tools", "load_tools", "condense_ops", "recall_ops"]

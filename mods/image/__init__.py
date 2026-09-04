@@ -35,10 +35,19 @@ LOAD_AFTER = ("storage",)
 _stream = log.stream("image")
 
 TEMP_PATH = "data/tmp_files"
+# WHY: 15 天是防止数据无限膨胀的纯估计值，没有实测依据。三处（图片缓存闲置、别名、
+# 描述缓存）碰巧同值，但保持各自独立是有意的——它们过期的代价不同，应当能分别调整。
+# 不要合并成一个常量。
 IMAGE_CACHE_MAX_IDLE_DAYS = 15
 IMAGE_ALIAS_MAX_AGE_DAYS = 15
 IMAGE_CACHE_PRUNE_INTERVAL_SECONDS = 24 * 60 * 60
 DESCRIPTION_CACHE_MAX_AGE_DAYS = 15
+# WHY: 这个版本号是自动图片描述缓存唯一的失效开关，而决定描述内容的东西在别的文件里：
+# llm/__init__.py 的 DEFAULT_IMAGE_DESCRIPTION_PROMPT（自动路径固定用它，不传自定义
+# prompt）、vision.py 的 AUTO_IMAGE_SPLIT_PROMPT，以及 vision.py 的切割参数（它们决定
+# 模型实际看到什么）。改动其中任何一个都必须同时改这里的字符串，否则新旧两代描述会共存于
+# 同一份缓存里——get_cached_description 只删版本号不匹配的条目，版本号没动就一条都不删，
+# 不报错、不提示，只是模型读到的图片描述一半是旧的。
 AUTO_IMAGE_DESCRIPTION_VERSION = "auto-v1"
 MAX_LOCAL_IMAGE_BYTES = 20 * 1024 * 1024
 

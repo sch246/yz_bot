@@ -12,11 +12,15 @@ from mods import log
 _stream = log.stream("image")
 
 
+# WHY: 长图被切片时这段会追加到描述 prompt 末尾，结果同样进自动描述缓存。改这段文字或
+# 下面三个切割参数，都要同时提升 image.AUTO_IMAGE_DESCRIPTION_VERSION。
 AUTO_IMAGE_SPLIT_PROMPT = (
     "【自动图片切割】同一张原始长截图已按从上到下的顺序切割为连续片段，"
     "相邻片段存在重叠。请将这些片段作为一张完整图片理解，利用重叠衔接上下文，"
     "描述或转录时不要重复重叠内容。"
 )
+# WHY: 三个比例都是试出来的经验值，没有推导，目前跑着没问题。改动它们会改变模型实际
+# 看到的内容，所以要连带提升 image.AUTO_IMAGE_DESCRIPTION_VERSION（见上）。
 LONG_IMAGE_RATIO = 4
 IMAGE_SLICE_HEIGHT_RATIO = 3
 IMAGE_SLICE_OVERLAP_DIVISOR = 4
