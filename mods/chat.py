@@ -216,19 +216,29 @@ def _message_cost(converted: dict) -> int:
     return sum(count_tokens(part.get("text", "")) for part in content if isinstance(part, dict) and part.get("type") == "text")
 
 
-def get_msgs(token_limit: int | None = None, return_token: bool = False):
-    token_limit = max_token if token_limit is None else token_limit
-    current = context.current() or {}
-    in_group = current.get("group_id") is not None
-    selected = _selected_events(current, in_group)
-    output = []
+def _within_budget(events: list[dict], in_group: bool, token_limit: int) -> tuple[list[tuple[float, dict]], int]:
+    """The chat messages that fit, oldest first, each with its timestamp.
+
+    WHY: 截断只有这一处实现。get_msgs 和 build_context 都从这里取，操作记录再依附到它的
+    结果上——三处各写一遍"留多少"，改一处就会静默地分叉。
+    """
+    picked: list[tuple[float, dict]] = []
     used = 0
-    for event in selected:
+    for event in events:
         converted = event2chat(event, in_group)
         used += _message_cost(converted)
         if used > token_limit:
             break
-        output.insert(0, converted)
+        picked.insert(0, (float(event.get("time") or 0.0), converted))
+    return picked, used
+
+
+def get_msgs(token_limit: int | None = None, return_token: bool = False):
+    current = context.current() or {}
+    in_group = current.get("group_id") is not None
+    picked, used = _within_budget(_selected_events(current, in_group), in_group,
+                                  max_token if token_limit is None else token_limit)
+    output = [converted for _at, converted in picked]
     return (output, used) if return_token else output
 
 
@@ -296,67 +306,49 @@ def _base_prompt() -> list[dict]:
 - 如无特殊要求，请用中文回复"""}]
 
 
-def _round_cost(batch: list[dict]) -> int:
-    """Token cost of one rebuilt round, tool_calls arguments included."""
-    total = 0
-    for message in batch:
-        for call in message.get("tool_calls") or ():
-            function = call["function"]
-            total += count_tokens(function["name"]) + count_tokens(function["arguments"])
-        if isinstance(message.get("content"), str):
-            total += count_tokens(message["content"])
-    return total
-
-
 def build_context(token_limit: int | None = None) -> list:
-    """Assemble chat history and rebuilt tool rounds under one shared budget.
+    """Chat history, with the rebuilt tool rounds that belong inside it.
 
-    WHY: 一份预算，不是两份。聊天消息和重建出的工具调用记录进的是同一个上下文，各算各的
-    等于没算——两边都在限额内，加起来照样超。所以归并发生在预算**之内**：按时间从新到旧
-    走一条合并后的时间轴，谁先够到边界谁被丢。
+    WHY: 只有**一套**截断规则，就是聊天消息那套（max_msg + max_token）。操作记录不再自己
+    算预算、也没有自己的保留期，它依附于聊天窗口：留下来的最老那条消息之后发生的工具轮才
+    进上下文。两套规则曾经并存过，拆了——它们描述的是同一件事"多早以前的事情还算数"，
+    答案有两个就意味着两处调参、两处解释，而且总有一处会先漂。
+
+    WHY: 代价是工具轮不占预算，调用密集时上下文会超出 max_token。这是知情的选择：压住它
+    的是 condense_ops，由模型在得出结论时自己收缩，而不是由这里按大小乱砍——按大小砍会在
+    结论产出之前砍掉前提。真要封顶的话，是在这里给工具轮也记一份成本，别去给它加保留期。
 
     WHY: 归并单位是一轮。assistant(tool_calls) 和它的 tool 结果之间插进一条聊天消息就拆散
-    了这一对，请求会被拒；预算也按整轮扣，半轮进上下文同样是非法的。
+    了这一对，请求会被拒，所以每轮带一个时间、整体落位。
 
     WHY: 同一时刻聊天排在工具轮前面。工具调用是被某条消息触发的，触发它的那句话在它之前；
     秒级时间戳里两者常常相等，靠这个平手规则维持因果。
 
-    WHY: 早于最老那条聊天消息的工具轮不进上下文。没有对应聊天做锚点的操作，模型无从判断
-    它当时在回应什么，孤零零摆在最前面只会误导。丢掉不等于丢失——它们仍在轨道里，最长
-    保留 7 天，知道 cid 就能用 recall_ops 取回。
-
     WHY: 顺序不保证与当时完全一致：一轮里几个并发调用完成时间不同，工具执行期间到达的
     消息其真实先后也无法从一个时间点还原。这是明知的近似。
+
+    WHY: 没载入的部分不列清单。曾经这里插过一行"更早还有 N 次工具调用未载入（op1–op12）"，
+    拆掉了：真正需要重新打开的是被自己收缩掉的那些，它们的 cid 就写在 condense_ops 调用的
+    arguments 里、跟着重建回到上下文中——入口已经在了，不用再指一次。
     """
     token_limit = max_token if token_limit is None else token_limit
     current = context.current() or {}
     in_group = current.get("group_id") is not None
     window = history.window(current)
-    # 每项：(时间, 平手序, token 成本, 这一项整体落位的消息)
-    items: list[tuple[float, int, int, list]] = []
-    for event in _selected_events(current, in_group):
-        converted = event2chat(event, in_group)
-        items.append((float(event.get("time") or 0.0), 0, _message_cost(converted), [converted]))
-    for at, batch in oplog.build_rounds(window):
-        items.append((at, 1, _round_cost(batch), batch))
+    events = _selected_events(current, in_group)
+    picked, _used = _within_budget(events, in_group, token_limit)
+    if not picked:
+        # 没有聊天做锚点时不载入任何操作记录：孤零零摆着，模型无从判断它当时在回应什么。
+        return []
+    # WHY: 回收也依附于聊天。events 已经按 max_msg 截过，比它最老那条还早的操作再也不可能
+    # 被载入，这里顺手让 oplog 忘掉——门槛用 max_msg 窗口而不是本轮预算，因为预算每轮可松
+    # 可紧（`.chat` 就传别的值），拿它当删除门槛会删掉下一轮还够得着的记录。
+    oplog.forget_before(window, float(events[-1].get("time") or 0.0))
+    items: list[tuple[float, int, list]] = [(at, 0, [converted]) for at, converted in picked]
+    floor = picked[0][0]
+    items.extend((at, 1, batch) for at, batch in oplog.build_rounds(window) if at >= floor)
     items.sort(key=lambda item: (item[0], item[1]))
-
-    kept: list[tuple[float, int, int, list]] = []
-    used = 0
-    for item in reversed(items):
-        used += item[2]
-        if used > token_limit:
-            break
-        kept.append(item)
-    kept.reverse()
-
-    anchor = next((index for index, item in enumerate(kept) if item[1] == 0), None)
-    kept = kept[anchor:] if anchor is not None else []
-    # WHY: 没载入的部分不列清单。曾经这里插过一行"更早还有 N 次工具调用未载入（op1–op12）"，
-    # 拆掉了：保留期是 7 天，那个 N 会大到这行本身变成噪音，而且绝大多数没载入的调用模型
-    # 本来也不需要回头看。真正需要重新打开的是被自己收缩掉的那些，它们的 cid 就写在
-    # condense_ops 调用的 arguments 里、跟着重建回到上下文中——入口已经在了，不用再指一次。
-    return [message for item in kept for message in item[3]]
+    return [message for item in items for message in item[2]]
 
 
 def init_chat(session: llm.Chat, messages: list | None = None) -> None:

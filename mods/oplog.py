@@ -18,11 +18,16 @@ WHY: 重建成**真的**工具调用记录（assistant(tool_calls) + tool），�
 和"条目删除"之间维护两份等价实现。
 
 WHY: 因此写入时**存全量**，不截断。截断过的内容重建出来会冒充原文——那比明写的摘要更糟，
-因为它看起来就是当时真实发生的事。唯一的存储上限是保留期，见 MAX_AGE_SECONDS。
+因为它看起来就是当时真实发生的事。
 
-WHY: 条目只有一种消失方式——过期。收缩不删除，只标记（见 condense），标记过的离开上下文
-但仍可 recall_ops 取回。所以"这一轮上下文里有什么"和"存储里还有什么"是两个不同的集合，
-读这个模块时别把它们当成一回事。
+WHY: 这个模块**没有自己的截断规则**——没有保留期，没有条数上限，没有字数上限。操作记录
+依附于聊天消息的截断：聊天窗口留多久，操作就留多久，滚出窗口的由 chat.build_context 调
+forget_before 清掉（见那里）。曾经这里有过一个独立的 7 天保留期，拆了：两套截断规则要各自
+调参、各自解释，而它们描述的其实是同一件事——"多早以前的事情还算数"。答案只该有一个。
+
+WHY: 条目只有两种消失方式——滚出聊天窗口，或被 clear。收缩不删除，只标记（见 condense），
+标记过的离开上下文但仍可 recall_ops 取回。所以"这一轮上下文里有什么"和"存储里还有什么"
+是两个不同的集合，读这个模块时别把它们当成一回事。
 
 WHY: cid 用跨轮稳定的 uid，不用每轮重排的序号。原因不是"稳定一点更好"，而是序号在这里会
 自我否定：结论住在模型那条 condense_ops 调用的 arguments 里（见 meta.condense_ops），
@@ -45,11 +50,6 @@ from mods import INFRA
 PHASE = INFRA
 LOAD_AFTER = ("storage",)
 
-# WHY: 保留期是**唯一**的存储上限，没有条数上限也没有字数上限。上下文放不放得下由
-# chat.build_context 的共用预算决定，与"存多久"是两件事：进不进上下文靠预算，还能不能
-# 被取回靠这里。所以即使一次调用输出很大、或者某窗口从没收缩过，也照存不误——超出预算的
-# 部分只是不自动载入，模型仍可用 recall_ops 显式取回原文。
-MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 # 人看的那份（#ops）才截断，模型那份不截断。
 DISPLAY_CHARS = 200
 
@@ -80,17 +80,27 @@ def _state(window: tuple[str, Any] | None) -> dict | None:
     return state
 
 
-def _prune(state: dict) -> None:
-    """Forget whole rounds older than the retention window.
+def forget_before(window: tuple[str, Any] | None, at: float) -> int:
+    """Drop rounds that started before ``at``; return how many entries went.
+
+    WHY: 这是唯一的存储回收口，而且门槛由调用方给——chat 那边传的是聊天窗口能回溯到的
+    最早时刻。比那更早的操作再也不可能被载入，留着只是磁盘上的死重量。回收规则不写在这
+    个模块里，是因为"多早以前的事情还算数"是聊天截断的问题，不是操作记录自己的问题。
 
     WHY: 按**整轮**丢，不按条。丢掉一轮里的一部分，重建出来就是一条 assistant 的
-    tool_calls 少了对应的 tool 消息，供应商直接拒——过期清理不该把上下文变成非法的。
+    tool_calls 少了对应的 tool 消息，供应商直接拒——回收不该把上下文变成非法的。
     """
-    cutoff = time.time() - MAX_AGE_SECONDS
-    listed = state["entries"]
-    expired = {entry["round"] for entry in listed if float(entry.get("at") or 0.0) < cutoff}
-    if expired:
-        state["entries"] = [entry for entry in listed if entry["round"] not in expired]
+    with _lock:
+        state = _state(window)
+        if state is None:
+            return 0
+        listed = state["entries"]
+        stale = {entry["round"] for entry in listed if float(entry.get("at") or 0.0) < at}
+        if not stale:
+            return 0
+        kept = [entry for entry in listed if entry["round"] not in stale]
+        state["entries"] = kept
+        return len(listed) - len(kept)
 
 
 def record(
@@ -124,38 +134,31 @@ def record(
             "content": "" if content is None else str(content),
             "tool_call_id": str(tool_call_id),
         })
-        _prune(state)
         return cid
 
 
 def entries(window: tuple[str, Any] | None, include_condensed: bool = False) -> list[dict]:
-    """Live entries only. Expired rounds are invisible everywhere, including #ops.
+    """Everything still on record for this window.
 
-    WHY: 收缩过的条目默认不出现，但它们**还在**。收缩只让一次调用离开上下文，不参与重建、
-    不再占预算；能不能取回是保留期说了算。分开之后收缩才是安全的动作——模型收缩时不是在
-    销毁证据，结论被推翻或需要核对当初到底看到了什么时，recall_ops 仍然能把原文捞回来。
+    WHY: 收缩过的条目默认不出现，但它们**还在**。收缩只让一次调用离开上下文，不参与重建；
+    能不能取回是"有没有滚出聊天窗口"说了算。分开之后收缩才是安全的动作——模型收缩时不是
+    在销毁证据，结论被推翻或需要核对当初到底看到了什么时，recall_ops 仍然能把原文捞回来。
     """
-    cutoff = time.time() - MAX_AGE_SECONDS
     with _lock:
         state = _state(window)
         if not state:
             return []
-        expired = {
-            entry["round"] for entry in state["entries"]
-            if float(entry.get("at") or 0.0) < cutoff
-        }
         return [
             entry for entry in state["entries"]
-            if entry["round"] not in expired
-            and (include_condensed or not entry.get("condensed"))
+            if include_condensed or not entry.get("condensed")
         ]
 
 
 def recall(window: tuple[str, Any] | None, cids: Iterable[str]) -> tuple[list[dict], list[str]]:
     """Look up stored calls by cid, whatever the context budget left out.
 
-    WHY: 保留期比上下文预算宽，所以"存着但这一轮没载入"是常态而不是异常。没有这个入口，
-    7 天的留存就等于存了拿不到；有了它，预算收紧才是安全的——够不着的东西仍然能点名取回。
+    WHY: 载入范围比存下来的窄（收缩过的、以及超出 token 预算的都不载入），所以"存着但这
+    一轮没载入"是常态而不是异常。没有这个入口，那些记录就等于存了拿不到。
 
     WHY: 收缩过的也能取回，而且这才是主要用途。上下文里不会有一行清单去介绍那些没载入的
     调用（7 天的量列出来本身就是浪费），模型唯一能看见的 cid 来源是它自己那条

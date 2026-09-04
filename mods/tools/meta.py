@@ -87,11 +87,11 @@ Markdown 不需要 front matter、额外 summary 字段或同步机制，也不�
 
 结论写在 `conclusion` 参数里就够了，工具不会把它再返回一遍：这次调用本身留在上下文里，参数里的结论就是它的记录。
 
-收缩是**可逆**的：被收缩的调用只是离开上下文，原文按保留期继续留着。你那次 `condense_ops` 调用会跟着重建回到后面每一轮的上下文里，`cids` 参数里写的就是被收掉的那几个 cid——什么时候觉得当初的结论不够用、或者要核对当初到底看到了什么，用 `recall_ops(["op3"])` 按 cid 把完整原文取回来。所以收缩不必犹豫，它不销毁任何东西。
+收缩是**可逆**的：被收缩的调用只是离开上下文，原文继续留着。你那次 `condense_ops` 调用会跟着重建回到后面每一轮的上下文里，`cids` 参数里写的就是被收掉的那几个 cid——什么时候觉得当初的结论不够用、或者要核对当初到底看到了什么，用 `recall_ops(["op3"])` 按 cid 把完整原文取回来。所以收缩不必犹豫，它不销毁任何东西。
 
 三条规则：同一条 assistant 消息里并发的多个调用必须一起点名收缩，只点其中一个会被拒绝；正在执行、结果还没回来的那一轮不能收缩；后来的收缩可以把更早那次 `condense_ops` 也收掉，那次的结论随之从上下文消失——需要保留就在新结论里带上。
 
-上下文能装下多少由聊天历史和工具记录**共用的 token 预算**决定，装不下的、以及早于最老那条聊天消息的，都不会自动载入。这些不会有清单列给你——记录最长保留 7 天，量太大，列出来本身就是浪费。
+操作记录跟着聊天窗口走：留在上下文里的最老那条聊天消息之后发生的调用才会载入，更早的随聊天一起滚出去、也就取不回来了。没载入的不会有清单列给你，量太大，列出来本身就是浪费。
 
 ## 原子性与请求边界
 
@@ -174,7 +174,7 @@ def condense_ops(cids: list[str], conclusion: str) -> str:
         return "没有指定要收缩的调用"
     tool_call_ids, unknown = oplog.call_ids(window, cids)
     if unknown:
-        return f"没有可收缩的（已经收缩过、或已过保留期）: {', '.join(unknown)}"
+        return f"没有可收缩的（已经收缩过，或已随聊天滚出窗口）: {', '.join(unknown)}"
     removed = current_binding().session.condense_calls(tool_call_ids)
     dropped = oplog.condense(window, cids)
     # 这里刻意不回显 conclusion：它已经在这次调用的 arguments 里，回显就是第二个副本。
@@ -182,7 +182,7 @@ def condense_ops(cids: list[str], conclusion: str) -> str:
 
 
 def recall_ops(cids: list[str]) -> str:
-    """按 cid 取回工具调用的完整原文，包括已经被 condense_ops 收缩掉的、以及因为上下文预算或时间太早而没有载入的那些。需要核对某次收缩当初到底看到了什么时用它，cid 就写在那次 condense_ops 调用的 cids 参数里。
+    """按 cid 取回工具调用的完整原文，包括已经被 condense_ops 收缩掉的、以及因为时间太早而没有载入的那些。需要核对某次收缩当初到底看到了什么时用它，cid 就写在那次 condense_ops 调用的 cids 参数里。
 
     @param
     cids: 要取回的调用 id 列表，形如 ["op3", "op4"]
@@ -201,7 +201,7 @@ def recall_ops(cids: list[str]) -> str:
         for entry in found
     ]
     if unknown:
-        lines.append(f"找不到（已过保留期或从未存在）: {', '.join(unknown)}")
+        lines.append(f"找不到（已随聊天滚出窗口，或从未存在）: {', '.join(unknown)}")
     return "\n\n".join(lines) if lines else "没有取回任何内容"
 
 
