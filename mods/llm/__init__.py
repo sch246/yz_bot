@@ -512,13 +512,30 @@ class LLMClient:
             reasoning_content=reasoning_content,
         )
 
-    def chat(self, messages: list[dict], tools: list[Tool] | Callable[[], list[Tool]] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None, on_round: Callable[[], list[dict]] | None = None, should_stop: Callable[[], bool] | None = None) -> Generator[LLMResponse, None, None]:
+    def chat(self, messages: list[dict], tools: list[Tool] | Callable[[], list[Tool]] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None, on_round: Callable[[], list[dict]] | None = None, should_stop: Callable[[], bool] | None = None, hints: Callable[[], list[dict]] | None = None) -> Generator[LLMResponse, None, None]:
         # Every message appended below is printed live as it happens, so each
         # further round only logs what it has not shown yet -- usually nothing.
         logged = 0
         # WHY: 工具循环有意没有最大轮数、总时限、确认步骤或副作用回滚，恢复手段是
         # .reboot。取舍与它暴露在同一条提示注入路径上的能力都记在 docs/llm.md 的
         # 「当前信任边界与维护取舍」一节——加限制前先读那里，这不是漏了。
+        #
+        # WHY?: 操作历史是一条缺失的平行轨道，方向已定、尚未实现。
+        # 现状：本轮的 assistant(tool_calls) 与 tool result 只活在这个 messages 列表里，
+        # 不写 chatlog，chat.get_msgs 也不重建它们。所以**下一轮开始时模型完全不知道自己
+        # 上一轮干了什么**——改过哪个文件、发过什么请求、加载过哪个模块，一概不知，只能靠
+        # 它自己把结论说进聊天正文才留得下来。这不是省 token 的取舍，是能力缺口。
+        # 方向：单独一条平行轨道记操作历史，不混进 chatlog 的聊天消息。
+        # 但直接全量保留是不行的：工具调用通常是为某个目的服务的，结论一旦得出，中间过程
+        # 就该压缩掉。主流 agent 普遍用子代理绕开这件事，而不是正面解决。
+        # 因此要配一个**结论收缩工具**：对那些输出只起局部作用的调用，把前面几条工具调用
+        # 从上下文里隐去，只留一条结论。
+        # 这推出两个前提，缺一不可：
+        #   1. 工具需要有操作上下文的能力（现在工具只能读 cache.thismsg，不能改上下文）；
+        #   2. 模型必须能看到自己每条消息和每次工具调用的上下文 id(cid)，否则它无法指名
+        #      要收缩哪几条。
+        # 实现时按这套来，别另起一套；也别退化成"到 N 轮就自动截断"，那会在结论产出之前
+        # 把前提砍掉。
         #
         # WHY: on_round 是"追加式上下文"的唯一入口，在每次子请求**之前**调用。放这里
         # 而不是让调用方直接改 messages，是因为工具执行发生在 assistant(tool_calls) 与
@@ -530,8 +547,8 @@ class LLMClient:
             if should_stop is not None and should_stop():
                 return
             if on_round is not None:
-                # WHY?: 追加进去的是 role="user"，于是线上会出现 tool 消息紧跟 user 消息、
-                # 中间没有 assistant 的序列。按 OpenAI 的工具协议这是合法的——硬性要求只是
+                # WHY?: 追加进去的是 role="user"（末尾 hint 同样用 user），于是线上会
+                # 出现 tool 消息紧跟 user 消息、中间没有 assistant 的序列。按 OpenAI 的工具协议这是合法的——硬性要求只是
                 # assistant.tool_calls 的每个 id 都要有对应的 tool 消息，而它们在这之前就
                 # 已经补齐——但这是本仓库里唯一会产生这种形状的地方，而且**没有对真实供应商
                 # 验证过**：已有的验证都用假 client 跑，只证明了顺序逻辑，没证明 deepseek /
@@ -546,7 +563,13 @@ class LLMClient:
             # mapping; the new snapshot is observed by the next iteration.
             tools_snapshot = tools() if callable(tools) else list(tools or [])
             console.notice(f"等待 {model or self.config['default_model']} 的响应…")
-            response = iter(self.generate_response(messages, tools_snapshot, tool_choice, model, stream, description_cache, do_process_image, logged))
+            # WHY: hint 只挂在**发出去的那一份**上，永远不写回 messages。这是它与
+            # on_round 的唯一区别，也是它存在的理由：on_round 追加的东西进历史、可回放、
+            # 会一直留着；hint 是"当前状态"，每次子请求重新生成一次，旧的自然消失，不会
+            # 在上下文里堆出几代互相矛盾的副本。因此 hint 里只放随时可重算的东西，不放
+            # 任何"只此一次、错过就没有"的信息——那种必须走 on_round。
+            outgoing = (messages + hints()) if hints is not None else messages
+            response = iter(self.generate_response(outgoing, tools_snapshot, tool_choice, model, stream, description_cache, do_process_image, logged))
             mapping = {tool.description["function"]["name"]: tool for tool in tools_snapshot}
             pending_calls = []
             # Yielded chunks remain the live display/tool stream.  The return
@@ -581,6 +604,12 @@ class LLMClient:
                     yield chunk
 
             assistant_message = {"role": assistant.role, "content": assistant.content}
+            # WHY?: 轮内是否带回思考内容，应当可切换（尚未实现）。现状是原样带回，
+            # docs/llm.md 记着这满足 DeepSeek thinking mode 的工具调用协议。想省 token
+            # 的话可以把它置成空字符串而不是删掉字段——但**空串是否仍被 DeepSeek 的校验器
+            # 接受，没有验证过**，改之前先实测。
+            # 注意范围：思考本来就不跨轮——chat.get_msgs 从 chatlog 重建，chatlog 里没有
+            # reasoning。所以这里讨论的只是一次工具循环之内要不要一直背着它。
             if assistant.reasoning_content is not None:
                 assistant_message["reasoning_content"] = assistant.reasoning_content
             if pending_calls:
@@ -619,6 +648,12 @@ class Chat:
         self.context_providers: list[Callable[[], list[dict]]] = []
         # 返回 True 表示这一轮应当就地停下（^C 打断）。
         self.should_stop: Callable[[], bool] | None = None
+        # WHY: hint 与 context_providers 是两层，别合并。provider 追加进 messages——进
+        # 历史、留下来；hint 每次子请求重新渲染并挂在末尾，不进 messages。判据是这条：
+        # 频繁变化、且随时可以重算的状态放 hint；"发生过一次"的事实放 provider。
+        # 它和 system 提示词一样支持用函数生成，只是重置时机不同：system 在建会话时定一次，
+        # hint 每个子请求重来一次。
+        self.hints: list[Callable[[], str] | str] = []
         if messages is not None:
             self.set_messages(messages)
         if functions is not None:
@@ -653,6 +688,25 @@ class Chat:
         self.functions = {}
         for name, function in functions.items() if isinstance(functions, dict) else ((None, value) for value in functions):
             self.add_tool(function, name)
+
+    def add_hint(self, source: Callable[[], str] | str):
+        """Register one always-at-the-end, never-in-history block."""
+        self.hints.append(source)
+        return source
+
+    def render_hints(self) -> list[dict]:
+        parts: list[str] = []
+        for source in self.hints:
+            try:
+                value = source() if callable(source) else source
+            except Exception:
+                # 提醒坏掉不该让整轮聊天失败：它按定义是可有可无的补充。
+                _log.exception("hint source failed")
+                continue
+            if value and str(value).strip():
+                parts.append(str(value).strip())
+        # 合成一条：多个 hint 之间没有先后语义，拆成多条只会占更多消息位。
+        return [{"role": "user", "content": "\n\n".join(parts)}] if parts else []
 
     def add_context_provider(self, provider: Callable[[], list[dict]]):
         """Register one source of messages appended before each sub-request."""
@@ -697,6 +751,7 @@ class Chat:
                 self.do_process_image if do_process_image is None else do_process_image,
                 self._collect_context,
                 self.should_stop,
+                self.render_hints,
             )
             results = []
             for chunk in response:

@@ -8,9 +8,9 @@
 #    _split_description、_render_context、_source_paths 合起来已经是这个形状。
 # 2. 让模型能随时改自己的工具，并主动察觉到工具可更新；更新后立即可用，失败则拿到错误栈。
 #    "更新后立即可用/拿到错误栈"由 reload_tools + registry._failures 覆盖，结果以追加
-#    的方式进上下文，见 _announce。"主动察觉磁盘变了"这一半还没做：目前只有模型自己调
-#    list_tools 才看得到差异，见 list_text 上方的 WHY?:。别把 _announce 当成它——那是
-#    显式 reload/load 的结果，不是变化探测。
+#    的方式进上下文，见 _announce。"主动察觉磁盘变了"由 _drift_hint 覆盖：它是末尾 hint，
+#    每次子请求重算、不进历史。两者别混——_announce 是显式 reload/load 的结果，_drift_hint
+#    是磁盘状态的探测，而且只报告不加载。
 # 3. meta.py 是这套东西的使用说明书，给模型看的。
 #
 # 因此判断这里的代码时，标准不是"它已经在这儿而且能跑"，而是 docs/design-principles.md
@@ -483,6 +483,9 @@ class SessionBinding:
         register = getattr(session, "add_context_provider", None)
         if callable(register):
             register(self._take_announcements)
+        add_hint = getattr(session, "add_hint", None)
+        if callable(add_hint):
+            add_hint(self._drift_hint)
 
     def load(self, names: str | Iterable[str]) -> dict[str, dict]:
         """Activate only in-memory last-good modules in this session."""
@@ -534,13 +537,48 @@ class SessionBinding:
             self._announce(before)
         return results
 
-    # WHY?: 缺"被动提醒"这一层——维护者期望里"模型能主动察觉工具可更新"的那一半。
-    # 现状：registry.scan() 的磁盘差异只有模型**自己调 list_tools** 才看得到，改了文件
-    # 不说就没人知道。方向是更轻的一层 hint：频繁变化、不需要进历史的内容始终追加在上下文
-    # 末尾但不写入历史，像 system 提示词一样支持用函数生成，只是重置时机不同。
-    # 注意这与 _announce 的追加式上下文是两件事，别合并：那条是显式 reload/load 的结果、
-    # 要进历史、承载模块正文；hint 只是"磁盘变了，去看看"，不承载重内容，也不代替 reload
-    # ——发现变化之后仍然要模型显式 reload，理由见 _announce 的 WHY。
+    def _drift_hint(self) -> str:
+        """Report disk sources that differ from last-good, as an end-of-context hint.
+
+        WHY: 这是"被动提醒"那一层，对应维护者期望里"模型能主动察觉工具可更新"的一半。
+        以前 registry.scan() 的差异只有模型**自己调 list_tools** 才看得到，改了文件不说
+        就没人知道。
+
+        WHY: 它是 hint 不是 provider——每次子请求重算，不进历史。磁盘差异正是那种"随时
+        可以重算、而且只有当前值有意义"的状态：文件改回去，提醒就该消失，而不是在上下文
+        里留着一条"曾经改过"。
+
+        WHY: 它只报告，不加载。发现变化与决定应用是两步，理由见 _announce 的 WHY——磁盘
+        上的模块随时可能正被写到一半。所以这里也不承载模块正文，只给名字。
+
+        WHY: 每次都真读磁盘，没有节流。一次 scan 是十来个小文件的 read_bytes，相对一次
+        模型往返可以忽略；加缓存反而会让"刚改完就问"读到旧值，那正是这条提醒要解决的场景。
+        """
+        try:
+            changes = self.registry.scan()
+        except Exception:
+            _log.exception("failed to scan tool sources for the drift hint")
+            return ""
+        labels = (("added", "新增"), ("modified", "修改"), ("deleted", "删除"))
+        parts = [
+            f"{label} {', '.join(changes[kind])}"
+            for kind, label in labels
+            if changes.get(kind)
+        ]
+        if not parts:
+            return ""
+        return _framed(
+            "工具模块的磁盘源与已加载版本不一致，尚未应用：\n"
+            + "\n".join(f"- {part}" for part in parts)
+            + "\n需要时用 reload_tools 显式应用；不应用则当前生效的仍是上面目录里的版本。"
+        )
+
+    # WHY?: UI 模式（可切换，尚未实现）。默认是现在这样：工具变动走 _announce 追加，
+    # 进历史、可回放。切换后改成"把整个工具状态作为一整块 hint 放在上下文末尾"——
+    # 好处是注意力：工具只剩一个权威副本，而且它明确位于所有修改之后。就地改写做不到
+    # 这一点，追加式也做不到（上下文里会同时留着旧正文和新正文，模型可能以为修改之前
+    # 的工具就长那样）。代价是那一整块每次子请求都是未命中缓存的新 token，工具循环越长
+    # 付得越多，所以要可切换而不是直接替换掉现在的模式。
     def list_text(self) -> str:
         """Describe last-good, active, failed, and changed modules."""
         modules = self.registry.modules
