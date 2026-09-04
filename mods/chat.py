@@ -216,7 +216,7 @@ def _message_cost(converted: dict) -> int:
     return sum(count_tokens(part.get("text", "")) for part in content if isinstance(part, dict) and part.get("type") == "text")
 
 
-def get_msgs(token_limit: int | None = None, return_token: bool = False):
+def get_msgs(token_limit: int | None = None, return_token: bool = False, with_times: bool = False):
     token_limit = max_token if token_limit is None else token_limit
     current = context.current() or {}
     in_group = current.get("group_id") is not None
@@ -246,6 +246,7 @@ def get_msgs(token_limit: int | None = None, return_token: bool = False):
             selected.append(event)
 
     output = []
+    times: list[float] = []
     used = 0
     for event in selected:
         converted = event2chat(event, in_group)
@@ -253,6 +254,10 @@ def get_msgs(token_limit: int | None = None, return_token: bool = False):
         if used > token_limit:
             break
         output.insert(0, converted)
+        # 事件自带的 OneBot 时间戳，供 init_chat 把工具调用记录按时间插回来。
+        times.insert(0, float(event.get("time") or 0.0))
+    if with_times:
+        return (output, times, used) if return_token else (output, times)
     return (output, used) if return_token else output
 
 
@@ -291,26 +296,48 @@ def _base_prompt() -> list[dict]:
 - 如无特殊要求，请用中文回复"""}]
 
 
-def init_chat(session: llm.Chat, messages: list | None = None) -> None:
+def _merge_operations(window, messages: list, times: list | None) -> list:
+    """Interleave rebuilt tool rounds with chat messages by time.
+
+    WHY: 工具调用当时就是与聊天消息交错发生的。整块堆在聊天之前，模型看到的因果顺序
+    是错的——它会以为自己是先做完所有事、然后才有人说话。
+
+    WHY: 同一时刻聊天排在工具轮前面。工具调用是被某条消息触发的，触发它的那句话在它
+    之前；秒级时间戳里两者常常相等，靠这个平手规则维持因果。
+
+    WHY: 没有时间的调用方（`.chat` 单句请求）退回旧行为：工具记录整块在前。那条路径
+    只有一条合成消息，没有可归并的时间轴。
+
+    WHY: 已知不对称——get_msgs 会因 token 预算丢掉更早的聊天消息，而工具轮不受那个预算
+    约束，所以可能出现"比现存最老的聊天还早"的工具轮排在最前面。工具轨道有自己的
+    MAX_TOTAL_CHARS 兜底，不至于无限；真要对齐得让两边共用一个预算，那是另一件事。
+    """
+    rounds = oplog.build_rounds(window)
+    if not rounds:
+        return list(messages)
+    if times is None or len(times) != len(messages):
+        return [message for _at, batch in rounds for message in batch] + list(messages)
+    items = [(at, 1, batch) for at, batch in rounds]
+    items.extend((at, 0, [message]) for at, message in zip(times, messages))
+    items.sort(key=lambda item: (item[0], item[1]))
+    return [message for _at, _kind, batch in items for message in batch]
+
+
+def init_chat(session: llm.Chat, messages: list | None = None, times: list | None = None) -> None:
     inc_call_count()
     prompts["base"] = _base_prompt()
     group = context.current().get("group_id") if context.current() else None
     state = {"role": "system", "content": f"当前所在群聊:{identity.getgroupname(group)}({group})"} if group is not None else {"role": "system", "content": f"当前在私聊:{identity.getname()}({context.current().get('user_id')})"}
     ui_mode = get_tools_mode() == "ui"
     tool_context = tool_modules.create_context_message(ui_mode=ui_mode)
-    # WHY: 操作历史重建成**真的**工具调用记录，放在 state 之后、聊天消息之前。它记的是
-    # 模型自己过去干了什么，不是对话的一部分。
-    # 已知取舍：这些记录整块排在聊天历史之前，而实际上它们当时是与聊天消息交错发生的。
-    # 按时间交错更忠实，但要把 chatlog 重建出的消息和轨道按时间归并；现在没有做，因为
-    # 相对"模型完全不知道自己干过什么"，先把内容拿回来更要紧。要做的话在这里做。
+    # WHY: 操作历史重建成**真的**工具调用记录，并按时间归并进聊天消息，见 _merge_operations。
     window = history.window(context.current() or {})
     session.set_messages([
         *get_prompt(),
         *prompts["base"],
         tool_context,
         state,
-        *oplog.build_messages(window),
-        *(messages or []),
+        *_merge_operations(window, messages or [], times),
     ])
     tool_modules.bind_session(session, tool_context, ui_mode=ui_mode)
     session.do_process_image = get_image_mode() != "off"
@@ -369,7 +396,7 @@ def chat(model: str | None = None) -> None:
 
 def _run_chat(model: str | None, turn, in_group: bool) -> None:
     session = llm.Chat(model=model or get_model(), chat_client=llm.get_client())
-    init_chat(session, get_msgs())
+    init_chat(session, *get_msgs(with_times=True))
     if turn is not None:
         # WHY: 先建上下文再清队列，顺序不能反。get_msgs 已经从 history 读到了此刻为止
         # 的全部消息，队列里同一批就是重复；反过来先清再读，则清掉之后、读到之前到达的

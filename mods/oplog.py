@@ -31,6 +31,7 @@ cid 只需窗口内唯一——收缩和重建都在单个窗口里，不存在�
 from __future__ import annotations
 
 from collections.abc import Iterable
+import time
 from threading import RLock
 from typing import Any
 
@@ -119,6 +120,8 @@ def record(
             "cid": cid,
             # 同一条 assistant 消息里并发的调用共用一个 round，重建时据此还原分组。
             "round": str(round_id or tool_call_id),
+            # 重建时用来和聊天消息按时间归并，见 build_rounds。
+            "at": time.time(),
             "name": str(name),
             "arguments": _cap(arguments),
             "content": _cap(content),
@@ -187,6 +190,54 @@ def clear(window: tuple[str, Any] | None) -> None:
             state["entries"] = []
 
 
+def build_rounds(window: tuple[str, Any] | None) -> list[tuple[float, list[dict]]]:
+    """Rebuild the track as timestamped, atomic tool-call rounds.
+
+    WHY: 归并的单位是**一轮**，不是一条消息。assistant(tool_calls) 和它的 tool 结果之间
+    插进一条聊天消息就拆散了这一对，请求会被拒。所以每一轮带一个时间、整体落位。
+
+    WHY: 时间取这一轮里第一条的完成时刻。一轮里几个并发调用各自完成时间不同，而且工具
+    执行期间到达的聊天消息，其真实先后没法从这一个时间点还原——重建出的顺序因此不保证
+    与当时完全一致。这是明知的近似：拿回"发生过什么、大致在什么时候"，不追求逐条复原。
+    """
+    listed = entries(window)
+    if not listed:
+        return []
+    order: list[str] = []
+    grouped: dict[str, list[dict]] = {}
+    for entry in listed:
+        round_id = entry["round"]
+        if round_id not in grouped:
+            grouped[round_id] = []
+            order.append(round_id)
+        grouped[round_id].append(entry)
+    rounds: list[tuple[float, list[dict]]] = []
+    for round_id in order:
+        batch = grouped[round_id]
+        messages: list[dict] = [{
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": entry["tool_call_id"] or entry["cid"],
+                    "type": "function",
+                    "function": {"name": entry["name"], "arguments": entry["arguments"]},
+                }
+                for entry in batch
+            ],
+        }]
+        messages.extend(
+            {
+                "role": "tool",
+                "tool_call_id": entry["tool_call_id"] or entry["cid"],
+                "content": f"[{entry['cid']}] {entry['content']}",
+            }
+            for entry in batch
+        )
+        rounds.append((float(batch[0].get("at") or 0.0), messages))
+    return rounds
+
+
 def build_messages(window: tuple[str, Any] | None) -> list[dict]:
     """Rebuild the track as the real tool-call records it came from.
 
@@ -198,41 +249,7 @@ def build_messages(window: tuple[str, Any] | None) -> list[dict]:
     请求停在 tool 上"这个形状实跑验证过被接受（deepseek-v4-flash, 2026-09-04）。同一次
     验证还覆盖了这些记录后面紧跟聊天消息（tool -> user）的形状。
     """
-    listed = entries(window)
-    if not listed:
-        return []
-    messages: list[dict] = []
-    order: list[str] = []
-    grouped: dict[str, list[dict]] = {}
-    for entry in listed:
-        round_id = entry["round"]
-        if round_id not in grouped:
-            grouped[round_id] = []
-            order.append(round_id)
-        grouped[round_id].append(entry)
-    for round_id in order:
-        batch = grouped[round_id]
-        messages.append({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {
-                    "id": entry["tool_call_id"] or entry["cid"],
-                    "type": "function",
-                    "function": {"name": entry["name"], "arguments": entry["arguments"]},
-                }
-                for entry in batch
-            ],
-        })
-        messages.extend(
-            {
-                "role": "tool",
-                "tool_call_id": entry["tool_call_id"] or entry["cid"],
-                "content": f"[{entry['cid']}] {entry['content']}",
-            }
-            for entry in batch
-        )
-    return messages
+    return [message for _at, messages in build_rounds(window) for message in messages]
 
 
 def render(window: tuple[str, Any] | None) -> str | None:
