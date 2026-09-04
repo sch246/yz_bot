@@ -57,6 +57,11 @@ class ToolRegistry:
         self._initialized = False
         # A binding holds this for the length of one prepare/commit pair.
         self.lock = threading.RLock()
+        # WHY?: 用 id(self) 拼包名，是为了让多个 registry 的候选模块互不串扰。查下来这
+        # 不是 bug（活着的两个 registry 地址必不相同；registry 被回收后 sys.modules 里只
+        # 剩这个包本身，_prepare_import_package 会把 __path__ 重新指向新的 source_dir），
+        # 但生产环境自始至终只有一个 default_registry。是保留这个可多实例的写法，还是换成
+        # 固定包名？
         self._import_package = f"{__name__}._registry_{id(self):x}"
 
     @property
@@ -204,6 +209,11 @@ class ToolRegistry:
             "__builtins__": __builtins__,
         })
 
+        # WHY: 这段存取还原让候选模块的下划线 helper 跟着候选一起重新加载。执行前清空
+        # package.* 下的所有条目，候选里的 `from ._helper import x` 就必须重新读盘；执行后
+        # 再把新产生的条目摘掉、把原有的放回去，进程里不会留下候选的半成品子模块（实测：
+        # 改 _helper.py 后 reload_tools 立刻拿到新值，sys.modules 里只剩包本身）。
+        # 删掉它，reload_tools 会对已缓存的 helper 视而不见——源码改了却不生效，而且不报错。
         prefix = package + "."
         previous_children = {
             module_name: module
@@ -214,6 +224,12 @@ class ToolRegistry:
             sys.modules.pop(module_name, None)
         sys.modules[candidate_name] = candidate
         try:
+            # WHY: 这一行就是信任边界本身——校验候选模块的唯一方式是执行它的顶层代码。
+            # 没有沙箱，也不打算加：docs/llm.md 的"当前信任边界与维护取舍"记录了维护者
+            # 接受这条模型的理由（群白名单是主要运维控制面），meta.py 的模块手册则要求
+            # 顶层只放 import、常量和定义。所以 reload_tools 与 .py、exec_code、宿主机
+            # 操作同属一个信任域，不要在这里加"先静态检查再执行"之类的半吊子防线：它挡不住
+            # 顶层副作用，只会让人误以为这里是安全的。
             exec(compile(source, str(path), "exec"), candidate.__dict__)
         finally:
             for module_name in tuple(sys.modules):
@@ -223,6 +239,9 @@ class ToolRegistry:
 
         description, content = _split_description(candidate.__doc__, path)
         exports = _explicit_exports(candidate, path)
+        # WHY?: meta.py 的 __all__ 必须与 _BASE_TOOL_NAMES 完全一致——顺序、数量都不能差。
+        # 猜测是要保证模型永远拿得到这组元工具（少一个就没法自救），而顺序影响 schema 的
+        # 呈现次序。是有意如此，还是只需要"包含"即可？
         if name == _BASE_MODULE_NAME and tuple(exports) != _BASE_TOOL_NAMES:
             raise ValueError(
                 "meta.py.__all__ must be exactly: " + ", ".join(_BASE_TOOL_NAMES)
@@ -345,6 +364,9 @@ def _validated_tool(function: Callable, schema_name: str) -> Tool:
     if not inspect.getdoc(function):
         raise ValueError(f"tool {schema_name} requires a docstring")
 
+    # WHY?: 下面这段把 Tool 刚从同一个 signature 生成的 schema 又逐项校验了一遍。它防的
+    # 不是工具模块作者写错（上面的检查已经覆盖），而是 Tool._load 自身的回归。看起来像
+    # 过度工程，但如果 schema 不完整会被模型静默误用，留着也说得通。要删吗？
     tool = Tool(function, schema_name)
     schema = tool.description
     function_schema = schema.get("function")

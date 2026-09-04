@@ -29,6 +29,10 @@ from .types import LLMResponse, ModelCapabilities, ToolCallResult
 LOAD_AFTER = ("image", "storage")
 _log = logging.getLogger(__name__)
 
+# WHY: 自动图片描述路径固定使用这段 prompt（_get_image_description 调 describe_image 时
+# 不传 prompt），结果按内容摘要长期缓存。改这里必须同时提升
+# image.AUTO_IMAGE_DESCRIPTION_VERSION，理由见那边的注释。
+# tools/image.py 的 recognize_image 走的是带自定义 prompt 的分支，不读写这份缓存。
 DEFAULT_IMAGE_DESCRIPTION_PROMPT = """请详细描述图片内容，作为无视觉能力模型的上下文替代：
 
 - 主体与文字：指出图片类型，并完整准确地转录图中所有清晰可见的文字。
