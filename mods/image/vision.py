@@ -19,8 +19,8 @@ AUTO_IMAGE_SPLIT_PROMPT = (
     "相邻片段存在重叠。请将这些片段作为一张完整图片理解，利用重叠衔接上下文，"
     "描述或转录时不要重复重叠内容。"
 )
-# WHY?: 长图判定与切割的三个比例，猜测是试出来的经验值。分别是什么在决定它们——
-# 视觉模型的输入尺寸上限、单次请求的 token 预算，还是纯粹目测效果？
+# WHY: 三个比例都是试出来的经验值，没有推导，目前跑着没问题。改动它们会改变模型实际
+# 看到的内容，所以要连带提升 image.AUTO_IMAGE_DESCRIPTION_VERSION（见上）。
 LONG_IMAGE_RATIO = 4
 IMAGE_SLICE_HEIGHT_RATIO = 3
 IMAGE_SLICE_OVERLAP_DIVISOR = 4

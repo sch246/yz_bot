@@ -1,5 +1,20 @@
 """Registry and per-Chat binding for Python and Markdown tool modules."""
 
+# WHY: 这一整套是从更早的 tool 系统迁移过来的，迁移由 GPT 执行，所以文件里有若干形状
+# 并未经过维护者裁决（见下面几处指向本注释的标记）。维护者对这套东西的期望是：
+#
+# 1. tool 与 skill 本质二合一：Python 的模块 docstring 就相当于 Markdown 全文，首行始终
+#    显示用于索引，激活后展开全部。当前 _split_description 与 _render_context 已经是
+#    这个形状；尚未做到的是"允许进一步索引子文件夹内的内容"——_source_paths 只 iterdir
+#    顶层。
+# 2. 让模型能随时改自己的工具，并主动察觉到工具可更新；更新后立即可用，失败则拿到错误栈。
+#    reload_tools + registry._failures 已经覆盖"立即可用/拿到错误栈"，
+#    "主动察觉"目前只能靠模型自己调 list_tools。
+# 3. meta.py 是这套东西的使用说明书，给模型看的。
+#
+# 因此判断这里的代码时，标准不是"它已经在这儿而且能跑"，而是 docs/design-principles.md
+# 对任何抽象的那个提问：它被观察到解决了哪个问题。整体重写是被允许的。
+
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
@@ -57,11 +72,11 @@ class ToolRegistry:
         self._initialized = False
         # A binding holds this for the length of one prepare/commit pair.
         self.lock = threading.RLock()
-        # WHY?: 用 id(self) 拼包名，是为了让多个 registry 的候选模块互不串扰。查下来这
-        # 不是 bug（活着的两个 registry 地址必不相同；registry 被回收后 sys.modules 里只
-        # 剩这个包本身，_prepare_import_package 会把 __path__ 重新指向新的 source_dir），
-        # 但生产环境自始至终只有一个 default_registry。是保留这个可多实例的写法，还是换成
-        # 固定包名？
+        # WHY: 用 id(self) 拼包名是为了让多个 registry 的候选互不串扰。查下来不是 bug
+        # （活着的两个 registry 地址必不相同；registry 被回收后 sys.modules 里只剩这个包
+        # 本身，_prepare_import_package 会把 __path__ 重新指向新的 source_dir），但生产
+        # 自始至终只有一个 default_registry——这是迁移带来的形状，不是为解决观察到的问题
+        # 而写的。见模块顶部注释；重写时不必保留。
         self._import_package = f"{__name__}._registry_{id(self):x}"
 
     @property
@@ -239,9 +254,9 @@ class ToolRegistry:
 
         description, content = _split_description(candidate.__doc__, path)
         exports = _explicit_exports(candidate, path)
-        # WHY?: meta.py 的 __all__ 必须与 _BASE_TOOL_NAMES 完全一致——顺序、数量都不能差。
-        # 猜测是要保证模型永远拿得到这组元工具（少一个就没法自救），而顺序影响 schema 的
-        # 呈现次序。是有意如此，还是只需要"包含"即可？
+        # WHY: 要求完全一致（含顺序）来自迁移，未经裁决。真正承重的只是"meta 的四个恢复
+        # 入口必须都在"——少一个模型就没法自救，docs/llm.md 记的也是这条。顺序相等属于
+        # 附带收紧。见模块顶部注释；重写时把它放宽成"包含"是安全的。
         if name == _BASE_MODULE_NAME and tuple(exports) != _BASE_TOOL_NAMES:
             raise ValueError(
                 "meta.py.__all__ must be exactly: " + ", ".join(_BASE_TOOL_NAMES)
@@ -364,9 +379,9 @@ def _validated_tool(function: Callable, schema_name: str) -> Tool:
     if not inspect.getdoc(function):
         raise ValueError(f"tool {schema_name} requires a docstring")
 
-    # WHY?: 下面这段把 Tool 刚从同一个 signature 生成的 schema 又逐项校验了一遍。它防的
-    # 不是工具模块作者写错（上面的检查已经覆盖），而是 Tool._load 自身的回归。看起来像
-    # 过度工程，但如果 schema 不完整会被模型静默误用，留着也说得通。要删吗？
+    # WHY: 下面这段把 Tool 刚从同一个 signature 生成的 schema 又逐项校验了一遍。它防的
+    # 不是模块作者写错（上面的检查已覆盖），而是 Tool._load 自身回归。这是迁移留下的
+    # 形状，没有对应的真实事故。见模块顶部注释；重写时可以删。
     tool = Tool(function, schema_name)
     schema = tool.description
     function_schema = schema.get("function")
@@ -390,6 +405,14 @@ def _validated_tool(function: Callable, schema_name: str) -> Tool:
     return tool
 
 
+# WHY?: 缺"末尾 hint"这一层，方向已定、尚未实现——实现时按这套来，别另起一套。
+# 现状：整个模块目录塞在一条 system 消息里，由 SessionBinding._render 就地改写。就地改写
+# 意味着每次 reload/load 都会让它后面的全部上下文失去前缀缓存，而模块目录恰恰是最爱变的
+# 那部分；同时模型只有主动调 list_tools 才知道磁盘变了。
+# 目标形状（可参考 deepseek-harness 注入 context 的做法）：按缓存原理分层——频繁变化且
+# 不需要进历史的内容就是 hint，始终追加到上下文末尾但不写入历史，像 system 提示词一样
+# 支持用函数生成，只是重置时机不同。工具变化由 hint 提示，模型不必主动 list，还能省掉
+# 一个工具。这是 llm 侧的一层通用能力，不属于 tools 包，所以要连带改 Chat 的消息组装。
 def _render_context(
     registry: ToolRegistry,
     active: Mapping[str, ToolModule],

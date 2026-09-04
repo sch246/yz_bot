@@ -35,8 +35,9 @@ LOAD_AFTER = ("storage",)
 _stream = log.stream("image")
 
 TEMP_PATH = "data/tmp_files"
-# WHY?: 三个独立的 15 天（图片缓存闲置、别名、描述缓存）——是碰巧取了同一个数，还是
-# 有意保持一致？如果是后者，应该合成一个常量；如果是前者，各自的依据是什么。
+# WHY: 15 天是防止数据无限膨胀的纯估计值，没有实测依据。三处（图片缓存闲置、别名、
+# 描述缓存）碰巧同值，但保持各自独立是有意的——它们过期的代价不同，应当能分别调整。
+# 不要合并成一个常量。
 IMAGE_CACHE_MAX_IDLE_DAYS = 15
 IMAGE_ALIAS_MAX_AGE_DAYS = 15
 IMAGE_CACHE_PRUNE_INTERVAL_SECONDS = 24 * 60 * 60
