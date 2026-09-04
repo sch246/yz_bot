@@ -83,9 +83,11 @@ Markdown 不需要 front matter、额外 summary 字段或同步机制，也不�
 
 每次工具调用的结果开头都有一个 `[opN]`，那是这次调用的上下文 id（cid）。这些调用会记进本窗口的操作历史，**跨轮保留**：下一轮开始时你能看到自己上一轮改过什么、加载过什么，而聊天记录里并没有这些。
 
-历史不该无限增长。一组调用往往是为某个目的服务的，结论一旦得出，中间过程就只剩噪音——查完资料、确认完状态、修完一个文件之后，调用 `condense_ops(["op3", "op4"], "结论")` 把它们收成一条结论。它同时缩短两处：跨轮的操作历史，以及当前上下文里那几轮 assistant/tool 消息。
+这些记录会以**原样的调用记录**重建，不是摘要，所以上下文会随调用增长。压缩靠你自己：一组调用往往是为某个目的服务的，结论一旦得出中间过程就只剩噪音——查完资料、确认完状态、修完一个文件之后，调用 `condense_ops(["op3", "op4"], "结论")` 把它们移除。
 
-两条规则：同一条 assistant 消息里并发的多个调用必须一起点名收缩，只点其中一个会被拒绝；正在执行、结果还没回来的那一轮不能收缩。
+结论写在 `conclusion` 参数里就够了，工具不会把它再返回一遍：这次调用本身留在上下文里，参数里的结论就是它的记录。
+
+三条规则：同一条 assistant 消息里并发的多个调用必须一起点名收缩，只点其中一个会被拒绝；正在执行、结果还没回来的那一轮不能收缩；后来的收缩可以把更早那次 `condense_ops` 也收掉，那次的结论随之消失——需要保留就在新结论里带上。
 
 ## 原子性与请求边界
 
@@ -153,11 +155,11 @@ def load_tools(names: list[str]) -> str:
 
 
 def condense_ops(cids: list[str], conclusion: str) -> str:
-    """把已经得出结论的几次工具调用收缩成一条结论，同时缩短当前上下文和跨轮的操作历史。查完资料、确认完状态、修完一个文件之后调用它，只留下结论。
+    """把已经得出结论的几次工具调用从上下文和操作历史里移除，只留下你在 conclusion 里写的结论。查完资料、确认完状态、修完一个文件之后调用它。
 
     @param
     cids: 要收缩的调用 id 列表，形如 ["op3", "op4"]；每条工具结果开头的 [opN] 就是它
-    conclusion: 这几次调用最终得出的结论，写成后面还用得上的一句话
+    conclusion: 这几次调用得出的结论，写成后面还用得上的一句话；它留在这次调用里，不会被再返回一遍
     """
     from mods import context, history, oplog
 
@@ -169,9 +171,10 @@ def condense_ops(cids: list[str], conclusion: str) -> str:
     tool_call_ids, unknown = oplog.call_ids(window, cids)
     if unknown:
         return f"操作历史里找不到: {', '.join(unknown)}"
-    removed = current_binding().session.condense_calls(tool_call_ids, conclusion)
-    replaced = oplog.condense(window, cids, conclusion)
-    return f"已收缩 {replaced} 条操作历史，当前上下文移除 {removed} 条消息"
+    removed = current_binding().session.condense_calls(tool_call_ids)
+    dropped = oplog.condense(window, cids)
+    # 这里刻意不回显 conclusion：它已经在这次调用的 arguments 里，回显就是第二个副本。
+    return f"已收缩 {dropped} 条操作，当前上下文移除 {removed} 条消息"
 
 
 def _format_results(results: Mapping) -> str:

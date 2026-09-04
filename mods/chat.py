@@ -298,17 +298,18 @@ def init_chat(session: llm.Chat, messages: list | None = None) -> None:
     state = {"role": "system", "content": f"当前所在群聊:{identity.getgroupname(group)}({group})"} if group is not None else {"role": "system", "content": f"当前在私聊:{identity.getname()}({context.current().get('user_id')})"}
     ui_mode = get_tools_mode() == "ui"
     tool_context = tool_modules.create_context_message(ui_mode=ui_mode)
-    # WHY: 操作历史放在 state 之后、聊天消息之前。它记的是模型自己过去干了什么，属于
-    # "你是谁、你在哪、你做过什么"这一组交代，不是对话的一部分——混进聊天消息里会让模型
-    # 把自己的工具调用当成有人说过的话。
+    # WHY: 操作历史重建成**真的**工具调用记录，放在 state 之后、聊天消息之前。它记的是
+    # 模型自己过去干了什么，不是对话的一部分。
+    # 已知取舍：这些记录整块排在聊天历史之前，而实际上它们当时是与聊天消息交错发生的。
+    # 按时间交错更忠实，但要把 chatlog 重建出的消息和轨道按时间归并；现在没有做，因为
+    # 相对"模型完全不知道自己干过什么"，先把内容拿回来更要紧。要做的话在这里做。
     window = history.window(context.current() or {})
-    operations = oplog.render(window)
     session.set_messages([
         *get_prompt(),
         *prompts["base"],
         tool_context,
         state,
-        *([{"role": "system", "content": operations}] if operations else []),
+        *oplog.build_messages(window),
         *(messages or []),
     ])
     tool_modules.bind_session(session, tool_context, ui_mode=ui_mode)
@@ -329,8 +330,8 @@ def get_handler(session: llm.Chat):
 
 def _oplog_recorder(window):
     """Record each finished tool call and hand back the cid the model can name."""
-    def record(result) -> str | None:
-        return oplog.record(window, result.name, result.arguments, result.content, result.tool_call_id)
+    def record(result, round_id: str) -> str | None:
+        return oplog.record(window, result.name, result.arguments, result.content, result.tool_call_id, round_id)
     return record
 
 

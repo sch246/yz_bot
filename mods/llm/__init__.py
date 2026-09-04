@@ -512,7 +512,7 @@ class LLMClient:
             reasoning_content=reasoning_content,
         )
 
-    def chat(self, messages: list[dict], tools: list[Tool] | Callable[[], list[Tool]] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None, on_round: Callable[[], list[dict]] | None = None, should_stop: Callable[[], bool] | None = None, hints: Callable[[], list[dict]] | None = None, keep_reasoning: bool = True, on_tool_result: Callable[[ToolCallResult], str | None] | None = None) -> Generator[LLMResponse, None, None]:
+    def chat(self, messages: list[dict], tools: list[Tool] | Callable[[], list[Tool]] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None, on_round: Callable[[], list[dict]] | None = None, should_stop: Callable[[], bool] | None = None, hints: Callable[[], list[dict]] | None = None, keep_reasoning: bool = True, on_tool_result: Callable[[ToolCallResult, str], str | None] | None = None) -> Generator[LLMResponse, None, None]:
         # Every message appended below is printed live as it happens, so each
         # further round only logs what it has not shown yet -- usually nothing.
         logged = 0
@@ -614,6 +614,10 @@ class LLMClient:
             if not pending_calls:
                 return
             results: list[ToolCallResult] = []
+            # WHY: 同一条 assistant 消息里并发的调用共用一个 round 标识，用这批里第一个
+            # tool_call 的 id 当它。轨道靠它还原分组——重建时一轮的 tool_calls 必须和它的
+            # tool 消息成套出现，否则供应商拒。
+            round_id = pending_calls[0][0]["id"]
             for call, tool, arguments in pending_calls:
                 function = call["function"]
                 try:
@@ -628,7 +632,7 @@ class LLMClient:
                     # WHY: 先记录原始 content，再把 cid 前缀加到发给模型的那一份上。轨道里
                     # 存的是这次调用真正返回了什么，不该混进只为模型寻址而加的前缀。
                     try:
-                        cid = on_tool_result(result)
+                        cid = on_tool_result(result, round_id)
                     except Exception:
                         # 记账坏掉不该让工具调用失败：轨道是补充，不是主体。
                         _log.exception("operation log hook failed")
@@ -666,7 +670,7 @@ class Chat:
         self.keep_reasoning: bool = True
         # 每次工具调用出结果时回调一次，返回该次调用的 cid（没有就返回 None）。
         # 操作历史轨道靠它采集，见 mods/oplog。
-        self.on_tool_result: Callable[[ToolCallResult], str | None] | None = None
+        self.on_tool_result: Callable[[ToolCallResult, str], str | None] | None = None
         if messages is not None:
             self.set_messages(messages)
         if functions is not None:
@@ -739,12 +743,16 @@ class Chat:
                 collected.append(value if isinstance(value, dict) else {"role": "user", "content": str(value)})
         return collected
 
-    def condense_calls(self, tool_call_ids: Iterable[str], conclusion: str) -> int:
-        """Replace finished tool-call rounds with one conclusion; return messages removed.
+    def condense_calls(self, tool_call_ids: Iterable[str]) -> int:
+        """Drop finished tool-call rounds from this context; return messages removed.
 
         WHY: 这是"结论收缩"真正生效的地方。工具调用往往是为某个目的服务的，结论一旦得出，
         中间过程就只剩噪音。主流 agent 用子代理绕开这件事——让子代理跑完只回一句结论，
         于是主上下文从没见过中间过程。这里是正面解决：让模型自己在得出结论时把过程收掉。
+
+        WHY: 只删，不在原地补一条结论消息。结论已经在模型那条 condense_ops 调用的
+        arguments 里了，而那条 assistant 消息此刻就在 messages 中（工具是在它之后执行的），
+        再插一条就是同一句话的第二个副本。
 
         WHY: 按**整轮**收缩，不按单条。一条 assistant 消息可以并发多个 tool_calls，而协议
         要求它的每个 id 都有对应 tool 消息。只删其中一条会拆散这一对，请求直接被拒。所以
@@ -792,13 +800,7 @@ class Chat:
             drop.add(index)
             drop.update(answered)
 
-        first = min(drop)
-        kept = [message for index, message in enumerate(self.messages) if index not in drop]
-        kept.insert(first, {
-            "role": "system",
-            "content": f"[已收缩的操作] {conclusion}",
-        })
-        self.messages[:] = kept
+        self.messages[:] = [message for index, message in enumerate(self.messages) if index not in drop]
         return len(drop)
 
     def get_tools(self) -> list[Tool]:
