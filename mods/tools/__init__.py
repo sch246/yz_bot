@@ -4,12 +4,11 @@
 # 并未经过维护者裁决（见下面几处指向本注释的标记）。维护者对这套东西的期望是：
 #
 # 1. tool 与 skill 本质二合一：Python 的模块 docstring 就相当于 Markdown 全文，首行始终
-#    显示用于索引，激活后展开全部。当前 _split_description 与 _render_context 已经是
-#    这个形状；尚未做到的是"允许进一步索引子文件夹内的内容"——_source_paths 只 iterdir
-#    顶层。
+#    显示用于索引，激活后展开全部，展开后还能按需继续索引子文件夹内容。
+#    _split_description、_render_context、_source_paths 合起来已经是这个形状。
 # 2. 让模型能随时改自己的工具，并主动察觉到工具可更新；更新后立即可用，失败则拿到错误栈。
 #    reload_tools + registry._failures 已经覆盖"立即可用/拿到错误栈"，
-#    "主动察觉"目前只能靠模型自己调 list_tools。
+#    "主动察觉"还差一层（见 _render_context 上方的 WHY?:）。
 # 3. meta.py 是这套东西的使用说明书，给模型看的。
 #
 # 因此判断这里的代码时，标准不是"它已经在这儿而且能跑"，而是 docs/design-principles.md
@@ -178,6 +177,10 @@ class ToolRegistry:
             self._initialized = True
 
     def _source_paths(self) -> dict[str, list[Path]]:
+        # WHY: 只 iterdir 顶层是有意的分层，不是漏了递归。模块目录是常驻上下文，递归扫描
+        # 会让子文件夹里的东西一开局就全部占位；只列顶层，子文件夹的内容就变成"展开之后
+        # 按需索引"的一层——由激活后的模块正文引用，或由 Python 正常 import 取用。
+        # 这与首行/全文的分层是同一个道理，往下再多一级而已。加递归会破坏这个性质。
         if not self.source_dir.is_dir():
             return {}
         grouped: dict[str, list[Path]] = {}
@@ -405,14 +408,16 @@ def _validated_tool(function: Callable, schema_name: str) -> Tool:
     return tool
 
 
-# WHY?: 缺"末尾 hint"这一层，方向已定、尚未实现——实现时按这套来，别另起一套。
-# 现状：整个模块目录塞在一条 system 消息里，由 SessionBinding._render 就地改写。就地改写
-# 意味着每次 reload/load 都会让它后面的全部上下文失去前缀缓存，而模块目录恰恰是最爱变的
-# 那部分；同时模型只有主动调 list_tools 才知道磁盘变了。
-# 目标形状（可参考 deepseek-harness 注入 context 的做法）：按缓存原理分层——频繁变化且
-# 不需要进历史的内容就是 hint，始终追加到上下文末尾但不写入历史，像 system 提示词一样
-# 支持用函数生成，只是重置时机不同。工具变化由 hint 提示，模型不必主动 list，还能省掉
-# 一个工具。这是 llm 侧的一层通用能力，不属于 tools 包，所以要连带改 Chat 的消息组装。
+# WHY?: 工具变动应该以追加的方式进入上下文，方向已定、尚未实现——实现时按这套来。
+# 现状：整个模块目录塞在一条 system 消息里，由 SessionBinding._render 就地改写；而
+# chat.init_chat 把它放在全部历史之前。最爱变的一段坐在最前面，每次 reload/load 都让它
+# 之后的全部前缀缓存失效；模型也只有主动调 list_tools 才知道磁盘变了。
+# 目标形状（参考 deepseek-harness 的 packages/context/*：它的上下文插件不改动已有消息，
+# 而是往历史里追加带来源的 user 消息，首次注入完整基线、之后只追加变更列表，内容包在
+# 插件自己拥有的 <system-reminder> 框架里，且仓库文本中字面的结束标记会被转义）：
+# 工具变动同样应作为一种 context 条目**追加**到末尾，前面的部分一个字都不动，模型据此
+# 得知磁盘变了。因为是普通历史消息，它可回放、可压缩、可从会话日志重建。
+# 注意别和 hint 混为一谈：hint 是更轻的一层，用于被动提醒，不承载工具目录这种重内容。
 def _render_context(
     registry: ToolRegistry,
     active: Mapping[str, ToolModule],
