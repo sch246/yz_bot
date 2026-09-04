@@ -122,7 +122,17 @@ def _recv_request(client: socket.socket, buffer_size: int = 4096) -> bytes:
         body = body[:expected]
     else:
         # 见 DRAIN_TIMEOUT：这条分支是截断风险所在，记一条日志好知道它还发不发生。
-        _log.warning("OneBot ingress request has no Content-Length; draining")
+        # WHY: 连请求行和头名字一起记。原先只报"发生了"，于是它真的天天发生时，人仍然
+        # 只能猜是哪种请求——探针答得出"有没有"却答不出"是什么"，等于还得再查一次。
+        # 只记头的名字不记值：Authorization 之类的东西不该进日志。
+        _log.warning(
+            "OneBot ingress request has no Content-Length; draining (%s | headers: %s)",
+            header.split(b"\r\n", 1)[0].decode("latin-1", "replace"),
+            ", ".join(
+                line.split(b":", 1)[0].decode("latin-1", "replace")
+                for line in header.split(b"\r\n")[1:] if b":" in line
+            ),
+        )
         client.settimeout(DRAIN_TIMEOUT)
         try:
             while True:
@@ -154,7 +164,12 @@ def request_to_json(request: str | bytes) -> dict | None:
         # 它比原意宽(从任何垃圾里捞最外层大括号)，但实测救不了截断的 body：截断处大括号
         # 不配对，捞出来仍然解析失败。所以它放行的是"外面裹了东西的完整 JSON"，
         # 不是"被截断的半个 JSON"——后者一律丢弃。
-        _log.warning("OneBot ingress body is not JSON; falling back to brace scan")
+        # WHY: 带上开头那几十个字节。是"chunk 长度裹在外面"还是"body 被截断"，肉眼一看
+        # 就分得出；只报一句"不是 JSON"则两种都对得上，而这正是它要区分的两件事。
+        _log.warning(
+            "OneBot ingress body is not JSON; falling back to brace scan (head=%r)",
+            bytes(body[:80]),
+        )
         start, end = body.find(b"{"), body.rfind(b"}")
         if start < 0 or end < start:
             return None
