@@ -50,7 +50,7 @@ def lookup(query: str, limit: int = 10) -> str:
 __all__ = ["lookup"]
 ```
 
-一个文件可以通过 `__all__` 导出多个同步函数，也可导出空列表、只提供说明。每个参数都要有类型标注，函数要有 docstring，签名必须能按关键字调用；不要使用位置专用参数、`*args`、`**kwargs` 或异步函数。模型侧函数名带模块命名空间，例如 `foo__lookup`。`meta` 是始终激活的保留模块，其四个恢复工具不加前缀。
+一个文件可以通过 `__all__` 导出多个同步函数，也可导出空列表、只提供说明。每个参数都要有类型标注，函数要有 docstring，签名必须能按关键字调用；不要使用位置专用参数、`*args`、`**kwargs` 或异步函数。模型侧函数名带模块命名空间，例如 `foo__lookup`。`meta` 是始终激活的保留模块，它导出的工具不加前缀。
 
 Python 模块可以正常 import 第三方依赖、其它 `mods`，也可以 `from ._helper import value` 引用同目录以下划线开头的 helper。候选加载会执行顶层代码，所以顶层只放 import、常量和定义；它与 Bot 处在同一宿主信任域，不是沙箱。
 
@@ -87,9 +87,11 @@ Markdown 不需要 front matter、额外 summary 字段或同步机制，也不�
 
 结论写在 `conclusion` 参数里就够了，工具不会把它再返回一遍：这次调用本身留在上下文里，参数里的结论就是它的记录。
 
-三条规则：同一条 assistant 消息里并发的多个调用必须一起点名收缩，只点其中一个会被拒绝；正在执行、结果还没回来的那一轮不能收缩；后来的收缩可以把更早那次 `condense_ops` 也收掉，那次的结论随之消失——需要保留就在新结论里带上。
+收缩是**可逆**的：被收缩的调用只是离开上下文，原文按保留期继续留着。你那次 `condense_ops` 调用会跟着重建回到后面每一轮的上下文里，`cids` 参数里写的就是被收掉的那几个 cid——什么时候觉得当初的结论不够用、或者要核对当初到底看到了什么，用 `recall_ops(["op3"])` 按 cid 把完整原文取回来。所以收缩不必犹豫，它不销毁任何东西。
 
-上下文能装下多少由聊天历史和工具记录**共用的 token 预算**决定，装不下的、以及早于最老那条聊天消息的，都不会自动载入。它们没有丢：记录最长保留 7 天，上下文开头会提示"更早还有 N 次工具调用未载入（op1–op12）"，用 `recall_ops(["op3"])` 按 cid 取回完整原文。
+三条规则：同一条 assistant 消息里并发的多个调用必须一起点名收缩，只点其中一个会被拒绝；正在执行、结果还没回来的那一轮不能收缩；后来的收缩可以把更早那次 `condense_ops` 也收掉，那次的结论随之从上下文消失——需要保留就在新结论里带上。
+
+上下文能装下多少由聊天历史和工具记录**共用的 token 预算**决定，装不下的、以及早于最老那条聊天消息的，都不会自动载入。这些不会有清单列给你——记录最长保留 7 天，量太大，列出来本身就是浪费。
 
 ## 原子性与请求边界
 
@@ -157,7 +159,7 @@ def load_tools(names: list[str]) -> str:
 
 
 def condense_ops(cids: list[str], conclusion: str) -> str:
-    """把已经得出结论的几次工具调用从上下文和操作历史里移除，只留下你在 conclusion 里写的结论。查完资料、确认完状态、修完一个文件之后调用它。
+    """把已经得出结论的几次工具调用移出上下文，只留下你在 conclusion 里写的结论。查完资料、确认完状态、修完一个文件之后调用它。原文不会被删除，之后可以用 recall_ops 按同样的 cid 取回。
 
     @param
     cids: 要收缩的调用 id 列表，形如 ["op3", "op4"]；每条工具结果开头的 [opN] 就是它
@@ -172,15 +174,15 @@ def condense_ops(cids: list[str], conclusion: str) -> str:
         return "没有指定要收缩的调用"
     tool_call_ids, unknown = oplog.call_ids(window, cids)
     if unknown:
-        return f"操作历史里找不到: {', '.join(unknown)}"
+        return f"没有可收缩的（已经收缩过、或已过保留期）: {', '.join(unknown)}"
     removed = current_binding().session.condense_calls(tool_call_ids)
     dropped = oplog.condense(window, cids)
     # 这里刻意不回显 conclusion：它已经在这次调用的 arguments 里，回显就是第二个副本。
-    return f"已收缩 {dropped} 条操作，当前上下文移除 {removed} 条消息"
+    return f"已收缩 {dropped} 条操作，当前上下文移除 {removed} 条消息；需要时可用 recall_ops 取回原文"
 
 
 def recall_ops(cids: list[str]) -> str:
-    """按 cid 取回工具调用的完整原文，包括因为上下文预算或时间太早而没有载入的那些。上下文开头提示"更早还有 N 次工具调用未载入"时用它。
+    """按 cid 取回工具调用的完整原文，包括已经被 condense_ops 收缩掉的、以及因为上下文预算或时间太早而没有载入的那些。需要核对某次收缩当初到底看到了什么时用它，cid 就写在那次 condense_ops 调用的 cids 参数里。
 
     @param
     cids: 要取回的调用 id 列表，形如 ["op3", "op4"]
@@ -194,11 +196,12 @@ def recall_ops(cids: list[str]) -> str:
         return "没有指定要取回的调用"
     found, unknown = oplog.recall(window, cids)
     lines = [
-        f"[{entry['cid']}] {entry['name']}({entry['arguments']})\n{entry['content']}"
+        f"[{entry['cid']}]{'(已收缩)' if entry.get('condensed') else ''} "
+        f"{entry['name']}({entry['arguments']})\n{entry['content']}"
         for entry in found
     ]
     if unknown:
-        lines.append(f"找不到（可能已过保留期或被收缩）: {', '.join(unknown)}")
+        lines.append(f"找不到（已过保留期或从未存在）: {', '.join(unknown)}")
     return "\n\n".join(lines) if lines else "没有取回任何内容"
 
 

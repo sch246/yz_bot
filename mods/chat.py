@@ -323,7 +323,7 @@ def build_context(token_limit: int | None = None) -> list:
 
     WHY: 早于最老那条聊天消息的工具轮不进上下文。没有对应聊天做锚点的操作，模型无从判断
     它当时在回应什么，孤零零摆在最前面只会误导。丢掉不等于丢失——它们仍在轨道里，最长
-    保留 7 天，模型可以用 recall_ops 点名取回。
+    保留 7 天，知道 cid 就能用 recall_ops 取回。
 
     WHY: 顺序不保证与当时完全一致：一轮里几个并发调用完成时间不同，工具执行期间到达的
     消息其真实先后也无法从一个时间点还原。这是明知的近似。
@@ -332,16 +332,16 @@ def build_context(token_limit: int | None = None) -> list:
     current = context.current() or {}
     in_group = current.get("group_id") is not None
     window = history.window(current)
-    # 每项：(时间, 平手序, token 成本, 消息, 轮标识或 None)
-    items: list[tuple[float, int, int, list, str | None]] = []
+    # 每项：(时间, 平手序, token 成本, 这一项整体落位的消息)
+    items: list[tuple[float, int, int, list]] = []
     for event in _selected_events(current, in_group):
         converted = event2chat(event, in_group)
-        items.append((float(event.get("time") or 0.0), 0, _message_cost(converted), [converted], None))
-    for at, round_id, batch in oplog.build_rounds(window):
-        items.append((at, 1, _round_cost(batch), batch, round_id))
+        items.append((float(event.get("time") or 0.0), 0, _message_cost(converted), [converted]))
+    for at, batch in oplog.build_rounds(window):
+        items.append((at, 1, _round_cost(batch), batch))
     items.sort(key=lambda item: (item[0], item[1]))
 
-    kept: list[tuple[float, int, int, list, str | None]] = []
+    kept: list[tuple[float, int, int, list]] = []
     used = 0
     for item in reversed(items):
         used += item[2]
@@ -352,17 +352,11 @@ def build_context(token_limit: int | None = None) -> list:
 
     anchor = next((index for index, item in enumerate(kept) if item[1] == 0), None)
     kept = kept[anchor:] if anchor is not None else []
-    loaded = {item[4] for item in kept if item[4] is not None}
-    left_out = [entry["cid"] for entry in oplog.entries(window) if entry["round"] not in loaded]
-    assembled = [message for item in kept for message in item[3]]
-    if left_out:
-        # WHY: 一行指路。没载入的操作模型根本不知道存在，也就猜不出 cid，recall_ops 就等于
-        # 够不着。只报数量和范围，不报内容——报内容就等于没省下来。
-        assembled.insert(0, {"role": "system", "content": (
-            f"更早还有 {len(left_out)} 次工具调用未载入（{left_out[0]}–{left_out[-1]}），"
-            "需要原文时用 recall_ops 点名取回。"
-        )})
-    return assembled
+    # WHY: 没载入的部分不列清单。曾经这里插过一行"更早还有 N 次工具调用未载入（op1–op12）"，
+    # 拆掉了：保留期是 7 天，那个 N 会大到这行本身变成噪音，而且绝大多数没载入的调用模型
+    # 本来也不需要回头看。真正需要重新打开的是被自己收缩掉的那些，它们的 cid 就写在
+    # condense_ops 调用的 arguments 里、跟着重建回到上下文中——入口已经在了，不用再指一次。
+    return [message for item in kept for message in item[3]]
 
 
 def init_chat(session: llm.Chat, messages: list | None = None) -> None:

@@ -18,7 +18,11 @@ WHY: 重建成**真的**工具调用记录（assistant(tool_calls) + tool），�
 和"条目删除"之间维护两份等价实现。
 
 WHY: 因此写入时**存全量**，不截断。截断过的内容重建出来会冒充原文——那比明写的摘要更糟，
-因为它看起来就是当时真实发生的事。上限只作为兜底存在，见下面两个常量。
+因为它看起来就是当时真实发生的事。唯一的存储上限是保留期，见 MAX_AGE_SECONDS。
+
+WHY: 条目只有一种消失方式——过期。收缩不删除，只标记（见 condense），标记过的离开上下文
+但仍可 recall_ops 取回。所以"这一轮上下文里有什么"和"存储里还有什么"是两个不同的集合，
+读这个模块时别把它们当成一回事。
 
 WHY: cid 用跨轮稳定的 uid，不用每轮重排的序号。原因不是"稳定一点更好"，而是序号在这里会
 自我否定：结论住在模型那条 condense_ops 调用的 arguments 里（见 meta.condense_ops），
@@ -119,8 +123,13 @@ def record(
         return cid
 
 
-def entries(window: tuple[str, Any] | None) -> list[dict]:
-    """Live entries only. Expired rounds are invisible everywhere, including #ops."""
+def entries(window: tuple[str, Any] | None, include_condensed: bool = False) -> list[dict]:
+    """Live entries only. Expired rounds are invisible everywhere, including #ops.
+
+    WHY: 收缩过的条目默认不出现，但它们**还在**。收缩只让一次调用离开上下文，不参与重建、
+    不再占预算；能不能取回是保留期说了算。分开之后收缩才是安全的动作——模型收缩时不是在
+    销毁证据，结论被推翻或需要核对当初到底看到了什么时，recall_ops 仍然能把原文捞回来。
+    """
     cutoff = time.time() - MAX_AGE_SECONDS
     with _lock:
         state = _state(window)
@@ -130,7 +139,11 @@ def entries(window: tuple[str, Any] | None) -> list[dict]:
             entry["round"] for entry in state["entries"]
             if float(entry.get("at") or 0.0) < cutoff
         }
-        return [entry for entry in state["entries"] if entry["round"] not in expired]
+        return [
+            entry for entry in state["entries"]
+            if entry["round"] not in expired
+            and (include_condensed or not entry.get("condensed"))
+        ]
 
 
 def recall(window: tuple[str, Any] | None, cids: Iterable[str]) -> tuple[list[dict], list[str]]:
@@ -138,9 +151,14 @@ def recall(window: tuple[str, Any] | None, cids: Iterable[str]) -> tuple[list[di
 
     WHY: 保留期比上下文预算宽，所以"存着但这一轮没载入"是常态而不是异常。没有这个入口，
     7 天的留存就等于存了拿不到；有了它，预算收紧才是安全的——够不着的东西仍然能点名取回。
+
+    WHY: 收缩过的也能取回，而且这才是主要用途。上下文里不会有一行清单去介绍那些没载入的
+    调用（7 天的量列出来本身就是浪费），模型唯一能看见的 cid 来源是它自己那条
+    condense_ops 调用的 arguments——那里面写的正是被收缩掉的 cid。所以这个入口如果够不着
+    收缩过的条目，它实际上就没有可用的入参。
     """
     wanted = {str(value) for value in cids}
-    found = [entry for entry in entries(window) if entry["cid"] in wanted]
+    found = [entry for entry in entries(window, include_condensed=True) if entry["cid"] in wanted]
     return found, sorted(wanted - {entry["cid"] for entry in found})
 
 
@@ -158,31 +176,36 @@ def call_ids(window: tuple[str, Any] | None, cids: Iterable[str]) -> tuple[list[
 
 
 def condense(window: tuple[str, Any] | None, cids: Iterable[str]) -> int:
-    """Delete the named calls from the track. Nothing is written in their place.
+    """Mark the named calls condensed: out of the context, still on record.
 
-    WHY: 纯删除，不留结论条目。结论已经在模型那条 condense_ops 调用的 arguments 里，
+    WHY: 标记而不删除。删除会让"收缩"变成不可逆的销毁，模型每次收缩都得先赌自己的结论没
+    写错；标记之后收缩只是移出上下文，原文按保留期继续留着，recall_ops 随时能捞回来。
+    唯一真正的删除是过期（见 _prune）。
+
+    WHY: 不留结论条目。结论已经在模型那条 condense_ops 调用的 arguments 里，
     而那条调用本身也是一次被记录的工具调用，会跟着重建回来。再存一份就是第二个副本。
 
-    WHY: 按整轮删，理由与 _prune 相同：半轮会重建出配对不上的 tool_calls。
+    WHY: 按整轮，理由与 _prune 相同：半轮会重建出配对不上的 tool_calls。
 
-    WHY: 后来的收缩可以把更早那次 condense_ops 调用本身也收掉，于是旧结论消失。这是
-    刻意的——更高层的结论本就该取代下层的。别把它当成 bug 去"保护"结论条目。
+    WHY: 后来的收缩可以把更早那次 condense_ops 调用本身也收掉，于是旧结论从上下文里消失。
+    这是刻意的——更高层的结论本就该取代下层的。别把它当成 bug 去"保护"结论条目。
     """
     wanted = {str(value) for value in cids}
     with _lock:
         state = _state(window)
         if state is None:
             return 0
-        listed = state["entries"]
-        rounds = {entry["round"] for entry in listed if entry["cid"] in wanted}
-        partial = [entry["cid"] for entry in listed if entry["round"] in rounds and entry["cid"] not in wanted]
+        live = [entry for entry in state["entries"] if not entry.get("condensed")]
+        rounds = {entry["round"] for entry in live if entry["cid"] in wanted}
+        partial = [entry["cid"] for entry in live if entry["round"] in rounds and entry["cid"] not in wanted]
         if partial:
             raise ValueError("同一轮里的调用必须一起收缩，还差: " + ", ".join(sorted(partial)))
-        kept = [entry for entry in listed if entry["round"] not in rounds]
-        removed = len(listed) - len(kept)
-        if removed:
-            state["entries"] = kept
-        return removed
+        marked = 0
+        for entry in state["entries"]:
+            if entry["round"] in rounds and not entry.get("condensed"):
+                entry["condensed"] = True
+                marked += 1
+        return marked
 
 
 def clear(window: tuple[str, Any] | None) -> None:
@@ -197,7 +220,7 @@ def clear(window: tuple[str, Any] | None) -> None:
             state["entries"] = []
 
 
-def build_rounds(window: tuple[str, Any] | None) -> list[tuple[float, str, list[dict]]]:
+def build_rounds(window: tuple[str, Any] | None) -> list[tuple[float, list[dict]]]:
     """Rebuild the track as timestamped, atomic tool-call rounds.
 
     WHY: 归并的单位是**一轮**，不是一条消息。assistant(tool_calls) 和它的 tool 结果之间
@@ -218,7 +241,7 @@ def build_rounds(window: tuple[str, Any] | None) -> list[tuple[float, str, list[
             grouped[round_id] = []
             order.append(round_id)
         grouped[round_id].append(entry)
-    rounds: list[tuple[float, str, list[dict]]] = []
+    rounds: list[tuple[float, list[dict]]] = []
     for round_id in order:
         batch = grouped[round_id]
         messages: list[dict] = [{
@@ -241,7 +264,7 @@ def build_rounds(window: tuple[str, Any] | None) -> list[tuple[float, str, list[
             }
             for entry in batch
         )
-        rounds.append((float(batch[0].get("at") or 0.0), round_id, messages))
+        rounds.append((float(batch[0].get("at") or 0.0), messages))
     return rounds
 
 
@@ -256,12 +279,16 @@ def build_messages(window: tuple[str, Any] | None) -> list[dict]:
     请求停在 tool 上"这个形状实跑验证过被接受（deepseek-v4-flash, 2026-09-04）。同一次
     验证还覆盖了这些记录后面紧跟聊天消息（tool -> user）的形状。
     """
-    return [message for _at, _round, messages in build_rounds(window) for message in messages]
+    return [message for _at, messages in build_rounds(window) for message in messages]
 
 
 def render(window: tuple[str, Any] | None) -> str | None:
-    """Render the track for a human (``#ops``); truncated, unlike the model's copy."""
-    listed = entries(window)
+    """Render the track for a human (``#ops``); truncated, unlike the model's copy.
+
+    WHY: 人这一份要连收缩过的一起显示（打上标记）。模型那边看不到它们是刻意的，人这边看
+    不到就只剩困惑：条目会毫无征兆地从 #ops 里消失，而磁盘上其实还在。
+    """
+    listed = entries(window, include_condensed=True)
     if not listed:
         return None
     def short(value: str) -> str:
@@ -269,6 +296,7 @@ def render(window: tuple[str, Any] | None) -> str | None:
         return text if len(text) <= DISPLAY_CHARS else text[:DISPLAY_CHARS] + f"…({len(text)}字)"
     return "\n".join([
         "本窗口的操作历史:",
-        *(f"- [{entry['cid']}] {entry['name']}({short(entry['arguments'])}) -> {short(entry['content'])}"
+        *(f"- [{entry['cid']}]{'(已收缩)' if entry.get('condensed') else ''} "
+          f"{entry['name']}({short(entry['arguments'])}) -> {short(entry['content'])}"
           for entry in listed),
     ])
