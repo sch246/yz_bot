@@ -89,6 +89,8 @@ Markdown 不需要 front matter、额外 summary 字段或同步机制，也不�
 
 三条规则：同一条 assistant 消息里并发的多个调用必须一起点名收缩，只点其中一个会被拒绝；正在执行、结果还没回来的那一轮不能收缩；后来的收缩可以把更早那次 `condense_ops` 也收掉，那次的结论随之消失——需要保留就在新结论里带上。
 
+上下文能装下多少由聊天历史和工具记录**共用的 token 预算**决定，装不下的、以及早于最老那条聊天消息的，都不会自动载入。它们没有丢：记录最长保留 7 天，上下文开头会提示"更早还有 N 次工具调用未载入（op1–op12）"，用 `recall_ops(["op3"])` 按 cid 取回完整原文。
+
 ## 原子性与请求边界
 
 每个模块单独校验和提交：任一导出失败，整个模块保留旧版；一次 reload 多个名称时，其它成功模块仍可独立提交。单个 LLM 子请求发送前会冻结工具 schema 与 callable 的同一份快照，所以 load/reload 只从下一次模型子请求起生效，不改变已发请求，也不改变同一响应中的其它工具调用。
@@ -177,6 +179,29 @@ def condense_ops(cids: list[str], conclusion: str) -> str:
     return f"已收缩 {dropped} 条操作，当前上下文移除 {removed} 条消息"
 
 
+def recall_ops(cids: list[str]) -> str:
+    """按 cid 取回工具调用的完整原文，包括因为上下文预算或时间太早而没有载入的那些。上下文开头提示"更早还有 N 次工具调用未载入"时用它。
+
+    @param
+    cids: 要取回的调用 id 列表，形如 ["op3", "op4"]
+    """
+    from mods import context, history, oplog
+
+    window = history.window(context.current() or {})
+    if window is None:
+        return "当前不在聊天窗口里，没有操作历史"
+    if not cids:
+        return "没有指定要取回的调用"
+    found, unknown = oplog.recall(window, cids)
+    lines = [
+        f"[{entry['cid']}] {entry['name']}({entry['arguments']})\n{entry['content']}"
+        for entry in found
+    ]
+    if unknown:
+        lines.append(f"找不到（可能已过保留期或被收缩）: {', '.join(unknown)}")
+    return "\n\n".join(lines) if lines else "没有取回任何内容"
+
+
 def _format_results(results: Mapping) -> str:
     action_labels = {
         "loaded": "已加载",
@@ -203,4 +228,4 @@ def _format_results(results: Mapping) -> str:
     ])
 
 
-__all__ = ["exec_code", "list_tools", "reload_tools", "load_tools", "condense_ops"]
+__all__ = ["exec_code", "list_tools", "reload_tools", "load_tools", "condense_ops", "recall_ops"]

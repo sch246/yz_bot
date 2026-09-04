@@ -41,11 +41,11 @@ from mods import INFRA
 PHASE = INFRA
 LOAD_AFTER = ("storage",)
 
-# WHY: 两个上限都是**兜底**，不是压缩机制。压缩靠模型显式 condense_ops；这两个只防单次
-# 巨量输出（比如读了个大文件）和"从没收缩过的窗口"把存储与上下文撑爆。设得比正常用量高
-# 一截，正常路径碰不到。别把它们调小当成自动压缩用：按大小自动砍会在结论产出之前砍掉前提。
-MAX_ENTRY_CHARS = 20000
-MAX_TOTAL_CHARS = 200000
+# WHY: 保留期是**唯一**的存储上限，没有条数上限也没有字数上限。上下文放不放得下由
+# chat.build_context 的共用预算决定，与"存多久"是两件事：进不进上下文靠预算，还能不能
+# 被取回靠这里。所以即使一次调用输出很大、或者某窗口从没收缩过，也照存不误——超出预算的
+# 部分只是不自动载入，模型仍可用 recall_ops 显式取回原文。
+MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 # 人看的那份（#ops）才截断，模型那份不截断。
 DISPLAY_CHARS = 200
 
@@ -76,29 +76,17 @@ def _state(window: tuple[str, Any] | None) -> dict | None:
     return state
 
 
-def _cap(value: Any) -> str:
-    text = "" if value is None else str(value)
-    if len(text) <= MAX_ENTRY_CHARS:
-        return text
-    return text[:MAX_ENTRY_CHARS] + f"\n…（截断，原文共 {len(text)} 字）"
-
-
-def _trim(state: dict) -> None:
-    """Drop the oldest whole rounds once the window is over budget.
+def _prune(state: dict) -> None:
+    """Forget whole rounds older than the retention window.
 
     WHY: 按**整轮**丢，不按条。丢掉一轮里的一部分，重建出来就是一条 assistant 的
-    tool_calls 少了对应的 tool 消息，供应商直接拒——兜底裁剪不该把上下文变成非法的。
+    tool_calls 少了对应的 tool 消息，供应商直接拒——过期清理不该把上下文变成非法的。
     """
-    def size(entry: dict) -> int:
-        return len(entry["content"]) + len(entry["arguments"])
-
+    cutoff = time.time() - MAX_AGE_SECONDS
     listed = state["entries"]
-    total = sum(size(entry) for entry in listed)
-    while total > MAX_TOTAL_CHARS and listed:
-        oldest = listed[0]["round"]
-        total -= sum(size(entry) for entry in listed if entry["round"] == oldest)
-        listed = [entry for entry in listed if entry["round"] != oldest]
-        state["entries"] = listed
+    expired = {entry["round"] for entry in listed if float(entry.get("at") or 0.0) < cutoff}
+    if expired:
+        state["entries"] = [entry for entry in listed if entry["round"] not in expired]
 
 
 def record(
@@ -123,18 +111,37 @@ def record(
             # 重建时用来和聊天消息按时间归并，见 build_rounds。
             "at": time.time(),
             "name": str(name),
-            "arguments": _cap(arguments),
-            "content": _cap(content),
+            "arguments": "" if arguments is None else str(arguments),
+            "content": "" if content is None else str(content),
             "tool_call_id": str(tool_call_id),
         })
-        _trim(state)
+        _prune(state)
         return cid
 
 
 def entries(window: tuple[str, Any] | None) -> list[dict]:
+    """Live entries only. Expired rounds are invisible everywhere, including #ops."""
+    cutoff = time.time() - MAX_AGE_SECONDS
     with _lock:
         state = _state(window)
-        return list(state["entries"]) if state else []
+        if not state:
+            return []
+        expired = {
+            entry["round"] for entry in state["entries"]
+            if float(entry.get("at") or 0.0) < cutoff
+        }
+        return [entry for entry in state["entries"] if entry["round"] not in expired]
+
+
+def recall(window: tuple[str, Any] | None, cids: Iterable[str]) -> tuple[list[dict], list[str]]:
+    """Look up stored calls by cid, whatever the context budget left out.
+
+    WHY: 保留期比上下文预算宽，所以"存着但这一轮没载入"是常态而不是异常。没有这个入口，
+    7 天的留存就等于存了拿不到；有了它，预算收紧才是安全的——够不着的东西仍然能点名取回。
+    """
+    wanted = {str(value) for value in cids}
+    found = [entry for entry in entries(window) if entry["cid"] in wanted]
+    return found, sorted(wanted - {entry["cid"] for entry in found})
 
 
 def call_ids(window: tuple[str, Any] | None, cids: Iterable[str]) -> tuple[list[str], list[str]]:
@@ -156,7 +163,7 @@ def condense(window: tuple[str, Any] | None, cids: Iterable[str]) -> int:
     WHY: 纯删除，不留结论条目。结论已经在模型那条 condense_ops 调用的 arguments 里，
     而那条调用本身也是一次被记录的工具调用，会跟着重建回来。再存一份就是第二个副本。
 
-    WHY: 按整轮删，理由与 _trim 相同：半轮会重建出配对不上的 tool_calls。
+    WHY: 按整轮删，理由与 _prune 相同：半轮会重建出配对不上的 tool_calls。
 
     WHY: 后来的收缩可以把更早那次 condense_ops 调用本身也收掉，于是旧结论消失。这是
     刻意的——更高层的结论本就该取代下层的。别把它当成 bug 去"保护"结论条目。
@@ -190,7 +197,7 @@ def clear(window: tuple[str, Any] | None) -> None:
             state["entries"] = []
 
 
-def build_rounds(window: tuple[str, Any] | None) -> list[tuple[float, list[dict]]]:
+def build_rounds(window: tuple[str, Any] | None) -> list[tuple[float, str, list[dict]]]:
     """Rebuild the track as timestamped, atomic tool-call rounds.
 
     WHY: 归并的单位是**一轮**，不是一条消息。assistant(tool_calls) 和它的 tool 结果之间
@@ -211,7 +218,7 @@ def build_rounds(window: tuple[str, Any] | None) -> list[tuple[float, list[dict]
             grouped[round_id] = []
             order.append(round_id)
         grouped[round_id].append(entry)
-    rounds: list[tuple[float, list[dict]]] = []
+    rounds: list[tuple[float, str, list[dict]]] = []
     for round_id in order:
         batch = grouped[round_id]
         messages: list[dict] = [{
@@ -234,7 +241,7 @@ def build_rounds(window: tuple[str, Any] | None) -> list[tuple[float, list[dict]
             }
             for entry in batch
         )
-        rounds.append((float(batch[0].get("at") or 0.0), messages))
+        rounds.append((float(batch[0].get("at") or 0.0), round_id, messages))
     return rounds
 
 
@@ -249,7 +256,7 @@ def build_messages(window: tuple[str, Any] | None) -> list[dict]:
     请求停在 tool 上"这个形状实跑验证过被接受（deepseek-v4-flash, 2026-09-04）。同一次
     验证还覆盖了这些记录后面紧跟聊天消息（tool -> user）的形状。
     """
-    return [message for _at, messages in build_rounds(window) for message in messages]
+    return [message for _at, _round, messages in build_rounds(window) for message in messages]
 
 
 def render(window: tuple[str, Any] | None) -> str | None:

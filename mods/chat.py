@@ -216,10 +216,24 @@ def _message_cost(converted: dict) -> int:
     return sum(count_tokens(part.get("text", "")) for part in content if isinstance(part, dict) and part.get("type") == "text")
 
 
-def get_msgs(token_limit: int | None = None, return_token: bool = False, with_times: bool = False):
+def get_msgs(token_limit: int | None = None, return_token: bool = False):
     token_limit = max_token if token_limit is None else token_limit
     current = context.current() or {}
     in_group = current.get("group_id") is not None
+    selected = _selected_events(current, in_group)
+    output = []
+    used = 0
+    for event in selected:
+        converted = event2chat(event, in_group)
+        used += _message_cost(converted)
+        if used > token_limit:
+            break
+        output.insert(0, converted)
+    return (output, used) if return_token else output
+
+
+def _selected_events(current: dict, in_group: bool) -> list[dict]:
+    """Walk recent history newest-first and keep what may enter the model context."""
     selected = []
     for event in history.getlog(current)[:max_msg]:
         if msgs.is_msg(event):
@@ -244,21 +258,7 @@ def get_msgs(token_limit: int | None = None, return_token: bool = False, with_ti
             selected.append(event)
         elif _is_context_poke(event, in_group):
             selected.append(event)
-
-    output = []
-    times: list[float] = []
-    used = 0
-    for event in selected:
-        converted = event2chat(event, in_group)
-        used += _message_cost(converted)
-        if used > token_limit:
-            break
-        output.insert(0, converted)
-        # 事件自带的 OneBot 时间戳，供 init_chat 把工具调用记录按时间插回来。
-        times.insert(0, float(event.get("time") or 0.0))
-    if with_times:
-        return (output, times, used) if return_token else (output, times)
-    return (output, used) if return_token else output
+    return selected
 
 
 def _usage_entry() -> list:
@@ -296,48 +296,89 @@ def _base_prompt() -> list[dict]:
 - 如无特殊要求，请用中文回复"""}]
 
 
-def _merge_operations(window, messages: list, times: list | None) -> list:
-    """Interleave rebuilt tool rounds with chat messages by time.
+def _round_cost(batch: list[dict]) -> int:
+    """Token cost of one rebuilt round, tool_calls arguments included."""
+    total = 0
+    for message in batch:
+        for call in message.get("tool_calls") or ():
+            function = call["function"]
+            total += count_tokens(function["name"]) + count_tokens(function["arguments"])
+        if isinstance(message.get("content"), str):
+            total += count_tokens(message["content"])
+    return total
 
-    WHY: 工具调用当时就是与聊天消息交错发生的。整块堆在聊天之前，模型看到的因果顺序
-    是错的——它会以为自己是先做完所有事、然后才有人说话。
 
-    WHY: 同一时刻聊天排在工具轮前面。工具调用是被某条消息触发的，触发它的那句话在它
-    之前；秒级时间戳里两者常常相等，靠这个平手规则维持因果。
+def build_context(token_limit: int | None = None) -> list:
+    """Assemble chat history and rebuilt tool rounds under one shared budget.
 
-    WHY: 没有时间的调用方（`.chat` 单句请求）退回旧行为：工具记录整块在前。那条路径
-    只有一条合成消息，没有可归并的时间轴。
+    WHY: 一份预算，不是两份。聊天消息和重建出的工具调用记录进的是同一个上下文，各算各的
+    等于没算——两边都在限额内，加起来照样超。所以归并发生在预算**之内**：按时间从新到旧
+    走一条合并后的时间轴，谁先够到边界谁被丢。
 
-    WHY: 已知不对称——get_msgs 会因 token 预算丢掉更早的聊天消息，而工具轮不受那个预算
-    约束，所以可能出现"比现存最老的聊天还早"的工具轮排在最前面。工具轨道有自己的
-    MAX_TOTAL_CHARS 兜底，不至于无限；真要对齐得让两边共用一个预算，那是另一件事。
+    WHY: 归并单位是一轮。assistant(tool_calls) 和它的 tool 结果之间插进一条聊天消息就拆散
+    了这一对，请求会被拒；预算也按整轮扣，半轮进上下文同样是非法的。
+
+    WHY: 同一时刻聊天排在工具轮前面。工具调用是被某条消息触发的，触发它的那句话在它之前；
+    秒级时间戳里两者常常相等，靠这个平手规则维持因果。
+
+    WHY: 早于最老那条聊天消息的工具轮不进上下文。没有对应聊天做锚点的操作，模型无从判断
+    它当时在回应什么，孤零零摆在最前面只会误导。丢掉不等于丢失——它们仍在轨道里，最长
+    保留 7 天，模型可以用 recall_ops 点名取回。
+
+    WHY: 顺序不保证与当时完全一致：一轮里几个并发调用完成时间不同，工具执行期间到达的
+    消息其真实先后也无法从一个时间点还原。这是明知的近似。
     """
-    rounds = oplog.build_rounds(window)
-    if not rounds:
-        return list(messages)
-    if times is None or len(times) != len(messages):
-        return [message for _at, batch in rounds for message in batch] + list(messages)
-    items = [(at, 1, batch) for at, batch in rounds]
-    items.extend((at, 0, [message]) for at, message in zip(times, messages))
+    token_limit = max_token if token_limit is None else token_limit
+    current = context.current() or {}
+    in_group = current.get("group_id") is not None
+    window = history.window(current)
+    # 每项：(时间, 平手序, token 成本, 消息, 轮标识或 None)
+    items: list[tuple[float, int, int, list, str | None]] = []
+    for event in _selected_events(current, in_group):
+        converted = event2chat(event, in_group)
+        items.append((float(event.get("time") or 0.0), 0, _message_cost(converted), [converted], None))
+    for at, round_id, batch in oplog.build_rounds(window):
+        items.append((at, 1, _round_cost(batch), batch, round_id))
     items.sort(key=lambda item: (item[0], item[1]))
-    return [message for _at, _kind, batch in items for message in batch]
+
+    kept: list[tuple[float, int, int, list, str | None]] = []
+    used = 0
+    for item in reversed(items):
+        used += item[2]
+        if used > token_limit:
+            break
+        kept.append(item)
+    kept.reverse()
+
+    anchor = next((index for index, item in enumerate(kept) if item[1] == 0), None)
+    kept = kept[anchor:] if anchor is not None else []
+    loaded = {item[4] for item in kept if item[4] is not None}
+    left_out = [entry["cid"] for entry in oplog.entries(window) if entry["round"] not in loaded]
+    assembled = [message for item in kept for message in item[3]]
+    if left_out:
+        # WHY: 一行指路。没载入的操作模型根本不知道存在，也就猜不出 cid，recall_ops 就等于
+        # 够不着。只报数量和范围，不报内容——报内容就等于没省下来。
+        assembled.insert(0, {"role": "system", "content": (
+            f"更早还有 {len(left_out)} 次工具调用未载入（{left_out[0]}–{left_out[-1]}），"
+            "需要原文时用 recall_ops 点名取回。"
+        )})
+    return assembled
 
 
-def init_chat(session: llm.Chat, messages: list | None = None, times: list | None = None) -> None:
+def init_chat(session: llm.Chat, messages: list | None = None) -> None:
     inc_call_count()
     prompts["base"] = _base_prompt()
     group = context.current().get("group_id") if context.current() else None
     state = {"role": "system", "content": f"当前所在群聊:{identity.getgroupname(group)}({group})"} if group is not None else {"role": "system", "content": f"当前在私聊:{identity.getname()}({context.current().get('user_id')})"}
     ui_mode = get_tools_mode() == "ui"
     tool_context = tool_modules.create_context_message(ui_mode=ui_mode)
-    # WHY: 操作历史重建成**真的**工具调用记录，并按时间归并进聊天消息，见 _merge_operations。
     window = history.window(context.current() or {})
     session.set_messages([
         *get_prompt(),
         *prompts["base"],
         tool_context,
         state,
-        *_merge_operations(window, messages or [], times),
+        *(messages or []),
     ])
     tool_modules.bind_session(session, tool_context, ui_mode=ui_mode)
     session.do_process_image = get_image_mode() != "off"
@@ -396,7 +437,9 @@ def chat(model: str | None = None) -> None:
 
 def _run_chat(model: str | None, turn, in_group: bool) -> None:
     session = llm.Chat(model=model or get_model(), chat_client=llm.get_client())
-    init_chat(session, *get_msgs(with_times=True))
+    # WHY: 聊天历史与重建出的工具调用记录由 build_context 一起装配，共用一份 token
+    # 预算。`.chat` 单句请求走的是另一条路：它本来就不读聊天历史，也就不载入工具记录。
+    init_chat(session, build_context())
     if turn is not None:
         # WHY: 先建上下文再清队列，顺序不能反。get_msgs 已经从 history 读到了此刻为止
         # 的全部消息，队列里同一批就是重复；反过来先清再读，则清掉之后、读到之前到达的
