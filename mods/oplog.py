@@ -215,11 +215,17 @@ def recall(window: tuple[str, Any] | None, cids: Iterable[str]) -> tuple[list[di
 
 
 def call_ids(window: tuple[str, Any] | None, cids: Iterable[str]) -> tuple[list[str], list[str]]:
-    """Map cids to their tool_call ids; also report the cids nothing matches."""
+    """Map cids to their tool_call ids; also report the cids nothing matches.
+
+    WHY: 这里看**全部**条目，包括已收缩的。收缩过的条目 entries() 默认藏起来，如果这个
+    查询也跟着藏，它就和 condense 之间有了顺序耦合：先标记再查就查不到、当前轮静默地不
+    变短。查询看全量之后，两步谁先谁后都对——"已经收缩过"改由 condense 返回 0 条来报，
+    那是它本来就知道的事实，不必靠另一个函数的可见性副作用来表达。
+    """
     wanted = {str(value) for value in cids}
     found: list[str] = []
     seen: set[str] = set()
-    for entry in entries(window):
+    for entry in entries(window, include_condensed=True):
         if entry.get("cid") in wanted:
             seen.add(entry["cid"])
             if entry.get("tool_call_id"):
