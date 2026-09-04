@@ -21,11 +21,11 @@ WHY: 因此写入时**存全量**，不截断。截断过的内容重建出来�
 因为它看起来就是当时真实发生的事。
 
 WHY: 这个模块**没有自己的截断规则**——没有保留期，没有条数上限，没有字数上限。操作记录
-依附于聊天消息的截断：聊天窗口留多久，操作就留多久，滚出窗口的由 chat.build_context 调
-forget_before 清掉（见那里）。曾经这里有过一个独立的 7 天保留期，拆了：两套截断规则要各自
+依附于聊天消息的截断：聊天窗口留多久，操作就留多久，够不着的由 chat.build_context 调
+sweep 清掉（见那里）。曾经这里有过一个独立的 7 天保留期，拆了：两套截断规则要各自
 调参、各自解释，而它们描述的其实是同一件事——"多早以前的事情还算数"。答案只该有一个。
 
-WHY: 条目只有两种消失方式——滚出聊天窗口，或被 clear。收缩不删除，只标记（见 condense），
+WHY: 条目只有两种消失方式——滚出聊天窗口且没人引用，或被 clear。收缩不删除，只标记（见 condense），
 标记过的离开上下文但仍可 recall_ops 取回。所以"这一轮上下文里有什么"和"存储里还有什么"
 是两个不同的集合，读这个模块时别把它们当成一回事。
 
@@ -40,6 +40,7 @@ cid 只需窗口内唯一——收缩和重建都在单个窗口里，不存在�
 from __future__ import annotations
 
 from collections.abc import Iterable
+import json
 import time
 from threading import RLock
 from typing import Any
@@ -80,25 +81,68 @@ def _state(window: tuple[str, Any] | None) -> dict | None:
     return state
 
 
-def forget_before(window: tuple[str, Any] | None, at: float) -> int:
-    """Drop rounds that started before ``at``; return how many entries went.
+def _referenced_cids(entry: dict) -> list[str]:
+    """The cids this call names in its arguments, if any.
 
-    WHY: 这是唯一的存储回收口，而且门槛由调用方给——chat 那边传的是聊天窗口能回溯到的
-    最早时刻。比那更早的操作再也不可能被载入，留着只是磁盘上的死重量。回收规则不写在这
-    个模块里，是因为"多早以前的事情还算数"是聊天截断的问题，不是操作记录自己的问题。
+    WHY: 判据是"参数里有 cids 这个字段"，不是硬编码 condense_ops / recall_ops 两个名字。
+    cids 是这套系统里"我引用了这几次调用"的唯一写法；按写法认，将来再加一个吃 cids 的
+    工具，回收自动跟上，写死名字则会在加工具的那天悄悄漏掉一类引用。
+    """
+    try:
+        arguments = json.loads(entry.get("arguments") or "{}")
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(arguments, dict):
+        return []
+    cids = arguments.get("cids")
+    return [str(value) for value in cids] if isinstance(cids, list) else []
+
+
+def sweep(window: tuple[str, Any] | None, keep_since: float) -> int:
+    """Drop rounds that are neither recent nor referenced; return entries dropped.
+
+    WHY: 不是"比 keep_since 早的一律删"。收缩过的调用被它那次 condense_ops 的 arguments
+    引用着，而那次调用可能还在窗口里——把被引用的原文删掉，上下文里就留下一个指向空处的
+    cid：模型看得见 op3、读得出当初的结论，一 recall 却说找不到。所以这里是可达性回收：
+    以窗口内的轮为根，顺着 cids 引用递归标记，标不到的才删。
+
+    WHY: 门槛由调用方给——chat 那边传的是聊天窗口能回溯到的最早时刻。"多早以前的事情还
+    算数"是聊天截断的问题，不是操作记录自己的问题，所以这个模块只负责可达性，不负责定时。
 
     WHY: 按**整轮**丢，不按条。丢掉一轮里的一部分，重建出来就是一条 assistant 的
     tool_calls 少了对应的 tool 消息，供应商直接拒——回收不该把上下文变成非法的。
+
+    WHY: 因此收缩本身**不释放磁盘**，只释放上下文。一串"收缩的收缩"会把整条证据链一直
+    拽着，直到最新那次也滚出窗口——那一刻整条链一起没有根，一次全清。这是有意的：引用
+    还在就得能还原，否则收缩就成了留下断号的删除。
     """
     with _lock:
         state = _state(window)
         if state is None:
             return 0
         listed = state["entries"]
-        stale = {entry["round"] for entry in listed if float(entry.get("at") or 0.0) < at}
-        if not stale:
+        grouped: dict[str, list[dict]] = {}
+        for entry in listed:
+            grouped.setdefault(entry["round"], []).append(entry)
+        owner = {entry["cid"]: entry["round"] for entry in listed}
+        reachable: set[str] = set()
+        queue = [
+            round_id for round_id, batch in grouped.items()
+            if float(batch[0].get("at") or 0.0) >= keep_since
+        ]
+        while queue:
+            round_id = queue.pop()
+            if round_id in reachable:
+                continue
+            reachable.add(round_id)
+            for entry in grouped[round_id]:
+                for cid in _referenced_cids(entry):
+                    target = owner.get(cid)
+                    if target is not None and target not in reachable:
+                        queue.append(target)
+        kept = [entry for entry in listed if entry["round"] in reachable]
+        if len(kept) == len(listed):
             return 0
-        kept = [entry for entry in listed if entry["round"] not in stale]
         state["entries"] = kept
         return len(listed) - len(kept)
 

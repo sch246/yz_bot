@@ -340,10 +340,12 @@ def build_context(token_limit: int | None = None) -> list:
     if not picked:
         # 没有聊天做锚点时不载入任何操作记录：孤零零摆着，模型无从判断它当时在回应什么。
         return []
-    # WHY: 回收也依附于聊天。events 已经按 max_msg 截过，比它最老那条还早的操作再也不可能
-    # 被载入，这里顺手让 oplog 忘掉——门槛用 max_msg 窗口而不是本轮预算，因为预算每轮可松
-    # 可紧（`.chat` 就传别的值），拿它当删除门槛会删掉下一轮还够得着的记录。
-    oplog.forget_before(window, float(events[-1].get("time") or 0.0))
+    # WHY: 回收也依附于聊天。events 已经按 max_msg 截过，比它最老那条还早、又没人引用的
+    # 操作再也够不着了，这里顺手让 oplog 扫掉——门槛用 max_msg 窗口而不是本轮预算，因为
+    # 预算每轮可松可紧（`.chat` 就传别的值），拿它当删除门槛会删掉下一轮还够得着的记录。
+    # "又没人引用"那半句在 oplog.sweep 里：被窗口内的 condense_ops 点过名的调用要留着，
+    # 否则上下文里那个 cid 就成了指向空处的断号。
+    oplog.sweep(window, float(events[-1].get("time") or 0.0))
     items: list[tuple[float, int, list]] = [(at, 0, [converted]) for at, converted in picked]
     floor = picked[0][0]
     items.extend((at, 1, batch) for at, batch in oplog.build_rounds(window) if at >= floor)
