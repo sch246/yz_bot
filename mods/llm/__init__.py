@@ -610,6 +610,11 @@ class LLMClient:
             # 接受，没有验证过**，改之前先实测。
             # 注意范围：思考本来就不跨轮——chat.get_msgs 从 chatlog 重建，chatlog 里没有
             # reasoning。所以这里讨论的只是一次工具循环之内要不要一直背着它。
+            # 开关怎么做不用再设计，仓库里已有成熟先例，照抄别另起一套：`#` 子命令 +
+            # getchatstorage() 的按窗口设置。见 chat._subcommand 的 image 一支——`#image`
+            # 无参读当前值、带参写入，读取端 get_image_mode 负责 normalize；use_model 一支
+            # 还示范了失效自愈（get_model 发现存的值解析不了就 pop 回默认）。按窗口存是对的，
+            # 模型选择本来就是按窗口的。
             if assistant.reasoning_content is not None:
                 assistant_message["reasoning_content"] = assistant.reasoning_content
             if pending_calls:

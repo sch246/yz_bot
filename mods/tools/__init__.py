@@ -579,6 +579,8 @@ class SessionBinding:
     # 这一点，追加式也做不到（上下文里会同时留着旧正文和新正文，模型可能以为修改之前
     # 的工具就长那样）。代价是那一整块每次子请求都是未命中缓存的新 token，工具循环越长
     # 付得越多，所以要可切换而不是直接替换掉现在的模式。
+    # 开关照 chat._subcommand 的 image/use_model 来：`#` 子命令 + getchatstorage() 的
+    # 按窗口设置，读取端 normalize + 失效自愈。仓库里已有这个成熟模式，别另起一套。
     def list_text(self) -> str:
         """Describe last-good, active, failed, and changed modules."""
         modules = self.registry.modules
