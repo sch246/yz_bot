@@ -632,6 +632,19 @@ class SessionBinding:
         WHY: 这里只往队列里放，不直接改 session.messages。工具是在 assistant(tool_calls)
         与 tool result 之间执行的，此刻插一条 user 消息会拆散这一对，供应商会拒。队列由
         llm.Chat 的 context provider 在下一次子请求前取走，那时 tool result 已经补齐。
+
+        WHY: 这是**显式 load/reload 的结果报告**，不是磁盘变化探测器。调用链只有一条：
+        模型调 meta 的 reload_tools/load_tools → SessionBinding.reload/load → 这里。
+        没有 watcher，改文件本身仍然不生效——这一条不要"顺手补上"：磁盘上的模块随时
+        可能正被写到一半（模型自己也在写），自动加载等于把半个文件当成新版本，而
+        registry 的 last-good 只在校验通过后才替换，正是为了让这种时刻不影响正在跑的
+        会话。想让模型知道磁盘变了，用 list_tools 报告差异，或者将来的 hint 层，都不是
+        在这里加扫描。
+
+        WHY: 通告是**累积**的，靠顺序而不是替换生效——上下文里会同时留着某模块的旧正文
+        和后来追加的新正文，后者在后面。这是追加式的必然代价，deepseek-harness 的
+        baseline+refresh 也是如此。换成回头改写旧消息就等于放弃前缀缓存，而那正是这套
+        东西存在的理由。同一轮内的多次变动各自成条、按发生顺序交付，不互相覆盖。
         """
         before_active, before_catalog, before_failures = before
         after_active, after_catalog, after_failures = self._capture()
