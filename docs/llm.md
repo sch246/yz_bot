@@ -129,7 +129,7 @@ Python 候选作为正常模块执行，可以 import 第三方依赖、其它 `
 - **交付点。** `llm.Chat.context_providers` 是一组"每次模型子请求前调用一次、返回要追加的消息"的函数（`Chat.add_context_provider` 注册）。`LLMClient.chat` 在每轮开头调用它们并 `extend` 到 `messages` 末尾。
 - **为什么是子请求前而不是立刻。** 工具在 assistant `tool_calls` 消息与 tool result 之间执行；`load_tools`／`reload_tools` 若当场往 `messages` 里插一条 user 消息，就会拆散这一对，供应商会拒。所以 `SessionBinding._announce` 只入队，等到下一轮开头取走，那时 tool result 已经补齐。
 - **内容。** 一条通告列出目录新增／移除／描述更新、激活／停用、已激活模块内容更新、以及本次新出现的加载失败；新激活或内容变了的模块附完整正文，失败附 traceback。没有变化就不产生消息。
-- **仍然是显式的。** 通告是 `reload_tools`／`load_tools` 的结果报告，不是磁盘变化探测器；没有 watcher，改文件本身仍然不生效。自动加载会把可能正写到一半的模块当成新版本，而 last-good 只在校验通过后替换，就是为了让这种时刻不影响正在跑的会话。要让模型知道磁盘变了，仍然靠 `list_tools` 报告差异。
+- **仍然是显式的。** 通告是 `reload_tools`／`load_tools` 的结果报告，不是磁盘变化探测器；没有 watcher，改文件本身仍然不生效。自动加载会把可能正写到一半的模块当成新版本，而 last-good 只在校验通过后替换，就是为了让这种时刻不影响正在跑的会话。要让模型知道磁盘变了，仍然靠 `list_tools` 报告差异——把这一步变成被动提醒是"末尾 hint"那一层的事，见下；即便有了 hint，发现变化之后仍然要显式 reload。
 - **累积而非替换。** 上下文里会同时留着某模块的旧正文和后来追加的新正文，靠顺序生效。这是追加式的必然代价（deepseek-harness 的 baseline+refresh 同样如此）；回头改写旧消息就等于放弃前缀缓存。同一轮内的多次变动各自成条、按发生顺序交付，不互相覆盖。
 - **框架转义。** 模块正文是模型自己写的——`reload_tools` 应用的就是它刚写进磁盘的文件。所以正文里字面的 `</system-reminder>` 会被转义，否则模型可以提前关掉框架，让后面它自己写的内容看起来像系统说的。框架归 `mods/tools` 所有，被框住的内容不许碰它。
 

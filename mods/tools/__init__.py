@@ -7,8 +7,10 @@
 #    显示用于索引，激活后展开全部，展开后还能按需继续索引子文件夹内容。
 #    _split_description、_render_context、_source_paths 合起来已经是这个形状。
 # 2. 让模型能随时改自己的工具，并主动察觉到工具可更新；更新后立即可用，失败则拿到错误栈。
-#    reload_tools + registry._failures 已经覆盖"立即可用/拿到错误栈"；变化的通告走
-#    _announce 追加到上下文末尾，见那里的说明。
+#    "更新后立即可用/拿到错误栈"由 reload_tools + registry._failures 覆盖，结果以追加
+#    的方式进上下文，见 _announce。"主动察觉磁盘变了"这一半还没做：目前只有模型自己调
+#    list_tools 才看得到差异，见 list_text 上方的 WHY?:。别把 _announce 当成它——那是
+#    显式 reload/load 的结果，不是变化探测。
 # 3. meta.py 是这套东西的使用说明书，给模型看的。
 #
 # 因此判断这里的代码时，标准不是"它已经在这儿而且能跑"，而是 docs/design-principles.md
@@ -532,6 +534,13 @@ class SessionBinding:
             self._announce(before)
         return results
 
+    # WHY?: 缺"被动提醒"这一层——维护者期望里"模型能主动察觉工具可更新"的那一半。
+    # 现状：registry.scan() 的磁盘差异只有模型**自己调 list_tools** 才看得到，改了文件
+    # 不说就没人知道。方向是更轻的一层 hint：频繁变化、不需要进历史的内容始终追加在上下文
+    # 末尾但不写入历史，像 system 提示词一样支持用函数生成，只是重置时机不同。
+    # 注意这与 _announce 的追加式上下文是两件事，别合并：那条是显式 reload/load 的结果、
+    # 要进历史、承载模块正文；hint 只是"磁盘变了，去看看"，不承载重内容，也不代替 reload
+    # ——发现变化之后仍然要模型显式 reload，理由见 _announce 的 WHY。
     def list_text(self) -> str:
         """Describe last-good, active, failed, and changed modules."""
         modules = self.registry.modules
