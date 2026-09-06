@@ -96,8 +96,11 @@
 | `later` | `later__later_add`、`later__later_del` |
 | `user_data` | `user_data__get_user_data`、`user_data__set_user_data` |
 | `agents` | `agents__assign_tasks` |
+| `host` | `host__read_file`、`host__write_file`、`host__run_command` |
 | `minecraft` | `minecraft__search_mc_mod`、`minecraft__check_mod` |
 | `weather` | `weather__search_city`、`weather__get_realtime_weather`、`weather__get_daily_forecast`、`weather__get_hourly_forecast` |
+
+`host` 是 `exec_code` 之外的常用出口：文件读写和 shell 都不必再绕一次任意代码执行。读取按本次实际截取的窗口计字节，超过 `max_bytes` 时只回大小和后续建议（缩小区间、先 `grep -n` 定位、或用 `assign_tasks` 开子会话通读后带回摘要），不做分页会话。改写靠 `read_file` 首行 header 里的 `line`/`size`/`v` 定位与对账：位置与新内容的写法无关，`v` 只在该区间自读取后被改动过时失配，失配的返回自带现状和新 header。渲染格式与 `.edit` 同源，所以手动编辑和模型改写看到的是同一种东西；它没有目录白名单，`data/`、`config.json`、`.env` 和聊天记录都在可及范围内。
 
 除 `weather` 继续投影可用的 `mods.weather` 函数（其 schema 描述来自 `mods.weather` 函数自身的 docstring，与命令的 `-h` 帮助同源）外，这些文件持有各自工具的真实实现，不再从 `mods.chat` re-export。图片和子任务模块只惰性复用 `mods.chat` 的 usage/cost 入口，计费状态仍只有一份。
 
@@ -247,6 +250,7 @@ Chat.chat
 这使以下能力处于同一条提示注入路径上：
 
 - `exec_code` 可访问 `.py loc`，本质上接近任意代码执行；
+- `host` 的三个函数可以读、改、删宿主机任意路径的文件并执行任意 shell 命令，与 `exec_code` 同级；读取会把文件内容发送给模型供应商，写入和命令都不可撤销；
 - `reload_tools` 可以在进程内执行并应用 `mods/tools` 中的受信任 Python；候选顶层代码在校验期间就会执行；`load_tools` 可以把任意 last-good 模块交给当前模型；
 - `set_user_data` 可读取模型生成的 Python 字面量并修改任意用户 storage；
 - `get_user_data` 可把任意用户数据发送给模型供应商；
