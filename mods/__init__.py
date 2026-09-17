@@ -43,6 +43,15 @@ load_order: list[str] = []
 _log = logging.getLogger(__name__)
 _exit_lock = threading.Lock()
 _exited = False
+# WHY: 有些事必须等整批 on_load 跑完才能做。最典型的是"重启后接着聊"——它要在启动结束时
+# 开一轮聊天，而在某个模块的 on_load 里开，依赖的模块可能还没加载。这不是给 on_load 加
+# 一个"更晚的 on_load"，是给"启动已经结束"这件事一个可等的信号。
+_booted = threading.Event()
+
+
+def wait_booted(timeout: float | None = None) -> bool:
+    """Block until :func:`boot` has finished; ``False`` if *timeout* elapsed first."""
+    return _booted.wait(timeout)
 
 
 def is_available(module: str | ModuleType) -> bool:
@@ -224,6 +233,7 @@ def boot() -> None:
                 + ", ".join(missing)
                 + f" (import failures: {failed_imports}; load failures: {failed_loads})"
             )
+        _booted.set()
     except BaseException:
         exit()
         raise
