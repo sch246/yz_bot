@@ -67,17 +67,6 @@ def _report_error(name: str, stage: str) -> None:
     message.sendmsg(_traceback_text())
 
 
-def _eval_last(source: str, environment: dict):
-    lines = source.splitlines(keepends=True)
-    if not lines:
-        return None
-    exec("".join(lines[:-1]), environment)
-    last = lines[-1].strip()
-    if not last or last.startswith("#"):
-        return None
-    return eval(last, environment)
-
-
 def _action_py(name: str, action: str, environment: dict) -> bool:
     if not action:
         return True
@@ -94,7 +83,7 @@ def _action_re(name: str, action: str, environment: dict, captures: dict) -> boo
         return True
     try:
         rendered = text.stc_set(cq.unescape(action))(captures)
-        result = _eval_last(rendered, environment)
+        result = py.eval_last(rendered, environment)
         if result is not None:
             message.sendmsg(result)
         return True
@@ -114,7 +103,7 @@ def _evaluate(item: dict, perform_action: bool = True, announce: bool = False) -
         if not condition:
             return False, True
         try:
-            matched = bool(_eval_last(condition, py.loc))
+            matched = bool(py.eval_last(condition, py.loc))
         except Exception:
             _report_error(name, "cond")
             return False, True

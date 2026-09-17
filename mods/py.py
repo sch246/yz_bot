@@ -294,6 +294,23 @@ def get_one(predicate, count=None):
     return history.get_one(context.current(), predicate, count)
 
 
+def eval_last(source: str, environment: dict):
+    """执行 *source* 并返回最后一行的表达式值；末行为空或以 `#` 开头时返回 ``None``。
+
+    WHY: 前几行 ``exec``、只把最后一行 ``eval`` 出来，一次调用里就能既做赋值又交回一个
+    结果。这个形状原本只有 link 里私有的一份，`#hint` 也要用，所以移到这里当唯一的一份，
+    link 与 chat 都调它——它只是**复用求值语义**，不是"执行任意代码"的新入口。
+    """
+    lines = source.splitlines(keepends=True)
+    if not lines:
+        return None
+    exec("".join(lines[:-1]), environment)
+    last = lines[-1].strip()
+    if not last or last.startswith("#"):
+        return None
+    return eval(last, environment)
+
+
 def _execute(body: str, msg=None, skip_op=False, insert=None):
     event = msg if msg is not None else context.current()
     context.set_current(event)

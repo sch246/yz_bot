@@ -10,6 +10,7 @@ class ModelCapabilities:
     vision: bool = False
     function_calling: bool = False
     prompt_price: float = 0.0
+    prompt_cached_price: float = 0.0
     completion_price: float = 0.0
 
 
@@ -20,6 +21,10 @@ class LLMResponse:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    # prompt_tokens 里命中供应商缓存的那部分——它和未命中部分的单价不同，所以计费必须
+    # 分开看，不能只留一个 prompt_tokens（见 llm.pricing）。默认 0 表示"对端没报"，
+    # 于是整段 prompt 按未命中价算。
+    cached_tokens: int = 0
     reasoning_content: str | None = None
 
     def __add__(self, other: "LLMResponse") -> "LLMResponse":
@@ -42,6 +47,7 @@ class LLMResponse:
             prompt_tokens=self.prompt_tokens + other.prompt_tokens,
             completion_tokens=self.completion_tokens + other.completion_tokens,
             total_tokens=self.total_tokens + other.total_tokens,
+            cached_tokens=self.cached_tokens + other.cached_tokens,
             reasoning_content=reasoning_content,
         )
 

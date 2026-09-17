@@ -27,14 +27,14 @@ from mods import context, llm, log, tools as tool_modules
 _stream = log.stream("agent")
 
 
-def assign_tasks(prompt: str, tasks: str, tools: str, model: str = "deepseek/deepseek-v4-flash", max_workers: int = 5) -> str:
+def assign_tasks(prompt: str, tasks: str, tools: str, model: str = "deepseek/deepseek-flash", max_workers: int = 5) -> str:
     """并发分派互不依赖的 LLM 子任务，返回 [(任务, 回答), ...] 的字符串形式；失败项的回答以 ERROR: 开头。
 
     @param
     prompt: 每个子任务共享的完整说明；子模型看不到当前对话，背景和输出格式都要写在这里
     tasks: 每行一个子任务；该行会接在 prompt 后面发给子模型
     tools: 每行一个要在子任务中激活的工具模块名，不需要额外工具就传空字符串；子任务与当前聊天共享上下文，慎给会发消息的模块
-    model: provider/model 形式的模型名，例如 deepseek/deepseek-v4-flash；需要子任务调用工具时要选支持函数调用的模型
+    model: provider/model 形式的模型名，例如 deepseek/deepseek-flash；需要子任务调用工具时要选支持函数调用的模型
     max_workers: 最大并发数，1 到 5，超过按 5 处理
     """
     task_list = [value.strip() for value in tasks.splitlines() if value.strip()]
@@ -60,7 +60,7 @@ def assign_tasks(prompt: str, tasks: str, tools: str, model: str = "deepseek/dee
                     # chat remains the sole owner of model pricing and usage state.
                     from mods import chat
 
-                    chat.inc_call_tokens_cost(model, (chunk.prompt_tokens, chunk.completion_tokens))
+                    chat.inc_call_cost(model, chunk.prompt_tokens, chunk.completion_tokens, chunk.cached_tokens)
 
             session.chat(recall_func=collect)
             _stream.info(f"线程 {worker_id}: LLM 子任务完成")

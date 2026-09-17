@@ -7,11 +7,13 @@ from datetime import datetime
 import re
 import threading
 import time
+import traceback
 from typing import Callable
 
-from mods import context, cq, history, identity, image, llm, log, message, msgs, oplog, storage, text, thread, tools as tool_modules
+from mods import context, cq, history, identity, image, llm, log, message, msgs, op, oplog, py, storage, text, thread, tools as tool_modules
 from mods.command import command
 from mods.capture import capture
+from mods.llm import pricing
 
 
 LOAD_AFTER = ("history", "identity", "image", "llm", "oplog", "storage")
@@ -35,15 +37,20 @@ prompts: dict = {}
 chat_groups: list = []
 description_cache: dict = {}
 llm_config: dict = {}
-# WHY: 这两个是 LLM 刚出现时定的，那时模型上下文上限本身就很小——max_msg 早期是 20
-# 甚至更少，因为太容易超限。现在的模型早已宽松得多，这组默认值只是没人回头调过，不是
-# 出于省钱的判断。两者都可以被 storage 里的 llm_config 覆盖(见 on_load)，所以要放宽
-# 优先改配置而不是改这里的默认值。
-max_token = 4000
-max_msg = 200
+# WHY: 两个上限的默认值写死在这里，不再读 llm_system/config.json。一是那份配置只在
+# on_load 读一次，改它必须重启才生效，而它描述的本来就是"每窗口配置的缺省"、不是全局
+# 开关；二是那两个数从 LLM 刚出现时就没回头调过，当时的理由（上限本身就小）早不成立了。
+# WHY: 宁可低。条数只按普通聊天给——正常聊天不会编程，几十条就够；默认值高会让每次重建
+# 上下文都更贵，而真需要更长历史的窗口可以自己写覆盖值（见 WINDOW_SETTINGS 与 #limit），
+# 这比让所有窗口默默付大账单好。token 反过来给得宽：卡在预算里会让模型说到一半没法思考，
+# 而一个纯聊天的会话本来就远用不满，所以它的默认值是"够用"而不是"尽量小"。
+DEFAULT_MAX_MSG = 20
+DEFAULT_MAX_TOKEN = 50000
 _cost_lock = threading.Lock()
 # Eager capture is image work reported on the image stream, not chat traffic.
 _image_stream = log.stream("image")
+# hint 求值失败只记日志，所以它有自己的流，不混进聊天流量。
+_hint_stream = log.stream("hint")
 
 
 def getchatstorage(event: dict | None = None) -> dict:
@@ -64,8 +71,32 @@ def normalize_image_mode(value) -> str:
     return normalized if normalized in IMAGE_MODES else "off"
 
 
+def window_setting(name: str, data: dict | None = None):
+    """本窗口生效的窗口级配置：窗口里写过的合法值优先，否则回到默认值。
+
+    WHY: 只有这一处合并，没有别的间接层。窗口层住在 `getchatstorage()` 的平铺键里
+    （与 `#image`/`#tools` 一系），缺省写死在 WINDOW_SETTINGS；合法值判断交给归一化
+    函数，所以读取端永远拿得到能用的值，旧存储里的遗留值也不会让聊天崩掉。
+    """
+    key, _default, normalize = WINDOW_SETTINGS[name]
+    return normalize((getchatstorage() if data is None else data).get(key))
+
+
+def limit(event: dict | None = None) -> tuple[int, int]:
+    """本窗口生效的 `(消息条数上限, 上下文 token 上限)`。
+
+    两个值都从 WINDOW_SETTINGS 取，窗口没写就用默认。没有窗口（没有 group_id 也
+    没有 user_id）时直接给默认值——`#hint` 的默认代码要拿它显示，不该因此抛出去。
+    """
+    event = context.current() if event is None else event
+    if event is None or history.window(event) is None:
+        return DEFAULT_MAX_MSG, DEFAULT_MAX_TOKEN
+    data = getchatstorage(event)
+    return window_setting("max_msg", data), window_setting("max_token", data)
+
+
 def get_image_mode(data: dict | None = None) -> str:
-    return normalize_image_mode((getchatstorage() if data is None else data).get("image"))
+    return window_setting("image", data)
 
 
 # WHY: 下面两组照 image 那一套写：normalize 负责把存坏的值拉回默认，读取端永远拿得到
@@ -76,7 +107,7 @@ def normalize_reasoning_mode(value) -> str:
 
 
 def get_reasoning_mode(data: dict | None = None) -> str:
-    return normalize_reasoning_mode((getchatstorage() if data is None else data).get("reasoning"))
+    return window_setting("reasoning", data)
 
 
 def normalize_tools_mode(value) -> str:
@@ -84,8 +115,35 @@ def normalize_tools_mode(value) -> str:
     return normalized if normalized in TOOLS_MODES else "append"
 
 
+def _bounded_int(minimum: int, fallback: int):
+    """归一化成一个不小于 *minimum* 的整数，否则回到默认值。"""
+
+    def normalize(value) -> int:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return fallback
+        return number if number >= minimum else fallback
+
+    return normalize
+
+
+# 窗口级配置：命令名 -> (storage 键, 默认值, 归一化)。
+# WHY: 读取一律走 window_setting，合并就一句话——窗口里写过的合法值优先，否则默认值。
+# 表是唯一的清单，加一项配置就是加一行；默认值散在各自动归化函数的兜底分支里，改一处就
+# 够。`hint`/`prompt` 不在这张表里：它们是复合值（dict / 列表），缺省来自别的存储，
+# 各自的合并也只有一行，塞进来反而要造间接层。
+WINDOW_SETTINGS = {
+    "image": ("image", "off", normalize_image_mode),
+    "reasoning": ("reasoning", "keep", normalize_reasoning_mode),
+    "tools": ("tools", "append", normalize_tools_mode),
+    "max_msg": ("max_msg", DEFAULT_MAX_MSG, _bounded_int(1, DEFAULT_MAX_MSG)),
+    "max_token": ("max_token", DEFAULT_MAX_TOKEN, _bounded_int(1, DEFAULT_MAX_TOKEN)),
+}
+
+
 def get_tools_mode(data: dict | None = None) -> str:
-    return normalize_tools_mode((getchatstorage() if data is None else data).get("tools"))
+    return window_setting("tools", data)
 
 
 def get_prompt() -> list:
@@ -236,16 +294,37 @@ def _within_budget(events: list[dict], in_group: bool, token_limit: int) -> tupl
 def get_msgs(token_limit: int | None = None, return_token: bool = False):
     current = context.current() or {}
     in_group = current.get("group_id") is not None
-    picked, used = _within_budget(_selected_events(current, in_group), in_group,
-                                  max_token if token_limit is None else token_limit)
+    if token_limit is None:
+        token_limit = limit(current)[1]
+    picked, used = _within_budget(_selected_events(current, in_group), in_group, token_limit)
     output = [converted for _at, converted in picked]
     return (output, used) if return_token else output
 
 
+def context_usage() -> int:
+    """已进上下文的聊天文本 token 估算——`#hint` 里的 `usage` 用的就是它。
+
+    WHY: 用量本来只在 `get_handler` 里临时算一次就丢，这里给它一个出口；hint 只调它、不
+    自己算。它是**下界**：只算重建上下文时那些聊天消息的文本，系统提示、工具 schema 和
+    本轮的生成都不在内。
+    """
+    return get_msgs(return_token=True)[1]
+
+
 def _selected_events(current: dict, in_group: bool) -> list[dict]:
     """Walk recent history newest-first and keep what may enter the model context."""
+    message_limit = limit(current)[0]
+    events = history.getlog(current)[:message_limit]
+    if len(events) < message_limit:
+        # WHY: 内存里的窗口只有 history.MAX_LEN 条，max_msg 调过它就得回 chatlog 文件取，
+        # 否则 `#limit 500` 会静默地只给 256 条。read_range 按天倒走、读够就停，所以这条
+        # 只在窗口真的写了大上限时才贵。读文件失败就用手上那份，聊天不该因此中断。
+        try:
+            events = history.getlog(current, limit=message_limit)
+        except OSError:
+            pass
     selected = []
-    for event in history.getlog(current)[:max_msg]:
+    for event in events:
         if msgs.is_msg(event):
             value = msgs.body(event)
             # WHY: `#` 开头的消息一律不进 LLM 上下文。这是一条跨模块的约定，且这里是
@@ -271,30 +350,61 @@ def _selected_events(current: dict, in_group: bool) -> list[dict]:
     return selected
 
 
-def _usage_entry() -> list:
+def usage_name(when: datetime | None = None) -> str:
+    """The storage name for one month's usage: ``YYYY-MM``.
+
+    WHY: 键必须带年份。裸月份把每一年的同一个月并进同一个文件，"去年九月"无从
+    查起，多年数据还会被加在一起——这是 usage 数字失真的直接来源之一。
+    """
+    moment = when or datetime.today()
+    return f"{moment.year}-{moment.month:02d}"
+
+
+def _usage_entry() -> list | None:
+    """The acting user's ``[calls, cost]`` for the current month, or ``None``.
+
+    WHY: 归属用 ``history.author`` 而不是顶层 ``user_id``。私聊窗口的 ``user_id`` 是
+    **窗口对端**，Bot 自己发起的那一轮（比如注入的命令）会因此把费用记到对端头上——
+    这和 ``history.same_author``、``op.is_op`` 修的是同一处混淆。群聊两者本来相同，
+    所以改动只在私聊、且只在 Bot 自己是作者时生效。
+
+    WHY: 没有 user_id 时返回 None，而不是写入一个 "None" 键——那种键 .chattop
+    读不出来（int() 会炸），费用也就永久记丢。宁可这次不计，也不落一个查不到的条目。
+    """
     event = context.current() or {}
-    storage.get("usage", "last_call")["last_call"] = f"{datetime.today().year}-{datetime.today().month}"
-    usage = storage.get("usage", str(datetime.today().month))
-    return usage.setdefault(str(event.get("user_id")), [0, 0])
+    user_id = history.author(event)
+    if user_id is None:
+        return None
+    usage = storage.get("usage", usage_name())
+    return usage.setdefault(str(user_id), [0, 0])
 
 
 def inc_call_count() -> None:
-    _usage_entry()[0] += 1
+    entry = _usage_entry()
+    if entry is not None:
+        entry[0] += 1
 
 
-def inc_call_tokens_cost(model: str, tokens: tuple[int, int]) -> None:
+def inc_call_cost(model: str, prompt_tokens: int, completion_tokens: int, cached_tokens: int = 0) -> None:
+    """把一次调用的费用记到当前发言者名下。
+
+    WHY: 单价、缓存命中价和峰谷档位全部来自模型/供应商元数据（见 llm.pricing），这里只
+    负责取元数据、算钱、记账三件事。命中缓存的那部分必须单独算——聊天的 prompt 大多是
+    重复上下文，一律按未命中价算会把费用高估一个数量级（实测同一段上下文第二次调用，
+    845 个 prompt token 里有 640 是命中）。
+    """
     _, _, attributes = llm.resolve_model(llm_config, model)
-    prompt_price = attributes.get("prompt_price", 0)
-    completion_price = attributes.get("completion_price", 0)
-    price = (tokens[0] * prompt_price + tokens[1] * completion_price) / 1_000_000
-    inc_usage_cost(price)
+    provider = llm.provider_config(llm_config, model)
+    inc_usage_cost(pricing.token_cost(provider, attributes, prompt_tokens, completion_tokens, cached_tokens))
 
 
 def inc_usage_cost(price: float) -> None:
     """Add one externally calculated cost to the current user's usage."""
     # A storage list is the authority; only this read-modify-write needs a lock.
     with _cost_lock:
-        _usage_entry()[1] += price
+        entry = _usage_entry()
+        if entry is not None:
+            entry[1] += price
 
 
 def _base_prompt() -> list[dict]:
@@ -331,8 +441,9 @@ def build_context(token_limit: int | None = None) -> list:
     拆掉了：真正需要重新打开的是被自己收缩掉的那些，它们的 cid 就写在 condense_ops 调用的
     arguments 里、跟着重建回到上下文中——入口已经在了，不用再指一次。
     """
-    token_limit = max_token if token_limit is None else token_limit
     current = context.current() or {}
+    if token_limit is None:
+        token_limit = limit(current)[1]
     in_group = current.get("group_id") is not None
     window = history.window(current)
     events = _selected_events(current, in_group)
@@ -350,8 +461,40 @@ def build_context(token_limit: int | None = None) -> list:
     floor = picked[0][0]
     items.extend((at, 1, batch) for at, batch in oplog.build_rounds(window) if at >= floor)
     items.sort(key=lambda item: (item[0], item[1]))
-    return [message for item in items for message in item[2]]
+    return _close_with_user([message for item in items for message in item[2]])
 
+
+_CLOSING_NOTE = "<system-reminder>\n会话已自动接续。\n</system-reminder>"
+
+
+def _close_with_user(messages: list) -> list:
+    """Make sure the assembled context ends with a user message.
+
+    WHY: DeepSeek 在请求带 `tools` 时要求**最后一条 user 之后的每条 assistant** 都带
+    `reasoning_content`，缺一条就 400（"The reasoning_content in the thinking mode must
+    be passed back to the API."）。2026-09-17 用最小报文实测的边界：同一条没有 reasoning
+    的 assistant 只要**后面还有 user** 就没关系；补一个空串也能过；而把 `tools` 去掉整条
+    校验就消失。也就是说被拒与否取决于**位置**，不是取决于那条消息是谁造的。
+
+    WHY: 于是这里只保一件事——上下文以一条 user 消息收尾。这样尾段的 assistant 集合天然是
+    空的，规则无从触发，而**不需要**去给重建出来的历史编造 `reasoning_content`：那个字段是
+    DeepSeek 专有的，别的供应商并不要求（草籽 2026-09-17），替它们发明一个字段是拿一个供应
+    商的规矩去改所有人的请求。
+
+    WHY: 平时不会走到这里——正常聊天最后一条总是触发它的那条 user 消息，`.chat` 单句自带
+    一条。只有"没有新消息的那一轮"（重启后接着聊，`reboot.resume_chat`）会以 assistant
+    收尾，那正是 2026-09-17 两次 400 的现场。
+
+    WHY: 追加的是一句极短的**声明**，不是假装有人说了一句话。形状抄 `tools._announce` 的系统
+    追加：`role="user"` 加 `<system-reminder>` 框架——那条路径实跑过很多轮，说明"系统追加的
+    user 消息"这个形状本身是被接受的。它只活在发出去的那一份里，不进 chatlog、不发 QQ。
+
+    WHY: 空 content 的 assistant 不算数。重建出来的工具轮 `content` 一律是空串（可见正文
+    另在 chatlog 里），它照样是 assistant，照样要算进尾段。
+    """
+    if messages and messages[-1].get("role") == "user":
+        return messages
+    return [*messages, {"role": "user", "content": _CLOSING_NOTE}]
 
 def init_chat(session: llm.Chat, messages: list | None = None) -> None:
     inc_call_count()
@@ -368,10 +511,24 @@ def init_chat(session: llm.Chat, messages: list | None = None) -> None:
         state,
         *(messages or []),
     ])
-    tool_modules.bind_session(session, tool_context, ui_mode=ui_mode)
+    # WHY: 已激活的工具模块属于**窗口**，要在这一轮开局装回去，改的时候也写回去。每轮
+    # `_run_chat` 都新建一个 `llm.Chat`，激活只在内存里活着的话，下一轮模型就拿着上一轮
+    # 装载过的名字去调用，而快照里没有——那个调用被丢掉、整轮直接结束，模型连自救的机会
+    # 都没有（2026-09-17 `browser__open_page`）。读写在 `_active_modules`／
+    # `_persist_modules`，理由写在那里。
+    # WHY: 装回不是无限的：超过时限没用过的模块会在 `restore` 里被收掉，并给模型一条
+    # 通告——"只进不出"会让每次 `load_tools` 都永久占着基线消息。判据用的是每个模块最后
+    # 一次被调用的时刻，所以 bind 出来的那个对象要一直拿着，供 `_oplog_recorder` 上报。
+    binding = tool_modules.bind_session(
+        session,
+        tool_context,
+        _active_modules(window) if window is not None else {},
+        ui_mode=ui_mode,
+        persist=_persist_modules(window) if window is not None else None,
+    )
     session.do_process_image = get_image_mode() != "off"
     session.keep_reasoning = get_reasoning_mode() == "keep"
-    session.on_tool_result = _oplog_recorder(window)
+    session.on_tool_result = _oplog_recorder(window, binding)
 
 
 def get_handler(session: llm.Chat):
@@ -379,14 +536,21 @@ def get_handler(session: llm.Chat):
         if chunk.role == "assistant" and chunk.content:
             message.sendmsg(chunk.content)
         if chunk.total_tokens:
-            inc_call_tokens_cost(session.model, (chunk.prompt_tokens, chunk.completion_tokens))
+            inc_call_cost(session.model, chunk.prompt_tokens, chunk.completion_tokens, chunk.cached_tokens)
 
     return handle
 
 
-def _oplog_recorder(window):
-    """Record each finished tool call and hand back the cid the model can name."""
+def _oplog_recorder(window, binding=None):
+    """Record each finished tool call and hand back the cid the model can name.
+
+    WHY: 顺手把"这个模块刚被用过"告诉 binding（`touch`）。空闲回收唯一的判据就是这个时刻，
+    而工具是 `llm` 那层直接 `tool.call(**arguments)` 执行的，它不认识 binding——所以借这个
+    每个工具结果都会经过的钩子把名字递过去。
+    """
     def record(result, round_id: str) -> str | None:
+        if binding is not None:
+            binding.touch(result.name)
         return oplog.record(window, result.name, result.arguments, result.content, result.tool_call_id, round_id)
     return record
 
@@ -396,6 +560,122 @@ def _interject_provider(turn, in_group: bool):
     def provide() -> list[dict]:
         return [event2chat(event, in_group) for event in turn.take_pending()]
     return provide
+
+
+def _window_storage(window: tuple) -> dict:
+    """取本窗口自己的 chat storage，键就是 `history.window(...)`（`#hint` 和工具激活共用）。
+
+    WHY: 不经过 `context.current()`——hint 在 `chat` 的 `finally` 里跑，那个窗口就是调用方
+    手上的实参；由实参决定"哪个窗口"，触发点就不依赖线程局部的当前事件，也不跟捕获、派发
+    的细节绑在一起。工具激活走同一个理由：`init_chat` 手上的 window 就是它的窗口。
+    命名空间与 getchatstorage 同一套。
+    """
+    kind, key = window
+    return storage.get("groups" if kind == "group" else "users", str(key))
+
+
+# 本窗口持久激活的工具模块名，以及各自最后一次被调用的时刻。别和 WINDOW_SETTINGS 里的
+# "tools"（工具状态呈现方式）混用，两者住在同一个 storage 字典里。
+_ACTIVE_MODULES_KEY = "active_tools"
+
+
+def _active_modules(window: tuple) -> dict[str, float]:
+    """本窗口上次装着哪些工具模块、各自最后一次被调用是什么时候（`init_chat` 开局装回去）。
+
+    WHY: 值是使用时刻，`tools.SessionBinding.restore` 靠它决定哪些模块已经空闲太久、
+    该在这一轮收掉。旧格式（只存名字的列表）一律当成"就是刚才用过"——那是这份格式之前
+    留下的，给它一个完整时限比让它立刻消失更不容易误伤。
+    """
+    value = _window_storage(window).get(_ACTIVE_MODULES_KEY)
+    if isinstance(value, dict):
+        return {
+            name: float(stamp)
+            for name, stamp in value.items()
+            if isinstance(name, str) and isinstance(stamp, (int, float))
+        }
+    if isinstance(value, list):
+        return {name: time.time() for name in value if isinstance(name, str)}
+    return {}
+
+
+def _persist_modules(window: tuple):
+    """给 `SessionBinding` 的回调：把本窗口的激活集合写回 storage。
+
+    WHY: 激活是**窗口级**状态，不是单轮状态。`_run_chat` 每轮都新建一个 `llm.Chat`，
+    激活如果只活在内存里，模型下一轮会照上一轮装载过的名字去调用（操作历史轨道把那几次
+    `load_tools` 原样重建进了上下文），而那一轮的快照里没有这个名字——`llm` 解析时
+    `mapping[name]` 抛 KeyError，整个调用被丢掉，那一轮连一条 tool 结果都没有就结束了
+    （2026-09-17 群里 `browser__open_page` 那次）。所以要写在这里：模型改一次，这一
+    份就更新一次，下一轮开局原样装回去。
+
+    WHY: 空字典就删键，不留 `{}`。storage 里没有这个键就是"没激活过"，和空字典是一回事，
+    少一个需要解释的状态。
+
+    WHY: 值是使用时刻而不是只有名字，见 `_active_modules`；空闲回收在 `tools` 那层判，
+    这里只负责如实来回搬。
+    """
+    def save(stamps: dict[str, float]) -> None:
+        data = _window_storage(window)
+        if stamps:
+            data[_ACTIVE_MODULES_KEY] = {name: float(stamp) for name, stamp in stamps.items()}
+        else:
+            data.pop(_ACTIVE_MODULES_KEY, None)
+    return save
+
+
+def _hint_effective(default: dict, chat_hint: dict | None) -> dict:
+    """生效配置：`{**default, **chat_hint}`——窗口的覆盖默认的，只读 `code`/`on`。
+
+    WHY: 就这一句合并，没有别的间接层。窗口只写 `on` 也是合法配置——那样它仍继承默认的
+    `code`，只是把自己单独关掉；`on` 缺省当作 False，所以只写了 `code` 的配置不会生效。
+    """
+    return {**default, **(chat_hint if isinstance(chat_hint, dict) else {})}
+
+
+def _run_hint(window: tuple) -> None:
+    """求值本窗口的结束提示，并把结果发出去；触发点写在 `chat` 的 `finally`。
+
+    WHY: 唯一信号是"循环停下"：`while` 里每个 `return` 和异常都经过 `finally`，而每轮
+    `_run_chat` 返回时不经过，所以不会每句都刷；`if not owner:` 的早退和不带窗口的单轮
+    chat 也走不到这里，于是"真的结束"只算一次、也只由这一轮的持有者来做。
+
+    WHY: 求值与发送的任何异常都吞掉、只写日志，绝不抛回 `finally`——这段代码是用户自己
+    写的、每次聊天都自动跑，让它抛出去就等于一段烂代码能污染聊天主流程的返回路径。
+    """
+    try:
+        merged = _hint_effective(storage.get("", "hint"), _window_storage(window).get("hint"))
+        code = merged.get("code")
+        if not merged.get("on", False) or not isinstance(code, str) or not code.strip():
+            return
+        result = _hint_evaluate(code, window)
+        if result is not None:
+            # `#` 前缀让结束提示不回流进 LLM 上下文，见 get_msgs 的说明。
+            message.sendmsg("#" + cq.escape(str(result)))
+    except Exception:
+        _report_hint_failure()
+
+
+def _hint_evaluate(code: str, window: tuple):
+    """在 `py.loc` 的一份私用副本里跑一次 *code*，返回末行的值。
+
+    WHY: 名字要照旧认（`sendmsg`/`storage`/…都在），痕迹不能留——副本 + 单次求值就够了：
+    `window`/`usage` 是这一次临时的，代码里的赋值也只落进副本，`py.loc` 一个键都不会多。
+    仍走 `py.eval_last`，于是「末行是表达式才发」和 Traceback 指回作者那几行都不变。
+    """
+    namespace = dict(py.loc)
+    namespace["window"] = window
+    namespace["usage"] = context_usage()
+    return py.eval_last(code, namespace)
+
+
+def _report_hint_failure() -> None:
+    """照 link._report_error 的惯例，把 traceback 用 `#` 前缀发出去。"""
+    _hint_stream.exception("hint 执行失败")
+    try:
+        # `#` 前缀让 traceback 不回流进 LLM 上下文，见 get_msgs 的说明。
+        message.sendmsg("#" + "".join(traceback.format_exc().splitlines(True)[3:]).strip())
+    except Exception:
+        _hint_stream.exception("hint 的错误报告也发不出去")
 
 
 def chat(model: str | None = None) -> None:
@@ -412,6 +692,9 @@ def chat(model: str | None = None) -> None:
         turn.mark_trigger()
         return
     in_group = event.get("group_id") is not None
+    # WHY: 一次对话 = 这次持有的全过程（多轮 + 插话续写，直到 finally），图片检查台账就
+    # 活在这段里：同一张图不重复下载/解析，对话结束即清掉，下次再聊重新检查一遍。
+    image_ledger = image.begin_conversation()
     try:
         while True:
             _run_chat(model, turn, in_group)
@@ -420,7 +703,10 @@ def chat(model: str | None = None) -> None:
             if not context.finish_turn(window, turn):
                 return
     finally:
+        image.end_conversation(image_ledger)
         context.end_turn(window, turn)
+        # WHY: 循环停下的唯一信号就在这里，见 _run_hint。
+        _run_hint(window)
 
 
 def _run_chat(model: str | None, turn, in_group: bool) -> None:
@@ -440,10 +726,10 @@ def _run_chat(model: str | None, turn, in_group: bool) -> None:
 
 
 _SUBCOMMAND_HELP = (
-    ("help", "显示这份帮助"),
+    ("help [name]", "显示子命令目录或某条子命令的完整说明。\n格式：#help | #help <名称>"),
     ("model", "查看当前模型"),
     ("model <selection>", "查看指定模型信息"),
-    ("models", "列出当前供应商模型"),
+    ("models", "列出当前供应商的模型（优先在线列表）"),
     ("use_model [selection]", "设置或重置当前模型"),
     ("prompt", "查看当前提示词"),
     ("add_prompt [count|list]", "追加聊天或给定提示词"),
@@ -455,16 +741,89 @@ _SUBCOMMAND_HELP = (
     ("reasoning [keep|drop]", "查看或设置工具循环内是否带回思考内容"),
     ("tools [append|ui]", "查看或设置工具状态的呈现方式"),
     ("ops [clear]", "查看或清空本窗口的操作历史"),
+    ("limit [<条数> <token>|reset]", """查看或设置本窗口的消息条数与上下文 token 上限（管理员）。
+
+格式：#limit | #limit <条数> <token> | #limit reset
+两个上限决定重建上下文时最多取多少条聊天消息、估算多少 token；默认值写死在代码里（现在 max_msg=20、max_token=50000），本窗口写过的值优先。
+#limit                  显示两个上限，并标出值来自本窗口还是默认
+#limit <条数> <token>   写入本窗口的两个上限，都必须是正整数
+#limit reset            清掉本窗口的值，回落到默认
+条数超过 history 的内存窗口（256）时会从 chatlog 按天倒读补足，读够就停。"""),
+    ("hint [get|set|default]", """查看、编写或开关本窗口的结束提示（管理员）。
+
+格式：#hint | #hint get | #hint set <代码> | #hint set | #hint default [get|set <代码>]
+本窗口的配置在 chat storage 的 hint 键，全局默认在 storage 的 "" 命名空间；生效的是两者按 {**默认, **窗口} 合并之后 code 非空、on 为真的那份。
+聊天循环停下时求值一次，非 None 的结果作为一条消息发出（自带 # 前缀，不进模型上下文）。
+求值环境是共享动态环境，另外注入 window（本窗口）与 usage（已进上下文的聊天文本 token 估算，下界）。
+#hint              切换本窗口的开关（只写本窗口）
+#hint get          显示合并后生效的代码与开关，并标出代码来自哪里
+#hint set <代码>   写入本窗口的代码并打开开关；set 之后第一个换行起即为源码
+#hint set          清掉本窗口配置，回落到全局默认
+#hint default      切换全局默认的开关
+#hint default get  显示全局默认的代码与开关
+#hint default set <代码>  写入全局默认的代码并打开开关"""),
 )
 _SUBCOMMAND_NAMES = {pattern.partition(" ")[0] for pattern, _description in _SUBCOMMAND_HELP}
 
 
-def _subcommand_help() -> str:
-    return "\n".join(f"{pattern}\n    {description}" for pattern, description in _SUBCOMMAND_HELP)
+def _subcommand_help(name: str = "") -> str:
+    if not name:
+        # WHY: 每行自带 `#`，用户可以直接照抄；`call()` 又会给整条消息补一个 `#`，所以
+        # 把生成的第一个字符空出来，免得渲染成 `##help`。
+        lines = [
+            f"#{pattern} — {description.splitlines()[0]}"
+            for pattern, description in _SUBCOMMAND_HELP
+        ]
+        lines[0] = lines[0][1:]
+        return "\n".join(lines)
+    matched = [
+        description
+        for pattern, description in _SUBCOMMAND_HELP
+        if pattern.partition(" ")[0] == name
+    ]
+    if not matched:
+        return "该命令不存在！"
+    return "\n".join(matched)
+
+
+_MODEL_TABLE_HEADER = "模型 输入(未命中/命中) 输出 (单位: 元/(1m token)，高峰价) 视觉识别 函数调用"
 
 
 def _format_model(selection: str, attributes: dict) -> str:
-    return f"{selection}\n    {attributes.get('prompt_price', '-')} {attributes.get('completion_price', '-')} {'👀' if attributes.get('vision') else ''} {'⚙️' if attributes.get('function_calling') else ''}"
+    # WHY: 表里列的是**高峰价**（provider 传空字典即"不在空闲时段"），峰谷规则由
+    # `_price_note` 另起一行说明。一张表只放一套数字，比每行分高峰/空闲两栏好读。
+    if any(key in attributes for key in pricing.PRICE_KEYS):
+        prices = pricing.format_prices(pricing.unit_prices({}, attributes))
+    else:
+        # 本地没有这条模型的元数据，不替对端猜价格（见 UNKNOWN_MODEL_CAPABILITIES）。
+        prices = " / ".join("-" for _ in pricing.PRICE_KEYS)
+    return f"{selection}\n    {prices} {'👀' if attributes.get('vision') else ''} {'⚙️' if attributes.get('function_calling') else ''}"
+
+
+def _price_note(selection: str) -> str:
+    """峰谷说明；该 provider 没有 `off_peak` 规则时是空串。"""
+    return pricing.describe_off_peak(llm.provider_config(llm_config, selection)) or ""
+
+
+def _models_report(data: dict) -> str:
+    """当前 provider 的模型列表：先问对端，取不到就用本地配置。
+
+    WHY: 清单的权威在对端，本地 models 只是价格与能力元数据。对端列出而本地没有元数据的
+    行只显示名字（价格为 ``-``、无能力标记），不替对端猜能力。
+    """
+    provider = llm.resolve_model(llm_config, get_model(data))[0]
+    local = llm_config.get("providers", {}).get(provider, {}).get("models", {})
+    online = llm.get_client().list_models(provider)
+    if online is None:
+        names = list(local)
+        note = f"（未取到 {provider} 的在线模型列表，以上为本地配置）"
+    else:
+        names = list(online) + [name for name in local if name not in online]
+        note = f"（{provider} 的在线模型列表；本地没有元数据的行只显示名字）"
+    rows = [_MODEL_TABLE_HEADER, *(_format_model(f"{provider}/{name}", local.get(name) or {}) for name in names), note]
+    if price_note := _price_note(get_model(data)):
+        rows.append(price_note)
+    return "\n".join(rows)
 
 
 def _first_argument(value: str) -> tuple[str, str]:
@@ -480,13 +839,159 @@ def _list_argument(value: str) -> list:
     return parsed
 
 
+def _after_tokens(line: str, count: int) -> str:
+    """*line* 里前 *count* 个以空白分隔的 token 之后的内容。"""
+    position = 0
+    for _ in range(count):
+        match = re.search(r"\S+", line[position:])
+        if match is None:
+            return ""
+        position += match.end()
+    return line[position:].lstrip(" \t")
+
+
+def _hint_request(raw: str) -> tuple[str, str]:
+    """把一次 `#hint` 调用切成 `(动词, 源码)`；动词认不出时给 `"?"`。
+
+    WHY: 源码要整段原样取，所以不能先 strip 再切——那会吃掉作者写的缩进。切分只有一条规则：
+    认动词只看第一行（`default` 后面再看一个词），认完把动词那几个 token 去掉，剩下的整段
+    就是源码、首尾各 strip 一次。行内换行照旧保留，于是「同一行写 `set x`」「只换行再写」
+    「两处都写」三种写法都不丢内容。（`_after_tokens` 按空白取词、不跨行，所以它天然按整段工作。）
+    """
+    body = raw.lstrip()[len("hint"):].lstrip()
+    words = body.split("\n", 1)[0].split()
+    if not words:
+        return "", ""
+    if words[0] == "default":
+        if len(words) > 1 and words[1] in ("get", "set"):
+            verb, taken = f"default {words[1]}", 2
+        else:
+            verb, taken = "default", 1
+    elif words[0] in ("get", "set"):
+        verb, taken = words[0], 1
+    else:
+        return "?", ""
+    return verb, _after_tokens(body, taken).strip()
+
+
+def _hint_origin(chat_hint: dict | None) -> str:
+    """合并后生效的那个 `code` 是从窗口来的，还是从默认来的。"""
+    return "本窗口" if isinstance(chat_hint, dict) and "code" in chat_hint else "默认"
+
+
+def _hint_report(config: dict, origin: str) -> str:
+    """`#hint get` 要看的两样：开关，加上那段代码和它的来处。"""
+    state = "on" if config.get("on", False) else "off"
+    code = config.get("code")
+    if not isinstance(code, str) or not code:
+        return f"hint: {state}\ncode（{origin}）: （空）"
+    return f"hint: {state}\ncode（{origin}）:\n{code}"
+
+
+def _hint_subcommand(raw: str) -> str:
+    """处理一次 `#hint`；op 判权在 `cond`，不在这里。
+
+    WHY: 命令面只管文本——写、看、开关，和 `#prompt` 一系；"聊天循环停下时自动求值"是
+    `_run_hint` 那一半，不混进命令语义里。因此没有 del：源码是劳动成果，不用了就
+    `#hint set` 回落默认、或把开关切到关。
+    WHY: 改完立刻 `storage.save()`，不等后台扫描——hint 是用户手写的配置，紧接着一次重启
+    就该还在（cave、link 也是这么落盘的）。
+    """
+    data = getchatstorage()
+    default = storage.get("", "hint")
+    chat_hint = data.get("hint")
+    verb, source = _hint_request(raw)
+    if verb in ("get", "default", "default get") and source.strip():
+        return f"hint {verb} 参数过多"
+    if verb == "set":
+        if source.strip():
+            data["hint"] = {"code": cq.unescape(source), "on": True}
+            storage.save()
+            return "提示已开启"
+        data.pop("hint", None)
+        storage.save()
+        return "已设为默认"
+    if verb == "default set":
+        if not source.strip():
+            return "hint default set 需要代码"
+        default["code"] = cq.unescape(source)
+        default["on"] = True
+        storage.save()
+        return "默认已开启"
+    if verb == "get":
+        return _hint_report(_hint_effective(default, chat_hint), _hint_origin(chat_hint))
+    if verb == "default get":
+        return _hint_report(default, "默认")
+    if verb == "default":
+        default["on"] = not bool(default.get("on", False))
+        storage.save()
+        return "默认已开启" if default["on"] else "默认已关闭"
+    if verb == "":
+        if not isinstance(chat_hint, dict):
+            chat_hint = {}
+            data["hint"] = chat_hint
+        chat_hint["on"] = not bool(chat_hint.get("on", False))
+        storage.save()
+        return "提示已开启" if chat_hint["on"] else "提示已关闭"
+    return "hint 参数错误，可用 #help hint 查看"
+
+
+def _limit_report() -> str:
+    """`#limit` 看两个上限，并标出这个值来自本窗口还是默认。"""
+    data = getchatstorage()
+    lines = []
+    for name in ("max_msg", "max_token"):
+        key, _default, _normalize = WINDOW_SETTINGS[name]
+        origin = "本窗口" if key in data else "默认"
+        lines.append(f"{name}: {window_setting(name, data)}（{origin}）")
+    return "\n".join(lines)
+
+
+def _limit_set(tail: str) -> str:
+    """`#limit <条数> <token>` 写本窗口的两个上限；`#limit reset` 清掉、回落默认。
+
+    WHY: 两个值一起写、都必须是正整数——窗口配置要么整份生效、要么整份没有，半份
+    （只改了条数、token 还是上一版）比拒绝更难解释。清掉本窗口的值就等于回落默认，
+    所以不需要"删除"这个动作。
+    """
+    data = getchatstorage()
+    if tail.strip() == "reset":
+        for name in ("max_msg", "max_token"):
+            data.pop(WINDOW_SETTINGS[name][0], None)
+        storage.save()
+        return "已重置上限，回落到默认"
+    parts = tail.split()
+    if len(parts) != 2:
+        return "limit 参数错误，可用 #help limit 查看"
+    written = []
+    for name, raw_value in zip(("max_msg", "max_token"), parts):
+        try:
+            number = int(raw_value)
+        except ValueError:
+            return "limit 参数错误，可用 #help limit 查看"
+        if number < 1:
+            return "limit 参数错误，可用 #help limit 查看"
+        written.append((name, number))
+    for name, number in written:
+        data[WINDOW_SETTINGS[name][0]] = number
+    storage.save()
+    return "\n".join(f"{name}: {number}" for name, number in written)
+
+
 def _subcommand(value: str):
+    # WHY: hint 的源码要求原样取（含缩进与换行），所以先留一份没 strip 的原文。
+    raw = value
     value = value.strip()
     name, _, tail = value.partition(" ")
     tail = tail.strip()
     data = getchatstorage()
     if name == "help" and not tail:
         return _subcommand_help()
+    if name == "help" and tail:
+        argument, remaining = _first_argument(tail)
+        if remaining.strip():
+            return "help 参数过多"
+        return _subcommand_help(argument)
     if name == "model" and not tail:
         return get_model(data)
     if name == "model" and tail:
@@ -497,11 +1002,9 @@ def _subcommand(value: str):
             _provider, _api_model, attributes = llm.resolve_model(llm_config, selection)
         except ValueError as error:
             return str(error)
-        return "模型 输入价格 输出价格 (单位: 元/(1m token)) 视觉识别 函数调用\n" + _format_model(selection, attributes)
+        return "\n".join(part for part in (_MODEL_TABLE_HEADER, _format_model(selection, attributes), _price_note(selection)) if part)
     if name == "models" and not tail:
-        provider = llm.resolve_model(llm_config, get_model(data))[0]
-        models = llm_config.get("providers", {}).get(provider, {}).get("models", {})
-        return "\n".join(["模型 输入价格 输出价格 (单位: 元/(1m token)) 视觉识别 函数调用", *(_format_model(f"{provider}/{model}", attributes) for model, attributes in models.items())])
+        return _models_report(data)
     if name == "use_model" and tail:
         selection, remaining = _first_argument(tail)
         if remaining.strip():
@@ -621,6 +1124,12 @@ def _subcommand(value: str):
             return "当前没有可保存的自定义提示词"
         prompts[setting_name] = prompt
         return "设定已保存"
+    if name == "limit" and not tail:
+        return _limit_report()
+    if name == "limit" and tail:
+        return _limit_set(tail)
+    if name == "hint":
+        return _hint_subcommand(raw)
     return "子命令格式错误，可用 #help 查看"
 
 
@@ -638,6 +1147,11 @@ def cond() -> Callable | bool:
             if value == "#poke":
                 return True
             if subcommand in _SUBCOMMAND_NAMES:
+                if subcommand == "hint" and not op.require_op(event, pattern=r"^#\s*hint"):
+                    # WHY: hint 是用户可写的代码、跑在特权环境、还每次聊天自动执行，权限
+                    # 与 .py/.link 同级，所以非 op 连命令面都不给；require_op 已经按节流
+                    # 约定（同一个人的同类重试）给过提醒，这里只要不接管这条消息。
+                    return False
                 return lambda value=value: _subcommand(value[1:])
     return msgs.is_poke(event) and event.get("target_id") == identity.bot_id()
 
@@ -740,11 +1254,16 @@ def run(body: str, model: str | None = None):
         return run.__doc__
     session = llm.Chat(model=model or get_model(), chat_client=llm.get_client())
     init_chat(session, [{"role": "user", "content": body.lstrip()}])
-    session.chat(recall_func=get_handler(session), description_cache=description_cache)
+    # WHY: 单句请求里的工具轮同样会反复经过图片处理，所以也按一次对话记台账。
+    image_ledger = image.begin_conversation()
+    try:
+        session.chat(recall_func=get_handler(session), description_cache=description_cache)
+    finally:
+        image.end_conversation(image_ledger)
 
 
 def on_load(ctx) -> None:
-    global settings, prompts, chat_groups, description_cache, llm_config, max_token, max_msg
+    global settings, prompts, chat_groups, description_cache, llm_config
     from mods import is_available
 
     missing = [name for name in ("identity", "image", "llm", "storage") if not is_available(name)]
@@ -756,5 +1275,3 @@ def on_load(ctx) -> None:
     chat_groups = storage.get("", "chat_groups", list)
     description_cache = storage.get("llm_system", "description_cache")
     llm_config = llm.get_client().config
-    max_token = int(llm_config.get("max_token", 4000))
-    max_msg = int(llm_config.get("max_msg", 200))

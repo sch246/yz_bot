@@ -115,7 +115,6 @@
 | `bbxm.py` | 从聊天日志重建百变小猫语料 | `bbxm.py` | 保留；live link/pyload 仍调用 |
 | `cave.py` | 回声洞状态、随机池、导入导出和 `.cave` | `cave.py` | 保留；storage 读取移入 `on_load` |
 | `change.py` | 易经起卦与 `.change` | `change.py` | 保留为叶子功能 |
-| `chat4.py` | `.chat4` 兼容入口 | `chat4.py` | 保留明确别名，不建立第二套 chat |
 | `chattop.py` | LLM 调用统计查看 | `chattop.py` | 随 `chat` 保留 |
 | `cpp.py` | C++ 临时编译和交互子进程 | `cpp.py` 与 `_code/funcs.py` 的 `run_process`/`read_process` | 保留为按需启动的设备叶子功能 |
 | `dir.py` | `.dir` 的 zip 目录收发 | `dir.py` | 保留命令名，调用 `file`；不复制文件实现 |

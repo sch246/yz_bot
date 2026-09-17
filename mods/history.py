@@ -90,6 +90,7 @@ def getlog(
     *,
     since: int | None = None,
     until: int | None = None,
+    limit: int | None = None,
 ) -> list[dict[str, Any]]:
     """One window's events, newest first.
 
@@ -107,6 +108,12 @@ def getlog(
     is exactly why the range is spelled out in the call and not inferred.
 
     *msg* may be an event, a ``window()`` key, or omitted for the current event.
+
+    ``limit`` asks for at most the newest that many records.  It only makes
+    sense together with a file read: the in-memory list is already capped at
+    ``MAX_LEN``, so a ``limit`` at or below that is a plain slice and callers
+    keep doing it themselves; a larger one has to come from the tree, and
+    ``chatlog.read_range`` walks newest-first and stops early for it.
     """
     if isinstance(msg, tuple):
         key: tuple[str, Any] | None = msg
@@ -114,12 +121,12 @@ def getlog(
         key = window(_current() if msg is None else msg)
     if key is None:
         return []
-    if since is None and until is None:
+    if since is None and until is None and limit is None:
         with _lock:
             return msgs[key[0]].setdefault(key[1], [])
     from mods import chatlog
 
-    return chatlog.read_range(key[0], key[1], since=since, until=until)
+    return chatlog.read_range(key[0], key[1], since=since, until=until, limit=limit)
 
 
 def author(event: dict[str, Any]) -> Any:

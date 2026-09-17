@@ -333,9 +333,10 @@ def build_messages(window: tuple[str, Any] | None) -> list[dict]:
     进了 chatlog（见 message.py 的 _chatlog_write），下一轮 get_msgs 会重建它。这里再带一份
     就是同一句话在上下文里出现两遍。所以这条轨道只负责它独有的部分：调用与结果。
 
-    WHY: 也不带 reasoning_content——轨道里本来就没有，而"assistant 不带 reasoning、
-    请求停在 tool 上"这个形状实跑验证过被接受（deepseek-v4-flash, 2026-09-04）。同一次
-    验证还覆盖了这些记录后面紧跟聊天消息（tool -> user）的形状。
+    WHY: 也不带 reasoning_content——轨道里本来就没有。缺字段会不会被拒取决于**位置**
+    （见 `chat._close_with_user` 里写明的实测规则），而位置只有装配上下文的那一方看得见，
+    所以那边负责保证上下文以 user 收尾。2026-09-04 记过"请求停在 tool 上被接受"，那条结论
+    是错的：当时没带 `tools`，而 DeepSeek 只在带 tools 时才校验。
     """
     return [message for _at, messages in build_rounds(window) for message in messages]
 

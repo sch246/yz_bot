@@ -4,18 +4,36 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from mods import context, identity, op, storage
+from mods import chat, context, identity, op, storage
 from mods.command import command
 
+# WHY: 月份键由 chat.usage_name 统一生成——写入(chat)和读取(chattop)必须是同一份口径，
+# 否则数据会落到两个文件里。这条依赖也必须在加载期成立：chattop 与 chat 同为 FEATURE
+# 阶段，没有这条边时 chattop 的 indegree 为 0，会排在 chat 前面，on_load 时 chat 还没进
+# available。INFRA 阶段的那些模块(identity/op/storage)靠阶段顺序天然在前，不需要声明。
+LOAD_AFTER = ("chat",)
 
-_last_call: dict = {}
+
+def _is_entry(value) -> bool:
+    """Whether *value* is a ``[calls, cost]`` pair, not junk from an old run."""
+    return isinstance(value, (list, tuple)) and len(value) == 2
 
 
 def _lines(usage: dict, user_ids: set[int] | None = None) -> tuple[float, list[str]]:
     total = 0.0
     lines = []
-    for raw_user, value in sorted(usage.items(), key=lambda item: item[1][1], reverse=True):
-        user_id = int(raw_user)
+    ordered = sorted(
+        usage.items(),
+        key=lambda item: item[1][1] if _is_entry(item[1]) else 0.0,
+        reverse=True,
+    )
+    for raw_user, value in ordered:
+        if not _is_entry(value):
+            continue
+        try:
+            user_id = int(raw_user)
+        except (TypeError, ValueError):
+            continue
         if user_ids is not None and user_id not in user_ids:
             continue
         calls, cost = value
@@ -24,25 +42,38 @@ def _lines(usage: dict, user_ids: set[int] | None = None) -> tuple[float, list[s
     return total, lines
 
 
+def _month(body: str) -> str | None:
+    """Resolve the ``.chattop`` argument into a ``YYYY-MM`` storage name."""
+    value = body.strip().replace("/", "-")
+    today = datetime.today()
+    if not value:
+        return chat.usage_name()
+    parts = value.split("-")
+    try:
+        if len(parts) == 1:
+            year, month = today.year, int(parts[0])
+        elif len(parts) == 2:
+            year, month = int(parts[0]), int(parts[1])
+        else:
+            return None
+    except ValueError:
+        return None
+    if not 1 <= month <= 12:
+        return None
+    return f"{year}-{month:02d}"
+
+
 @command
 def run(body: str):
     """查看指定月份的 LLM 使用费用。
 
-    格式：.chattop [月份 1..12]
-    默认当前月；群聊显示群成员，私聊管理员显示全部，普通用户只显示自己。
+    格式：.chattop [月份]，月份为 1..12（指今年）或 YYYY-MM；默认当前月。
+    群聊显示群成员，私聊管理员显示全部，普通用户只显示自己。
     """
-    value = body.strip() or str(datetime.today().month)
-    try:
-        month = int(value)
-    except ValueError:
+    name = _month(body)
+    if name is None:
         return run.__doc__
-    if not 1 <= month <= 12:
-        return run.__doc__
-    usage = storage.get("usage", str(month))
-    current_month = f"{datetime.today().year}-{datetime.today().month}"
-    if _last_call.get("last_call") != current_month and month == datetime.today().month:
-        usage.clear()
-    _last_call["last_call"] = current_month
+    usage = storage.get("usage", name)
     event = context.current() or {}
     if event.get("group_id") is not None:
         members = {int(item["user_id"]) for item in identity.memberlist(event["group_id"])}
@@ -51,15 +82,17 @@ def run(body: str):
         total, lines = _lines(usage)
     else:
         total, lines = _lines(usage, {int(event["user_id"])})
-    return f"总费用:￥{total:.4f}\n" + "\n".join(lines) if lines else "这个月没有使用记录"
+    if not lines:
+        return f"「{name}」没有使用记录"
+    return f"「{name}」总费用:￥{total:.4f}\n" + "\n".join(lines)
 
 
 def on_load(ctx) -> None:
-    global _last_call
     from mods import is_available
 
-    missing = [name for name in ("identity", "op", "storage") if not is_available(name)]
+    missing = [
+        name for name in ("chat", "identity", "op", "storage")
+        if not is_available(name)
+    ]
     if missing:
         raise RuntimeError("chattop requires available mods: " + ", ".join(missing))
-    _last_call = storage.get("usage", "last_call")
-    _last_call.setdefault("last_call", "")

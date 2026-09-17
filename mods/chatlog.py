@@ -822,6 +822,7 @@ def read_range(
     *,
     since: int | None = None,
     until: int | None = None,
+    limit: int | None = None,
     bot_id: int | None = None,
     root: str | os.PathLike | None = None,
 ) -> list[dict[str, Any]]:
@@ -840,6 +841,11 @@ def read_range(
     ``history.getlog()`` are inherent to reading files rather than memory:
     recalled messages are still here (the tree is append-only; the recall is a
     separate notice line), and notices are the opaque prose ``write`` produced.
+
+    ``limit`` caps the result at the newest that many records, and the day walk
+    stops as soon as enough are collected -- that is what makes backfilling past
+    the in-memory cap (``history.MAX_LEN``) affordable instead of reading the
+    whole tree.  ``None`` means no cap.
     """
     directory = window_path(kind, target, root)
     if not directory.is_dir():
@@ -849,13 +855,17 @@ def read_range(
     switch = _switch_moment()
     bot_names, names_complete = _bot_identities()
     records: list[dict[str, Any]] = []
-    for path in sorted(directory.rglob("*.log")):
+    # WHY: 倒着走天文件、每天内再倒着收，得到的次序与"全读一遍再 reverse"完全相同——
+    # 日志是 append-only，全局正序就是"天升序 × 天内正序"，反过来即"天倒序 × 天内倒序"。
+    # 换了写法是为了能读够 limit 条就停；不设 limit 时行为与从前逐条一致。
+    for path in sorted(directory.rglob("*.log"), reverse=True):
         day = day_of(path)
         if day is None:
             continue
         start, end = _day_bounds(day)
         if since is not None and end <= since:
-            continue
+            # 天已经倒序，这一天整天的上界都在 since 之前，再往前只会更早。
+            break
         if until is not None and start > until:
             continue
         try:
@@ -873,14 +883,20 @@ def read_range(
             bot_names=bot_names,
             names_complete=names_complete,
         )
+        batch = []
         for record in parsed:
             when = record.get("time")
             if since is not None and (when is None or when < since):
                 continue
             if until is not None and (when is None or when > until):
                 continue
-            records.append(record)
-    records.reverse()
+            batch.append(record)
+        batch.reverse()
+        records.extend(batch)
+        if limit is not None and len(records) >= limit:
+            break
+    if limit is not None:
+        del records[limit:]
     return records
 
 

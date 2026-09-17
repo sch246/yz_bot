@@ -34,6 +34,51 @@ LOAD_AFTER = ("storage",)
 
 _stream = log.stream("image")
 
+# 一次对话（`chat.chat()` 的一次持有：多轮 + 插话续写，直到 finally）内的图片检查台账。
+# WHY: 同一张图在一次对话里只该被解析/下载一次——失败的不要每轮重试（腾讯 rkey 过期后
+# 只会拿到 HTML），成功的也不必每轮重新查一遍。挂在线程局部：对话在哪个线程跑就在哪个
+# 线程记账，别的线程（eager 预取、.chat 单句）各记各的，互不干扰。
+_local = threading.local()
+
+
+class AlreadyCheckedFailed(ValueError):
+    """本次对话里该图片已检查过且失败——重试没有意义，直接沿用这个失败。"""
+
+
+def begin_conversation() -> dict | None:
+    """开启本次对话的图片台账，返回被顶掉的上一份（供 `end_conversation` 还原）。"""
+    previous = getattr(_local, "ledger", None)
+    _local.ledger = {}
+    return previous
+
+
+def end_conversation(previous: dict | None) -> None:
+    """关闭本次对话的图片台账，还原上一个（通常是 None）。"""
+    _local.ledger = previous
+
+
+def _ledger() -> dict | None:
+    return getattr(_local, "ledger", None)
+
+
+def _ledger_key(uri) -> str | None:
+    return uri.strip() if isinstance(uri, str) and uri.strip() else None
+
+
+def checked_in_conversation(uri) -> bool:
+    """本次对话里是否已经检查过这张图（无论成功还是失败）。"""
+    ledger = _ledger()
+    key = _ledger_key(uri)
+    return ledger is not None and key is not None and key in ledger
+
+
+def checked_failed(uri) -> bool:
+    """本次对话里是否已经检查过且判定失败——调用方据此跳过重试，也不再重复报错。"""
+    ledger = _ledger()
+    key = _ledger_key(uri)
+    return ledger is not None and key is not None and key in ledger and ledger[key] is None
+
+
 TEMP_PATH = "data/tmp_files"
 # WHY: 15 天是防止数据无限膨胀的纯估计值，没有实测依据。三处（图片缓存闲置、别名、
 # 描述缓存）碰巧同值，但保持各自独立是有意的——它们过期的代价不同，应当能分别调整。
@@ -322,6 +367,31 @@ def _resolve_cached_network_image(uri: str, target_dir: str, max_bytes: int) -> 
 
 
 def resolve_image_with_digest(uri: str, target_dir: str = TEMP_PATH, max_bytes: int = MAX_LOCAL_IMAGE_BYTES) -> tuple[str, str, str]:
+    """解析图片 URI 到本地内容缓存，返回 ``(路径, MIME, 摘要)``。
+
+    WHY: 本次对话的台账在这里短路——同一张图第二次被问到就不再解析、不再下载、也不再
+    刷日志：成功直接给出上次的结果，失败则抛 `AlreadyCheckedFailed`（调用方据此静默
+    跳过）。台账只活在一次对话之内，对话结束后重新聊会重新检查一遍。
+    """
+    ledger = _ledger()
+    key = _ledger_key(uri)
+    if ledger is not None and key is not None and key in ledger:
+        outcome = ledger[key]
+        if outcome is None:
+            raise AlreadyCheckedFailed(f"本次对话已检查过该图片且失败：{_display_uri(key)}")
+        return outcome
+    try:
+        resolved = _resolve_image_with_digest(uri, target_dir, max_bytes)
+    except Exception:
+        if ledger is not None and key is not None:
+            ledger[key] = None
+        raise
+    if ledger is not None and key is not None:
+        ledger[key] = resolved
+    return resolved
+
+
+def _resolve_image_with_digest(uri: str, target_dir: str, max_bytes: int) -> tuple[str, str, str]:
     if not isinstance(uri, str) or not uri.strip():
         raise ValueError("图片 URI 不能为空")
     uri = uri.strip()
