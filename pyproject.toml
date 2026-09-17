@@ -5,6 +5,7 @@ description = "Personal QQ Bot with a module-based runtime"
 requires-python = ">=3.11"
 dependencies = [
     "apscheduler",
+    "beautifulsoup4",
     "click",
     "cryptography",
     "httpx[socks]",
@@ -22,6 +23,7 @@ dependencies = [
     "termcolor",
     "tiktoken",
     "watchdog",
+    "websockets",
 ]
 
 [tool.uv]
