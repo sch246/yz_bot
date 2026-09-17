@@ -80,7 +80,18 @@ def _send_now(text: Any, user_id=None, group_id=None, **params) -> int | None:
     message_id = (result.get("data") or {}).get("message_id")
     if message_id is None:
         return None
+    record_sent(message_id, user_id=user_id, group_id=group_id)
+    return message_id
 
+
+def record_sent(message_id, user_id=None, group_id=None) -> dict | None:
+    """Fetch one message we sent and write it into the chatlog and history.
+
+    WHY: 这是"Bot 说过的话要进聊天记录和内存历史"的唯一实现。它原先只在 `_send_now`
+    里，于是**只有走 send_msg 的消息**才被记下来；任何用别的 action 发出去的东西
+    （合并转发用的是 send_forward_msg）就变成一段无痕：日志里没有，下一轮模型也看不见
+    自己做过这件事。取不到就把 message_id 交回去，调用方自己决定要不要在意。
+    """
     fetched = connect.call_api(
         "get_msg",
         message_id=message_id,
@@ -89,14 +100,14 @@ def _send_now(text: Any, user_id=None, group_id=None, **params) -> int | None:
     )
     if fetched.get("retcode") != 0 or not isinstance(fetched.get("data"), dict):
         _log.warning("sent OneBot message %s but failed to fetch it", message_id)
-        return message_id
+        return None
     sent_event = dict(fetched["data"])
     if group_id is None:
         sent_event["user_id"] = user_id
     elif isinstance(sent_event.get("sender"), dict):
         sent_event["user_id"] = sent_event["sender"].get("user_id")
     _chatlog_write(sent_event)
-    return message_id
+    return sent_event
 
 
 def _work() -> None:

@@ -25,6 +25,19 @@ cave: "Cave | None" = None
 _cave_startup_snapshot = ""
 
 
+def _store(value: str) -> str:
+    """一条回声洞正文的长期保存形式：图片落本地，合并转发取回存档后展开成正文。
+
+    WHY: 转发 id 和图片 url 都会过期（转发几小时到几天，图片的 rkey 更短）。`.cave` 是
+    给以后读的，存那串 CQ 等于什么都没存。`forward` 是 FEATURE 模块，动态取而不是顶层
+    import：它没加载成功时退回原来的行为（只本地化图片），回声洞不该因为这个崩掉。
+    """
+    from mods import get_available
+
+    module = get_available("forward")
+    return module.store(value) if module is not None else cq.save_pic(value)
+
+
 def _snapshot(value: "Cave") -> str:
     return json.dumps(
         {"msgs": value.msgs, "pool": value.pool},
@@ -106,7 +119,7 @@ class Cave:
             "qq": event["user_id"],
             "group": identity.getgroupname() if event.get("group_id") else None,
             "time": time.strftime("%Y-%m-%d %H:%M"),
-            "text": cq.save_pic(value),
+            "text": _store(value),
         }
         self.pool.append(index)
         return f"已添加，序号 {index}"
