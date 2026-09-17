@@ -2,7 +2,9 @@
 
 ## 直接执行 Python
 
-`exec_code(expr, code)` 用的是 `.py` 命令那份共享环境：先 `exec(code)`，再 `eval(expr)`，返回 `repr(结果)`。`code` 里的 `print` 输出会被捕获后一起回传，不会发进聊天。环境跨调用持久，上一次定义的变量和函数下一次仍然在。
+`exec_code(expr, code, timeout)` 用的是 `.py` 命令那份共享环境：先 `exec(code)`，再 `eval(expr)`，返回 `repr(结果)`。`code` 里的 `print` 输出会被捕获后一起回传，不会发进聊天。环境跨调用持久，上一次定义的变量和函数下一次仍然在。
+
+`timeout` 是必填的秒数上限，`0` 表示不限。代码在一个可以被终止的子线程里执行：到点会 kill 掉这次调用启动的子进程、并给那个线程注入中断，然后照常把已经捕获的 print 输出交回来。时限由调用方负责，所以哪怕代码卡在一个打断不了的系统调用里，你也会在时限内拿回控制权——但那个线程可能还留着，**下一次仍然能看见它留下的痕迹**。默认给一个够用的值，别用 `0` 图省事：这条路的代价是线程和子进程，不是耐心。
 
 只有当前发送者是管理员时可用，否则返回"权限不足"。
 
@@ -16,13 +18,15 @@
 
 1. 磁盘源码：刚编辑的文件，还不一定生效。
 2. 进程级 last-good：最后一次成功初始化或 `reload_tools` 的完整模块版本。
-3. 当前 Chat 激活态：经 `load_tools` 加入当前任务的模块内容和函数。
+3. 本窗口的激活态：经 `load_tools` 加入的模块内容和函数。它属于**窗口**，不是单轮：`load_tools` 一成功就记进本窗口，下一轮开局自动装回来，跨重启也还在。但它**只进不出**——每次 `load_tools` 都会永久往基线消息里添一份正文，所以超过 1 小时没被调用过的模块，下一轮开局不再装回，改动会以一条"已停用（空闲收回）"的系统通告告诉你；需要就重新 `load_tools`。
 
 `reload_tools` 从磁盘应用源码；`load_tools` 只激活 last-good，不能混用。没有自动 watcher，也不要等待修改自行生效。
 
+因为激活属于窗口，同一件事不需要每轮重复 `load_tools`，也不会因为一轮聊完就消失。会"自己消失"的情况有两种，都会以系统通告告诉你（内容里写明了原因）：**装不回来**（`op` 这类只在 op 轮可见的模块，在普通轮里恢复不了，连同 storage 里的记录一起丢掉）和**空闲收回**（超过 1 小时没被调用过）。两者都只是"这一轮它不在了"，重新 `load_tools` 就能回来——不要照着上一轮的印象直接调它的函数，本轮快照里没有那个名字，你会白跑一次（虽然会收到一条说明，告诉你本轮可用什么、要怎么激活）。
+
 ## 查询
 
-先调用 `list_tools()`。它列出 last-good 模块及一句话描述、当前 Chat 已激活模块、磁盘相对 last-good 的新增/修改/删除，以及最近的加载失败 traceback。需要阅读源码时，再用文件能力或 `exec_code` 精确读取 `mods/tools/<name>.py` 或 `.md`。
+先调用 `list_tools()`。它列出 last-good 模块及一句话描述、本窗口已激活模块、磁盘相对 last-good 的新增/修改/删除，以及最近的加载失败 traceback。需要阅读源码时，再用文件能力或 `exec_code` 精确读取 `mods/tools/<name>.py` 或 `.md`。
 
 ## 新增 Python 工具模块
 
@@ -106,27 +110,43 @@ from typing import Mapping
 from mods.tools import current_binding
 
 
-def exec_code(expr: str, code: str = "") -> str:
+def exec_code(expr: str, code: str, timeout: float) -> str:
     """在 Bot 进程的共享 Python 环境中先执行 code、再求值 expr，返回 repr 结果和被捕获的 print 输出；需要管理员权限。
 
     @param
     expr: 在 code 之后求值并返回的单个表达式；只想执行 code、不关心返回值时传字符串 None
     code: 先执行的 Python 语句，可以多行；不需要时传空字符串
+    timeout: 秒数上限，必填；0 表示不限，到点会终止这次调用启动的子进程并中断执行线程
     """
-    from mods import context, op, py
+    from mods import context, op, py, watchdog
 
     if not op.require_op(context.current()):
         return "权限不足"
+    # WHY: 代码现在跑在一个子线程里（见 watchdog.run），所以它在代码里改
+    # `context.set_current` 再也影响不到本线程。工具本身仍然可能改，所以照旧进来先快照、
+    # 出去无条件还原：工具可以读路由，但不该在自己脚下把它换掉——2026-09-17 就因此把私聊的
+    # 回复发进了群。
+    original_event = context.current()
     buffer = io.StringIO()
     missing = object()
     original = py.loc.get("print", missing)
     py.loc["print"] = lambda *values, sep=" ", end="\n": buffer.write(
         sep.join(map(str, values)) + end
     )
-    try:
+
+    def perform():
         exec(code, py.loc)
-        result = repr(eval(expr, py.loc))
+        return eval(expr, py.loc)
+
+    try:
+        try:
+            result = repr(watchdog.run(perform, timeout))
+        except TimeoutError as error:
+            result = f"超时：{error}"
+        except watchdog.Interrupted:
+            result = "已被 ^C 中断"
     finally:
+        context.set_current(original_event)
         if original is missing:
             py.loc.pop("print", None)
         else:
@@ -136,7 +156,7 @@ def exec_code(expr: str, code: str = "") -> str:
 
 
 def list_tools() -> str:
-    """列出全部 last-good 工具模块及其一句话描述、当前聊天已激活的模块、磁盘相对 last-good 的新增/修改/删除，以及最近的加载失败 traceback。想知道有哪些模块名可用时先调用它。"""
+    """列出全部 last-good 工具模块及其一句话描述、本窗口已激活的模块、磁盘相对 last-good 的新增/修改/删除，以及最近的加载失败 traceback。想知道有哪些模块名可用时先调用它。"""
     return current_binding().list_text()
 
 
@@ -150,7 +170,7 @@ def reload_tools(names: list[str]) -> str:
 
 
 def load_tools(names: list[str]) -> str:
-    """把已有的 last-good 模块激活到当前聊天，让它的说明和整组函数可用；不读磁盘，因此不会应用刚改的源码。新激活的工具从下一次模型请求起才可调用。
+    """把已有的 last-good 模块激活到当前聊天，让它的说明和整组函数可用；不读磁盘，因此不会应用刚改的源码。新激活的工具从下一次模型请求起才可调用；激活属于本窗口，下一轮开局会自动装回，但超过 1 小时没被调用过就不再装回（会给你一条通告）。
 
     @param
     names: 模块名列表，不带 .py/.md 后缀，也不带 模块名__ 前缀；名字来自 list_tools

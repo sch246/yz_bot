@@ -32,11 +32,28 @@ def _current() -> dict[str, Any]:
 
 
 def is_op(user_or_msg: int | dict[str, Any]) -> bool:
-    user_id = user_or_msg.get("user_id") if isinstance(user_or_msg, dict) else user_or_msg
+    """Whether this user -- or the author of this event -- is in the op domain.
+
+    WHY: 传事件时读的是 ``history.author``，不是顶层 ``user_id``。私聊窗口的 ``user_id``
+    是**窗口对端**，Bot 自己发的话也带着对端的 id，于是"这是谁"在那个字段上问不出来；
+    ``sender.user_id`` 才是两种窗口下都指向作者的字段（与 ``history.same_author``、
+    ``chat.msg2chat`` 同一条约定）。传整数时它就是那个人自己的 id，没有这层区分。
+
+    这条区分是为了让"以 Bot 自己的身份在当前窗口注入一条命令"能过 op 门：窗口仍由
+    顶层 ``user_id`` 决定，作者由 ``sender.user_id`` 声明。
+    """
+    if isinstance(user_or_msg, dict):
+        user_id = history.author(user_or_msg)
+    else:
+        user_id = user_or_msg
     return user_id is not None and int(user_id) in ops
 
 
-def require_op(msg: dict[str, Any] | None = None, remind: bool = True) -> bool:
+def require_op(
+    msg: dict[str, Any] | None = None,
+    remind: bool = True,
+    pattern: str = r"^(?:!|\.op)",
+) -> bool:
     """Return whether this event is in the host-level trusted op domain."""
     if msg is None:
         msg = _current()
@@ -45,7 +62,10 @@ def require_op(msg: dict[str, Any] | None = None, remind: bool = True) -> bool:
     # WHY: 这是全仓库的提醒节流约定——同一窗口最近若干条里已经出现过同类尝试，就不再
     # 重复提醒，否则一个人连点几次会把群刷满。判据是聊天记录而不是计时器或计数器，因为
     # 记录本来就在，不需要再引入一份状态。post.py 的 .post 提醒用的是同一个模式。
-    if remind and not history.any_same(msg, r"^(?:!|\.op)"):
+    # WHY: *pattern* 是"同类尝试"的范围，默认是 ``!``/``.op`` 这一族；op 专属的 ``#``
+    # 子命令（hint）借用这套提醒时换成自己的命令词，节流才落在同一个人的同类重试上，
+    # 而不是每次点一下都提醒一遍。
+    if remind and not history.any_same(msg, pattern):
         from mods import message
 
         group_id = msg.get("group_id")

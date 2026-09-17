@@ -11,7 +11,7 @@ import threading
 
 from openai import OpenAI
 
-from mods import image
+from mods import image, watchdog
 from . import console
 from .models import (
     BYTECAT_PROVIDER_CONFIG,
@@ -19,6 +19,7 @@ from .models import (
     DEFAULT_VISION_MODEL,
     DEFAULT_REQUEST_TIMEOUT,
     default_config as _default_config,
+    provider_config,
     resolve_model,
     split_model_selection,
 )
@@ -26,7 +27,7 @@ from .tools import Tool
 from .types import LLMResponse, ModelCapabilities, ToolCallResult
 
 
-LOAD_AFTER = ("image", "storage")
+LOAD_AFTER = ("image", "storage", "watchdog")
 _log = logging.getLogger(__name__)
 
 # WHY: 自动图片描述路径固定使用这段 prompt（_get_image_description 调 describe_image 时
@@ -54,6 +55,65 @@ def format_image_reference(uri: str, label: str = "图片") -> str:
 def format_image_description(uri: str, description: str | None = None) -> str:
     detail = description or "图片解析失败"
     return f"[图片识别结果：{detail}]" if not uri or uri.startswith("data:image/") else f"[图片({uri})识别结果：{detail}]"
+
+
+def usage_cached_tokens(usage) -> int:
+    """一次响应的 usage 里，prompt 中命中缓存的那部分 token 数。
+
+    WHY: 两家字段名不同——DeepSeek 直接给 `prompt_cache_hit_tokens`，OpenAI 一系放在
+    `prompt_tokens_details.cached_tokens`。都读不到就返回 0，那时整段 prompt 按未命中价
+    算：宁可高估也不漏算，命中数只有供应商能报，本地猜不出来。
+    """
+    value = getattr(usage, "prompt_cache_hit_tokens", None)
+    if value is None:
+        details = getattr(usage, "prompt_tokens_details", None)
+        value = getattr(details, "cached_tokens", None) if details is not None else None
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+_MAX_LISTED_TOOLS = 40
+
+
+def _unavailable_message(name: str, available: list[str], problem: str | None = None) -> str:
+    """一次没能执行的工具调用要回给模型什么，见 UnavailableTool。
+
+    @param
+    name: 模型叫的那个名字
+    available: 本轮快照里真正可用的工具名
+    problem: 非 None 时说明坏在哪一步，而不是"名字不存在"
+    """
+    shown = ", ".join(available[:_MAX_LISTED_TOOLS])
+    if len(available) > _MAX_LISTED_TOOLS:
+        shown += f"，等共 {len(available)} 个"
+    head = f"工具 {name} 这次调用没能执行：{problem}。" if problem else f"工具 {name} 不在本轮可用工具里。"
+    return (
+        head
+        + f"本轮可用：{shown}。"
+        + "如果它属于某个还没激活的模块，先调用 load_tools 激活那个模块再重试；"
+        + "如果名字写错了，改用上面列出的名字。"
+    )
+
+
+class UnavailableTool:
+    """兜住一次"本轮调不到"的工具调用，让模型能在同一轮里自己改正。
+
+    WHY: 未知名字原先在解析那段抛 KeyError，被同一个 except 连同这次调用一起吞掉：
+    pending_calls 变空后那条 assistant 消息既无 tool_calls 也无内容，chat 循环直接
+    return，整轮静默结束，模型连"这个名字不存在"都看不到。这里合成一条正常的 tool
+    结果——assistant.tool_calls 与 tool 消息依然成套，协议合法，模型看到提示后可以
+    改名字、或者先 load_tools 把模块激活起来。
+    """
+
+    def __init__(self, name: str, available: list[str], problem: str | None = None) -> None:
+        self.name = name
+        self._content = _unavailable_message(name, available, problem)
+
+    def call(self, **arguments) -> str:
+        return self._content
+
 
 
 _MARKDOWN_IMAGE = re.compile(r"!\[.*?\]\((.*?)\)")
@@ -166,6 +226,16 @@ class _DescriptionTask:
 
 class LLMClient:
     def __init__(self, config: dict) -> None:
+        # WHY: 这里是**活引用**，不是副本：on_load 传进来的正是 storage 的
+        # ``llm_system/config`` 本身，靠它实现"文件改了，运行中的客户端立刻看得见"（见
+        # storage._replace 的 WHY）。别为了"安全"改成 deepcopy，那会切断这条唯一的
+        # 配置热更新路径。
+        # 代价是一个自指写法会静默清空整个配置：``client.config.clear()`` 之后
+        # ``client.config.update(新配置)``，只要那个"新配置"就是 client.config 本身，
+        # 就是先清空再拿清空后的自己更新自己——配置变成 {}，接着一次 _write_one 把 {}
+        # 写进磁盘，reload_clients() 又会把 clients 建成空的，进程从此不能说一句话
+        # （2026-09-17 就是这么崩的）。热换配置要改那个**共享字典**（storage.load、
+        # 或就地 update 一份独立构造的内容），再调 reload_clients()。
         self.config = config
         self.clients: dict[str, OpenAI] = {}
         self._description_inflight: dict[tuple[str, object], _DescriptionTask] = {}
@@ -208,6 +278,7 @@ class LLMClient:
             "vision": False,
             "function_calling": False,
             "prompt_price": 0.0,
+            "prompt_cached_price": 0.0,
             "completion_price": 0.0,
         }.items()}
         return ModelCapabilities(**known)
@@ -222,6 +293,25 @@ class LLMClient:
             return None
         return selection if capabilities.get("vision") else None
 
+    def list_models(self, provider: str) -> list[str] | None:
+        """问 provider 要它当前提供的模型 id 列表；取不到返回 None。
+
+        WHY: 模型清单的权威在对端，本地 models 只是价格与能力元数据，所以能取到就以对端
+        为准。取不到时退回本地配置而不是抛给调用方——一条查看用的命令不该因为网络或密钥
+        失败变成报错。失败原因进 llm 流，聊天里只说已回退，见 chat._models_report。
+        """
+        client = self.clients.get(provider)
+        if client is None:
+            return None
+        try:
+            page = client.models.list()
+        except Exception as error:
+            # 调用方回退到本地列表，这是一次被恢复的失败：红字进 llm 流。
+            console.error(f"取 {provider} 的在线模型列表失败：{error}")
+            return None
+        items = getattr(page, "data", page)
+        return [str(item.id) for item in items if getattr(item, "id", None)]
+
     @staticmethod
     def _replace_images_with_text(messages: list[dict], description: str = "") -> list[dict]:
         def replace(uri: str) -> list[dict]:
@@ -234,9 +324,15 @@ class LLMClient:
     @staticmethod
     def _convert_images(messages: list[dict], convert_url: Callable[[str], str]) -> list[dict]:
         def replace(uri: str) -> list[dict]:
+            # WHY: 一次对话里同一张图只走一遍这条路径。台账判定失败的直接给占位文本，
+            # 不再重复下载、也不再每轮报一次错；已经查过的成功图静默复用，不刷日志。
+            if image.checked_failed(uri):
+                return [_text_part(format_image_description(uri))]
+            quiet = image.checked_in_conversation(uri)
             parts: list[dict] = []
             try:
-                console.notice(f"🖼️ 正在准备视觉图片：{console.format_uri(uri)}")
+                if not quiet:
+                    console.notice(f"🖼️ 正在准备视觉图片：{console.format_uri(uri)}")
                 data_uri = uri if uri.startswith("data:") else convert_url(uri)
                 if uri and not uri.startswith("data:"):
                     parts.append(_text_part(f"[下方图片的原始链接: {uri}]"))
@@ -244,13 +340,15 @@ class LLMClient:
                 parts.extend({"type": "image_url", "image_url": {"url": value}} for value in slices)
                 if split:
                     parts.append(_text_part(image.AUTO_IMAGE_SPLIT_PROMPT))
-                    console.notice(f"✅ 长图已切分为 {len(slices)} 张视觉输入")
-                else:
+                    if not quiet:
+                        console.notice(f"✅ 长图已切分为 {len(slices)} 张视觉输入")
+                elif not quiet:
                     console.notice("✅ 视觉图片已准备")
             except Exception as error:
-                console.error(
-                    f"❌ 图片处理失败（{console.format_uri(uri)}）：{error}"
-                )
+                if not quiet:
+                    console.error(
+                        f"❌ 图片处理失败（{console.format_uri(uri)}）：{error}"
+                    )
                 parts.append(_text_part(format_image_description(uri)))
             return parts
 
@@ -348,11 +446,18 @@ class LLMClient:
             return self._replace_images_with_text(messages, "图片，未配置可用的视觉模型")
 
         def replace(uri: str) -> list[dict]:
-            console.notice(f"🖼️ 检查图片：{console.format_uri(uri)}")
+            # WHY: 同 _convert_images——一次对话里同一张图只检查一遍。已判定失败的直接给
+            # 占位文本（不再重试、不再报错），已查过的成功图静默复用那段描述。
+            if image.checked_failed(uri):
+                return [_text_part(format_image_description(uri))]
+            quiet = image.checked_in_conversation(uri)
+            if not quiet:
+                console.notice(f"🖼️ 检查图片：{console.format_uri(uri)}")
             try:
                 description = self._get_image_description(uri, vision_model, cache)
             except Exception as error:
-                console.error(f"❌ 图片描述失败：{error}")
+                if not quiet:
+                    console.error(f"❌ 图片描述失败：{error}")
                 description = None
             return [_text_part(format_image_description(uri, description))]
 
@@ -393,7 +498,7 @@ class LLMClient:
         if client is None:
             raise ValueError(f"Provider {provider} not configured")
         capabilities = ModelCapabilities(**{key: raw_capabilities.get(key, default) for key, default in {
-            "vision": False, "function_calling": False, "prompt_price": 0.0, "completion_price": 0.0,
+            "vision": False, "function_calling": False, "prompt_price": 0.0, "prompt_cached_price": 0.0, "completion_price": 0.0,
         }.items()})
         if do_process_image:
             messages = self._convert_images(messages, image.image_uri_to_data_uri) if capabilities.vision else self._describe_images(messages, description_cache or {})
@@ -472,7 +577,7 @@ class LLMClient:
                         "tool",
                     )
             if usage:
-                yield LLMResponse("", role, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens)
+                yield LLMResponse("", role, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens, cached_tokens=usage_cached_tokens(usage))
             return LLMResponse(
                 assistant_content,
                 role,
@@ -505,7 +610,7 @@ class LLMClient:
             console.message(message.content, role, label=f"{role}({model}): ", label_role=role)
             yield LLMResponse(message.content, role)
         if response.usage:
-            yield LLMResponse("", "assistant", response.usage.prompt_tokens, response.usage.completion_tokens, response.usage.total_tokens)
+            yield LLMResponse("", "assistant", response.usage.prompt_tokens, response.usage.completion_tokens, response.usage.total_tokens, cached_tokens=usage_cached_tokens(response.usage))
         return LLMResponse(
             message.content or "",
             message.role or "assistant",
@@ -589,13 +694,29 @@ class LLMClient:
                 try:
                     call = json.loads(chunk.content)
                     function = call["function"]
-                    tool = mapping[function["name"]]
-                    arguments = json.loads(function["arguments"] or "{}")
-                    pending_calls.append((call, tool, arguments))
                 except Exception as error:
-                    _log.exception("failed to process LLM tool call")
-                    console.error(f"工具调用处理失败：{error}")
+                    # WHY: 这里剩下的只有"协议层就坏了"的情形，没有可自救的东西，
+                    # 记录并跳过这一次；"名字不在快照里"已经不算失败，见 UnavailableTool。
+                    _log.exception("failed to parse LLM tool call")
+                    console.error(f"工具调用解析失败：{error}")
                     yield chunk
+                    continue
+                name = function.get("name") or ""
+                tool = mapping.get(name)
+                if tool is None:
+                    # WHY: 多半是模型照上一轮的印象直呼（激活态已经变了），或者自己写错。
+                    # 丢掉它会让整轮静默结束，所以换成一个会说话的占位工具留在这批调用里。
+                    tool = UnavailableTool(name, sorted(mapping))
+                    arguments: dict = {}
+                else:
+                    try:
+                        arguments = json.loads(function["arguments"] or "{}")
+                    except Exception as error:
+                        _log.exception("failed to parse LLM tool arguments")
+                        console.error(f"工具参数解析失败：{error}")
+                        tool = UnavailableTool(name, sorted(mapping), f"参数不是合法 JSON（{error}）")
+                        arguments = {}
+                pending_calls.append((call, tool, arguments))
 
             assistant_message = {"role": assistant.role, "content": assistant.content}
             # WHY: keep_reasoning=False 时置成空字符串而不是删掉字段。两种写法都实跑
@@ -619,7 +740,17 @@ class LLMClient:
             # tool 消息成套出现，否则供应商拒。
             round_id = pending_calls[0][0]["id"]
             for call, tool, arguments in pending_calls:
+                if should_stop is not None and should_stop():
+                    # WHY: 这是 ^C 够得到的最后一个检查点。工具是同步执行的，原先只在这一批
+                    # 全部跑完之后才有机会看这个标记——于是这批里只要有一个调用卡住，排在它
+                    # 后面的每一个都照跑，^C 迟迟不生效。已经补齐的 tool 消息就留在那儿：这一轮
+                    # 的 messages 随轮次结束丢弃（每轮都从 history 重建），不做半轮修补。
+                    return
                 function = call["function"]
+                # WHY: 登记这次调用期间 spawn 的子进程，^C 才能真的把它们 kill 掉（卡住的
+                # grep 就是这一类）。有意**不**登记本线程：工具写到一半时被掀翻，换来的不是
+                # "停住了"而是"半成品"。见 mods/watchdog。
+                job = watchdog.begin()
                 try:
                     content = str(tool.call(**arguments))
                 except Exception as error:
@@ -627,6 +758,8 @@ class LLMClient:
                     console.error(f" -> {content}")
                 else:
                     console.message(f" -> {content}", "tool")
+                finally:
+                    watchdog.end(job)
                 result = ToolCallResult(call["id"], function["name"], function["arguments"], content)
                 if on_tool_result is not None:
                     # WHY: 先记录原始 content，再把 cid 前缀加到发给模型的那一份上。轨道里

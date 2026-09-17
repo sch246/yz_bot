@@ -27,6 +27,7 @@ import logging
 from pathlib import Path
 import sys
 import threading
+import time
 import traceback as traceback_module
 from types import MappingProxyType, ModuleType
 from typing import get_type_hints
@@ -39,6 +40,17 @@ _SOURCE_SUFFIXES = frozenset({".py", ".md"})
 _BASE_MODULE_NAME = "meta"
 # 恢复入口：meta 必须导出这四个，少一个模型就没法自救。可以多导出别的。
 _BASE_TOOL_NAMES = ("exec_code", "list_tools", "reload_tools", "load_tools")
+# 窗口里多久没被调用过的工具模块就不再装回去（秒）。见 SessionBinding.restore 与 touch。
+_IDLE_RECLAIM_SECONDS = 3600.0
+
+
+def _human_time(seconds: float) -> str:
+    """Render a duration like 3600.0 as `1 小时` for the reclaim notice."""
+    if seconds >= 3600 and seconds % 3600 == 0:
+        return f"{seconds / 3600:g} 小时"
+    if seconds >= 60 and seconds % 60 == 0:
+        return f"{seconds / 60:g} 分钟"
+    return f"{seconds:g} 秒"
 _current_binding_var: ContextVar[SessionBinding | None] = ContextVar(
     "tool_session_binding", default=None
 )
@@ -62,6 +74,10 @@ class ToolModule:
     tools: Mapping[str, Tool]
     source_suffix: str
     source: bytes
+    # WHY: 模块自己声明"只在 op 发起的轮里可见"。它是模块的属性而不是门控本身——门控是
+    # op_tool_visible，两边分开，因为"哪些模块受限"是模块作者的事，"这一轮算不算 op 轮"
+    # 是运行期的判断。见 op_tool_visible 与 docs/working/proposals/op-toolbox.md 决定三。
+    op_only: bool = False
 
 
 class ToolRegistry:
@@ -217,6 +233,7 @@ class ToolRegistry:
                 MappingProxyType({}),
                 ".md",
                 source,
+                False,
             )
         return self._load_python(name, path, source)
 
@@ -281,6 +298,7 @@ class ToolRegistry:
             MappingProxyType(tools),
             ".py",
             source,
+            bool(getattr(candidate, "OP_ONLY", False)),
         )
 
     def _prepare_import_package(self) -> str:
@@ -432,13 +450,12 @@ def _framed(body: str) -> str:
 # WHY: 这是**基线**，只在 bind 时渲染一次，之后永不改写。工具变动走 _announce 追加到
 # 上下文末尾，见那边的说明。
 def _render_context(
-    registry: ToolRegistry,
+    catalog: Mapping[str, ToolModule],
     active: Mapping[str, ToolModule],
 ) -> str:
-    modules = registry.modules
     lines = ["## 可用工具模块"]
-    if modules:
-        lines.extend(f"- {name}: {module.description}" for name, module in modules.items())
+    if catalog:
+        lines.extend(f"- {name}: {module.description}" for name, module in catalog.items())
     else:
         lines.append("- (无)")
     result = "\n".join(lines)
@@ -459,14 +476,53 @@ _UI_POINTER = (
 )
 
 
+def op_tool_visible(name: str, module: ToolModule) -> bool:
+    """Whether one module may be shown and loaded in the turn running right now.
+
+    WHY: 只有声明了 ``OP_ONLY = True`` 的模块受限，判据是**当轮触发者**是不是 op。窗口
+    相同、轮次不同，答案可以不同（同一个群里这轮是管理员、下轮是普通成员），所以它每次
+    现算，结果不进目录缓存。
+    """
+    if not getattr(module, "op_only", False):
+        return True
+    try:
+        from mods import context, op
+    except Exception:
+        return False
+    try:
+        return bool(op.is_op(context.current() or {}))
+    except Exception:
+        return False
+
+
+def _visible_catalog(
+    registry: ToolRegistry, visible: Callable[[str, ToolModule], bool] | None
+) -> dict[str, ToolModule]:
+    """The subset of last-good modules this turn is allowed to see.
+
+    WHY: 目录来自**进程全局**的 registry，而"这一轮谁在说话"是**按窗口、按轮**的。两个
+    维度不同，所以过滤发生在每次渲染，而不是在 registry 里删模块——删掉会连非 op 的窗口
+    一起失去能力（op-toolbox 提案的决定三）。
+    """
+    pick = op_tool_visible if visible is None else visible
+    return {
+        name: module
+        for name, module in registry.modules.items()
+        if pick(name, module)
+    }
+
+
 def create_context_message(
-    *, registry: ToolRegistry | None = None, ui_mode: bool = False
+    *,
+    registry: ToolRegistry | None = None,
+    ui_mode: bool = False,
+    visible: Callable[[str, ToolModule], bool] | None = None,
 ) -> dict[str, str]:
     """Create the baseline module catalog; later changes are appended, not rewritten."""
     selected = default_registry if registry is None else registry
     if ui_mode:
         return {"role": "system", "content": _UI_POINTER}
-    return {"role": "system", "content": _render_context(selected, {})}
+    return {"role": "system", "content": _render_context(_visible_catalog(selected, visible), {})}
 
 
 class SessionBinding:
@@ -479,6 +535,9 @@ class SessionBinding:
         *,
         registry: ToolRegistry,
         ui_mode: bool = False,
+        visible: Callable[[str, ToolModule], bool] | None = None,
+        persist: Callable[[Mapping[str, float]], None] | None = None,
+        ttl: float | None = _IDLE_RECLAIM_SECONDS,
     ) -> None:
         if not isinstance(context_message, dict) or context_message.get("role") != "system":
             raise TypeError("context_message must be an existing system message dict")
@@ -487,7 +546,17 @@ class SessionBinding:
         self.session = session
         self.context_message = context_message
         self.registry = registry
+        self.visible = op_tool_visible if visible is None else visible
+        # 激活集合每变一次就回调一次，写到哪儿由调用方决定：连续聊天写本窗口 storage，
+        # 子会话不传。见 restore 与 _save_active。
+        self.persist = persist
+        # 空闲多久就把模块收回去（秒）；None 或 <=0 表示不收，见 restore。
+        self.ttl = ttl
         self.active: dict[str, ToolModule] = {}
+        # 每个激活模块最后一次被调用的时刻，见 touch。先活在内存里，落盘由 _save_active 做。
+        self._touched: dict[str, float] = {}
+        # 有没有还没落盘的使用时刻：只是省掉“没有变化也写一次 storage”。
+        self._dirty = False
         self._lock = threading.RLock()
         meta = self.registry.get(_BASE_MODULE_NAME)
         if meta is None:
@@ -504,12 +573,70 @@ class SessionBinding:
                 add_hint(self._state_hint)
             return
         # 追加模式：基线在 bind 时写一次，之后这条消息不再变，变动走 _announce 追加。
-        self.context_message["content"] = _render_context(self.registry, self.active)
+        self.context_message["content"] = _render_context(self._catalog(), self.active)
         register = getattr(session, "add_context_provider", None)
         if callable(register):
             register(self._take_announcements)
         if callable(add_hint):
             add_hint(self._drift_hint)
+
+    def restore(self, entries: Mapping[str, float] | Iterable[str]) -> list[str]:
+        """Re-activate a window's persisted modules at bind time, without announcing.
+
+        WHY: 激活是**窗口级**状态。每次变化都由 `_save_active` 交给调用方持久化（连续聊天
+        写本窗口 storage），所以每个新 `Chat` 开局都要把这些模块装回来，装回本身就是这一
+        层存在的理由，见 `chat._persist_modules`。
+
+        WHY: 装回**本身**不发 `_announce`。此刻还没有任何模型请求，对模型来说什么都没
+        "发生"，把已激活模块的正文直接渲染进基线那条目录消息就够了；而 `_announce` 比的是
+        前后全量，开局时"前"只有 meta，于是每轮都会把这次装回的模块报成"已激活"并各附一份
+        正文副本。`load` 仍然只用于"模型刚要求激活"，那里的通告才是它要的反馈。
+
+        WHY: 装不回来的名字就地丢掉。判据用 `visible`：op-only 模块只在 op 那一轮可见，
+        窗口在普通轮里恢复它必然失败，留着只会每轮报一次加载失败；丢掉无害，它上一轮已经
+        用完了。丢掉的同时回写一次，storage 里不会一直挂着装不回来的名字。
+
+        WHY: 超过 `self.ttl` 没被调用过的也丢掉，这是"只进不出"的解药——不丢的话每次
+        `load_tools` 都会永久留在这个窗口里，每轮都往基线消息里渲染一份正文。判据放在
+        **开局**：轮中间把工具抽走会让模型手上的快照和它下一句要调的名字对不上，而开局
+        收掉的模块，从这一轮的目录消息起就不在了。旧格式（只存名字的列表）由调用方补上
+        "就是刚才用过"，见 `chat._active_modules`。
+
+        WHY: 被丢掉的要发一条通告，装回的不发，见 `_queue_reclaimed`。
+        """
+        now = time.time()
+        if isinstance(entries, Mapping):
+            stamps = {
+                name: float(stamp)
+                for name, stamp in entries.items()
+                if isinstance(name, str) and isinstance(stamp, (int, float))
+            }
+        else:
+            stamps = {name: now for name in _requested_names(entries) if isinstance(name, str)}
+        with self._lock:
+            requested = [name for name in stamps if name and name != _BASE_MODULE_NAME]
+            kept: list[str] = []
+            reclaimed: list[tuple[str, str]] = []
+            for name in requested:
+                module = self.registry.get(name)
+                if module is None or not self.visible(name, module):
+                    reclaimed.append((name, "本轮不可用"))
+                    continue
+                stamp = stamps[name]
+                if self.ttl is not None and self.ttl > 0 and now - stamp > self.ttl:
+                    _log.debug("reclaiming idle tool module from window: %s", name)
+                    reclaimed.append((name, "空闲收回"))
+                    continue
+                self._activate(module, touched_at=stamp)
+                kept.append(name)
+            if not self.ui_mode:
+                # UI 模式的工具状态整块挂在末尾，每次子请求重算，这里不用碰。
+                self.context_message["content"] = _render_context(self._catalog(), self.active)
+            if kept != requested or self._dirty:
+                self._save_active()
+            if reclaimed:
+                self._queue_reclaimed(reclaimed)
+            return kept
 
     def load(self, names: str | Iterable[str]) -> dict[str, dict]:
         """Activate only in-memory last-good modules in this session."""
@@ -522,6 +649,10 @@ class SessionBinding:
                     module = self.registry.get(name)
                     if module is None:
                         raise KeyError(f"no last-good tool module: {name}")
+                    if not self.visible(name, module):
+                        # WHY: 目录里不列它，但模型可能记得名字直接 load。门控必须在**激活**
+                        # 这一层再拦一次，否则目录只是"没提示"，不是"没能力"。理由见决定三。
+                        raise PermissionError(f"tool module not available in this turn: {name}")
                     previous = self.active.get(name)
                     self._activate(module)
                     results[name] = {"action": "replaced" if previous is not None else "activated"}
@@ -530,6 +661,7 @@ class SessionBinding:
                         "failed to activate tool module %r", requested_name
                     )
             self._announce(before)
+            self._save_active()
         return results
 
     def reload(self, names: str | Iterable[str]) -> dict[str, dict]:
@@ -559,6 +691,7 @@ class SessionBinding:
                     self.registry.record_failure(result_name, failure["error"])
                     results[result_name] = failure
             self._announce(before)
+            self._save_active()
         return results
 
     def _drift_hint(self) -> str:
@@ -617,7 +750,7 @@ class SessionBinding:
         except Exception:
             _log.exception("failed to scan tool sources for the state hint")
             changes = {}
-        modules = self.registry.modules
+        modules = self._catalog()
         lines = ["当前工具状态（本块位于你所有修改之后，是唯一权威）：", "", "## 可用工具模块"]
         if modules:
             lines.extend(
@@ -645,7 +778,7 @@ class SessionBinding:
 
     def list_text(self) -> str:
         """Describe last-good, active, failed, and changed modules."""
-        modules = self.registry.modules
+        modules = self._catalog()
         changes = self.registry.scan()
         failures = self.registry.failures
         lines = ["可用模块:"]
@@ -670,7 +803,16 @@ class SessionBinding:
             lines.extend(f"- {name}:\n{error}" for name, error in failures.items())
         return "\n".join(lines)
 
-    def _activate(self, module: ToolModule) -> None:
+    def _catalog(self) -> dict[str, ToolModule]:
+        """This turn's visible subset of last-good modules; recomputed at each render."""
+        return _visible_catalog(self.registry, self.visible)
+
+    def _activate(self, module: ToolModule, touched_at: float | None = None) -> None:
+        """Install ``module``'s tools in this session, stamping when it was last used.
+
+        WHY: `touched_at` 只有 `restore` 会传，而且必须传——它带的是磁盘上那次使用的
+        时刻，拿“现在”顶替的话，每轮开局都会把一切刷成刚用过，空闲回收永远不触发。
+        """
         module = self._bind_module(module)
         previous = self.active.get(module.name)
         previous_tools = dict(previous.tools) if previous is not None else {}
@@ -690,6 +832,8 @@ class SessionBinding:
             functions.pop(name)
         functions.update(module.tools)
         self.active[module.name] = module
+        self._touched[module.name] = time.time() if touched_at is None else touched_at
+        self._dirty = True
 
     def _bind_module(self, module: ToolModule) -> ToolModule:
         if module.name != _BASE_MODULE_NAME:
@@ -715,6 +859,7 @@ class SessionBinding:
             MappingProxyType(tools),
             module.source_suffix,
             module.source,
+            module.op_only,
         )
 
     def _deactivate(self, name: str) -> None:
@@ -728,12 +873,91 @@ class SessionBinding:
         for tool_name in previous.tools:
             functions.pop(tool_name)
         del self.active[name]
+        # 名字都没了，使用时刻留着只会让 _touched 无限长；下次 load 会重新盖上“现在”。
+        self._touched.pop(name, None)
+
+    def touch(self, tool_name: str) -> None:
+        """Refresh the last-use stamp of the module that owns ``tool_name``.
+
+        WHY: 空闲回收的判据是"用过没有"，而"用过"只有调用那一刻知道。不在这里等调用——
+        工具是 `llm` 那层直接 `tool.call(**arguments)` 执行的，它不认识 binding，所以由
+        调用方在工具结果回来时把名字递进来（`chat._oplog_recorder`，每个工具结果都经过
+        它）。名字是模型面向的那个（`<模块名>__<函数名>`）；`meta` 的工具没有前缀，不记，
+        反正它每轮都在。
+        """
+        prefix, sep, _tail = tool_name.partition("__")
+        if not sep or prefix not in self.active:
+            return
+        with self._lock:
+            self._touched[prefix] = time.time()
+            self._dirty = True
+
+    def _queue_reclaimed(self, reclaimed: list[tuple[str, str]]) -> None:
+        """Queue one appended notice about modules this window lost with nobody talking.
+
+        WHY: 收回必须让模型知道，理由和 `_announce` 那条一字不差：操作历史轨道里留着上一
+        轮那几次 `load_tools`，模型据此以为模块还在；它照着那个印象调名，而这一轮的快照里
+        没有这个名字，`llm` 解析时 `mapping[name]` 抛 KeyError，整个调用被丢掉，那一轮连
+        一条 tool 结果都没有就结束了（2026-09-17 `browser__open_page` 那次）。收回发生在
+        模型没说话的时候，所以这条通告是它**唯一**的信息来源：基线目录消息里少了一行，而
+        模型不会把那行和"我上一轮明明装载过"对上。
+
+        WHY: 不走 `_announce`。开局时"前"只有 meta，全量比较会把这次装回的模块全报成
+        "已激活"并各附一份正文副本，每轮都来一遍。这里只报丢掉的那几个。
+
+        WHY: UI 模式不发，和 `_announce` 同一条理由。整块状态挂在末尾、每次子请求重算，
+        本来就是最新的，再追加一条"变了什么"就又是两个副本并存。
+        """
+        if self.ui_mode:
+            return
+        grouped: dict[str, list[str]] = {}
+        for name, reason in reclaimed:
+            grouped.setdefault(reason, []).append(name)
+        lines = ["工具模块已变化（本条由系统追加，不是用户发言）："]
+        lines.extend(
+            f"- 已停用（{reason}）：{', '.join(sorted(names))}"
+            for reason, names in grouped.items()
+            if names
+        )
+        if grouped.get("空闲收回"):
+            limit = _human_time(self.ttl) if self.ttl else ""
+            lines.append(
+                f"空闲收回只按时限判断：超过 {limit} 没有被调用过的模块，新一轮开局就不再装回来"
+                "（你上一轮装载过它，这一轮它不在了）。需要时重新 `load_tools` 激活。"
+            )
+        if grouped.get("本轮不可用"):
+            lines.append("标记为「本轮不可用」的模块在它自己的轮里会重新出现，不用重复装载。")
+        self._announcements.append(_framed("\n".join(lines)))
+
+    def _save_active(self) -> None:
+        """Hand this window's activation set, with use stamps, to the storage owner.
+
+        WHY: 记的是**名**不是模块对象：storage 是 JSON，模块对象跨重启不存在，名才是
+        下次开局能装回去的东西。`meta` 不记——它按定义每次都在，记了反而多一个"恢复
+        一个必需模块失败"的失败面。值是该模块最后一次被调用的时刻，空闲回收要用，见
+        `touch` 与 `restore`。
+
+        WHY: 使用时刻在 `touch` 里只更新内存，不落盘——一次工具调用配一次 storage 写没有
+        必要。落盘的机会是装载/重载之后，以及下一轮开局 `restore`（那里 `_dirty` 为真就
+        写一次）。代价是进程正好在这中间重启会丢最后一轮的时刻，最坏让某个模块早一轮被
+        收回，可以接受。
+        """
+        if self.persist is None:
+            return
+        now = time.time()
+        self._touched = {name: stamp for name, stamp in self._touched.items() if name in self.active}
+        self.persist({
+            name: float(self._touched.get(name, now))
+            for name in sorted(self.active)
+            if name != _BASE_MODULE_NAME
+        })
+        self._dirty = False
 
     def _capture(self) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
         """Snapshot everything the model can currently see about tool modules."""
         return (
             {name: module.content for name, module in self.active.items()},
-            {name: module.description for name, module in self.registry.modules.items()},
+            {name: module.description for name, module in self._catalog().items()},
             dict(self.registry.failures),
         )
 
@@ -814,21 +1038,32 @@ default_registry = ToolRegistry()
 def bind_session(
     session,
     context_message: dict,
-    initial_modules: Iterable[str] = (),
+    initial_modules: Mapping[str, float] | Iterable[str] = (),
     *,
     registry: ToolRegistry | None = None,
     ui_mode: bool = False,
+    visible: Callable[[str, ToolModule], bool] | None = None,
+    persist: Callable[[Mapping[str, float]], None] | None = None,
+    ttl: float | None = _IDLE_RECLAIM_SECONDS,
 ) -> SessionBinding:
-    """Bind base tools and explicit module activation to an existing Chat."""
+    """Bind base tools, the window's persisted activation, and explicit modules.
+
+    `initial_modules` 走 `restore`：静默装回，装不回来的、以及超过 `ttl` 没被调用过的都
+    丢掉，都不发"已激活"通告（被丢掉的会收到一条收回通告）。旧格式的纯名字可迭代对象也
+    收，一律当成"就是刚才用过"。`persist` 给了的话，此后每次激活集合变化都会回调一次，
+    收到的是 `{模块名: 最后使用时刻}`。
+    """
     binding = SessionBinding(
         session,
         context_message,
         registry=default_registry if registry is None else registry,
         ui_mode=ui_mode,
+        visible=visible,
+        persist=persist,
+        ttl=ttl,
     )
-    initial = tuple(initial_modules)
-    if initial:
-        binding.load(initial)
+    if initial_modules:
+        binding.restore(initial_modules)
     return binding
 
 
