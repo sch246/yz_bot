@@ -187,3 +187,10 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+
+# 本机配置备份：里面是明文 API key，绝不入库
+*.bak
+
+# 用凭据/登录态抓取站点，含绕过反爬的实现，保持私有
+/mods/tools/baidumap.py
+/mods/tools/dianping.py
