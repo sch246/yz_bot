@@ -87,6 +87,7 @@ _page_lock = threading.RLock()
 _process: subprocess.Popen | None = None
 _port = 0
 _pages: dict[tuple, str] = {}
+# 主机名 -> 检查结论。只放**确定**的结论，见 _public_host。
 _host_cache: dict[str, str | None] = {}
 
 
@@ -399,35 +400,55 @@ def _parse_ip(value: str):
     return parsed
 
 
-def _resolve_public(host: str) -> str | None:
+def _resolve_public(host: str) -> tuple[str | None, bool]:
+    """检查一个主机名，返回 ``(不通过的理由或 None, 这个结论确不确定)``。
+
+    WHY: 结论分"确定"和"不确定"两种，因为只有前者可以被缓存。由**具体地址**得出的判断
+    是确定的：字面 IP 的性质、以及解析出地址之后对那些地址的判断，都不会因为再问一次而
+    改变。而 `gaierror`、没解析出地址、地址认不出来，说的是"这次没问出来"，不是主机的
+    性质——把它们记住，一次 DNS 抖动就会把某个域名钉死到进程重启，`.reboot` 成了 DNS
+    抖动的修法。见 _public_host。
+    """
     literal = _parse_ip(host)
     if literal is not None:
-        return None if literal.is_global else f"地址不对外（{host}）"
+        return (None if literal.is_global else f"地址不对外（{host}）"), True
     try:
         infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
     except socket.gaierror as error:
-        return f"域名解析失败（{error}）"
+        return f"域名解析失败（{error}）", False
     addresses = {info[4][0] for info in infos}
     if not addresses:
-        return "域名没有解析出地址"
+        return "域名没有解析出地址", False
     for address in addresses:
         parsed = _parse_ip(address.split("%")[0])
         if parsed is None:
-            return f"地址无法识别（{address}）"
+            return f"地址无法识别（{address}）", False
         if not parsed.is_global:
-            return f"解析到不对外地址（{address}）"
-    return None
+            return f"解析到不对外地址（{address}）", True
+    return None, True
 
 
 def _public_host(host: str) -> str | None:
-    """主机名不全是公网就返回理由，通过返回 None；结果按主机名缓存。"""
+    """主机名不全是公网就返回理由，通过返回 None。
+
+    WHY: 缓存只收**确定**的结论（见 _resolve_public），所以它不是一个纯粹按主机名记结果
+    的 cache：解析失败那一类每次都会重新问一次。代价是一次本地解析，换掉的是"网络抖一下
+    就把一个域名永久拉黑"。
+
+    WHY: 缓存**不过期**，而且检查与浏览器自己的解析之间必然有时间差（Chromium 不共享这
+    次结果，自己再解析一遍），所以 DNS rebinding 这条路只在第一次被拦住。这是明知接受的：
+    能靠它拿到的是宿主上的内网服务，而同一个模型手上的 exec_code 和 host 本来就能直接
+    读写这台机器，边际风险接近零。要改的话该改的是信任模型，不是在这里加一个 TTL 假装
+    挡住了。
+    """
     if not host:
         return "缺少主机名"
     key = host.strip("[]").lower()
     if key in _host_cache:
         return _host_cache[key]
-    reason = _resolve_public(key)
-    _host_cache[key] = reason
+    reason, settled = _resolve_public(key)
+    if settled:
+        _host_cache[key] = reason
     return reason
 
 
