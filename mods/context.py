@@ -125,7 +125,11 @@ class WindowTurn:
         self.key = key
         self._lock = threading.RLock()
         self._pending: list[dict] = []
-        self._triggered = False
+        # WHY: 记的是**触发事件本身**，不是一个 bool。续跑的那一轮属于要求它的那个人，
+        # 而"属于谁"决定了那一轮的 op 门（tools.op_tool_visible 问的就是当前事件）。
+        # 只留一个 bool 的话，续轮只能沿用开轮那个人的身份，群里任何成员都能在管理员
+        # 开的轮之后要来一轮、并在那一轮里看见 op 专属模块。见 chat.chat 的续轮分支。
+        self._trigger_event: dict | None = None
         self._cancelled = False
 
     def interject(self, event: dict, *, trigger: bool = False) -> None:
@@ -138,7 +142,7 @@ class WindowTurn:
         with self._lock:
             self._pending.append(event)
             if trigger:
-                self._triggered = True
+                self._trigger_event = event
 
     def take_pending(self) -> list[dict]:
         """Hand over everything queued so far, leaving the trigger flag alone."""
@@ -146,19 +150,25 @@ class WindowTurn:
             pending, self._pending = self._pending, []
             return pending
 
-    def mark_trigger(self) -> None:
-        """Ask for one more round without queueing an event.
+    def mark_trigger(self, event: dict) -> None:
+        """Ask for one more round, on behalf of *event*, without queueing it.
 
         The event is already in history, so the next round's context rebuild sees
-        it; what is missing is only the reason to run that round.
+        it; what is missing is only the reason to run that round -- and who that
+        round belongs to.
         """
         with self._lock:
-            self._triggered = True
+            self._trigger_event = event
 
-    def consume_trigger(self) -> bool:
-        """Report and clear whether a triggering message arrived this round."""
+    def consume_trigger(self) -> dict | None:
+        """Report and clear which message asked for another round, if any.
+
+        WHY: 同一轮里来了好几次触发时，留下的是**最后**那一次——续跑的是"最近一次还没被
+        回答的请求"。方向上也更安全：非 op 在 op 之后再要一轮只会把这轮降成普通轮，反过来
+        要抬高身份，op 自己必须真的开口。
+        """
         with self._lock:
-            triggered, self._triggered = self._triggered, False
+            triggered, self._trigger_event = self._trigger_event, None
             return triggered
 
     def cancel(self) -> None:
@@ -201,8 +211,11 @@ def end_turn(key: Any, turn: WindowTurn) -> None:
             del _turns[key]
 
 
-def finish_turn(key: Any, turn: WindowTurn) -> bool:
-    """Close *key*'s turn, or keep it open when a trigger arrived.
+def finish_turn(key: Any, turn: WindowTurn) -> dict | None:
+    """Close *key*'s turn, or keep it open for the message that asked for more.
+
+    Returns that message, so the caller can run the extra round **as** its author
+    instead of as whoever opened the turn; ``None`` closes the turn.
 
     Checking the flag and removing the registration under one lock is what keeps
     an at-message that lands right as the turn ends from being dropped: either it
@@ -210,11 +223,12 @@ def finish_turn(key: Any, turn: WindowTurn) -> bool:
     turn of its own.
     """
     with _lock:
-        if turn.consume_trigger():
-            return True
+        triggered = turn.consume_trigger()
+        if triggered is not None:
+            return triggered
         if _turns.get(key) is turn:
             del _turns[key]
-        return False
+        return None
 
 
 def cancel_turn(key: Any) -> bool:

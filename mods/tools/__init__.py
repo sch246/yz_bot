@@ -555,6 +555,12 @@ class SessionBinding:
         self.active: dict[str, ToolModule] = {}
         # 每个激活模块最后一次被调用的时刻，见 touch。先活在内存里，落盘由 _save_active 做。
         self._touched: dict[str, float] = {}
+        # WHY: 这一轮装不回来、但**不该从窗口里删掉**的模块（名 -> 它原来的使用时刻）。
+        # 目前只有一种来源：OP_ONLY 模块在非 op 的轮里不可见。它在这一轮确实不存在，可是
+        # 窗口并没有停用它——下一次 op 自己开的轮里它就该回来。落盘时与 active 一起写回，
+        # 见 _save_active；时刻用**原来**那个，所以它照样会被 restore 的空闲回收收走，不需要
+        # 第二套回收规则。
+        self._deferred: dict[str, float] = {}
         # 有没有还没落盘的使用时刻：只是省掉“没有变化也写一次 storage”。
         self._dirty = False
         self._lock = threading.RLock()
@@ -592,9 +598,12 @@ class SessionBinding:
         前后全量，开局时"前"只有 meta，于是每轮都会把这次装回的模块报成"已激活"并各附一份
         正文副本。`load` 仍然只用于"模型刚要求激活"，那里的通告才是它要的反馈。
 
-        WHY: 装不回来的名字就地丢掉。判据用 `visible`：op-only 模块只在 op 那一轮可见，
-        窗口在普通轮里恢复它必然失败，留着只会每轮报一次加载失败；丢掉无害，它上一轮已经
-        用完了。丢掉的同时回写一次，storage 里不会一直挂着装不回来的名字。
+        WHY: 分两种。**源码没了**的名字就地丢掉并回写，它指向的东西已经不存在。而
+        `visible` 挡下的（op-only 模块落在非 op 的轮里）只是**这一轮**装不回来，窗口并没有
+        停用它——把它记进 `_deferred`，storage 里的记录连同原来的使用时刻一起留着，下一次
+        op 自己开的轮里照常装回。原先这两种一起删，于是管理员窗口里只要有普通成员接着说过
+        一句话，管理员下一轮就得重新 `load_tools`；而通告里那句"在它自己的轮里会重新出现"
+        也就成了假话。留着不会攒垃圾：时刻是原来那个，超过 `ttl` 照样被下面的空闲回收收走。
 
         WHY: 超过 `self.ttl` 没被调用过的也丢掉，这是"只进不出"的解药——不丢的话每次
         `load_tools` 都会永久留在这个窗口里，每轮都往基线消息里渲染一份正文。判据放在
@@ -619,13 +628,20 @@ class SessionBinding:
             reclaimed: list[tuple[str, str]] = []
             for name in requested:
                 module = self.registry.get(name)
-                if module is None or not self.visible(name, module):
-                    reclaimed.append((name, "本轮不可用"))
-                    continue
                 stamp = stamps[name]
+                if module is None:
+                    reclaimed.append((name, "已不存在"))
+                    continue
+                # WHY: 空闲回收排在可见性前面。反过来的话，一个一直不可见的模块永远走不到
+                # 这一步，`_deferred` 就会把它在 storage 里留成永久居民——而 ttl 正是那份
+                # 记录唯一的回收者。
                 if self.ttl is not None and self.ttl > 0 and now - stamp > self.ttl:
                     _log.debug("reclaiming idle tool module from window: %s", name)
                     reclaimed.append((name, "空闲收回"))
+                    continue
+                if not self.visible(name, module):
+                    self._deferred[name] = stamp
+                    reclaimed.append((name, "本轮不可用"))
                     continue
                 self._activate(module, touched_at=stamp)
                 kept.append(name)
@@ -832,6 +848,9 @@ class SessionBinding:
             functions.pop(name)
         functions.update(module.tools)
         self.active[module.name] = module
+        # 装上了就不再是"这一轮装不回来"的那种；两边同时挂着一个名字会让 _save_active
+        # 有两个时刻可选。
+        self._deferred.pop(module.name, None)
         self._touched[module.name] = time.time() if touched_at is None else touched_at
         self._dirty = True
 
@@ -926,7 +945,12 @@ class SessionBinding:
                 "（你上一轮装载过它，这一轮它不在了）。需要时重新 `load_tools` 激活。"
             )
         if grouped.get("本轮不可用"):
-            lines.append("标记为「本轮不可用」的模块在它自己的轮里会重新出现，不用重复装载。")
+            lines.append(
+                "标记为「本轮不可用」的模块在它自己的轮里会重新出现，不用重复装载——窗口里的"
+                "激活记录还留着，只是这一轮的发言者看不到它。"
+            )
+        if grouped.get("已不存在"):
+            lines.append("标记为「已不存在」的模块源码已经没了，窗口里的记录也一并清掉了。")
         self._announcements.append(_framed("\n".join(lines)))
 
     def _save_active(self) -> None:
@@ -941,14 +965,21 @@ class SessionBinding:
         必要。落盘的机会是装载/重载之后，以及下一轮开局 `restore`（那里 `_dirty` 为真就
         写一次）。代价是进程正好在这中间重启会丢最后一轮的时刻，最坏让某个模块早一轮被
         收回，可以接受。
+
+        WHY: 写回的是 `active` **加上** `_deferred`。后者这一轮没装、因此不在 `active` 里，
+        但它仍然属于这个窗口；只写 `active` 就等于让一轮普通聊天把管理员的激活记录删掉。见
+        `_deferred` 与 `restore`。
         """
         if self.persist is None:
             return
         now = time.time()
         self._touched = {name: stamp for name, stamp in self._touched.items() if name in self.active}
+        stamps = {name: stamp for name, stamp in self._deferred.items() if name not in self.active}
+        for name in self.active:
+            stamps[name] = float(self._touched.get(name, now))
         self.persist({
-            name: float(self._touched.get(name, now))
-            for name in sorted(self.active)
+            name: float(stamp)
+            for name, stamp in sorted(stamps.items())
             if name != _BASE_MODULE_NAME
         })
         self._dirty = False
