@@ -22,9 +22,7 @@
 
 `reload_tools` 从磁盘应用源码；`load_tools` 只激活 last-good，不能混用。没有自动 watcher，也不要等待修改自行生效。
 
-**用完就卸。** 每个激活模块都在提示词里占着一份正文，一直不卸就是一直占着；`unload_tools(["foo"])` 把它的说明和函数拿下来，本窗口的激活记录也一并清掉。判断依据就在 `list_tools` 里：它标出当前激活了哪些，你自己看哪些已经和手头的事无关了。
-
-导出了函数的模块另有一层兜底：一段时间没有任何函数被调用过，下一轮开局就不再装回，并给你一条"已停用（空闲收回）"的通告（确切时限见 `list_tools` 的"空闲回收"一节）。**没有导出函数的模块**——`.md` 技能，以及只提供说明的 `.py`——报告不了"用过"，所以不参与这层兜底，不会自己消失，只能你自己卸。
+激活会自己到期，你不需要收拾它：超过一段时间没有被装入或调用过的模块，下一轮开局就不再装回，并给你一条"已停用（空闲收回）"的通告，里面写着被收走的是哪个模块、干什么用的（确切时限见 `list_tools` 的"空闲回收"一节）。装入本身算一次"用过"，所以只靠读正文的模块（`.md` 技能，以及只提供说明的 `.py`）按装入时刻计时——**阅读不留痕迹**，读得再勤也不会续期。还要用就照通告说的重新 `load_tools`，那是一次往返，不必省。
 
 因为激活属于窗口，同一件事不需要每轮重复 `load_tools`，也不会因为一轮聊完就消失。会"自己消失"的情况有两种，都会以系统通告告诉你（内容里写明了原因）：**本轮不可用**（`op` 这类只在 op 轮可见的模块，在普通轮里装不上；窗口里的激活记录**仍然留着**，等它自己那种轮一到就会照常回来，不用重新装）和**空闲收回**（见上一段，记录会被清掉）。两种都只是"这一轮它不在了"——不要照着上一轮的印象直接调它的函数，本轮快照里没有那个名字，你会白跑一次（虽然会收到一条说明，告诉你本轮可用什么、要怎么激活）。
 
@@ -62,7 +60,7 @@ __all__ = ["lookup"]
 
 Python 模块可以正常 import 第三方依赖、其它 `mods`，也可以 `from ._helper import value` 引用同目录以下划线开头的 helper。候选加载会执行顶层代码，所以顶层只放 import、常量和定义；它与 Bot 处在同一宿主信任域，不是沙箱。
 
-写入后先调用 `reload_tools(["foo"])` 完成整模块校验并建立 last-good，再调用 `load_tools(["foo"])` 把余下说明和整组函数激活到当前 Chat；这件事做完之后用 `unload_tools(["foo"])` 卸掉。
+写入后先调用 `reload_tools(["foo"])` 完成整模块校验并建立 last-good，再调用 `load_tools(["foo"])` 把余下说明和整组函数激活到当前 Chat。
 
 ## 新增 Markdown Skill
 
@@ -75,13 +73,15 @@ Python 模块可以正常 import 第三方依赖、其它 `mods`，也可以 `fr
 ……
 ```
 
-Markdown 不需要 front matter、额外 summary 字段或同步机制，也不导出函数。目录不递归扫描；Skill 可在正文中引用子目录资源。写完同样先 `reload_tools(["foo"])`，需要在当前任务使用时再 `load_tools(["foo"])`。Skill 没有函数、因此不参与空闲回收：用完必须自己 `unload_tools(["foo"])`，否则它会一直占着提示词。
+Markdown 不需要 front matter、额外 summary 字段或同步机制，也不导出函数。目录不递归扫描；Skill 可在正文中引用子目录资源。写完同样先 `reload_tools(["foo"])`，需要在当前任务使用时再 `load_tools(["foo"])`。
 
 ## 修改
 
 先精确读取现有源文件，只修改目标模块，再调用 `reload_tools(["foo"])`。成功后 last-good 才替换；如果模块已在当前 Chat 激活，内容和函数会为下一次模型子请求更新。失败时根据返回的完整 traceback 修复并再次 reload，旧 last-good 和旧活动版本继续服务。仅调用 `load_tools` 不会读取刚改的磁盘文件。
 
 下划线 helper 不是独立模块，它的变化不会单独出现在 `list_tools` 中。修改 helper 后要显式 reload 所有 import 它的模块。
+
+`reload_tools` 换得动的只有 `mods/tools/` 下的那一个文件（外加它的下划线 helper）。它 `import` 的 `mods.*`——包括这套机制自己的 `mods/tools/__init__.py`——是进程启动时的那份，改了要重启才生效，典型症状是"说明书和工具清单里有、调用时 AttributeError"。这条边界的完整说明在仓库的 `docs/runtime.md`（"热更换得动什么"一节），需要重启时用 op 工具集的 `send_command` 注入 `.reboot`，重启后会在这个窗口接着开一轮，手上的事不会断。
 
 ## 删除
 
@@ -160,7 +160,7 @@ def exec_code(expr: str, code: str, timeout: float) -> str:
 
 
 def list_tools() -> str:
-    """列出全部 last-good 工具模块及其一句话描述、本窗口已激活的模块、空闲回收的规则与确切时限、磁盘相对 last-good 的新增/修改/删除，以及最近的加载失败 traceback。想知道有哪些模块名可用、或者该卸掉哪些时，先调用它。"""
+    """列出全部 last-good 工具模块及其一句话描述、本窗口已激活的模块、空闲回收的规则与确切时限、磁盘相对 last-good 的新增/修改/删除，以及最近的加载失败 traceback。想知道有哪些模块名可用时先调用它。"""
     return current_binding().list_text()
 
 
@@ -174,21 +174,12 @@ def reload_tools(names: list[str]) -> str:
 
 
 def load_tools(names: list[str]) -> str:
-    """把已有的 last-good 模块激活到当前聊天，让它的说明和整组函数可用；不读磁盘，因此不会应用刚改的源码。新激活的工具从下一次模型请求起才可调用；激活属于本窗口，下一轮开局会自动装回，所以用完要用 unload_tools 卸掉。导出了函数的模块长期没被调用会自动收回（规则与时限见 list_tools），没有函数的不会。
+    """把已有的 last-good 模块激活到当前聊天，让它的说明和整组函数可用；不读磁盘，因此不会应用刚改的源码。新激活的工具从下一次模型请求起才可调用；激活属于本窗口，下一轮开局会自动装回，长期没有被装入或调用过则自动收回（规则与时限见 list_tools）。
 
     @param
     names: 模块名列表，不带 .py/.md 后缀，也不带 模块名__ 前缀；名字来自 list_tools
     """
     return _format_results(current_binding().load(names))
-
-
-def unload_tools(names: list[str]) -> str:
-    """把已经用不上的模块从当前聊天卸掉：它的说明和函数从下一次模型请求起消失，本窗口的激活记录也一并清除，下一轮开局不再装回。每个激活模块都在提示词里占一份正文，用完就卸。meta 不能卸；本来就没激活的名字会如实告诉你，不算错误。
-
-    @param
-    names: 模块名列表，不带 .py/.md 后缀，也不带 模块名__ 前缀；当前激活了哪些见 list_tools
-    """
-    return _format_results(current_binding().unload(names))
 
 
 def condense_ops(cids: list[str], conclusion: str) -> str:
@@ -252,9 +243,6 @@ def _format_results(results: Mapping) -> str:
         "deleted": "已删除",
         "activated": "已激活",
         "replaced": "已替换",
-        "unloaded": "已停用",
-        "not_active": "本来就没激活，什么都没做",
-        "refused": "不能停用（它是恢复入口）",
     }
     succeeded = [
         f"- {name}: {action_labels.get(result['action'], result['action'])}"
@@ -279,7 +267,6 @@ __all__ = [
     "list_tools",
     "reload_tools",
     "load_tools",
-    "unload_tools",
     "condense_ops",
     "recall_ops",
 ]

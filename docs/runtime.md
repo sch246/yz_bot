@@ -86,6 +86,19 @@ LLM 的逐字输出不是流，而是终端的交互效果：它仍然直写 `sy
 
 HTTP 200 只表示事件已被本地监听器接收，不表示命令或回复执行成功。
 
+### 热更换得动什么
+
+`reload_tools` 的边界是**一个文件**：`mods/tools/<name>.py`（或 `.md`），外加它 `from ._helper import ...` 引用的同目录下划线 helper——候选执行前会清掉 registry 那个合成包下的条目，所以 helper 跟着重新读盘。
+
+它换不动别的任何东西。工具模块里的 `from mods import x` 拿到的是 `sys.modules` 里那份，也就是**进程启动时**加载的版本；`mods/tools/__init__.py` 这个 loader/registry 本体同样如此。所以：
+
+- 改 `mods/` 下的任何文件（含 `mods/tools/__init__.py`）→ 要重启；
+- 改 `mods/tools/<name>.py` → `reload_tools(["<name>"])` 就够。
+
+两者在同一批提交里一起改时会出现一个窗口：`meta.py` 的说明书和工具清单是热的、它描述的框架能力是冷的。2026-09-18 撞到过一次——进程起于合并之前，`reload_tools(["meta"])` 把新的 `__all__` 换了进来，于是工具清单里出现一个函数，调用时 `AttributeError: 'SessionBinding' object has no attribute 'unload'`。meta 的函数几乎都是框架方法的薄包装，所以它是这类不一致最容易暴露的地方。
+
+**没有为此加检查**（比如"`__init__.py` 比进程新就不许 reload meta"）：那个门挡不住真正的危险——框架与进程不一致在 reload 之前就已经存在，不 reload 的人照样跑在旧框架上——而且它要加在 `meta` 上，也就是那个"少一个函数模型就没法自救"的恢复入口。给恢复入口加前提条件，等于在最容易把 `meta.py` 写坏的那一刻（框架正在变更）关掉修它的唯一办法。这是知道代价之后选的：宁可让不一致以一次响亮的 `AttributeError` 出现。
+
 ### 工具目录允许存在未追踪模块
 
 `mods/tools/` 的 registry 扫的是磁盘上的顶层文件，而仓库有意不追踪其中几个（带凭据抓站点的那些，见 `.gitignore`）。所以生产机上的模块目录比仓库里多，`run.py --check` 的文件计数、`--smoke` 的模块数和 `list_tools` 的目录在干净 clone 与线上并不相同。这是设计如此，不是回归——比对这些数字时，基准要取**同一台机器上改动前的那次运行**，而不是另一台机器的结果。

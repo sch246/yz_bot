@@ -45,12 +45,12 @@ _IDLE_RECLAIM_SECONDS = 3600.0
 
 
 def _human_time(seconds: float) -> str:
-    """Render a duration like 3600.0 as `1 小时` for the reclaim notice."""
+    """Render a duration like 3600.0 as `1小时` for the reclaim notice."""
     if seconds >= 3600 and seconds % 3600 == 0:
-        return f"{seconds / 3600:g} 小时"
+        return f"{seconds / 3600:g}小时"
     if seconds >= 60 and seconds % 60 == 0:
-        return f"{seconds / 60:g} 分钟"
-    return f"{seconds:g} 秒"
+        return f"{seconds / 60:g}分钟"
+    return f"{seconds:g}秒"
 _current_binding_var: ContextVar[SessionBinding | None] = ContextVar(
     "tool_session_binding", default=None
 )
@@ -610,7 +610,7 @@ class SessionBinding:
         一句话，管理员下一轮就得重新 `load_tools`；而通告里那句"在它自己的轮里会重新出现"
         也就成了假话。留着不会攒垃圾：时刻是原来那个，超过 `ttl` 照样被下面的空闲回收收走。
 
-        WHY: 超过 `self.ttl` 没被调用过的也丢掉，这是"只进不出"的解药——不丢的话每次
+        WHY: 超过 `self.ttl` 没有被装入或调用过的也丢掉，这是"只进不出"的解药——不丢的话每次
         `load_tools` 都会永久留在这个窗口里，每轮都往基线消息里渲染一份正文。判据放在
         **开局**：轮中间把工具抽走会让模型手上的快照和它下一句要调的名字对不上，而开局
         收掉的模块，从这一轮的目录消息起就不在了。旧格式（只存名字的列表）由调用方补上
@@ -640,16 +640,21 @@ class SessionBinding:
                 # WHY: 空闲回收排在可见性前面。反过来的话，一个一直不可见的模块永远走不到
                 # 这一步，`_deferred` 就会把它在 storage 里留成永久居民——而 ttl 正是那份
                 # 记录唯一的回收者。
-                # WHY: 只回收**导出了函数**的模块。空闲的判据是"有没有被调用过"，而 `.md`
-                # 技能和只给说明的 `.py` 根本没有可被调用的东西，对它们计时是在量一个不存在
-                # 的信号：它们必然每次都超时，于是激活满一个时限就被收走，哪怕模型每一轮都在
-                # 读它的正文。方向上也是亏的——留着是一份稳定、命中前缀缓存的正文，收回是缓存
-                # 失效加一条通告加模型重新 `load_tools` 的一次往返，收回比留着贵。它们的出口
-                # 是 `unload_tools`，那才是"只进不出"真正缺的东西。
+                # WHY: 一条判据，不分模块种类。曾经按"模块导出了函数没有"分过两档，让 `.md`
+                # 技能和只给说明的 `.py` 不参与回收，出口交给一个 `unload_tools`——撤掉了。
+                # 撤的理由是那扇门的成本不在 token 而在**注意力**：它没有触发时机，于是每轮
+                # 都要分神判一次"这个还留着吗"，天天付；而它买到的只是躲开一次收回，罕见且
+                # 便宜。收回本身是有界的：通告是追加的不会消失，目录里那一行每轮都在，重新
+                # `load_tools` 就是一次往返。
+                # WHY: 代价是这里**唯一**一处"明知可能还要用也照收"——一个 `.md` 技能在第二
+                # 个小时仍被每轮阅读，也会在开局被收掉，因为阅读留不下痕迹。这不是没想到的
+                # 副作用，是知情的取舍：函数模块误收会被下一次调用当场打回来，内容模块误收
+                # 没有任何动作会撞上它，靠的是目录首行那个被动钩子，外加通告里那句说明（见
+                # `_queue_reclaimed`，它带上首行描述正是为了补这一口）。哪天发现模型反复漏掉
+                # 某个技能里写着的约束，回来看这一条。
                 if (
                     self.ttl is not None
                     and self.ttl > 0
-                    and module.tools
                     and now - stamp > self.ttl
                 ):
                     _log.debug("reclaiming idle tool module from window: %s", name)
@@ -691,42 +696,6 @@ class SessionBinding:
                 except Exception:
                     results[_result_name(requested_name)] = _failure(
                         "failed to activate tool module %r", requested_name
-                    )
-            self._announce(before)
-            self._save_active()
-        return results
-
-    def unload(self, names: str | Iterable[str]) -> dict[str, dict]:
-        """Deactivate modules here and drop them from this window's record.
-
-        WHY: 这是 `load` 的对门，而门原先是缺的。没有它的时候激活只进不出，于是空闲回收在
-        替一个不存在的按钮当班——用一个计时器去猜模型什么时候不再需要某个模块。有了门，
-        计时器只需要兜住"模型忘了关门"，判据也就能退回它真正观察得到的那件事：调用。
-
-        WHY: `meta` 挡在这里，而且是在函数里挡、不是靠说明书劝。它是恢复入口，`bind` 每轮
-        无条件装它，`restore` 也不经手它；真让它走到 `_deactivate`，得到的只是一条假通告
-        ——模型以为自己关掉了什么，下一轮它原样还在。
-
-        WHY: 没激活的名字回一句话，不抛异常。卸一个本来就不在的东西不是错误，结果也一样；
-        抛出去只会让模型拿到一段 traceback，然后以为自己得修点什么。
-        """
-        results: dict[str, dict] = {}
-        with self._lock:
-            before = self._capture()
-            for requested_name in _requested_names(names):
-                try:
-                    name = _validate_module_name(requested_name)
-                    if name == _BASE_MODULE_NAME:
-                        results[name] = {"action": "refused"}
-                        continue
-                    if name not in self.active:
-                        results[name] = {"action": "not_active"}
-                        continue
-                    self._deactivate(name)
-                    results[name] = {"action": "unloaded"}
-                except Exception:
-                    results[_result_name(requested_name)] = _failure(
-                        "failed to deactivate tool module %r", requested_name
                     )
             self._announce(before)
             self._save_active()
@@ -863,9 +832,9 @@ class SessionBinding:
         lines.append("空闲回收:")
         if self.ttl is not None and self.ttl > 0:
             lines.append(
-                f"- 导出了函数的模块：超过{_human_time(self.ttl)}没被调用过，下一轮开局不再装回"
+                f"- 超过{_human_time(self.ttl)}没有被装入或调用过的模块，下一轮开局不再装回；"
+                "装入本身算一次用过，没有导出函数的模块因此按装入时刻计时"
             )
-            lines.append("- 没有导出函数的（.md 技能、只给说明的 .py）：不回收，用完自己 unload_tools")
         else:
             lines.append("- 关闭")
         lines.append("源码变化:")
@@ -978,6 +947,18 @@ class SessionBinding:
             self._touched[owner] = time.time()
             self._dirty = True
 
+    def _summary(self, name: str) -> str:
+        """That module's first line, for a notice that says what was taken away.
+
+        WHY: 通告只报名字是不够的。函数模块被误收会被下一次调用当场打回来，内容模块不会
+        ——没有任何动作会撞上它，被拿走的恰恰是"这件事要注意什么"的那段文字，模型连自己
+        少了什么都不知道。带上首行就把通告从"拿走了一个东西"变成"拿走的是干这个用的"，
+        钩子从目录里那一行（被动、要自己去看）挪到通告里（就在眼前）。
+        """
+        module = self.registry.get(name)
+        description = getattr(module, "description", "")
+        return f" — {description}" if description else ""
+
     def _queue_reclaimed(self, reclaimed: list[tuple[str, str]]) -> None:
         """Queue one appended notice about modules this window lost with nobody talking.
 
@@ -1000,16 +981,16 @@ class SessionBinding:
         for name, reason in reclaimed:
             grouped.setdefault(reason, []).append(name)
         lines = ["工具模块已变化（本条由系统追加，不是用户发言）："]
-        lines.extend(
-            f"- 已停用（{reason}）：{', '.join(sorted(names))}"
-            for reason, names in grouped.items()
-            if names
-        )
+        for reason, names in grouped.items():
+            for name in sorted(names):
+                lines.append(f"- 已停用（{reason}）：{name}{self._summary(name)}")
         if grouped.get("空闲收回"):
             limit = _human_time(self.ttl) if self.ttl else ""
             lines.append(
-                f"空闲收回只按时限判断：超过 {limit} 没有被调用过的模块，新一轮开局就不再装回来"
-                "（你上一轮装载过它，这一轮它不在了）。需要时重新 `load_tools` 激活。"
+                f"空闲收回只按时限判断：超过{limit}没有被装入或调用过的模块，新一轮开局就不再"
+                "装回来（你上一轮装载过它，这一轮它不在了）。**阅读不留痕迹**，所以只靠读正文的"
+                "模块也会按装入时刻到期——还要用就 `load_tools` 把它装回来，这是下一步，不是"
+                "以后再说。"
             )
         if grouped.get("本轮不可用"):
             lines.append(
@@ -1117,8 +1098,9 @@ class SessionBinding:
 
         sections = ["工具模块已变化（本条由系统追加，不是用户发言）：", *body]
         if stopped:
-            # 走到这里的停用只有两条路：你自己 unload_tools，或者 reload_tools 发现源码没了。
-            # 两条都紧跟着 _save_active，窗口记录确实一起没了，所以这句话在两边都成立。
+            # 走到这里的停用只有一条路：reload_tools 发现源码没了。它紧跟着 _save_active，
+            # 窗口记录确实一起没了。（开局的空闲回收不走这里，它有自己的通告，见
+            # _queue_reclaimed——那条比的是前后全量，开局报出来的会是一堆"已激活"。）
             sections.append(
                 "已停用的模块同时从本窗口的激活记录里清掉了，下一轮开局不会再装回来；"
                 "还要用就重新 `load_tools`。"
