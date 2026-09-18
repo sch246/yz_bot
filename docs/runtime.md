@@ -79,11 +79,23 @@ LLM 的逐字输出不是流，而是终端的交互效果：它仍然直写 `sy
 1. NapCat 把 OneBot 事件 POST 到监听端口。
 2. HTTP 接收器读完请求体后立即返回 200，再解析 JSON 并把事件放进队列；`recv_msg()` 从队列里取。因此 200 早于任何处理，NapCat 不再等 Bot 跑完一条慢命令。
 3. `mods.bot.recv()` 记录当前消息和聊天日志。
-4. reply/开头 at 投影（不改写事件）、`^C` 删除 catch、延续式阻塞、普通命令、shell、link 按[完整入口优先级](interaction-model.md#入口有优先级)处理。
-5. 回复进入异步发送队列，再调用 NapCat 的 OneBot API。
-6. Bot 查询刚发送的消息并写入自己的聊天记录。
+4. `post_type == "message_sent"` 的事件到此为止：**只记录、不派发**（见下）。
+5. reply/开头 at 投影（不改写事件）、`^C` 删除 catch、延续式阻塞、普通命令、shell、link 按[完整入口优先级](interaction-model.md#入口有优先级)处理。
+6. 回复进入异步发送队列，再调用 NapCat 的 OneBot API。
+7. Bot 查询刚发送的消息并写入自己的聊天记录。
 
 HTTP 200 只表示事件已被本地监听器接收，不表示命令或回复执行成功。
+
+### 自己发出去的消息不回流
+
+入站只有 `5701` 那一个 `HTTPServer`（`mods/connect.py`），仓库里没有 websocket 客户端；喂它的是 NapCat 的 httpClients，那条上的 `reportSelfMessage` 是 `false`（ws server 上那条是 `true`，但没有谁连它）。所以 `message_sent` 事件目前根本进不来，第 4 步是一条**零行为变更**的不变量——现在挡，是为了不必在它哪天开始进来时先分辨哪些行为原本就依赖它。
+
+它挡住的是两件事：
+
+- **执行。** 派发会让 Bot 自己的话走命令、shell 和 link：`.` 开头当命令跑，`!` 开头过 op 门——而 op 门读的是 `sender.user_id`（`op.is_op`），作者是 Bot 自己就是 op，前提是 Bot 的号在 op 名单里，而 op 工具集正要求它在。于是「检索/网页里的不受信文本 → 模型复述 → 自己执行」会成为一条完整的路。
+- **重复记账。** `message.record_sent` 已经是"Bot 说过的话进聊天记录和内存历史"的唯一实现（走 `get_msg` 自己写一遍），而 `history.add_msg` 不按 `message_id` 去重；`message_sent` 一旦进来，每句话会被记两遍，聊天记录和下一轮上下文里都成对出现。
+
+第 7 步那条路不受影响：它不经过 `bot._route`。op 工具集自注入的事件也不受影响，它写的是 `post_type: "message"`。
 
 ## 已存在的“交互端口”
 
@@ -95,7 +107,7 @@ HTTP 200 只表示事件已被本地监听器接收，不表示命令或回复�
 
 代码内还有 `recvmsg()`，可从 `.py` 或 link action 递归构造一条消息进入 `mods.bot.recv()`。它同样走真实状态和真实副作用，只是省略了 NapCat 入站网络；它把 `sender_id` **同时**写进顶层 `user_id` 和 `sender.user_id`，而权限判定读的是**作者**（`sender.user_id`，缺失时回落 `user_id`），所以它的分量等同于「以被伪造者的身份执行」。注意顶层 `user_id` 只在群聊里等于作者，私聊里它是**窗口对端**；窗口本身由 `group_id`（群）或那个对端（私聊）决定，所以「谁发的」与「发到哪个窗口」是两件事，只有前者决定权限。
 
-op 工具集的 `send_command` 是第三条同类入口，但它不走 `bot.recv()`，而是把事件投进 `connect._events`——也就是 `5701` 入站用的**同一条队列**，由主线程按真实路由处理。这个差别是关键：`recvmsg` 在**调用者线程**里同步跑完整轮路由，而 `.reboot`/`.shutdown` 的 `SystemExit` 必须落在主线程才退得掉进程，所以工具调用线程里只能投队列。它同样以 Bot 自己的身份执行（作者写在 `sender.user_id`，顶层 `user_id` 留作窗口，见上一条），因此门控只有两处：模块本身 `OP_ONLY`、以及 Bot 的 QQ 号是否在 op 名单里。
+op 工具集的 `send_command` 是第三条同类入口，但它不走 `bot.recv()`，而是把事件投进 `connect._events`——也就是 `5701` 入站用的**同一条队列**，由主线程按真实路由处理。这个差别是关键：`recvmsg` 在**调用者线程**里同步跑完整轮路由，而 `.reboot`/`.shutdown` 的 `SystemExit` 必须落在主线程才退得掉进程，所以工具调用线程里只能投队列。它同样以 Bot 自己的身份执行（作者写在 `sender.user_id`，顶层 `user_id` 留作窗口，见上一条），因此门控只有两处：模块本身 `OP_ONLY`、以及 Bot 的 QQ 号是否在 op 名单里。投递前会**无条件**在目标窗口发一行「以 Bot 身份投递：<命令>」（命令原文经 `cq.escape`，所以不会顺手替模型发一次 at 或图片）：这是唯一一处人在窗口里看不见发起者的动作，多数命令自己会留下痕迹，但那是命令的性质而不是这条路的性质——没有输出的命令否则就是一次无痕操作。回执发不出去不会让投递失败。
 
 它因此不构成越权通道：能调用它的两个入口都只对 op 开放——`.py` 环境（含 `recvmsg`）不向非 op 暴露，link 的创建与维护命令在 `mods/link/__init__.py` 的 `run()` 开头即 `op.require_op(event)`。非 op 既接触不到 `exec_code` 也造不出 link，自然到不了 `recvmsg`；而能伪造身份的人本来就已经在信任域内。换言之，它的风险是「op 自己误用」，不是提权。
 
