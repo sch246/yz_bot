@@ -635,7 +635,18 @@ class SessionBinding:
                 # WHY: 空闲回收排在可见性前面。反过来的话，一个一直不可见的模块永远走不到
                 # 这一步，`_deferred` 就会把它在 storage 里留成永久居民——而 ttl 正是那份
                 # 记录唯一的回收者。
-                if self.ttl is not None and self.ttl > 0 and now - stamp > self.ttl:
+                # WHY: 只回收**导出了函数**的模块。空闲的判据是"有没有被调用过"，而 `.md`
+                # 技能和只给说明的 `.py` 根本没有可被调用的东西，对它们计时是在量一个不存在
+                # 的信号：它们必然每次都超时，于是激活满一个时限就被收走，哪怕模型每一轮都在
+                # 读它的正文。方向上也是亏的——留着是一份稳定、命中前缀缓存的正文，收回是缓存
+                # 失效加一条通告加模型重新 `load_tools` 的一次往返，收回比留着贵。它们的出口
+                # 是 `unload_tools`，那才是"只进不出"真正缺的东西。
+                if (
+                    self.ttl is not None
+                    and self.ttl > 0
+                    and module.tools
+                    and now - stamp > self.ttl
+                ):
                     _log.debug("reclaiming idle tool module from window: %s", name)
                     reclaimed.append((name, "空闲收回"))
                     continue
@@ -675,6 +686,42 @@ class SessionBinding:
                 except Exception:
                     results[_result_name(requested_name)] = _failure(
                         "failed to activate tool module %r", requested_name
+                    )
+            self._announce(before)
+            self._save_active()
+        return results
+
+    def unload(self, names: str | Iterable[str]) -> dict[str, dict]:
+        """Deactivate modules here and drop them from this window's record.
+
+        WHY: 这是 `load` 的对门，而门原先是缺的。没有它的时候激活只进不出，于是空闲回收在
+        替一个不存在的按钮当班——用一个计时器去猜模型什么时候不再需要某个模块。有了门，
+        计时器只需要兜住"模型忘了关门"，判据也就能退回它真正观察得到的那件事：调用。
+
+        WHY: `meta` 挡在这里，而且是在函数里挡、不是靠说明书劝。它是恢复入口，`bind` 每轮
+        无条件装它，`restore` 也不经手它；真让它走到 `_deactivate`，得到的只是一条假通告
+        ——模型以为自己关掉了什么，下一轮它原样还在。
+
+        WHY: 没激活的名字回一句话，不抛异常。卸一个本来就不在的东西不是错误，结果也一样；
+        抛出去只会让模型拿到一段 traceback，然后以为自己得修点什么。
+        """
+        results: dict[str, dict] = {}
+        with self._lock:
+            before = self._capture()
+            for requested_name in _requested_names(names):
+                try:
+                    name = _validate_module_name(requested_name)
+                    if name == _BASE_MODULE_NAME:
+                        results[name] = {"action": "refused"}
+                        continue
+                    if name not in self.active:
+                        results[name] = {"action": "not_active"}
+                        continue
+                    self._deactivate(name)
+                    results[name] = {"action": "unloaded"}
+                except Exception:
+                    results[_result_name(requested_name)] = _failure(
+                        "failed to deactivate tool module %r", requested_name
                     )
             self._announce(before)
             self._save_active()
@@ -805,6 +852,17 @@ class SessionBinding:
         )
         if not modules:
             lines.append("- (无)")
+        # WHY: 确切时限只写在这里，不写进 meta 的说明书。说明书是那个一旦加载失败就全盘瘫痪
+        # 的文件，为一句话让它的顶层多一个 import 不划算；而这段本来就是算出来的，改常量就
+        # 跟着变，不会像写死的数字那样漂。
+        lines.append("空闲回收:")
+        if self.ttl is not None and self.ttl > 0:
+            lines.append(
+                f"- 导出了函数的模块：超过{_human_time(self.ttl)}没被调用过，下一轮开局不再装回"
+            )
+            lines.append("- 没有导出函数的（.md 技能、只给说明的 .py）：不回收，用完自己 unload_tools")
+        else:
+            lines.append("- 关闭")
         lines.append("源码变化:")
         labels = {"added": "新增", "modified": "修改", "deleted": "删除"}
         changed = False
@@ -1028,6 +1086,7 @@ class SessionBinding:
             for name, error in after_failures.items()
             if before_failures.get(name) != error
         }
+        stopped = set(before_active) - set(after_active)
         lines = [
             joined("目录新增", set(after_catalog) - set(before_catalog)),
             joined("目录移除", set(before_catalog) - set(after_catalog)),
@@ -1036,7 +1095,7 @@ class SessionBinding:
                 if after_catalog[name] != before_catalog[name]
             }),
             joined("已激活", set(after_active) - set(before_active)),
-            joined("已停用", set(before_active) - set(after_active)),
+            joined("已停用", stopped),
             joined("已激活模块内容更新", {
                 name for name in set(after_active) & set(before_active)
                 if after_active[name] != before_active[name]
@@ -1048,6 +1107,13 @@ class SessionBinding:
             return
 
         sections = ["工具模块已变化（本条由系统追加，不是用户发言）：", *body]
+        if stopped:
+            # 走到这里的停用只有两条路：你自己 unload_tools，或者 reload_tools 发现源码没了。
+            # 两条都紧跟着 _save_active，窗口记录确实一起没了，所以这句话在两边都成立。
+            sections.append(
+                "已停用的模块同时从本窗口的激活记录里清掉了，下一轮开局不会再装回来；"
+                "还要用就重新 `load_tools`。"
+            )
         for name in sorted(after_active):
             content = after_active[name]
             if content and before_active.get(name) != content:
