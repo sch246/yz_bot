@@ -127,6 +127,22 @@ def _run_bash(command_text: str):
 
 def _route(event: dict) -> str | None:
     context.set_current(event)
+    # WHY: 自己发出去的消息在这里**整段跳过**：不记录，也不派发。
+    # WHY: 位置在 chatlog.write **之前**是承重的，不是排版。`message.record_sent` 已经是
+    # "Bot 说过的话进聊天记录和内存历史"的唯一写入权威（send_msg 走 mods/message.py，合并
+    # 转发走 mods/forward.py，两条都收在它那里），而 `chatlog.write` 的判据收 message_sent、
+    # `history.add_msg` 又不按 message_id 去重。放在写记录之后，回声那一遍照样写一次，每句
+    # 话就成对出现在 chatlog 和下一轮上下文里——那正是这条过滤要挡的两件事之一。
+    # WHY: 另一件是执行。派发会让 Bot 自己的话走命令、shell 和 link：`.` 开头当命令跑，
+    # `!` 开头过 op 门——而 op 门读 `sender.user_id`（见 op.is_op），作者是 Bot 自己就是 op，
+    # 前提是 Bot 的号在 op 名单里，而 op 工具集正要求它在。于是"网页/检索里的不受信文本 →
+    # 模型复述 → 自己执行"就成了一条完整的路。
+    # WHY: 今天这条过滤是**零行为变更**：入站只有 5701 那个 HTTPServer（mods/connect.py），
+    # 喂它的 NapCat httpClients 上 reportSelfMessage 是 false，所以 message_sent 根本进不来
+    # （ws server 上那条为真，但没有谁连它）。正因为如此才现在挡：等它真的开始进来，就得先
+    # 分辨哪些行为原本就依赖它，而不是一行了事。
+    if event.get("post_type") == "message_sent":
+        return "self"
     chatlog = _optional("chatlog")
     if chatlog is not None:
         # The prefix and the body chatlog formats are one line of terminal
@@ -135,20 +151,6 @@ def _route(event: dict) -> str | None:
         if written is not None:
             body = chatlog.display(written).removesuffix("\n")
             _stream.info(f'[{time.strftime("%H:%M:%S")}]【收到消息】{body}')
-    # WHY: 自己发出去的消息只记录、不派发。上面那段已经把它写进 chatlog 和内存历史了，
-    # 派发则会让 Bot 自己的话去走命令、shell 和 link：`.` 开头当命令跑，`!` 开头过 op 门
-    # ——而 op 门现在读 `sender.user_id`（见 op.is_op），作者是 Bot 自己就是 op，前提是
-    # Bot 的号在 op 名单里，而 op 工具集正要求它在。于是"网页/检索里的不受信文本 → 模型
-    # 复述 → 自己执行"就成了一条完整的路。
-    # WHY: 今天这条过滤是**零行为变更**：入站只有 5701 那个 HTTPServer（mods/connect.py），
-    # 喂它的 NapCat httpClients 上 reportSelfMessage 是 false，所以 message_sent 根本进不来
-    # （ws server 上那条为真，但没有谁连它）。正因为如此才现在挡：等它真的开始进来，就得先
-    # 分辨哪些行为原本就依赖它，而不是一行了事。
-    # WHY: 它顺带挡住重复记账。`message.record_sent` 已经是"Bot 说过的话进聊天记录和内存
-    # 历史"的唯一实现（走 get_msg 自己写一遍），而 history.add_msg 不按 message_id 去重；
-    # message_sent 一旦进来，每句话会被记两遍，聊天记录和下一轮上下文里都成对出现。
-    if event.get("post_type") == "message_sent":
-        return "self"
     if any(value in sys.argv[1:] for value in ("-l", "--log-only", "log_only")):
         return "log-only"
 

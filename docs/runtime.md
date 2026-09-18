@@ -78,8 +78,8 @@ LLM 的逐字输出不是流，而是终端的交互效果：它仍然直写 `sy
 
 1. NapCat 把 OneBot 事件 POST 到监听端口。
 2. HTTP 接收器读完请求体后立即返回 200，再解析 JSON 并把事件放进队列；`recv_msg()` 从队列里取。因此 200 早于任何处理，NapCat 不再等 Bot 跑完一条慢命令。
-3. `mods.bot.recv()` 记录当前消息和聊天日志。
-4. `post_type == "message_sent"` 的事件到此为止：**只记录、不派发**（见下）。
+3. `post_type == "message_sent"` 的事件到此为止：**整段跳过**，既不记录也不派发（见下）。
+4. `mods.bot.recv()` 记录当前消息和聊天日志。
 5. reply/开头 at 投影（不改写事件）、`^C` 删除 catch、延续式阻塞、普通命令、shell、link 按[完整入口优先级](interaction-model.md#入口有优先级)处理。
 6. 回复进入异步发送队列，再调用 NapCat 的 OneBot API。
 7. Bot 查询刚发送的消息并写入自己的聊天记录。
@@ -105,14 +105,14 @@ HTTP 200 只表示事件已被本地监听器接收，不表示命令或回复�
 
 ### 自己发出去的消息不回流
 
-入站只有 `5701` 那一个 `HTTPServer`（`mods/connect.py`），仓库里没有 websocket 客户端；喂它的是 NapCat 的 httpClients，那条上的 `reportSelfMessage` 是 `false`（ws server 上那条是 `true`，但没有谁连它）。所以 `message_sent` 事件目前根本进不来，第 4 步是一条**零行为变更**的不变量——现在挡，是为了不必在它哪天开始进来时先分辨哪些行为原本就依赖它。
+入站只有 `5701` 那一个 `HTTPServer`（`mods/connect.py`），仓库里没有 websocket 客户端；喂它的是 NapCat 的 httpClients，那条上的 `reportSelfMessage` 是 `false`（ws server 上那条是 `true`，但没有谁连它）。所以 `message_sent` 事件目前根本进不来，第 3 步是一条**零行为变更**的不变量——现在挡，是为了不必在它哪天开始进来时先分辨哪些行为原本就依赖它。
 
-它挡住的是两件事：
+它挡住的是两件事，而**位置**决定了它能不能挡住第二件：
 
 - **执行。** 派发会让 Bot 自己的话走命令、shell 和 link：`.` 开头当命令跑，`!` 开头过 op 门——而 op 门读的是 `sender.user_id`（`op.is_op`），作者是 Bot 自己就是 op，前提是 Bot 的号在 op 名单里，而 op 工具集正要求它在。于是「检索/网页里的不受信文本 → 模型复述 → 自己执行」会成为一条完整的路。
-- **重复记账。** `message.record_sent` 已经是"Bot 说过的话进聊天记录和内存历史"的唯一实现（走 `get_msg` 自己写一遍），而 `history.add_msg` 不按 `message_id` 去重；`message_sent` 一旦进来，每句话会被记两遍，聊天记录和下一轮上下文里都成对出现。
+- **重复记账。** `message.record_sent` 是"Bot 说过的话进聊天记录和内存历史"的唯一写入权威（`send_msg` 走 `mods/message.py`，合并转发走 `mods/forward.py`，两条都收在它那里），而 `chatlog.write` 的判据收 `message_sent`、`history.add_msg` 又不按 `message_id` 去重。所以关卡必须在 `chatlog.write` **之前**——2026-09-18 第一版放在它之后，派发挡住了、记账没有，每句话照样会被记两遍。
 
-第 7 步那条路不受影响：它不经过 `bot._route`。op 工具集自注入的事件也不受影响，它写的是 `post_type: "message"`。
+因此这条是"整段跳过"而不是"只记录不派发"，`-q` 下也不会为自己发的消息打一行【收到消息】。第 7 步那条路不受影响：它不经过 `bot._route`。op 工具集自注入的事件也不受影响，它写的是 `post_type: "message"`。
 
 ## 已存在的“交互端口”
 
