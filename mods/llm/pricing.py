@@ -100,6 +100,11 @@ def is_off_peak(provider, when: datetime | None = None) -> bool:
     days = rule.get("days")
     if isinstance(days, list) and days and moment.weekday() not in [day for day in days if isinstance(day, int)]:
         return True
+    # WHY: 一个窗口跨不过午夜——判据是 `start <= t < end`，写成 `["22:00", "02:00"]` 谁也
+    # 不命中。要表达跨夜的高峰就拆成两段（`["22:00", "24:00"]` 与 `["00:00", "02:00"]`），
+    # 别指望这里替你绕回去。当前供应商的峰谷都落在同一天之内，所以没有为它加环绕逻辑：
+    # 那要么让 `days` 的含义在跨夜那一段变得可疑（算前一天还是后一天），要么再引入一个
+    # 表示法，两样都比拆成两段贵。
     windows = rule.get("windows")
     for window in windows if isinstance(windows, list) else []:
         if not (isinstance(window, (list, tuple)) and len(window) == 2):

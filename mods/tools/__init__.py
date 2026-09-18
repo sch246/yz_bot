@@ -555,6 +555,11 @@ class SessionBinding:
         self.active: dict[str, ToolModule] = {}
         # 每个激活模块最后一次被调用的时刻，见 touch。先活在内存里，落盘由 _save_active 做。
         self._touched: dict[str, float] = {}
+        # WHY: schema 名 -> 拥有它的模块名。它和 `session.functions` 是同一份事实的两面，
+        # 所以在写 functions 的**同一处**（`_activate`/`_deactivate`）一起维护，别处不碰。
+        # 有了它，`touch` 就不必从 `<模块名>__<函数名>` 里反解模块名——反解是猜：模块 `a`
+        # 导出 `b__c` 与模块 `a__b` 导出 `c` 生成同一个 schema 名，靠前缀匹配必然有一种猜错。
+        self._owner: dict[str, str] = {}
         # WHY: 这一轮装不回来、但**不该从窗口里删掉**的模块（名 -> 它原来的使用时刻）。
         # 目前只有一种来源：OP_ONLY 模块在非 op 的轮里不可见。它在这一轮确实不存在，可是
         # 窗口并没有停用它——下一次 op 自己开的轮里它就该回来。落盘时与 active 一起写回，
@@ -904,7 +909,10 @@ class SessionBinding:
 
         for name in previous_tools:
             functions.pop(name)
+            self._owner.pop(name, None)
         functions.update(module.tools)
+        for name in module.tools:
+            self._owner[name] = module.name
         self.active[module.name] = module
         # 装上了就不再是"这一轮装不回来"的那种；两边同时挂着一个名字会让 _save_active
         # 有两个时刻可选。
@@ -949,6 +957,7 @@ class SessionBinding:
                 raise KeyError(f"active tool ownership changed: {tool_name}")
         for tool_name in previous.tools:
             functions.pop(tool_name)
+            self._owner.pop(tool_name, None)
         del self.active[name]
         # 名字都没了，使用时刻留着只会让 _touched 无限长；下次 load 会重新盖上“现在”。
         self._touched.pop(name, None)
@@ -959,14 +968,14 @@ class SessionBinding:
         WHY: 空闲回收的判据是"用过没有"，而"用过"只有调用那一刻知道。不在这里等调用——
         工具是 `llm` 那层直接 `tool.call(**arguments)` 执行的，它不认识 binding，所以由
         调用方在工具结果回来时把名字递进来（`chat._oplog_recorder`，每个工具结果都经过
-        它）。名字是模型面向的那个（`<模块名>__<函数名>`）；`meta` 的工具没有前缀，不记，
-        反正它每轮都在。
+        它）。名字是模型面向的那个（`<模块名>__<函数名>`），归属查 `_owner`，不从名字反解；
+        `meta` 不记，反正它每轮都在，记了只会在 `_touched` 里多一个谁也不看的条目。
         """
-        prefix, sep, _tail = tool_name.partition("__")
-        if not sep or prefix not in self.active:
+        owner = self._owner.get(tool_name)
+        if owner is None or owner == _BASE_MODULE_NAME:
             return
         with self._lock:
-            self._touched[prefix] = time.time()
+            self._touched[owner] = time.time()
             self._dirty = True
 
     def _queue_reclaimed(self, reclaimed: list[tuple[str, str]]) -> None:

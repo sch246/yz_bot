@@ -188,8 +188,10 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
-# 本机配置备份：里面是明文 API key，绝不入库
-*.bak
+# 本机配置备份：里面是明文 API key，绝不入库。挡的是这个目录本身，不是 *.bak——
+# 明文 key 的性质是"在这个目录里"，而按扩展名挡会连别处正当的备份一起吞掉，还挡不住
+# 改了名的同一份东西。
+/config-backups/
 
 # 用凭据/登录态抓取站点，含绕过反爬的实现，保持私有
 /mods/tools/baidumap.py
