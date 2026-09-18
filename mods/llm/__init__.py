@@ -276,6 +276,7 @@ class LLMClient:
             return ModelCapabilities()
         known = {field: capabilities.get(field, default) for field, default in {
             "vision": False,
+            "tool_images": False,
             "function_calling": False,
             "prompt_price": 0.0,
             "prompt_cached_price": 0.0,
@@ -322,7 +323,7 @@ class LLMClient:
         return [_rewrite_message_images(message, replace) for message in messages]
 
     @staticmethod
-    def _convert_images(messages: list[dict], convert_url: Callable[[str], str]) -> list[dict]:
+    def _convert_images(messages: list[dict], convert_url: Callable[[str], str], allow_tool_images: bool = False) -> list[dict]:
         def replace(uri: str) -> list[dict]:
             # WHY: 一次对话里同一张图只走一遍这条路径。台账判定失败的直接给占位文本，
             # 不再重复下载、也不再每轮报一次错；已经查过的成功图静默复用，不刷日志。
@@ -353,9 +354,13 @@ class LLMClient:
             return parts
 
         result = []
+        # WHY: 除 user 之外还放行 tool，是因为"图片只能出现在 user 消息里"是文档的说法，不是
+        # 对端的行为：DeepSeek 的 chat/completions 实收 tool 消息里的 image_url（见
+        # ModelCapabilities.tool_images）。放不放行由能力位按模型登记，未登记的仍旧降级成
+        # 占位文字。
+        roles = {"user", "tool"} if allow_tool_images else {"user"}
         for message in messages:
-            # Only user messages may carry real image parts to the provider.
-            if message.get("role") != "user":
+            if message.get("role") not in roles:
                 result.extend(LLMClient._replace_images_with_text([message]))
                 continue
             result.append(_rewrite_message_images(message, replace, collapse_text=False))
@@ -498,10 +503,11 @@ class LLMClient:
         if client is None:
             raise ValueError(f"Provider {provider} not configured")
         capabilities = ModelCapabilities(**{key: raw_capabilities.get(key, default) for key, default in {
-            "vision": False, "function_calling": False, "prompt_price": 0.0, "prompt_cached_price": 0.0, "completion_price": 0.0,
+            "vision": False, "function_calling": False, "tool_images": False,
+            "prompt_price": 0.0, "prompt_cached_price": 0.0, "completion_price": 0.0,
         }.items()})
         if do_process_image:
-            messages = self._convert_images(messages, image.image_uri_to_data_uri) if capabilities.vision else self._describe_images(messages, description_cache or {})
+            messages = self._convert_images(messages, image.image_uri_to_data_uri, capabilities.tool_images) if capabilities.vision else self._describe_images(messages, description_cache or {})
         else:
             messages = self._replace_images_with_text(messages)
         # Image conversion is one output message per input message, so the

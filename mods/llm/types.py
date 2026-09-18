@@ -8,6 +8,12 @@ from dataclasses import dataclass
 @dataclass
 class ModelCapabilities:
     vision: bool = False
+    # WHY: 图片能不能放在 **tool** 消息里，由对端决定，不由协议文档决定。OpenAI 与 DeepSeek
+    # 的文档都写着"图片仅支持出现在 user 消息中"，但 DeepSeek 的 chat/completions 实收
+    # tool 消息 content 数组里的 image_url——2026-09-18 实测 deepseek-flash 读对了工具结果
+    # 那张图里的随机码。所以它按模型登记，未登记一律 False，退回"把图换成占位文字"那条老路：
+    # 那条路不会 400，代价只是模型看不到图，比让整次请求失败好。
+    tool_images: bool = False
     function_calling: bool = False
     prompt_price: float = 0.0
     prompt_cached_price: float = 0.0

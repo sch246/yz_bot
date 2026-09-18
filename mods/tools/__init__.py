@@ -57,7 +57,11 @@ _current_binding_var: ContextVar[SessionBinding | None] = ContextVar(
 
 
 def current_binding() -> SessionBinding:
-    """Return the binding only while one bound meta tool is executing."""
+    """Return the binding while a tool of this session is executing.
+
+    WHY: 每个模块的工具都被 `_bind_module` 包了一层，所以任何工具执行期间都拿得到自己所属的
+    binding（`binding.session` 就是当前的 `llm.Chat`）；不在工具里调用就抛 RuntimeError。
+    """
     binding = _current_binding_var.get()
     if binding is None:
         raise RuntimeError("tool called outside a bound Chat session")
@@ -891,8 +895,13 @@ class SessionBinding:
         self._dirty = True
 
     def _bind_module(self, module: ToolModule) -> ToolModule:
-        if module.name != _BASE_MODULE_NAME:
-            return module
+        """把模块的每个工具包一层"当前 binding"上下文，再装进会话。
+
+        WHY: 工具执行期间要能问到 `current_binding()`——以前只有 meta 的工具包了这一层，别的
+        模块想借会话做点事（例如把图片附加进下一次请求，见 mods/tools/_vision.py）只能绕路：
+        工具是 `llm` 那层直接 `tool.call(**arguments)` 执行的，它不认识 binding。代价只是一次
+        ContextVar 的 set/reset，"哪些模块能用"这种区别没有第二个地方需要，所以统一包。
+        """
         tools = {}
         for name, original in module.tools.items():
             bound = Tool(original.call, name)

@@ -12,6 +12,16 @@
 
 它与 Bot 共享同一个宿主信任域，不是沙箱：会真实发消息、读写磁盘、改动运行中的状态。用之前先确认没有现成工具能做这件事，并避免 `input(...)`（会阻塞等待聊天回复）和长时间运行的代码。异常以 traceback 回传，可据此修正重试。需要反复使用的能力应当沉淀成下面的工具模块，而不是每次都 `exec_code`。
 
+## 让模型自己看图
+
+`attach_image(uri, note)` 把一张图片交给**你自己**看：地址写成工具结果里的一行 markdown
+引用，`llm._convert_images` 在发出请求前把它展开成真正的图。所以下一个子请求就看得见它
+（`✅` 走的就是这条路，`⚠️` 表示这次走不通，退回让视觉模型转述）。
+
+对端支不支持"工具结果带图"看模型的 `tool_images` 能力位；不支持时退回老办法——把图作为
+一条 user 消息附加到下一次请求，只活一次子请求、不进历史。支持时图**留在操作记录里**，
+哪次调用看到了哪张图以后还查得到，代价是它每轮都要跟着上下文重发。
+
 ## 工具模块的三层状态
 
 所有模块源都放在 `mods/tools/` 顶层。`foo.py` 是带函数的工具模块，`foo.md` 是没有函数的 Skill；二者使用同一套生命周期，不能同 stem 共存。
@@ -242,6 +252,18 @@ def recall_ops(cids: list[str]) -> str:
     return "\n\n".join(lines) if lines else "没有取回任何内容"
 
 
+def attach_image(uri: str, note: str = "") -> str:
+    """把一张图片交给**你自己**看——截图、图表、验证码、扫描件这类"只有看了才知道"的东西用它，不要让你自己靠猜。图随这条工具结果一起送到，下一个子请求里就看得见（`✅`/`⚠️` 是结果说明）。
+
+    @param
+    uri: 图片地址，`file://`、`http(s)://` 或已经是 `data:` 都行；浏览器截图给出的 `file://` 直接传进来即可
+    note: 附在图前面的一句话，例如"读出图中的字"
+    """
+    from ._vision import attach
+
+    return attach(uri, note)
+
+
 def _format_results(results: Mapping) -> str:
     action_labels = {
         "loaded": "已加载",
@@ -275,4 +297,5 @@ __all__ = [
     "load_tools",
     "condense_ops",
     "recall_ops",
+    "attach_image",
 ]

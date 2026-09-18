@@ -109,10 +109,13 @@ def default_config() -> dict:
                 # 聊天的 prompt 绝大多数是重复上下文，不区分就会把费用高估一大截。
                 # deepseek-flash 就是原 v4-flash 系列（DeepSeek-V4.1-Flash），自带图像理解；
                 # 两个旧名仍可调用、按 Flash 计费，保留它们以免存量的模型选择失效。
-                "deepseek-flash": {"vision": True, "function_calling": True, "prompt_price": 2, "prompt_cached_price": 0.04, "completion_price": 8},
+                # tool_images：图片可以放进 tool 消息（工具结果里带图），2026-09-18 实测
+                # deepseek-flash 读对了工具结果里那张图的随机码。同族的两个旧名一起登记；
+                # 别的供应商没验过，一律不写（默认 False）。
+                "deepseek-flash": {"vision": True, "tool_images": True, "function_calling": True, "prompt_price": 2, "prompt_cached_price": 0.04, "completion_price": 8},
                 "deepseek-v4-pro": {"vision": False, "function_calling": True, "prompt_price": 9, "prompt_cached_price": 0.30, "completion_price": 27},
-                "deepseek-v4-flash": {"vision": True, "function_calling": True, "prompt_price": 2, "prompt_cached_price": 0.04, "completion_price": 8},
-                "deepseek-v4-flash-vision-exp": {"vision": True, "function_calling": True, "prompt_price": 2, "prompt_cached_price": 0.04, "completion_price": 8},
+                "deepseek-v4-flash": {"vision": True, "tool_images": True, "function_calling": True, "prompt_price": 2, "prompt_cached_price": 0.04, "completion_price": 8},
+                "deepseek-v4-flash-vision-exp": {"vision": True, "tool_images": True, "function_calling": True, "prompt_price": 2, "prompt_cached_price": 0.04, "completion_price": 8},
             }},
             "bytecat": deepcopy(BYTECAT_PROVIDER_CONFIG),
         },
