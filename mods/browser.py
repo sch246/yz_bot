@@ -37,7 +37,9 @@ import base64
 import glob
 import ipaddress
 import json
+import math
 import os
+import random
 import shutil
 import signal
 import socket
@@ -70,8 +72,19 @@ CALL_TIMEOUT = 30.0
 MAX_TEXT = 6000
 MAX_RESULT = 8000
 SHOT_KEEP = 30
+# 局部放大截图的上限：宽或高乘上放大倍数不能超过它。放大是为了看清细节，超过这个尺寸
+# 只会换来一张几百 KB 的 PNG 和一次更慢的模型请求。
+MAX_CLIP_PIXELS = 4000
 COOKIE_INTERVAL = 0.25            # 写 Cookie 之间的停顿，见 set_cookies
 SETTLE_SECONDS = 0.4
+
+# WHY: 站点（Google 登录是最典型的例子）会把 UA 里的 "HeadlessChrome" 当成机器人特征，
+# 直接拒绝："此浏览器或应用可能不安全"。宿主上有 Xvfb 时就用它开一个虚拟显示，浏览器按
+# **有头**模式跑，UA 与各种指纹都是普通 Chrome 的样子；没有 Xvfb 才退回 --headless。
+# 设 YUZU_BROWSER_HEADLESS=1 可以强制回到无头模式。
+HEADLESS_ENV = "YUZU_BROWSER_HEADLESS"
+XVFB_DISPLAY = ":99"
+XVFB_NUMBER = 99
 
 # 从哪儿找一份现成的 Chromium。装好之后就不再需要它了。
 DEFAULT_SOURCES = (
@@ -85,6 +98,7 @@ _stream = log.stream("browser")
 _state_lock = threading.RLock()
 _page_lock = threading.RLock()
 _process: subprocess.Popen | None = None
+_xvfb: subprocess.Popen | None = None
 _port = 0
 _pages: dict[tuple, str] = {}
 # 主机名 -> 检查结论。只放**确定**的结论，见 _public_host。
@@ -270,6 +284,71 @@ def _clear_profile_locks() -> None:
             _stream.info("清理 %s 失败", path, exc_info=True)
 
 
+def _stop_display() -> None:
+    """关掉自己起的 Xvfb；复用别人起的那个就不动它。"""
+    global _xvfb
+    with _state_lock:
+        process, _xvfb = _xvfb, None
+    if process is not None and process.poll() is None:
+        _terminate(process)
+
+
+def _ensure_display() -> str:
+    """给有头模式准备一个显示，返回要用的 DISPLAY；没有就返回空串（调用方退回无头）。
+
+    先认现成的 `DISPLAY`，再认已经跑着的 Xvfb（socket 在就算，哪怕不是自己起的——重启
+    bot 之后进程还在，没必要再起一个），最后才自己拉一个。任何一步失败都只是退回无头，
+    不影响原来能用的功能。
+    """
+    global _xvfb
+    if os.environ.get(HEADLESS_ENV):
+        return ""
+    current = (os.environ.get("DISPLAY") or "").strip()
+    if current:
+        return current
+    with _state_lock:
+        if _xvfb is not None and _xvfb.poll() is None:
+            os.environ["DISPLAY"] = XVFB_DISPLAY
+            return XVFB_DISPLAY
+        socket_path = f"/tmp/.X11-unix/X{XVFB_NUMBER}"
+        if not os.path.exists(socket_path):
+            executable = shutil.which("Xvfb")
+            if not executable:
+                return ""
+            os.makedirs(ROOT, exist_ok=True)
+            stream = open(LOG_PATH, "ab", buffering=0)
+            with watchdog.detached():
+                _xvfb = subprocess.Popen(
+                    [
+                        executable,
+                        XVFB_DISPLAY,
+                        "-screen",
+                        "0",
+                        f"{VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT}x24",
+                        "-nolisten",
+                        "tcp",
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=stream,
+                    stderr=subprocess.STDOUT,
+                    cwd=ROOT,
+                )
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                if os.path.exists(socket_path):
+                    break
+                if _xvfb.poll() is not None:
+                    _stream.info("Xvfb 起不来，退回无头模式", exc_info=False)
+                    _xvfb = None
+                    return ""
+                time.sleep(0.2)
+            if not os.path.exists(socket_path):
+                _stream.info("Xvfb 十秒内没就绪，退回无头模式")
+                return ""
+        os.environ["DISPLAY"] = XVFB_DISPLAY
+        return XVFB_DISPLAY
+
+
 def _launch() -> None:
     global _process, _port
     if _running():
@@ -280,9 +359,10 @@ def _launch() -> None:
     _reap_stale()
     _clear_profile_locks()
     port = _free_port()
+    display = _ensure_display()
     command = [
         executable,
-        "--headless",
+        *([] if display else ["--headless"]),
         "--no-sandbox",
         "--disable-gpu",
         "--disable-dev-shm-usage",
@@ -385,6 +465,7 @@ def stop(reason: str = "") -> str:
 
 def on_exit() -> None:
     stop("模块退出")
+    _stop_display()
 
 
 # --------------------------------------------------------------------------- 地址检查
@@ -747,6 +828,22 @@ _JS_STATE = (
     "}))()"
 )
 
+_JS_BOX = (
+    "(() => {"
+    "const el = document.querySelector(__SELECTOR__);"
+    "if (!el) return null;"
+    "const rect = el.getBoundingClientRect();"
+    "return {"
+    "x: rect.x + window.scrollX,"
+    "y: rect.y + window.scrollY,"
+    "width: rect.width,"
+    "height: rect.height"
+    "};"
+    "})()"
+)
+
+_JS_SCROLL = "[window.scrollX, window.scrollY]"
+
 _JS_LINKS = (
     "(() => {"
     "const out = []; const seen = new Set();"
@@ -885,11 +982,452 @@ def run_js(code: str, timeout: float = CALL_TIMEOUT) -> dict:
     return outcome
 
 
-def screenshot(full: bool = False) -> str:
+def _region_clip(session: _Session, region: str, scale: float = 0.0) -> dict | None:
+    """把 *region* 的说法翻成 CDP 的 clip；留空返回 None（表示整屏）。
+
+    WHY: 数字坐标一律按**视口**算，再自己加上滚动偏移。模型看图看的就是视口那一张，报出来
+    的坐标自然是视口坐标；照搬给 CDP 会错在已经滚动过的页面上，而那种错看起来像"截错了
+    地方"，不像坐标系不一致。
+
+    @param
+    region: `css:选择器` 或 `x,y,w,h`（视口内 CSS 像素）
+    scale: 放大倍数，0 表示默认 2 倍
+    """
+    text = str(region or "").strip()
+    if not text:
+        return None
+    zoom = float(scale) if scale and scale > 0 else 2.0
+    if text.lower().startswith("css:"):
+        selector = text[4:].strip()
+        if not selector:
+            raise ValueError("css: 后面要给一个选择器，例如 css:#captcha")
+        box = _evaluate(session, _JS_BOX.replace("__SELECTOR__", json.dumps(selector)))
+        if not isinstance(box, dict) or not box.get("width") or not box.get("height"):
+            raise ValueError(f"选择器没有匹配到有尺寸的元素：{selector}")
+        x, y = float(box["x"]), float(box["y"])
+        width, height = float(box["width"]), float(box["height"])
+    else:
+        numbers = [part.strip() for part in text.replace("，", ",").split(",")]
+        if len(numbers) != 4:
+            raise ValueError("region 要写成 x,y,w,h（视口内的 CSS 像素）或 css:选择器")
+        try:
+            x, y, width, height = (float(value) for value in numbers)
+        except ValueError as error:
+            raise ValueError("region 的四个数字没读懂，写成 x,y,w,h") from error
+        offset = _evaluate(session, _JS_SCROLL) or [0, 0]
+        x += float(offset[0] or 0)
+        y += float(offset[1] or 0)
+    if width <= 0 or height <= 0:
+        raise ValueError("region 的宽高要大于 0")
+    zoom = min(zoom, MAX_CLIP_PIXELS / width, MAX_CLIP_PIXELS / height)
+    if zoom <= 0.05:
+        raise ValueError("region 太小了（不足 5% 原始大小），换个范围再试")
+    return {
+        "x": round(x, 2),
+        "y": round(y, 2),
+        "width": round(width, 2),
+        "height": round(height, 2),
+        "scale": round(zoom, 3),
+    }
+
+
+
+# ------------------------------------------------------------------ 真鼠标、真键盘
+#
+# WHY: 页面里的 `el.click()` 是**合成事件**——没有真实指针轨迹，`isTrusted` 为假。多数站点
+# 不在乎，但账号选择器、滑块、人机验证这类地方专门盯着它：要么没反应，要么直接判你是脚本。
+# 所以这里走 CDP 的 `Input.dispatchMouseEvent` / `Input.dispatchKeyEvent`，让浏览器自己产生
+# 带 `isTrusted` 的输入事件。坐标一律是**视口内 CSS 像素**（鼠标事件就这么算），元素类落点
+# 用 `getBoundingClientRect()` 现场换算，滚动过的页面也不会错位。
+
+_JS_CLICK_POINT = (
+    "(() => {"
+    "const el = document.querySelector(__SELECTOR__);"
+    "if (!el) return null;"
+    "el.scrollIntoView({block: 'center', inline: 'center'});"
+    "const rect = el.getBoundingClientRect();"
+    "const x = rect.x + rect.width / 2, y = rect.y + rect.height / 2;"
+    "const hit = document.elementFromPoint(x, y);"
+    "return {"
+    "x: x, y: y, width: rect.width, height: rect.height,"
+    "tag: el.tagName.toLowerCase(),"
+    "label: (el.innerText || el.getAttribute('aria-label') || el.getAttribute('name') || '').trim().replace(/\\s+/g, ' ').slice(0, 60),"
+    "covered: (hit && hit !== el && !el.contains(hit) && !hit.contains(el))"
+    " ? (hit.tagName.toLowerCase() + (hit.className ? '.' + String(hit.className).split(' ')[0] : '')) : ''"
+    "};})()"
+)
+
+_JS_MOUSE = "[window.__yuzuMouseX || 0, window.__yuzuMouseY || 0]"
+
+#: 常用按键：名称 -> (key, code, windowsVirtualKeyCode, 要发的字符)
+KEYS = {
+    "enter": ("Enter", "Enter", 13, "\r"),
+    "tab": ("Tab", "Tab", 9, ""),
+    "escape": ("Escape", "Escape", 27, ""),
+    "backspace": ("Backspace", "Backspace", 8, ""),
+    "delete": ("Delete", "Delete", 46, ""),
+    "arrowleft": ("ArrowLeft", "ArrowLeft", 37, ""),
+    "arrowright": ("ArrowRight", "ArrowRight", 39, ""),
+    "arrowup": ("ArrowUp", "ArrowUp", 38, ""),
+    "arrowdown": ("ArrowDown", "ArrowDown", 40, ""),
+    "pageup": ("PageUp", "PageUp", 33, ""),
+    "pagedown": ("PageDown", "PageDown", 34, ""),
+    "home": ("Home", "Home", 36, ""),
+    "end": ("End", "End", 35, ""),
+    "space": (" ", "Space", 32, " "),
+}
+
+_BUTTON_BITS = {"left": 1, "right": 2, "middle": 4}
+
+
+def _point(session: _Session, target: str) -> dict:
+    """把 `css:选择器` 或 `x,y` 翻成一个视口坐标点（含元素信息）。
+
+    @param
+    session: 当前标签页的 CDP 连接
+    target: 落点说法
+    """
+    text = str(target or "").strip()
+    if not text:
+        raise ValueError("要给个落点：`css:选择器` 或 `x,y`（视口坐标）")
+    if text.lower().startswith("css:"):
+        selector = text[4:].strip()
+        if not selector:
+            raise ValueError("css: 后面要给一个选择器，例如 css:#captcha")
+        box = _evaluate(session, _JS_CLICK_POINT.replace("__SELECTOR__", json.dumps(selector)))
+        if not isinstance(box, dict):
+            raise ValueError(f"选择器没匹配到元素：{selector}（跨 iframe 的元素用 x,y 坐标来点）")
+        if not box.get("width") or not box.get("height"):
+            raise ValueError(f"元素没有尺寸，点不着：{selector}")
+        return {**box, "how": f"css:{selector}"}
+    numbers = [part.strip() for part in text.replace("，", ",").split(",")]
+    if len(numbers) != 2:
+        raise ValueError("落点要写成 `x,y`（视口坐标）或 `css:选择器`")
+    try:
+        x, y = (float(value) for value in numbers)
+    except ValueError as error:
+        raise ValueError("x,y 没读懂：两个数字，逗号隔开") from error
+    return {"x": x, "y": y, "width": 0, "height": 0, "tag": "", "label": "", "covered": "", "how": text}
+
+
+def _viewport(session: _Session) -> tuple:
+    size = _evaluate(session, "[window.innerWidth, window.innerHeight]") or [1280, 900]
+    return float(size[0] or 1280), float(size[1] or 900)
+
+
+def _path(x0: float, y0: float, x1: float, y1: float, steps: int, human: bool) -> list:
+    """从 (x0,y0) 走到 (x1,y1) 的一串路径点，最后一点精确落在终点。
+
+    WHY: 一次 `mouseMoved` 直接跳到目标，轨迹在页面上就是"瞬移"，滑块和风控都把这当机器人。
+    这里按 smoothstep 缓入缓出切成若干小步，再叠一点垂直于路径的抖动。
+
+    @param
+    x0: 起点 x
+    y0: 起点 y
+    x1: 终点 x
+    y1: 终点 y
+    steps: 切几段，至少 1
+    human: 是否加缓动与抖动
+    """
+    count = max(1, int(steps))
+    dx, dy = x1 - x0, y1 - y0
+    distance = math.hypot(dx, dy)
+    points: list = []
+    for index in range(1, count + 1):
+        t = index / count
+        eased = t * t * (3 - 2 * t) if human else t
+        px, py = x0 + dx * eased, y0 + dy * eased
+        if human and distance > 6:
+            normal_x, normal_y = -dy / distance, dx / distance
+            amplitude = math.sin(math.pi * t) * min(2.5, distance * 0.02) * random.uniform(-1, 1)
+            px += normal_x * amplitude
+            py += normal_y * amplitude
+        points.append((round(px, 1), round(py, 1)))
+    points[-1] = (round(x1, 1), round(y1, 1))
+    return points
+
+
+def _move_pointer(session: _Session, x: float, y: float, human: bool, buttons: int = 0, span: float = 0.0) -> int:
+    """把指针挪到 (x,y)，返回走了多少步；*buttons* 非 0 表示"按住移动"（拖拽）。
+
+    @param
+    session: 当前标签页的 CDP 连接
+    x: 目标 x（视口坐标）
+    y: 目标 y（视口坐标）
+    human: 是否缓动 + 抖动
+    buttons: 按住时传 1（左键拖拽）
+    span: 整段路程大约用多少秒，0 表示按默认节奏
+    """
+    here = _evaluate(session, _JS_MOUSE) or [0, 0]
+    hx, hy = float(here[0] or 0), float(here[1] or 0)
+    distance = math.hypot(x - hx, y - hy)
+    if human:
+        steps = max(8, min(48, int(distance / 14) + 8))
+    else:
+        steps = 1
+    points = _path(hx, hy, x, y, steps, human)
+    if span > 0:
+        gap = span / len(points)
+    elif human:
+        gap = 0.012
+    else:
+        gap = 0.004
+    for px, py in points:
+        session.call(
+            "Input.dispatchMouseEvent",
+            {"type": "mouseMoved", "x": px, "y": py, "button": "none" if not buttons else "left", "buttons": buttons},
+        )
+        time.sleep(gap * random.uniform(0.6, 1.4))
+    _evaluate(session, f"[window.__yuzuMouseX = {json.dumps(round(x, 1))}, window.__yuzuMouseY = {json.dumps(round(y, 1))}]")
+    return len(points)
+
+
+def _press_key(session: _Session, name: str) -> None:
+    """按一下具名按键（Enter/Tab/Backspace…），期间发完整的 down/char/up。
+
+    @param
+    session: 当前标签页的 CDP 连接
+    name: KEYS 里的键名，大小写不敏感
+    """
+    key = KEYS.get(str(name or "").strip().lower())
+    if key is None:
+        raise ValueError(f"不认识的按键：{name}；可用的是 {', '.join(sorted(KEYS))}")
+    label, code, virtual, text = key
+    session.call(
+        "Input.dispatchKeyEvent",
+        {"type": "rawKeyDown", "key": label, "code": code,
+         "windowsVirtualKeyCode": virtual, "nativeVirtualKeyCode": virtual},
+    )
+    if text:
+        session.call("Input.dispatchKeyEvent", {"type": "char", "key": label, "text": text, "unmodifiedText": text})
+    session.call(
+        "Input.dispatchKeyEvent",
+        {"type": "keyUp", "key": label, "code": code,
+         "windowsVirtualKeyCode": virtual, "nativeVirtualKeyCode": virtual},
+    )
+    time.sleep(random.uniform(0.03, 0.08))
+
+
+def click(target: str = "", human: bool = True, count: int = 1, button: str = "left", hold: float = 0.0) -> dict:
+    """在页面上真的点一下鼠标（CDP 真实指针事件，不是 `el.click()`）。
+
+    @param
+    target: 落点：`css:选择器` 点元素中心（会自动滚进视野），或 `x,y`（视口内 CSS 像素）
+    human: true 时把移动拆成小步并带轻微抖动（更像人），false 一步到位
+    count: 连点几次，2 就是双击
+    button: left / right / middle
+    hold: 按下后停多少秒再松开；0 表示用 0.05~0.12 秒的随机停顿
+    """
+    if button not in _BUTTON_BITS:
+        raise ValueError(f"button 只能是 {', '.join(_BUTTON_BITS)}")
+    port = start()["port"]
+    with _page_lock:
+        tab = _page_target(port, _page_key())
+        if tab is None:
+            raise RuntimeError("当前窗口还没有打开任何页面")
+        with _Session(tab["webSocketDebuggerUrl"]) as session:
+            point = _point(session, target)
+            x, y = float(point["x"]), float(point["y"])
+            width, height = _viewport(session)
+            if not (0 <= x <= width and 0 <= y <= height):
+                raise ValueError(
+                    f"落点 ({x:g},{y:g}) 不在视口里（视口 {width:g}x{height:g}）；换个 css: 选择器让它滚进来"
+                )
+            moved = _move_pointer(session, x, y, human)
+            bits = _BUTTON_BITS[button]
+            for index in range(1, int(count) + 1):
+                session.call(
+                    "Input.dispatchMouseEvent",
+                    {"type": "mousePressed", "x": x, "y": y, "button": button,
+                     "buttons": bits, "clickCount": index},
+                )
+                time.sleep(hold if hold > 0 else random.uniform(0.05, 0.12))
+                session.call(
+                    "Input.dispatchMouseEvent",
+                    {"type": "mouseReleased", "x": x, "y": y, "button": button,
+                     "buttons": 0, "clickCount": index},
+                )
+                time.sleep(random.uniform(0.05, 0.12))
+            return {"ok": True, "x": round(x, 1), "y": round(y, 1), "count": int(count), "button": button,
+                    "steps": moved, "tag": point.get("tag", ""), "label": point.get("label", ""),
+                    "covered": point.get("covered", ""), "how": point["how"],
+                    "viewport": [width, height]}
+
+
+def drag(source: str, target: str, human: bool = True, duration: float = 0.0, hold: float = 0.0) -> dict:
+    """按住 *source* 拖到 *target* 再松开——滑块类验证码要的就是这个。
+
+    @param
+    source: 起点，`css:选择器` 或 `x,y`（视口坐标）
+    target: 终点，写法同上
+    human: true 时缓动并带轻微抖动
+    duration: 整段拖拽大约花多少秒；0 表示随机 0.5~0.9 秒
+    hold: 在起点按住后停多少秒再开始移动；0 表示随机 0.08~0.18 秒
+    """
+    port = start()["port"]
+    with _page_lock:
+        tab = _page_target(port, _page_key())
+        if tab is None:
+            raise RuntimeError("当前窗口还没有打开任何页面")
+        with _Session(tab["webSocketDebuggerUrl"]) as session:
+            start_point = _point(session, source)
+            end_point = _point(session, target)
+            sx, sy = float(start_point["x"]), float(start_point["y"])
+            ex, ey = float(end_point["x"]), float(end_point["y"])
+            _move_pointer(session, sx, sy, human)
+            session.call("Input.dispatchMouseEvent",
+                         {"type": "mousePressed", "x": sx, "y": sy, "button": "left", "buttons": 1, "clickCount": 1})
+            time.sleep(hold if hold > 0 else random.uniform(0.08, 0.18))
+            span = duration if duration > 0 else random.uniform(0.5, 0.9)
+            _move_pointer(session, ex, ey, human, buttons=1, span=span)
+            time.sleep(random.uniform(0.12, 0.3))
+            session.call("Input.dispatchMouseEvent",
+                         {"type": "mouseReleased", "x": ex, "y": ey, "button": "left", "buttons": 0, "clickCount": 1})
+            return {"ok": True, "from": [round(sx, 1), round(sy, 1)], "to": [round(ex, 1), round(ey, 1)],
+                    "seconds": round(span, 2), "how": f"{start_point['how']} -> {end_point['how']}"}
+
+
+def type_text(text: str, target: str = "", clear: bool = False, slow: bool = False, submit: bool = False) -> dict:
+    """往页面上打字：可先点一下取得焦点，再送入内容。
+
+    @param
+    text: 要输入的内容
+    target: 先点哪里取得焦点（`css:选择器` 或 `x,y`），留空就打给当前焦点
+    clear: 先 Ctrl+A 全选再删掉原有内容
+    slow: true 时逐字符发真实按键（个别站点只认这个）；false 用一次 insertText，快且中文稳
+    submit: 打完按一次回车
+    """
+    port = start()["port"]
+    with _page_lock:
+        tab = _page_target(port, _page_key())
+        if tab is None:
+            raise RuntimeError("当前窗口还没有打开任何页面")
+        with _Session(tab["webSocketDebuggerUrl"]) as session:
+            focused = ""
+            if str(target or "").strip():
+                point = _point(session, target)
+                x, y = float(point["x"]), float(point["y"])
+                width, height = _viewport(session)
+                if not (0 <= x <= width and 0 <= y <= height):
+                    raise ValueError(f"落点 ({x:g},{y:g}) 不在视口里，先让它滚进来再点")
+                _move_pointer(session, x, y, True)
+                session.call("Input.dispatchMouseEvent",
+                             {"type": "mousePressed", "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 1})
+                time.sleep(random.uniform(0.04, 0.1))
+                session.call("Input.dispatchMouseEvent",
+                             {"type": "mouseReleased", "x": x, "y": y, "button": "left", "buttons": 0, "clickCount": 1})
+                time.sleep(random.uniform(0.08, 0.16))
+                focused = point.get("how", "")
+            if clear:
+                session.call("Input.dispatchKeyEvent",
+                             {"type": "rawKeyDown", "key": "a", "code": "KeyA", "modifiers": 2,
+                              "windowsVirtualKeyCode": 65, "nativeVirtualKeyCode": 65})
+                session.call("Input.dispatchKeyEvent",
+                             {"type": "keyUp", "key": "a", "code": "KeyA", "modifiers": 2,
+                              "windowsVirtualKeyCode": 65, "nativeVirtualKeyCode": 65})
+                time.sleep(random.uniform(0.05, 0.12))
+                _press_key(session, "backspace")
+            payload = str(text if text is not None else "")
+            if slow:
+                for char in payload:
+                    if char == "\n":
+                        _press_key(session, "enter")
+                        continue
+                    session.call("Input.dispatchKeyEvent",
+                                 {"type": "keyDown", "text": char, "unmodifiedText": char, "key": char})
+                    session.call("Input.dispatchKeyEvent", {"type": "keyUp", "key": char})
+                    time.sleep(random.uniform(0.04, 0.12))
+            elif payload:
+                session.call("Input.insertText", {"text": payload})
+                time.sleep(random.uniform(0.06, 0.15))
+            if submit:
+                _press_key(session, "enter")
+            state = _evaluate(session,
+                              "(() => { const el = document.activeElement;"
+                              " if (!el) return null;"
+                              " return {tag: el.tagName.toLowerCase(),"
+                              " type: (el.getAttribute('type') || ''),"
+                              " length: (typeof el.value === 'string' ? el.value.length : -1)}; })()")
+            return {"ok": True, "focused": focused, "typed": len(payload), "slow": bool(slow),
+                    "submit": bool(submit), "active": state or {}}
+
+
+def press_key(name: str) -> dict:
+    """按一下具名按键：enter / tab / escape / backspace / delete / arrowleft / pagedown / home / end / space。
+
+    @param
+    name: 按键名，大小写不敏感
+    """
+    port = start()["port"]
+    with _page_lock:
+        tab = _page_target(port, _page_key())
+        if tab is None:
+            raise RuntimeError("当前窗口还没有打开任何页面")
+        with _Session(tab["webSocketDebuggerUrl"]) as session:
+            _press_key(session, name)
+            return {"ok": True, "key": str(name).strip().lower()}
+
+
+def scroll(amount: int = 0, target: str = "", x: float = 0, y: float = 0,
+           steps: int = 0) -> dict:
+    """滚动页面：滚轮式滚动 *amount* 像素（负数向上），或把某个元素滚进视野。
+
+    @param
+    amount: 纵向滚动像素，正数向下；0 表示不动（配合 target 用）
+    target: `css:选择器`，把它滚到视野中央
+    x: 滚轮落点横坐标（视口内 CSS 像素）；0 表示页面水平中央
+    y: 滚轮落点纵坐标；0 表示页面垂直中央。列表/下拉这种**自己内部可滚**的容器，
+       把光标放进容器里滚才有效——这就是它和滚整页的区别
+    steps: 把 amount 拆成几次滚（默认 1 次一口；给 4、6 这种更像人手）
+    """
+    port = start()["port"]
+    with _page_lock:
+        tab = _page_target(port, _page_key())
+        if tab is None:
+            raise RuntimeError("当前窗口还没有打开任何页面")
+        with _Session(tab["webSocketDebuggerUrl"]) as session:
+            if str(target or "").strip():
+                text = str(target).strip()
+                if not text.lower().startswith("css:"):
+                    raise ValueError("target 要写成 css:选择器")
+                selector = text[4:].strip()
+                box = _evaluate(session, _JS_CLICK_POINT.replace("__SELECTOR__", json.dumps(selector)))
+                if not isinstance(box, dict):
+                    raise ValueError(f"选择器没匹配到元素：{selector}")
+                return {"ok": True, "scrolled_to": selector, "center": [round(box["x"], 1), round(box["y"], 1)]}
+            if int(amount) == 0:
+                raise ValueError("给个 amount（正数向下滚）或 target（css:选择器）")
+            width, height = _viewport(session)
+            point_x = float(x) if float(x) > 0 else width / 2
+            point_y = float(y) if float(y) > 0 else height / 2
+            total = int(amount)
+            parts = max(1, min(12, int(steps) or 1))
+            done = 0
+            for index in range(parts):
+                piece = total // parts
+                if index < total % parts:
+                    piece += 1 if total > 0 else -1
+                if piece == 0:
+                    continue
+                done += piece
+                session.call("Input.dispatchMouseEvent",
+                             {"type": "mouseWheel", "x": point_x, "y": point_y,
+                              "deltaX": 0, "deltaY": piece})
+                time.sleep(random.uniform(0.03, 0.09))
+            time.sleep(random.uniform(0.08, 0.2))
+            offset = _evaluate(session, _JS_SCROLL) or [0, 0]
+            return {"ok": True, "amount": done, "point": [round(point_x, 1), round(point_y, 1)],
+                    "steps": parts, "scroll": [offset[0], offset[1]]}
+
+
+def screenshot(full: bool = False, region: str = "", scale: float = 0.0) -> str:
     """截图当前标签页，返回宿主机上的 `file://` 地址。
 
     @param
     full: true 时按整页高度截图，false 只截视口
+    region: 只截其中一块并放大，用来看细节：`css:选择器`（如 `css:#captcha`）或
+            `x,y,w,h`（视口内 CSS 像素）；留空截整屏
+    scale: region 的放大倍数，默认 2；1 表示按原始像素
     """
     port = start()["port"]
     with _page_lock:
@@ -898,19 +1436,19 @@ def screenshot(full: bool = False) -> str:
             raise RuntimeError("当前窗口还没有打开任何页面")
         with _Session(target["webSocketDebuggerUrl"]) as session:
             session.call("Page.enable")
+            clip = _region_clip(session, region, scale)
             resized = False
-            if full:
+            if full and clip is None:
                 metrics = session.call("Page.getLayoutMetrics", timeout=15.0)
                 size = metrics.get("cssContentSize") or metrics.get("contentSize") or {}
                 height = int(min(max(float(size.get("height") or VIEWPORT_HEIGHT), VIEWPORT_HEIGHT), 20000))
                 session.call("Emulation.setDeviceMetricsOverride", _metrics(height))
                 resized = True
             try:
-                result = session.call(
-                    "Page.captureScreenshot",
-                    {"format": "png", "captureBeyondViewport": bool(full)},
-                    timeout=60.0,
-                )
+                params = {"format": "png", "captureBeyondViewport": bool(full or clip)}
+                if clip is not None:
+                    params["clip"] = clip
+                result = session.call("Page.captureScreenshot", params, timeout=60.0)
             finally:
                 if resized:
                     session.call("Emulation.setDeviceMetricsOverride", _metrics())
@@ -1118,4 +1656,9 @@ __all__ = [
     "start",
     "status",
     "stop",
+    "click",
+    "drag",
+    "press_key",
+    "scroll",
+    "type_text",
 ]
