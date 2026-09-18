@@ -649,8 +649,9 @@ class SessionBinding:
                 # WHY: 代价是这里**唯一**一处"明知可能还要用也照收"——一个 `.md` 技能在第二
                 # 个小时仍被每轮阅读，也会在开局被收掉，因为阅读留不下痕迹。这不是没想到的
                 # 副作用，是知情的取舍：函数模块误收会被下一次调用当场打回来，内容模块误收
-                # 没有任何动作会撞上它，靠的是目录首行那个被动钩子，外加通告里那句说明（见
-                # `_queue_reclaimed`，它带上首行描述正是为了补这一口）。哪天发现模型反复漏掉
+                # 没有任何动作会撞上它，靠的是会话开头那份目录：模块的名字加首行描述
+                # 在那里是**无条件**列着的，收不收都在，所以钩子不是"重装之后才有"，而是本来
+                # 就在（这也是通告不必再抄一遍描述的原因，见 `_queue_reclaimed`）。哪天发现模型反复漏掉
                 # 某个技能里写着的约束，回来看这一条。
                 if (
                     self.ttl is not None
@@ -947,18 +948,6 @@ class SessionBinding:
             self._touched[owner] = time.time()
             self._dirty = True
 
-    def _summary(self, name: str) -> str:
-        """That module's first line, for a notice that says what was taken away.
-
-        WHY: 通告只报名字是不够的。函数模块被误收会被下一次调用当场打回来，内容模块不会
-        ——没有任何动作会撞上它，被拿走的恰恰是"这件事要注意什么"的那段文字，模型连自己
-        少了什么都不知道。带上首行就把通告从"拿走了一个东西"变成"拿走的是干这个用的"，
-        钩子从目录里那一行（被动、要自己去看）挪到通告里（就在眼前）。
-        """
-        module = self.registry.get(name)
-        description = getattr(module, "description", "")
-        return f" — {description}" if description else ""
-
     def _queue_reclaimed(self, reclaimed: list[tuple[str, str]]) -> None:
         """Queue one appended notice about modules this window lost with nobody talking.
 
@@ -972,6 +961,13 @@ class SessionBinding:
         WHY: 不走 `_announce`。开局时"前"只有 meta，全量比较会把这次装回的模块全报成
         "已激活"并各附一份正文副本，每轮都来一遍。这里只报丢掉的那几个。
 
+        WHY: 一条记录只有名字和原因，不带描述、也不带"要回来该怎么做"。三处各管一件事：
+        会话开头那份目录管**是什么**——它是无条件的，每个模块的名字加首行一直列在那儿，
+        与激活与否无关（见 `_render_context`），被收掉的模块照样占着它那一行；`meta` 的
+        正文管**怎么装载**，三种原因的含义也写在那里；通告只管**状态变了、为什么变**。
+        通告再抄一遍描述或操作步骤，就是同一个事实有了第二个写入权威——而重复的指引会被
+        当成义务照做，2026-09-18 的"用完就卸"就是这么让模型真去调了一次 unload。
+
         WHY: UI 模式不发，和 `_announce` 同一条理由。整块状态挂在末尾、每次子请求重算，
         本来就是最新的，再追加一条"变了什么"就又是两个副本并存。
         """
@@ -982,23 +978,7 @@ class SessionBinding:
             grouped.setdefault(reason, []).append(name)
         lines = ["工具模块已变化（本条由系统追加，不是用户发言）："]
         for reason, names in grouped.items():
-            for name in sorted(names):
-                lines.append(f"- 已停用（{reason}）：{name}{self._summary(name)}")
-        if grouped.get("空闲收回"):
-            limit = _human_time(self.ttl) if self.ttl else ""
-            lines.append(
-                f"空闲收回只按时限判断：超过{limit}没有被装入或调用过的模块，新一轮开局就不再"
-                "装回来（你上一轮装载过它，这一轮它不在了）。**阅读不留痕迹**，所以只靠读正文的"
-                "模块也会按装入时刻到期——还要用就 `load_tools` 把它装回来，这是下一步，不是"
-                "以后再说。"
-            )
-        if grouped.get("本轮不可用"):
-            lines.append(
-                "标记为「本轮不可用」的模块在它自己的轮里会重新出现，不用重复装载——窗口里的"
-                "激活记录还留着，只是这一轮的发言者看不到它。"
-            )
-        if grouped.get("已不存在"):
-            lines.append("标记为「已不存在」的模块源码已经没了，窗口里的记录也一并清掉了。")
+            lines.extend(f"- 已停用（{reason}）：{name}" for name in sorted(names))
         self._announcements.append(_framed("\n".join(lines)))
 
     def _save_active(self) -> None:
@@ -1076,7 +1056,6 @@ class SessionBinding:
             for name, error in after_failures.items()
             if before_failures.get(name) != error
         }
-        stopped = set(before_active) - set(after_active)
         lines = [
             joined("目录新增", set(after_catalog) - set(before_catalog)),
             joined("目录移除", set(before_catalog) - set(after_catalog)),
@@ -1085,7 +1064,7 @@ class SessionBinding:
                 if after_catalog[name] != before_catalog[name]
             }),
             joined("已激活", set(after_active) - set(before_active)),
-            joined("已停用", stopped),
+            joined("已停用", set(before_active) - set(after_active)),
             joined("已激活模块内容更新", {
                 name for name in set(after_active) & set(before_active)
                 if after_active[name] != before_active[name]
@@ -1097,14 +1076,6 @@ class SessionBinding:
             return
 
         sections = ["工具模块已变化（本条由系统追加，不是用户发言）：", *body]
-        if stopped:
-            # 走到这里的停用只有一条路：reload_tools 发现源码没了。它紧跟着 _save_active，
-            # 窗口记录确实一起没了。（开局的空闲回收不走这里，它有自己的通告，见
-            # _queue_reclaimed——那条比的是前后全量，开局报出来的会是一堆"已激活"。）
-            sections.append(
-                "已停用的模块同时从本窗口的激活记录里清掉了，下一轮开局不会再装回来；"
-                "还要用就重新 `load_tools`。"
-            )
         for name in sorted(after_active):
             content = after_active[name]
             if content and before_active.get(name) != content:
