@@ -89,7 +89,8 @@ def run(body: str):
     event = context.current()
     destination = {
         "group_id": event.get("group_id"),
-        "user_id": event.get("user_id"),
+        # 订阅目标是**窗口**：私聊读 `target_id`（对端），`user_id` 是作者，只作兜底。
+        "user_id": event.get("target_id") or event.get("user_id"),
     }
     if operation == "check":
         check_latest_version()

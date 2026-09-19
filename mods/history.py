@@ -78,11 +78,19 @@ def window(event: dict[str, Any]) -> tuple[str, Any] | None:
     *not* ``context.interaction_key``, which identifies one line of interaction
     -- a single person inside a window -- so that a ``yield`` knows whose next
     message it is waiting for.  A window has many lines.
+
+    WHY: 私聊窗口读 ``target_id``，不读顶层 ``user_id``。``user_id`` 是**作者**，
+    两个方向、实时与重建都一致（2026-09-19 实测：对端发来的与 Bot 自己发出的私聊
+    事件里 ``user_id`` 都是作者，``target_id`` 都是那条私聊），而私聊"是哪一条"
+    只有 ``target_id`` 答得出，NapCat 两个方向都填它。曾经靠"把 Bot 自己那条的
+    ``user_id`` 改写成对端"凑出窗口——那要求每个入口都记得改写，也让"谁发的"和
+    "发到哪个窗口"两个问题共用同一个字段。读不到 ``target_id`` 就返回 ``None``：
+    窗口未知好过猜一个错的。
     """
     if event.get("group_id") is not None:
         return "group", event["group_id"]
-    user_id = event.get("user_id")
-    return ("private", user_id) if user_id is not None else None
+    target_id = event.get("target_id")
+    return ("private", target_id) if target_id is not None else None
 
 
 def getlog(
@@ -132,12 +140,10 @@ def getlog(
 def author(event: dict[str, Any]) -> Any:
     """Who actually sent an event.
 
-    ``user_id`` cannot answer this.  A group event carries the sender there, but
-    a private one carries the window's peer -- including for the Bot's own
-    messages, which ``mods.message`` stamps with the peer's id -- so in a private
-    window ``user_id`` makes the Bot and the person indistinguishable.  ``sender``
-    is the field that names the author in both windows, on live events and on
-    records rebuilt from chatlog alike.
+    WHY: 两个方向、实时与重建都读 ``user_id`` 也可以——它现在就是作者（私聊窗口
+    改由 ``target_id`` 给出，见 ``window``）。仍然优先 ``sender.user_id``，是因为
+    从 chatlog 重建 v0 私聊行时作者只能按名字猜，那份猜测连同名字一起写在 ``sender``
+    上，而 ``user_id`` 会缺；两者不一致时 ``sender`` 更具体。
     """
     sender = event.get("sender")
     if isinstance(sender, dict) and sender.get("user_id") is not None:

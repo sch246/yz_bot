@@ -31,9 +31,15 @@ def _current() -> dict[str, Any]:
 
 
 def msg_id(msg: dict[str, Any]) -> tuple[bool, int]:
-    if "group_id" in msg:
+    """这条任务属于哪个窗口，同时用作锁的键。
+
+    WHY: 私聊窗口是 ``target_id``（那条私聊的对端），不是顶层 ``user_id``——后者是
+    作者。``user_id`` 只作兜底，因为**改动之前**存进任务文件的 ``msg`` 里，窗口恰恰
+    写在 ``user_id`` 上（那时私聊的 ``user_id`` 就是对端）。
+    """
+    if msg.get("group_id") is not None:
         return True, int(msg["group_id"])
-    return False, int(msg["user_id"])
+    return False, int(msg.get("target_id") or msg["user_id"])
 
 
 def get_lock(is_group: bool, identifier: int) -> Lock:
@@ -43,9 +49,9 @@ def get_lock(is_group: bool, identifier: int) -> Lock:
 def get_later_list(msg: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     if msg is None:
         msg = _current()
-    if "group_id" in msg:
+    if msg.get("group_id") is not None:
         return storage.get("later_list/groups", str(msg["group_id"]), list)
-    return storage.get("later_list/users", str(msg["user_id"]), list)
+    return storage.get("later_list/users", str(msg.get("target_id") or msg["user_id"]), list)
 
 
 def later(

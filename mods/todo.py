@@ -111,9 +111,10 @@ def _split_once(text: str) -> tuple[str, str]:
 def get_todo_list(msg: dict[str, Any] | None = None) -> list[dict[str, str]]:
     if msg is None:
         msg = _current()
-    if "group_id" in msg:
+    if msg.get("group_id") is not None:
         return storage.get("todo_list/groups", str(msg["group_id"]), list)
-    return storage.get("todo_list/users", str(msg["user_id"]), list)
+    # 私聊窗口是 `target_id`（对端）；`user_id` 是作者，只作兜底。
+    return storage.get("todo_list/users", str(msg.get("target_id") or msg["user_id"]), list)
 
 
 @command

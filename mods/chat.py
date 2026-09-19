@@ -59,7 +59,8 @@ def getchatstorage(event: dict | None = None) -> dict:
         raise RuntimeError("当前没有聊天窗口")
     if event.get("group_id") is not None:
         return storage.get("groups", str(event["group_id"]))
-    return storage.get("users", str(event["user_id"]))
+    # 私聊窗口是对端（`target_id`）；`user_id` 是作者，只在窗口缺失时兜底。
+    return storage.get("users", str(event.get("target_id") or event.get("user_id")))
 
 
 def normalize_image_mode(value) -> str:

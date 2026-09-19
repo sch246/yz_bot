@@ -206,10 +206,10 @@ def _resolve_window(target: str, current: dict):
         group_id = current.get("group_id")
         if group_id is not None:
             return int(group_id), None
-        user_id = current.get("user_id") or current.get("sender_id")
-        if user_id is None:
+        target_id = current.get("target_id")
+        if target_id is None:
             return "当前不在任何窗口里，请在聊天中调用或给出 target"
-        return None, int(user_id)
+        return None, int(target_id)
     matched = _match_window.fullmatch(choice)
     if matched is None:
         return f"target 无法识别：{choice!r}。用 g<群号>、u<QQ号>，或留空表示当前窗口"
@@ -242,7 +242,7 @@ def _receipt(command: str, executor, group_id, user_id) -> None:
 
 
 def _event(text: str, group_id, user_id, author) -> dict:
-    """作者写在 ``sender.user_id`` 上；顶层 ``user_id`` 群聊里是作者、私聊里是窗口对端。"""
+    """顶层 ``user_id`` 是作者（两种窗口一致）；私聊的窗口另写在 ``target_id`` 上。"""
     from mods import identity
 
     event = {
@@ -265,7 +265,7 @@ def _event(text: str, group_id, user_id, author) -> dict:
             }
         )
     else:
-        event.update({"message_type": "private", "sub_type": "friend", "user_id": user_id})
+        event.update({"message_type": "private", "sub_type": "friend", "user_id": author, "target_id": user_id})
     return event
 
 

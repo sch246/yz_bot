@@ -37,11 +37,16 @@ class SendFuture(SimpleFuture[int | None]):
 
 
 def target(event: dict) -> dict[str, object]:
-    """Reduce a OneBot event to the explicit destination accepted by send_msg."""
+    """Reduce a OneBot event to the explicit destination accepted by send_msg.
+
+    WHY: 私聊的目的地是 ``target_id``——那条私聊的对端——不是顶层 ``user_id``。
+    ``user_id`` 是作者，Bot 自己发出的回声也带着它；拿它当目的地，回复会发给自己。
+    群聊本来只看 ``group_id``。
+    """
     group_id = event.get("group_id")
     if group_id is not None:
         return {"group_id": group_id}
-    user_id = event.get("user_id") or event.get("sender_id")
+    user_id = event.get("target_id")
     if user_id is None:
         raise ValueError("event has no message destination")
     return {"user_id": user_id}
@@ -91,6 +96,11 @@ def record_sent(message_id, user_id=None, group_id=None) -> dict | None:
     里，于是**只有走 send_msg 的消息**才被记下来；任何用别的 action 发出去的东西
     （合并转发用的是 send_forward_msg）就变成一段无痕：日志里没有，下一轮模型也看不见
     自己做过这件事。取不到就把 message_id 交回去，调用方自己决定要不要在意。
+
+    WHY: ``get_msg`` 回来的事件带作者、**不带**私聊窗口（实测：``user_id`` 是 Bot
+    自己，没有 ``target_id``），所以这里把窗口补上——发送目的地就是那个对端。补完之后
+    它和一条实时入站事件同形，``chatlog`` 与 ``history`` 因此不需要任何"把作者当窗口"
+    的特判。作者不动：回查给的本来就对。
     """
     fetched = connect.call_api(
         "get_msg",
@@ -103,7 +113,7 @@ def record_sent(message_id, user_id=None, group_id=None) -> dict | None:
         return None
     sent_event = dict(fetched["data"])
     if group_id is None:
-        sent_event["user_id"] = user_id
+        sent_event["target_id"] = user_id
     elif isinstance(sent_event.get("sender"), dict):
         sent_event["user_id"] = sent_event["sender"].get("user_id")
     _chatlog_write(sent_event)
@@ -162,7 +172,8 @@ def sendmsg(text: Any, user_id=None, group_id=None, **params) -> SendFuture:
             return future
         group_id = event.get("group_id")
         if group_id is None:
-            user_id = event.get("user_id") or event.get("sender_id")
+            # 同上：私聊回给窗口对端，不是回给作者。
+            user_id = event.get("target_id")
     return send(text, user_id=user_id, group_id=group_id, **params)
 
 

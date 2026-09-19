@@ -28,7 +28,9 @@
 - `op.is_op(event)`——op 门的判据。传事件时原来读顶层 `user_id`，私聊里那是窗口对端。
 - `chat._usage_entry()`——LLM 费用的归属，docstring 本来就写着 "the acting user's"，原来也读顶层 `user_id`。
 
-两者的用户可见变化都**只在私聊、且只在 Bot 自己是作者时**生效（群聊两个字段本来就相同）：前者让「以 Bot 自己的身份在当前窗口注入一条命令」能过 op 门，后者让那一轮的费用记到 Bot 自己而不是窗口对端。`history.author` 因此成为「谁发的」这个问题在仓库里的唯一读法；`later`/`todo`/`chattop`/`cave` 里出现的 `user_id` 是**窗口键或窗口对端**（私聊里它就是路由目标），不是作者，保持原样。
+两者的用户可见变化都**只在私聊、且只在 Bot 自己是作者时**生效（群聊两个字段本来就相同）：前者让「以 Bot 自己的身份在当前窗口注入一条命令」能过 op 门，后者让那一轮的费用记到 Bot 自己而不是窗口对端。`history.author` 因此成为「谁发的」这个问题在仓库里的唯一读法。
+
+**再续修（2026-09-19）：那条「私聊里 `user_id` 是窗口对端」的约定本身被撤掉了。** 抓 5701 上的真实入站看到：`user_id` 两个方向都是作者，私聊「是哪一条」由 NapCat 的扩展字段 `target_id` 给出、与方向无关；两件事因此不再共用一个字段，`later`/`todo`/`chattop`/`cave` 那批读者也不必再分两派。取舍、实测与完整改动面见[私聊窗口的身份](proposals/window-identity.md)。
 
 `message.recvmsg()` 仍把作者与窗口写成一个值（`sender_id` 同时写进两处），所以它表达不了「作者 ≠ 窗口」——op 工具集按[提案](../proposals/op-toolbox.md)是手工构造事件投 `connect._events`，不走它。
 

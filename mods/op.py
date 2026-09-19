@@ -69,7 +69,8 @@ def require_op(
         from mods import message
 
         group_id = msg.get("group_id")
-        user_id = None if group_id is not None else msg.get("user_id")
+        # 提醒要回原窗口：私聊窗口是 `target_id`（对端），`user_id` 是作者。
+        user_id = None if group_id is not None else msg.get("target_id")
         message.send(
             "权限不足(一定消息内将不再提醒)",
             user_id=user_id,

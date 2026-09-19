@@ -95,10 +95,10 @@ def _resolve_window(target: str, current: dict):
         group_id = current.get("group_id")
         if group_id is not None:
             return int(group_id), None
-        user_id = current.get("user_id") or current.get("sender_id")
-        if user_id is None:
+        target_id = current.get("target_id")
+        if target_id is None:
             return "当前不在任何窗口里，请在聊天中调用或给出 target"
-        return None, int(user_id)
+        return None, int(target_id)
     matched = _match_window.fullmatch(choice)
     if matched is None:
         return f"target 无法识别：{choice!r}。用 g<群号>、u<QQ号>，或留空表示当前窗口"
@@ -111,10 +111,10 @@ def _resolve_window(target: str, current: dict):
 def _event(text: str, group_id, user_id) -> dict:
     """Build the inbound-shaped event that carries one self-issued command.
 
-    WHY: 顶层 ``user_id`` **不动**，作者写在 ``sender.user_id`` 上——私聊窗口里顶层
-    ``user_id`` 是**窗口对端**（Bot 自己发的话也带着对端的 id），拿它当作者会让重启回执
-    发到错的窗口去。``sender.user_id`` 才是两种窗口下都指向作者的字段，与
-    ``history.author``、``chat.msg2chat``、``op.is_op`` 同一条约定。
+    WHY: 顶层 ``user_id`` 是**作者**，两种窗口下都一样；私聊的窗口写在 ``target_id``
+    上（与实时事件、与 ``history.window``、``message.target`` 同一条约定）。这条注入的
+    作者是 Bot 自己——``send_command`` 就是以 Bot 自己的身份执行——所以 ``user_id``
+    写 ``bot_id``，窗口另写 ``target_id``。两者分得开，重启回执才回得到原窗口。
 
     WHY: ``post_type`` 写 ``"message"`` 同样是**承重**的，不是照抄 inbound 形状。
     ``bot._route`` 开头按 ``post_type == "message_sent"`` 把自发消息整段跳过，而这里伪造
@@ -148,7 +148,14 @@ def _event(text: str, group_id, user_id) -> dict:
             "user_id": bot_id,
         })
     else:
-        event.update({"message_type": "private", "sub_type": "friend", "user_id": user_id})
+        event.update(
+            {
+                "message_type": "private",
+                "sub_type": "friend",
+                "user_id": bot_id,
+                "target_id": user_id,
+            }
+        )
     return event
 
 

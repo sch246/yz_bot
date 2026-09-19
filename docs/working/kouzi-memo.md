@@ -211,3 +211,20 @@
 
 ## 五、待归类（还没想好放哪，先堆着）
 - （暂无）
+
+- [x] **撤掉「私聊 `user_id` 是窗口对端」这条约定（草籽 2026-09-19 点）**：草籽的意见是
+  「不管谁发的、群聊还是私聊，`user_id` 都该是作者；靠加 `sender`、再在私聊把 `user_id`
+  折成窗口，纯粹是在制造复杂度」。抓 `5701` 上的真实入站实测后成立：`user_id` 两个方向
+  都是作者，私聊「是哪一条」由 Napcat 扩展 `target_id` 给出、两个方向都填、与方向无关
+  （对端发来时它等于 `user_id`，因为它不是收件人，是那条会话的标识）；`get_msg` 回查是
+  唯一丢窗口的一路，而它知道发送目的地。
+  - 改动：读窗口改读 `target_id`（`history.window` / `message.target` / `message.sendmsg` /
+    `context.interaction_key` / `chat.getchatstorage` / `chatlog.search_current` / `later` /
+    `todo` / `mcversion` / 两个 `_resolve_window` / `op.require_op` 的提醒目的地）；
+    写事件不再折（`record_sent` 补 `target_id`、`_message_record` 分开存、两个 `_event` 摆对位）。
+  - 保留 `target_id or user_id` 兜底的四处：改动前存进文件的任务与订阅里，窗口写在 `user_id` 上。
+  - **上面那条「保持原样的是窗口语义」到此作废**——「谁发的」与「发到哪」不再共用一个字段。
+  - 取舍与实测表：`docs/working/proposals/window-identity.md`（已实现）。
+  - 磁盘格式不动（行头本来就是作者、路径本来就是窗口）；notice 一族不在约定内。
+  - 验证：语义四例、真实档案重建（回声 `user_id`=Bot / `target_id`=对端）、写入→反查往返各过；
+    `--check` 117 文件 / 84 模块。**核心模块，需重启才生效。**

@@ -74,7 +74,8 @@ def search_current(pattern: str) -> list[str]:
     if group_id is not None:
         directory = Path(rootfile) / "group" / str(group_id)
     else:
-        directory = Path(rootfile) / "private" / str(event["user_id"])
+        # 私聊窗口是流水线的对端。顶层 `user_id` 是作者（Bot 自己说的话也带着它）。
+        directory = Path(rootfile) / "private" / str(event["target_id"])
     expression = re.compile(pattern)
     matches = []
     for path in sorted(directory.rglob("*.log")) if directory.is_dir() else []:
@@ -263,6 +264,9 @@ def _message(msg: dict[str, Any]) -> str:
         msg["sender"] = sender
     identity.update(msg)
     sender_id = int(sender.get("user_id", msg["user_id"]))
+    # WHY: 私聊窗口正常由 ``target_id`` 给出（实时事件、回声、回查都带它），能走到
+    # ``or`` 这一支说明上游没给窗口。落点取"作者自己的私聊"：它是一个稳定、且错处
+    # 看得见的键，比替它猜一个对端好。
     kind, target = history.window(msg) or ("private", sender_id)
     if kind == "group":
         group_id = int(target)
@@ -566,19 +570,29 @@ def _message_record(
     if kind == "group":
         record["group_id"] = target
         derived.append("group_id")
+    if kind == "private":
+        # 私聊记录的两半来自两处：``target_id`` 是**窗口**（路径给出的那个对端），
+        # ``user_id``/``sender`` 是**作者**（行头，v1 起带号码）。合成一个字段的日子
+        # 到此为止——从前的写法是 group 存作者、private 存窗口，于是"谁发的"和
+        # "发到哪"共用 ``user_id``，每个消费者都得记住自己在问哪一件事。
+        record["target_id"] = target
+        derived.append("target_id")
     if sender_id is None:
-        record["user_id"] = target
-        derived.append("user_id")
+        # v0 私聊行只有名字、没有号码，作者只能按 bot_names 猜（见 _guess_private_sender）。
         author = _guess_private_sender(head["name"], kind, target, bot_names or {}, names_complete)
         if author is None:
             missing.append("sender")
+            missing.append("user_id")
+            record["user_id"] = None
         else:
+            record["user_id"] = author
             record["sender"] = {"user_id": author, "nickname": head["name"]}
             record["post_type"] = "message_sent" if author in bot_ids else "message"
             derived.append("post_type")
             guessed.append("sender")
+            guessed.append("user_id")
     else:
-        record["user_id"] = sender_id if kind == "group" else target
+        record["user_id"] = sender_id
         sender: dict[str, Any] = {"user_id": sender_id, "nickname": head["name"]}
         if kind == "group":
             sender["card"] = head["name"]

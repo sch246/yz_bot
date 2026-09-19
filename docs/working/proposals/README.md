@@ -10,6 +10,7 @@
 - [可自维护的同相上下文](self-maintaining-context.md)（未实现；记录长期记忆、外显状态转移与自修改的北极星语义及证伪条件；[讨论来源与演化索引](self-maintaining-context-discussion.md)保留原话与修正链）
 - [检索索引：把子代理找过的路存下来](retrieval-index.md)（未实现；缓存子代理的检索路径而不是结论，失效判据由模型自写的校验命令给出）
 - [聊天消息的递归压缩](chat-condense.md)（未实现；把 `condense_ops` 那套延伸到聊天消息，节点自带 cid 因而可被再次压缩；记录已拍定项、未定项，以及落地时会失效的现有 `WHY`）
+- [私聊窗口的身份](window-identity.md)（已实现；`user_id` 是作者、`target_id` 是那条私聊，「谁发的」与「发到哪」不再共用一个字段）
 - [自发消息回流](self-message-echo.md)（未实现，阻塞在一项实测；把「Bot 说过的话」的写入权威从 `get_msg` 回查换成 `message_sent` 回声，并说明关卡为什么不能先于权威切换落地）
 - [异常、日志与 link 报错节流](errors-and-logging.md)（按严重程度分）与[日志分流：流的身份与出口](log-streams.md)（按流的身份分；两者正交）
 - [消息表示与 at/reply 解析](message-representation.md)（调查；§2 列出的五个问题已按其中 A 方案的前半修掉四个半，本篇按节标注了现状，未做的是模型侧的结构化渲染）

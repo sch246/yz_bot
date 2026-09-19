@@ -66,16 +66,25 @@ def latest() -> dict | None:
 
 
 def interaction_key(event: dict | None = None) -> tuple[Any, Any]:
-    """Return ``(group, user)``; private conversations use ``None`` as group.
+    """Return ``(group, person)``; private conversations use ``None`` as group.
 
     One line of interaction, not one chat window: two people in the same group
     have different keys here, which is what lets a ``yield`` wait for the right
     person.  ``history.window`` is the other one, and keys the shared history.
+
+    WHY: 私聊那一半是 ``target_id``——这条私聊的对端——不是 ``user_id``。这一位
+    答的是"在和谁说话"，与"这句谁发的"无关：Bot 自己发出的回声指向同一条线。
     """
     event = current() if event is None else event
-    if event is None or event.get("user_id") is None:
+    if event is None:
         raise RuntimeError("the current event has no interaction line")
-    return event.get("group_id"), event["user_id"]
+    if event.get("group_id") is not None:
+        person = event.get("user_id")
+    else:
+        person = event.get("target_id")
+    if person is None:
+        raise RuntimeError("the current event has no interaction line")
+    return event.get("group_id"), person
 
 
 def register_waiter(key: tuple[Any, Any], waiter: Any) -> Any:
