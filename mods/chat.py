@@ -452,15 +452,21 @@ def build_context(token_limit: int | None = None) -> list:
     if not picked:
         # 没有聊天做锚点时不载入任何操作记录：孤零零摆着，模型无从判断它当时在回应什么。
         return []
-    # WHY: 回收也依附于聊天。events 已经按 max_msg 截过，比它最老那条还早、又没人引用的
-    # 操作再也够不着了，这里顺手让 oplog 扫掉——门槛用 max_msg 窗口而不是本轮预算，因为
-    # 预算每轮可松可紧（`.chat` 就传别的值），拿它当删除门槛会删掉下一轮还够得着的记录。
-    # "又没人引用"那半句在 oplog.sweep 里：被窗口内的 condense_ops 点过名的调用要留着，
-    # 否则上下文里那个 cid 就成了指向空处的断号。
-    oplog.sweep(window, float(events[-1].get("time") or 0.0))
+    # WHY: 这里**不回收**操作记录，装配上下文是一个纯读动作。原先这行是
+    # `oplog.sweep(window, events[-1]["time"])`：拿"过滤后最老那条聊天"当门槛做可达性
+    # 回收，而 `_selected_events` 撞上「聊天开始」/「聊天结束」就 break——于是发一次边界
+    # 就把门槛抬到当下，下一轮装配上下文时**物理删除**边界之前的全部操作记录。
+    # 2026-09-19 真的发生了：一次「聊天开始」删掉 515 轮（op1598→op2112），而发它的人和
+    # 模型都以为那只是"不再往前看"。不可逆动作挂在每轮都会发生的读操作上，这是它的根因。
+    # 现在两件事分开：**边界照旧只管可见性**（下面的 floor 就是它），回收另有其人。
+    # 代价是刻意接受的：在按高度退休落位之前，操作记录只增不减，storage 那份全量回写与
+    # `#ops` 的输出都随之线性变长。见 docs/working/proposals/chat-condense.md。
+    # 删除条件：按高度退休落位，由它接管回收——那时门槛是**深度**，不再是聊天时间。
     items: list[tuple[float, int, list]] = [(at, 0, [converted]) for at, converted in picked]
     floor = picked[0][0]
-    items.extend((at, 1, batch) for at, batch in oplog.build_rounds(window) if at >= floor)
+    # 过滤下推给 build_rounds：条目不再被回收，全量重建再丢掉绝大部分会让这条热路径随
+    # 记录数线性变慢。
+    items.extend((at, 1, batch) for at, batch in oplog.build_rounds(window, since=floor))
     items.sort(key=lambda item: (item[0], item[1]))
     return _close_with_user([message for item in items for message in item[2]])
 
@@ -1069,10 +1075,11 @@ def _subcommand(value: str):
     if name == "ops" and not tail:
         # WHY: 操作历史是新加的一份持久存储，人必须能看见它、也能重置它。轨道写歪了
         # (记进了不该记的东西、或者收缩坏了)时，这是不用改代码就能恢复的入口。
-        # WHY: clear 的适用面比它看起来窄。操作记录依附聊天窗口，而 _selected_events 撞上
-        # 「聊天开始」/「聊天结束」就 break——所以重开一次聊天，地板抬到新起点，旧记录下
-        # 一轮自然被 sweep 扫掉。clear 真正管的是**聊天进行中途**要清轨道又不想断对话的
-        # 情况。别因为"反正重开聊天也能清"就删掉它，那是另一个代价。
+        # WHY: clear 现在是清除操作记录的**唯一**入口，这一条 2026-09-19 反转过。原先
+        # 它的适用面很窄——重开一次聊天，地板抬到新起点，旧记录下一轮就被 sweep 扫掉，
+        # clear 只管"聊天进行中途要清轨道又不想断对话"。而 sweep 恰恰因为这条路径被拆了
+        # （一条「聊天开始」删掉 515 轮，见 build_context 那条 WHY），所以现在边界只改
+        # 可见性，不再清除任何东西。按高度退休落位之前，不用 clear 就永远不减。
         window = history.window(context.current() or {})
         return oplog.render(window) or "本窗口还没有操作历史"
     if name == "ops" and tail.strip() == "clear":

@@ -20,14 +20,22 @@ WHY: 重建成**真的**工具调用记录（assistant(tool_calls) + tool），�
 WHY: 因此写入时**存全量**，不截断。截断过的内容重建出来会冒充原文——那比明写的摘要更糟，
 因为它看起来就是当时真实发生的事。
 
-WHY: 这个模块**没有自己的截断规则**——没有保留期，没有条数上限，没有字数上限。操作记录
-依附于聊天消息的截断：聊天窗口留多久，操作就留多久，够不着的由 chat.build_context 调
-sweep 清掉（见那里）。曾经这里有过一个独立的 7 天保留期，拆了：两套截断规则要各自
-调参、各自解释，而它们描述的其实是同一件事——"多早以前的事情还算数"。答案只该有一个。
+WHY: 这个模块**没有自己的截断规则**——没有保留期，没有条数上限，没有字数上限。"多早以前
+的事情还算数"这个问题只该有一个答案；曾经这里有过一个独立的 7 天保留期，拆了，因为它和
+聊天截断是同一个问题的两套参数。这条精神仍然成立，**过期的只是那个答案的度量**：原先答案
+是"聊天窗口能回溯多久"（`chat.build_context` 顺手调 `sweep` 清掉够不着的），2026-09-19
+拆掉了——那条路让「聊天开始」这样一条普通消息变成不可逆的物理删除，一次删掉 515 轮。
+新的答案是**深度**：被总结盖过 H 层的子树整体退休。见
+docs/working/proposals/chat-condense.md。
 
-WHY: 条目只有两种消失方式——滚出聊天窗口且没人引用，或被 clear。收缩不删除，只标记（见 condense），
-标记过的离开上下文但仍可 recall_ops 取回。所以"这一轮上下文里有什么"和"存储里还有什么"
-是两个不同的集合，读这个模块时别把它们当成一回事。
+WHY: 在按高度退休落位之前，条目**只增不减**，唯一的消失方式是 `clear`。这是刻意接受的
+过渡态，不是漏了回收：磁盘无界增长是那份提案里明写的取舍（消息那条线同样如此），而
+"不可逆删除挂在每轮的上下文装配上"是已经兑现过代价的错误。代价要知道：storage 的全量
+回写和 `#ops` 的输出都随记录数线性变长。真扛不住时先加回收，别把门槛改回聊天时间。
+
+WHY: 收缩不删除，只标记（见 condense），标记过的离开上下文但仍可 recall_ops 取回。所以
+"这一轮上下文里有什么"和"存储里还有什么"是两个不同的集合，读这个模块时别把它们当成一
+回事——摘掉回收之后这两个集合只会差得更远。
 
 WHY: cid 用跨轮稳定的 uid，不用每轮重排的序号。原因不是"稳定一点更好"，而是序号在这里会
 自我否定：结论住在模型那条 condense_ops 调用的 arguments 里（见 meta.condense_ops），
@@ -86,7 +94,18 @@ def _referenced_cids(entry: dict) -> list[str]:
 
     WHY: 判据是"参数里有 cids 这个字段"，不是硬编码 condense_ops / recall_ops 两个名字。
     cids 是这套系统里"我引用了这几次调用"的唯一写法；按写法认，将来再加一个吃 cids 的
-    工具，回收自动跟上，写死名字则会在加工具的那天悄悄漏掉一类引用。
+    工具，可达性自动跟上，写死名字则会在加工具的那天悄悄漏掉一类引用。
+
+    WHY: 眼下**没有消费者**——`sweep` 连同它那套可达性回收已经拆掉（见模块头）。留着它
+    是因为接管者需要它：按高度退休要判的同样是"这条还有没有人引用"，而下面这两条约束
+    与门槛用时间还是深度无关，重写时照样成立：
+      1. 被引用的原文不能删。收缩过的调用被它那次 condense_ops 的 arguments 引用着，
+         把原文删掉，上下文里就留下一个指向空处的 cid——模型看得见 op3、读得出当初的
+         结论，一 recall 却说找不到。
+      2. 因此收缩本身**不释放磁盘**，只释放上下文。一串"收缩的收缩"会把整条证据链一直
+         拽着，直到最新那次也失去根——那一刻整条链一起没有根，一次全清。这是有意的：
+         引用还在就得能还原，否则收缩就成了留下断号的删除。
+    删除条件：接管者落位后确认不用它，或它自己长出更合适的判据。
     """
     try:
         arguments = json.loads(entry.get("arguments") or "{}")
@@ -96,55 +115,6 @@ def _referenced_cids(entry: dict) -> list[str]:
         return []
     cids = arguments.get("cids")
     return [str(value) for value in cids] if isinstance(cids, list) else []
-
-
-def sweep(window: tuple[str, Any] | None, keep_since: float) -> int:
-    """Drop rounds that are neither recent nor referenced; return entries dropped.
-
-    WHY: 不是"比 keep_since 早的一律删"。收缩过的调用被它那次 condense_ops 的 arguments
-    引用着，而那次调用可能还在窗口里——把被引用的原文删掉，上下文里就留下一个指向空处的
-    cid：模型看得见 op3、读得出当初的结论，一 recall 却说找不到。所以这里是可达性回收：
-    以窗口内的轮为根，顺着 cids 引用递归标记，标不到的才删。
-
-    WHY: 门槛由调用方给——chat 那边传的是聊天窗口能回溯到的最早时刻。"多早以前的事情还
-    算数"是聊天截断的问题，不是操作记录自己的问题，所以这个模块只负责可达性，不负责定时。
-
-    WHY: 按**整轮**丢，不按条。丢掉一轮里的一部分，重建出来就是一条 assistant 的
-    tool_calls 少了对应的 tool 消息，供应商直接拒——回收不该把上下文变成非法的。
-
-    WHY: 因此收缩本身**不释放磁盘**，只释放上下文。一串"收缩的收缩"会把整条证据链一直
-    拽着，直到最新那次也滚出窗口——那一刻整条链一起没有根，一次全清。这是有意的：引用
-    还在就得能还原，否则收缩就成了留下断号的删除。
-    """
-    with _lock:
-        state = _state(window)
-        if state is None:
-            return 0
-        listed = state["entries"]
-        grouped: dict[str, list[dict]] = {}
-        for entry in listed:
-            grouped.setdefault(entry["round"], []).append(entry)
-        owner = {entry["cid"]: entry["round"] for entry in listed}
-        reachable: set[str] = set()
-        queue = [
-            round_id for round_id, batch in grouped.items()
-            if float(batch[0].get("at") or 0.0) >= keep_since
-        ]
-        while queue:
-            round_id = queue.pop()
-            if round_id in reachable:
-                continue
-            reachable.add(round_id)
-            for entry in grouped[round_id]:
-                for cid in _referenced_cids(entry):
-                    target = owner.get(cid)
-                    if target is not None and target not in reachable:
-                        queue.append(target)
-        kept = [entry for entry in listed if entry["round"] in reachable]
-        if len(kept) == len(listed):
-            return 0
-        state["entries"] = kept
-        return len(listed) - len(kept)
 
 
 def record(
@@ -278,11 +248,20 @@ def clear(window: tuple[str, Any] | None) -> None:
             state["entries"] = []
 
 
-def build_rounds(window: tuple[str, Any] | None) -> list[tuple[float, list[dict]]]:
+def build_rounds(
+    window: tuple[str, Any] | None, since: float | None = None
+) -> list[tuple[float, list[dict]]]:
     """Rebuild the track as timestamped, atomic tool-call rounds.
+
+    ``since`` keeps only the rounds at or after that moment.
 
     WHY: 归并的单位是**一轮**，不是一条消息。assistant(tool_calls) 和它的 tool 结果之间
     插进一条聊天消息就拆散了这一对，请求会被拒。所以每一轮带一个时间、整体落位。
+
+    WHY: ``since`` 按**整轮**筛，判据取这一轮的时间（下面那条 WHY 说的"第一条的完成
+    时刻"），不按条筛——理由和上一条同一个：半轮是非法的上下文。它是纯过滤，不删任何
+    东西；调用方只是说"这次不要更早的"。加它是因为条目不再被回收（见 chat.build_context
+    那条 WHY），全量重建再由调用方丢掉绝大部分，会让每轮装配随记录数线性变慢。
 
     WHY: 时间取这一轮里第一条的完成时刻。一轮里几个并发调用各自完成时间不同，而且工具
     执行期间到达的聊天消息，其真实先后没法从这一个时间点还原——重建出的顺序因此不保证
@@ -302,6 +281,8 @@ def build_rounds(window: tuple[str, Any] | None) -> list[tuple[float, list[dict]
     rounds: list[tuple[float, list[dict]]] = []
     for round_id in order:
         batch = grouped[round_id]
+        if since is not None and float(batch[0].get("at") or 0.0) < since:
+            continue
         messages: list[dict] = [{
             "role": "assistant",
             "content": "",
