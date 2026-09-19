@@ -327,9 +327,7 @@ def deliver(nodes: list[dict], user_id=None, group_id=None) -> str:
     if not isinstance(result, dict) or result.get("retcode") != 0:
         detail = result.get("wording") or result.get("message") if isinstance(result, dict) else result
         return f"发送失败：{detail}"
-    # 合并转发走的是 send_forward_msg，不经过 mods.message 的发送队列，所以要自己把这条
-    # 记录补进聊天记录和内存历史——否则模型下一轮看不见自己发过它。
-    sent = (result.get("data") or {}).get("message_id")
-    if sent is not None:
-        message.record_sent(sent, user_id=user_id, group_id=group_id)
+    # WHY: 这里不补登记。合并转发不经过 mods.message 的发送队列，所以它原先自己调一次
+    # `message.record_sent` 才进得了聊天记录；现在写记录统一归自发消息回声（实测
+    # send_forward_msg 也回流），那次补登记连同 record_sent 一起删了。同 message._send_now。
     return f"已发送 {len(nodes)} 条合并转发 → {where}"

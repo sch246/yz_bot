@@ -52,17 +52,6 @@ def target(event: dict) -> dict[str, object]:
     return {"user_id": user_id}
 
 
-def _chatlog_write(event: dict) -> None:
-    from mods import get_available
-
-    chatlog = get_available("chatlog")
-    if chatlog is not None:
-        written = chatlog.write(event)
-        if written is not None:
-            body = chatlog.display(written).removesuffix("\n")
-            _stream.info(f'[{time.strftime("%H:%M:%S")}]【发送消息】{body}')
-
-
 def _send_now(text: Any, user_id=None, group_id=None, **params) -> int | None:
     if "-d" in sys.argv or "--debug" in sys.argv:
         _stream.info("【准备发送消息】")
@@ -82,42 +71,14 @@ def _send_now(text: Any, user_id=None, group_id=None, **params) -> int | None:
     )
     if result.get("retcode") != 0:
         raise RuntimeError(f"OneBot send_msg failed: {result.get('wording', result)!s}")
-    message_id = (result.get("data") or {}).get("message_id")
-    if message_id is None:
-        return None
-    record_sent(message_id, user_id=user_id, group_id=group_id)
-    return message_id
-
-
-def record_sent(message_id, user_id=None, group_id=None) -> dict | None:
-    """Fetch one message we sent and write it into the chatlog and history.
-
-    WHY: 这是"Bot 说过的话要进聊天记录和内存历史"的唯一实现。它原先只在 `_send_now`
-    里，于是**只有走 send_msg 的消息**才被记下来；任何用别的 action 发出去的东西
-    （合并转发用的是 send_forward_msg）就变成一段无痕：日志里没有，下一轮模型也看不见
-    自己做过这件事。取不到就把 message_id 交回去，调用方自己决定要不要在意。
-
-    WHY: ``get_msg`` 回来的事件带作者、**不带**私聊窗口（实测：``user_id`` 是 Bot
-    自己，没有 ``target_id``），所以这里把窗口补上——发送目的地就是那个对端。补完之后
-    它和一条实时入站事件同形，``chatlog`` 与 ``history`` 因此不需要任何"把作者当窗口"
-    的特判。作者不动：回查给的本来就对。
-    """
-    fetched = connect.call_api(
-        "get_msg",
-        message_id=message_id,
-        user_id=user_id,
-        group_id=group_id,
-    )
-    if fetched.get("retcode") != 0 or not isinstance(fetched.get("data"), dict):
-        _log.warning("sent OneBot message %s but failed to fetch it", message_id)
-        return None
-    sent_event = dict(fetched["data"])
-    if group_id is None:
-        sent_event["target_id"] = user_id
-    elif isinstance(sent_event.get("sender"), dict):
-        sent_event["user_id"] = sent_event["sender"].get("user_id")
-    _chatlog_write(sent_event)
-    return sent_event
+    # WHY: 这里**不**登记"我说过这句话"。写记录归 NapCat 的自发消息回声（post_type
+    # message_sent），由 bot._route 收在 chatlog.write 那一行，对任何 action 自动生效。
+    # 这里原先挂着 `record_sent`：发完再 get_msg 回查一次、自己写进 chatlog 与 history。
+    # 它是在**手工枚举发送路径**，而 mods/forward.py 当初要补登记一次就是枚举没做完的
+    # 证据；回查失败时还会静默丢账（消息发出去了，chatlog 和 history 里没有）。别因为
+    # "某条路看起来没被记下来"就把它加回来——先确认 NapCat 的 reportSelfMessage 还开着。
+    # 删除条件：回声不再进来（那时 bot._route 的自发消息关卡也一并失去意义）。
+    return (result.get("data") or {}).get("message_id")
 
 
 def _work() -> None:

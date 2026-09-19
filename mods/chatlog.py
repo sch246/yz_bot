@@ -368,11 +368,7 @@ def write(msg: dict[str, Any]) -> str | None:
     msg.setdefault("time", int(time.time()))
     try:
         post_type = msg.get("post_type")
-        # ``get_msg`` responses used to record Bot output do not consistently
-        # include post_type, but do carry the normal message fields.
-        if post_type in ("message", "message_sent") or (
-            post_type is None and "message" in msg and "message_id" in msg
-        ):
+        if post_type in ("message", "message_sent"):
             return _message(msg)
         if post_type == "notice":
             return _notice(msg)

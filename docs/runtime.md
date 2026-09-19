@@ -78,11 +78,11 @@ LLM 的逐字输出不是流，而是终端的交互效果：它仍然直写 `sy
 
 1. NapCat 把 OneBot 事件 POST 到监听端口。
 2. HTTP 接收器读完请求体后立即返回 200，再解析 JSON 并把事件放进队列；`recv_msg()` 从队列里取。因此 200 早于任何处理，NapCat 不再等 Bot 跑完一条慢命令。
-3. `post_type == "message_sent"` 的事件到此为止：**整段跳过**，既不记录也不派发（见下）。
-4. `mods.bot.recv()` 记录当前消息和聊天日志。
+3. `mods.bot.recv()` 记录当前消息和聊天日志。Bot 自己发出去的消息以 `post_type == "message_sent"` 回流，和真人的消息走**同一行**写入。
+4. `post_type == "message_sent"` 的事件到此为止：**记录了，但不派发**（见下）。
 5. reply/开头 at 投影（不改写事件）、`^C` 删除 catch、延续式阻塞、普通命令、shell、link 按[完整入口优先级](interaction-model.md#入口有优先级)处理。
-6. 回复进入异步发送队列，再调用 NapCat 的 OneBot API。
-7. Bot 查询刚发送的消息并写入自己的聊天记录。
+6. 回复进入异步发送队列，再调用 NapCat 的 OneBot API。发送侧**不**写记录。
+7. NapCat 把这条自发消息回声回来，从第 1 步重新进来——Bot 的聊天记录与内存历史由此写成，延迟约一秒。
 
 HTTP 200 只表示事件已被本地监听器接收，不表示命令或回复执行成功。
 
@@ -103,16 +103,24 @@ HTTP 200 只表示事件已被本地监听器接收，不表示命令或回复�
 
 `mods/tools/` 的 registry 扫的是磁盘上的顶层文件，而仓库有意不追踪其中几个（带凭据抓站点的那些，见 `.gitignore`）。所以生产机上的模块目录比仓库里多，`run.py --check` 的文件计数、`--smoke` 的模块数和 `list_tools` 的目录在干净 clone 与线上并不相同。这是设计如此，不是回归——比对这些数字时，基准要取**同一台机器上改动前的那次运行**，而不是另一台机器的结果。
 
-### 自己发出去的消息不回流
+### 自己发出去的消息按回声记账，记录但不派发
 
-入站只有 `5701` 那一个 `HTTPServer`（`mods/connect.py`），仓库里没有 websocket 客户端；喂它的是 NapCat 的 httpClients，那条上的 `reportSelfMessage` 是 `false`（ws server 上那条是 `true`，但没有谁连它）。所以 `message_sent` 事件目前根本进不来，第 3 步是一条**零行为变更**的不变量——现在挡，是为了不必在它哪天开始进来时先分辨哪些行为原本就依赖它。
+入站只有 `5701` 那一个 `HTTPServer`（`mods/connect.py`），仓库里没有 websocket 客户端；喂它的是 NapCat 的 httpClients，那条上的 `reportSelfMessage` 现在是 `true`。所以 Bot 自己发出去的每条消息都会作为 `post_type: "message_sent"` 事件回流进来（另带 NapCat 的扩展字段 `message_sent_type`，实测只见过 `"self"`），合并转发也回流。
 
-它挡住的是两件事，而**位置**决定了它能不能挡住第二件：
+**它就是「Bot 说过的话」的唯一写入权威。** 发送侧不再自己记账：原先 `message.record_sent` 会在 `send_msg` 之后调一次 `get_msg` 回查、自己写进 chatlog 与 history，`mods/forward.py` 因为不走发送队列还要再补一次同样的调用——那是在手工枚举发送路径，枚举漏了就是一段无痕，回查失败还会静默丢账。回声对任何 action 自动生效，所以这套连同 `record_sent` 一起删了（2026-09-19）。
 
-- **执行。** 派发会让 Bot 自己的话走命令、shell 和 link：`.` 开头当命令跑，`!` 开头过 op 门——而 op 门读的是 `sender.user_id`（`op.is_op`），作者是 Bot 自己就是 op，前提是 Bot 的号在 op 名单里，而 op 工具集正要求它在。于是「检索/网页里的不受信文本 → 模型复述 → 自己执行」会成为一条完整的路。
-- **重复记账。** `message.record_sent` 是"Bot 说过的话进聊天记录和内存历史"的唯一写入权威（`send_msg` 走 `mods/message.py`，合并转发走 `mods/forward.py`，两条都收在它那里），而 `chatlog.write` 的判据收 `message_sent`、`history.add_msg` 又不按 `message_id` 去重。所以关卡必须在 `chatlog.write` **之前**——2026-09-18 第一版放在它之后，派发挡住了、记账没有，每句话照样会被记两遍。
+关卡因此落在 `chatlog.write` **之后**，早退一个独立标签：
 
-因此这条是"整段跳过"而不是"只记录不派发"，`-q` 下也不会为自己发的消息打一行【收到消息】。第 7 步那条路不受影响：它不经过 `bot._route`。op 工具集自注入的事件也不受影响，它写的是 `post_type: "message"`。
+- **记录要留下。** 挪回 `chatlog.write` 之前，Bot 自己的每句话就会从聊天记录和下一轮上下文里整段消失，而且是静默的。反过来，挪到之后却不删 `record_sent`，每句话会被记两遍（`chatlog.write` 的判据收 `message_sent`，`history.add_msg` 又不按 `message_id` 去重）——2026-09-18 那版就是这样，所以当时关卡只能放在前面。两笔必须同进同退。
+- **派发要挡住。** 派发会让 Bot 自己的话走命令、shell 和 link：`.` 开头当命令跑，`!` 开头过 op 门——而 op 门读的是 `sender.user_id`（`op.is_op`），作者是 Bot 自己就是 op，前提是 Bot 的号在 op 名单里，而 op 工具集正要求它在。于是「检索/网页里的不受信文本 → 模型复述 → 自己执行」会成为一条完整的路。
+
+一句话的不变量：**Bot 说的话是记录的来源，永远不是指令的来源。** 以后新增的派发路径该落在关卡哪一侧，由这句话回答。
+
+判据只能是 `post_type`：op 工具集自注入的事件写的是 `post_type: "message"`，和真回声只差这一个字段（两者的 `sender.user_id` 都是 Bot 自己），换成「作者是不是 Bot」会把 `send_command` 连同它唯一支撑的那条真重启路径一起挡掉。也不要改读 `message_sent_type`——那分的是自发消息的种类，而关卡要挡的是「这是我自己发出去的」，与种类无关。
+
+终端回显按 `post_type` 分标签：回声打【发送消息】，真人的消息打【收到消息】。
+
+一条**未决**的：`message_sent_type` 的存在说明 NapCat 区分了自发消息的种类。如果同一个 QQ 号在别的客户端（比如手机）上说话，那条大概也会回流；它是「这个账号说过的话」，但不是模型说的，而换权威之后模型会把它当成自己上一轮的发言读进上下文。见[自发消息回流](working/proposals/self-message-echo.md)。
 
 ## 已存在的“交互端口”
 

@@ -127,22 +127,6 @@ def _run_bash(command_text: str):
 
 def _route(event: dict) -> str | None:
     context.set_current(event)
-    # WHY: 自己发出去的消息在这里**整段跳过**：不记录，也不派发。
-    # WHY: 位置在 chatlog.write **之前**是承重的，不是排版。`message.record_sent` 已经是
-    # "Bot 说过的话进聊天记录和内存历史"的唯一写入权威（send_msg 走 mods/message.py，合并
-    # 转发走 mods/forward.py，两条都收在它那里），而 `chatlog.write` 的判据收 message_sent、
-    # `history.add_msg` 又不按 message_id 去重。放在写记录之后，回声那一遍照样写一次，每句
-    # 话就成对出现在 chatlog 和下一轮上下文里——那正是这条过滤要挡的两件事之一。
-    # WHY: 另一件是执行。派发会让 Bot 自己的话走命令、shell 和 link：`.` 开头当命令跑，
-    # `!` 开头过 op 门——而 op 门读 `sender.user_id`（见 op.is_op），作者是 Bot 自己就是 op，
-    # 前提是 Bot 的号在 op 名单里，而 op 工具集正要求它在。于是"网页/检索里的不受信文本 →
-    # 模型复述 → 自己执行"就成了一条完整的路。
-    # WHY: 今天这条过滤是**零行为变更**：入站只有 5701 那个 HTTPServer（mods/connect.py），
-    # 喂它的 NapCat httpClients 上 reportSelfMessage 是 false，所以 message_sent 根本进不来
-    # （ws server 上那条为真，但没有谁连它）。正因为如此才现在挡：等它真的开始进来，就得先
-    # 分辨哪些行为原本就依赖它，而不是一行了事。
-    if event.get("post_type") == "message_sent":
-        return "self"
     chatlog = _optional("chatlog")
     if chatlog is not None:
         # The prefix and the body chatlog formats are one line of terminal
@@ -150,7 +134,30 @@ def _route(event: dict) -> str | None:
         written = chatlog.write(event)
         if written is not None:
             body = chatlog.display(written).removesuffix("\n")
-            _stream.info(f'[{time.strftime("%H:%M:%S")}]【收到消息】{body}')
+            # Bot 自己那条是从 NapCat 回声回来的，走的也是这一行；标签不按 post_type 分，
+            # 终端里自己说的话就会打成【收到消息】。
+            label = "发送消息" if event.get("post_type") == "message_sent" else "收到消息"
+            _stream.info(f'[{time.strftime("%H:%M:%S")}]【{label}】{body}')
+    # WHY: 自己发出去的消息**记录、但不派发**。这条关卡守的不变量是：Bot 说的话是记录的
+    # 来源，永远不是指令的来源。以后新增的派发路径该落在关卡哪一侧，由这句话回答，而不是由
+    # "自己的消息不派发"回答。
+    # WHY: 不派发挡住的是执行。派发会让 Bot 自己的话走命令、shell 和 link：`.` 开头当命令
+    # 跑，`!` 开头过 op 门——而 op 门读 `sender.user_id`（见 op.is_op），作者是 Bot 自己就是
+    # op，前提是 Bot 的号在 op 名单里，而 op 工具集正要求它在。于是"网页/检索里的不受信
+    # 文本 → 模型复述 → 自己执行"会成为一条完整的路。
+    # WHY: 位置在 chatlog.write **之后**是承重的，而且方向和 0a334b7 那版相反。回声现在是
+    # "Bot 说过的话进聊天记录和内存历史"的唯一写入权威：`message.record_sent` 连同它那次
+    # get_msg 回查已经删掉，两条发送路径（send_msg 与 send_forward_msg）都只靠回声落账。
+    # 挪回 write 之前，Bot 自己的每句话会从 chatlog 和下一轮上下文里整段消失，而且是静默
+    # 的。反过来，挪到 write 之后却**不**删 record_sent，每句话就记两遍——`chatlog.write`
+    # 的判据收 message_sent，`history.add_msg` 又不按 message_id 去重。两者必须同进同退。
+    # WHY: 判据只能是 post_type。`mods/tools/op.py` 的 `_event` 伪造的自注入命令和真回声只
+    # 差这一个字段——两者的 `sender.user_id` 都是 Bot 自己。换成"作者是不是 Bot"会把
+    # send_command 连同它唯一支撑的那条真重启路径一起挡掉。也不要改读 message_sent_type：
+    # 那是 NapCat 的扩展字段，分的是自发消息的**种类**，而这里要挡的是"这是我自己发出去
+    # 的"，与种类无关。
+    if event.get("post_type") == "message_sent":
+        return "self"
     if any(value in sys.argv[1:] for value in ("-l", "--log-only", "log_only")):
         return "log-only"
 

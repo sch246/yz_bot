@@ -330,7 +330,7 @@ def build_messages(window: tuple[str, Any] | None) -> list[dict]:
     """Rebuild the track as the real tool-call records it came from.
 
     WHY: assistant 消息的 content 一律留空。模型当时说的可见正文已经作为 QQ 消息发出去、
-    进了 chatlog（见 message.py 的 _chatlog_write），下一轮 get_msgs 会重建它。这里再带一份
+    进了 chatlog（自发消息回声经 bot._route 落账），下一轮 get_msgs 会重建它。这里再带一份
     就是同一句话在上下文里出现两遍。所以这条轨道只负责它独有的部分：调用与结果。
 
     WHY: 也不带 reasoning_content——轨道里本来就没有。缺字段会不会被拒取决于**位置**
