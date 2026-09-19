@@ -115,6 +115,14 @@ def _event(text: str, group_id, user_id) -> dict:
     ``user_id`` 是**窗口对端**（Bot 自己发的话也带着对端的 id），拿它当作者会让重启回执
     发到错的窗口去。``sender.user_id`` 才是两种窗口下都指向作者的字段，与
     ``history.author``、``chat.msg2chat``、``op.is_op`` 同一条约定。
+
+    WHY: ``post_type`` 写 ``"message"`` 同样是**承重**的，不是照抄 inbound 形状。
+    ``bot._route`` 开头按 ``post_type == "message_sent"`` 把自发消息整段跳过，而这里伪造
+    的事件和真正的回声只差这一个字段——两者的 ``sender.user_id`` 都是 Bot 自己。改成
+    ``"message_sent"``（比如为了"更诚实地标注这是自己发的"）会让注入的命令在那道关卡处被
+    丢掉，``send_command`` 连同它唯一支撑的那条真重启路径一起**静默**失效：投递照样回
+    "已投递"，命令永远不执行。反过来那道关卡也只能按 ``post_type`` 判，换成"作者是不是
+    Bot"就会连这条路一起挡掉。删除条件：``bot._route`` 不再按 ``post_type`` 分自发消息。
     """
     from mods import identity
 
