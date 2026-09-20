@@ -504,6 +504,13 @@ def _close_with_user(messages: list) -> list:
     return [*messages, {"role": "user", "content": _CLOSING_NOTE}]
 
 def init_chat(session: llm.Chat, messages: list | None = None) -> None:
+    # WHY: 这一行和下面的 `_restore_window_tools` 是**同一类**东西，都不是上下文装配：
+    # 它们是「一轮聊天开始了」这个时刻该发生的事，只因为 init_chat 每轮恰好跑一次才挂在
+    # 这里。mail 与激活状态统一之后，「开局」不再等于一次 init_chat，那时这两处要一起换
+    # 时机——所以别把任何第三件事顺手挂进来，也别把这两件散开。
+    # 位置停在第一行是**刻意不动**：挪到后面会让装配中途抛异常的那种轮不再计数，而摘出
+    # 时机的这一步要求行为逐字保持。要改语义是接管时机那一步的事，不是这一步。
+    # 见 docs/working/proposals/condense-and-unify-handoff.md 的阶段 0 与阶段 3。
     inc_call_count()
     prompts["base"] = _base_prompt()
     group = context.current().get("group_id") if context.current() else None
@@ -529,15 +536,40 @@ def init_chat(session: llm.Chat, messages: list | None = None) -> None:
     binding = tool_modules.bind_session(
         session,
         tool_context,
-        _active_modules(window) if window is not None else {},
         ui_mode=ui_mode,
         persist=_persist_modules(window) if window is not None else None,
     )
+    _restore_window_tools(binding, window)
     session.do_process_image = get_image_mode() != "off"
     session.keep_reasoning = get_reasoning_mode() == "keep"
     session.on_tool_result = _oplog_recorder(window, binding)
 
 
+
+def _restore_window_tools(binding, window: tuple | None) -> None:
+    """把本窗口已激活的工具模块装回这一轮；空闲回收挂在同一个动作上。
+
+    WHY: 这一步**不**再交给 `bind_session` 的 `initial_modules` 参数顺带做，虽然那样少一
+    行。装回是一个**生命周期动作**，不是装配的一部分：它发生在「一轮开局」这个时刻，而
+    空闲回收——超过 ttl 没被装入或调用过的模块在这里被收掉，见 `tools.SessionBinding.
+    restore`——挂的是同一个时刻。写成这里显式的一行，是为了让「何时发生」有一个能改的
+    地方；mail 与激活状态统一之后接管的就是它。见 init_chat 开头那条 WHY。
+
+    WHY: `tools/agents.py` 那条路仍然走 `bind_session(initial_modules=...)`，不跟着改，
+    因为它传的是**名字列表**而不是 `{名字: 时刻}`：`restore` 于是把每个名字的时刻都当成
+    now，空闲回收在那条路上恒为空操作。子代理只借用「静默装回、不发通告」，没有生命周期
+    含义，把它也卷进来只会让接管时机的那一步多一个不相干的调用点。
+
+    WHY: 空映射时不调用，**这个条件是照搬的**，不是新加的判断——原先它写在 `bind_session`
+    的 `if initial_modules:` 里，搬过来时一起搬，因为这一步要求行为逐字保持。核实过它此刻
+    并不承重：刚 bind 完 `_dirty` 是 False，空输入下 `kept == requested == []`，所以
+    `restore` 既不会 `_save_active` 也不会 `_queue_reclaimed`，只是把 `_render_context`
+    幂等地重算一遍。也就是说去掉它今天不会有可见变化——但那是接管时机那一步该顺手清的，
+    不是这一步；这一步的价值全在「行为一个字没变」。
+    """
+    modules = _active_modules(window) if window is not None else {}
+    if modules:
+        binding.restore(modules)
 def get_handler(session: llm.Chat):
     def handle(chunk: llm.LLMResponse) -> None:
         if chunk.role == "assistant" and chunk.content:
