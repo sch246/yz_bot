@@ -214,25 +214,24 @@ def msg_split(value: str) -> list[dict]:
 
 
 def msg2chat(event: dict, in_group: bool = True) -> dict:
-    sender = event.get("sender") if isinstance(event.get("sender"), dict) else {}
-    try:
-        sent_by_bot = int(sender.get("user_id")) == identity.bot_id()
-    except (TypeError, ValueError):
-        sent_by_bot = False
-    if sent_by_bot:
-        role = "assistant"
-        content = msg_split(event.get("message", ""))
-    else:
-        role = "user"
-        timestamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(event.get("time", time.time())))
-        metadata = [f"  <time>{timestamp}</time>", f"  <message_id>{event.get('message_id', '')}</message_id>"]
-        if in_group:
-            metadata[0:0] = [
-                f"  <user_id>{event.get('user_id')}</user_id>",
-                f"  <name>{identity.getname(event.get('user_id'), event.get('group_id'))!r}</name>",
-            ]
-        content = [{"type": "text", "text": "<metadata>\n" + "\n".join(metadata) + "\n</metadata>"}, *msg_split(event.get("message", ""))]
-    return {"role": role, "content": content}
+    """Project one QQ message as an ordinary external input.
+
+    WHY: Bot-authored messages arrive here as ``message_sent`` echoes.  The
+    corresponding ``say`` tool call is the model's action; the echo is the same
+    kind of window event as anybody else's message.  Rendering it as assistant
+    would collapse those two facts back together.  The existing message id and
+    ordering are enough for the model to associate the pair, so there is no
+    separate self-observation tag.
+    """
+    timestamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(event.get("time", time.time())))
+    metadata = [f"  <time>{timestamp}</time>", f"  <message_id>{event.get('message_id', '')}</message_id>"]
+    if in_group:
+        metadata[0:0] = [
+            f"  <user_id>{event.get('user_id')}</user_id>",
+            f"  <name>{identity.getname(event.get('user_id'), event.get('group_id'))!r}</name>",
+        ]
+    content = [{"type": "text", "text": "<metadata>\n" + "\n".join(metadata) + "\n</metadata>"}, *msg_split(event.get("message", ""))]
+    return {"role": "user", "content": content}
 
 
 def _poke_text(event: dict) -> str:
