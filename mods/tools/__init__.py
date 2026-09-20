@@ -78,10 +78,9 @@ class ToolModule:
     tools: Mapping[str, Tool]
     source_suffix: str
     source: bytes
-    # WHY: 模块自己声明"只在 op 发起的轮里可见"。它是模块的属性而不是门控本身——门控是
-    # op_tool_visible，两边分开，因为"哪些模块受限"是模块作者的事，"这一轮算不算 op 轮"
-    # 是运行期的判断。见 op_tool_visible 与 docs/working/proposals/op-toolbox.md 决定三。
-    op_only: bool = False
+    # WHY: 模块自己声明"只有 Bot 获得 op 权限时可见"。哪些模块受限由模块作者声明，
+    # Bot 的固定权限由配置声明，两者不能再借当前消息作者拼成一条按轮变化的规则。
+    bot_op_only: bool = False
 
 
 class ToolRegistry:
@@ -302,7 +301,7 @@ class ToolRegistry:
             MappingProxyType(tools),
             ".py",
             source,
-            bool(getattr(candidate, "OP_ONLY", False)),
+            bool(getattr(candidate, "BOT_OP_ONLY", False)),
         )
 
     def _prepare_import_package(self) -> str:
@@ -480,21 +479,16 @@ _UI_POINTER = (
 )
 
 
-def op_tool_visible(name: str, module: ToolModule) -> bool:
-    """Whether one module may be shown and loaded in the turn running right now.
-
-    WHY: 只有声明了 ``OP_ONLY = True`` 的模块受限，判据是**当轮触发者**是不是 op。窗口
-    相同、轮次不同，答案可以不同（同一个群里这轮是管理员、下轮是普通成员），所以它每次
-    现算，结果不进目录缓存。
-    """
-    if not getattr(module, "op_only", False):
+def bot_op_tool_visible(name: str, module: ToolModule) -> bool:
+    """Whether Bot's fixed permission allows one module to be shown and loaded."""
+    if not getattr(module, "bot_op_only", False):
         return True
     try:
-        from mods import context, op
+        from mods import op
     except Exception:
         return False
     try:
-        return bool(op.is_op(context.current() or {}))
+        return bool(op.bot_is_op())
     except Exception:
         return False
 
@@ -504,11 +498,10 @@ def _visible_catalog(
 ) -> dict[str, ToolModule]:
     """The subset of last-good modules this turn is allowed to see.
 
-    WHY: 目录来自**进程全局**的 registry，而"这一轮谁在说话"是**按窗口、按轮**的。两个
-    维度不同，所以过滤发生在每次渲染，而不是在 registry 里删模块——删掉会连非 op 的窗口
-    一起失去能力（op-toolbox 提案的决定三）。
+    WHY: 权限过滤留在投影和加载处，不从进程级 registry 删除模块；配置改变需要重启，
+    重启后的所有窗口应看到同一个 Bot 权限结果。
     """
-    pick = op_tool_visible if visible is None else visible
+    pick = bot_op_tool_visible if visible is None else visible
     return {
         name: module
         for name, module in registry.modules.items()
@@ -550,7 +543,7 @@ class SessionBinding:
         self.session = session
         self.context_message = context_message
         self.registry = registry
-        self.visible = op_tool_visible if visible is None else visible
+        self.visible = bot_op_tool_visible if visible is None else visible
         # 激活集合每变一次就回调一次，写到哪儿由调用方决定：连续聊天写本窗口 storage，
         # 子会话不传。见 restore 与 _save_active。
         self.persist = persist
@@ -564,11 +557,8 @@ class SessionBinding:
         # 有了它，`touch` 就不必从 `<模块名>__<函数名>` 里反解模块名——反解是猜：模块 `a`
         # 导出 `b__c` 与模块 `a__b` 导出 `c` 生成同一个 schema 名，靠前缀匹配必然有一种猜错。
         self._owner: dict[str, str] = {}
-        # WHY: 这一轮装不回来、但**不该从窗口里删掉**的模块（名 -> 它原来的使用时刻）。
-        # 目前只有一种来源：OP_ONLY 模块在非 op 的轮里不可见。它在这一轮确实不存在，可是
-        # 窗口并没有停用它——下一次 op 自己开的轮里它就该回来。落盘时与 active 一起写回，
-        # 见 _save_active；时刻用**原来**那个，所以它照样会被 restore 的空闲回收收走，不需要
-        # 第二套回收规则。
+        # WHY: 因 Bot 固定权限不足而装不回来、但**不该从窗口里删掉**的模块（名 -> 原使用
+        # 时刻）。权限配置下次启动可能改变，记录留下来后届时可恢复；原时刻仍参与 ttl 回收。
         self._deferred: dict[str, float] = {}
         # 有没有还没落盘的使用时刻：只是省掉“没有变化也写一次 storage”。
         self._dirty = False
@@ -608,11 +598,9 @@ class SessionBinding:
         正文副本。`load` 仍然只用于"模型刚要求激活"，那里的通告才是它要的反馈。
 
         WHY: 分两种。**源码没了**的名字就地丢掉并回写，它指向的东西已经不存在。而
-        `visible` 挡下的（op-only 模块落在非 op 的轮里）只是**这一轮**装不回来，窗口并没有
-        停用它——把它记进 `_deferred`，storage 里的记录连同原来的使用时刻一起留着，下一次
-        op 自己开的轮里照常装回。原先这两种一起删，于是管理员窗口里只要有普通成员接着说过
-        一句话，管理员下一轮就得重新 `load_tools`；而通告里那句"在它自己的轮里会重新出现"
-        也就成了假话。留着不会攒垃圾：时刻是原来那个，超过 `ttl` 照样被下面的空闲回收收走。
+        `visible` 挡下的（Bot 没有模块所需权限）仍保留在 `_deferred`，storage 里的记录连同
+        原使用时刻一起留下；以后修改权限配置并重启即可装回。留着不会攒垃圾：时刻不刷新，
+        超过 `ttl` 照样被下面的空闲回收收走。
 
         WHY: 超过 `self.ttl` 没有被装入或调用过的也丢掉，这是"只进不出"的解药——不丢的话每次
         `load_tools` 都会永久留在这个窗口里，每轮都往基线消息里渲染一份正文。判据放在
@@ -667,7 +655,7 @@ class SessionBinding:
                     continue
                 if not self.visible(name, module):
                     self._deferred[name] = stamp
-                    reclaimed.append((name, "本轮不可用"))
+                    reclaimed.append((name, "Bot 未获权限"))
                     continue
                 self._activate(module, touched_at=stamp)
                 kept.append(name)
@@ -923,7 +911,7 @@ class SessionBinding:
             MappingProxyType(tools),
             module.source_suffix,
             module.source,
-            module.op_only,
+            module.bot_op_only,
         )
 
     def _deactivate(self, name: str) -> None:

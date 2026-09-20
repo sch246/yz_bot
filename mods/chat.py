@@ -822,20 +822,8 @@ def chat(model: str | None = None) -> None:
             _run_chat(model, turn, in_group)
             if turn.cancelled:
                 return
-            triggered = context.finish_turn(window, turn)
-            if triggered is None:
+            if not context.finish_turn(window, turn):
                 return
-            # WHY: 续跑的这一轮属于**要求它的那个人**，所以当前事件换成它。按窗口登记的
-            # 那些东西（storage、oplog、hint）本来就只看 window，换不换都一样；换的是"这
-            # 一轮谁在说话"，而 op 门（tools.op_tool_visible、SessionBinding.load 的
-            # visible、op 工具执行时自己那次 is_op）问的正是这个。不换的话三层问的都是开
-            # 轮那个人：管理员开一轮、普通群友接着 at 一句，那一轮就带着管理员的身份为群友
-            # 跑，op 专属模块在里面可见、可加载、可执行。
-            # WHY: 判据只认**触发事件**，不认"上下文里出现过 op"。后者会把权限绑在
-            # max_msg/max_token 上——同一段聊天，预算调大就有权限、调小就没有，既没法跟人
-            # 解释，也没法事后复现。插话（不置 trigger 的那些）因此不改变身份：它们是上下
-            # 文，不是授权。
-            context.set_current(triggered)
     finally:
         image.end_conversation(image_ledger)
         context.end_turn(window, turn)

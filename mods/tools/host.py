@@ -40,7 +40,7 @@ header，照着重来一次即可，不要凭猜测重试。
 
 ## 边界
 
-三个函数都需要管理员权限，直接作用于宿主机真实文件系统，没有沙箱也没有目录白名单：
+三个函数都需要 Bot 自身拥有 op 权限，直接作用于宿主机真实文件系统，没有沙箱也没有目录白名单：
 `data/`、`config.json`、`.env`、聊天记录都在可及范围内。覆盖和删除不可撤销，动手前先
 读一遍确认改的是想改的地方。写入的内容末尾会补一个换行。改完 Python 源码记得跑
 `uv run --frozen python run.py --check`。
@@ -54,7 +54,7 @@ import os
 import re
 import subprocess
 
-from mods import context, file, op
+from mods import file, op
 
 
 MAX_READ_BYTES = 32 * 1024
@@ -136,7 +136,7 @@ def read_file(path: str, start: int = 0, size: int = 0, max_bytes: int = MAX_REA
     size: 读取行数，默认 0 表示读到文件末尾
     max_bytes: 本次截取内容的字节上限，默认 32768；超出则不展开内容，只回大小和后续建议
     """
-    if not op.require_op(context.current()):
+    if not op.bot_is_op():
         return "权限不足"
     if os.path.isdir(path):
         return file.listdir(path)
@@ -167,7 +167,7 @@ def write_file(path: str, content: str, at: str = "") -> str:
     content: 新内容；行号前缀、header 行和结尾的 ...rest 提示都会被自动剥离
     at: read_file 返回的首行 header，原样贴回即可；留空表示新建文件，目标已存在时会拒绝并回一份 header
     """
-    if not op.require_op(context.current()):
+    if not op.bot_is_op():
         return "权限不足"
     body = content.splitlines()
     if body and not at:
@@ -252,7 +252,7 @@ def run_command(
     timeout: 超时秒数，默认 60；超时会终止进程并回传已有输出
     max_bytes: stdout 和 stderr 各自的字节上限，默认 8192；超出时省略中间部分
     """
-    if not op.require_op(context.current()):
+    if not op.bot_is_op():
         return "权限不足"
     workdir = os.path.abspath(cwd) if cwd else os.getcwd()
     if not os.path.isdir(workdir):

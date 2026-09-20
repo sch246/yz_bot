@@ -252,7 +252,11 @@ def _first_configuration(login_name: str) -> dict[str, Any]:
     )
     nickname_event = _receive_private(user_id=owner)
     nickname = str(nickname_event.get("message", "")).strip() or login_name or "bot"
-    return {"ops": [owner], "nicknames": [nickname]}
+    return {
+        "ops": [owner],
+        "nicknames": [nickname],
+        "bot_permissions": {"op": True},
+    }
 
 
 def on_load(_ctx: dict[str, Any] | None = None) -> None:
@@ -268,7 +272,13 @@ def on_load(_ctx: dict[str, Any] | None = None) -> None:
     if first_configuration:
         document = _first_configuration(name)
     else:
-        document = config.init_or_load_config({"ops": [], "nicknames": [name]})
+        document = config.init_or_load_config(
+            {
+                "ops": [],
+                "nicknames": [name],
+                "bot_permissions": {"op": True},
+            }
+        )
     config.dict_save_config(document)
     if first_configuration:
         owner = int(document["ops"][0])

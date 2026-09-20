@@ -2,7 +2,7 @@
 
 ## 图片 URI 从哪来
 
-`image_uri` / `image_uris` 只接受 `http://`、`https://` 或 `file://` 开头的完整 URI。用户在聊天里发的图片，进入模型时已经由 CQ 码转成了图片链接，直接把那个链接原样传进来，不要自己拼接、猜测或改写。`file://` 必须是宿主机上的绝对路径，且只有管理员可用。
+`image_uri` / `image_uris` 只接受 `http://`、`https://` 或 `file://` 开头的完整 URI。用户在聊天里发的图片，进入模型时已经由 CQ 码转成了图片链接，直接把那个链接原样传进来，不要自己拼接、猜测或改写。`file://` 必须是宿主机上的绝对路径，且只有 Bot 自身拥有 op 权限时可用。
 
 ## 识别
 
@@ -26,7 +26,7 @@ import traceback
 
 import requests
 
-from mods import context, cq, image as image_mod, llm, message, op
+from mods import cq, image as image_mod, llm, message, op
 
 
 def recognize_image(image_uri: str, prompt: str = "") -> str:
@@ -38,7 +38,7 @@ def recognize_image(image_uri: str, prompt: str = "") -> str:
     """
     if not re.match(r"^(?:https?|file)://", image_uri, re.I):
         return "图片识别失败：仅支持 http://、https:// 或 file:// 图片 URI"
-    if image_uri.lower().startswith("file://") and not op.require_op(context.current()):
+    if image_uri.lower().startswith("file://") and not op.bot_is_op():
         return "图片识别失败：本地文件需要管理员权限"
     try:
         result = llm.get_client().describe_image(image_uri, prompt)
@@ -121,7 +121,7 @@ def create_image_from_references(prompt: str, image_uris: str, size: str = "1024
     uris = list(dict.fromkeys(uri.strip() for uri in image_uris.splitlines() if uri.strip()))
     if not uris:
         return "参考图生图失败：至少需要一个图片 URI"
-    if any(uri.lower().startswith("file://") for uri in uris) and not op.require_op(context.current()):
+    if any(uri.lower().startswith("file://") for uri in uris) and not op.bot_is_op():
         return "参考图生图失败：本地文件需要管理员权限"
     base_url, api_key = os.getenv("BYTECAT_BASE_URL", "").rstrip("/"), os.getenv("BYTECAT_IMAGE_API_KEY")
     if not base_url or not api_key:

@@ -7,7 +7,7 @@
 - 纯提醒：`later_add("10m", "", "'十分钟到了，记得喝水'")`
 - 需要到点才计算的内容：把逻辑放 `code`，最后用 `expr` 给出要发的字符串。
 
-`code` 非空时属于任意 Python 执行，只有当前发送者是管理员才允许，否则直接返回"字符串以外的任务需要管理员权限"。普通用户的提醒把 `code` 传空字符串即可。
+`code` 非空时属于任意 Python 执行，只有 Bot 自身拥有 op 权限才允许，否则直接返回"字符串以外的任务需要管理员权限"。普通提醒把 `code` 传空字符串即可。
 
 时间格式（`time` 参数）：
 
@@ -32,7 +32,7 @@ def later_add(time: str, code: str, expr: str) -> str:
     """
     from mods import later
 
-    return later.run(f" add {time} {code}\n{expr}")
+    return later.run(f" add {time} {code}\n{expr}", bot_action=True)
 
 
 def later_del(seqs: str) -> str:
@@ -43,7 +43,7 @@ def later_del(seqs: str) -> str:
     """
     from mods import later
 
-    return later.run(f" del {seqs}")
+    return later.run(f" del {seqs}", bot_action=True)
 
 
 __all__ = ["later_add", "later_del"]

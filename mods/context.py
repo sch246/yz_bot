@@ -227,14 +227,11 @@ class Mailbox:
         with self._lock:
             return list(self._entries[self._read - self._base:])
 
-    def latest_activation(self) -> dict | None:
-        """Return the last unread activated event, if the red dot is lit."""
+    def has_activation(self) -> bool:
+        """Return whether an unread activated entry keeps the red dot lit."""
         with self._lock:
             start = self._read - self._base
-            for entry in reversed(self._entries[start:]):
-                if entry.activated:
-                    return entry.event
-            return None
+            return any(entry.activated for entry in self._entries[start:])
 
     def _trim(self) -> None:
         """Drop consumed entries past the retention tail; never drop unread ones.
@@ -341,11 +338,8 @@ def end_turn(key: Any, turn: WindowTurn) -> None:
             del _turns[key]
 
 
-def finish_turn(key: Any, turn: WindowTurn) -> dict | None:
-    """Close *key*'s turn, or keep it open for the message that asked for more.
-
-    Returns that message, so the caller can run the extra round **as** its author
-    instead of as whoever opened the turn; ``None`` closes the turn.
+def finish_turn(key: Any, turn: WindowTurn) -> bool:
+    """Close *key*'s turn, or keep it open while activated mail remains unread.
 
     The unread mailbox is the authority.  Under `_lock`, either an activated
     entry is already visible here and keeps this reader, or the turn is removed;
@@ -353,12 +347,11 @@ def finish_turn(key: Any, turn: WindowTurn) -> dict | None:
     never looks up a turn before delivery, so there is no detached-turn race.
     """
     with _lock:
-        triggered = turn.mail.latest_activation()
-        if triggered is not None:
-            return triggered
+        if turn.mail.has_activation():
+            return True
         if _turns.get(key) is turn:
             del _turns[key]
-        return None
+        return False
 
 
 def cancel_turn(key: Any) -> bool:

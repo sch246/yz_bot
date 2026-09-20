@@ -63,7 +63,7 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 命令函数继续接收命令名后的原始 `body`。返回普通值会发送；返回 generator 会登记为当前用户、当前窗口的 continuation。Import 或 Load 失败模块留下的注册会被过滤，因此失败功能不会占住点命令入口。
 
-命令依然处于 Bot 进程的宿主机信任域。权限不是统一中间件；高权限函数必须显式调用 `mods.op`。普通模块应直接 import 已知依赖，不通过命令注册表反查模块。
+命令依然处于 Bot 进程的宿主机信任域。权限不是统一中间件；高权限函数必须显式调用 `mods.op`。人类命令按事件作者查 `ops`，模型工具按 `config.bot_permissions.op` 查 Bot 自身固定权限，显式代行事件再按被代行者查 `ops`。普通模块应直接 import 已知依赖，不通过命令注册表反查模块。
 
 ## `.py`、`pyload.py` 与动态名称
 
@@ -126,7 +126,7 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 一个进程服务一个 Bot 账号。cache、storage、link 环境、命令表、scheduler 和 connector 都是进程级单例；多个独立 Bot 项目共存不改变本项目内部的单实例事实。
 
-master/op 与普通用户仍是当前权限边界。op 能使用 `.py`、shell、文件、link 和宿主控制能力，技术上拥有 Bot 进程和宿主机控制权。整数权限体系仍只是[未实现提案](working/proposals/permissions.md)。
+人类侧仍以 master/op 与普通用户为权限边界；op 能直接使用 `.py`、shell、文件、link 和宿主控制能力，技术上拥有 Bot 进程和宿主机控制权。Bot 自己是否进入同一信任域由 `config.bot_permissions.op` 单独声明，不依赖 Bot 账号是否也写进人类 `ops` 名单。整数权限体系仍只是[未实现部分](working/proposals/permissions.md)。
 
 `.reboot` 以退出码 233 请求外层监督者重启；`.shutdown` 以 0 正常退出。第一次 Ctrl+C 由 `run.py` 转发，`main.py` 进入同一 `finally`，随后逆序停止 scheduler、listener、worker、子进程与 storage。重复 SIGINT 在保存期间被抑制；SIGKILL、断电和解释器 fatal error 不经过这条有序路径。
 

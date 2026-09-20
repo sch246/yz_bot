@@ -147,9 +147,8 @@ def _route(event: dict) -> str | None:
     # 来源，永远不是指令的来源。以后新增的派发路径该落在关卡哪一侧，由这句话回答，而不是由
     # "自己的消息不派发"回答。
     # WHY: 不派发挡住的是执行。派发会让 Bot 自己的话走命令、shell 和 link：`.` 开头当命令
-    # 跑，`!` 开头过 op 门——而 op 门读 `sender.user_id`（见 op.is_op），作者是 Bot 自己就是
-    # op，前提是 Bot 的号在 op 名单里，而 op 工具集正要求它在。于是"网页/检索里的不受信
-    # 文本 → 模型复述 → 自己执行"会成为一条完整的路。
+    # 跑，`!` 开头过 op 门——而 Bot 作者的结果来自固定的 `config.bot_permissions.op`。
+    # 于是"网页/检索里的不受信文本 → 模型复述 → 自己执行"会成为一条完整的路。
     # WHY: 位置在 chatlog.write **之后**是承重的，而且方向和 0a334b7 那版相反。回声现在是
     # "Bot 说过的话进聊天记录和内存历史"的唯一写入权威：`message.record_sent` 连同它那次
     # get_msg 回查已经删掉，两条发送路径（send_msg 与 send_forward_msg）都只靠回声落账。

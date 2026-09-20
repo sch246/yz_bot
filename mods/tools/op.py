@@ -1,4 +1,4 @@
-"""以 Bot 自身的身份执行命令（含重启自己）；只在 op 发起的聊天轮里可见、可加载。
+"""以 Bot 自身的身份执行命令（含重启自己）；只在 Bot 拥有 op 权限时可见、可加载。
 
 ## 使用时机
 
@@ -12,8 +12,8 @@
 - 这是让模型**真正重启自己**的唯一路径：`.reboot` 的退出动作必须落在主线程（外层
   `run.py` 认退出码 233），而工具调用跑在 worker 线程里，直接 `raise SystemExit(233)`
   只会打死那个线程，进程照常活着。
-- 消息的发送者写成 Bot 自己（`identity.bot_id()`），因此需要 op 的命令照样放行——前提是
-  Bot 的 QQ 号本身在 op 名单里。窗口由 `target` 决定，缺省是当前窗口。
+- 消息的发送者写成 Bot 自己（`identity.bot_id()`），因此需要 op 的命令按
+  `config.bot_permissions.op` 放行。窗口由 `target` 决定，缺省是当前窗口。
 - 命令照常进聊天记录，所以「重启中」「重启完成」这类回执你看得见；它也以 `assistant`
   角色出现在后续上下文里，因为它确实是 Bot 自己做的事。要它**不**进上下文，让 `text` 以
   `#` 开头（那是全仓库通用的"不进模型上下文"前缀）。
@@ -28,8 +28,8 @@ import logging
 import re
 import time
 
-# 门控声明：只有 op 发起的轮才看得到、加载得了这个模块。判据见 tools.op_tool_visible。
-OP_ONLY = True
+# 门控声明：只有 Bot 获得 op 权限时才看得到、加载得了这个模块。
+BOT_OP_ONLY = True
 
 _log = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ def send_command(text: str, target: str = "") -> str:
     from mods import connect, context, identity, op
 
     current = context.current() or {}
-    if not op.is_op(current):
+    if not op.bot_is_op():
         return "权限不足"
     command = text.strip()
     if not command:

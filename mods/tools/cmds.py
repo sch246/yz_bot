@@ -1,6 +1,6 @@
 """把一条命令当成某个人说的，投进任意窗口执行，并把它的输出带回给你。
 
-- `cmds__run_command(".jrrp")` —— 以当前说话者的身份、在这个窗口里执行 `.jrrp`，
+- `cmds__run_command(".jrrp")` —— 以 Bot 自身身份、在这个窗口里执行 `.jrrp`，
   返回值就是这条命令本来会发出来的文字。
 - `cmds__run_command(".jrrp", sender="980001119")` —— 换个身份执行：写 QQ 号，
   也接受 `[CQ:at,qq=980001119]`。
@@ -13,7 +13,6 @@
 
 from __future__ import annotations
 
-import inspect
 import logging
 import re
 import time
@@ -24,7 +23,6 @@ _match_at = re.compile(r"^\[CQ:at,qq=([0-9]+)\]$")
 _match_window = re.compile(r"^([guGU]?)([0-9]+)$")
 _SIGILS = (".", "#!", "!")
 _ASYNC_WAIT = 5.0
-_op_names: dict[str, bool] = {}
 
 
 def list_commands(keyword: str = "") -> str:
@@ -47,10 +45,10 @@ def run_command(text: str, target: str = "", sender: str = "", capture: bool = T
     @param
     text: 命令原文，例如 .jrrp、.jrxm、.answer、!ls
     target: 在哪个窗口执行：g<群号>、u<QQ号>，留空表示当前窗口
-    sender: 以谁的身份执行：留空=当前说话的人，也可以写 QQ 号或 [CQ:at,qq=...]
+    sender: 以谁的身份执行：留空=Bot 自己；写 QQ 号或 [CQ:at,qq=...] 表示代行该用户
     capture: True=输出收下来交给你，聊天里不出现；False=原样投递，输出自己冒出来
     """
-    from mods import context, history, op
+    from mods import context, identity
 
     command_text = text.strip()
     complaint = _complaint(command_text)
@@ -61,17 +59,9 @@ def run_command(text: str, target: str = "", sender: str = "", capture: bool = T
     if isinstance(window, str):
         return window
     group_id, user_id = window
-    initiator = history.author(current)
-    executor, complaint = _resolve_sender(sender, initiator)
+    executor, delegated, complaint = _resolve_sender(sender, identity.bot_id())
     if complaint:
         return complaint
-    if (
-        executor != initiator
-        and not op.is_op(initiator)
-        and op.is_op(executor)
-        and _needs_op(command_text)
-    ):
-        return "权限不足：发起者不在 op 名单里，不能借 op 的身份执行需要 op 的命令"
     event = _event(command_text, group_id, user_id, executor)
     if not capture:
         from mods import connect
@@ -79,10 +69,10 @@ def run_command(text: str, target: str = "", sender: str = "", capture: bool = T
         _receipt(command_text, executor, group_id, user_id)
         connect._events.put(event)
         return f"已投递，由主循环执行：{command_text}"
-    return _capture(event, command_text, executor, initiator)
+    return _capture(event, command_text, executor, delegated)
 
 
-def _capture(event: dict, text: str, executor, initiator) -> str:
+def _capture(event: dict, text: str, executor, delegated: bool) -> str:
     """跑一遍真实路由，只把它要发出去的文本收下来，不落到聊天里。"""
     from mods import bot, command, context, message
 
@@ -104,7 +94,7 @@ def _capture(event: dict, text: str, executor, initiator) -> str:
     body = "\n".join(part for part in collected if part.strip())
     if not body:
         return "（这条命令没有输出）"
-    if executor != initiator:
+    if delegated:
         return f"[以 {_name_of(executor)} 的身份]\n{body}"
     return body
 
@@ -158,45 +148,16 @@ def _lookup(text: str):
     return command.match(text[1:])
 
 
-def _needs_op(text: str) -> bool:
-    """这条命令要不要 op：shell 一律算；点命令看它所在模块自己有没有查权限。"""
-    if text.startswith(("!", "#!")):
-        return True
-    matched = _lookup(text)
-    if matched is None:
-        return True
-    name = matched[0]
-    if name not in _op_names:
-        _op_names[name] = _module_checks_op(name)
-    return _op_names[name]
-
-
-def _module_checks_op(name: str) -> bool:
-    """保守判据：读不到、拿不准，都当作需要 op。"""
-    from mods import command
-
-    function = command.get(name)
-    try:
-        path = inspect.getsourcefile(function)
-        with open(path, encoding="utf-8", errors="replace") as handle:
-            source = handle.read()
-    except Exception:
-        return True
-    return "require_op" in source or "is_op(" in source
-
-
-def _resolve_sender(choice: str, initiator):
+def _resolve_sender(choice: str, bot_id: int):
     value = (choice or "").strip()
     if not value:
-        if initiator is None:
-            return None, "拿不到发起者，请显式给出 sender，或在聊天里调用"
-        return int(initiator), None
+        return bot_id, False, None
     at = _match_at.fullmatch(value)
     if at:
-        return int(at.group(1)), None
+        return int(at.group(1)), True, None
     if value.lstrip("+-").isdigit():
-        return int(value), None
-    return None, f"sender 无法识别：{choice!r}。留空＝当前说话的人，或者写一个 QQ 号"
+        return int(value), True, None
+    return None, False, f"sender 无法识别：{choice!r}。留空＝Bot 自己，或者写一个 QQ 号"
 
 
 def _resolve_window(target: str, current: dict):

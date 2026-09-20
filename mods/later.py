@@ -107,10 +107,9 @@ def _action(sequence: int, expr: str, msg: dict[str, Any]) -> None:
     future = py.run(
         expr,
         msg,
-        # WHY: 权限在 later_add / later_set 创建时就检查过一次(op.is_op 或 is_safe)，
-        # 执行时不再检查，也不借用 Bot 管理员身份——任务不能因为被推迟到未来执行就
-        # 获得比创建者更高的权限。skip_op=True 看起来像漏检，实际是这个不变量的实现，
-        # 别"补上"。同一条也记在 docs/llm.md 的当前信任边界一节。
+        # WHY: 权限在 later_add / later_set 创建时已经按入口检查过一次：人类命令看消息
+        # 作者，模型工具看 Bot 自身权限。执行时不再重判，任务不能因推迟到未来就换权限。
+        # skip_op=True 看起来像漏检，实际是这个不变量的实现。
         skip_op=True,
         insert={"later_repeat": repeat_here, "repeat": repeat_here},
     )
@@ -335,18 +334,20 @@ def _read_time_expr(text: str) -> tuple[str, str]:
     raise SyntaxError("时间格式不符")
 
 
-def later_add(text: str, msg: dict[str, Any]) -> str:
+def later_add(text: str, msg: dict[str, Any], *, allow_unsafe: bool | None = None) -> str:
     when_text, expr = _read_time_expr(text)
     if not expr.strip():
         raise SyntaxError("表达式为空")
-    if not op.is_op(msg) and not is_safe(expr):
+    if allow_unsafe is None:
+        allow_unsafe = op.is_op(msg)
+    if not allow_unsafe and not is_safe(expr):
         return "字符串以外的任务需要管理员权限"
     sequence, when = enter(when_text, expr, msg)
     return f"{sequence}: {when} {expr}"
 
 
 @command
-def run(text: str) -> str:
+def run(text: str, *, bot_action: bool = False) -> str:
     """设置发送回当前群或私聊的一次性定时消息。
 
     示例：.later 10m '十分钟后提醒我'；.later 21:30 '晚上提醒我'。add 可以省略。
@@ -355,6 +356,7 @@ def run(text: str) -> str:
     提醒文字必须用半角单引号或双引号包住；只有管理员可以使用字符串以外的 Python 表达式。
     """
     msg = _current()
+    allow_unsafe = op.bot_is_op() if bot_action else op.is_op(msg)
     if not text.strip():
         tasks = get_later_list(msg)
         return print_list(tasks) if tasks else "延时任务为空"
@@ -363,7 +365,7 @@ def run(text: str) -> str:
         if operation in ("-h", "--help"):
             return run.__doc__ or ""
         if operation == "add":
-            return later_add(body, msg)
+            return later_add(body, msg, allow_unsafe=allow_unsafe)
         if operation == "del":
             body = body.strip()
             tasks = get_later_list(msg)
@@ -382,11 +384,11 @@ def run(text: str) -> str:
             when_text, expr = _read_time_expr(rest)
             if not expr.strip():
                 raise SyntaxError("表达式为空")
-            if not op.is_op(msg) and not is_safe(expr):
+            if not allow_unsafe and not is_safe(expr):
                 return "字符串以外的任务需要管理员权限"
             when = change(int(sequence_text), when_text, expr, msg)
             return "没有找到任务" if when is None else f"{sequence_text}: {when} {expr}"
-        return later_add(text, msg)
+        return later_add(text, msg, allow_unsafe=allow_unsafe)
     except Exception:
         return traceback.format_exc()
 

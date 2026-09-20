@@ -15,6 +15,7 @@ PHASE = INFRA
 LOAD_AFTER = ("identity",)
 
 ops: list[int] = []
+_bot_op = False
 _match_at = re.compile(r"\[CQ:at,qq=([0-9]+)\]$")
 _match_qq = re.compile(r"[0-9]+$")
 
@@ -39,14 +40,25 @@ def is_op(user_or_msg: int | dict[str, Any]) -> bool:
     ``sender.user_id`` 才是两种窗口下都指向作者的字段（与 ``history.same_author``、
     ``chat.msg2chat`` 同一条约定）。传整数时它就是那个人自己的 id，没有这层区分。
 
-    这条区分是为了让"以 Bot 自己的身份在当前窗口注入一条命令"能过 op 门：窗口仍由
-    顶层 ``user_id`` 决定，作者由 ``sender.user_id`` 声明。
+    Bot 作者是唯一的特例：它不借 ``ops`` 名单，而读 ``config.bot_permissions.op``。
+    这样自有行动的权限不会随当前消息作者改变，显式代行的作者仍照常查 ``ops``。
     """
     if isinstance(user_or_msg, dict):
         user_id = history.author(user_or_msg)
     else:
         user_id = user_or_msg
-    return user_id is not None and int(user_id) in ops
+    if user_id is None:
+        return False
+    from mods import identity
+
+    if identity.qq is not None and int(user_id) == identity.qq:
+        return _bot_op
+    return int(user_id) in ops
+
+
+def bot_is_op() -> bool:
+    """Whether Bot's own actions may enter the host-level op domain."""
+    return _bot_op
 
 
 def require_op(
@@ -143,8 +155,12 @@ def run(body: str) -> str | None:
 
 
 def on_load(_ctx: dict[str, Any] | None = None) -> None:
-    global ops
+    global _bot_op, ops
     loaded = config.load_config("ops")
     if not isinstance(loaded, list) or not loaded:
         raise ValueError("config.ops 必须是包含 master 的非空列表")
     ops = [int(user_id) for user_id in loaded]
+    permissions = config.load_config("bot_permissions")
+    if not isinstance(permissions, dict) or not isinstance(permissions.get("op"), bool):
+        raise ValueError("config.bot_permissions.op 必须是布尔值")
+    _bot_op = permissions["op"]

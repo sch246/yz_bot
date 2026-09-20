@@ -2,7 +2,7 @@
 
 每个用户对应一份持久化的 dict，键由使用方自己约定，跨会话、跨群、跨重启保留。`name` 是全局约定的键，保存该用户的自定义称呼，Bot 其它地方（如 `getname`）会读它；其余键可以自由命名，写之前先 `get_user_data` 看一眼现有内容，别覆盖别人写的东西。
 
-权限：任何人都能改自己的数据；改别人的数据需要管理员，否则返回"权限不足"。查询不限权限。
+权限：查询不限权限；修改按 Bot 自身的 op 权限判断，不借当前消息发送者的权限。
 
 `set_user_data` 的 `value` 按 Python 字面量解析（`ast.literal_eval`），不是纯文本：
 
@@ -16,7 +16,7 @@
 
 import ast
 
-from mods import context, identity, op
+from mods import identity, op
 
 
 def get_user_data(user_id: int) -> str:
@@ -32,12 +32,11 @@ def set_user_data(user_id: int, key: str, value: str) -> str:
     """写入或删除某个用户的一个数据键，成功返回 done。
 
     @param
-    user_id: 目标用户 QQ 号；不是自己时需要管理员权限
+    user_id: 目标用户 QQ 号；修改需要 Bot 自身拥有 op 权限
     key: 数据键名，例如 name
     value: Python 字面量形式的新值，字符串要带引号（如 '小明'）；传 del 表示删除该键
     """
-    current = context.current() or {}
-    if int(user_id) != int(current.get("user_id", -1)) and not op.require_op(current):
+    if not op.bot_is_op():
         return "权限不足"
     target = identity.getstorage(user_id)
     if value == "del":

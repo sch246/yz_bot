@@ -81,8 +81,8 @@ def send_file(path: str, inline: bool = False, user_id: int | None = None, group
     user_id: 目标私聊 QQ 号，留空则发给当前对话
     group_id: 目标群号，留空则发给当前对话；与 user_id 同时给出时以群为准
     """
-    # 能读宿主机任意路径，所以先卡权限；require_op 自己会提醒非管理员，这里只需短路
-    if not op.require_op(context.current()):
+    # 能读宿主机任意路径，所以按 Bot 自身的固定权限短路。
+    if not op.bot_is_op():
         return "发送失败：发送宿主机文件需要管理员权限"
     # expanduser 支持 ~/... 这种写法；不是文件（含目录、拼错的重名）就不必往下走
     absolute = Path(path).expanduser()
