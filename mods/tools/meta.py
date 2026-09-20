@@ -111,6 +111,15 @@ Markdown 不需要 front matter、额外 summary 字段或同步机制，也不�
 
 结论写在 `conclusion` 参数里就够了，工具不会把它再返回一遍：这次调用本身留在上下文里，参数里的结论就是它的记录。
 
+## 说话
+
+`say(text, final_call)` 是你**唯一**的发言方式——直接写在回复正文里的内容不会发出去，那是你的自言自语，只留在这一轮里，人看得见但收不到。
+
+- 返回值就是这条消息的 `message_id`。它和聊天记录里那一条是同一个号，所以你之后要点名自己说过的话（比如压缩一段对话），用它。
+- `final_call` 默认 **true**：说完这句，这一轮就结束了，同一批里其它工具的结果你这一轮也看不到。说完还要接着干活，就显式传 `final_call=false`。
+- 发送**失败**或**未确认**时，不管 `final_call` 传了什么，都会照常再跑一轮，让你看到发生了什么。"未确认"的意思是请求被收下了但没给回号码，消息很可能已经发出去——别直接重发，先看下一轮的聊天记录。
+- 一次 `say` 发一条消息。要发几条就调几次，最后一条传默认的 `final_call=true`。
+
 收缩是**可逆**的：被收缩的调用只是离开上下文，原文继续留着。你那次 `condense_ops` 调用会跟着重建回到后面每一轮的上下文里，`cids` 参数里写的就是被收掉的那几个 cid——什么时候觉得当初的结论不够用、或者要核对当初到底看到了什么，用 `recall_ops(["op3"])` 按 cid 把完整原文取回来。所以收缩不必犹豫，它不销毁任何东西——这句话现在是字面成立的：除了 `#ops clear`，没有任何东西会删掉操作记录。
 
 三条规则：同一条 assistant 消息里并发的多个调用必须一起点名收缩，只点其中一个会被拒绝；正在执行、结果还没回来的那一轮不能收缩；后来的收缩可以把更早那次 `condense_ops` 也收掉，那次的结论随之从上下文消失——需要保留就在新结论里带上。
@@ -264,6 +273,72 @@ def attach_image(uri: str, note: str = "") -> str:
     return attach(uri, note)
 
 
+_SAY_TIMEOUT = 30.0
+
+
+def say(text: str, final_call: bool = True) -> str:
+    """把一句话发进当前窗口，返回它的 message_id；默认说完这一轮就结束。
+
+    @param
+    text: 要说的话。CQ 码原样写，at、reply、图片都照常生效
+    final_call: 这次发言是不是本轮最后一个动作。默认 true；要接着干活就显式传 false
+
+    WHY: 它**等**发送结果，不是投递完就返回。这不是谨慎，是终止语义逼出来的：一轮的结束
+    由 `final_call` 声明，而"失败时照常再跑一轮"要求这里能分辨成败——成败只有 SendFuture
+    完成时才知道。实测代价约 0.3~0.6 秒，来自 `message._work` 每条消息后的节流 sleep，
+    不是网络。
+
+    WHY: 三类结果，不是两类。异常＝没发出去；拿到 id＝发出去了；而 `retcode == 0` 却没有
+    message_id 是**第三类**——`_send_now` 此时既不抛也没有号码，消息很可能已经发出去。
+    把它当失败会让模型重发一条已经在窗口里的话，当成功又会让这次发言在 oplog 里没有
+    可反查的号码。所以单列成"未确认"，照常触发下一轮，由模型自己去看聊天记录。
+    删除条件：send_msg 在 retcode 为 0 时被证明总是带 message_id。
+
+    WHY: **超时归"未确认"，不归"失败"。** 等待超时说明 future 还没有结果，而不是结果是
+    失败——消息可能正排在发送队列里，也可能已经发出去了。把它写成"没有发出去"是一句会
+    骗到模型的断言，它会照着重发。队列上限 20、每条节流最多 0.6 秒，最坏约 12 秒，所以
+    30 秒是留了一倍余量的"大概率不是排队问题"。
+
+    WHY: `final_call` 是**参数**而不是这个工具的静态属性。同一个动作有时是一轮的最后一
+    件、有时不是，只有发起调用的那一方知道——所以它是模型的意图声明。别把它推广成一张
+    "哪些工具终结一轮"的表，那会把判断从调用点搬到一张猜出来的清单上。
+
+    WHY: 正文**不转义**。模型是 CQ 原生的一方：收到的消息原样带 CQ 码，写出去的也照原样
+    发，往返因此闭合。在这里 `cq.escape` 会让它写的 at 和图片变成字面文本。这与
+    `op._receipt` 那条相反的规矩不冲突——那里转义的是**命令原文**，是记录，不是发言。
+
+    WHY: 它住在 meta 而不是自己一个模块，因为发言是模型**永远**该有的能力，而
+    `tools._BASE_MODULE_NAME` 是单数、基础模块只有一个。meta 早就不只是"管工具模块"了
+    （`condense_ops`/`recall_ops` 管的是上下文），它实际是那组不可卸载的基础能力，`say`
+    属于这一组。改成支持多个基础模块也行，代价是那条"基础模块的导出不加模块名前缀"的
+    规则会多出命名冲突的可能，眼下不值得。
+
+    WHY?: 子代理（`tools/agents.py`）因此也拿得到 `say`，于是它能直接往窗口里说话——这是
+    工具化带来的**新**能力，以前子代理的正文只回给主模型。没有给它加门控，因为"子代理该
+    不该能说话"还没有人拍过；先记在这里，真出现不想要的发言再决定是挡掉还是保留。
+    """
+    from mods import message
+    from mods.tools import current_binding
+
+    body = str(text)
+    if not body.strip():
+        return "text 为空，什么都没发。要说话就给出正文"
+    unconfirmed = (
+        "先在下一轮的聊天记录里看它在不在，再决定要不要重发——不要直接重发。"
+    )
+    try:
+        message_id = message.sendmsg(body).result(timeout=_SAY_TIMEOUT)
+    except TimeoutError:
+        return f"未确认：等了 {_SAY_TIMEOUT:.0f} 秒还没有结果，这句话可能正在发、也可能已经发出去。" + unconfirmed
+    except Exception as error:
+        return f"发送失败（{type(error).__name__}）：{error}。这句话没有发出去。"
+    if message_id is None:
+        return "未确认：对端收下了请求，却没有回一个 message_id，所以这句话可能已经发出去了。" + unconfirmed
+    if final_call:
+        current_binding().session.turn_done = lambda: True
+    return str(message_id)
+
+
 def _format_results(results: Mapping) -> str:
     action_labels = {
         "loaded": "已加载",
@@ -291,6 +366,7 @@ def _format_results(results: Mapping) -> str:
 
 
 __all__ = [
+    "say",
     "exec_code",
     "list_tools",
     "reload_tools",

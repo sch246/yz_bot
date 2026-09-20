@@ -49,6 +49,8 @@ DEFAULT_MAX_TOKEN = 50000
 _cost_lock = threading.Lock()
 # Eager capture is image work reported on the image stream, not chat traffic.
 _image_stream = log.stream("image")
+# 自言自语走 msg 流：和收发消息的回显共用同一把行租约，见 get_handler。
+_self_talk = log.stream("msg")
 # hint 求值失败只记日志，所以它有自己的流，不混进聊天流量。
 _hint_stream = log.stream("hint")
 
@@ -414,7 +416,9 @@ def _base_prompt() -> list[dict]:
 - 你的QQ号: {identity.bot_id()}；群聊 at 格式为 [CQ:at,qq=qq号]，reply 格式为 [CQ:reply,id=message_id]
 - 你收到的消息原样带着这两种 CQ 码。reply 里的 message_id 与上文各条消息 <metadata> 中的 <message_id> 对应，据此判断对方在回复哪一条
 - 聊天中可能不会有明显的问题，扮演好角色即可
-- 如无特殊要求，请用中文回复"""}]
+- 如无特殊要求，请用中文回复
+- **说话要调 `say`**。直接写在回复正文里的内容不会发出去，那是你这一轮的自言自语
+- `say` 返回这条消息的 message_id；它默认 `final_call=true`，说完这一轮就结束，要接着干活就传 `final_call=false`"""}]
 
 
 def build_context(token_limit: int | None = None) -> list:
@@ -571,9 +575,24 @@ def _restore_window_tools(binding, window: tuple | None) -> None:
     if modules:
         binding.restore(modules)
 def get_handler(session: llm.Chat):
+    """The per-chunk sink: self-talk to the terminal, cost to the ledger.
+
+    WHY: 模型写在回复正文里的内容**不再发进聊天**。发言是一次 `say` 调用（见
+    `tools/meta.py`），正文因此退化成这一轮的自言自语：它只活在 `llm.Chat.messages` 里，
+    轮结束就死，也不进 chatlog——所以模型下一轮看不到自己想过什么，这是刻意的（没有追踪
+    的东西不跨轮）。
+
+    WHY: 但它要打到终端。人得看得见模型在想什么，尤其是在它**忘了调 `say`**的时候——那
+    种轮对聊天窗口是完全静默的，终端这一行是唯一的痕迹。用 msg 流而不是另开一个，是为了
+    和 `bot._route`、`message._chatlog_write` 的回显共用同一把行租约，终端顺序才不会乱。
+
+    WHY: 这里不做兜底发送。"正文非空却没调 say 就替它发出去"会把刚删掉的那条旁路原样装
+    回来，而且是隐式的——模型会学会不调 say 照样能说话，`final_call` 那套终止语义随之失效。
+    宁可静默一轮、在终端留下证据。
+    """
     def handle(chunk: llm.LLMResponse) -> None:
         if chunk.role == "assistant" and chunk.content:
-            message.sendmsg(chunk.content)
+            _self_talk.info(f'[{time.strftime("%H:%M:%S")}]【自言自语】{chunk.content}')
         if chunk.total_tokens:
             inc_call_cost(session.model, chunk.prompt_tokens, chunk.completion_tokens, chunk.cached_tokens)
 
