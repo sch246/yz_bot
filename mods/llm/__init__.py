@@ -623,7 +623,7 @@ class LLMClient:
             reasoning_content=reasoning_content,
         )
 
-    def chat(self, messages: list[dict], tools: list[Tool] | Callable[[], list[Tool]] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None, on_round: Callable[[], list[dict]] | None = None, should_stop: Callable[[], bool] | None = None, hints: Callable[[], list[dict]] | None = None, keep_reasoning: bool = True, on_tool_result: Callable[[ToolCallResult, str], str | None] | None = None) -> Generator[LLMResponse, None, None]:
+    def chat(self, messages: list[dict], tools: list[Tool] | Callable[[], list[Tool]] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None, on_round: Callable[[], list[dict]] | None = None, should_stop: Callable[[], bool] | None = None, hints: Callable[[], list[dict]] | None = None, keep_reasoning: bool = True, on_tool_result: Callable[[ToolCallResult, str], str | None] | None = None, turn_done: Callable[[], bool] | None = None) -> Generator[LLMResponse, None, None]:
         # Every message appended below is printed live as it happens, so each
         # further round only logs what it has not shown yet -- usually nothing.
         logged = 0
@@ -781,6 +781,19 @@ class LLMClient:
                 results.append(result)
             messages.extend({"role": "tool", "tool_call_id": result.tool_call_id, "content": result.content} for result in results)
             logged = len(messages)
+            # WHY: 这是「这一轮的活干完了」的检查点，和 should_stop 是**两件事**，别合并。
+            # should_stop 是 ^C：外面要求立刻停，停下来这一轮就算被取消了；turn_done 是
+            # 工具自己说「我做的这件事就是本轮的最后一件」——轮正常结束。混用会让
+            # chat.chat 外层那句 `if turn.cancelled: return` 把正常结束误判成被取消，于是
+            # 不再去看 trigger，等着续跑的那一轮就被丢掉。
+            # WHY: 位置在这一批 tool 结果**全部追加之后**。一批里有几个并发调用，只要其中
+            # 一个声明了结束，这一批的结果都已经进了 messages——它们会跟着 oplog 轨道在
+            # 下一轮重建回来，不会因为提前 return 而丢账。代价是这一批里别的工具的结果，
+            # 模型这一轮看不到了；那是它自己的选择（声明结束的是它）。
+            # WHY: 这一层不认识任何具体工具。谁有资格结束一轮、凭什么结束，全在调用方，
+            # 见 mods/chat 给它的那个闭包。这里只问一句「完了吗」。
+            if turn_done is not None and turn_done():
+                return
 
 
 class Chat:
@@ -798,6 +811,9 @@ class Chat:
         self.context_providers: list[Callable[[], list[dict]]] = []
         # 返回 True 表示这一轮应当就地停下（^C 打断）。
         self.should_stop: Callable[[], bool] | None = None
+        # 返回 True 表示这一轮的活已经干完，可以正常结束（不是被打断）。见 LLMClient.chat
+        # 里那个检查点的 WHY——它和 should_stop 的区别是"完成"与"取消"，后果不同。
+        self.turn_done: Callable[[], bool] | None = None
         # WHY: hint 与 context_providers 是两层，别合并。provider 追加进 messages——进
         # 历史、留下来；hint 每次子请求重新渲染并挂在末尾，不进 messages。判据是这条：
         # 频繁变化、且随时可以重算的状态放 hint；"发生过一次"的事实放 provider。
@@ -970,6 +986,7 @@ class Chat:
                 self.render_hints,
                 self.keep_reasoning,
                 self.on_tool_result,
+                self.turn_done,
             )
             results = []
             for chunk in response:
