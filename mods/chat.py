@@ -1212,27 +1212,81 @@ def _subcommand(value: str):
     return "子命令格式错误，可用 #help 查看"
 
 
-def cond() -> Callable | bool:
-    event = context.current() or {}
+def _in_chat_scope(event: dict) -> bool:
+    """这个窗口开了聊天吗——群要在白名单里，私聊一律算开。"""
     group_id = event.get("group_id")
-    if group_id is not None and group_id not in chat_groups:
+    return group_id is None or group_id in chat_groups
+
+
+def _addressed(event: dict, value: str) -> bool:
+    """这条消息是冲着 Bot 说的吗：at、`<名字>，`、或者 `柚子，`。"""
+    return (has_at(identity.bot_id())(event)
+            or value.startswith(f"{identity.bot_name()}，")
+            or value.startswith("柚子，"))
+
+
+def activation_signal(event: dict) -> bool:
+    """这条事件该不该把柚子叫醒——**只问这一件事**，不回答「它进不进上下文」。
+
+    WHY: 这是「红点」那一位，从 `cond` 里摘出来的。`cond` 一直在同时回答两个问题：
+    「这条要不要激活一轮」和「这条是不是一条就地执行的 `#` 子命令」，靠返回值的类型
+    （bool 还是 callable）区分。两个问题的答案本来就不该共用一个出口——子命令那一支
+    既不激活、也不进上下文，它和聊天循环唯一的关系就是「不要碰它」。
+    见 docs/working/proposals/mail-and-activation.md 3.0。
+
+    WHY: 四个判据一个不少，顺序也照搬：at／名字开头优先于 `#`，所以 `@Bot #help`
+    是激活而不是子命令；`#poke` 是唯一一个长得像子命令的激活信号；最后那行的戳一戳
+    判据留在**函数末尾**而不是提前 `return False`，因为今天 `#` 未知子命令那条路就是
+    落到它上面的——提前返回要先证明「一个事件不可能同时 is_msg 和 is_poke」，
+    而那条证明现在没人做过。
+    """
+    if not _in_chat_scope(event):
         return False
     if msgs.is_msg(event):
         value = msgs.body(event)
-        if has_at(identity.bot_id())(event) or value.startswith(f"{identity.bot_name()}，") or value.startswith("柚子，"):
+        if _addressed(event, value):
             return True
         if value.startswith("#"):
-            subcommand = value[1:].strip().partition(" ")[0]
             if value == "#poke":
                 return True
-            if subcommand in _SUBCOMMAND_NAMES:
-                if subcommand == "hint" and not op.require_op(event, pattern=r"^#\s*hint"):
-                    # WHY: hint 是用户可写的代码、跑在特权环境、还每次聊天自动执行，权限
-                    # 与 .py/.link 同级，所以非 op 连命令面都不给；require_op 已经按节流
-                    # 约定（同一个人的同类重试）给过提醒，这里只要不接管这条消息。
-                    return False
-                return lambda value=value: _subcommand(value[1:])
+            if value[1:].strip().partition(" ")[0] in _SUBCOMMAND_NAMES:
+                # 子命令那一支：就地执行，不激活。谁来执行见 _subcommand_call。
+                return False
     return msgs.is_poke(event) and event.get("target_id") == identity.bot_id()
+
+
+def _subcommand_call(event: dict) -> Callable | None:
+    """`#` 子命令那一支：返回就地执行它的那个闭包，不是子命令就返回 None。
+
+    WHY: 和 `activation_signal` 是**互斥**的两支，合起来正好是老 `cond` 的全部返回值。
+    判据的先后必须与那边一致，否则 `@Bot #help` 会同时被两边认领。
+    """
+    if not _in_chat_scope(event) or not msgs.is_msg(event):
+        return None
+    value = msgs.body(event)
+    if _addressed(event, value) or not value.startswith("#") or value == "#poke":
+        return None
+    subcommand = value[1:].strip().partition(" ")[0]
+    if subcommand not in _SUBCOMMAND_NAMES:
+        return None
+    if subcommand == "hint" and not op.require_op(event, pattern=r"^#\s*hint"):
+        # WHY: hint 是用户可写的代码、跑在特权环境、还每次聊天自动执行，权限
+        # 与 .py/.link 同级，所以非 op 连命令面都不给；require_op 已经按节流
+        # 约定（同一个人的同类重试）给过提醒，这里只要不接管这条消息。
+        return None
+    return lambda value=value: _subcommand(value[1:])
+
+
+def cond() -> Callable | bool:
+    """老入口，保持原样返回 callable／bool。
+
+    WHY: 没有删，因为它是公开名字——`.py`、link 动作、`#hint` 里的代码都可能在运行期
+    按名字引用它，而那些引用 grep 不到。新代码请直接用 `activation_signal` 与
+    `_subcommand_call`，这两个各自只回答一个问题。
+    """
+    event = context.current() or {}
+    handler = _subcommand_call(event)
+    return handler if handler is not None else activation_signal(event)
 
 
 def call(data: Callable | bool):
@@ -1244,13 +1298,16 @@ def call(data: Callable | bool):
 
 @capture(before="chatstart")
 def capture_chat(event: dict) -> bool:
-    matched = cond()
-    if callable(matched):
+    # WHY: 两个问题分两次问，不再靠一个返回值的类型来区分。顺序是承重的：子命令先问，
+    # 因为它就地执行、既不激活也不进上下文；剩下的才轮到「红点亮不亮」。
+    handler = _subcommand_call(event)
+    if handler is not None:
         # `#` 子命令不调模型也不进上下文，跟插话无关，照旧就地执行。
-        result = call(matched)
+        result = call(handler)
         if result is not None:
             message.sendmsg(result)
         return True
+    matched = activation_signal(event)
     window = history.window(event)
     turn = context.get_turn(window) if window is not None else None
     if turn is not None:
@@ -1265,9 +1322,9 @@ def capture_chat(event: dict) -> bool:
         return bool(matched)
     if not matched:
         return False
-    result = call(matched)
-    if result is not None:
-        message.sendmsg(result)
+    # WHY: 这里直接开一轮，不再走 `call()`。`call` 现在只剩子命令那一支的意义——
+    # 它曾经同时接 bool 和 callable，正是「一个出口回答两个问题」的最后一处。
+    chat()
     return True
 
 
