@@ -145,23 +145,72 @@ class Mailbox:
     def __init__(self, key: Any) -> None:
         self.key = key
         self._lock = threading.RLock()
+        # 按到达顺序排好的条目。序号是**单调递增**的，`_base` 是 `_entries[0]` 的序号，
+        # 所以修剪掉开头的已读条目不会让后面的序号跟着变。
         self._entries: list[dict] = []
+        self._base = 0
+        # 水位线：序号 < `_read` 的条目都已经进过这个窗口的上下文了。
+        self._read = 0
 
-    def add(self, event: dict) -> None:
-        """Put one event in, unconditionally.  Nothing here decides anything."""
+    def add(self, event: dict) -> int:
+        """Put one event in and return its sequence number.  Decides nothing else."""
         with self._lock:
             self._entries.append(event)
+            return self._base + len(self._entries) - 1
 
-    def take(self) -> list[dict]:
-        """Hand over everything buffered so far and leave the box empty."""
+    def advance(self) -> list[dict]:
+        """Move the watermark to the end and return everything it crossed.
+
+        WHY: 这是**唯一**推进水位线的动作，两个调用方都走它，但用途相反——
+        `chat._run_chat` 开局调它然后**把返回值丢掉**（因为 `build_context` 刚从
+        history 把同一段重建进上下文了），`chat._interject_provider` 调它然后**把返回值
+        渲染进去**（那是建完上下文之后才到的）。两者是同一件事：把「已经进过上下文」
+        这条线往前推，区别只在谁负责让它进。合成一个动作是有意的——两处各写一遍
+        「怎么算已读」必然会分叉。
+        """
         with self._lock:
-            entries, self._entries = self._entries, []
-            return entries
+            start = self._read - self._base
+            crossed = self._entries[start:]
+            self._read = self._base + len(self._entries)
+            self._trim()
+            return crossed
+
+    def unread(self) -> list[dict]:
+        """Look at what has not entered the context yet, without consuming it."""
+        with self._lock:
+            return self._entries[self._read - self._base:]
+
+    def _trim(self) -> None:
+        """Drop consumed entries past the retention tail; never drop unread ones.
+
+        WHY: 只修剪**水位线之前**的。之后的那些是「还没进过上下文」，丢了就是丢消息，
+        而这个模块是它们在内存里唯一的落点。之前的那些今天没有任何消费者，留一小段
+        纯粹为了出事时能看，所以一个上界就够。
+
+        WHY: 这是**临时**的内存形态。主观时间轴（「柚子什么时候知道的」）最终要落成
+        追加式文件，那时候「留多少」由存储回答，不再由这个上界回答。删除条件：
+        mail 升级成时序记录之后。见 docs/working/proposals/mail-and-activation.md 第五节。
+        """
+        consumed = self._read - self._base
+        if consumed > _MAILBOX_RETAIN:
+            drop = consumed - _MAILBOX_RETAIN
+            del self._entries[:drop]
+            self._base += drop
+
+    @property
+    def watermark(self) -> int:
+        with self._lock:
+            return self._read
 
     def __len__(self) -> int:
+        """**未读**条数——红点要问的就是这个，不是总条数。"""
         with self._lock:
-            return len(self._entries)
+            return len(self._entries) - (self._read - self._base)
 
+
+# 水位线之前还留在内存里的条目上界，见 Mailbox._trim。对齐 history.MAX_LEN 只是为了
+# 两边「内存里留多久」的量级一致，没有哪条逻辑依赖它们相等。
+_MAILBOX_RETAIN = 256
 
 _mailboxes: dict[Any, Mailbox] = {}
 
@@ -221,9 +270,9 @@ class WindowTurn:
                 self._trigger_event = event
 
     def take_pending(self) -> list[dict]:
-        """Drain this window's mailbox, leaving the trigger flag alone."""
+        """Advance this window's watermark, leaving the trigger flag alone."""
         with self._lock:
-            return self.mail.take()
+            return self.mail.advance()
 
     def mark_trigger(self, event: dict) -> None:
         """Ask for one more round, on behalf of *event*, without queueing it.

@@ -620,7 +620,12 @@ def _oplog_recorder(window, binding=None):
 
 
 def _interject_provider(turn, in_group: bool):
-    """Drain the window's queue into messages appended before the next request."""
+    """Advance the window's watermark into messages appended before the next request.
+
+    WHY: 和 `_run_chat` 开局那次推进是**同一个动作、相反的用途**：那次把返回值丢掉
+    （重建已经覆盖了），这次把返回值渲染进去（这些是建完上下文之后才到的）。
+    两边都只经 `Mailbox.advance`，所以「怎么算已读」只有一处定义。
+    """
     def provide() -> list[dict]:
         return [event2chat(event, in_group) for event in turn.take_pending()]
     return provide
@@ -793,10 +798,13 @@ def _run_chat(model: str | None, turn, in_group: bool) -> None:
     # 预算。`.chat` 单句请求走的是另一条路：它本来就不读聊天历史，也就不载入工具记录。
     init_chat(session, build_context())
     if turn is not None:
-        # WHY: 先建上下文再清队列，顺序不能反。get_msgs 已经从 history 读到了此刻为止
-        # 的全部消息，队列里同一批就是重复；反过来先清再读，则清掉之后、读到之前到达的
-        # 消息会两头落空。这个方向漏掉的消息只是本轮不追加——它仍在 history 里，而且
-        # take_pending 不动 trigger 标记，该再跑一轮还是会跑。
+        # WHY: 这一行不是「清队列」，是**把水位线推到当下**。`build_context()` 刚刚从
+        # history 把此刻为止的全部消息重建进了上下文，所以邮箱里那一段按定义已经进过
+        # 上下文了——推过去，返回值丢掉。重建与排空是把同一段内容送进上下文的**两条路**，
+        # 水位线是它们不打架的唯一原因。
+        # WHY: 顺序仍然不能反。先推线再建上下文的话，推掉之后、读到之前到达的消息会
+        # 两头落空：水位线说它已读，而上下文里没有它。现在这个方向最坏只是本轮不追加，
+        # 而它仍在 history 里、trigger 标记也没动，该再跑一轮还是会跑。
         turn.take_pending()
         session.add_context_provider(_interject_provider(turn, in_group))
         session.should_stop = lambda: turn.cancelled
