@@ -128,10 +128,15 @@ def _run_bash(command_text: str):
 def _route(event: dict) -> str | None:
     context.set_current(event)
     chatlog = _optional("chatlog")
+    chat = _optional("chat")
     if chatlog is not None:
         # The prefix and the body chatlog formats are one line of terminal
         # output, so they are one record rather than two racing writes.
-        written = chatlog.write(event)
+        writer = lambda: chatlog.write(event)
+        # Chat history and the matching window-mail entry are one commit.  A
+        # concurrent context rebuild takes the same mailbox lock, so it cannot
+        # observe one without the other.
+        written = chat.record_event(event, writer) if chat is not None else writer()
         if written is not None:
             body = chatlog.display(written).removesuffix("\n")
             # Bot 自己那条是从 NapCat 回声回来的，走的也是这一行；标签不按 post_type 分，
@@ -162,7 +167,6 @@ def _route(event: dict) -> str | None:
         return "log-only"
 
     if msgs.is_msg(event):
-        chat = _optional("chat")
         if chat is not None:
             chat.eager_cache_images(event)
         key = context.interaction_key(event)

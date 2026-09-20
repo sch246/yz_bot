@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from queue import Full, Queue
 import threading
-from typing import Any
+from typing import Any, Callable
 
 
 class InteractionCancelled(Exception):
@@ -122,6 +123,15 @@ def cancel(key: tuple[Any, Any]) -> bool:
     return True
 
 
+@dataclass
+class MailEntry:
+    """One event in a window mailbox and the activation fact fixed at arrival."""
+
+    seq: int
+    event: dict
+    activated: bool = False
+
+
 class Mailbox:
     """One window's buffer: what arrived and has not entered the context yet.
 
@@ -131,15 +141,10 @@ class Mailbox:
     这条轴今天没有任何地方记着），那更是跨轮的。见
     docs/working/proposals/mail-and-activation.md 3.0 与九点八。
 
-    WHY: **这一步只搬容器，不改任何策略。** 入列的条件仍然是「这个窗口正跑着一轮」
-    （判据在 `chat.capture_chat`），排空时机仍然是每次子请求之前加开轮那次丢弃。
-    「邮箱比一轮活得久」在**可观察行为**上要等水位线那一步才真正生效——在那之前，
-    上一轮残留的条目会在下一轮开局被 `take` 丢掉，和过去随 `end_turn` 一起销毁
-    完全等价。别以为搬完容器语义就已经变了。
-
     WHY: 自己带锁，而不是借 `WindowTurn` 的。轮会消失，锁不能跟着消失——不然
-    「邮箱不随轮生灭」这句话在并发下就是假的。调用方仍然从 `WindowTurn.interject`
-    进来，于是两把锁的获取顺序恒为 turn→mail，不存在反向路径。
+    「邮箱不随轮生灭」这句话在并发下就是假的。聊天记录写入与 mail 入列由 `record`
+    在这把锁里一次提交；开轮时的历史重建与水位线推进由 `rebuild` 在同一把锁里完成。
+    因此 history 与 mail 观察的是同一个截面，不需要靠事后去重补两份状态之间的竞态。
     """
 
     def __init__(self, key: Any) -> None:
@@ -147,38 +152,89 @@ class Mailbox:
         self._lock = threading.RLock()
         # 按到达顺序排好的条目。序号是**单调递增**的，`_base` 是 `_entries[0]` 的序号，
         # 所以修剪掉开头的已读条目不会让后面的序号跟着变。
-        self._entries: list[dict] = []
+        self._entries: list[MailEntry] = []
         self._base = 0
         # 水位线：序号 < `_read` 的条目都已经进过这个窗口的上下文了。
         self._read = 0
 
-    def add(self, event: dict) -> int:
-        """Put one event in and return its sequence number.  Decides nothing else."""
+    def _add(self, event: dict, *, activated: bool = False) -> MailEntry:
+        entry = MailEntry(self._base + len(self._entries), event, activated)
+        self._entries.append(entry)
+        return entry
+
+    def add(self, event: dict, *, activated: bool = False) -> int:
+        """Put one event in and return its sequence number."""
         with self._lock:
-            self._entries.append(event)
-            return self._base + len(self._entries) - 1
+            return self._add(event, activated=activated).seq
 
-    def advance(self) -> list[dict]:
-        """Move the watermark to the end and return everything it crossed.
+    def record(self, event: dict, write: Callable[[], Any]) -> Any:
+        """Commit one durable history write and its mailbox entry together.
 
-        WHY: 这是**唯一**推进水位线的动作，两个调用方都走它，但用途相反——
-        `chat._run_chat` 开局调它然后**把返回值丢掉**（因为 `build_context` 刚从
-        history 把同一段重建进上下文了），`chat._interject_provider` 调它然后**把返回值
-        渲染进去**（那是建完上下文之后才到的）。两者是同一件事：把「已经进过上下文」
-        这条线往前推，区别只在谁负责让它进。合成一个动作是有意的——两处各写一遍
-        「怎么算已读」必然会分叉。
+        The writer runs while the mailbox is locked.  `rebuild` takes the same
+        lock around its history snapshot, so a reader sees either both facts or
+        neither; it can never rebuild an event whose mail entry has not arrived.
         """
         with self._lock:
-            start = self._read - self._base
-            crossed = self._entries[start:]
-            self._read = self._base + len(self._entries)
-            self._trim()
-            return crossed
+            result = write()
+            if result is not None:
+                self._add(event)
+            return result
 
-    def unread(self) -> list[dict]:
+    def ensure(self, event: dict) -> MailEntry:
+        """Return *event*'s entry, adding it for non-router callers if needed."""
+        with self._lock:
+            for entry in reversed(self._entries):
+                if entry.event is event:
+                    return entry
+            return self._add(event)
+
+    def activate(self, event: dict) -> bool:
+        """Mark an unread event active; return false when it was already read."""
+        with self._lock:
+            entry = next((item for item in reversed(self._entries) if item.event is event), None)
+            if entry is None:
+                entry = self._add(event)
+            if entry.seq < self._read:
+                return False
+            entry.activated = True
+            return True
+
+    def advance(self) -> list[MailEntry]:
+        """Move the watermark to the end and return everything it crossed.
+
+        Provider 用它读取建会话之后到达的段；建会话走 `rebuild`，但最终也调用同一个
+        `_advance`。水位线怎么算、何时修剪因此只有一处。
+        """
+        with self._lock:
+            return self._advance()
+
+    def _advance(self) -> list[MailEntry]:
+        start = self._read - self._base
+        crossed = list(self._entries[start:])
+        self._read = self._base + len(self._entries)
+        self._trim()
+        return crossed
+
+    def rebuild(self, builder: Callable[[list[MailEntry]], Any]) -> tuple[Any, list[MailEntry]]:
+        """Build from history and consume the same mailbox snapshot atomically."""
+        with self._lock:
+            crossed = list(self._entries[self._read - self._base:])
+            built = builder(crossed)
+            return built, self._advance()
+
+    def unread(self) -> list[MailEntry]:
         """Look at what has not entered the context yet, without consuming it."""
         with self._lock:
-            return self._entries[self._read - self._base:]
+            return list(self._entries[self._read - self._base:])
+
+    def latest_activation(self) -> dict | None:
+        """Return the last unread activated event, if the red dot is lit."""
+        with self._lock:
+            start = self._read - self._base
+            for entry in reversed(self._entries[start:]):
+                if entry.activated:
+                    return entry.event
+            return None
 
     def _trim(self) -> None:
         """Drop consumed entries past the retention tail; never drop unread ones.
@@ -229,71 +285,21 @@ def mailbox(key: Any) -> Mailbox:
 
 
 class WindowTurn:
-    """One chat window's in-flight LLM turn: who asked for it, and the stop flag.
+    """One chat window's in-flight LLM reader and its stop flag.
 
     WHY: 这里按**窗口**登记，而不是 interaction_key 的 (窗口, 用户)。插话和 ^C 都是
     任何人可用的：LLM 上下文本来就整个窗口共享，只让触发者能停，群里其他人就无法制止
     一轮跑偏的生成。这与 _waiters 的粒度不同，所以是另一份登记，不要合并。
 
-    WHY: 缓冲区**不在这里**，在 `Mailbox`（按窗口、不随轮生灭）。这一位留着
-    `interject` / `take_pending` 两个方法转发过去，是为了**不动锁的结构**：它们今天
-    在同一把 `self._lock` 下把「入列」和「置触发位」做成一个原子动作，而尾缘触发不丢
-    正依赖这一点（见 `finish_turn`）。把调用方直接改成两次独立调用是另一件事，
-    要连同水位线一起做，不在这一步。
+    WHY: 缓冲区与红点都不在这里。`Mailbox` 的未读条目是唯一事实；其中是否还有
+    `activated` 条目就是红点。轮只保留正在执行与是否取消，不再复制一份 trigger 状态。
     """
 
     def __init__(self, key: Any) -> None:
         self.key = key
         self._lock = threading.RLock()
         self.mail = mailbox(key)
-        # WHY: 记的是**触发事件本身**，不是一个 bool。续跑的那一轮属于要求它的那个人，
-        # 而"属于谁"决定了那一轮的 op 门（tools.op_tool_visible 问的就是当前事件）。
-        # 只留一个 bool 的话，续轮只能沿用开轮那个人的身份，群里任何成员都能在管理员
-        # 开的轮之后要来一轮、并在那一轮里看见 op 专属模块。见 chat.chat 的续轮分支。
-        self._trigger_event: dict | None = None
         self._cancelled = False
-
-    def interject(self, event: dict, *, trigger: bool = False) -> None:
-        """Put one event in this window's mailbox; *trigger* also lights the dot.
-
-        WHY: 分级是有意的。任何消息都进邮箱（让模型看到更多上下文），但只有原本就会
-        触发聊天的消息（at、名字开头、poke）才置位 trigger，让本轮结束后再跑一轮。
-        否则普通闲聊会让 Bot 无限续聊下去。
-
-        WHY: 两件事在同一把锁里，这是**承重的**：尾缘触发不丢依赖「入列与置位不可分割」
-        （见 `finish_turn`）。邮箱搬走之后它们分处两个对象，所以这里显式地把邮箱那次
-        写入也罩在 `self._lock` 里，而不是让调用方各调各的。
-        """
-        with self._lock:
-            self.mail.add(event)
-            if trigger:
-                self._trigger_event = event
-
-    def take_pending(self) -> list[dict]:
-        """Advance this window's watermark, leaving the trigger flag alone."""
-        with self._lock:
-            return self.mail.advance()
-
-    def mark_trigger(self, event: dict) -> None:
-        """Ask for one more round, on behalf of *event*, without queueing it.
-
-        The event is already in history, so the next round's context rebuild sees
-        it; what is missing is only the reason to run that round -- and who that
-        round belongs to.
-        """
-        with self._lock:
-            self._trigger_event = event
-
-    def consume_trigger(self) -> dict | None:
-        """Report and clear which message asked for another round, if any.
-
-        WHY: 同一轮里来了好几次触发时，留下的是**最后**那一次——续跑的是"最近一次还没被
-        回答的请求"。方向上也更安全：非 op 在 op 之后再要一轮只会把这轮降成普通轮，反过来
-        要抬高身份，op 自己必须真的开口。
-        """
-        with self._lock:
-            triggered, self._trigger_event = self._trigger_event, None
-            return triggered
 
     def cancel(self) -> None:
         with self._lock:
@@ -311,9 +317,9 @@ _turns: dict[Any, WindowTurn] = {}
 def begin_turn(key: Any) -> tuple[WindowTurn, bool]:
     """Claim *key*'s LLM turn; the second caller joins instead of starting one.
 
-    Returns ``(turn, owner)``.  Only the owner drives the model; a non-owner has
-    nothing to do beyond queueing its event, which keeps a second at-message from
-    starting a concurrent generation that would read context and speak on its own.
+    Returns ``(turn, owner)``.  Only the owner drives the model; the event is
+    already in mail, so a non-owner has nothing else to do.  This keeps a second
+    at-message from starting a concurrent generation in the same window.
     """
     with _lock:
         turn = _turns.get(key)
@@ -341,25 +347,13 @@ def finish_turn(key: Any, turn: WindowTurn) -> dict | None:
     Returns that message, so the caller can run the extra round **as** its author
     instead of as whoever opened the turn; ``None`` closes the turn.
 
-    Checking the flag and removing the registration under one lock is what keeps
-    an at-message that lands right as the turn ends from being dropped: either it
-    is seen here and the turn runs again, or it arrives after removal and starts a
-    turn of its own.
-
-    WHY: **上面那条保证有一个缺口，2026-09-20 实跑确认过，这里如实记下。** 它的第二条
-    分支要求 `capture_chat` 查不到这一轮；但 `capture_chat` 是先 `get_turn`（拿模块锁、
-    随即放掉）、再 `turn.interject(..., trigger=True)`（只拿 turn 的锁）。若这一轮恰好
-    在这两步之间收摊，触发位就被置到一个**已经摘掉登记**的 turn 上，没有任何人会再读它
-    ——那条 at 被静默丢掉。窗口很窄（要求正好落在这两步之间），但它是真的。
-
-    WHY: 没有就地修，因为正解不是再加一把锁，而是**让这条路不存在**：邮箱改成无条件
-    `add`、红点改成「邮箱里有没有激活元素」这个派生谓词之后，`capture_chat` 不再需要先
-    查一轮才能投递，这个交错也就没有了。见
-    docs/working/proposals/mail-and-activation.md 3.0 与第十一节第 5 步；
-    那一步落地时，连同这段 WHY 一起删掉。
+    The unread mailbox is the authority.  Under `_lock`, either an activated
+    entry is already visible here and keeps this reader, or the turn is removed;
+    a later activator then claims a new reader through `begin_turn`.  `capture_chat`
+    never looks up a turn before delivery, so there is no detached-turn race.
     """
     with _lock:
-        triggered = turn.consume_trigger()
+        triggered = turn.mail.latest_activation()
         if triggered is not None:
             return triggered
         if _turns.get(key) is turn:

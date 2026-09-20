@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from collections import Counter
 from datetime import datetime
 import re
 import threading
@@ -269,6 +270,33 @@ def event2chat(event: dict, in_group: bool) -> dict:
     return {"role": "user", "content": f"【{kind}】{_poke_text(event)}"}
 
 
+def _event_key(event: dict) -> tuple:
+    """Stable identity for matching a live mail event to rebuilt history."""
+    window = history.window(event)
+    message_id = event.get("message_id")
+    if message_id not in (None, ""):
+        return "message", window, str(message_id)
+    if msgs.is_msg(event):
+        return (
+            "message",
+            window,
+            event.get("time"),
+            event.get("user_id"),
+            event.get("post_type"),
+            event.get("message"),
+        )
+    return (
+        "event",
+        window,
+        event.get("time"),
+        event.get("post_type"),
+        event.get("notice_type"),
+        event.get("sub_type"),
+        event.get("user_id"),
+        event.get("target_id"),
+    )
+
+
 def _message_cost(converted: dict) -> int:
     content = converted["content"]
     if isinstance(content, str):
@@ -276,20 +304,20 @@ def _message_cost(converted: dict) -> int:
     return sum(count_tokens(part.get("text", "")) for part in content if isinstance(part, dict) and part.get("type") == "text")
 
 
-def _within_budget(events: list[dict], in_group: bool, token_limit: int) -> tuple[list[tuple[float, dict]], int]:
+def _within_budget(events: list[dict], in_group: bool, token_limit: int) -> tuple[list[tuple[float, dict, dict]], int]:
     """The chat messages that fit, oldest first, each with its timestamp.
 
     WHY: 截断只有这一处实现。get_msgs 和 build_context 都从这里取，操作记录再依附到它的
     结果上——三处各写一遍"留多少"，改一处就会静默地分叉。
     """
-    picked: list[tuple[float, dict]] = []
+    picked: list[tuple[float, dict, dict]] = []
     used = 0
     for event in events:
         converted = event2chat(event, in_group)
         used += _message_cost(converted)
         if used > token_limit:
             break
-        picked.insert(0, (float(event.get("time") or 0.0), converted))
+        picked.insert(0, (float(event.get("time") or 0.0), converted, event))
     return picked, used
 
 
@@ -299,7 +327,7 @@ def get_msgs(token_limit: int | None = None, return_token: bool = False):
     if token_limit is None:
         token_limit = limit(current)[1]
     picked, used = _within_budget(_selected_events(current, in_group), in_group, token_limit)
-    output = [converted for _at, converted in picked]
+    output = [converted for _at, converted, _event in picked]
     return (output, used) if return_token else output
 
 
@@ -313,7 +341,7 @@ def context_usage() -> int:
     return get_msgs(return_token=True)[1]
 
 
-def _selected_events(current: dict, in_group: bool) -> list[dict]:
+def _selected_events(current: dict, in_group: bool, exclude: Counter | None = None) -> list[dict]:
     """Walk recent history newest-first and keep what may enter the model context."""
     message_limit = limit(current)[0]
     events = history.getlog(current)[:message_limit]
@@ -346,8 +374,16 @@ def _selected_events(current: dict, in_group: bool) -> list[dict]:
                 continue
             if value in ("聊天开始", "聊天结束"):
                 break
+            key = _event_key(event)
+            if exclude is not None and exclude[key] > 0:
+                exclude[key] -= 1
+                continue
             selected.append(event)
         elif _is_context_poke(event, in_group):
+            key = _event_key(event)
+            if exclude is not None and exclude[key] > 0:
+                exclude[key] -= 1
+                continue
             selected.append(event)
     return selected
 
@@ -420,7 +456,7 @@ def _base_prompt() -> list[dict]:
 - `say` 返回这条消息的 message_id；它默认 `final_call=true`，说完这一轮就结束，要接着干活就传 `final_call=false`"""}]
 
 
-def build_context(token_limit: int | None = None) -> list:
+def _build_context_snapshot(token_limit: int | None = None, exclude: Counter | None = None) -> list:
     """Chat history, with the rebuilt tool rounds that belong inside it.
 
     WHY: 只有**一套**截断规则，就是聊天消息那套（max_msg + max_token）。操作记录不再自己
@@ -457,7 +493,7 @@ def build_context(token_limit: int | None = None) -> list:
         token_limit = limit(current)[1]
     in_group = current.get("group_id") is not None
     window = history.window(current)
-    events = _selected_events(current, in_group)
+    events = _selected_events(current, in_group, exclude)
     picked, _used = _within_budget(events, in_group, token_limit)
     if not picked:
         # 没有聊天做锚点时不载入任何操作记录：孤零零摆着，模型无从判断它当时在回应什么。
@@ -472,13 +508,18 @@ def build_context(token_limit: int | None = None) -> list:
     # 代价是刻意接受的：在按高度退休落位之前，操作记录只增不减，storage 那份全量回写与
     # `#ops` 的输出都随之线性变长。见 docs/working/proposals/chat-condense.md。
     # 删除条件：按高度退休落位，由它接管回收——那时门槛是**深度**，不再是聊天时间。
-    items: list[tuple[float, int, list]] = [(at, 0, [converted]) for at, converted in picked]
+    items: list[tuple[float, int, list]] = [(at, 0, [converted]) for at, converted, _event in picked]
     floor = picked[0][0]
     # 过滤下推给 build_rounds：条目不再被回收，全量重建再丢掉绝大部分会让这条热路径随
     # 记录数线性变慢。
     items.extend((at, 1, batch) for at, batch in oplog.build_rounds(window, since=floor))
     items.sort(key=lambda item: (item[0], item[1]))
     return _close_with_user([message for item in items for message in item[2]])
+
+
+def build_context(token_limit: int | None = None) -> list:
+    """Build the current window context without consuming its mailbox."""
+    return _build_context_snapshot(token_limit)
 
 
 _CLOSING_NOTE = "<system-reminder>\n会话已自动接续。\n</system-reminder>"
@@ -622,13 +663,27 @@ def _oplog_recorder(window, binding=None):
 def _interject_provider(turn, in_group: bool):
     """Advance the window's watermark into messages appended before the next request.
 
-    WHY: 和 `_run_chat` 开局那次推进是**同一个动作、相反的用途**：那次把返回值丢掉
-    （重建已经覆盖了），这次把返回值渲染进去（这些是建完上下文之后才到的）。
-    两边都只经 `Mailbox.advance`，所以「怎么算已读」只有一处定义。
+    `_run_chat` 开局通过 `Mailbox.rebuild` 原子取得并渲染当时的未读段；之后到达的段
+    在每次子请求前从这里读取。两条路最终都经 Mailbox 的同一个水位线推进动作。
     """
     def provide() -> list[dict]:
-        return [event2chat(event, in_group) for event in turn.take_pending()]
+        return _mail_context(turn.mail.advance(), in_group)
     return provide
+
+
+def _mail_context(entries: list[context.MailEntry], in_group: bool) -> list[dict]:
+    """Project one drained mail segment through the history-visible rules."""
+    output = []
+    for entry in entries:
+        event = entry.event
+        if msgs.is_msg(event):
+            value = msgs.body(event)
+            if value.startswith("#") or value in ("聊天开始", "聊天结束"):
+                continue
+        elif not _is_context_poke(event, in_group):
+            continue
+        output.append(event2chat(event, in_group))
+    return output
 
 
 def _window_storage(window: tuple) -> dict:
@@ -755,12 +810,8 @@ def chat(model: str | None = None) -> None:
         return
     turn, owner = context.begin_turn(window)
     if not owner:
-        # WHY: 一个窗口同时只跑一轮。以前第二条 at 会再起一轮并发的 chat()，两轮各自读
-        # get_msgs()、各自发言，像两个人抢着回答。现在只登记"还要再跑一轮"，事件本身已经
-        # 在 history 里，下一轮重建上下文时自然会读到。
-        # WHY: 带上事件本身。续跑的那一轮属于要求它的人，而不是开轮的人——判据见 finish_turn
-        # 之后的 set_current。
-        turn.mark_trigger(event)
+        # 一个窗口只有一个 reader。事件已经在 mail；当前 reader 会在下一次子请求前读到，
+        # 或在收尾时发现仍有未读激活元素并继续。这里不再复制一份 trigger 状态。
         return
     in_group = event.get("group_id") is not None
     # WHY: 一次对话 = 这次持有的全过程（多轮 + 插话续写，直到 finally），图片检查台账就
@@ -796,18 +847,20 @@ def _run_chat(model: str | None, turn, in_group: bool) -> None:
     session = llm.Chat(model=model or get_model(), chat_client=llm.get_client())
     # WHY: 聊天历史与重建出的工具调用记录由 build_context 一起装配，共用一份 token
     # 预算。`.chat` 单句请求走的是另一条路：它本来就不读聊天历史，也就不载入工具记录。
-    init_chat(session, build_context())
     if turn is not None:
-        # WHY: 这一行不是「清队列」，是**把水位线推到当下**。`build_context()` 刚刚从
-        # history 把此刻为止的全部消息重建进了上下文，所以邮箱里那一段按定义已经进过
-        # 上下文了——推过去，返回值丢掉。重建与排空是把同一段内容送进上下文的**两条路**，
-        # 水位线是它们不打架的唯一原因。
-        # WHY: 顺序仍然不能反。先推线再建上下文的话，推掉之后、读到之前到达的消息会
-        # 两头落空：水位线说它已读，而上下文里没有它。现在这个方向最坏只是本轮不追加，
-        # 而它仍在 history 里、trigger 标记也没动，该再跑一轮还是会跑。
-        turn.take_pending()
+        # history 重建与 mail 排空共用邮箱锁：路由写 history + 入列也拿同一把锁，因此
+        # 两边看到同一个截面。未读段先从重建里排除，再按 mail 顺序追加；这既保住主观
+        # 到达顺序，也不会让超过 max_msg 的未读前缀被一次无声的水位线推进跳过去。
+        def rebuild(unread: list[context.MailEntry]) -> list:
+            excluded = Counter(_event_key(entry.event) for entry in unread)
+            return _build_context_snapshot(exclude=excluded)
+
+        messages, pending = turn.mail.rebuild(rebuild)
+        init_chat(session, [*messages, *_mail_context(pending, in_group)])
         session.add_context_provider(_interject_provider(turn, in_group))
         session.should_stop = lambda: turn.cancelled
+    else:
+        init_chat(session, build_context())
     session.chat(recall_func=get_handler(session), description_cache=description_cache)
 
 
@@ -1226,6 +1279,23 @@ def _in_chat_scope(event: dict) -> bool:
     return group_id is None or group_id in chat_groups
 
 
+def _mail_candidate(event: dict) -> bool:
+    """Whether history may project this event into an enabled chat window."""
+    if not _in_chat_scope(event):
+        return False
+    if msgs.is_msg(event):
+        return True
+    return _is_context_poke(event, event.get("group_id") is not None)
+
+
+def record_event(event: dict, write: Callable[[], object]) -> object:
+    """Write chat history and enqueue the same event as one window transaction."""
+    window = history.window(event)
+    if window is None or not _mail_candidate(event):
+        return write()
+    return context.mailbox(window).record(event, write)
+
+
 def _addressed(event: dict, value: str) -> bool:
     """这条消息是冲着 Bot 说的吗：at、`<名字>，`、或者 `柚子，`。"""
     return (has_at(identity.bot_id())(event)
@@ -1317,21 +1387,16 @@ def capture_chat(event: dict) -> bool:
         return True
     matched = activation_signal(event)
     window = history.window(event)
-    turn = context.get_turn(window) if window is not None else None
-    if turn is not None:
-        # WHY: 分级在这里。这个窗口正跑着一轮，任何进得了上下文的消息都入队(让模型看到
-        # 更多，而不是等这轮结束才发现群里已经聊了十句)，但只有原本就会触发聊天的那种
-        # 才置 trigger 让它再跑一轮。否则普通闲聊会把 Bot 拖进无限续聊。
-        # `#` 开头的一律不入队，理由与 get_msgs 的过滤完全相同。
-        if msgs.is_msg(event) and not msgs.body(event).startswith("#"):
-            turn.interject(event, trigger=bool(matched))
-        elif matched:
-            turn.interject(event, trigger=True)
-        return bool(matched)
+    if window is None or not _mail_candidate(event):
+        return False
+    box = context.mailbox(window)
+    box.ensure(event)
     if not matched:
         return False
-    # WHY: 这里直接开一轮，不再走 `call()`。`call` 现在只剩子命令那一支的意义——
-    # 它曾经同时接 bool 和 callable，正是「一个出口回答两个问题」的最后一处。
+    # 红点就是「未读里有激活元素」。若这一项已经被 reader 读过，激活也已经得到处理，
+    # 不再为了保留旧 trigger 状态额外开一轮；否则只需确保窗口有一个 reader。
+    if not box.activate(event):
+        return True
     chat()
     return True
 
