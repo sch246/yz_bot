@@ -32,7 +32,7 @@
 
 **再续修（2026-09-19）：那条「私聊里 `user_id` 是窗口对端」的约定本身被撤掉了。** 抓 5701 上的真实入站看到：`user_id` 两个方向都是作者，私聊「是哪一条」由 NapCat 的扩展字段 `target_id` 给出、与方向无关；两件事因此不再共用一个字段，`later`/`todo`/`chattop`/`cave` 那批读者也不必再分两派。取舍、实测与完整改动面见[私聊窗口的身份](proposals/window-identity.md)。
 
-`message.recvmsg()` 仍把作者与窗口写成一个值（`sender_id` 同时写进两处），所以它表达不了「作者 ≠ 窗口」——op 工具集按[提案](../proposals/op-toolbox.md)是手工构造事件投 `connect._events`，不走它。
+`message.recvmsg()` 仍把作者与窗口写成一个值（`sender_id` 同时写进两处），所以它表达不了「作者 ≠ 窗口」——op 工具集按[提案](proposals/op-toolbox.md)是手工构造事件投 `connect._events`，不走它。
 
 ## 接受的现行约束与取舍
 

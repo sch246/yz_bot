@@ -207,13 +207,14 @@ def condense(window: tuple[str, Any] | None, cids: Iterable[str]) -> int:
     """Mark the named calls condensed: out of the context, still on record.
 
     WHY: 标记而不删除。删除会让"收缩"变成不可逆的销毁，模型每次收缩都得先赌自己的结论没
-    写错；标记之后收缩只是移出上下文，原文按保留期继续留着，recall_ops 随时能捞回来。
-    唯一真正的删除是过期（见 _prune）。
+    写错；标记之后收缩只是移出上下文，原文继续留着，recall_ops 随时能捞回来。
+    唯一真正的删除是 `#ops clear`（2026-09-19 起；此前还有一条"随聊天滚出窗口"，见模块头）。
+    这两句旧版本写作"过期（见 _prune）"——`_prune` 从来就不存在于这个仓库，别去找它。
 
     WHY: 不留结论条目。结论已经在模型那条 condense_ops 调用的 arguments 里，
     而那条调用本身也是一次被记录的工具调用，会跟着重建回来。再存一份就是第二个副本。
 
-    WHY: 按整轮，理由与 _prune 相同：半轮会重建出配对不上的 tool_calls。
+    WHY: 按整轮，理由与 build_rounds 的 `since` 相同：半轮会重建出配对不上的 tool_calls。
 
     WHY: 后来的收缩可以把更早那次 condense_ops 调用本身也收掉，于是旧结论从上下文里消失。
     这是刻意的——更高层的结论本就该取代下层的。别把它当成 bug 去"保护"结论条目。
