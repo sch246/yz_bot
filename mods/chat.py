@@ -554,15 +554,12 @@ def _close_with_user(messages: list) -> list:
         return messages
     return [*messages, {"role": "user", "content": _CLOSING_NOTE}]
 
-def init_chat(session: llm.Chat, messages: list | None = None) -> None:
-    # WHY: 这一行和下面的 `_restore_window_tools` 是**同一类**东西，都不是上下文装配：
-    # 它们是「一轮聊天开始了」这个时刻该发生的事，只因为 init_chat 每轮恰好跑一次才挂在
-    # 这里。mail 与激活状态统一之后，「开局」不再等于一次 init_chat，那时这两处要一起换
-    # 时机——所以别把任何第三件事顺手挂进来，也别把这两件散开。
-    # 位置停在第一行是**刻意不动**：挪到后面会让装配中途抛异常的那种轮不再计数，而摘出
-    # 时机的这一步要求行为逐字保持。要改语义是接管时机那一步的事，不是这一步。
-    # 见 docs/working/proposals/condense-and-unify-handoff.md 的阶段 0 与阶段 3。
-    inc_call_count()
+
+def init_chat(
+    session: llm.Chat,
+    messages: list | None = None,
+) -> tuple[tool_modules.SessionBinding, tuple | None]:
+    """Assemble one Chat and return its tool binding and window."""
     prompts["base"] = _base_prompt()
     group = context.current().get("group_id") if context.current() else None
     state = {"role": "system", "content": f"当前所在群聊:{identity.getgroupname(group)}({group})"} if group is not None else {"role": "system", "content": f"当前在私聊:{identity.getname()}({context.current().get('user_id')})"}
@@ -576,7 +573,7 @@ def init_chat(session: llm.Chat, messages: list | None = None) -> None:
         state,
         *(messages or []),
     ])
-    # WHY: 已激活的工具模块属于**窗口**，要在这一轮开局装回去，改的时候也写回去。每轮
+    # WHY: 已激活的工具模块属于**窗口**，要在激活时装回去，改的时候也写回去。每轮
     # `_run_chat` 都新建一个 `llm.Chat`，激活只在内存里活着的话，下一轮模型就拿着上一轮
     # 装载过的名字去调用，而快照里没有——那个调用被丢掉、整轮直接结束，模型连自救的机会
     # 都没有（2026-09-17 `browser__open_page`）。读写在 `_active_modules`／
@@ -590,37 +587,51 @@ def init_chat(session: llm.Chat, messages: list | None = None) -> None:
         ui_mode=ui_mode,
         persist=_persist_modules(window) if window is not None else None,
     )
+    return binding, window
+
+
+def _activate_chat(
+    session: llm.Chat,
+    messages: list | None = None,
+) -> tool_modules.SessionBinding:
+    """Run the two lifecycle effects owned by one top-level activation."""
+    # WHY: 调用计数与窗口工具恢复描述的是「Bot 被激活一次」，不是「有人调用了上下文装配
+    # 函数」。把两者放在同一个入口后，mail 续读、`.chat` 与重启接续都明确经过它，单纯
+    # 构造 Chat 则不产生生命周期副作用。顺序仍与迁移前一致：先计数，再装配，再恢复工具。
+    inc_call_count()
+    binding, window = init_chat(session, messages)
     _restore_window_tools(binding, window)
+    # WHY: 工具恢复可能持久化 ttl 回收；它必须先于其余窗口设置读取，避免无关的配置异常
+    # 改变这一轮是否完成回收。
     session.do_process_image = get_image_mode() != "off"
     session.keep_reasoning = get_reasoning_mode() == "keep"
     session.on_tool_result = _oplog_recorder(window, binding)
-
+    return binding
 
 
 def _restore_window_tools(binding, window: tuple | None) -> None:
-    """把本窗口已激活的工具模块装回这一轮；空闲回收挂在同一个动作上。
+    """把本窗口已激活的工具模块装回本次激活；空闲回收挂在同一个动作上。
 
     WHY: 这一步**不**再交给 `bind_session` 的 `initial_modules` 参数顺带做，虽然那样少一
-    行。装回是一个**生命周期动作**，不是装配的一部分：它发生在「一轮开局」这个时刻，而
+    行。装回是一个**生命周期动作**，不是装配的一部分：它发生在「顶层激活」这个时刻，而
     空闲回收——超过 ttl 没被装入或调用过的模块在这里被收掉，见 `tools.SessionBinding.
-    restore`——挂的是同一个时刻。写成这里显式的一行，是为了让「何时发生」有一个能改的
-    地方；mail 与激活状态统一之后接管的就是它。见 init_chat 开头那条 WHY。
+    restore`——挂的是同一个时刻。`_activate_chat` 是唯一调用点，`init_chat` 只负责装配。
 
     WHY: `tools/agents.py` 那条路仍然走 `bind_session(initial_modules=...)`，不跟着改，
     因为它传的是**名字列表**而不是 `{名字: 时刻}`：`restore` 于是把每个名字的时刻都当成
     now，空闲回收在那条路上恒为空操作。子代理只借用「静默装回、不发通告」，没有生命周期
     含义，把它也卷进来只会让接管时机的那一步多一个不相干的调用点。
 
-    WHY: 空映射时不调用，**这个条件是照搬的**，不是新加的判断——原先它写在 `bind_session`
-    的 `if initial_modules:` 里，搬过来时一起搬，因为这一步要求行为逐字保持。核实过它此刻
+    WHY: 空映射时不调用，**这个条件是照搬的**，不是新加的判断。核实过它此刻
     并不承重：刚 bind 完 `_dirty` 是 False，空输入下 `kept == requested == []`，所以
     `restore` 既不会 `_save_active` 也不会 `_queue_reclaimed`，只是把 `_render_context`
-    幂等地重算一遍。也就是说去掉它今天不会有可见变化——但那是接管时机那一步该顺手清的，
-    不是这一步；这一步的价值全在「行为一个字没变」。
+    幂等地重算一遍。继续保留这个条件，是为了只迁移副作用的归属，不同时改变空名单语义。
     """
     modules = _active_modules(window) if window is not None else {}
     if modules:
         binding.restore(modules)
+
+
 def get_handler(session: llm.Chat):
     """The per-chunk sink: self-talk to the terminal, cost to the ledger.
 
@@ -691,7 +702,7 @@ def _window_storage(window: tuple) -> dict:
 
     WHY: 不经过 `context.current()`——hint 在 `chat` 的 `finally` 里跑，那个窗口就是调用方
     手上的实参；由实参决定"哪个窗口"，触发点就不依赖线程局部的当前事件，也不跟捕获、派发
-    的细节绑在一起。工具激活走同一个理由：`init_chat` 手上的 window 就是它的窗口。
+    的细节绑在一起。工具激活走同一个理由：`_activate_chat` 手上的 window 就是它的窗口。
     命名空间与 getchatstorage 同一套。
     """
     kind, key = window
@@ -704,7 +715,7 @@ _ACTIVE_MODULES_KEY = "active_tools"
 
 
 def _active_modules(window: tuple) -> dict[str, float]:
-    """本窗口上次装着哪些工具模块、各自最后一次被调用是什么时候（`init_chat` 开局装回去）。
+    """本窗口上次装着哪些工具模块、各自最后一次被调用是什么时候（激活时装回去）。
 
     WHY: 值是使用时刻，`tools.SessionBinding.restore` 靠它决定哪些模块已经空闲太久、
     该在这一轮收掉。旧格式（只存名字的列表）一律当成"就是刚才用过"——那是这份格式之前
@@ -844,11 +855,11 @@ def _run_chat(model: str | None, turn, in_group: bool) -> None:
             return _build_context_snapshot(exclude=excluded)
 
         messages, pending = turn.mail.rebuild(rebuild)
-        init_chat(session, [*messages, *_mail_context(pending, in_group)])
+        _activate_chat(session, [*messages, *_mail_context(pending, in_group)])
         session.add_context_provider(_interject_provider(turn, in_group))
         session.should_stop = lambda: turn.cancelled
     else:
-        init_chat(session, build_context())
+        _activate_chat(session, build_context())
     session.chat(recall_func=get_handler(session), description_cache=description_cache)
 
 
@@ -1450,7 +1461,7 @@ def run(body: str, model: str | None = None):
     if not body.strip():
         return run.__doc__
     session = llm.Chat(model=model or get_model(), chat_client=llm.get_client())
-    init_chat(session, [{"role": "user", "content": body.lstrip()}])
+    _activate_chat(session, [{"role": "user", "content": body.lstrip()}])
     # WHY: 单句请求里的工具轮同样会反复经过图片处理，所以也按一次对话记台账。
     image_ledger = image.begin_conversation()
     try:

@@ -55,8 +55,8 @@ connect._events.put(event)   # event 形状与真实入站事件一致
 并不存在。更直接的形状是**「在某个窗口开一轮聊天，带一句种子」**：
 
 - 目标是（群，群号）或（私聊，QQ 号）—— 也就是 `history.window(event)` 的键；
-- 直接走 `context.begin_turn(window)` → `chat._run_chat(...)`，种子作为 `init_chat` 的 `messages`
-  参数传进去。这正是 `.chat` 命令已有的形状（`init_chat(session, [{"role": "user", "content": body}])`）。
+- 直接走 `context.begin_turn(window)` → `chat._run_chat(...)`，种子作为顶层 `_activate_chat` 的
+  `messages` 参数传进去。这正是 `.chat` 命令已有的形状。
 
 于是「续话」是**开一轮**，不是**假造一条入站消息**。`.reboot chat [文本]` 只负责把种子交给这条路，
 不再伪造 QQ 消息。注入原语（决定一）留给「执行命令」，续话走「开一轮聊天」，两者不再混用。
