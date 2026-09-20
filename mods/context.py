@@ -1,4 +1,4 @@
-"""Current event, per-interaction continuations, and per-window LLM turns."""
+"""Current event, per-interaction continuations, per-window mailboxes and LLM turns."""
 
 from __future__ import annotations
 
@@ -122,18 +122,81 @@ def cancel(key: tuple[Any, Any]) -> bool:
     return True
 
 
-class WindowTurn:
-    """One chat window's in-flight LLM turn: its interject queue and stop flag.
+class Mailbox:
+    """One window's buffer: what arrived and has not entered the context yet.
 
-    WHY: 这里按**窗口**登记，而不是 interaction_key 的 (窗口, 用户)。插话和 ^C 都是
-    任何人可用的：LLM 上下文本来就整个窗口共享，只让触发者能停，群里其他人就无法制止
-    一轮跑偏的生成。这与 _waiters 的粒度不同，所以是另一份登记，不要合并。
+    WHY: 它按**窗口**登记，和 `_turns` **并列**，而且**不随一轮生灭**——这是它和
+    `WindowTurn` 最重要的区别，也是把它摘出来的全部理由。轮是一次生成的生命周期，
+    邮箱是这个窗口的东西；以后它还要升级成追加式的时序记录（「柚子什么时候知道的」
+    这条轴今天没有任何地方记着），那更是跨轮的。见
+    docs/working/proposals/mail-and-activation.md 3.0 与九点八。
+
+    WHY: **这一步只搬容器，不改任何策略。** 入列的条件仍然是「这个窗口正跑着一轮」
+    （判据在 `chat.capture_chat`），排空时机仍然是每次子请求之前加开轮那次丢弃。
+    「邮箱比一轮活得久」在**可观察行为**上要等水位线那一步才真正生效——在那之前，
+    上一轮残留的条目会在下一轮开局被 `take` 丢掉，和过去随 `end_turn` 一起销毁
+    完全等价。别以为搬完容器语义就已经变了。
+
+    WHY: 自己带锁，而不是借 `WindowTurn` 的。轮会消失，锁不能跟着消失——不然
+    「邮箱不随轮生灭」这句话在并发下就是假的。调用方仍然从 `WindowTurn.interject`
+    进来，于是两把锁的获取顺序恒为 turn→mail，不存在反向路径。
     """
 
     def __init__(self, key: Any) -> None:
         self.key = key
         self._lock = threading.RLock()
-        self._pending: list[dict] = []
+        self._entries: list[dict] = []
+
+    def add(self, event: dict) -> None:
+        """Put one event in, unconditionally.  Nothing here decides anything."""
+        with self._lock:
+            self._entries.append(event)
+
+    def take(self) -> list[dict]:
+        """Hand over everything buffered so far and leave the box empty."""
+        with self._lock:
+            entries, self._entries = self._entries, []
+            return entries
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+
+_mailboxes: dict[Any, Mailbox] = {}
+
+
+def mailbox(key: Any) -> Mailbox:
+    """This window's mailbox, created on first use and then kept.
+
+    WHY: 不删。窗口数量有界（群 + 私聊对端），而一个空邮箱只是一个空列表；
+    反过来「用完就删」会把它退回成轮级对象，正是这一步要拆掉的那件事。
+    """
+    with _lock:
+        box = _mailboxes.get(key)
+        if box is None:
+            box = _mailboxes[key] = Mailbox(key)
+        return box
+
+
+class WindowTurn:
+    """One chat window's in-flight LLM turn: who asked for it, and the stop flag.
+
+    WHY: 这里按**窗口**登记，而不是 interaction_key 的 (窗口, 用户)。插话和 ^C 都是
+    任何人可用的：LLM 上下文本来就整个窗口共享，只让触发者能停，群里其他人就无法制止
+    一轮跑偏的生成。这与 _waiters 的粒度不同，所以是另一份登记，不要合并。
+
+    WHY: 缓冲区**不在这里**，在 `Mailbox`（按窗口、不随轮生灭）。这一位留着
+    `interject` / `take_pending` 两个方法转发过去，是为了**不动锁的结构**：它们今天
+    在同一把 `self._lock` 下把「入列」和「置触发位」做成一个原子动作，而尾缘触发不丢
+    正依赖这一点（见 `finish_turn`）。把调用方直接改成两次独立调用是另一件事，
+    要连同水位线一起做，不在这一步。
+    """
+
+    def __init__(self, key: Any) -> None:
+        self.key = key
+        self._lock = threading.RLock()
+        self.mail = mailbox(key)
         # WHY: 记的是**触发事件本身**，不是一个 bool。续跑的那一轮属于要求它的那个人，
         # 而"属于谁"决定了那一轮的 op 门（tools.op_tool_visible 问的就是当前事件）。
         # 只留一个 bool 的话，续轮只能沿用开轮那个人的身份，群里任何成员都能在管理员
@@ -142,22 +205,25 @@ class WindowTurn:
         self._cancelled = False
 
     def interject(self, event: dict, *, trigger: bool = False) -> None:
-        """Queue one event that arrived while this turn was running.
+        """Put one event in this window's mailbox; *trigger* also lights the dot.
 
-        WHY: 分级是有意的。任何消息都进队列（让模型看到更多上下文），但只有原本就会
+        WHY: 分级是有意的。任何消息都进邮箱（让模型看到更多上下文），但只有原本就会
         触发聊天的消息（at、名字开头、poke）才置位 trigger，让本轮结束后再跑一轮。
         否则普通闲聊会让 Bot 无限续聊下去。
+
+        WHY: 两件事在同一把锁里，这是**承重的**：尾缘触发不丢依赖「入列与置位不可分割」
+        （见 `finish_turn`）。邮箱搬走之后它们分处两个对象，所以这里显式地把邮箱那次
+        写入也罩在 `self._lock` 里，而不是让调用方各调各的。
         """
         with self._lock:
-            self._pending.append(event)
+            self.mail.add(event)
             if trigger:
                 self._trigger_event = event
 
     def take_pending(self) -> list[dict]:
-        """Hand over everything queued so far, leaving the trigger flag alone."""
+        """Drain this window's mailbox, leaving the trigger flag alone."""
         with self._lock:
-            pending, self._pending = self._pending, []
-            return pending
+            return self.mail.take()
 
     def mark_trigger(self, event: dict) -> None:
         """Ask for one more round, on behalf of *event*, without queueing it.
@@ -230,6 +296,18 @@ def finish_turn(key: Any, turn: WindowTurn) -> dict | None:
     an at-message that lands right as the turn ends from being dropped: either it
     is seen here and the turn runs again, or it arrives after removal and starts a
     turn of its own.
+
+    WHY: **上面那条保证有一个缺口，2026-09-20 实跑确认过，这里如实记下。** 它的第二条
+    分支要求 `capture_chat` 查不到这一轮；但 `capture_chat` 是先 `get_turn`（拿模块锁、
+    随即放掉）、再 `turn.interject(..., trigger=True)`（只拿 turn 的锁）。若这一轮恰好
+    在这两步之间收摊，触发位就被置到一个**已经摘掉登记**的 turn 上，没有任何人会再读它
+    ——那条 at 被静默丢掉。窗口很窄（要求正好落在这两步之间），但它是真的。
+
+    WHY: 没有就地修，因为正解不是再加一把锁，而是**让这条路不存在**：邮箱改成无条件
+    `add`、红点改成「邮箱里有没有激活元素」这个派生谓词之后，`capture_chat` 不再需要先
+    查一轮才能投递，这个交错也就没有了。见
+    docs/working/proposals/mail-and-activation.md 3.0 与第十一节第 5 步；
+    那一步落地时，连同这段 WHY 一起删掉。
     """
     with _lock:
         triggered = turn.consume_trigger()
