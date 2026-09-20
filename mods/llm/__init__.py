@@ -986,7 +986,9 @@ class Chat:
                 self.render_hints,
                 self.keep_reasoning,
                 self.on_tool_result,
-                self.turn_done,
+                # WHY: 工具在这次生成器已经开始以后才会声明完成；直接传 self.turn_done 会把
+                # 开始时的 None 按值交进去，say 后来安装的回调永远到不了检查点。
+                lambda: self.turn_done() if self.turn_done is not None else False,
             )
             results = []
             for chunk in response:
