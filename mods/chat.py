@@ -120,15 +120,15 @@ def normalize_tools_mode(value) -> str:
     return normalized if normalized in TOOLS_MODES else "append"
 
 
-def _bounded_int(minimum: int, fallback: int):
-    """归一化成一个不小于 *minimum* 的整数，否则回到默认值。"""
+def _bounded_int(minimum: int, fallback: int, maximum: int | None = None):
+    """归一化成指定范围内的整数，否则回到默认值。"""
 
     def normalize(value) -> int:
         try:
             number = int(value)
         except (TypeError, ValueError):
             return fallback
-        return number if number >= minimum else fallback
+        return number if number >= minimum and (maximum is None or number <= maximum) else fallback
 
     return normalize
 
@@ -144,6 +144,7 @@ WINDOW_SETTINGS = {
     "tools": ("tools", "append", normalize_tools_mode),
     "max_events": ("max_events", DEFAULT_MAX_EVENTS, _bounded_int(1, DEFAULT_MAX_EVENTS)),
     "max_token": ("max_token", DEFAULT_MAX_TOKEN, _bounded_int(1, DEFAULT_MAX_TOKEN)),
+    "pressure_percent": ("pressure_percent", _PRESSURE_PERCENT, _bounded_int(1, _PRESSURE_PERCENT, 100)),
 }
 
 
@@ -727,8 +728,8 @@ def _visible_stream_ids(messages: list[dict]) -> set[str]:
     return visible
 
 
-def _pressure_hint(used_tokens: int, max_tokens: int) -> str:
-    if used_tokens * 100 <= max_tokens * _PRESSURE_PERCENT:
+def _pressure_hint(used_tokens: int, max_tokens: int, threshold: int) -> str:
+    if used_tokens * 100 <= max_tokens * threshold:
         return ""
     percent = (used_tokens * 100 + max_tokens - 1) // max_tokens
     return f"上下文占用{percent}%"
@@ -949,7 +950,8 @@ def _run_chat(model: str | None, turn, in_group: bool) -> None:
         messages, _pending = turn.mail.rebuild(rebuild)
         _activate_chat(session, messages, read_mail=True)
         session.add_context_provider(_interject_provider(turn, in_group, session))
-        session.add_hint(lambda: _pressure_hint(turn._chat_usage_tokens, limit(context.current())[1]))
+        session.add_hint(lambda: _pressure_hint(turn._chat_usage_tokens, limit(context.current())[1],
+                                                 window_setting("pressure_percent")))
         session.should_stop = lambda: turn.cancelled
     else:
         _activate_chat(session, build_context())
@@ -972,13 +974,13 @@ _SUBCOMMAND_HELP = (
     ("reasoning [keep|drop]", "查看或设置工具循环内是否带回思考内容"),
     ("tools [append|ui]", "查看或设置工具状态的呈现方式"),
     ("ops [clear]", "查看或清空本窗口的操作历史"),
-    ("limit [<事件数> <token>|reset]", """查看或设置本窗口的可见事件数与上下文 token 上限（管理员）。
+    ("limit [<事件数> <token> [提醒百分比]|reset]", """查看或设置本窗口的可见事件数、上下文 token 上限与提醒阈值（管理员）。
 
-格式：#limit | #limit <事件数> <token> | #limit reset
-两个上限共同裁剪近期已读输入、输出与工具返回；默认值写死在代码里（现在 max_events=20、max_token=50000），本窗口写过的值优先。旧 max_msg 值仅在没有 max_events 时读取。
-#limit                  显示两个上限，并标出值来自本窗口还是默认
-#limit <事件数> <token> 写入本窗口的两个上限，都必须是正整数
-#limit reset            清掉本窗口的值，回落到默认
+格式：#limit | #limit <事件数> <token> [提醒百分比] | #limit reset
+两个上限共同裁剪近期已读输入、输出与工具返回；提醒百分比只决定模型末尾何时显示 token 占比。默认值分别为 20、50000、75%；旧 max_msg 值仅在没有 max_events 时读取。
+#limit                  显示两个上限和提醒百分比，并标出值来自本窗口还是默认
+#limit <事件数> <token> [提醒百分比] 写入本窗口的上限；省略百分比则保留原设置
+#limit reset            清掉本窗口的上限与提醒百分比，回落到默认
 未读 mail 不受历史限额丢弃；历史 chatlog 只在主模型实际读到时按文件行定位赋号。"""),
     ("hint [get|set|default]", """查看、编写或开关本窗口的结束提示（管理员）。
 
@@ -1168,10 +1170,10 @@ def _hint_subcommand(raw: str) -> str:
 
 
 def _limit_report() -> str:
-    """`#limit` 看两个上限，并标出这个值来自本窗口还是默认。"""
+    """`#limit` 查看窗口上限与提醒阈值。"""
     data = getchatstorage()
     lines = []
-    for name in ("max_events", "max_token"):
+    for name in ("max_events", "max_token", "pressure_percent"):
         key, _default, _normalize = WINDOW_SETTINGS[name]
         origin = "本窗口" if key in data or name == "max_events" and "max_msg" in data else "默认"
         value = limit(context.current())[0] if name == "max_events" else window_setting(name, data)
@@ -1180,29 +1182,28 @@ def _limit_report() -> str:
 
 
 def _limit_set(tail: str) -> str:
-    """`#limit <事件数> <token>` 写本窗口的两个上限；`#limit reset` 清掉、回落默认。
+    """`#limit <事件数> <token> [提醒百分比]` 写窗口设置；`reset` 回落默认。
 
-    WHY: 两个值一起写、都必须是正整数——窗口配置要么整份生效、要么整份没有，半份
-    （只改了条数、token 还是上一版）比拒绝更难解释。清掉本窗口的值就等于回落默认，
-    所以不需要"删除"这个动作。
+    WHY: 两个历史上限仍一起写，避免只改其中一个造成难解释的半份配置。提醒百分比
+    可选，不写就保留原设置；老的两参数命令因此不会意外重置它。
     """
     data = getchatstorage()
     if tail.strip() == "reset":
-        for name in ("max_events", "max_token"):
+        for name in ("max_events", "max_token", "pressure_percent"):
             data.pop(WINDOW_SETTINGS[name][0], None)
         data.pop("max_msg", None)
         storage.save()
         return "已重置上限，回落到默认"
     parts = tail.split()
-    if len(parts) != 2:
+    if len(parts) not in (2, 3):
         return "limit 参数错误，可用 #help limit 查看"
     written = []
-    for name, raw_value in zip(("max_events", "max_token"), parts):
+    for name, raw_value in zip(("max_events", "max_token", "pressure_percent"), parts):
         try:
             number = int(raw_value)
         except ValueError:
             return "limit 参数错误，可用 #help limit 查看"
-        if number < 1:
+        if number < 1 or name == "pressure_percent" and number > 100:
             return "limit 参数错误，可用 #help limit 查看"
         written.append((name, number))
     for name, number in written:
