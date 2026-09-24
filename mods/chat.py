@@ -745,32 +745,48 @@ def _pressure_hint(session: llm.Chat, window: tuple, limits: tuple[int, int]) ->
         amount = _message_cost(message)
         costs[event_id] = amount
         used_tokens += amount
-    if len(stream) < max_events * _PRESSURE_FRACTION and used_tokens < max_tokens * _PRESSURE_FRACTION:
+    count_pressure = len(stream) >= max_events * _PRESSURE_FRACTION
+    token_pressure = used_tokens >= max_tokens * _PRESSURE_FRACTION
+    if not count_pressure and not token_pressure:
         return ""
     lead = f"上下文接近历史限额：已见 {len(stream)}/{max_events} 条、约 {used_tokens}/{max_tokens} 文本 token。"
     if not stream:
         return lead
     visible = {event_id for event_id, _message in stream}
-    requested = []
-    amount = 0
-    for event_id, _message in stream[:_PRESSURE_SEGMENT_LIMIT]:
-        requested.append(event_id)
-        amount += costs[event_id]
-        if len(requested) < 3 or amount <= _PRESSURE_SUMMARY_ALLOWANCE:
-            continue
+    oldest = [event_id for event_id, _message in stream[:_PRESSURE_SEGMENT_LIMIT]]
+    lower, upper = 1, len(oldest)
+    selected_members = set()
+    obstruction = ""
+    # WHY: Closure already includes every coupled event, so adding requested IDs
+    # cannot repair an invalid prefix. Binary search bounds full-journal previews.
+    while lower <= upper:
+        size = (lower + upper) // 2
         try:
-            members = oplog.preview_cover(window, requested, visible)
-        except ValueError:
-            break
-        amount = sum(costs[member] for member in members)
-        if (len(members) > 2 and len(members) <= _PRESSURE_SEGMENT_LIMIT
-                and amount > _PRESSURE_SUMMARY_ALLOWANCE):
-            selected = [member for member, _ in stream if member in members]
-            return (lead + f" 可考虑总结最老段 {', '.join(selected)}"
-                    f"（{len(selected)} 条、约 {amount} token；覆盖须连带这些关联事件）。"
-                    "仅为建议，结论由你决定；cover_events 的摘要输出和返回也占预算。")
-        break
-    return lead + " 最老段目前无明显净收益，或关联事件尚不可覆盖；不要声称已经压缩。"
+            members = oplog.preview_cover(window, oldest[:size], visible)
+        except ValueError as error:
+            obstruction = str(error)
+            upper = size - 1
+            continue
+        if len(members) > _PRESSURE_SEGMENT_LIMIT:
+            obstruction = "关联闭包超过本次建议的 12 条上限"
+            upper = size - 1
+            continue
+        selected_members = members
+        lower = size + 1
+    if not selected_members:
+        return lead + f" 最老段暂不可覆盖：{obstruction}。"
+    amount = sum(costs[member] for member in selected_members)
+    count_gain = len(selected_members) > 2
+    token_gain = amount > _PRESSURE_SUMMARY_ALLOWANCE
+    if not ((count_pressure and count_gain) or (token_pressure and token_gain)):
+        return lead + " 最老可覆盖段对当前受压限额暂无明显净收益。"
+    selected = [member for member, _ in stream if member in selected_members]
+    note = "短文本总结可能增加 token；" if not token_gain else ""
+    if not count_gain:
+        note += "总结可能不节省事件位；"
+    return (lead + f" 可考虑总结最老段 {', '.join(selected)}"
+            f"（{len(selected)} 条、约 {amount} token；覆盖须连带这些关联事件）。"
+            f"{note}仅为建议，结论由你决定；cover_events 的摘要输出和返回也占预算。")
 
 
 def _cover_projection(messages: list[dict], members: set[str]) -> None:
