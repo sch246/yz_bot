@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 
 @dataclass
@@ -31,6 +32,7 @@ class LLMResponse:
     # 分开看，不能只留一个 prompt_tokens（见 llm.pricing）。默认 0 表示"对端没报"，
     # 于是整段 prompt 按未命中价算。
     cached_tokens: int = 0
+    requested_at: datetime | None = None
     reasoning_content: str | None = None
 
     def __add__(self, other: "LLMResponse") -> "LLMResponse":
@@ -54,6 +56,7 @@ class LLMResponse:
             completion_tokens=self.completion_tokens + other.completion_tokens,
             total_tokens=self.total_tokens + other.total_tokens,
             cached_tokens=self.cached_tokens + other.cached_tokens,
+            requested_at=self.requested_at or other.requested_at,
             reasoning_content=reasoning_content,
         )
 

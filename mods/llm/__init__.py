@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import threading
+from datetime import datetime, timezone
 
 from openai import OpenAI
 
@@ -528,6 +529,7 @@ class LLMClient:
 
     @staticmethod
     def _stream_response(client: OpenAI, params: dict, model: str) -> Generator[LLMResponse, None, LLMResponse]:
+        requested_at = datetime.now(timezone.utc)
         buffer = ""
         assistant_content = ""
         reasoning_content: str | None = None
@@ -597,7 +599,8 @@ class LLMClient:
                         "tool",
                     )
             if usage:
-                yield LLMResponse("", role, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens, cached_tokens=usage_cached_tokens(usage))
+                yield LLMResponse("", role, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens,
+                                  cached_tokens=usage_cached_tokens(usage), requested_at=requested_at)
             return LLMResponse(
                 assistant_content,
                 role,
@@ -610,6 +613,7 @@ class LLMClient:
 
     @staticmethod
     def _non_stream_response(client: OpenAI, params: dict, model: str) -> Generator[LLMResponse, None, LLMResponse]:
+        requested_at = datetime.now(timezone.utc)
         response = client.chat.completions.create(**params)
         finish_reason = getattr(response.choices[0], "finish_reason", None)
         if finish_reason not in ("stop", "tool_calls", "function_call"):
@@ -633,7 +637,9 @@ class LLMClient:
             console.message(message.content, role, label=f"{role}({model}): ", label_role=role)
             yield LLMResponse(message.content, role)
         if response.usage:
-            yield LLMResponse("", "assistant", response.usage.prompt_tokens, response.usage.completion_tokens, response.usage.total_tokens, cached_tokens=usage_cached_tokens(response.usage))
+            yield LLMResponse("", "assistant", response.usage.prompt_tokens, response.usage.completion_tokens,
+                              response.usage.total_tokens, cached_tokens=usage_cached_tokens(response.usage),
+                              requested_at=requested_at)
         return LLMResponse(
             message.content or "",
             message.role or "assistant",

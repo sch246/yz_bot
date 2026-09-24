@@ -18,6 +18,7 @@ app.log*
 /config.json
 /data.json
 /.jwt_cache.json
+/.local/
 
 # 密钥
 ed25519-*.pem

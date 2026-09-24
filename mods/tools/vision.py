@@ -45,6 +45,7 @@ terra 前面）。
 from __future__ import annotations
 
 import base64
+from datetime import datetime, timezone
 import io
 import json
 import math
@@ -55,6 +56,7 @@ from urllib.parse import unquote, urlparse
 
 from mods import image as image_mod
 from mods import llm
+from mods.llm import pricing
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 OUTPUT_DIR = os.path.join(ROOT, "data", "tmp_files")
@@ -259,6 +261,7 @@ def models(keyword: str = "", limit: int = 30) -> str:
     """
     config = llm.get_client().config
     now = llm.get_client().get_vision_model()
+    priced_at = datetime.now(timezone.utc)
     rows = []
     for provider, block in (config.get("providers") or {}).items():
         for name, info in (block.get("models") or {}).items():
@@ -268,13 +271,14 @@ def models(keyword: str = "", limit: int = 30) -> str:
             if keyword and keyword.lower() not in full.lower():
                 continue
             factor = PROVIDER_FACTOR.get(provider, 1.0)
-            rows.append((float(info.get("prompt_price") or 0) * factor, full,
-                         float(info.get("completion_price") or 0) * factor))
+            prices = pricing.unit_prices(block, info, priced_at)
+            rows.append((prices["prompt_price"] * factor, full,
+                         prices["completion_price"] * factor))
     rows.sort(key=lambda row: (row[0] <= 0, row[0]))   # 没标价的排最后，别占着前排
     if not rows:
         return f"没有名字含「{keyword}」的视觉模型"
     lines = [f"当前默认视觉模型：{now or '（未设置）'}",
-             "价格单位：元 / 百万 token（输入, 输出）；已按所用分组的倍率折算成实际花费"]
+             "当前单价：元 / 百万 token（输入未命中, 输出）；已按所用分组的倍率折算"]
     for prompt, full, completion in rows[:limit]:
         mark = " ←便宜" if full == CHEAP else (" ←最强" if full == STRONG else "")
         price = "未知" if not prompt and not completion else f"¥{prompt:g}, ¥{completion:g}"

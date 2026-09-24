@@ -8,6 +8,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 from threading import RLock
 import time
 from typing import Any
@@ -19,6 +20,7 @@ from mods import INFRA
 PHASE = INFRA
 LOAD_AFTER = ("storage",)
 DISPLAY_CHARS = 200
+_REFERENCE = re.compile(r"(?<![A-Za-z0-9_-])(\d{8}-[1-9]\d*(?:#[1-9]\d*)?)(?![A-Za-z0-9_#-])")
 
 _lock = RLock()
 _root: Path | None = None
@@ -29,6 +31,7 @@ _next: dict[str, int] = {}
 _pending: dict[str, dict] = {}
 _covered: dict[tuple, set[str]] = {}
 _coverage_nodes: dict[str, list[str]] = {}
+_mentioned_by: dict[str, list[str]] = {}
 _origins: dict[tuple[tuple, str], dict] = {}
 _failed = False
 
@@ -51,13 +54,14 @@ def _restore() -> None:
     pending: dict[str, dict] = {}
     covered: dict[tuple, set[str]] = {}
     coverage_nodes: dict[str, list[str]] = {}
+    mentioned_by: dict[str, list[str]] = {}
     origins: dict[tuple[tuple, str], dict] = {}
     for path in sorted(directory.glob("????????.jsonl")):
         data = path.read_bytes()
         complete = data.rfind(b"\n") + 1
         for line in data[:complete].splitlines():
             entry = json.loads(line.decode("utf-8"))
-            _apply(entry, restored, indexes, windows, counters, pending, covered, coverage_nodes, origins)
+            _apply(entry, restored, indexes, windows, counters, pending, covered, coverage_nodes, origins, mentioned_by)
         if complete != len(data):
             # WHY: Only a missing final newline is a crash tail. A malformed complete
             # row is corruption, never permission to silently skip committed facts.
@@ -87,16 +91,41 @@ def _restore() -> None:
     _covered.update(covered)
     _coverage_nodes.clear()
     _coverage_nodes.update(coverage_nodes)
+    _mentioned_by.clear()
+    _mentioned_by.update(mentioned_by)
     _origins.clear()
     _origins.update(origins)
     _root = directory
     _failed = False
 
 
+def _reference_candidates(entry: dict) -> Iterable[str]:
+    kind = entry["kind"]
+    if kind == "input":
+        projection = entry.get("projection") or {}
+        content = projection.get("content", "")
+        if isinstance(content, list):
+            texts = [part.get("text", "") for part in content
+                     if isinstance(part, dict) and part.get("type") == "text"]
+        else:
+            texts = [content]
+    elif kind == "output":
+        texts = [entry.get("body", ""), *(action.get("arguments", "") for action in entry.get("actions", ()))]
+    elif kind == "result":
+        texts = [value for result in entry.get("returns", ())
+                 for value in (result.get("arguments", ""), result.get("content", ""))]
+    else:
+        texts = []
+    for value in texts:
+        for match in _REFERENCE.finditer(str(value)):
+            yield match.group(1)
+
+
 def _apply(
     entry: dict, recorded: list[dict], indexes: dict[str, dict], windows: dict[tuple, list[dict]],
     counters: dict[str, int], pending: dict[str, dict], covered: dict[tuple, set[str]],
     coverage_nodes: dict[str, list[str]], origins: dict[tuple[tuple, str], dict],
+    mentioned_by: dict[str, list[str]],
 ) -> None:
     if entry["kind"] == "arrival":
         pending[entry["arrival"]] = entry
@@ -127,6 +156,19 @@ def _apply(
     event_id = entry["id"]
     if event_id in indexes:
         raise ValueError(f"duplicate event id: {event_id}")
+    mentions = []
+    seen_mentions = set()
+    for reference in _reference_candidates(entry):
+        target_id, separator, position = reference.partition("#")
+        target = indexes.get(target_id)
+        if target is None or target["window"] != entry["window"]:
+            continue
+        if separator and (target["kind"] != "output" or not 1 <= int(position) <= len(target["actions"])):
+            continue
+        if reference not in seen_mentions:
+            seen_mentions.add(reference)
+            mentions.append(reference)
+    entry["_mentions"] = mentions
     day, number = event_id.split("-", 1)
     if entry["kind"] == "result" and indexes[entry["source"]].get("condensed"):
         entry["condensed"] = True
@@ -134,6 +176,8 @@ def _apply(
     recorded.append(entry)
     indexes[event_id] = entry
     windows.setdefault(tuple(entry["window"]), []).append(entry)
+    for target_id in dict.fromkeys(reference.partition("#")[0] for reference in mentions):
+        mentioned_by.setdefault(target_id, []).append(event_id)
     if entry["kind"] == "input" and entry.get("origin"):
         key = (tuple(entry["window"]), entry["origin"])
         if key in origins:
@@ -161,7 +205,7 @@ def _append(entry: dict, day: str) -> None:
     except BaseException:
         _failed = True
         raise
-    _apply(entry, _events, _by_id, _windows, _next, _pending, _covered, _coverage_nodes, _origins)
+    _apply(entry, _events, _by_id, _windows, _next, _pending, _covered, _coverage_nodes, _origins, _mentioned_by)
 
 
 def arrive(window: tuple, event: dict, *, activated: bool = False) -> str:
@@ -209,6 +253,7 @@ def recall_events(window: tuple | None, ids: Iterable[str]) -> tuple[list[dict],
                 missing.append(event_id)
             else:
                 recalled = entry.copy()
+                recalled["mentions"] = recalled.pop("_mentions", [])
                 if entry["kind"] == "output":
                     members = {f"{event_id}#{position + 1}": list(_coverage_nodes[f"{event_id}#{position + 1}"])
                                for position in range(len(entry["actions"]))
@@ -326,6 +371,28 @@ def coverage_members(window: tuple | None, node: str) -> list[str] | None:
         return list(members) if members is not None else None
 
 
+def reference_links(window: tuple | None, ids: Iterable[str]) -> dict[str, dict]:
+    """Resolve text mentions separately from coverage and tool-result source links."""
+    with _lock:
+        _restore()
+        selected = {}
+        for event_id in dict.fromkeys(str(value) for value in ids):
+            entry = _by_id.get(event_id)
+            if (entry is None or entry["window"] != list(window or ())
+                    or (entry["kind"] == "input" and entry.get("projection") is None)):
+                continue
+            covered_by = [node for node, members in _coverage_nodes.items() if event_id in members]
+            selected[event_id] = {
+                "mentions": list(entry.get("_mentions", ())),
+                "mentioned_by": list(_mentioned_by.get(event_id, ())),
+                "covers": {node: list(members) for node, members in _coverage_nodes.items()
+                           if node.partition("#")[0] == event_id},
+                "covered_by": covered_by,
+                "source": entry.get("source") if entry["kind"] == "result" else None,
+            }
+        return selected
+
+
 def cover(window: tuple, node: str, ids: Iterable[str], visible: set[str]) -> set[str]:
     """Commit one validated coverage fact; all projections derive from its journal."""
     with _lock:
@@ -391,8 +458,9 @@ def cover(window: tuple, node: str, ids: Iterable[str], visible: set[str]) -> se
             raise ValueError("覆盖不能包含本次输出")
         for event_id in closure:
             entry = _by_id.get(event_id)
-            if (event_id not in visible or entry is None or entry["window"] != list(window)
-                    or event_id in _covered.get(window, ()) or entry.get("hidden")
+            if (entry is None or entry["window"] != list(window)
+                    or (event_id not in visible and event_id not in _covered.get(window, ()))
+                    or entry.get("hidden")
                     or entry.get("condensed") or (entry["kind"] == "input" and entry.get("projection") is None)):
                 raise ValueError(f"覆盖成员不在当前主窗口可见已读流中: {event_id}")
         _append({"kind": "cover", "window": list(window), "node": node,

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ast
-from datetime import datetime
+from datetime import datetime, timezone
 import re
 import threading
 import time
@@ -399,7 +399,8 @@ def inc_call_count() -> None:
         entry[0] += 1
 
 
-def inc_call_cost(model: str, prompt_tokens: int, completion_tokens: int, cached_tokens: int = 0) -> None:
+def inc_call_cost(model: str, prompt_tokens: int, completion_tokens: int, cached_tokens: int = 0,
+                  requested_at: datetime | None = None) -> None:
     """把一次调用的费用记到当前发言者名下。
 
     WHY: 单价、缓存命中价和峰谷档位全部来自模型/供应商元数据（见 llm.pricing），这里只
@@ -409,7 +410,7 @@ def inc_call_cost(model: str, prompt_tokens: int, completion_tokens: int, cached
     """
     _, _, attributes = llm.resolve_model(llm_config, model)
     provider = llm.provider_config(llm_config, model)
-    inc_usage_cost(pricing.token_cost(provider, attributes, prompt_tokens, completion_tokens, cached_tokens))
+    inc_usage_cost(pricing.token_cost(provider, attributes, prompt_tokens, completion_tokens, cached_tokens, requested_at))
 
 
 def inc_usage_cost(price: float) -> None:
@@ -429,6 +430,8 @@ def _base_prompt() -> list[dict]:
 - 聊天中可能不会有明显的问题，扮演好角色即可
 - 如无特殊要求，请用中文回复
 - **说话要调 `say`**。直接写在回复正文里的内容不会发出去，那是你这一轮的自言自语
+- 眼前历史只是本窗口已读信息流按预算选出的可见部分，不是全部记录。覆盖只改变默认显示；按正式号反查仍能取回原文，反查结果被读到后会作为新的结果事件靠近当前
+- 想积累经验就实际写入以后会用的载体：可复用做法写 Markdown Skill 并按需加载，当前窗口待办用 `edit_hint` 保存；只在回复里说“记住了”不会保存它
 - `say` 返回这条消息的 message_id；它默认 `final_call=true`，说完这一轮就结束，要接着干活就传 `final_call=false`"""}]
 
 
@@ -618,6 +621,9 @@ def _activate_chat(
     binding, window = init_chat(session, messages)
     session.reads_window_mail = read_mail
     _restore_window_tools(binding, window)
+    if window is not None:
+        session.add_hint(lambda: _agent_hint(window))
+    session.add_hint("对外说话必须实际调用 say；回复正文只是自言自语，不会发送到聊天窗口。")
     # WHY: 工具恢复可能持久化 ttl 回收；它必须先于其余窗口设置读取，避免无关的配置异常
     # 改变这一轮是否完成回收。
     session.do_process_image = get_image_mode() != "off"
@@ -673,7 +679,7 @@ def get_handler(session: llm.Chat):
         if chunk.role == "assistant" and chunk.content:
             _self_talk.info(f'[{time.strftime("%H:%M:%S")}]【自言自语】{chunk.content}')
         if chunk.total_tokens:
-            inc_call_cost(session.model, chunk.prompt_tokens, chunk.completion_tokens, chunk.cached_tokens)
+            inc_call_cost(session.model, chunk.prompt_tokens, chunk.completion_tokens, chunk.cached_tokens, chunk.requested_at)
 
     return handle
 
@@ -796,6 +802,25 @@ def _window_storage(window: tuple) -> dict:
     """
     kind, key = window
     return storage.get("groups" if kind == "group" else "users", str(key))
+
+
+_AGENT_HINT_KEY = "agent_hint"
+
+
+def _agent_hint(window: tuple) -> str:
+    value = _window_storage(window).get(_AGENT_HINT_KEY)
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    return f"本窗口待办（你用 edit_hint 保存，可整体替换或清空）：\n{value}"
+
+
+def set_agent_hint(window: tuple, text: str) -> None:
+    data = _window_storage(window)
+    if text.strip():
+        data[_AGENT_HINT_KEY] = text.strip()
+    else:
+        data.pop(_AGENT_HINT_KEY, None)
+    storage.save()
 
 
 # 本窗口持久激活的工具模块名，以及各自最后一次被调用的时刻。别和 WINDOW_SETTINGS 里的
@@ -1019,23 +1044,17 @@ def _subcommand_help(name: str = "") -> str:
     return "\n".join(matched)
 
 
-_MODEL_TABLE_HEADER = "模型 输入(未命中/命中) 输出 (单位: 元/(1m token)，高峰价) 视觉识别 函数调用"
+_MODEL_TABLE_HEADER = "模型 输入(未命中/命中) 输出 (单位: 元/(1m token)，当前价) 视觉识别 函数调用"
 
 
-def _format_model(selection: str, attributes: dict) -> str:
-    # WHY: 表里列的是**高峰价**（provider 传空字典即"不在空闲时段"），峰谷规则由
-    # `_price_note` 另起一行说明。一张表只放一套数字，比每行分高峰/空闲两栏好读。
+def _format_model(selection: str, attributes: dict, when: datetime | None = None) -> str:
     if any(key in attributes for key in pricing.PRICE_KEYS):
-        prices = pricing.format_prices(pricing.unit_prices({}, attributes))
+        provider = llm.provider_config(llm_config, selection)
+        prices = pricing.format_prices(pricing.unit_prices(provider, attributes, when))
     else:
         # 本地没有这条模型的元数据，不替对端猜价格（见 UNKNOWN_MODEL_CAPABILITIES）。
         prices = " / ".join("-" for _ in pricing.PRICE_KEYS)
     return f"{selection}\n    {prices} {'👀' if attributes.get('vision') else ''} {'⚙️' if attributes.get('function_calling') else ''}"
-
-
-def _price_note(selection: str) -> str:
-    """峰谷说明；该 provider 没有 `off_peak` 规则时是空串。"""
-    return pricing.describe_off_peak(llm.provider_config(llm_config, selection)) or ""
 
 
 def _models_report(data: dict) -> str:
@@ -1053,9 +1072,13 @@ def _models_report(data: dict) -> str:
     else:
         names = list(online) + [name for name in local if name not in online]
         note = f"（{provider} 的在线模型列表；本地没有元数据的行只显示名字）"
-    rows = [_MODEL_TABLE_HEADER, *(_format_model(f"{provider}/{name}", local.get(name) or {}) for name in names), note]
-    if price_note := _price_note(get_model(data)):
-        rows.append(price_note)
+    priced_at = datetime.now(timezone.utc)
+    rows = [_MODEL_TABLE_HEADER]
+    for name in names:
+        selection = f"{provider}/{name}"
+        attributes = local.get(name) or {}
+        rows.append(_format_model(selection, attributes, priced_at))
+    rows.append(note)
     return "\n".join(rows)
 
 
@@ -1236,7 +1259,7 @@ def _subcommand(value: str):
             _provider, _api_model, attributes = llm.resolve_model(llm_config, selection)
         except ValueError as error:
             return str(error)
-        return "\n".join(part for part in (_MODEL_TABLE_HEADER, _format_model(selection, attributes), _price_note(selection)) if part)
+        return "\n".join((_MODEL_TABLE_HEADER, _format_model(selection, attributes)))
     if name == "models" and not tail:
         return _models_report(data)
     if name == "use_model" and tail:

@@ -91,6 +91,8 @@ Python 模块可以正常 import 第三方依赖、其它 `mods`，也可以 `fr
 
 Markdown 不需要 front matter、额外 summary 字段或同步机制，也不导出函数。目录不递归扫描；Skill 可在正文中引用子目录资源。写完同样先 `reload_tools(["foo"])`，需要在当前任务使用时再 `load_tools(["foo"])`。
 
+Skill 也是可编辑的长期笔记：把可重复使用的经验、做法、失败教训按主题写进去，首行说明何时值得加载；下次可从模块目录发现，再按需 `load_tools` 把正文带进上下文。要自己落盘时，先 `load_tools(["host"])`，用 `host__read_file`／`host__write_file` 精确编辑源文件，再 `reload_tools` 应用。不要为了记一件事就改始终加载的基础 prompt，也不要把整段聊天照搬进 Skill。Skill 文件可被所有窗口发现，私人聊天原话仍留在原窗口可反查的信息流里；Skill 只写可复用的做法，若保留来源正式号，反查也只能在原窗口进行。临时待办不要塞进 Skill，用 `edit_hint`。
+
 ## 修改
 
 先精确读取现有源文件，只修改目标模块，再调用 `reload_tools(["foo"])`。成功后 last-good 才替换；如果模块已在当前 Chat 激活，内容和函数会为下一次模型子请求更新。失败时根据返回的完整 traceback 修复并再次 reload，旧 last-good 和旧活动版本继续服务。仅调用 `load_tools` 不会读取刚改的磁盘文件。
@@ -112,6 +114,14 @@ Markdown 不需要 front matter、额外 summary 字段或同步机制，也不�
 结论写在 `conclusion` 参数里就够了，工具不会把它再返回一遍：这次调用本身留在上下文里，参数里的结论就是它的记录。
 
 已读消息和输出也能总结：主窗口调用 `cover_events(["20260923-4", "20260923-5"], "结论")`，参数用的是上文方括号里的正式事件号，不是 QQ `message_id` 或行动位置。覆盖使成员从本轮和后续自动上下文中消失；原号可用 `recall_events` 反查而不解除覆盖，反查总结会显示实际冻结的所有成员，不只是你传入的号。整个输出与其返回批次不可拆，已确认的 `say`／回声也必须成组；未确认的自发回声不能先单独覆盖，未读成员不会被补进覆盖。摘要与聊天消息、输出、返回一样占历史事件数和 token 预算；私有 `.chat` 和子代理不能替主窗口写覆盖，只能继续使用 `condense_ops`。
+
+眼前历史只是本窗口已读信息流按事件数和 token 选出的可见部分，不是完整记录。总结改变默认显示，不删除原文。反查会产生新的行动返回；主窗口下一次读到这个返回时，它成为靠近当前的新结果事件，旧记录本身仍保持覆盖。
+
+总结要方便反查：在结论里留下关键来源的正式号，别只写一段没有出处的大块故事。后续总结可以再次引用前一层总结；同一来源也可被多个不同主题的总结引用，不必强行归到唯一父节点。已被覆盖的正式号也可再次点名，与新的可见成员组成另一份总结；这不解除原覆盖。`event_links` 可查输入、输出和工具返回中明确出现的正式号，以及各节点实际覆盖的成员；“出现过编号”、“被覆盖”和“确实支撑某个结论”是三回事，核对原话仍须 `recall_events`。
+
+## 本窗口待办
+
+`edit_hint(text)` 整体替换你自己在当前群聊或私聊窗口的待办；传空字符串清空。它持久保存，下一次模型子请求会在末尾 hint 看到最新内容；hint 自身不逐版追加，但 `edit_hint` 行动仍照常留在信息流里。改动不会发送 QQ 消息；要对人说话仍须调用 `say`。这里的模型可见 hint 与聊天结束后向 QQ 发状态消息的 `#hint` 命令不是一回事。只放尚待处理的事，做完及时更新；可复用经验放 Skill，聊天证据放可反查的信息流。
 
 ## 说话
 
@@ -291,7 +301,7 @@ def recall_ops(cids: list[str]) -> str:
 
 
 def recall_events(ids: list[str]) -> str:
-    """按信息流正式号反查本窗口已读取的输入、完整输出或结果批次；旧档只在主模型读到时取得正式号。
+    """按信息流正式号反查本窗口已读取的输入、完整输出或结果批次，返回其文本引用与覆盖成员；旧档只在主模型读到时取得正式号。
 
     @param
     ids: 要反查的信息流正式号，形如 ["20260923-4", "20260923-5"]
@@ -310,11 +320,33 @@ def recall_events(ids: list[str]) -> str:
     return "\n".join(items) if items else "没有指定信息流编号"
 
 
-def cover_events(ids: list[str], conclusion: str) -> str:
-    """将本次主窗口已读的事件归入这次行动的结论；成员不再自动载入，但仍可按原编号反查。关联的整批输出、返回和已确认 say 回声必须一同覆盖。
+def event_links(ids: list[str]) -> str:
+    """查看本窗口事件的文本引用、被谁引用、实际覆盖关系和结果来源；引用不等于事实依据。
 
     @param
-    ids: 当前主窗口可见信息流的正式事件号，形如 ["20260923-4", "20260923-5"]；不要填写行动位置
+    ids: 要查看直接关系的正式事件号，形如 ["20260923-4"]；按返回的编号可继续逐层查询
+    """
+    import json
+
+    from mods import context, history, oplog
+
+    window = history.window(context.current() or {})
+    if window is None:
+        return "当前不在聊天窗口里"
+    if not ids:
+        return "没有指定信息流编号"
+    found = oplog.reference_links(window, ids)
+    missing = [event_id for event_id in dict.fromkeys(ids) if event_id not in found]
+    if missing:
+        found["找不到"] = missing
+    return json.dumps(found, ensure_ascii=False)
+
+
+def cover_events(ids: list[str], conclusion: str) -> str:
+    """将本次主窗口可见或此前已覆盖的事件归入这次行动的结论；成员不再自动载入，但仍可按原编号反查。关联的整批输出、返回和已确认 say 回声必须一同覆盖。
+
+    @param
+    ids: 当前主窗口可见或此前已覆盖的正式事件号，形如 ["20260923-4", "20260923-5"]；不要填写行动位置
     conclusion: 你从这些事件得出的结论，写出供后续子请求保留的摘要
     """
     from mods import chat, context, history, oplog
@@ -412,6 +444,21 @@ def say(text: str, final_call: bool = True) -> str:
     return str(message_id)
 
 
+def edit_hint(text: str) -> str:
+    """整体替换本聊天窗口的模型可见待办 hint；传空字符串清空，不会向 QQ 发送消息。
+
+    @param
+    text: 更新后的完整待办文本；请保留仍未完成的事项，空字符串表示清空
+    """
+    from mods import chat, context, history
+
+    window = history.window(context.current() or {})
+    if window is None:
+        return "当前不在聊天窗口里，无法编辑待办 hint"
+    chat.set_agent_hint(window, text)
+    return "已更新本窗口待办 hint；下次模型请求会看到新内容" if text.strip() else "已清空本窗口待办 hint"
+
+
 def _format_results(results: Mapping) -> str:
     action_labels = {
         "loaded": "已加载",
@@ -441,6 +488,7 @@ def _format_results(results: Mapping) -> str:
 __all__ = [
     "cover_events",
     "say",
+    "edit_hint",
     "exec_code",
     "list_tools",
     "reload_tools",
@@ -448,5 +496,6 @@ __all__ = [
     "condense_ops",
     "recall_ops",
     "recall_events",
+    "event_links",
     "attach_image",
 ]

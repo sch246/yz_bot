@@ -12,6 +12,23 @@ DEFAULT_VISION_MODEL = "bytecat/gpt-5.4-mini"
 # 是"对端不再说话"。可用 llm_system/config 的 request_timeout 覆盖。
 DEFAULT_REQUEST_TIMEOUT = 120.0
 
+# 官方价目：https://api-docs.deepseek.com/zh-cn/quick_start/pricing/
+# 2026 放假日期：https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm
+# WHY: 这是一段普通价格函数源码，随默认配置存入 JSON。设备已有配置不会被默认值覆盖；
+# 官方调时段、假期或价格时，改配置中的这一个函数即可，不必扩展计价器的规则字段。
+DEEPSEEK_PRICE_FN = """def price_fn(when, prices):
+    local = when.astimezone(ZoneInfo('Asia/Shanghai'))
+    holidays = {
+        '2026-01-01', '2026-01-02',
+        '2026-02-16', '2026-02-17', '2026-02-18', '2026-02-19', '2026-02-20', '2026-02-23',
+        '2026-04-06', '2026-05-01', '2026-05-04', '2026-05-05', '2026-06-19',
+        '2026-09-25', '2026-10-01', '2026-10-02', '2026-10-05', '2026-10-06', '2026-10-07',
+    }
+    peak = (local.weekday() < 5 and local.date().isoformat() not in holidays
+            and (9 <= local.hour < 12 or 14 <= local.hour < 18))
+    return {key: value * (1 if peak else 0.5) for key, value in prices.items()}
+"""
+
 BYTECAT_PROVIDER_CONFIG = {
     "base_url": "BYTECAT_BASE_URL",
     "api_key": "BYTECAT_API_KEY",
@@ -73,7 +90,7 @@ def resolve_model(config: dict, selection: str) -> tuple[str, str, dict]:
 def provider_config(config: dict, selection: str) -> dict:
     """取 *selection* 所属 provider 的配置字典；供应商未配置或格式不对时返回 ``{}``。
 
-    WHY: 比 `resolve_model` 宽松——要的是"这个供应商的计费规则"（`off_peak`）而不是
+    WHY: 比 `resolve_model` 宽松——要的是"这个供应商的计价函数"（`price_fn`）而不是
     "能不能调用"，所以拿不到就当没有规则，不抛错。计费发生在一次响应之后，那里再抛一个
     配置异常，只会把一次成功的调用变成一条聊天里的报错。
     """
@@ -94,17 +111,9 @@ def default_config() -> dict:
                 "gpt-3.5-turbo": {"vision": False, "function_calling": True},
             }},
             "deepseek": {"base_url": "DEEPSEEK_BASE_URL", "api_key": "DEEPSEEK_API_KEY",
-                # 官方价目：https://api-docs.deepseek.com/zh-cn/quick_start/pricing
-                # 高峰是北京时间周一至周五 9:00-12:00、14:00-18:00，其余空闲且空闲价 = 高峰 × 0.5。
-                # 规则写在这里而不是写进每个模型的价格：模型价只有一套数字，峰谷表变动改这一处。
-                "off_peak": {
-                    "timezone": "Asia/Shanghai",
-                    "days": [0, 1, 2, 3, 4],
-                    "windows": [["09:00", "12:00"], ["14:00", "18:00"]],
-                    "ratio": 0.5,
-                },
+                "price_fn": DEEPSEEK_PRICE_FN,
                 "models": {
-                # 价格是人民币元/百万 token，一律写**高峰**价：空闲价由上面的 off_peak.ratio 推出。
+                # 价格是人民币元/百万 token，这里写基础（高峰）价；实际单价由 price_fn 返回。
                 # prompt_cached_price 是输入中命中缓存那部分的价格，比未命中价低两个数量级——
                 # 聊天的 prompt 绝大多数是重复上下文，不区分就会把费用高估一大截。
                 # deepseek-flash 就是原 v4-flash 系列（DeepSeek-V4.1-Flash），自带图像理解；

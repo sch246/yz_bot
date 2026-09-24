@@ -66,7 +66,8 @@ def assign_tasks(prompt: str, tasks: str, tools: str, model: str = "deepseek/dee
                     # chat remains the sole owner of model pricing and usage state.
                     from mods import chat
 
-                    chat.inc_call_cost(model, chunk.prompt_tokens, chunk.completion_tokens, chunk.cached_tokens)
+                    chat.inc_call_cost(model, chunk.prompt_tokens, chunk.completion_tokens, chunk.cached_tokens,
+                                       chunk.requested_at)
 
             session.chat(recall_func=collect)
             _stream.info(f"线程 {worker_id}: LLM 子任务完成")
