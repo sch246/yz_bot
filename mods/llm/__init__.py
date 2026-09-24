@@ -115,6 +115,9 @@ class UnavailableTool:
         return self._content
 
 
+class RequiredContextError(RuntimeError):
+    """A mandatory mail read failed; never send the next provider request without it."""
+
 
 _MARKDOWN_IMAGE = re.compile(r"!\[.*?\]\((.*?)\)")
 
@@ -531,6 +534,7 @@ class LLMClient:
         role = "assistant"
         tool_calls: list[dict] = []
         usage = None
+        finished = False
         output = console.StreamPrinter(model)
         try:
             for chunk in client.chat.completions.create(**params):
@@ -538,7 +542,15 @@ class LLMClient:
                     usage = chunk.usage
                 if not getattr(chunk, "choices", None):
                     continue
-                delta = chunk.choices[0].delta
+                choice = chunk.choices[0]
+                finish_reason = getattr(choice, "finish_reason", None)
+                if finish_reason is not None:
+                    if finished or finish_reason not in ("stop", "tool_calls", "function_call"):
+                        raise RuntimeError(f"模型流未完整结束: {finish_reason}")
+                    finished = True
+                elif finished:
+                    raise RuntimeError("模型在结束标记后继续生成")
+                delta = choice.delta
                 if getattr(delta, "role", None):
                     role = delta.role
                 data = delta.to_dict(exclude_unset=False)
@@ -568,6 +580,8 @@ class LLMClient:
                         target["function"]["name"] = call.function.name
                     if call.function.arguments:
                         target["function"]["arguments"] += call.function.arguments
+            if not finished:
+                raise RuntimeError("模型流缺少结束标记，拒绝派发行动")
             output.finish()
             if buffer.strip():
                 yield LLMResponse(buffer.strip(), role)
@@ -597,6 +611,9 @@ class LLMClient:
     @staticmethod
     def _non_stream_response(client: OpenAI, params: dict, model: str) -> Generator[LLMResponse, None, LLMResponse]:
         response = client.chat.completions.create(**params)
+        finish_reason = getattr(response.choices[0], "finish_reason", None)
+        if finish_reason not in ("stop", "tool_calls", "function_call"):
+            raise RuntimeError(f"模型响应未完整结束: {finish_reason}")
         message = response.choices[0].message
         reasoning_content = getattr(message, "reasoning_content", None)
         for call in message.tool_calls or []:
@@ -623,7 +640,7 @@ class LLMClient:
             reasoning_content=reasoning_content,
         )
 
-    def chat(self, messages: list[dict], tools: list[Tool] | Callable[[], list[Tool]] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None, on_round: Callable[[], list[dict]] | None = None, should_stop: Callable[[], bool] | None = None, hints: Callable[[], list[dict]] | None = None, keep_reasoning: bool = True, on_tool_result: Callable[[ToolCallResult, str], str | None] | None = None, turn_done: Callable[[], bool] | None = None) -> Generator[LLMResponse, None, None]:
+    def chat(self, messages: list[dict], tools: list[Tool] | Callable[[], list[Tool]] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None, on_round: Callable[[], list[dict]] | None = None, should_stop: Callable[[], bool] | None = None, hints: Callable[[], list[dict]] | None = None, keep_reasoning: bool = True, on_output: Callable[[dict, list[dict]], str | tuple[str, dict] | None] | None = None, on_results: Callable[[str, list[ToolCallResult]], None] | None = None, turn_done: Callable[[], bool] | None = None, on_action: Callable[[str | None], None] | None = None) -> Generator[LLMResponse, None, None]:
         # Every message appended below is printed live as it happens, so each
         # further round only logs what it has not shown yet -- usually nothing.
         logged = 0
@@ -631,37 +648,16 @@ class LLMClient:
         # .reboot。取舍与它暴露在同一条提示注入路径上的能力都记在 docs/llm.md 的
         # 「当前信任边界与维护取舍」一节——加限制前先读那里，这不是漏了。
         #
-        # WHY: on_tool_result 是操作历史那条平行轨道的采集点，见 mods/oplog。
-        # 要解决的是这个：本轮的 assistant(tool_calls) 与 tool result 只活在这个 messages
-        # 列表里，不写 chatlog，chat.get_msgs 也不重建它们，所以下一轮开始时模型不知道自己
-        # 上一轮干了什么。轨道单独存，不混进 chatlog 的聊天消息。
-        # 钩子返回该次调用的 cid，返回值会加到 tool result 内容前面——模型必须看得见 cid，
-        # 否则它无法指名要收缩哪几条。收缩本身是 Chat.condense_calls 加 meta.condense_ops。
+        # WHY: 输出写入失败必须阻止工具派发，否则模型行动已经发生，却没有可反查的来源。
         # 不要退化成"到 N 轮就自动截断"：那会在结论产出之前把前提砍掉。压缩由模型在得出
         # 结论时显式发起，这正是主流 agent 用子代理绕开、而没有正面解决的那件事。
         #
-        # WHY: on_round 是"追加式上下文"的唯一入口，在每次子请求**之前**调用。放这里
-        # 而不是让调用方直接改 messages，是因为工具执行发生在 assistant(tool_calls) 与
-        # tool result 之间：那时候插一条 user 消息会拆散这一对，供应商会拒。等到这里，
-        # tool result 已经追加完毕，新内容落在一个合法的边界上。
-        # 两个生产者都走它：mods/tools 的模块变化通告，和 mods/chat 的插话队列。
-        # 它只追加，从不改写已有消息——前缀缓存因此不会被打断。
+        # WHY: on_round 在每次请求前读 mail；执行时暂存的原生工具配对必须先替换成
+        # 单条输出投影，才能按顺序读出夹在输出和结果之间的插话。
         while True:
             if should_stop is not None and should_stop():
                 return
             if on_round is not None:
-                # WHY: 追加进去的是 role="user"（末尾 hint 同样用 user），于是线上会
-                # 出现 tool 消息紧跟 user 消息、中间没有 assistant 的序列。按 OpenAI 的
-                # 工具协议这是合法的——硬性要求只是 assistant.tool_calls 的每个 id 都要有
-                # 对应的 tool 消息，而它们在这之前就已经补齐。
-                # 不只是"读规范应该合法"：已实跑验证（deepseek-v4-flash, 2026-09-04），
-                # 拿模型真实产出的 assistant 消息回放，「带 reasoning + tool -> user」这个
-                # 生产组合被接受，普通与流式都是 200。
-                # 两条退路也一并验证可用，真出问题时才改，别提前换：
-                #   1. 换成 role="system"；
-                #   2. 只对工具通告，把内容并进最后一条 tool result 的 content，消息序列
-                #      完全不变——插话没法这么办，它不依附于任何 tool_call。
-                # 只测了 deepseek。openai / bytecat 没测过，换供应商后这里出 400 先看这条。
                 messages.extend(on_round())
             # Freeze one tool snapshot for both the request schema and the
             # calls returned by that request. A tool may mutate this Chat's
@@ -725,32 +721,34 @@ class LLMClient:
                 pending_calls.append((call, tool, arguments))
 
             assistant_message = {"role": assistant.role, "content": assistant.content}
-            # WHY: keep_reasoning=False 时置成空字符串而不是删掉字段。两种写法都实跑
-            # 验证过被接受（deepseek-v4-flash, 2026-09-04），选空串是因为它诚实：这一轮
-            # 确实思考过，只是没往下带；删掉字段看起来像"根本没思考"。
-            # 保留 reasoning 满足 DeepSeek thinking mode 的工具调用协议，所以默认是 True，
-            # 关掉只为省一次工具循环内反复重发思考的 token。
-            # 范围只在一次工具循环之内——思考本来就不跨轮：chat.get_msgs 从 chatlog 重建，
-            # chatlog 里没有 reasoning。开关按窗口存，见 chat.get_reasoning_mode。
+            # WHY: 原生载体在执行行动时仍保留思考字段，供不读取 mail 的单句请求和
+            # 独立子代理使用；连续聊天完成行动后撤掉载体，不再传思考原文。
+            # drop 仍置空串而非删字段，避免向 DeepSeek 编造「从未思考」。
             if assistant.reasoning_content is not None:
                 assistant_message["reasoning_content"] = assistant.reasoning_content if keep_reasoning else ""
             if pending_calls:
                 assistant_message["tool_calls"] = [call for call, _, _ in pending_calls]
+            recorded_output = {**assistant_message, "reasoning_content": assistant.reasoning_content}
+            recorded = on_output(recorded_output, assistant_message.get("tool_calls", [])) if on_output else None
+            output_id = recorded[0] if isinstance(recorded, tuple) else recorded
+            if isinstance(recorded, str) and pending_calls:
+                references = ", ".join(f"{recorded}#{position + 1}" for position in range(len(pending_calls)))
+                assistant_message["content"] = f"{assistant_message['content']}\n行动引用：{references}"
             messages.append(assistant_message)
 
             if not pending_calls:
+                if isinstance(recorded, tuple):
+                    messages[-1:] = [recorded[1]]
                 return
             results: list[ToolCallResult] = []
-            # WHY: 同一条 assistant 消息里并发的调用共用一个 round 标识，用这批里第一个
-            # tool_call 的 id 当它。轨道靠它还原分组——重建时一轮的 tool_calls 必须和它的
-            # tool 消息成套出现，否则供应商拒。
-            round_id = pending_calls[0][0]["id"]
-            for call, tool, arguments in pending_calls:
+            for position, (call, tool, arguments) in enumerate(pending_calls):
                 if should_stop is not None and should_stop():
                     # WHY: 这是 ^C 够得到的最后一个检查点。工具是同步执行的，原先只在这一批
                     # 全部跑完之后才有机会看这个标记——于是这批里只要有一个调用卡住，排在它
                     # 后面的每一个都照跑，^C 迟迟不生效。已经补齐的 tool 消息就留在那儿：这一轮
                     # 的 messages 随轮次结束丢弃（每轮都从 history 重建），不做半轮修补。
+                    if results and on_results is not None and output_id is not None:
+                        on_results(output_id, results)
                     return
                 function = call["function"]
                 # WHY: 登记这次调用期间 spawn 的子进程，^C 才能真的把它们 kill 掉（卡住的
@@ -758,6 +756,8 @@ class LLMClient:
                 # "停住了"而是"半成品"。见 mods/watchdog。
                 job = watchdog.begin()
                 try:
+                    if on_action is not None:
+                        on_action(f"{output_id}#{position + 1}" if output_id is not None else None)
                     content = str(tool.call(**arguments))
                 except Exception as error:
                     content = f"工具调用失败: {type(error).__name__}: {error}"
@@ -765,21 +765,24 @@ class LLMClient:
                 else:
                     console.message(f" -> {content}", "tool")
                 finally:
+                    if on_action is not None:
+                        on_action(None)
                     watchdog.end(job)
                 result = ToolCallResult(call["id"], function["name"], function["arguments"], content)
-                if on_tool_result is not None:
-                    # WHY: 先记录原始 content，再把 cid 前缀加到发给模型的那一份上。轨道里
-                    # 存的是这次调用真正返回了什么，不该混进只为模型寻址而加的前缀。
-                    try:
-                        cid = on_tool_result(result, round_id)
-                    except Exception:
-                        # 记账坏掉不该让工具调用失败：轨道是补充，不是主体。
-                        _log.exception("operation log hook failed")
-                        cid = None
-                    if cid:
-                        result = ToolCallResult(result.tool_call_id, result.name, result.arguments, f"[{cid}] {content}")
                 results.append(result)
-            messages.extend({"role": "tool", "tool_call_id": result.tool_call_id, "content": result.content} for result in results)
+            native_results = [{"role": "tool", "tool_call_id": result.tool_call_id, "content": result.content}
+                              for result in results]
+            messages.extend(native_results)
+            if on_results is not None and output_id is not None:
+                on_results(output_id, results)
+            if isinstance(recorded, tuple):
+                # WHY: The native pair is only an execution carrier. Its result would
+                # disclose C before unread mail B in the next provider request.
+                if not any(message is assistant_message for message in messages):
+                    raise RuntimeError("执行行动期间丢失模型输出载体，拒绝后续请求")
+                native_ids = {id(message) for message in native_results}
+                messages[:] = [recorded[1] if message is assistant_message else message
+                               for message in messages if id(message) not in native_ids]
             logged = len(messages)
             # WHY: 这是「这一轮的活干完了」的检查点，和 should_stop 是**两件事**，别合并。
             # should_stop 是 ^C：外面要求立刻停，停下来这一轮就算被取消了；turn_done 是
@@ -820,12 +823,16 @@ class Chat:
         # 它和 system 提示词一样支持用函数生成，只是重置时机不同：system 在建会话时定一次，
         # hint 每个子请求重来一次。
         self.hints: list[Callable[[], str] | str] = []
-        # WHY: 默认原样带回思考内容（DeepSeek thinking mode 的工具调用协议这么要求）。
-        # 置 False 会把它换成空串，只影响一次工具循环之内，见 LLMClient.chat 里的说明。
+        # WHY: 默认保留原生载体的思考，供单句请求和独立子代理工具循环；连续
+        # 聊天在下一次子请求前把载体换成统一投影，keep/drop 均不保留全文。
         self.keep_reasoning: bool = True
-        # 每次工具调用出结果时回调一次，返回该次调用的 cid（没有就返回 None）。
-        # 操作历史轨道靠它采集，见 mods/oplog。
-        self.on_tool_result: Callable[[ToolCallResult, str], str | None] | None = None
+        self.on_output: Callable[[dict, list[dict]], str | tuple[str, dict] | None] | None = None
+        self.on_results: Callable[[str, list[ToolCallResult]], None] | None = None
+        # WHY: 私有模型已通过原生结果读到的行动，主窗口此时仍可能没读 mail。
+        # 这里只存该 Chat 的已读引用，用于限定待编号结果的反查，不复制结果正文或赋号。
+        self.native_seen_calls: set[str] = set()
+        self.active_action: str | None = None
+        self.reads_window_mail = False
         if messages is not None:
             self.set_messages(messages)
         if functions is not None:
@@ -845,6 +852,7 @@ class Chat:
 
     def set_messages(self, messages: list) -> None:
         self.messages = []
+        self.native_seen_calls.clear()
         for value in messages:
             self.add_message(value)
 
@@ -890,6 +898,8 @@ class Chat:
         for provider in self.context_providers:
             try:
                 produced = provider() or []
+            except RequiredContextError:
+                raise
             except Exception:
                 # 一个 provider 坏掉不该让整轮聊天失败：它提供的是补充上下文，不是主体。
                 _log.exception("context provider failed")
@@ -898,64 +908,32 @@ class Chat:
                 collected.append(value if isinstance(value, dict) else {"role": "user", "content": str(value)})
         return collected
 
-    def condense_calls(self, tool_call_ids: Iterable[str]) -> int:
-        """Drop finished tool-call rounds from this context; return messages removed.
-
-        WHY: 这是"结论收缩"真正生效的地方。工具调用往往是为某个目的服务的，结论一旦得出，
-        中间过程就只剩噪音。主流 agent 用子代理绕开这件事——让子代理跑完只回一句结论，
-        于是主上下文从没见过中间过程。这里是正面解决：让模型自己在得出结论时把过程收掉。
-
-        WHY: 只删，不在原地补一条结论消息。结论已经在模型那条 condense_ops 调用的
-        arguments 里了，而那条 assistant 消息此刻就在 messages 中（工具是在它之后执行的），
-        再插一条就是同一句话的第二个副本。
-
-        WHY: 按**整轮**收缩，不按单条。一条 assistant 消息可以并发多个 tool_calls，而协议
-        要求它的每个 id 都有对应 tool 消息。只删其中一条会拆散这一对，请求直接被拒。所以
-        某轮只要有一个 id 被点名，这一轮的 id 就必须全部被点名，否则宁可报错也不动手。
-
-        WHY: 拒绝收缩正在进行的那一轮——tool result 还没补齐的轮次。此刻工具正在执行，
-        assistant(tool_calls) 已在 messages 里、结果还没追加；把它删掉，调用返回时那些
-        结果就会挂在一条不存在的 assistant 上。
-
-        WHY: 这会让前缀缓存从收缩点之后全部失效——删消息必然如此。这是自愿付的代价：
-        收缩换来的是后面每一轮都更短。追加式上下文那套"绝不回头改写"的纪律是为了保住
-        缓存，而这里是明确地用缓存换长度，两者不矛盾，但别把它变成自动行为。
-        """
-        requested = {str(value) for value in tool_call_ids if str(value)}
+    def condense_native_calls(self, tool_call_ids: Iterable[str], *, sources: set[str] | None = None,
+                              apply: bool = True) -> int:
+        """Remove completed native execution pairs from a private Chat's live view."""
+        requested = {str(value) for value in tool_call_ids if value}
         if not requested:
             return 0
-        groups: list[tuple[int, set[str]]] = []
+        drop: set[int] = set()
         for index, message in enumerate(self.messages):
-            calls = message.get("tool_calls") if isinstance(message, dict) else None
+            calls = message.get("tool_calls")
             if not calls:
                 continue
-            ids = {str(call.get("id")) for call in calls}
-            if ids & requested:
-                groups.append((index, ids))
-        # 点名的调用可能全部来自更早的轮次——那时它们本就不在这一轮的 messages 里。
-        # 这不是错误，只是当前上下文没什么可删的，轨道那边照常收缩。
-        if not groups:
-            return 0
-
-        missing = {name for _index, ids in groups for name in ids} - requested
-        if missing:
-            raise ValueError("同一轮里的调用必须一起收缩，还差: " + ", ".join(sorted(missing)))
-
-        drop: set[int] = set()
-        for index, ids in groups:
-            answered = {
-                position
-                for position, message in enumerate(self.messages)
-                if isinstance(message, dict)
-                and message.get("role") == "tool"
-                and str(message.get("tool_call_id")) in ids
-            }
-            if len(answered) != len(ids):
-                raise ValueError("这一轮还没执行完，不能收缩正在进行的调用")
+            if sources and not any(f"{source}#" in str(message.get("content", "")) for source in sources):
+                continue
+            group = {str(call["id"]) for call in calls}
+            if not group & requested:
+                continue
+            if group - requested:
+                raise ValueError("同一输出里的行动必须一起收缩")
+            answered = {position for position, value in enumerate(self.messages)
+                        if value.get("role") == "tool" and str(value.get("tool_call_id")) in group}
+            if len(answered) != len(group):
+                raise ValueError("这一输出仍有行动未返回，不能收缩")
             drop.add(index)
             drop.update(answered)
-
-        self.messages[:] = [message for index, message in enumerate(self.messages) if index not in drop]
+        if apply:
+            self.messages[:] = [message for index, message in enumerate(self.messages) if index not in drop]
         return len(drop)
 
     def get_tools(self) -> list[Tool]:
@@ -972,6 +950,19 @@ class Chat:
         if user_message is not None:
             self.add_message(user_message)
         callback = recall_func or self.recall_func
+        native_sources: set[str] = set()
+
+        def record_output(assistant: dict, calls: list[dict]):
+            recorded = self.on_output(assistant, calls)
+            if isinstance(recorded, str):
+                native_sources.add(recorded)
+            return recorded
+
+        def record_results(source: str, results: list[ToolCallResult]) -> None:
+            self.on_results(source, results)
+            if source in native_sources:
+                self.native_seen_calls.update(f"{source}#{position + 1}" for position in range(len(results)))
+
         try:
             response = self.chat_client.chat(
                 self.messages,
@@ -985,10 +976,12 @@ class Chat:
                 self.should_stop,
                 self.render_hints,
                 self.keep_reasoning,
-                self.on_tool_result,
+                record_output if self.on_output is not None else None,
+                record_results if self.on_results is not None else None,
                 # WHY: 工具在这次生成器已经开始以后才会声明完成；直接传 self.turn_done 会把
                 # 开始时的 None 按值交进去，say 后来安装的回调永远到不了检查点。
                 lambda: self.turn_done() if self.turn_done is not None else False,
+                lambda reference: setattr(self, "active_action", reference),
             )
             results = []
             for chunk in response:

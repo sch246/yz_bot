@@ -130,6 +130,7 @@ class MailEntry:
     seq: int
     event: dict
     activated: bool = False
+    arrival: str = ""
 
 
 class Mailbox:
@@ -156,9 +157,14 @@ class Mailbox:
         self._base = 0
         # 水位线：序号 < `_read` 的条目都已经进过这个窗口的上下文了。
         self._read = 0
+        from mods import oplog
+        self._entries = [MailEntry(index, item["event"], item["activated"], item["arrival"])
+                         for index, item in enumerate(oplog.unread(key))]
 
     def _add(self, event: dict, *, activated: bool = False) -> MailEntry:
-        entry = MailEntry(self._base + len(self._entries), event, activated)
+        from mods import oplog
+        arrival = oplog.arrive(self.key, event, activated=activated)
+        entry = MailEntry(self._base + len(self._entries), event, activated, arrival)
         self._entries.append(entry)
         return entry
 
@@ -196,16 +202,22 @@ class Mailbox:
                 entry = self._add(event)
             if entry.seq < self._read:
                 return False
+            from mods import oplog
+            oplog.activate(entry.arrival)
             entry.activated = True
             return True
 
-    def advance(self) -> list[MailEntry]:
+    def advance(self, project: Callable[[list[MailEntry]], Any] | None = None) -> Any:
         """Move the watermark to the end and return everything it crossed.
 
         Provider 用它读取建会话之后到达的段；建会话走 `rebuild`，但最终也调用同一个
         `_advance`。水位线怎么算、何时修剪因此只有一处。
         """
         with self._lock:
+            if project is not None:
+                projected = project(list(self._entries[self._read - self._base:]))
+                self._advance()
+                return projected
             return self._advance()
 
     def _advance(self) -> list[MailEntry]:

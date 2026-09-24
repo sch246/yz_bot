@@ -6,6 +6,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import threading
 import time
 from typing import Any
 
@@ -17,6 +18,17 @@ PHASE = INFRA
 LOAD_AFTER = ("storage", "history", "identity")
 rootfile = "chatlog"
 logger = logging.getLogger(__name__)
+_append_lock = threading.Lock()
+_line_positions: dict[str, tuple[int, int]] = {}
+_live_origins: dict[int, tuple[dict, str]] = {}
+_recall_lock = threading.Lock()
+_recalls: dict[tuple[str, int], set[str]] = {}
+_live_recalls: dict[tuple[str, int], set[str]] = {}
+
+
+def recall_key(message_id: Any) -> str:
+    value = str(message_id)
+    return str(int(value)) if value.lstrip("-").isdigit() else value
 
 
 def on_load(_ctx: dict[str, Any] | None = None) -> None:
@@ -110,13 +122,40 @@ def display(record: str) -> str:
     return "\n".join(_unescape(line) if line.startswith("    ") else line for line in record.split("\n"))
 
 
-def _append(path: str, text: str) -> str:
-    """Append to the log file and hand the text back for the caller to echo."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "a", encoding="utf-8") as file:
-        file.write(text)
-        file.flush()
-    return text
+def _append(path: str, text: str) -> tuple[str, str]:
+    """Append one record and return its stable file/head-line locator."""
+    encoded = text.encode("utf-8")
+    with _append_lock:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a+b") as file:
+            file.seek(0, os.SEEK_END)
+            size = file.tell()
+            cached = _line_positions.get(path)
+            if cached is not None and cached[0] == size:
+                lines = cached[1]
+            else:
+                file.seek(0)
+                lines = 0
+                while chunk := file.read(65536):
+                    lines += chunk.count(b"\n")
+            file.seek(0, os.SEEK_END)
+            file.write(encoded)
+            file.flush()
+            _line_positions[path] = (size + len(encoded), lines + encoded.count(b"\n"))
+        origin = f"{Path(path).relative_to(rootfile)}:{lines + 1}"
+        return text, origin
+
+
+def _remember_origin(event: dict, origin: str) -> None:
+    _live_origins[id(event)] = (event, origin)
+    if len(_live_origins) > 4096:
+        _live_origins.pop(next(iter(_live_origins)))
+
+
+def consume_origin(event: dict) -> str | None:
+    """Pass writer provenance to the arrival journal without changing the OneBot event."""
+    saved = _live_origins.pop(id(event), None)
+    return saved[1] if saved is not None and saved[0] is event else None
 
 
 def get_path(root: str, timestamp: int | float) -> str:
@@ -185,19 +224,21 @@ def _notice_str(timestamp: int | float, text: str) -> str:
 
 
 def _group_write(msg: dict[str, Any], group_id: int, text: str) -> str:
-    result = _append(get_path(os.path.join(rootfile, "group", str(group_id)), msg["time"]), text)
+    result, origin = _append(get_path(os.path.join(rootfile, "group", str(group_id)), msg["time"]), text)
+    _remember_origin(msg, origin)
     history.add_msg("group", group_id, msg)
     return result
 
 
 def _private_write(msg: dict[str, Any], user_id: int, text: str) -> str:
-    result = _append(get_path(os.path.join(rootfile, "private", str(user_id)), msg["time"]), text)
+    result, origin = _append(get_path(os.path.join(rootfile, "private", str(user_id)), msg["time"]), text)
+    _remember_origin(msg, origin)
     history.add_msg("private", user_id, msg)
     return result
 
 
 def _bot_write(msg: dict[str, Any], text: str) -> str:
-    result = _append(get_path(os.path.join(rootfile, "bot"), msg["time"]), text)
+    result, _origin = _append(get_path(os.path.join(rootfile, "bot"), msg["time"]), text)
     history.add_self_msg(msg)
     return result
 
@@ -294,6 +335,12 @@ def _notice(msg: dict[str, Any]) -> str | None:
             group_id=group_id,
             user_id=None if group_id is not None else user_id,
         )
+        key = ("group", group_id) if group_id is not None else ("private", user_id)
+        if key[1] is not None:
+            with _recall_lock:
+                _live_recalls.setdefault(key, set()).add(recall_key(msg["message_id"]))
+                if key in _recalls:
+                    _recalls[key].add(recall_key(msg["message_id"]))
 
     name = identity.get_user_name(user_id) if user_id is not None else "[unknown]"
     title = ""
@@ -666,6 +713,7 @@ def parse_log(
     version: str | None = None,
     bot_names: dict[str, int] | None = None,
     names_complete: bool = False,
+    origin_path: str | None = None,
 ) -> list[dict[str, Any]]:
     """Read one day's log back into records, marking what is fact and what is not.
 
@@ -690,6 +738,7 @@ def parse_log(
     lines = content.split("\n")
     index = 0
     while index < len(lines):
+        head_line = index + 1
         line = lines[index]
         index += 1
         if line == "" or line.startswith("    "):
@@ -711,11 +760,16 @@ def parse_log(
             elif kind == "private":
                 record["user_id"] = target
             _recognise_notice(record)
+            if origin_path is not None:
+                record["_log_origin"] = f"{origin_path}:{head_line}"
             records.append(record)
             continue
         head = _split_head(line)
         if head is None:
-            records.append({"_source": rootfile, "_kind": "unparsed", "_derived": [], "_missing": ["time"], "text": line})
+            record = {"_source": rootfile, "_kind": "unparsed", "_derived": [], "_missing": ["time"], "text": line}
+            if origin_path is not None:
+                record["_log_origin"] = f"{origin_path}:{head_line}"
+            records.append(record)
             continue
         body: list[str] = []
         while index < len(lines) and (lines[index] == "" or lines[index].startswith("    ")):
@@ -724,19 +778,20 @@ def parse_log(
         if body != [""]:
             while body and body[-1] == "":
                 body.pop()
-        records.append(
-            _message_record(
-                head,
-                _deltab("\n".join(body)),
-                kind,
-                target,
-                day,
-                bot_ids,
-                _version_of(head, kind, version),
-                bot_names,
-                names_complete,
-            )
+        record = _message_record(
+            head,
+            _deltab("\n".join(body)),
+            kind,
+            target,
+            day,
+            bot_ids,
+            _version_of(head, kind, version),
+            bot_names,
+            names_complete,
         )
+        if origin_path is not None:
+            record["_log_origin"] = f"{origin_path}:{head_line}"
+        records.append(record)
     return records
 
 
@@ -892,6 +947,7 @@ def read_range(
             version=_day_version(start, end, switch),
             bot_names=bot_names,
             names_complete=names_complete,
+            origin_path=str(path.relative_to(Path(rootfile if root is None else root))),
         )
         batch = []
         for record in parsed:
@@ -908,6 +964,39 @@ def read_range(
     if limit is not None:
         del records[limit:]
     return records
+
+
+def recalled_ids(kind: str, target: int | str) -> set[str]:
+    """Index recall notices from the chatlog authority, then follow live writes."""
+    key = kind, int(target)
+    with _recall_lock:
+        if key in _recalls:
+            return set(_recalls[key])
+    found: set[str] = set()
+    for path in sorted(window_path(*key).rglob("*.log")):
+        day = day_of(path)
+        if day is None:
+            continue
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError:
+            logger.exception("读取 chatlog 撤回记录失败")
+            raise
+        for line in content.splitlines():
+            if not line.startswith(": "):
+                continue
+            stamp = _TIME_SUFFIX.search(line)
+            shown = line[2:stamp.start()].rstrip() if stamp else line[2:].rstrip()
+            recall = _RECALL.search(shown)
+            if recall is not None:
+                found.add(recall_key(recall["message_id"]))
+    with _recall_lock:
+        found.update(_live_recalls.get(key, ()))
+        if key in _recalls:
+            _recalls[key].update(found)
+        else:
+            _recalls[key] = found
+        return set(_recalls[key])
 
 
 # --- rebuilding recent history at boot --------------------------------------
@@ -952,6 +1041,7 @@ def _restore_window(kind: str, target: int, count: int, floor: int) -> list[dict
             day=day,
             bot_id=_bot_id(),
             version=_day_version(start, end, floor),
+            origin_path=str(path.relative_to(rootfile)),
         )
         recalled.update(record["message_id"] for record in parsed if record.get("_kind") == "recall")
         got = [

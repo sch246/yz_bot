@@ -21,7 +21,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import threading
 
-from mods import context, llm, log, tools as tool_modules
+from mods import context, history, llm, log, oplog, tools as tool_modules
 
 
 _stream = log.stream("agent")
@@ -50,7 +50,13 @@ def assign_tasks(prompt: str, tasks: str, tools: str, model: str = "deepseek/dee
             session = llm.Chat(model=model, chat_client=llm.get_client())
             tool_context = tool_modules.create_context_message()
             session.set_messages([tool_context, f"{prompt}\n{task_value}"])
-            tool_modules.bind_session(session, tool_context, requested)
+            binding = tool_modules.bind_session(session, tool_context, requested)
+            window = history.window(origin or {})
+            if window is not None:
+                from mods import chat
+
+                session.on_output = lambda assistant, calls: oplog.output(window, assistant, calls)
+                session.on_results = chat._stream_results(window, binding)
             pieces = []
 
             def collect(chunk: llm.LLMResponse) -> None:

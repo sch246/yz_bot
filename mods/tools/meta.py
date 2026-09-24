@@ -105,26 +105,30 @@ Markdown 不需要 front matter、额外 summary 字段或同步机制，也不�
 
 ## 操作历史与结论收缩
 
-每次工具调用的结果开头都有一个 `[opN]`，那是这次调用的上下文 id（cid）。这些调用会记进本窗口的操作历史，**跨轮保留**：下一轮开始时你能看到自己上一轮改过什么、加载过什么，而聊天记录里并没有这些。
+每次完整模型输出（思考、正文、多个行动）只有一个 `YYYYMMDD-N` 号；该输出内部行动用 `YYYYMMDD-N#位置` 指名。消息和工具结果也在被读到时进入同一信息流。结果可能在下一次模型请求才读到，未读不占正式号。
 
-这些记录会以**原样的调用记录**重建，不是摘要，所以上下文会随调用增长。压缩靠你自己：一组调用往往是为某个目的服务的，结论一旦得出中间过程就只剩噪音——查完资料、确认完状态、修完一个文件之后，调用 `condense_ops(["op3", "op4"], "结论")` 把它们移除。
+这些记录跨轮按读到的先后重建，未收缩的结果保留原文。压缩靠你自己：一组调用得到结论后，可调用 `condense_ops(["20260923-4#1", "20260923-4#2"], "结论")` 将同一输出内的行动一起移出上下文。
 
 结论写在 `conclusion` 参数里就够了，工具不会把它再返回一遍：这次调用本身留在上下文里，参数里的结论就是它的记录。
+
+已读消息和输出也能总结：主窗口调用 `cover_events(["20260923-4", "20260923-5"], "结论")`，参数用的是上文方括号里的正式事件号，不是 QQ `message_id` 或行动位置。覆盖使成员从本轮和后续自动上下文中消失；原号可用 `recall_events` 反查而不解除覆盖，反查总结会显示实际冻结的所有成员，不只是你传入的号。整个输出与其返回批次不可拆，已确认的 `say`／回声也必须成组；未确认的自发回声不能先单独覆盖，未读成员不会被补进覆盖。摘要与聊天消息、输出、返回一样占历史事件数和 token 预算；私有 `.chat` 和子代理不能替主窗口写覆盖，只能继续使用 `condense_ops`。
 
 ## 说话
 
 `say(text, final_call)` 是你**唯一**的发言方式——直接写在回复正文里的内容不会发出去，那是你的自言自语，只留在这一轮里，人看得见但收不到。
 
-- 返回值就是这条消息的 `message_id`。它和聊天记录里那一条是同一个号，所以你之后要点名自己说过的话（比如压缩一段对话），用它。
+- 返回值就是这条消息的 `message_id`。它可用于与聊天记录里的回声核对；要覆盖这句话，用回声读入后的信息流正式号，不用此 `message_id` 当 `cover_events` 的参数。
 - `final_call` 默认 **true**：说完这句，这一轮就结束了，同一批里其它工具的结果你这一轮也看不到。说完还要接着干活，就显式传 `final_call=false`。
 - 发送**失败**或**未确认**时，不管 `final_call` 传了什么，都会照常再跑一轮，让你看到发生了什么。"未确认"的意思是请求被收下了但没给回号码，消息很可能已经发出去——别直接重发，先看下一轮的聊天记录。
 - 一次 `say` 发一条消息。要发几条就调几次，最后一条传默认的 `final_call=true`。
 
-收缩是**可逆**的：被收缩的调用只是离开上下文，原文继续留着。你那次 `condense_ops` 调用会跟着重建回到后面每一轮的上下文里，`cids` 参数里写的就是被收掉的那几个 cid——什么时候觉得当初的结论不够用、或者要核对当初到底看到了什么，用 `recall_ops(["op3"])` 按 cid 把完整原文取回来。所以收缩不必犹豫，它不销毁任何东西——这句话现在是字面成立的：除了 `#ops clear`，没有任何东西会删掉操作记录。
+收缩是**可逆**的：结果离开后续模型视图，原文仍可用 `recall_ops(["20260923-4#1"])` 取回。`#ops clear` 清空操作视图，但不重用号码或物理删除事件。
 
-三条规则：同一条 assistant 消息里并发的多个调用必须一起点名收缩，只点其中一个会被拒绝；正在执行、结果还没回来的那一轮不能收缩；后来的收缩可以把更早那次 `condense_ops` 也收掉，那次的结论随之从上下文消失——需要保留就在新结论里带上。
+普通输入、完整输出及整批工具返回都可用 `recall_events(["20260923-4"])` 按正式号反查；这不自动把整个载荷放回后续模型上下文。
 
-操作记录跟着聊天窗口走**载入**：留在上下文里的最老那条聊天消息之后发生的调用才会自动出现在上下文里。但更早的**没有被删掉**——它们只是不自动载入，`recall_ops` 照样按 cid 取得回来。唯一会真正删掉记录的是 `#ops clear`（人手动执行）。没载入的不会有清单列给你，量太大，列出来本身就是浪费。
+同一输出里的多个行动必须一起点名收缩；尚未返回的行动不能收缩。
+
+操作记录跟着聊天窗口走**载入**：已读可见事件和 token 共同决定最新历史后缀，不靠聊天消息作为锚点。更早的结果没被删除，仍能按引用取回。
 
 ## 原子性与请求边界
 
@@ -211,7 +215,7 @@ def condense_ops(cids: list[str], conclusion: str) -> str:
     """把已经得出结论的几次工具调用移出上下文，只留下你在 conclusion 里写的结论。查完资料、确认完状态、修完一个文件之后调用它。原文不会被删除，之后可以用 recall_ops 按同样的 cid 取回。
 
     @param
-    cids: 要收缩的调用 id 列表，形如 ["op3", "op4"]；每条工具结果开头的 [opN] 就是它
+    cids: 要收缩的行动引用，形如 ["20260923-4#1", "20260923-4#2"]
     conclusion: 这几次调用得出的结论，写成后面还用得上的一句话；它留在这次调用里，不会被再返回一遍
     """
     from mods import context, history, oplog
@@ -221,27 +225,41 @@ def condense_ops(cids: list[str], conclusion: str) -> str:
         return "当前不在聊天窗口里，没有操作历史"
     if not cids:
         return "没有指定要收缩的调用"
-    tool_call_ids, unknown = oplog.call_ids(window, cids)
+    session = current_binding().session
+    found, unknown = oplog.recall(window, cids)
+    pending = oplog.pending_calls(window, unknown)
+    visible_native = {(str(item.get("tool_call_id")), str(item.get("content")))
+                      for item in session.messages if item.get("role") == "tool"}
+    pending = [item for item in pending if (str(item.get("tool_call_id")), str(item["content"])) in visible_native]
+    pending_ids = {item["cid"] for item in pending}
+    native_ids = [item["tool_call_id"] for item in [*found, *pending] if item.get("tool_call_id")]
+    sources = {cid.partition("#")[0] for cid in cids}
+    if pending and not session.condense_native_calls(native_ids, sources=sources, apply=False):
+        pending_ids.clear()
+    unknown = sorted(set(unknown) - pending_ids)
     if unknown:
         return f"操作历史里找不到（已被 #ops clear 清掉，或从未存在）: {', '.join(unknown)}"
     # WHY: 要写两处，因为"上下文"在这一刻有两副身体：当前这轮的 Chat.messages 是活的、
     # 正在被工具循环追加，而 oplog 是明天重建时读的那份。只动 store 的话，这一轮不会变短
     # ——而长工具循环恰恰是最需要当场省下 token 的场景；只动 messages 的话，明天重建又
-    # 把它们原样搬回来。两步没有先后要求：call_ids 看的是全量条目，不受标记影响。
+    # 把它们原样搬回来。两步没有先后要求：recall 看的是全量条目，不受标记影响。
     dropped = oplog.condense(window, cids)
     if not dropped:
         # 已经收缩过：当前上下文里那几条早就不在了，不必再去动活的那份。
         return "这几次调用已经收缩过了"
-    removed = current_binding().session.condense_calls(tool_call_ids)
+    from mods import chat
+
+    removed = chat._condense_projection(session.messages, window, sources)
+    removed += session.condense_native_calls(native_ids, sources=sources)
     # 这里刻意不回显 conclusion：它已经在这次调用的 arguments 里，回显就是第二个副本。
     return f"已收缩 {dropped} 条操作，当前上下文移除 {removed} 条消息；需要时可用 recall_ops 取回原文"
 
 
 def recall_ops(cids: list[str]) -> str:
-    """按 cid 取回工具调用的完整原文，包括已经被 condense_ops 收缩掉的、以及因为时间太早而没有载入的那些。需要核对某次收缩当初到底看到了什么时用它，cid 就写在那次 condense_ops 调用的 cids 参数里。
+    """按 cid 取回工具调用的原文，包括已收缩的结果；私有会话已见的原生返回在窗口 mail 尚未读到时也可取回，但不能提前读取别的会话的未读结果。
 
     @param
-    cids: 要取回的调用 id 列表，形如 ["op3", "op4"]
+    cids: 要取回的行动引用，形如 ["20260923-4#1", "20260923-4#2"]
     """
     from mods import context, history, oplog
 
@@ -251,14 +269,69 @@ def recall_ops(cids: list[str]) -> str:
     if not cids:
         return "没有指定要取回的调用"
     found, unknown = oplog.recall(window, cids)
-    lines = [
-        f"[{entry['cid']}]{'(已收缩)' if entry.get('condensed') else ''} "
-        f"{entry['name']}({entry['arguments']})\n{entry['content']}"
-        for entry in found
-    ]
+    if unknown:
+        try:
+            native_seen = current_binding().session.native_seen_calls
+        except RuntimeError:
+            native_seen = set()
+        pending = oplog.pending_calls(window, set(unknown) & native_seen)
+        found.extend(pending)
+        unknown = sorted(set(unknown) - {item["cid"] for item in pending})
+    lines = []
+    for entry in found:
+        members = oplog.coverage_members(window, entry["cid"])
+        lines.append(
+            f"[{entry['cid']}]{'(已收缩)' if entry.get('condensed') else ''} "
+            f"{entry['name']}({entry['arguments']})\n{entry['content']}"
+            + ("\n已冻结覆盖成员: " + ", ".join(members) if members is not None else "")
+        )
     if unknown:
         lines.append(f"找不到（已被 #ops clear 清掉，或从未存在）: {', '.join(unknown)}")
     return "\n\n".join(lines) if lines else "没有取回任何内容"
+
+
+def recall_events(ids: list[str]) -> str:
+    """按信息流正式号反查本窗口已读取的输入、完整输出或结果批次；旧档只在主模型读到时取得正式号。
+
+    @param
+    ids: 要反查的信息流正式号，形如 ["20260923-4", "20260923-5"]
+    """
+    import json
+
+    from mods import context, history, oplog
+
+    window = history.window(context.current() or {})
+    if window is None:
+        return "当前不在聊天窗口里"
+    found, missing = oplog.recall_events(window, ids)
+    items = [json.dumps(item, ensure_ascii=False) for item in found]
+    if missing:
+        items.append("找不到: " + ", ".join(missing))
+    return "\n".join(items) if items else "没有指定信息流编号"
+
+
+def cover_events(ids: list[str], conclusion: str) -> str:
+    """将本次主窗口已读的事件归入这次行动的结论；成员不再自动载入，但仍可按原编号反查。关联的整批输出、返回和已确认 say 回声必须一同覆盖。
+
+    @param
+    ids: 当前主窗口可见信息流的正式事件号，形如 ["20260923-4", "20260923-5"]；不要填写行动位置
+    conclusion: 你从这些事件得出的结论，写出供后续子请求保留的摘要
+    """
+    from mods import chat, context, history, oplog
+
+    window = history.window(context.current() or {})
+    session = current_binding().session
+    if window is None or not session.reads_window_mail or not session.active_action:
+        return "仅主窗口正在读取 mail 的会话能覆盖信息流；私有 .chat 和子代理不可覆盖"
+    if not conclusion.strip() or not ids:
+        return "请给出要覆盖的事件号及非空结论"
+    try:
+        members = oplog.cover(window, session.active_action, ids,
+                              chat._visible_stream_ids(session.messages))
+    except ValueError as error:
+        return f"未覆盖：{error}"
+    chat._cover_projection(session.messages, members)
+    return f"已覆盖 {len(members)} 条已读事件；原编号仍可用 recall_events 反查"
 
 
 def attach_image(uri: str, note: str = "") -> str:
@@ -366,6 +439,7 @@ def _format_results(results: Mapping) -> str:
 
 
 __all__ = [
+    "cover_events",
     "say",
     "exec_code",
     "list_tools",
@@ -373,5 +447,6 @@ __all__ = [
     "load_tools",
     "condense_ops",
     "recall_ops",
+    "recall_events",
     "attach_image",
 ]

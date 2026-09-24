@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-from collections import Counter
 from datetime import datetime
 import re
 import threading
@@ -41,11 +40,11 @@ llm_config: dict = {}
 # WHY: 两个上限的默认值写死在这里，不再读 llm_system/config.json。一是那份配置只在
 # on_load 读一次，改它必须重启才生效，而它描述的本来就是"每窗口配置的缺省"、不是全局
 # 开关；二是那两个数从 LLM 刚出现时就没回头调过，当时的理由（上限本身就小）早不成立了。
-# WHY: 宁可低。条数只按普通聊天给——正常聊天不会编程，几十条就够；默认值高会让每次重建
-# 上下文都更贵，而真需要更长历史的窗口可以自己写覆盖值（见 WINDOW_SETTINGS 与 #limit），
+# WHY: 宁可低。事件数现在包含输出与返回，默认 20 可能比旧消息数更早截断；
+# 真需要更长历史的窗口可以自己写覆盖值（见 WINDOW_SETTINGS 与 #limit），
 # 这比让所有窗口默默付大账单好。token 反过来给得宽：卡在预算里会让模型说到一半没法思考，
 # 而一个纯聊天的会话本来就远用不满，所以它的默认值是"够用"而不是"尽量小"。
-DEFAULT_MAX_MSG = 20
+DEFAULT_MAX_EVENTS = 20
 DEFAULT_MAX_TOKEN = 50000
 _cost_lock = threading.Lock()
 # Eager capture is image work reported on the image stream, not chat traffic.
@@ -87,16 +86,17 @@ def window_setting(name: str, data: dict | None = None):
 
 
 def limit(event: dict | None = None) -> tuple[int, int]:
-    """本窗口生效的 `(消息条数上限, 上下文 token 上限)`。
+    """本窗口生效的 `(可见事件数上限, 上下文 token 上限)`。
 
     两个值都从 WINDOW_SETTINGS 取，窗口没写就用默认。没有窗口（没有 group_id 也
     没有 user_id）时直接给默认值——`#hint` 的默认代码要拿它显示，不该因此抛出去。
     """
     event = context.current() if event is None else event
     if event is None or history.window(event) is None:
-        return DEFAULT_MAX_MSG, DEFAULT_MAX_TOKEN
+        return DEFAULT_MAX_EVENTS, DEFAULT_MAX_TOKEN
     data = getchatstorage(event)
-    return window_setting("max_msg", data), window_setting("max_token", data)
+    value = data.get("max_events", data.get("max_msg"))
+    return WINDOW_SETTINGS["max_events"][2](value), window_setting("max_token", data)
 
 
 def get_image_mode(data: dict | None = None) -> str:
@@ -141,7 +141,7 @@ WINDOW_SETTINGS = {
     "image": ("image", "off", normalize_image_mode),
     "reasoning": ("reasoning", "keep", normalize_reasoning_mode),
     "tools": ("tools", "append", normalize_tools_mode),
-    "max_msg": ("max_msg", DEFAULT_MAX_MSG, _bounded_int(1, DEFAULT_MAX_MSG)),
+    "max_events": ("max_events", DEFAULT_MAX_EVENTS, _bounded_int(1, DEFAULT_MAX_EVENTS)),
     "max_token": ("max_token", DEFAULT_MAX_TOKEN, _bounded_int(1, DEFAULT_MAX_TOKEN)),
 }
 
@@ -270,31 +270,15 @@ def event2chat(event: dict, in_group: bool) -> dict:
     return {"role": "user", "content": f"【{kind}】{_poke_text(event)}"}
 
 
-def _event_key(event: dict) -> tuple:
-    """Stable identity for matching a live mail event to rebuilt history."""
-    window = history.window(event)
-    message_id = event.get("message_id")
-    if message_id not in (None, ""):
-        return "message", window, str(message_id)
+def _model_event(event: dict, in_group: bool) -> dict | None:
+    """Project a window event only if it belongs in the model's view."""
     if msgs.is_msg(event):
-        return (
-            "message",
-            window,
-            event.get("time"),
-            event.get("user_id"),
-            event.get("post_type"),
-            event.get("message"),
-        )
-    return (
-        "event",
-        window,
-        event.get("time"),
-        event.get("post_type"),
-        event.get("notice_type"),
-        event.get("sub_type"),
-        event.get("user_id"),
-        event.get("target_id"),
-    )
+        value = msgs.body(event)
+        if value.startswith("#") or value in ("聊天开始", "聊天结束"):
+            return None
+    elif not _is_context_poke(event, in_group):
+        return None
+    return event2chat(event, in_group)
 
 
 def _message_cost(converted: dict) -> int:
@@ -304,88 +288,78 @@ def _message_cost(converted: dict) -> int:
     return sum(count_tokens(part.get("text", "")) for part in content if isinstance(part, dict) and part.get("type") == "text")
 
 
-def _within_budget(events: list[dict], in_group: bool, token_limit: int) -> tuple[list[tuple[float, dict, dict]], int]:
-    """The chat messages that fit, oldest first, each with its timestamp.
-
-    WHY: 截断只有这一处实现。get_msgs 和 build_context 都从这里取，操作记录再依附到它的
-    结果上——三处各写一遍"留多少"，改一处就会静默地分叉。
-    """
-    picked: list[tuple[float, dict, dict]] = []
+def _stream_rows(window: tuple | None, token_limit: int, event_limit: int) -> tuple[list[tuple[dict, dict]], int, bool]:
+    """Select one visible suffix by event count and projected token cost."""
+    all_entries = oplog.events(window, True)
+    boundary = next((index for index in range(len(all_entries) - 1, -1, -1)
+                     if all_entries[index]["kind"] == "input" and msgs.is_msg(all_entries[index]["event"])
+                     and msgs.body(all_entries[index]["event"]) in ("聊天开始", "聊天结束")), -1)
+    allowed = {entry["id"] for entry in all_entries[boundary + 1:]}
+    entries = oplog.events(window)
+    entries = [entry for entry in entries if entry["id"] in allowed]
+    recalled: set[str] | None = None
+    links = oplog.say_links(window)
+    picked: list[tuple[dict, dict]] = []
     used = 0
-    for event in events:
-        converted = event2chat(event, in_group)
-        used += _message_cost(converted)
-        if used > token_limit:
+    blocked = False
+    for entry in reversed(entries):
+        if len(picked) >= event_limit:
+            blocked = True
             break
-        picked.insert(0, (float(event.get("time") or 0.0), converted, event))
-    return picked, used
+        if entry["kind"] == "input":
+            projection = entry.get("projection")
+            if projection is None:
+                continue
+            message_id = entry["event"].get("message_id")
+            if message_id is not None and window is not None:
+                if recalled is None:
+                    from mods import chatlog
+
+                    recalled = chatlog.recalled_ids(*window)
+                if chatlog.recall_key(message_id) in recalled:
+                    continue
+            converted = _numbered(projection, entry["id"])
+            converted = _echo_relation(converted, entry, links)
+        elif entry["kind"] == "output":
+            if not entry["actions"]:
+                continue
+            converted = _output_projection(entry, include_body=False)
+        else:
+            converted = _result_projection(entry, links)
+        amount = _message_cost(converted)
+        if used + amount > token_limit:
+            blocked = True
+            break
+        picked.append((entry, converted))
+        used += amount
+    picked.reverse()
+    return picked, used, blocked
 
 
 def get_msgs(token_limit: int | None = None, return_token: bool = False):
     current = context.current() or {}
-    in_group = current.get("group_id") is not None
-    if token_limit is None:
-        token_limit = limit(current)[1]
-    picked, used = _within_budget(_selected_events(current, in_group), in_group, token_limit)
-    output = [converted for _at, converted, _event in picked]
+    max_events, max_tokens = limit(current)
+    selected_limit = max_tokens if token_limit is None else token_limit
+    rows, used, _blocked = _stream_rows(history.window(current), selected_limit, max_events)
+    output = [converted for _entry, converted in rows]
     return (output, used) if return_token else output
 
 
-def context_usage() -> int:
-    """已进上下文的聊天文本 token 估算——`#hint` 里的 `usage` 用的就是它。
+def _chat_msgs() -> list[dict]:
+    current = context.current() or {}
+    max_events, max_tokens = limit(current)
+    rows, _used, _blocked = _stream_rows(history.window(current), max_tokens, max_events)
+    return [converted for entry, converted in rows if entry["kind"] == "input"]
 
-    WHY: 用量本来只在 `get_handler` 里临时算一次就丢，这里给它一个出口；hint 只调它、不
-    自己算。它是**下界**：只算重建上下文时那些聊天消息的文本，系统提示、工具 schema 和
-    本轮的生成都不在内。
-    """
+
+def context_usage(turn=None) -> int:
+    """Estimate the last request's actual stream view when a reader owns it."""
+    if turn is None:
+        turn = context.get_turn(history.window(context.current() or {}))
+    captured = getattr(turn, "_chat_usage_tokens", None)
+    if captured is not None:
+        return captured
     return get_msgs(return_token=True)[1]
-
-
-def _selected_events(current: dict, in_group: bool, exclude: Counter | None = None) -> list[dict]:
-    """Walk recent history newest-first and keep what may enter the model context."""
-    message_limit = limit(current)[0]
-    events = history.getlog(current)[:message_limit]
-    if len(events) < message_limit:
-        # WHY: 内存里的窗口只有 history.MAX_LEN 条，max_msg 调过它就得回 chatlog 文件取，
-        # 否则 `#limit 500` 会静默地只给 256 条。read_range 按天倒走、读够就停，所以这条
-        # 只在窗口真的写了大上限时才贵。读文件失败就用手上那份，聊天不该因此中断。
-        try:
-            events = history.getlog(current, limit=message_limit)
-        except OSError:
-            pass
-    selected = []
-    for event in events:
-        if msgs.is_msg(event):
-            value = msgs.body(event)
-            # WHY: `#` 开头的消息一律不进 LLM 上下文。这是一条跨模块的约定，且这里是
-            # 唯一的消费端——所有生产端都指回这里：
-            #   llm.Chat.chat      LLM 失败信息  f"# {error}"
-            #   py.run             .py 的 traceback
-            #   link._traceback_text  link action 的 traceback
-            #   chat.call          #子命令的输出
-            # 目的是让调试输出不回流进模型：它们对模型无意义，占 token，还会让模型看到
-            # 自己的错误堆栈然后试图"解释"它。过滤对所有发送者一视同仁，Bot 自己发的也
-            # 一样被排除；用户发的 `#help` 等子命令因此也不进上下文，这同样是想要的。
-            # 改任何一个生产端的前缀(比如统一成 console 的 ❌ 图标)都会让那类输出开始
-            # 回流，而且不会报错——只会悄悄变贵变糟。
-            # 注意别和 py/link 里"最后一行以 # 开头就不 eval"混为一谈：那是 Python 的
-            # 注释语义，只是恰好同一个字符。
-            if value.startswith("#"):
-                continue
-            if value in ("聊天开始", "聊天结束"):
-                break
-            key = _event_key(event)
-            if exclude is not None and exclude[key] > 0:
-                exclude[key] -= 1
-                continue
-            selected.append(event)
-        elif _is_context_poke(event, in_group):
-            key = _event_key(event)
-            if exclude is not None and exclude[key] > 0:
-                exclude[key] -= 1
-                continue
-            selected.append(event)
-    return selected
 
 
 def usage_name(when: datetime | None = None) -> str:
@@ -456,65 +430,103 @@ def _base_prompt() -> list[dict]:
 - `say` 返回这条消息的 message_id；它默认 `final_call=true`，说完这一轮就结束，要接着干活就传 `final_call=false`"""}]
 
 
-def _build_context_snapshot(token_limit: int | None = None, exclude: Counter | None = None) -> list:
-    """Chat history, with the rebuilt tool rounds that belong inside it.
-
-    WHY: 只有**一套**截断规则，就是聊天消息那套（max_msg + max_token）。操作记录不再自己
-    算预算、也没有自己的保留期，它依附于聊天窗口：留下来的最老那条消息之后发生的工具轮才
-    进上下文。两套规则曾经并存过，拆了——它们描述的是同一件事"多早以前的事情还算数"，
-    答案有两个就意味着两处调参、两处解释，而且总有一处会先漂。
-
-    WHY: 代价是工具轮不占预算，调用密集时上下文会超出 max_token。这是知情的选择：压住它
-    的是 condense_ops，由模型在得出结论时自己收缩，而不是由这里按大小乱砍——按大小砍会在
-    结论产出之前砍掉前提。真要封顶的话，是在这里给工具轮也记一份成本，别去给它加保留期。
-
-    WHY: 归并单位是一轮。assistant(tool_calls) 和它的 tool 结果之间插进一条聊天消息就拆散
-    了这一对，请求会被拒，所以每轮带一个时间、整体落位。
-
-    WHY: 同一时刻聊天排在工具轮前面。工具调用是被某条消息触发的，触发它的那句话在它之前；
-    秒级时间戳里两者常常相等，靠这个平手规则维持因果。
-
-    WHY: 顺序不保证与当时完全一致：一轮里几个并发调用完成时间不同，工具执行期间到达的
-    消息其真实先后也无法从一个时间点还原。这是明知的近似。
-
-    WHY: 删除条件 2026-09-20 找到了：这条近似的根源是**顺序要从客观时间戳还原**，而模型当时
-    实际收到的顺序没有任何地方记着。插话在轮内按到达顺序落在工具调用之后，下一轮这里按时间戳
-    重排又可能把它挪到那些调用之前——模型读自己上一轮的记录，会看到自己在"已经知道某件事"的
-    情况下做了一串其实是在不知道时做的动作，而它无从察觉。mail 的主观时间轴（入列序号）把这个
-    顺序记下来之后，排序改成读它，上面这段平手规则连同这条"明知的近似"一起删掉，不是缓解是消除。
-    见 docs/working/proposals/mail-and-activation.md 九点八。
-
-    WHY: 没载入的部分不列清单。曾经这里插过一行"更早还有 N 次工具调用未载入（op1–op12）"，
-    拆掉了：真正需要重新打开的是被自己收缩掉的那些，它们的 cid 就写在 condense_ops 调用的
-    arguments 里、跟着重建回到上下文中——入口已经在了，不用再指一次。
-    """
+def _build_context_snapshot(token_limit: int | None = None) -> list:
+    """Project the selected visible stream without consuming unread mail."""
     current = context.current() or {}
-    if token_limit is None:
-        token_limit = limit(current)[1]
-    in_group = current.get("group_id") is not None
-    window = history.window(current)
-    events = _selected_events(current, in_group, exclude)
-    picked, _used = _within_budget(events, in_group, token_limit)
-    if not picked:
-        # 没有聊天做锚点时不载入任何操作记录：孤零零摆着，模型无从判断它当时在回应什么。
-        return []
-    # WHY: 这里**不回收**操作记录，装配上下文是一个纯读动作。原先这行是
-    # `oplog.sweep(window, events[-1]["time"])`：拿"过滤后最老那条聊天"当门槛做可达性
-    # 回收，而 `_selected_events` 撞上「聊天开始」/「聊天结束」就 break——于是发一次边界
-    # 就把门槛抬到当下，下一轮装配上下文时**物理删除**边界之前的全部操作记录。
-    # 2026-09-19 真的发生了：一次「聊天开始」删掉 515 轮（op1598→op2112），而发它的人和
-    # 模型都以为那只是"不再往前看"。不可逆动作挂在每轮都会发生的读操作上，这是它的根因。
-    # 现在两件事分开：**边界照旧只管可见性**（下面的 floor 就是它），回收另有其人。
-    # 代价是刻意接受的：在按高度退休落位之前，操作记录只增不减，storage 那份全量回写与
-    # `#ops` 的输出都随之线性变长。见 docs/working/proposals/chat-condense.md。
-    # 删除条件：按高度退休落位，由它接管回收——那时门槛是**深度**，不再是聊天时间。
-    items: list[tuple[float, int, list]] = [(at, 0, [converted]) for at, converted, _event in picked]
-    floor = picked[0][0]
-    # 过滤下推给 build_rounds：条目不再被回收，全量重建再丢掉绝大部分会让这条热路径随
-    # 记录数线性变慢。
-    items.extend((at, 1, batch) for at, batch in oplog.build_rounds(window, since=floor))
-    items.sort(key=lambda item: (item[0], item[1]))
-    return _close_with_user([message for item in items for message in item[2]])
+    max_events, max_tokens = limit(current)
+    selected_limit = max_tokens if token_limit is None else token_limit
+    rows, _used, _blocked = _stream_rows(history.window(current), selected_limit, max_events)
+    return _close_with_user([converted for _entry, converted in rows])
+
+
+def _import_legacy(window: tuple, in_group: bool) -> None:
+    """Backfill only archive records admitted on an actual primary-model read."""
+    from mods import chatlog
+
+    max_events, max_tokens = limit(context.current() or {})
+    rows, used, blocked = _stream_rows(window, max_tokens, max_events)
+    remaining_events = max_events - len(rows)
+    remaining_tokens = max_tokens - used
+    if blocked or remaining_events <= 0 or remaining_tokens <= 0:
+        return
+    recalled = chatlog.recalled_ids(*window)
+    scan_limit = max(history.MAX_LEN, remaining_events * 4)
+    candidates: list[tuple[dict, dict]] = []
+    while True:
+        records = chatlog.read_range(*window, limit=scan_limit)
+        candidates.clear()
+        boundary = False
+        for event in records:
+            if msgs.is_msg(event) and msgs.body(event) in ("聊天开始", "聊天结束"):
+                boundary = True
+                break
+            if msgs.is_msg(event):
+                if (event.get("_version") != chatlog.V1
+                        or event.get("post_type") not in ("message", "message_sent")
+                        or event.get("message_id") is None
+                        or chatlog.recall_key(event["message_id"]) in recalled):
+                    continue
+            elif event.get("_kind") != "poke":
+                continue
+            converted = _model_event(event, in_group)
+            if converted is None:
+                continue
+            origin = event.get("_log_origin")
+            if not origin:
+                raise RuntimeError("历史记录没有稳定 chatlog 定位，拒绝无号投影")
+            if oplog.origin_status(window, origin) is None:
+                candidates.append((event, converted))
+                if len(candidates) >= remaining_events:
+                    break
+        if boundary or len(candidates) >= remaining_events or len(records) < scan_limit:
+            break
+        scan_limit *= 2
+    oplog.import_legacy(window, candidates, remaining_events, remaining_tokens,
+                        lambda projection, event_id: _message_cost(_numbered(projection, event_id)))
+
+
+def _numbered(converted: dict, event_id: str) -> dict:
+    content = converted["content"]
+    prefix = f"[{event_id}] "
+    if isinstance(content, str):
+        return {**converted, "content": prefix + content}
+    return {**converted, "content": [{"type": "text", "text": prefix}, *content]}
+
+
+def _echo_relation(converted: dict, entry: dict, links: dict[str, tuple[str, str]]) -> dict:
+    event = entry["event"]
+    if event.get("post_type") != "message_sent" or event.get("message_id") is None:
+        return converted
+    linked = links.get(str(event["message_id"]))
+    if linked is None or linked[0] != entry["id"]:
+        return converted
+    relation = f"（已确认由 {linked[1]} say 发出）"
+    content = converted["content"]
+    if isinstance(content, list):
+        return {**converted, "content": [content[0], {"type": "text", "text": relation}, *content[1:]]}
+    return {**converted, "content": content + relation}
+
+
+def _output_projection(entry: dict, *, include_body: bool = True) -> dict:
+    actions = "\n".join(f"{entry['id']}#{position + 1} {action['name']}({action['arguments']})"
+                        for position, action in enumerate(entry["actions"]))
+    body = entry["body"] if isinstance(entry["body"], str) else str(entry["body"])
+    if not include_body:
+        body = "（正文已省略）"
+    return {"role": "user", "content": f"[{entry['id']}] 自己的输出：{body}\n{actions}"}
+
+
+def _result_projection(entry: dict, links: dict[str, tuple[str, str]]) -> dict:
+    lines = []
+    for result in entry["returns"]:
+        reference = f"{entry['source']}#{result['position'] + 1}"
+        relation = ""
+        if result["name"] == "say" and str(result["content"]).lstrip("-").isdecimal():
+            linked = links.get(str(result["content"]))
+            if linked and linked[1] == reference:
+                relation = f" (已确认回声 {linked[0]})"
+        lines.append(f"{reference} {result['name']} -> {result['content']}{relation}")
+    return {"role": "user", "content": f"[{entry['id']}] 行动返回：\n" + "\n".join(lines)}
 
 
 def build_context(token_limit: int | None = None) -> list:
@@ -580,7 +592,7 @@ def init_chat(
     # `_persist_modules`，理由写在那里。
     # WHY: 装回不是无限的：超过时限没用过的模块会在 `restore` 里被收掉，并给模型一条
     # 通告——"只进不出"会让每次 `load_tools` 都永久占着基线消息。判据用的是每个模块最后
-    # 一次被调用的时刻，所以 bind 出来的那个对象要一直拿着，供 `_oplog_recorder` 上报。
+    # 一次被调用的时刻，所以 bind 出来的那个对象要一直拿着，供 `_stream_results` 上报。
     binding = tool_modules.bind_session(
         session,
         tool_context,
@@ -593,6 +605,8 @@ def init_chat(
 def _activate_chat(
     session: llm.Chat,
     messages: list | None = None,
+    *,
+    read_mail: bool = False,
 ) -> tool_modules.SessionBinding:
     """Run the two lifecycle effects owned by one top-level activation."""
     # WHY: 调用计数与窗口工具恢复描述的是「Bot 被激活一次」，不是「有人调用了上下文装配
@@ -600,12 +614,17 @@ def _activate_chat(
     # 构造 Chat 则不产生生命周期副作用。顺序仍与迁移前一致：先计数，再装配，再恢复工具。
     inc_call_count()
     binding, window = init_chat(session, messages)
+    session.reads_window_mail = read_mail
     _restore_window_tools(binding, window)
     # WHY: 工具恢复可能持久化 ttl 回收；它必须先于其余窗口设置读取，避免无关的配置异常
     # 改变这一轮是否完成回收。
     session.do_process_image = get_image_mode() != "off"
     session.keep_reasoning = get_reasoning_mode() == "keep"
-    session.on_tool_result = _oplog_recorder(window, binding)
+    # WHY: `.chat` 只接受单句输入，不读取窗口 mail；它的下次请求必须从原生
+    # 工具配对得到同步返回。只有装了 mail reader 的主会话才能安全撤掉原生载体。
+    session.on_output = (lambda assistant, calls: _record_output(window, assistant, calls)
+                         if read_mail else oplog.output(window, assistant, calls))
+    session.on_results = _stream_results(window, binding)
     return binding
 
 
@@ -636,9 +655,9 @@ def get_handler(session: llm.Chat):
     """The per-chunk sink: self-talk to the terminal, cost to the ledger.
 
     WHY: 模型写在回复正文里的内容**不再发进聊天**。发言是一次 `say` 调用（见
-    `tools/meta.py`），正文因此退化成这一轮的自言自语：它只活在 `llm.Chat.messages` 里，
-    轮结束就死，也不进 chatlog——所以模型下一轮看不到自己想过什么，这是刻意的（没有追踪
-    的东西不跨轮）。
+    `tools/meta.py`），正文因此退化成这一轮的自言自语：同轮可见，完整输出事件
+    留存以供反查，但后续轮次的模型视图不载入正文，也不进 chatlog。模型下一轮
+    看不到自己想过什么，是刻意的。
 
     WHY: 但它要打到终端。人得看得见模型在想什么，尤其是在它**忘了调 `say`**的时候——那
     种轮对聊天窗口是完全静默的，终端这一行是唯一的痕迹。用 msg 流而不是另开一个，是为了
@@ -657,43 +676,104 @@ def get_handler(session: llm.Chat):
     return handle
 
 
-def _oplog_recorder(window, binding=None):
-    """Record each finished tool call and hand back the cid the model can name.
-
-    WHY: 顺手把"这个模块刚被用过"告诉 binding（`touch`）。空闲回收唯一的判据就是这个时刻，
-    而工具是 `llm` 那层直接 `tool.call(**arguments)` 执行的，它不认识 binding——所以借这个
-    每个工具结果都会经过的钩子把名字递过去。
-    """
-    def record(result, round_id: str) -> str | None:
-        if binding is not None:
+def _stream_results(window, binding):
+    def record(source: str, results: list[llm.ToolCallResult]) -> None:
+        for result in results:
             binding.touch(result.name)
-        return oplog.record(window, result.name, result.arguments, result.content, result.tool_call_id, round_id)
+        if window is not None:
+            context.mailbox(window).add({"_stream_results": {
+                "source": source,
+                "returns": [{"position": position, "name": result.name,
+                             "arguments": result.arguments, "content": result.content,
+                             "tool_call_id": result.tool_call_id}
+                            for position, result in enumerate(results)],
+            }})
     return record
 
 
-def _interject_provider(turn, in_group: bool):
+def _record_output(window, assistant: dict, calls: list[dict]) -> tuple[str, dict] | None:
+    source = oplog.output(window, assistant, calls)
+    if source is None:
+        return None
+    entry, missing = oplog.recall_events(window, [source])
+    if missing:
+        raise RuntimeError("刚写入的模型输出无法反查")
+    return source, _output_projection(entry[0])
+
+
+def _condense_projection(messages: list[dict], window: tuple, sources: set[str]) -> int:
+    prefixes = tuple(f"[{source}] 自己的输出：" for source in sources)
+    result_prefixes = tuple(f"[{entry['id']}] 行动返回：" for entry in oplog.events(window, True)
+                            if entry["kind"] == "result" and entry["source"] in sources)
+    prefixes += result_prefixes
+    kept = [message for message in messages if not (isinstance(message.get("content"), str)
+            and message["content"].startswith(prefixes))]
+    removed = len(messages) - len(kept)
+    messages[:] = kept
+    return removed
+
+
+def _visible_stream_ids(messages: list[dict]) -> set[str]:
+    visible = set()
+    for message in messages:
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        first = content[0].get("text", "") if isinstance(content, list) and content and isinstance(content[0], dict) else content
+        match = re.match(r"^\[(\d{8}-[1-9]\d*)\] ", first) if isinstance(first, str) else None
+        if match:
+            visible.add(match[1])
+    return visible
+
+
+def _cover_projection(messages: list[dict], members: set[str]) -> None:
+    messages[:] = [message for message in messages
+                   if not (_visible_stream_ids([message]) & members)]
+
+
+def _interject_provider(turn, in_group: bool, session: llm.Chat):
     """Advance the window's watermark into messages appended before the next request.
 
     `_run_chat` 开局通过 `Mailbox.rebuild` 原子取得并渲染当时的未读段；之后到达的段
     在每次子请求前从这里读取。两条路最终都经 Mailbox 的同一个水位线推进动作。
     """
     def provide() -> list[dict]:
-        return _mail_context(turn.mail.advance(), in_group)
+        try:
+            def project(entries: list[context.MailEntry]) -> list[dict]:
+                if any(msgs.is_msg(entry.event) and msgs.body(entry.event) in ("聊天开始", "聊天结束")
+                       for entry in entries):
+                    session.messages[:] = [message for message in session.messages
+                                           if not _visible_stream_ids([message])]
+                return _mail_context(entries, in_group, turn.key)
+            produced = turn.mail.advance(project)
+            projected = [message for message in [*session.messages, *produced]
+                         if _visible_stream_ids([message])]
+            turn._chat_usage_tokens = sum(_message_cost(message) for message in projected)
+            return produced
+        except Exception as error:
+            raise llm.RequiredContextError("读取聊天信息流失败，已停止后续行动") from error
     return provide
 
 
-def _mail_context(entries: list[context.MailEntry], in_group: bool) -> list[dict]:
+def _mail_context(entries: list[context.MailEntry], in_group: bool, window: tuple) -> list[dict]:
     """Project one drained mail segment through the history-visible rules."""
     output = []
     for entry in entries:
         event = entry.event
-        if msgs.is_msg(event):
-            value = msgs.body(event)
-            if value.startswith("#") or value in ("聊天开始", "聊天结束"):
-                continue
-        elif not _is_context_poke(event, in_group):
+        boundary = msgs.is_msg(event) and msgs.body(event) in ("聊天开始", "聊天结束")
+        if "_stream_results" in event:
+            values = event["_stream_results"]
+            recorded = oplog.read(entry.arrival) or oplog.result(window, values["source"], values["returns"], entry.arrival)
+            if recorded is not None and recorded["id"] not in oplog.covered(window) and not recorded.get("condensed"):
+                output.append(_result_projection(recorded, oplog.say_links(window)))
             continue
-        output.append(event2chat(event, in_group))
+        converted = _model_event(event, in_group)
+        recorded = oplog.read(entry.arrival) or oplog.input(window, event, converted, entry.arrival)
+        if boundary:
+            output.clear()
+        if converted is not None and recorded is not None and recorded["id"] not in oplog.covered(window):
+            output.append(_echo_relation(_numbered(converted, recorded["id"]), recorded,
+                                         oplog.say_links(window)))
     return output
 
 
@@ -767,7 +847,7 @@ def _hint_effective(default: dict, chat_hint: dict | None) -> dict:
     return {**default, **(chat_hint if isinstance(chat_hint, dict) else {})}
 
 
-def _run_hint(window: tuple) -> None:
+def _run_hint(window: tuple, turn=None) -> None:
     """求值本窗口的结束提示，并把结果发出去；触发点写在 `chat` 的 `finally`。
 
     WHY: 唯一信号是"循环停下"：`while` 里每个 `return` 和异常都经过 `finally`，而每轮
@@ -782,7 +862,7 @@ def _run_hint(window: tuple) -> None:
         code = merged.get("code")
         if not merged.get("on", False) or not isinstance(code, str) or not code.strip():
             return
-        result = _hint_evaluate(code, window)
+        result = _hint_evaluate(code, window, turn)
         if result is not None:
             # `#` 前缀让结束提示不回流进 LLM 上下文，见 get_msgs 的说明。
             message.sendmsg("#" + cq.escape(str(result)))
@@ -790,7 +870,7 @@ def _run_hint(window: tuple) -> None:
         _report_hint_failure()
 
 
-def _hint_evaluate(code: str, window: tuple):
+def _hint_evaluate(code: str, window: tuple, turn=None):
     """在 `py.loc` 的一份私用副本里跑一次 *code*，返回末行的值。
 
     WHY: 名字要照旧认（`sendmsg`/`storage`/…都在），痕迹不能留——副本 + 单次求值就够了：
@@ -799,7 +879,7 @@ def _hint_evaluate(code: str, window: tuple):
     """
     namespace = dict(py.loc)
     namespace["window"] = window
-    namespace["usage"] = context_usage()
+    namespace["usage"] = context_usage(turn)
     return py.eval_last(code, namespace)
 
 
@@ -824,6 +904,7 @@ def chat(model: str | None = None) -> None:
         # 一个窗口只有一个 reader。事件已经在 mail；当前 reader 会在下一次子请求前读到，
         # 或在收尾时发现仍有未读激活元素并继续。这里不再复制一份 trigger 状态。
         return
+    turn._chat_usage_tokens = 0
     in_group = event.get("group_id") is not None
     # WHY: 一次对话 = 这次持有的全过程（多轮 + 插话续写，直到 finally），图片检查台账就
     # 活在这段里：同一张图不重复下载/解析，对话结束即清掉，下次再聊重新检查一遍。
@@ -839,7 +920,7 @@ def chat(model: str | None = None) -> None:
         image.end_conversation(image_ledger)
         context.end_turn(window, turn)
         # WHY: 循环停下的唯一信号就在这里，见 _run_hint。
-        _run_hint(window)
+        _run_hint(window, turn)
 
 
 def _run_chat(model: str | None, turn, in_group: bool) -> None:
@@ -849,14 +930,17 @@ def _run_chat(model: str | None, turn, in_group: bool) -> None:
     if turn is not None:
         # history 重建与 mail 排空共用邮箱锁：路由写 history + 入列也拿同一把锁，因此
         # 两边看到同一个截面。未读段先从重建里排除，再按 mail 顺序追加；这既保住主观
-        # 到达顺序，也不会让超过 max_msg 的未读前缀被一次无声的水位线推进跳过去。
+        # 到达顺序，也不会让超过 max_events 的未读前缀被一次无声的水位线推进跳过去。
         def rebuild(unread: list[context.MailEntry]) -> list:
-            excluded = Counter(_event_key(entry.event) for entry in unread)
-            return _build_context_snapshot(exclude=excluded)
+            _import_legacy(turn.key, in_group)
+            boundary = any(msgs.is_msg(entry.event) and msgs.body(entry.event) in ("聊天开始", "聊天结束")
+                           for entry in unread)
+            return [*([] if boundary else _build_context_snapshot()),
+                    *_mail_context(unread, in_group, turn.key)]
 
-        messages, pending = turn.mail.rebuild(rebuild)
-        _activate_chat(session, [*messages, *_mail_context(pending, in_group)])
-        session.add_context_provider(_interject_provider(turn, in_group))
+        messages, _pending = turn.mail.rebuild(rebuild)
+        _activate_chat(session, messages, read_mail=True)
+        session.add_context_provider(_interject_provider(turn, in_group, session))
         session.should_stop = lambda: turn.cancelled
     else:
         _activate_chat(session, build_context())
@@ -879,20 +963,20 @@ _SUBCOMMAND_HELP = (
     ("reasoning [keep|drop]", "查看或设置工具循环内是否带回思考内容"),
     ("tools [append|ui]", "查看或设置工具状态的呈现方式"),
     ("ops [clear]", "查看或清空本窗口的操作历史"),
-    ("limit [<条数> <token>|reset]", """查看或设置本窗口的消息条数与上下文 token 上限（管理员）。
+    ("limit [<事件数> <token>|reset]", """查看或设置本窗口的可见事件数与上下文 token 上限（管理员）。
 
-格式：#limit | #limit <条数> <token> | #limit reset
-两个上限决定重建上下文时最多取多少条聊天消息、估算多少 token；默认值写死在代码里（现在 max_msg=20、max_token=50000），本窗口写过的值优先。
+格式：#limit | #limit <事件数> <token> | #limit reset
+两个上限共同裁剪近期已读输入、输出与工具返回；默认值写死在代码里（现在 max_events=20、max_token=50000），本窗口写过的值优先。旧 max_msg 值仅在没有 max_events 时读取。
 #limit                  显示两个上限，并标出值来自本窗口还是默认
-#limit <条数> <token>   写入本窗口的两个上限，都必须是正整数
+#limit <事件数> <token> 写入本窗口的两个上限，都必须是正整数
 #limit reset            清掉本窗口的值，回落到默认
-条数超过 history 的内存窗口（256）时会从 chatlog 按天倒读补足，读够就停。"""),
+未读 mail 不受历史限额丢弃；历史 chatlog 只在主模型实际读到时按文件行定位赋号。"""),
     ("hint [get|set|default]", """查看、编写或开关本窗口的结束提示（管理员）。
 
 格式：#hint | #hint get | #hint set <代码> | #hint set | #hint default [get|set <代码>]
 本窗口的配置在 chat storage 的 hint 键，全局默认在 storage 的 "" 命名空间；生效的是两者按 {**默认, **窗口} 合并之后 code 非空、on 为真的那份。
 聊天循环停下时求值一次，非 None 的结果作为一条消息发出（自带 # 前缀，不进模型上下文）。
-求值环境是共享动态环境，另外注入 window（本窗口）与 usage（已进上下文的聊天文本 token 估算，下界）。
+求值环境是共享动态环境，另外注入 window（本窗口）与 usage（最近一次模型子请求实际收到的已编号事件文本 token 估算，含当轮完整 mail 已读段；不含系统提示与工具 schema）。
 #hint              切换本窗口的开关（只写本窗口）
 #hint get          显示合并后生效的代码与开关，并标出代码来自哪里
 #hint set <代码>   写入本窗口的代码并打开开关；set 之后第一个换行起即为源码
@@ -1078,15 +1162,16 @@ def _limit_report() -> str:
     """`#limit` 看两个上限，并标出这个值来自本窗口还是默认。"""
     data = getchatstorage()
     lines = []
-    for name in ("max_msg", "max_token"):
+    for name in ("max_events", "max_token"):
         key, _default, _normalize = WINDOW_SETTINGS[name]
-        origin = "本窗口" if key in data else "默认"
-        lines.append(f"{name}: {window_setting(name, data)}（{origin}）")
+        origin = "本窗口" if key in data or name == "max_events" and "max_msg" in data else "默认"
+        value = limit(context.current())[0] if name == "max_events" else window_setting(name, data)
+        lines.append(f"{name}: {value}（{origin}）")
     return "\n".join(lines)
 
 
 def _limit_set(tail: str) -> str:
-    """`#limit <条数> <token>` 写本窗口的两个上限；`#limit reset` 清掉、回落默认。
+    """`#limit <事件数> <token>` 写本窗口的两个上限；`#limit reset` 清掉、回落默认。
 
     WHY: 两个值一起写、都必须是正整数——窗口配置要么整份生效、要么整份没有，半份
     （只改了条数、token 还是上一版）比拒绝更难解释。清掉本窗口的值就等于回落默认，
@@ -1094,15 +1179,16 @@ def _limit_set(tail: str) -> str:
     """
     data = getchatstorage()
     if tail.strip() == "reset":
-        for name in ("max_msg", "max_token"):
+        for name in ("max_events", "max_token"):
             data.pop(WINDOW_SETTINGS[name][0], None)
+        data.pop("max_msg", None)
         storage.save()
         return "已重置上限，回落到默认"
     parts = tail.split()
     if len(parts) != 2:
         return "limit 参数错误，可用 #help limit 查看"
     written = []
-    for name, raw_value in zip(("max_msg", "max_token"), parts):
+    for name, raw_value in zip(("max_events", "max_token"), parts):
         try:
             number = int(raw_value)
         except ValueError:
@@ -1212,11 +1298,11 @@ def _subcommand(value: str):
     if name == "add_prompt":
         try:
             if not tail:
-                addition = get_msgs()[-1:]
+                addition = _chat_msgs()[-1:]
                 result = "上一句聊天已追加到提示词"
             elif re.fullmatch(r"-?\d+", tail):
                 count = int(tail)
-                messages = get_msgs()
+                messages = _chat_msgs()
                 addition = messages[-count:] if count else messages
                 result = "当前聊天已追加到提示词(注意重复)"
             else:
