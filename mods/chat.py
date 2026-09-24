@@ -46,6 +46,11 @@ llm_config: dict = {}
 # 而一个纯聊天的会话本来就远用不满，所以它的默认值是"够用"而不是"尽量小"。
 DEFAULT_MAX_EVENTS = 20
 DEFAULT_MAX_TOKEN = 50000
+# WHY: This is an early advisory threshold, not a guarantee: a single unread mail
+# segment can cross either limit before the model has a chance to see a hint.
+_PRESSURE_FRACTION = 0.75
+_PRESSURE_SEGMENT_LIMIT = 12
+_PRESSURE_SUMMARY_ALLOWANCE = 120
 _cost_lock = threading.Lock()
 # Eager capture is image work reported on the image stream, not chat traffic.
 _image_stream = log.stream("image")
@@ -714,7 +719,11 @@ def _condense_projection(messages: list[dict], window: tuple, sources: set[str])
 
 
 def _visible_stream_ids(messages: list[dict]) -> set[str]:
-    visible = set()
+    return {event_id for event_id, _message in _visible_stream(messages)}
+
+
+def _visible_stream(messages: list[dict]) -> list[tuple[str, dict]]:
+    visible = []
     for message in messages:
         if message.get("role") != "user":
             continue
@@ -722,8 +731,46 @@ def _visible_stream_ids(messages: list[dict]) -> set[str]:
         first = content[0].get("text", "") if isinstance(content, list) and content and isinstance(content[0], dict) else content
         match = re.match(r"^\[(\d{8}-[1-9]\d*)\] ", first) if isinstance(first, str) else None
         if match:
-            visible.add(match[1])
+            visible.append((match[1], message))
     return visible
+
+
+def _pressure_hint(session: llm.Chat, window: tuple, limits: tuple[int, int]) -> str:
+    """Advise from the actual numbered request view, never from a rebuilt suffix."""
+    stream = _visible_stream(session.messages)
+    max_events, max_tokens = limits
+    costs = {}
+    used_tokens = 0
+    for event_id, message in stream:
+        amount = _message_cost(message)
+        costs[event_id] = amount
+        used_tokens += amount
+    if len(stream) < max_events * _PRESSURE_FRACTION and used_tokens < max_tokens * _PRESSURE_FRACTION:
+        return ""
+    lead = f"上下文接近历史限额：已见 {len(stream)}/{max_events} 条、约 {used_tokens}/{max_tokens} 文本 token。"
+    if not stream:
+        return lead
+    visible = {event_id for event_id, _message in stream}
+    requested = []
+    amount = 0
+    for event_id, _message in stream[:_PRESSURE_SEGMENT_LIMIT]:
+        requested.append(event_id)
+        amount += costs[event_id]
+        if len(requested) < 3 or amount <= _PRESSURE_SUMMARY_ALLOWANCE:
+            continue
+        try:
+            members = oplog.preview_cover(window, requested, visible)
+        except ValueError:
+            break
+        amount = sum(costs[member] for member in members)
+        if (len(members) > 2 and len(members) <= _PRESSURE_SEGMENT_LIMIT
+                and amount > _PRESSURE_SUMMARY_ALLOWANCE):
+            selected = [member for member, _ in stream if member in members]
+            return (lead + f" 可考虑总结最老段 {', '.join(selected)}"
+                    f"（{len(selected)} 条、约 {amount} token；覆盖须连带这些关联事件）。"
+                    "仅为建议，结论由你决定；cover_events 的摘要输出和返回也占预算。")
+        break
+    return lead + " 最老段目前无明显净收益，或关联事件尚不可覆盖；不要声称已经压缩。"
 
 
 def _cover_projection(messages: list[dict], members: set[str]) -> None:
@@ -941,6 +988,7 @@ def _run_chat(model: str | None, turn, in_group: bool) -> None:
         messages, _pending = turn.mail.rebuild(rebuild)
         _activate_chat(session, messages, read_mail=True)
         session.add_context_provider(_interject_provider(turn, in_group, session))
+        session.add_hint(lambda: _pressure_hint(session, turn.key, limit(context.current())))
         session.should_stop = lambda: turn.cancelled
     else:
         _activate_chat(session, build_context())
