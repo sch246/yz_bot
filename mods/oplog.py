@@ -339,83 +339,65 @@ def cover(window: tuple, node: str, ids: Iterable[str], visible: set[str]) -> se
             raise ValueError("覆盖节点必须是本窗口本次 cover_events 行动")
         if node in _coverage_nodes:
             raise ValueError("这次总结行动已经提交过覆盖")
-        closure = _coverage_closure(window, ids, visible, source)
+        requested = {str(event_id) for event_id in ids}
+        if not requested or source in requested:
+            raise ValueError("须指定非自身的已读事件")
+        all_entries = _windows.get(window, ())
+        by_source: dict[str, list[dict]] = {}
+        for entry in all_entries:
+            if entry["kind"] == "result":
+                by_source.setdefault(entry["source"], []).append(entry)
+        closure = set(requested)
+        for event_id in requested:
+            entry = _by_id.get(event_id)
+            if entry is None or entry["window"] != list(window):
+                raise ValueError(f"不是本窗口已读事件: {event_id}")
+        links = say_links(window)
+        linked_echoes = {echo for echo, _reference in links.values()}
+        while True:
+            expanded = set(closure)
+            for event_id in closure:
+                entry = _by_id[event_id]
+                if entry["kind"] == "result":
+                    expanded.add(entry["source"])
+                elif entry["kind"] == "output":
+                    expanded.update(result["id"] for result in by_source.get(event_id, ()))
+            for echo, reference in links.values():
+                group = {echo, reference.split("#")[0]}
+                group.update(result["id"] for result in by_source.get(reference.split("#")[0], ()))
+                if group & expanded:
+                    expanded.update(group)
+            if expanded == closure:
+                break
+            closure = expanded
+        for event_id in closure:
+            entry = _by_id[event_id]
+            if (entry["kind"] == "input" and entry["event"].get("post_type") == "message_sent"
+                    and event_id not in linked_echoes):
+                raise ValueError("自发回声尚无唯一已读 say 返回，不能孤立覆盖")
+            if entry["kind"] == "output":
+                positions = [item["position"] for result in by_source.get(event_id, ())
+                             for item in result["returns"]]
+                if sorted(positions) != list(range(len(entry["actions"]))):
+                    raise ValueError(f"输出 {event_id} 还有未读或未返回的行动，不能拆批覆盖")
+            if entry["kind"] == "result":
+                for item in entry["returns"]:
+                    if item["name"] != "say" or not str(item["content"]).lstrip("-").isdecimal():
+                        continue
+                    linked = links.get(str(item["content"]))
+                    if linked is None or linked[1] != _call({**entry, **item}):
+                        raise ValueError("say 返回尚无唯一已读回声，不能孤立覆盖")
+        if source in closure:
+            raise ValueError("覆盖不能包含本次输出")
+        for event_id in closure:
+            entry = _by_id.get(event_id)
+            if (event_id not in visible or entry is None or entry["window"] != list(window)
+                    or event_id in _covered.get(window, ()) or entry.get("hidden")
+                    or entry.get("condensed") or (entry["kind"] == "input" and entry.get("projection") is None)):
+                raise ValueError(f"覆盖成员不在当前主窗口可见已读流中: {event_id}")
         _append({"kind": "cover", "window": list(window), "node": node,
                  "members": sorted(closure)}, datetime.now().strftime("%Y%m%d"))
         return closure
-
-
-def preview_cover(window: tuple, ids: Iterable[str], visible: set[str]) -> set[str]:
-    """Read-only eligibility check for a proposed cover, without inventing an action node."""
-    with _lock:
-        # WHY: _restore may repair a crash tail on disk. The mail reader has
-        # already loaded this window; a preview must never perform that write.
-        if _root != _directory():
-            raise RuntimeError("信息流尚未载入，不能预览覆盖")
-        return _coverage_closure(window, ids, visible)
-
-
-def _coverage_closure(window: tuple, ids: Iterable[str], visible: set[str], source: str | None = None) -> set[str]:
-    requested = {str(event_id) for event_id in ids}
-    if not requested or source in requested:
-        raise ValueError("须指定非自身的已读事件")
-    for event_id in requested:
-        entry = _by_id.get(event_id)
-        if entry is None or entry["window"] != list(window):
-            raise ValueError(f"不是本窗口已读事件: {event_id}")
-    all_entries = _windows.get(window, ())
-    by_source: dict[str, list[dict]] = {}
-    for entry in all_entries:
-        if entry["kind"] == "result":
-            by_source.setdefault(entry["source"], []).append(entry)
-    links = say_links(window)
-    linked_echoes = {echo for echo, _reference in links.values()}
-    groups: dict[str, set[str]] = {}
-    for echo, reference in links.values():
-        output_id = reference.split("#")[0]
-        group = {echo, output_id, *(result["id"] for result in by_source.get(output_id, ()))}
-        for event_id in group:
-            groups.setdefault(event_id, set()).update(group)
-    closure: set[str] = set()
-    waiting = list(requested)
-    while waiting:
-        event_id = waiting.pop()
-        if event_id in closure:
-            continue
-        closure.add(event_id)
-        entry = _by_id[event_id]
-        related = groups.get(event_id, set())
-        if entry["kind"] == "result":
-            related = related | {entry["source"]}
-        elif entry["kind"] == "output":
-            related = related | {result["id"] for result in by_source.get(event_id, ())}
-        waiting.extend(related - closure)
-    for event_id in closure:
-        entry = _by_id[event_id]
-        if (entry["kind"] == "input" and entry["event"].get("post_type") == "message_sent"
-                and event_id not in linked_echoes):
-            raise ValueError("自发回声尚无唯一已读 say 返回，不能孤立覆盖")
-        if entry["kind"] == "output":
-            positions = [item["position"] for result in by_source.get(event_id, ())
-                         for item in result["returns"]]
-            if sorted(positions) != list(range(len(entry["actions"]))):
-                raise ValueError(f"输出 {event_id} 还有未读或未返回的行动，不能拆批覆盖")
-        if entry["kind"] == "result":
-            for item in entry["returns"]:
-                if item["name"] != "say" or not str(item["content"]).lstrip("-").isdecimal():
-                    continue
-                linked = links.get(str(item["content"]))
-                if linked is None or linked[1] != _call({**entry, **item}):
-                    raise ValueError("say 返回尚无唯一已读回声，不能孤立覆盖")
-    if source in closure:
-        raise ValueError("覆盖不能包含本次输出")
-    for event_id in closure:
-        entry = _by_id.get(event_id)
-        if (event_id not in visible or entry is None or entry["window"] != list(window)
-                or event_id in _covered.get(window, ()) or entry.get("hidden")
-                or entry.get("condensed") or (entry["kind"] == "input" and entry.get("projection") is None)):
-            raise ValueError(f"覆盖成员不在当前主窗口可见已读流中: {event_id}")
-    return closure
 
 
 def _call(entry: dict) -> str:
