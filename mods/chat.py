@@ -434,7 +434,8 @@ def _message_cost(converted: dict) -> int:
     return sum(count_tokens(part.get("text", "")) for part in content if isinstance(part, dict) and part.get("type") == "text")
 
 
-def _stream_rows(window: tuple | None, token_limit: int, event_limit: int) -> tuple[list[tuple[dict, dict]], int, bool]:
+def _stream_rows(window: tuple | None, token_limit: int | None,
+                 event_limit: int | None) -> tuple[list[tuple[dict, dict]], int, bool]:
     """Select one visible suffix by event count and projected token cost."""
     entries = oplog.events(window)
     recalled_by_window: dict[tuple, set[str]] = {}
@@ -445,7 +446,7 @@ def _stream_rows(window: tuple | None, token_limit: int, event_limit: int) -> tu
     for entry in reversed(entries):
         if entry["kind"] == "notification" and not entry.get("acknowledged"):
             continue
-        if len(picked) >= event_limit:
+        if event_limit is not None and len(picked) >= event_limit:
             blocked = True
             break
         if entry["kind"] == "input":
@@ -473,7 +474,7 @@ def _stream_rows(window: tuple | None, token_limit: int, event_limit: int) -> tu
         else:
             converted = _result_projection(entry, links)
         amount = _message_cost(converted)
-        if used + amount > token_limit:
+        if token_limit is not None and used + amount > token_limit:
             blocked = True
             break
         picked.append((entry, converted))
@@ -1371,7 +1372,14 @@ def _run_agent(model: str | None, turn) -> bool:
     session.associated_windows = turn.associated_windows
     session.notification_ids = []
     max_events, max_tokens = limit()
-    rows, _used, _blocked = _stream_rows(AGENT_WINDOW, max_tokens, max_events)
+    # WHY: 离线回放从空种子开始，正式读到的内容只能由模型 cover；若每次重建 Chat
+    # 仍取近期后缀，实验会被滑窗偷偷救活，测到的就不是自主整理。生产路径继续使用两个
+    # 上限，只有显式 offline scope 投影全部仍可见事件，直到模型整理或真实请求失败。
+    rows, _used, _blocked = _stream_rows(
+        AGENT_WINDOW,
+        None if offline is not None else max_tokens,
+        None if offline is not None else max_events,
+    )
     messages = []
     for entry, projection in rows:
         messages.append(projection)
