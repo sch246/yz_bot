@@ -63,7 +63,7 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 命令函数继续接收命令名后的原始 `body`。返回普通值会发送；返回 generator 会登记为当前用户、当前窗口的 continuation。Import 或 Load 失败模块留下的注册会被过滤，因此失败功能不会占住点命令入口。
 
-命令依然处于 Bot 进程的宿主机信任域。权限不是统一中间件；高权限函数必须显式调用 `mods.op`。人类命令按事件作者查 `ops`，模型工具按 `config.bot_permissions.op` 查 Bot 自身固定权限，显式代行事件再按被代行者查 `ops`。普通模块应直接 import 已知依赖，不通过命令注册表反查模块。
+命令依然处于 Bot 进程的宿主机信任域。权限不是统一中间件；高权限函数必须显式调用 `mods.op`。人类命令按事件作者查 `ops`，模型工具按 `config.bot_permissions.op` 查 Bot 自身固定权限；模型通过 `cmds__run_command` 显式代行时还按被代行者查 `ops`，但 Bot 自身没有 op 权限就不能代行人类 op。普通模块应直接 import 已知依赖，不通过命令注册表反查模块。
 
 ## `.py`、`pyload.py` 与动态名称
 
@@ -82,11 +82,11 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 `mods/tools/` 是工具和可按需载入说明的唯一目录，`mods.tools.ToolRegistry` 持有进程级 last-good 模块表。顶层 `foo.py` 和 `foo.md` 具有同一种模块语义：第一行是开局可见的模块描述，余下文本是激活后加入当前聊天 system 提示的内容；Markdown 模块没有函数，Python 模块通过 `__all__` 导出一组普通函数。Python 文件可以正常 import 第三方依赖、其它 `mods` 和同目录 `_helper.py`，导出函数仍由现有 `Tool` 校验，模型侧名称通常为 `foo__function`。
 
-首次使用 registry 时，每个顶层模块独立尝试进入 last-good；单模块失败只记录 traceback。之后修改磁盘不会自动改变运行版本：`list_tools` 查看差异，`reload_tools` 才逐模块读取、执行、校验并原子替换 last-good，失败保留旧版；`load_tools` 不读磁盘，只把 last-good 模块的说明和函数激活到当前 `Chat`。因此进程级“已应用源码”和窗口级“已激活能力”是两层状态，没有 watcher、变化 hint 或兼容旁路。窗口级那一层活在窗口 chat storage 的 `active_tools` 里：每次顶层 `_activate_chat` 装回，`load_tools`／`reload_tools` 改一次写一次，所以它跨轮、跨重启都在。名单里还带着每个模块最后一次被调用的时刻（`chat._stream_results` 上报给 `binding.touch`）：超过 1 小时没被调用过的不再装回，并给模型一条收回通告。不这么剪的话，每次 `load_tools` 都会永久占着基线消息。
+首次使用 registry 时，每个顶层模块独立尝试进入 last-good；单模块失败只记录 traceback。之后修改磁盘不会自动改变运行版本：`list_tools` 查看差异，`reload_tools` 才逐模块读取、执行、校验并原子替换 last-good，失败保留旧版；`load_tools` 不读磁盘，只把 last-good 模块的说明和函数激活到当前 `Chat`。因此进程级“已应用源码”和会话主体“已激活能力”是两层状态，没有 watcher、变化 hint 或兼容旁路。中心 agent 的激活名单在全局 agent storage 的 `active_tools` 中，独立 `.chat` 仍在窗口 chat storage 中；每次 `_activate_chat` 装回，`load_tools`／`reload_tools` 改一次写一次，所以跨轮、跨重启都在。名单里还带着每个模块最后一次被调用的时刻（`chat._stream_results` 上报给 `binding.touch`）：超过 1 小时没被调用过的不再装回，并给模型一条收回通告。不这么剪的话，每次 `load_tools` 都会永久占着基线消息。
 
 `meta.py` 是唯一默认激活的必需模块，保存工具维护说明并导出 `exec_code`、`list_tools`、`reload_tools`、`load_tools` 四个无前缀恢复入口。`__init__.py` 只持有 registry、last-good 和 per-Chat binding 机制；它不再伪装成工具格式。`meta` 调用通过一次调用范围内的 `ContextVar` 取得当前 binding，多 Chat 和 `assign_tasks` 工作线程不会共享错误会话；磁盘删除 `meta.py` 的 reload 会失败并保留旧 last-good。
 
-可用模块的第一行描述从一开始就在同一条 system 提示中；本窗口持久激活的模块在 bind 时渲染进这条消息，同一轮内的 `load_tools` 也原地更新它，两者都修改当前 Chat 的工具映射。每个 LLM 子请求仍冻结一份工具快照，同一份快照同时决定请求 schema 和响应调用解析，所以加载或重载只从下一子请求起生效，不改写已发出的请求或同一响应中的其它调用。`mods/tools/disable/README.md` 只保存历史上被明确禁用的工具的决策记录，不再保存它们的实现。
+可用模块的第一行描述从一开始就在同一条 system 提示中；中心 agent 持久激活的模块从全局 `agent.active_tools` 装回，私有 `.chat` 保留自己的窗口激活状态。同一轮内的 `load_tools` 更新当前 Chat 的内容和函数。每个 LLM 子请求冻结同一份 schema/callable 快照，所以加载或重载只从下一子请求起生效。
 
 提示词没有新增编辑管理器；`.py` 共享环境继续暴露可变 `prompts` 对象，模型需要时可自己编写工具编辑它。
 
@@ -118,9 +118,9 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 `mods.llm/` 持有模型配置、client、流式响应与每请求工具快照；`mods.chat` 持有 QQ 窗口上下文、提示和聊天命令；`mods.tools` 持有统一 registry、当前 Chat 绑定以及按职责分类的真实工具实现，天气模块只投影现有 `mods.weather`；`mods.image/` 持有图片身份、缓存和视觉输入；`mods.forward` 持有合并转发的取回、落盘与渲染——转发的 id 和节点里的图片 url 都会过期，所以取回来的节点落在 `data/forward/<id>.json`，`.cave` 存转发时走的就是它，发送方向则由 `send_forward_msg` 的节点数组承担。`mods.websearch` 持有互联网检索，把 DeepSeek 的服务端 `web_search` 包成一个普通函数——密钥与聊天共用，搜回来的外部正文只当数据交回，不当指令。`mods.browser` 持有自管的常驻 Chromium 与裸 CDP 会话：打开页面、读渲染后的正文、在页面里跑 JS、截图交给视觉链路，每个聊天窗口一个标签页；进程由 `watchdog.detached()` 起，不随工具调用被 `^C` 带走；只允许解析到公网的 http/https 目标，导航期间每个子请求再过一遍同样的检查；启动就绪后清掉 Chrome 按 profile 恢复出来的遗留标签页，让每次启动都从一页空白开始。图片与子任务工具只惰性调用 `mods.chat` 的既有 usage/cost 入口，不复制计费状态。`llm`、`tools` 和 `image` 采用文件夹 Module，是因为各自内部实现共同拥有明确状态；具体能力仍优先由普通函数表达。
 
-每个聊天窗口另有一个跨轮 `context.Mailbox`。路由把 chatlog/history 写入与 mail 入列作为同一窗口事务提交，聊天开轮则在同一锁内重建已读历史并排空未读段；轮内 provider 在每次模型子请求前继续排空。未读到达记录追加到 `data/event_stream/`，模型读取时再写正式号；生成完整输出后在工具派发前登记同一信息流的输出事件。mail 条目的 `activated` 是到达时固定的事实，红点是“未读段是否含激活条目”的派生结果；`WindowTurn` 只登记唯一 reader 和取消位，不复制 trigger。
+每个来源窗口有跨轮 `context.Mailbox`。路由在同一窗口锁内依次写入 chatlog/history 和 mail，`oplog` 持久记录到达；这保证入列顺序，不表示不同文件有跨文件崩溃原子性。唯一中心 reader 用 `AGENT_WINDOW` 持有全局执行线。激活只产生可确认的通知，不读取正文；`peek` 有界预览不减少未读，`pull_mail` 按选定窗口 FIFO 有界正式读取并分配统一号。工具结果走独立的全局待读队列，优先于聊天积压；输出在派发工具前持久登记。模型输出确认通知，页读取提交 pending，二者不是同一水位。首次没有可信旧边界的窗口持久冻结最近一页作为日常追读起点。
 
-主窗口显式压缩调用在 `oplog` 追加一条覆盖事实，节点身份沿用输出号与输出内位置，成员仅是该窗口已读可见的正式号；全量重放（含已收缩的节点）导出同一覆盖索引，重建及本轮投影均排除成员，按号反查不改索引。`max_events` 与 token 预算共同选已读可见输入、输出、工具返回的最新后缀；摘要与其它输出同样占名额，不再依赖聊天消息锚点。`聊天开始`／`聊天结束`仍截断可回看的历史；本轮 mail 读到边界时也收掉边界前的可见信息流投影，但不删除原始记录。旧 `max_msg` 配置仅作为只读回退，新的 `#limit` 只写 `max_events`。旧 chatlog 记录按文件内记录头行定位，仅在主模型实际读到时懒赋号；查询本身不推进身份。旧档无法证明是原始 QQ 消息（例如 v0 投影或无消息号的消息形记录）时不自动导入。撤回通知按 chatlog 原事实建立可见性索引，被撤回的正式号仍可反查但不再自动重放。未读 mail 仍在历史裁剪后整段追加，不因限额被标已读却丢弃；`#hint usage` 记录最近一次请求实际送达的已编号事件文本成本，包含这整段 mail，而不是另算一遍裁剪后的历史。私有 `.chat`／子代理不具有主 mail reader 的覆盖写入权。
+中心 agent 的 `cover_events` 在 `oplog` 追加覆盖事实，节点沿用输出号及行动位置；成员可跨来源窗口、允许多重引用，只能来自可见已读或明确反查的旧号，强绑定输出／结果／已确认回声仍成组。覆盖只隐藏默认投影，不删除原文或正式号。`event_span` 沿已读追加顺序按中心半径或双端点选择至多 40 条，之后才按种类和来源筛选；它只列正式号，不替模型读取或覆盖。全局 `max_events` 与 `max_token` 共同选唯一已读流的可见后缀，摘要也占名额；`聊天开始`／`聊天结束`是普通内容。旧窗口设置保留但不并入全局设置，独立 `.chat` 仍按窗口请求。旧 chatlog 通过有界 `peek` 主动翻阅；`peek_napcat` 可只读查询上游当前提供的有界群聊／私聊历史，不消本地未读。启动时以旧 chatlog 锚点逐页补回 NapCat 历史到独立按日 sidecar，持久页索引与消费位置由 oplog 记录；原窗口 mail 读完旧前缀后先读补回页，再读开机后实时尾部。主动 `fetch_source` 可为更早历史建立独立 FIFO；`source_status`、`peek_source`、`pull_source` 分别查看状态、预览和正式读取。回放返回在实际阅读时成为新的结果事件；本地 `_log_origin` 与远端 `message_seq` 是各自的排他分页游标，不是第二套记忆号。`#` 控制消息不投影。主模型与辅助调用费用记入 Bot 账，私有 `.chat` 仍记发起者；退休尚未接通。
 
 终端打印是实际运维界面的一部分：收发消息、流式 LLM 内容、工具调用、图片捕获/缓存、link/capture 命中、模块失败和生命周期进度都应保留可观察输出。这些产出者各自选一条**流名**（`mods.log.stream(...)`，即 `yz.*` logger），终端订阅其中一组；流是「属于哪个子系统」这条轴，与 logger 级别表达的「是不是故障」互不替代。每条流有自己的 `log/<流>.log`；`app.log` 只记严重程度；chatlog 保存产品聊天历史，三者不是同一用途。落盘的记录由一个 filter 自动补上交互归属，调用点不传参。终端行为、订阅集与 `.log` 见[运行时](runtime.md)。
 

@@ -142,10 +142,8 @@ class Mailbox:
     这条轴今天没有任何地方记着），那更是跨轮的。见
     docs/working/proposals/mail-and-activation.md 3.0 与九点八。
 
-    WHY: 自己带锁，而不是借 `WindowTurn` 的。轮会消失，锁不能跟着消失——不然
-    「邮箱不随轮生灭」这句话在并发下就是假的。聊天记录写入与 mail 入列由 `record`
-    在这把锁里一次提交；开轮时的历史重建与水位线推进由 `rebuild` 在同一把锁里完成。
-    因此 history 与 mail 观察的是同一个截面，不需要靠事后去重补两份状态之间的竞态。
+    WHY: 自己带锁，而不是借 `WindowTurn` 的。轮会消失，锁不能跟着消失。聊天记录
+    写入与 mail 入列由 `record` 在这把锁里一次提交；逐页正式读取也拿同一把锁。
     """
 
     def __init__(self, key: Any) -> None:
@@ -155,6 +153,8 @@ class Mailbox:
         # 所以修剪掉开头的已读条目不会让后面的序号跟着变。
         self._entries: list[MailEntry] = []
         self._base = 0
+        self._aliases: dict[int, tuple[dict, MailEntry | None]] = {}
+        self._absorbed: set[str] = set()
         # 水位线：序号 < `_read` 的条目都已经进过这个窗口的上下文了。
         self._read = 0
         from mods import oplog
@@ -168,6 +168,43 @@ class Mailbox:
         self._entries.append(entry)
         return entry
 
+    def unread_through(self, arrival: str | None, count: int) -> list[MailEntry]:
+        """Return the old unread prefix frozen before a recovery segment was opened."""
+        if arrival is None or count < 1:
+            return []
+        with self._lock:
+            self._skip_absorbed()
+            start = self._read - self._base
+            boundary = next((index for index in range(start, len(self._entries))
+                             if self._entries[index].arrival == arrival), None)
+            if boundary is None:
+                return []
+            return [entry for entry in self._entries[start:boundary + 1]
+                    if entry.arrival not in self._absorbed][:count]
+
+    def commit_recovered(self, message_id: int | str, project: Callable[[str | None], Any]) -> Any:
+        """Use one live arrival as the recovered page member when both are the same QQ message."""
+        with self._lock:
+            start = self._read - self._base
+            duplicate = next((entry for entry in self._entries[start:]
+                              if entry.arrival not in self._absorbed
+                              and entry.event.get("message_id") is not None
+                              and str(entry.event["message_id"]) == str(message_id)), None)
+            value = project(duplicate.arrival if duplicate is not None else None)
+            if duplicate is not None:
+                self._absorbed.add(duplicate.arrival)
+                self._skip_absorbed()
+            return value
+
+    def _skip_absorbed(self) -> None:
+        while self._read < self._base + len(self._entries):
+            entry = self._entries[self._read - self._base]
+            if entry.arrival not in self._absorbed:
+                break
+            self._absorbed.remove(entry.arrival)
+            self._read += 1
+        self._trim()
+
     def add(self, event: dict, *, activated: bool = False) -> int:
         """Put one event in and return its sequence number."""
         with self._lock:
@@ -176,43 +213,56 @@ class Mailbox:
     def record(self, event: dict, write: Callable[[], Any]) -> Any:
         """Commit one durable history write and its mailbox entry together.
 
-        The writer runs while the mailbox is locked.  `rebuild` takes the same
-        lock around its history snapshot, so a reader sees either both facts or
-        neither; it can never rebuild an event whose mail entry has not arrived.
+        The writer runs while the mailbox is locked. A page pull takes that same
+        lock, so it cannot observe the chatlog write without the mail arrival.
         """
         with self._lock:
             result = write()
             if result is not None:
-                self._add(event)
+                from mods import oplog
+
+                message_id = (event.get("message_id") if event.get("post_type") in ("message", "message_sent")
+                              else None)
+                existing = oplog.pending_message(self.key, message_id) if message_id is not None else None
+                entry = next((item for item in self._entries if item.arrival == existing), None)
+                if entry is None and not (message_id is not None and oplog.message_seen(self.key, message_id)):
+                    self._add(event)
+                else:
+                    self._aliases[id(event)] = event, entry
+                    if len(self._aliases) > 4096:
+                        self._aliases.pop(next(iter(self._aliases)))
             return result
 
-    def ensure(self, event: dict) -> MailEntry:
+    def ensure(self, event: dict) -> MailEntry | None:
         """Return *event*'s entry, adding it for non-router callers if needed."""
         with self._lock:
+            alias = self._aliases.get(id(event))
+            if alias is not None and alias[0] is event:
+                return alias[1]
             for entry in reversed(self._entries):
                 if entry.event is event:
                     return entry
             return self._add(event)
 
-    def activate(self, event: dict) -> bool:
+    def activate(self, event: dict, kind: str = "wake") -> bool:
         """Mark an unread event active; return false when it was already read."""
         with self._lock:
-            entry = next((item for item in reversed(self._entries) if item.event is event), None)
+            alias = self._aliases.get(id(event))
+            if alias is not None and alias[0] is event and alias[1] is None:
+                return False
+            entry = (alias[1] if alias is not None and alias[0] is event else
+                     next((item for item in reversed(self._entries) if item.event is event), None))
             if entry is None:
                 entry = self._add(event)
             if entry.seq < self._read:
                 return False
             from mods import oplog
-            oplog.activate(entry.arrival)
+            oplog.activate(entry.arrival, kind)
             entry.activated = True
             return True
 
     def advance(self, project: Callable[[list[MailEntry]], Any] | None = None) -> Any:
-        """Move the watermark to the end and return everything it crossed.
-
-        Provider 用它读取建会话之后到达的段；建会话走 `rebuild`，但最终也调用同一个
-        `_advance`。水位线怎么算、何时修剪因此只有一处。
-        """
+        """Drain the global result mailbox, never a chat window's unread body."""
         with self._lock:
             if project is not None:
                 projected = project(list(self._entries[self._read - self._base:]))
@@ -221,29 +271,61 @@ class Mailbox:
             return self._advance()
 
     def _advance(self) -> list[MailEntry]:
+        self._skip_absorbed()
         start = self._read - self._base
         crossed = list(self._entries[start:])
         self._read = self._base + len(self._entries)
         self._trim()
         return crossed
 
-    def rebuild(self, builder: Callable[[list[MailEntry]], Any]) -> tuple[Any, list[MailEntry]]:
-        """Build from history and consume the same mailbox snapshot atomically."""
-        with self._lock:
-            crossed = list(self._entries[self._read - self._base:])
-            built = builder(crossed)
-            return built, self._advance()
-
-    def unread(self) -> list[MailEntry]:
+    def unread(self, count: int | None = None) -> list[MailEntry]:
         """Look at what has not entered the context yet, without consuming it."""
         with self._lock:
-            return list(self._entries[self._read - self._base:])
+            self._skip_absorbed()
+            start = self._read - self._base
+            visible = [entry for entry in self._entries[start:]
+                       if entry.arrival not in self._absorbed]
+            return visible if count is None else visible[:count]
+
+    def pull(self, count: int, project: Callable[[list[MailEntry]], Any]) -> Any:
+        """Commit only a bounded FIFO prefix after its durable projection succeeds."""
+        if count < 1:
+            raise ValueError("mail page must be nonempty")
+        with self._lock:
+            self._skip_absorbed()
+            start = self._read - self._base
+            indexes = [index for index in range(start, len(self._entries))
+                       if self._entries[index].arrival not in self._absorbed][:count]
+            crossed = [self._entries[index] for index in indexes]
+            projected = project(crossed)
+            if indexes:
+                for index in range(start, indexes[-1] + 1):
+                    self._absorbed.discard(self._entries[index].arrival)
+                self._read = self._base + indexes[-1] + 1
+            self._skip_absorbed()
+            return projected
+
+    def prepare_initial_page(self, count: int) -> None:
+        """Apply a durable first-read floor to the live buffer, not a fake read."""
+        from mods import oplog
+
+        with self._lock:
+            oplog.prepare_window(self.key, count)
+            allowed = {entry["arrival"] for entry in oplog.unread(self.key)}
+            while self._read < self._base + len(self._entries):
+                entry = self._entries[self._read - self._base]
+                if entry.arrival in allowed:
+                    break
+                self._read += 1
+            self._trim()
 
     def has_activation(self) -> bool:
         """Return whether an unread activated entry keeps the red dot lit."""
         with self._lock:
+            self._skip_absorbed()
             start = self._read - self._base
-            return any(entry.activated for entry in self._entries[start:])
+            return any(entry.activated and entry.arrival not in self._absorbed
+                       for entry in self._entries[start:])
 
     def _trim(self) -> None:
         """Drop consumed entries past the retention tail; never drop unread ones.
@@ -270,7 +352,9 @@ class Mailbox:
     def __len__(self) -> int:
         """**未读**条数——红点要问的就是这个，不是总条数。"""
         with self._lock:
-            return len(self._entries) - (self._read - self._base)
+            self._skip_absorbed()
+            return sum(entry.arrival not in self._absorbed
+                       for entry in self._entries[self._read - self._base:])
 
 
 # 水位线之前还留在内存里的条目上界，见 Mailbox._trim。对齐 history.MAX_LEN 只是为了
@@ -321,6 +405,7 @@ class WindowTurn:
 
 
 _turns: dict[Any, WindowTurn] = {}
+_turn_finished = threading.Condition(_lock)
 
 
 def begin_turn(key: Any) -> tuple[WindowTurn, bool]:
@@ -348,9 +433,17 @@ def end_turn(key: Any, turn: WindowTurn) -> None:
     with _lock:
         if _turns.get(key) is turn:
             del _turns[key]
+            _turn_finished.notify_all()
 
 
-def finish_turn(key: Any, turn: WindowTurn) -> bool:
+def wait_turn_end(key: Any) -> None:
+    """Wait for an existing reader to release its turn before a recovery wake."""
+    with _turn_finished:
+        while key in _turns:
+            _turn_finished.wait()
+
+
+def finish_turn(key: Any, turn: WindowTurn, has_work: Callable[[], bool] | None = None) -> bool:
     """Close *key*'s turn, or keep it open while activated mail remains unread.
 
     The unread mailbox is the authority.  Under `_lock`, either an activated
@@ -359,10 +452,11 @@ def finish_turn(key: Any, turn: WindowTurn) -> bool:
     never looks up a turn before delivery, so there is no detached-turn race.
     """
     with _lock:
-        if turn.mail.has_activation():
+        if (has_work() if has_work is not None else turn.mail.has_activation()):
             return True
         if _turns.get(key) is turn:
             del _turns[key]
+            _turn_finished.notify_all()
         return False
 
 
@@ -378,3 +472,11 @@ def cancel_turn(key: Any) -> bool:
 def clear_current() -> None:
     if hasattr(_local, "event"):
         del _local.event
+
+
+def agent_mode() -> bool:
+    return bool(getattr(_local, "agent_mode", False))
+
+
+def set_agent_mode(enabled: bool) -> None:
+    _local.agent_mode = enabled

@@ -2,23 +2,28 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from pathlib import Path
 import re
+import sqlite3
 import threading
 import time
+from contextlib import closing
 from typing import Any
 
 from mods import INFRA
-from mods import cq, history, identity
+from mods import _backfill_archive, cq, history, identity
 
 
 PHASE = INFRA
 LOAD_AFTER = ("storage", "history", "identity")
 rootfile = "chatlog"
 logger = logging.getLogger(__name__)
-_append_lock = threading.Lock()
+_append_lock = threading.RLock()
+_reader_lock = threading.Lock()
+_boot_anchors: dict[tuple[str, int], str | None] | None = None
 _line_positions: dict[str, tuple[int, int]] = {}
 _live_origins: dict[int, tuple[dict, str]] = {}
 _recall_lock = threading.Lock()
@@ -99,6 +104,14 @@ def search_current(pattern: str) -> list[str]:
             shown = display("\n".join(lines[start:end])).rstrip()
             if any(expression.search(line) for line in shown.split("\n")):
                 matches.append(f"{path}:{start + 1}\n{shown}")
+    for path in sorted(directory.rglob("*.backfill.jsonl")) if directory.is_dir() else []:
+        for record in _backfill_archive.read_day(path):
+            sender = record.get("sender") or {}
+            name = sender.get("card") or sender.get("nickname") or str(record.get("user_id", ""))
+            shown = display(format_message(record, str(name), str(sender.get("title", "")))).rstrip()
+            if any(expression.search(line) for line in shown.split("\n")):
+                matches.append(f"{Path(rootfile) / record['_log_origin'].partition(':')[0]}:"
+                               f"{record['_log_origin'].rpartition(':')[2]}\n{shown}")
     return matches
 
 
@@ -156,6 +169,24 @@ def consume_origin(event: dict) -> str | None:
     """Pass writer provenance to the arrival journal without changing the OneBot event."""
     saved = _live_origins.pop(id(event), None)
     return saved[1] if saved is not None and saved[0] is event else None
+
+
+def append_backfill_page(kind: str, target: int, messages: list[dict]) -> list[str]:
+    """Commit a remote page without building a window-sized identity map."""
+    with _append_lock:
+        return _backfill_archive.append_messages(kind, target, messages, root=rootfile)
+
+
+def _existing_backfill_origin(kind: str, target: int, event: dict) -> str | None:
+    message_id = event.get("message_id")
+    if message_id is None:
+        return None
+    path = _backfill_archive.sidecar_path(kind, target, int(event["time"]), root=rootfile)
+    if not path.is_file():
+        return None
+    return _backfill_archive.lookup_origins(
+        kind, target, [message_id], int(event["time"]), int(event["time"]), root=rootfile
+    ).get(recall_key(message_id))
 
 
 def get_path(root: str, timestamp: int | float) -> str:
@@ -312,13 +343,35 @@ def _message(msg: dict[str, Any]) -> str:
     if kind == "group":
         group_id = int(target)
         title, display = identity.get_group_user_info(group_id, sender_id)
-        return _group_write(msg, group_id, format_message(msg, display, title))
+        rendered = format_message(msg, display, title)
+        with _append_lock:
+            try:
+                archived = _existing_backfill_origin(kind, group_id, msg)
+            except (OSError, ValueError):
+                logger.exception("检查回填档案失败，实时消息仍写入正常日档")
+                archived = None
+            if archived is None:
+                return _group_write(msg, group_id, rendered)
+            _remember_origin(msg, archived)
+        history.add_msg("group", group_id, msg)
+        return rendered
     window_user = int(target)
     display = identity.get_user_name(sender_id)
     # v1: a private record carries the sender the way a group record always did.
     # Without it the Bot's own line and the peer's line differ only by a nickname
     # anyone can change, so a private window has no reliable author at all.
-    return _private_write(msg, window_user, format_message(msg, display))
+    rendered = format_message(msg, display)
+    with _append_lock:
+        try:
+            archived = _existing_backfill_origin(kind, window_user, msg)
+        except (OSError, ValueError):
+            logger.exception("检查回填档案失败，实时消息仍写入正常日档")
+            archived = None
+        if archived is None:
+            return _private_write(msg, window_user, rendered)
+        _remember_origin(msg, archived)
+    history.add_msg("private", window_user, msg)
+    return rendered
 
 
 def _notice(msg: dict[str, Any]) -> str | None:
@@ -483,6 +536,19 @@ def day_of(path: str | os.PathLike) -> tuple[int, int, int] | None:
     if day is None or month is None:
         return None
     return int(month["year"]), int(month["month"]), int(day["day"])
+
+
+def _archive_day(path: Path) -> tuple[int, int, int] | None:
+    if path.name.endswith(".backfill.jsonl"):
+        return day_of(path.with_name(path.name.removesuffix(".backfill.jsonl") + ".log"))
+    return day_of(path)
+
+
+def _archive_days(directory: Path) -> list[tuple[int, int, int]]:
+    if not directory.is_dir():
+        return []
+    paths = (*directory.rglob("*.log"), *directory.rglob("*.backfill.jsonl"))
+    return sorted({day for path in paths if (day := _archive_day(path)) is not None}, reverse=True)
 
 
 def format_message(event: dict[str, Any], name: str, title: str = "") -> str:
@@ -881,6 +947,207 @@ def _day_version(start: int, end: int, switch: int | None) -> str | None:
     return None
 
 
+def _day_paths(kind: str, target: int | str | None, day: tuple[int, int, int],
+               root: str | os.PathLike | None) -> tuple[Path, Path]:
+    path = window_path(kind, target, root) / f"{day[0]:04d}-{day[1]:02d}" / f"{day[2]:02d}.log"
+    return path, path.with_name(f"{day[2]:02d}.backfill.jsonl")
+
+
+def _reader_index(directory: Path) -> sqlite3.Connection:
+    """Disposable byte-offset view; day files, never SQLite, own the history."""
+    database = sqlite3.connect(directory / ".archive-reader.sqlite3")
+    database.execute("PRAGMA temp_store=FILE")
+    database.execute("PRAGMA cache_size=-2048")
+    database.execute("CREATE TABLE IF NOT EXISTS reader_files (day TEXT, source INTEGER, size INTEGER, "
+                     "mtime INTEGER, inode INTEGER, PRIMARY KEY (day, source))")
+    database.execute("CREATE TABLE IF NOT EXISTS reader_rows (day TEXT, source INTEGER, line INTEGER, "
+                     "offset INTEGER, end INTEGER, stamp INTEGER, seq INTEGER, message_id TEXT, "
+                     "position INTEGER, visible INTEGER, PRIMARY KEY (day, source, line))")
+    database.execute("CREATE INDEX IF NOT EXISTS reader_order ON reader_rows (day, position)")
+    database.execute("CREATE INDEX IF NOT EXISTS reader_ids ON reader_rows (day, message_id, visible)")
+    return database
+
+
+def _file_stamp(path: Path) -> tuple[int, int, int] | None:
+    if not path.is_file():
+        return None
+    stat = path.stat()
+    return stat.st_size, stat.st_mtime_ns, stat.st_ino
+
+
+def _index_day(database: sqlite3.Connection, kind: str, target: int | str | None,
+               day: tuple[int, int, int], root: str | os.PathLike | None) -> str:
+    """Rebuild a changed day as a disk-backed merge, never a day-sized Python list."""
+    ordinary, sidecar = _day_paths(kind, target, day, root)
+    day_key = f"{day[0]:04d}-{day[1]:02d}-{day[2]:02d}"
+    paths = (ordinary, sidecar)
+    stamps = (_file_stamp(ordinary), _file_stamp(sidecar) if kind != "bot" else None)
+    indexed = {source: (size, mtime, inode) for source, size, mtime, inode in database.execute(
+        "SELECT source, size, mtime, inode FROM reader_files WHERE day=?", (day_key,))}
+    if indexed == {source: stamp for source, stamp in enumerate(stamps) if stamp is not None}:
+        return day_key
+    with database:
+        database.execute("DELETE FROM reader_rows WHERE day=?", (day_key,))
+        database.execute("DELETE FROM reader_files WHERE day=?", (day_key,))
+        if stamps[0] is not None:
+            with ordinary.open("rb") as file:
+                line_number = 0
+                head_line = None
+                head_offset = None
+                head_text = None
+                while True:
+                    offset = file.tell()
+                    chunk = file.readline()
+                    if not chunk:
+                        break
+                    line_number += 1
+                    if chunk.startswith(b"    ") or not chunk.strip():
+                        continue
+                    if head_line is not None:
+                        _index_ordinary(database, day_key, kind, target, day, head_line,
+                                        head_offset, offset, head_text)
+                    head_line, head_offset = line_number, offset
+                    head_text = chunk.decode("utf-8")
+                if head_line is not None:
+                    _index_ordinary(database, day_key, kind, target, day, head_line,
+                                    head_offset, file.tell(), head_text)
+        if stamps[1] is not None:
+            for line, offset, message in _backfill_archive._iter_sidecar(sidecar, rootfile if root is None else root):
+                database.execute(
+                    "INSERT INTO reader_rows VALUES (?, 0, ?, ?, NULL, ?, ?, ?, NULL, 1)",
+                    (day_key, line, offset, int(message["time"]), int(message["message_seq"]),
+                     recall_key(message["message_id"])),
+                )
+        ordinary_rows = iter(database.execute(
+            "SELECT source, line, stamp, message_id FROM reader_rows WHERE day=? AND source=1 ORDER BY line",
+            (day_key,)))
+        sidecar_rows = iter(database.execute(
+            "SELECT source, line, stamp, message_id FROM reader_rows WHERE day=? AND source=0 "
+            "ORDER BY stamp, seq, CAST(line AS TEXT)", (day_key,)))
+        additional = next(sidecar_rows, None)
+        position = 0
+        for row in ordinary_rows:
+            while additional is not None and row[2] is not None and additional[2] <= row[2]:
+                position = _place_row(database, day_key, additional, position)
+                additional = next(sidecar_rows, None)
+            position = _place_row(database, day_key, row, position)
+        while additional is not None:
+            position = _place_row(database, day_key, additional, position)
+            additional = next(sidecar_rows, None)
+        for source, path in enumerate(paths):
+            stamp = _file_stamp(path) if source == 0 or kind != "bot" else None
+            if stamp is not None:
+                database.execute("INSERT INTO reader_files VALUES (?, ?, ?, ?, ?)", (day_key, source, *stamp))
+    return day_key
+
+
+def _index_ordinary(database: sqlite3.Connection, day_key: str, kind: str,
+                    target: int | str | None, day: tuple[int, int, int], line: int,
+                    offset: int, end: int, head: str) -> None:
+    parsed = parse_log(head, kind=kind, target=None if kind == "bot" else int(target), day=day)
+    if not parsed:
+        return
+    record = parsed[0]
+    # WHY: A recall notice names the message it withdrew; it is not another
+    # stored copy of that message and must not hide it from archive reads.
+    message_id = record.get("message_id") if record.get("_kind") != "recall" else None
+    database.execute("INSERT INTO reader_rows VALUES (?, 1, ?, ?, ?, ?, NULL, ?, NULL, 1)",
+                     (day_key, line, offset, end, record.get("time"),
+                      recall_key(message_id) if message_id is not None else None))
+
+
+def _place_row(database: sqlite3.Connection, day_key: str, row: tuple, position: int) -> int:
+    source, line, _stamp, message_id = row
+    if message_id is not None:
+        database.execute("UPDATE reader_rows SET visible=0 WHERE day=? AND message_id=? AND visible=1",
+                         (day_key, message_id))
+    database.execute("UPDATE reader_rows SET position=?, visible=1 WHERE day=? AND source=? AND line=?",
+                     (position, day_key, source, line))
+    return position + 1
+
+
+def _read_indexed_record(kind: str, target: int | str | None, day: tuple[int, int, int],
+                         row: tuple, bot_id: int | None, switch: int | None,
+                         bot_names: dict[str, int], names_complete: bool,
+                         root: str | os.PathLike | None) -> dict[str, Any]:
+    source, line, offset, end = row
+    ordinary, sidecar = _day_paths(kind, target, day, root)
+    base = Path(rootfile if root is None else root)
+    path = sidecar if source == 0 else ordinary
+    with path.open("rb") as file:
+        file.seek(offset)
+        chunk = file.readline() if end is None else file.read(end - offset)
+    origin = f"{path.relative_to(base)}:{line}"
+    if source == 1:
+        start, finish = _day_bounds(day)
+        records = parse_log(chunk.decode("utf-8"), kind=kind,
+                            target=None if kind == "bot" else int(target), day=day,
+                            bot_id=bot_id, version=_day_version(start, finish, switch),
+                            bot_names=bot_names, names_complete=names_complete)
+        record = records[0]
+        record["_log_origin"] = origin
+        return record
+    message = json.loads(chunk)
+    _backfill_archive._validate(message)
+    parts = (kind, str(target), f"{day[0]:04d}-{day[1]:02d}", sidecar.name)
+    record = _backfill_archive._project(message, sidecar, line, parts, base)
+    if isinstance(record.get("raw_message"), str):
+        record["message"] = record["raw_message"]
+    bot_ids = set(bot_names.values()) | ({bot_id} if bot_id is not None else set())
+    if "post_type" not in record and bot_ids:
+        record["post_type"] = "message_sent" if int(record["user_id"]) in bot_ids else "message"
+        record["_derived"].append("post_type")
+        record["_missing"].remove("post_type")
+    return record
+
+
+def _locate_origin(kind: str, target: int | str | None, origin: str,
+                   root: str | os.PathLike | None,
+                   database: sqlite3.Connection) -> tuple[tuple[int, int, int], int, tuple]:
+    directory = window_path(kind, target, root)
+    base = Path(rootfile if root is None else root)
+    if not isinstance(origin, str):
+        raise ValueError("chatlog 游标不是记录定位")
+    origin_path, separator, line_text = origin.rpartition(":")
+    relative = Path(origin_path)
+    if (not separator or not line_text.isdecimal() or str(int(line_text)) != line_text
+            or relative.is_absolute() or str(relative) != origin_path
+            or relative.parent.parent != directory.relative_to(base)):
+        raise ValueError("chatlog 游标不属于当前窗口")
+    path = base / relative
+    day = _archive_day(path)
+    if (day is None or not path.is_file()
+            or not path.resolve().is_relative_to(directory.resolve())):
+        raise ValueError("chatlog 游标不是记录定位")
+    day_key = _index_day(database, kind, target, day, root)
+    source = 0 if path.name.endswith(".backfill.jsonl") else 1
+    row = database.execute("SELECT source, line, offset, end, position FROM reader_rows "
+                           "WHERE day=? AND source=? AND line=?",
+                           (day_key, source, int(line_text))).fetchone()
+    if row is None:
+        raise ValueError("chatlog 游标不是记录定位")
+    return day, row[4], row[:4]
+
+
+def read_origin(
+    kind: str,
+    target: int | str | None,
+    origin: str,
+    *,
+    bot_id: int | None = None,
+    root: str | os.PathLike | None = None,
+) -> dict[str, Any]:
+    """Read exactly one existing record by its stable window-local origin."""
+    directory = window_path(kind, target, root)
+    if not directory.is_dir():
+        raise ValueError("chatlog 游标不是记录定位")
+    bot_names, names_complete = _bot_identities()
+    with _append_lock, _backfill_archive._lock, _reader_lock, closing(_reader_index(directory)) as database:
+        day, _, row = _locate_origin(kind, target, origin, root, database)
+        return _read_indexed_record(kind, target, day, row, _bot_id() if bot_id is None else bot_id,
+                                    _switch_moment(), bot_names, names_complete, root)
+
+
 def read_range(
     kind: str,
     target: int | str | None = None,
@@ -888,14 +1155,15 @@ def read_range(
     since: int | None = None,
     until: int | None = None,
     limit: int | None = None,
+    before: str | None = None,
     bot_id: int | None = None,
     root: str | os.PathLike | None = None,
 ) -> list[dict[str, Any]]:
     """Rebuild one window's records for a time range, newest first.
 
-    The order is the append order reversed, not a sort by ``time``: the log
-    means "this was written after that", and a record the parser could not
-    timestamp still has a place in it.  Bounds are inclusive epoch seconds;
+    Ordinary log records retain append order; independently archived NapCat
+    messages merge by time and sequence, with a stable same-second tie rule.
+    Bounds are inclusive epoch seconds;
     ``None`` means open.  Records the parser
     could not place in time (an unstamped legacy line) are dropped as soon as
     either bound is set -- a time range cannot answer for them -- and kept when
@@ -910,60 +1178,102 @@ def read_range(
     ``limit`` caps the result at the newest that many records, and the day walk
     stops as soon as enough are collected -- that is what makes backfilling past
     the in-memory cap (``history.MAX_LEN``) affordable instead of reading the
-    whole tree.  ``None`` means no cap.
+    whole tree.  ``None`` means no cap.  ``before`` is the ``_log_origin`` of a
+    record in this window; that record is excluded and the walk continues from
+    the preceding record in merged order.  A copy hidden by a later duplicate
+    remains a valid locator.  Invalid or foreign cursors fail rather than
+    silently returning an unrelated page.
     """
     directory = window_path(kind, target, root)
     if not directory.is_dir():
+        if before is not None:
+            raise ValueError("chatlog 游标不是记录定位")
         return []
     if bot_id is None:
         bot_id = _bot_id()
     switch = _switch_moment()
     bot_names, names_complete = _bot_identities()
+    if limit is not None and limit <= 0 and before is None:
+        return []
     records: list[dict[str, Any]] = []
-    # WHY: 倒着走天文件、每天内再倒着收，得到的次序与"全读一遍再 reverse"完全相同——
-    # 日志是 append-only，全局正序就是"天升序 × 天内正序"，反过来即"天倒序 × 天内倒序"。
-    # 换了写法是为了能读够 limit 条就停；不设 limit 时行为与从前逐条一致。
-    for path in sorted(directory.rglob("*.log"), reverse=True):
-        day = day_of(path)
-        if day is None:
-            continue
-        start, end = _day_bounds(day)
-        if since is not None and end <= since:
-            # 天已经倒序，这一天整天的上界都在 since 之前，再往前只会更早。
-            break
-        if until is not None and start > until:
-            continue
-        try:
-            content = path.read_text(encoding="utf-8")
-        except OSError:
-            logger.exception("读取 chatlog 文件失败：%s", path)
-            continue
-        parsed = parse_log(
-            content,
-            kind=kind,
-            target=None if kind == "bot" else int(target),
-            day=day,
-            bot_id=bot_id,
-            version=_day_version(start, end, switch),
-            bot_names=bot_names,
-            names_complete=names_complete,
-            origin_path=str(path.relative_to(Path(rootfile if root is None else root))),
-        )
-        batch = []
-        for record in parsed:
-            when = record.get("time")
-            if since is not None and (when is None or when < since):
+    with _append_lock, _backfill_archive._lock, _reader_lock, closing(_reader_index(directory)) as database:
+        cursor_day = cursor_position = None
+        if before is not None:
+            cursor_day, cursor_position, _ = _locate_origin(kind, target, before, root, database)
+        for day in _archive_days(directory):
+            if cursor_day is not None and day > cursor_day:
                 continue
-            if until is not None and (when is None or when > until):
+            start, end = _day_bounds(day)
+            if since is not None and end <= since:
+                break
+            if until is not None and start > until:
                 continue
-            batch.append(record)
-        batch.reverse()
-        records.extend(batch)
-        if limit is not None and len(records) >= limit:
-            break
-    if limit is not None:
-        del records[limit:]
+            day_key = _index_day(database, kind, target, day, root)
+            maximum = cursor_position if day == cursor_day else None
+            for row in database.execute(
+                    "SELECT source, line, offset, end, stamp FROM reader_rows WHERE day=? AND visible=1 "
+                    "AND (? IS NULL OR position<?) AND (? IS NULL OR stamp>=?) "
+                    "AND (? IS NULL OR stamp<=?) ORDER BY position DESC",
+                    (day_key, maximum, maximum, since, since, until, until)):
+                record = _read_indexed_record(kind, target, day, row[:4], bot_id, switch,
+                                              bot_names, names_complete, root)
+                records.append(record)
+                if limit is not None and len(records) >= limit:
+                    return records[:limit]
     return records
+
+
+def known_windows() -> list[tuple[str, int]]:
+    """Only windows already represented in the local archive are boot candidates."""
+    windows = []
+    for kind in ("group", "private"):
+        base = Path(rootfile) / kind
+        if base.is_dir():
+            windows.extend((kind, int(path.name)) for path in base.iterdir()
+                           if path.is_dir() and path.name.isdecimal())
+    return windows
+
+
+def last_message_anchor(kind: str, target: int) -> str | None:
+    """Freeze the latest reliable QQ message identity before live ingress begins."""
+    for day in _archive_days(window_path(kind, target)):
+        directory = window_path(kind, target) / f"{day[0]:04d}-{day[1]:02d}"
+        ordinary = directory / f"{day[2]:02d}.log"
+        sidecar = directory / f"{day[2]:02d}.backfill.jsonl"
+        latest: tuple[int, int, int, str] | None = None
+        if ordinary.is_file():
+            with ordinary.open(encoding="utf-8") as file:
+                for line_number, line in enumerate(file):
+                    if line.startswith("    "):
+                        continue
+                    head = _split_head(line.rstrip("\r\n"))
+                    message_id = head.get("message_id") if head is not None else None
+                    if message_id is not None and message_id.lstrip("-").isdigit():
+                        candidate = (_epoch(day, head["stamp"]), 1, line_number,
+                                     recall_key(message_id))
+                        if latest is None or candidate[:3] > latest[:3]:
+                            latest = candidate
+        if sidecar.is_file():
+            for record in _backfill_archive.iter_day(sidecar, root=rootfile):
+                message_id = record.get("message_id")
+                if message_id is None or not str(message_id).lstrip("-").isdigit():
+                    continue
+                candidate = (int(record["time"]), 0, int(record["message_seq"]),
+                             recall_key(message_id))
+                if latest is None or candidate[:3] > latest[:3]:
+                    latest = candidate
+        if latest is not None:
+            return latest[3]
+    return None
+
+
+def freeze_boot_anchors() -> dict[tuple[str, int], str | None]:
+    """Freeze local anchors before the OneBot listener accepts a live message."""
+    global _boot_anchors
+    with _append_lock:
+        if _boot_anchors is None:
+            _boot_anchors = {window: last_message_anchor(*window) for window in known_windows()}
+        return dict(_boot_anchors)
 
 
 def recalled_ids(kind: str, target: int | str) -> set[str]:
@@ -1020,39 +1330,37 @@ def recalled_ids(kind: str, target: int | str) -> set[str]:
 
 def _restore_window(kind: str, target: int, count: int, floor: int) -> list[dict[str, Any]]:
     """The newest *count* rebuildable events of one window, newest first."""
+    if count <= 0:
+        return []
     got: list[dict[str, Any]] = []
-    recalled: set[int] = set()
-    for path in sorted(window_path(kind, target).rglob("*.log"), reverse=True):
-        day = day_of(path)
-        if day is None:
-            continue
-        start, end = _day_bounds(day)
-        if end <= floor:
-            break
-        try:
-            content = path.read_text(encoding="utf-8")
-        except OSError:
-            logger.exception("重建近期窗口时读取失败：%s", path)
-            continue
-        parsed = parse_log(
-            content,
-            kind=kind,
-            target=target,
-            day=day,
-            bot_id=_bot_id(),
-            version=_day_version(start, end, floor),
-            origin_path=str(path.relative_to(rootfile)),
-        )
-        recalled.update(record["message_id"] for record in parsed if record.get("_kind") == "recall")
-        got = [
-            record
-            for record in parsed
-            if (record.get("_version") == V1 and record.get("message_id") not in recalled)
-            or record.get("_kind") == "poke"
-        ] + got
-        if len(got) >= count:
-            break
-    return list(reversed(got[-count:]))
+    directory = window_path(kind, target)
+    if not directory.is_dir():
+        return got
+    with _append_lock, _backfill_archive._lock, _reader_lock, closing(_reader_index(directory)) as database:
+        database.execute("CREATE TEMP TABLE reader_recalls (message_id TEXT PRIMARY KEY)")
+        for day in _archive_days(directory):
+            start, end = _day_bounds(day)
+            if end <= floor:
+                break
+            day_key = _index_day(database, kind, target, day, None)
+            for row in database.execute(
+                    "SELECT source, line, offset, end FROM reader_rows WHERE day=? AND visible=1 "
+                    "ORDER BY position DESC", (day_key,)):
+                record = _read_indexed_record(kind, target, day, row, _bot_id(), floor, {}, False, None)
+                if record.get("_kind") == "recall":
+                    database.execute("INSERT OR IGNORE INTO reader_recalls VALUES (?)",
+                                     (recall_key(record["message_id"]),))
+                message_id = record.get("message_id")
+                recalled = message_id is not None and database.execute(
+                    "SELECT 1 FROM reader_recalls WHERE message_id=?",
+                    (recall_key(message_id),)).fetchone() is not None
+                if ((record.get("_version") in (V1, "raw") and record.get("post_type")
+                     and not recalled)
+                        or record.get("_kind") == "poke"):
+                    got.append(record)
+                    if len(got) >= count:
+                        return got
+    return got
 
 
 def _restore_history() -> tuple[int, int]:

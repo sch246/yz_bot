@@ -185,13 +185,15 @@ def _route(event: dict) -> str | None:
             if history is not None:
                 window = history.window(event)
                 if window is not None:
-                    context.cancel_turn(window)
+                    central = context.get_turn(chat.AGENT_WINDOW) if chat is not None else None
+                    central_work = central is not None and window in getattr(central, "associated_windows", ())
+                    context.cancel_turn(chat.AGENT_WINDOW if central_work else window)
                     # WHY: 软停止够不到正在同步执行的工具调用。真能让它回来的是把它
                     # 启动的子进程 kill 掉（卡死的 grep 就是这一类），`exec_code` 那种跑在
                     # 子线程里的代码则靠注入中断。两条都在 mods/watchdog，见那个模块的说明。
                     watchdog = _optional("watchdog")
                     if watchdog is not None:
-                        watchdog.stop(window, "用户 ^C")
+                        watchdog.stop(chat.AGENT_WINDOW if central_work else window, "用户 ^C")
 
         waiter = context.pop_waiter(key)
         if waiter is not None:

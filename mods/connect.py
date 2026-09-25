@@ -195,6 +195,12 @@ def recv_msg() -> dict | None:
 
 def on_load(ctx) -> None:
     global _server
+    from mods import chat
+
+    # WHY: The archive anchor and mail boundary must both predate live ingress;
+    # otherwise a newly received message could hide the offline gap. Chat's
+    # normal on_load is later, so only its preparation hook runs here.
+    chat.prepare_recovery_sources()
     with _server_lock:
         if _server is not None:
             return

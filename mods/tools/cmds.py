@@ -1,9 +1,9 @@
 """把一条命令当成某个人说的，投进任意窗口执行，并把它的输出带回给你。
 
-- `cmds__run_command(".jrrp")` —— 以 Bot 自身身份、在这个窗口里执行 `.jrrp`，
-  返回值就是这条命令本来会发出来的文字。
+- `cmds__run_command(".jrrp", target="g<群号>")` —— 以 Bot 自身身份、在指定窗口执行 `.jrrp`，
+  返回值就是这条命令本来会发出来的文字；中心会话不能省略目标。
 - `cmds__run_command(".jrrp", sender="980001119")` —— 换个身份执行：写 QQ 号，
-  也接受 `[CQ:at,qq=980001119]`。
+  也接受 `[CQ:at,qq=980001119]`。代行不能取得 Bot 自己没有的 op 权限。
 - `cmds__run_command(".jrrp", target="g916083933")` —— 在别的窗口执行：`g<群号>`／`u<QQ号>`，
   留空表示当前窗口。
 - `cmds__run_command(".jrrp", capture=False)` —— 不捕获：命令原样投进事件循环，它的输出
@@ -48,7 +48,7 @@ def run_command(text: str, target: str = "", sender: str = "", capture: bool = T
     sender: 以谁的身份执行：留空=Bot 自己；写 QQ 号或 [CQ:at,qq=...] 表示代行该用户
     capture: True=输出收下来交给你，聊天里不出现；False=原样投递，输出自己冒出来
     """
-    from mods import context, identity
+    from mods import context, identity, op
 
     command_text = text.strip()
     complaint = _complaint(command_text)
@@ -62,6 +62,10 @@ def run_command(text: str, target: str = "", sender: str = "", capture: bool = T
     executor, delegated, complaint = _resolve_sender(sender, identity.bot_id())
     if complaint:
         return complaint
+    # WHY: 下游命令按合成事件的作者判权。Bot 自身没有 op 权限时，代行人类 op
+    # 会把模型本应失去的宿主能力重新打开；在造事件前限制这条路径。
+    if delegated and op.is_op(executor) and not op.bot_is_op():
+        return "权限不足：Bot 不能代行 op 执行命令"
     event = _event(command_text, group_id, user_id, executor)
     if not capture:
         from mods import connect
@@ -78,10 +82,13 @@ def _capture(event: dict, text: str, executor, delegated: bool) -> str:
 
     collected: list[str] = []
     origin = context.current()
+    agent_mode = getattr(context, "agent_mode", lambda: False)()
     saved = (message.send, message.sendmsg)
     message.send = _interceptor(saved[0], event, collected)
     message.sendmsg = _interceptor(saved[1], event, collected)
     try:
+        if agent_mode:
+            context.set_agent_mode(False)
         context.set_current(event)
         matched = command.match(text[1:]) if text.startswith(".") else None
         if matched is None:
@@ -91,6 +98,8 @@ def _capture(event: dict, text: str, executor, delegated: bool) -> str:
     finally:
         message.send, message.sendmsg = saved
         context.set_current(origin)
+        if agent_mode:
+            context.set_agent_mode(True)
     body = "\n".join(part for part in collected if part.strip())
     if not body:
         return "（这条命令没有输出）"

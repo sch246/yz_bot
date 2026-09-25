@@ -119,6 +119,10 @@ _local = threading.local()
 
 def owner_key() -> Any:
     """调用线程归属的窗口；没有路由信息时退回线程标识。"""
+    if context.agent_mode():
+        from mods import chat
+
+        return chat.AGENT_WINDOW
     event = context.current()
     if isinstance(event, dict) and event:
         from mods import history
@@ -200,6 +204,7 @@ def run(routine: Callable[[], Any], timeout: float = 0.0) -> Any:
     """
     job = begin()
     origin = context.current()
+    agent_mode = context.agent_mode()
     outcome: dict[str, Any] = {}
     done = threading.Event()
 
@@ -209,11 +214,13 @@ def run(routine: Callable[[], Any], timeout: float = 0.0) -> Any:
             done.set()
             return
         context.set_current(origin)
+        context.set_agent_mode(agent_mode)
         try:
             outcome["value"] = routine()
         except BaseException as error:
             outcome["error"] = error
         finally:
+            context.set_agent_mode(False)
             context.clear_current()
             done.set()
 

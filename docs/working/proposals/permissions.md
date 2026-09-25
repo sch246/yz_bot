@@ -138,7 +138,7 @@
 
 模型工具里的宿主代码、文件、shell、本地图片、本地文件发送、任意用户数据修改、任意代码延时任务和 `send_command` 都读 `op.bot_is_op()`；`BOT_OP_ONLY` 模块的目录与加载也读同一项。mail 读到谁、谁触发续读、当前窗口里混进谁的消息，都不改变它。
 
-`cmds__run_command` 留空 `sender` 时以 Bot 自己执行；显式 `sender=X` 与 `message.recvmsg(sender_id=X)` 保持代行，构造作者为 X 的真实路由事件，后续命令按 X 的 `ops` 成员关系判权。人类直接命令也仍按其事件作者判权。
+`cmds__run_command` 留空 `sender` 时以 Bot 自己执行；显式 `sender=X` 构造作者为 X 的真实路由事件，后续命令按 X 的 `ops` 成员关系判权，但 Bot 自身没有 op 权限时不能代行人类 op。`message.recvmsg(sender_id=X)` 是可编程环境里的代行函数，不直接作为模型工具暴露；人类直接命令仍按其事件作者判权。
 
 #### 顺带：它也解掉了「identity 取最后那个」那条推论的麻烦
 

@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import ast
 from datetime import datetime, timezone
+import json
 import re
 import threading
 import time
 import traceback
 from typing import Callable
 
-from mods import context, cq, history, identity, image, llm, log, message, msgs, op, oplog, py, storage, text, thread, tools as tool_modules
+from mods import _source_pages, context, cq, history, identity, image, llm, log, message, msgs, op, oplog, py, storage, text, thread, tools as tool_modules
 from mods.command import command
 from mods.capture import capture
 from mods.llm import pricing
@@ -46,6 +47,12 @@ llm_config: dict = {}
 # 而一个纯聊天的会话本来就远用不满，所以它的默认值是"够用"而不是"尽量小"。
 DEFAULT_MAX_EVENTS = 20
 DEFAULT_MAX_TOKEN = 50000
+AGENT_WINDOW = oplog.AGENT_WINDOW
+MAIL_PAGE_EVENTS = 8
+MAIL_PAGE_TOKENS = 4000
+RESULT_PAGE_EVENTS = 1
+RESULT_ITEM_TOKENS = MAIL_PAGE_TOKENS
+NOTICE_TOKENS = 500
 _PRESSURE_PERCENT = 75
 _cost_lock = threading.Lock()
 # Eager capture is image work reported on the image stream, not chat traffic.
@@ -57,6 +64,8 @@ _hint_stream = log.stream("hint")
 
 
 def getchatstorage(event: dict | None = None) -> dict:
+    if context.agent_mode():
+        return storage.get("", "agent")
     event = context.current() if event is None else event
     if event is None:
         raise RuntimeError("当前没有聊天窗口")
@@ -92,6 +101,10 @@ def limit(event: dict | None = None) -> tuple[int, int]:
     两个值都从 WINDOW_SETTINGS 取，窗口没写就用默认。没有窗口（没有 group_id 也
     没有 user_id）时直接给默认值——`#hint` 的默认代码要拿它显示，不该因此抛出去。
     """
+    if context.agent_mode():
+        data = getchatstorage()
+        return (WINDOW_SETTINGS["max_events"][2](data.get("max_events")),
+                WINDOW_SETTINGS["max_token"][2](data.get("max_token")))
     event = context.current() if event is None else event
     if event is None or history.window(event) is None:
         return DEFAULT_MAX_EVENTS, DEFAULT_MAX_TOKEN
@@ -181,6 +194,18 @@ def count_tokens(value: str) -> int:
         return max(1, len(value) // 3)
 
 
+def bounded_excerpt(value: str, max_tokens: int) -> str:
+    """Take the longest leading character span within a token budget."""
+    low, high = 0, len(value)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if count_tokens(value[:middle]) <= max_tokens:
+            low = middle
+        else:
+            high = middle - 1
+    return value[:low]
+
+
 def has_at(user_id: int):
     def predicate(event: dict) -> bool:
         for code in msgs.at_cq(event):
@@ -226,13 +251,23 @@ def msg2chat(event: dict, in_group: bool = True) -> dict:
     ordering are enough for the model to associate the pair, so there is no
     separate self-observation tag.
     """
-    timestamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(event.get("time", time.time())))
-    metadata = [f"  <time>{timestamp}</time>", f"  <message_id>{event.get('message_id', '')}</message_id>"]
-    if in_group:
-        metadata[0:0] = [
-            f"  <user_id>{event.get('user_id')}</user_id>",
-            f"  <name>{identity.getname(event.get('user_id'), event.get('group_id'))!r}</name>",
-        ]
+    when = event.get("time")
+    timestamp = (time.strftime("%Y-%m-%d %H:%M", time.localtime(when))
+                 if isinstance(when, (int, float)) else "未知")
+    window = history.window(event)
+    author = event.get("user_id")
+    name = identity.getname(author, event.get("group_id")) if author is not None else "未知"
+    metadata = [f"  <window>{window}</window>",
+                f"  <user_id>{author}</user_id>",
+                f"  <name>{name!r}</name>",
+                f"  <time>{timestamp}</time>",
+                f"  <message_id>{event.get('message_id', '')}</message_id>"]
+    if event.get("_log_origin"):
+        metadata.append(f"  <origin>{event['_log_origin']}</origin>")
+    source = event.get("_history_source") or ("archive" if event.get("_log_origin") and not event.get("_live") else "live")
+    metadata.append(f"  <source>{source}</source>")
+    if event.get("_history_seq") is not None:
+        metadata.append(f"  <remote_seq>{event['_history_seq']}</remote_seq>")
     content = [{"type": "text", "text": "<metadata>\n" + "\n".join(metadata) + "\n</metadata>"}, *msg_split(event.get("message", ""))]
     return {"role": "user", "content": content}
 
@@ -269,18 +304,107 @@ def event2chat(event: dict, in_group: bool) -> dict:
     if msgs.is_msg(event):
         return msg2chat(event, in_group)
     kind = "群聊事件" if in_group else "私聊事件"
-    return {"role": "user", "content": f"【{kind}】{_poke_text(event)}"}
+    return {"role": "user", "content": f"【{kind} {history.window(event)}】{_poke_text(event)}"}
 
 
 def _model_event(event: dict, in_group: bool) -> dict | None:
     """Project a window event only if it belongs in the model's view."""
     if msgs.is_msg(event):
         value = msgs.body(event)
-        if value.startswith("#") or value in ("聊天开始", "聊天结束"):
+        if value.startswith("#"):
             return None
     elif not _is_context_poke(event, in_group):
         return None
     return event2chat(event, in_group)
+
+
+def parse_target(target: str) -> tuple[str, int]:
+    """Accept only an explicit QQ group or private-peer destination."""
+    matched = re.fullmatch(r"([gu])([1-9][0-9]*)", str(target).strip())
+    if matched is None:
+        raise ValueError("目标必须是 g<群号> 或 u<私聊对端号>")
+    return ("group" if matched[1] == "g" else "private"), int(matched[2])
+
+
+def _unread_detail_text(detail: dict) -> str:
+    window = detail["window"]
+    target = ("g" if window[0] == "group" else "u") + str(window[1])
+    sources = ", ".join(f"{item['kind']} 作者={item['user_id']} 时间={item['time']}"
+                        for item in detail["wake_sources"])
+    recovery = detail.get("recovery")
+    extra = ((f" 补回未读={recovery['remaining']} 补回状态={recovery['state']}"
+              + (f" 缺口={recovery['gap']}" if recovery.get("gap") else ""))
+             if recovery else "")
+    return (f"{target} 未读={detail['unread']} 普通={detail['ordinary']} "
+            f"@/提及={detail['mentions']} 其他唤醒={detail['other_wakes']}"
+            + (f" 唤醒来源：{sources}" if sources else "") + extra)
+
+
+def unread_details() -> list[dict]:
+    details = {tuple(item["window"]): item for item in oplog.pending_details()
+               if item["window"][0] in ("group", "private")}
+    for source in oplog.sources():
+        window = tuple(source["window"])
+        if source["source_type"] != "napcat_boot" or window[0] not in ("group", "private"):
+            continue
+        if not source["remaining"] and source["state"] == "complete":
+            continue
+        detail = details.setdefault(window, {"window": list(window), "unread": 0,
+                                             "ordinary": 0, "mentions": 0,
+                                             "other_wakes": 0, "wake_sources": []})
+        recovery = detail.setdefault("recovery", {"remaining": 0, "state": "complete", "gap": None})
+        recovery["remaining"] += source["remaining"]
+        detail["mentions"] += source["mention_count"] - source["read_mention_count"]
+        if source["state"] == "fetching":
+            recovery["state"] = "fetching"
+        elif source["state"] != "complete" and recovery["state"] != "fetching":
+            recovery["state"] = source["state"]
+        if source["gap"]:
+            recovery["gap"] = source["gap"]
+    return list(details.values())
+
+
+def _notification_projection(entry: dict) -> dict:
+    details = entry.get("unread", ())
+    if details:
+        shown = []
+        for detail in details:
+            candidate = "；".join([*shown, _unread_detail_text(detail)])
+            if count_tokens(candidate) > NOTICE_TOKENS - 150:
+                break
+            shown.append(_unread_detail_text(detail))
+        omitted = len(details) - len(shown)
+        listing = "；".join(shown) + (f"；还有 {omitted} 个窗口未列出，用 list_unread(offset={len(shown)}) 查看"
+                                   if omitted else "")
+    else:
+        listing = "、".join(f"{window[0]}:{window[1]}" for window in entry["windows"])
+    content = (f"[{entry['id']}] 新召唤通知：{listing}。"
+               "正文仍在未读队列；普通消息本身不激活；可先 peek，再指定目标 say，随后逐页 pull_mail。")
+    return {"role": "user", "content": bounded_excerpt(content, NOTICE_TOKENS)}
+
+
+def _pending_hint() -> str:
+    rows = unread_details()
+    independent = [source for source in oplog.sources()
+                   if source["source_type"] == "napcat_history"
+                   and (source["remaining"] or source["state"] != "complete")]
+    if not rows and not independent:
+        return ""
+    shown = []
+    for detail in rows:
+        if len(shown) >= 10 or count_tokens("；".join(_unread_detail_text(item)
+                                                 for item in [*shown, detail])) > NOTICE_TOKENS - 150:
+            break
+        shown.append(detail)
+    tail = f"；另有 {len(rows) - len(shown)} 个窗口，用 list_unread(offset={len(shown)}) 查看" if len(rows) > len(shown) else ""
+    source_lines = [f"{source['name']} key={source['key']} 未读={source['remaining']} "
+                    f"提及={source['mention_count'] - source['read_mention_count']} "
+                    f"状态={source['state']}" + (f" 缺口={source['gap']}" if source['gap'] else "")
+                    for source in independent[:3]]
+    if len(independent) > 3:
+        source_lines.append(f"另有 {len(independent) - 3} 个信源，用 source_status 查看")
+    parts = [*(_unread_detail_text(detail) for detail in shown), tail, *source_lines]
+    return bounded_excerpt("待正式读取：" + "；".join(part for part in parts if part), NOTICE_TOKENS)
 
 
 def _message_cost(converted: dict) -> int:
@@ -292,19 +416,15 @@ def _message_cost(converted: dict) -> int:
 
 def _stream_rows(window: tuple | None, token_limit: int, event_limit: int) -> tuple[list[tuple[dict, dict]], int, bool]:
     """Select one visible suffix by event count and projected token cost."""
-    all_entries = oplog.events(window, True)
-    boundary = next((index for index in range(len(all_entries) - 1, -1, -1)
-                     if all_entries[index]["kind"] == "input" and msgs.is_msg(all_entries[index]["event"])
-                     and msgs.body(all_entries[index]["event"]) in ("聊天开始", "聊天结束")), -1)
-    allowed = {entry["id"] for entry in all_entries[boundary + 1:]}
     entries = oplog.events(window)
-    entries = [entry for entry in entries if entry["id"] in allowed]
-    recalled: set[str] | None = None
+    recalled_by_window: dict[tuple, set[str]] = {}
     links = oplog.say_links(window)
     picked: list[tuple[dict, dict]] = []
     used = 0
     blocked = False
     for entry in reversed(entries):
+        if entry["kind"] == "notification" and not entry.get("acknowledged"):
+            continue
         if len(picked) >= event_limit:
             blocked = True
             break
@@ -314,10 +434,12 @@ def _stream_rows(window: tuple | None, token_limit: int, event_limit: int) -> tu
                 continue
             message_id = entry["event"].get("message_id")
             if message_id is not None and window is not None:
-                if recalled is None:
-                    from mods import chatlog
+                from mods import chatlog
 
-                    recalled = chatlog.recalled_ids(*window)
+                source_window = tuple(entry.get("source_window") or window)
+                if source_window not in recalled_by_window:
+                    recalled_by_window[source_window] = chatlog.recalled_ids(*source_window)
+                recalled = recalled_by_window[source_window]
                 if chatlog.recall_key(message_id) in recalled:
                     continue
             converted = _numbered(projection, entry["id"])
@@ -326,6 +448,8 @@ def _stream_rows(window: tuple | None, token_limit: int, event_limit: int) -> tu
             if not entry["actions"]:
                 continue
             converted = _output_projection(entry, include_body=False)
+        elif entry["kind"] == "notification":
+            converted = _notification_projection(entry)
         else:
             converted = _result_projection(entry, links)
         amount = _message_cost(converted)
@@ -375,18 +499,20 @@ def usage_name(when: datetime | None = None) -> str:
 
 
 def _usage_entry() -> list | None:
-    """The acting user's ``[calls, cost]`` for the current month, or ``None``.
+    """The current LLM actor's ``[calls, cost]`` for the month.
 
-    WHY: 归属用 ``history.author`` 而不是顶层 ``user_id``。私聊窗口的 ``user_id`` 是
-    **窗口对端**，Bot 自己发起的那一轮（比如注入的命令）会因此把费用记到对端头上——
-    这和 ``history.same_author``、``op.is_op`` 修的是同一处混淆。群聊两者本来相同，
-    所以改动只在私聊、且只在 Bot 自己是作者时生效。
+    WHY: 中心 reader 的行动属于 Bot，不能记给刚好唤醒它的群友；独立 `.chat`
+    仍是人类发起的单句请求，保留原作者账目。Bot 的 QQ 号作为中心账本键，
+    旧月份的人类账目不迁移或重写。
 
-    WHY: 没有 user_id 时返回 None，而不是写入一个 "None" 键——那种键 .chattop
-    读不出来（int() 会炸），费用也就永久记丢。宁可这次不计，也不落一个查不到的条目。
+    WHY: 私聊的顶层 `user_id` 是窗口对端，不一定是发起者；私有会话仍用
+    `history.author` 判归属。没有可确定作者时不写入 "None" 键，否则 `.chattop`
+    无法读回这笔费用。
     """
-    event = context.current() or {}
-    user_id = history.author(event)
+    if getattr(context, "agent_mode", lambda: False)():
+        user_id = identity.bot_id()
+    else:
+        user_id = history.author(context.current() or {})
     if user_id is None:
         return None
     usage = storage.get("usage", usage_name())
@@ -401,7 +527,7 @@ def inc_call_count() -> None:
 
 def inc_call_cost(model: str, prompt_tokens: int, completion_tokens: int, cached_tokens: int = 0,
                   requested_at: datetime | None = None) -> None:
-    """把一次调用的费用记到当前发言者名下。
+    """把一次调用的费用记到当前 LLM 主体账目。
 
     WHY: 单价、缓存命中价和峰谷档位全部来自模型/供应商元数据（见 llm.pricing），这里只
     负责取元数据、算钱、记账三件事。命中缓存的那部分必须单独算——聊天的 prompt 大多是
@@ -414,7 +540,7 @@ def inc_call_cost(model: str, prompt_tokens: int, completion_tokens: int, cached
 
 
 def inc_usage_cost(price: float) -> None:
-    """Add one externally calculated cost to the current user's usage."""
+    """Add one externally calculated cost to the current LLM actor's usage."""
     # A storage list is the authority; only this read-modify-write needs a lock.
     with _cost_lock:
         entry = _usage_entry()
@@ -430,8 +556,9 @@ def _base_prompt() -> list[dict]:
 - 聊天中可能不会有明显的问题，扮演好角色即可
 - 如无特殊要求，请用中文回复
 - **说话要调 `say`**。直接写在回复正文里的内容不会发出去，那是你这一轮的自言自语
-- 眼前历史只是本窗口已读信息流按预算选出的可见部分，不是全部记录。覆盖只改变默认显示；按正式号反查仍能取回原文，反查结果被读到后会作为新的结果事件靠近当前
-- 想积累经验就实际写入以后会用的载体：可复用做法写 Markdown Skill 并按需加载，当前窗口待办用 `edit_hint` 保存；只在回复里说“记住了”不会保存它
+- 眼前历史是唯一全局已读信息流按预算选出的可见部分，不是全部记录。通知不等于读取；先用 peek 预览，或用 pull_mail 逐页正式读取
+- 想积累经验就实际写入以后会用的载体：可复用做法写 Markdown Skill 并按需加载，全局待办用 `edit_hint` 保存；只在回复里说“记住了”不会保存它
+- 对外发送必须在 say 里明确写目标 g群号 或 u私聊对端号；没有默认接收窗口
 - `say` 返回这条消息的 message_id；它默认 `final_call=true`，说完这一轮就结束，要接着干活就传 `final_call=false`"""}]
 
 
@@ -442,52 +569,6 @@ def _build_context_snapshot(token_limit: int | None = None) -> list:
     selected_limit = max_tokens if token_limit is None else token_limit
     rows, _used, _blocked = _stream_rows(history.window(current), selected_limit, max_events)
     return _close_with_user([converted for _entry, converted in rows])
-
-
-def _import_legacy(window: tuple, in_group: bool) -> None:
-    """Backfill only archive records admitted on an actual primary-model read."""
-    from mods import chatlog
-
-    max_events, max_tokens = limit(context.current() or {})
-    rows, used, blocked = _stream_rows(window, max_tokens, max_events)
-    remaining_events = max_events - len(rows)
-    remaining_tokens = max_tokens - used
-    if blocked or remaining_events <= 0 or remaining_tokens <= 0:
-        return
-    recalled = chatlog.recalled_ids(*window)
-    scan_limit = max(history.MAX_LEN, remaining_events * 4)
-    candidates: list[tuple[dict, dict]] = []
-    while True:
-        records = chatlog.read_range(*window, limit=scan_limit)
-        candidates.clear()
-        boundary = False
-        for event in records:
-            if msgs.is_msg(event) and msgs.body(event) in ("聊天开始", "聊天结束"):
-                boundary = True
-                break
-            if msgs.is_msg(event):
-                if (event.get("_version") != chatlog.V1
-                        or event.get("post_type") not in ("message", "message_sent")
-                        or event.get("message_id") is None
-                        or chatlog.recall_key(event["message_id"]) in recalled):
-                    continue
-            elif event.get("_kind") != "poke":
-                continue
-            converted = _model_event(event, in_group)
-            if converted is None:
-                continue
-            origin = event.get("_log_origin")
-            if not origin:
-                raise RuntimeError("历史记录没有稳定 chatlog 定位，拒绝无号投影")
-            if oplog.origin_status(window, origin) is None:
-                candidates.append((event, converted))
-                if len(candidates) >= remaining_events:
-                    break
-        if boundary or len(candidates) >= remaining_events or len(records) < scan_limit:
-            break
-        scan_limit *= 2
-    oplog.import_legacy(window, candidates, remaining_events, remaining_tokens,
-                        lambda projection, event_id: _message_cost(_numbered(projection, event_id)))
 
 
 def _numbered(converted: dict, event_id: str) -> dict:
@@ -521,7 +602,8 @@ def _output_projection(entry: dict, *, include_body: bool = True) -> dict:
     return {"role": "user", "content": f"[{entry['id']}] 自己的输出：{body}\n{actions}"}
 
 
-def _result_projection(entry: dict, links: dict[str, tuple[str, str]]) -> dict:
+def _result_projection(entry: dict, links: dict[str, tuple[str, str]],
+                       max_tokens: int = MAIL_PAGE_TOKENS) -> dict:
     lines = []
     for result in entry["returns"]:
         reference = f"{entry['source']}#{result['position'] + 1}"
@@ -531,7 +613,12 @@ def _result_projection(entry: dict, links: dict[str, tuple[str, str]]) -> dict:
             if linked and linked[1] == reference:
                 relation = f" (已确认回声 {linked[0]})"
         lines.append(f"{reference} {result['name']} -> {result['content']}{relation}")
-    return {"role": "user", "content": f"[{entry['id']}] 行动返回：\n" + "\n".join(lines)}
+    content = f"[{entry['id']}] 行动返回：\n" + "\n".join(lines)
+    if count_tokens(content) > max_tokens:
+        marker = (f"\n结果未读完；用 recall_events(ids={[entry['id']]!r}, offset=0) "
+                  "按字符偏移续读持久化的完整结果")
+        content = bounded_excerpt(content, max(1, max_tokens - count_tokens(marker) - 20)) + marker
+    return {"role": "user", "content": content}
 
 
 def build_context(token_limit: int | None = None) -> list:
@@ -579,10 +666,13 @@ def init_chat(
     """Assemble one Chat and return its tool binding and window."""
     prompts["base"] = _base_prompt()
     group = context.current().get("group_id") if context.current() else None
-    state = {"role": "system", "content": f"当前所在群聊:{identity.getgroupname(group)}({group})"} if group is not None else {"role": "system", "content": f"当前在私聊:{identity.getname()}({context.current().get('user_id')})"}
+    state = ({"role": "system", "content": "你是唯一的中心 agent；窗口只是来源与明确发送目标。"}
+             if context.agent_mode() else
+             ({"role": "system", "content": f"当前所在群聊:{identity.getgroupname(group)}({group})"}
+              if group is not None else {"role": "system", "content": f"当前在私聊:{identity.getname()}({context.current().get('user_id')})"}))
     ui_mode = get_tools_mode() == "ui"
     tool_context = tool_modules.create_context_message(ui_mode=ui_mode)
-    window = history.window(context.current() or {})
+    window = AGENT_WINDOW if context.agent_mode() else history.window(context.current() or {})
     session.set_messages([
         *get_prompt(),
         *prompts["base"],
@@ -590,8 +680,8 @@ def init_chat(
         state,
         *(messages or []),
     ])
-    # WHY: 已激活的工具模块属于**窗口**，要在激活时装回去，改的时候也写回去。每轮
-    # `_run_chat` 都新建一个 `llm.Chat`，激活只在内存里活着的话，下一轮模型就拿着上一轮
+    # WHY: 激活态属于会话主体：主 reader 存全局 agent，独立 .chat 存窗口。每轮
+    # 都新建一个 `llm.Chat`，激活只在内存里活着的话，下一轮模型就拿着上一轮
     # 装载过的名字去调用，而快照里没有——那个调用被丢掉、整轮直接结束，模型连自救的机会
     # 都没有（2026-09-17 `browser__open_page`）。读写在 `_active_modules`／
     # `_persist_modules`，理由写在那里。
@@ -602,6 +692,9 @@ def init_chat(
         session,
         tool_context,
         ui_mode=ui_mode,
+        visible=(lambda name, module: name not in {
+            "agents", "amap", "baidumap", "dianping", "image", "later"
+        } and tool_modules.bot_op_tool_visible(name, module)) if context.agent_mode() else None,
         persist=_persist_modules(window) if window is not None else None,
     )
     return binding, window
@@ -630,9 +723,9 @@ def _activate_chat(
     session.keep_reasoning = get_reasoning_mode() == "keep"
     # WHY: `.chat` 只接受单句输入，不读取窗口 mail；它的下次请求必须从原生
     # 工具配对得到同步返回。只有装了 mail reader 的主会话才能安全撤掉原生载体。
-    session.on_output = (lambda assistant, calls: _record_output(window, assistant, calls)
+    session.on_output = (lambda assistant, calls: _record_output(window, assistant, calls, session)
                          if read_mail else oplog.output(window, assistant, calls))
-    session.on_results = _stream_results(window, binding)
+    session.on_results = _stream_results(window, binding) if read_mail else _private_results(window, binding)
     return binding
 
 
@@ -689,24 +782,38 @@ def _stream_results(window, binding):
         for result in results:
             binding.touch(result.name)
         if window is not None:
-            context.mailbox(window).add({"_stream_results": {
-                "source": source,
-                "returns": [{"position": position, "name": result.name,
-                             "arguments": result.arguments, "content": result.content,
-                             "tool_call_id": result.tool_call_id}
-                            for position, result in enumerate(results)],
-            }})
+            for position, result in enumerate(results):
+                context.mailbox(window).add({"_stream_results": {
+                    "source": source,
+                    "returns": [{"position": position, "name": result.name,
+                                 "arguments": result.arguments, "content": result.content,
+                                 "tool_call_id": result.tool_call_id}],
+                }})
     return record
 
 
-def _record_output(window, assistant: dict, calls: list[dict]) -> tuple[str, dict] | None:
+def _private_results(window, binding):
+    def record(source: str, results: list[llm.ToolCallResult]) -> None:
+        for position, result in enumerate(results):
+            binding.touch(result.name)
+            if window is not None:
+                oplog.result(window, source, [{"position": position, "name": result.name,
+                                              "arguments": result.arguments, "content": result.content,
+                                              "tool_call_id": result.tool_call_id}], "")
+    return record
+
+
+def _record_output(window, assistant: dict, calls: list[dict], session=None) -> tuple[str, dict] | None:
     source = oplog.output(window, assistant, calls)
     if source is None:
         return None
     entry, missing = oplog.recall_events(window, [source])
     if missing:
         raise RuntimeError("刚写入的模型输出无法反查")
-    return source, _output_projection(entry[0])
+    projection = _output_projection(entry[0])
+    if session is not None:
+        session.stream_ids[id(projection)] = source
+    return source, projection
 
 
 def _condense_projection(messages: list[dict], window: tuple, sources: set[str]) -> int:
@@ -719,6 +826,16 @@ def _condense_projection(messages: list[dict], window: tuple, sources: set[str])
     removed = len(messages) - len(kept)
     messages[:] = kept
     return removed
+
+
+def _trusted_stream_ids(session: llm.Chat) -> set[str]:
+    return {session.stream_ids[id(message)] for message in session.messages
+            if id(message) in getattr(session, "stream_ids", {})}
+
+
+def _cover_agent_projection(session: llm.Chat, members: set[str]) -> None:
+    session.messages[:] = [message for message in session.messages
+                          if session.stream_ids.get(id(message)) not in members]
 
 
 def _visible_stream_ids(messages: list[dict]) -> set[str]:
@@ -746,50 +863,252 @@ def _cover_projection(messages: list[dict], members: set[str]) -> None:
                    if not (_visible_stream_ids([message]) & members)]
 
 
-def _interject_provider(turn, in_group: bool, session: llm.Chat):
-    """Advance the window's watermark into messages appended before the next request.
-
-    `_run_chat` 开局通过 `Mailbox.rebuild` 原子取得并渲染当时的未读段；之后到达的段
-    在每次子请求前从这里读取。两条路最终都经 Mailbox 的同一个水位线推进动作。
-    """
-    def provide() -> list[dict]:
-        try:
-            def project(entries: list[context.MailEntry]) -> list[dict]:
-                if any(msgs.is_msg(entry.event) and msgs.body(entry.event) in ("聊天开始", "聊天结束")
-                       for entry in entries):
-                    session.messages[:] = [message for message in session.messages
-                                           if not _visible_stream_ids([message])]
-                return _mail_context(entries, in_group, turn.key)
-            produced = turn.mail.advance(project)
-            projected = [message for message in [*session.messages, *produced]
-                         if _visible_stream_ids([message])]
-            turn._chat_usage_tokens = sum(_message_cost(message) for message in projected)
-            return produced
-        except Exception as error:
-            raise llm.RequiredContextError("读取聊天信息流失败，已停止后续行动") from error
-    return provide
-
-
-def _mail_context(entries: list[context.MailEntry], in_group: bool, window: tuple) -> list[dict]:
-    """Project one drained mail segment through the history-visible rules."""
+def _mail_context(entries: list[context.MailEntry], in_group: bool, window: tuple,
+                  max_tokens: int = MAIL_PAGE_TOKENS) -> list[dict]:
+    """Project a global mailbox of tool results, never a window's chat mail."""
     output = []
     for entry in entries:
         event = entry.event
-        boundary = msgs.is_msg(event) and msgs.body(event) in ("聊天开始", "聊天结束")
-        if "_stream_results" in event:
-            values = event["_stream_results"]
-            recorded = oplog.read(entry.arrival) or oplog.result(window, values["source"], values["returns"], entry.arrival)
-            if recorded is not None and recorded["id"] not in oplog.covered(window) and not recorded.get("condensed"):
-                output.append(_result_projection(recorded, oplog.say_links(window)))
-            continue
-        converted = _model_event(event, in_group)
-        recorded = oplog.read(entry.arrival) or oplog.input(window, event, converted, entry.arrival)
-        if boundary:
-            output.clear()
-        if converted is not None and recorded is not None and recorded["id"] not in oplog.covered(window):
-            output.append(_echo_relation(_numbered(converted, recorded["id"]), recorded,
-                                         oplog.say_links(window)))
+        values = event["_stream_results"]
+        recorded = oplog.read(entry.arrival) or oplog.result(window, values["source"], values["returns"], entry.arrival)
+        if recorded is not None and recorded["id"] not in oplog.covered(window) and not recorded.get("condensed"):
+            output.append(_result_projection(recorded, oplog.say_links(window), max_tokens))
     return output
+
+
+_boot_sources: list[str] = []
+
+
+def prepare_recovery_sources() -> None:
+    """Freeze archive anchors and FIFO boundaries before live ingress opens."""
+    from mods import chatlog
+
+    if _boot_sources:
+        return
+    for window, anchor in chatlog.freeze_boot_anchors().items():
+        source = oplog.start_source("NapCat " + str(window), window, "napcat_boot",
+                                    anchor=anchor)
+        _boot_sources.append(source["key"])
+
+
+def _recovery_sources(window: tuple) -> list[dict]:
+    return [source for source in oplog.sources()
+            if tuple(source["queue_window"]) == window
+            and source["source_type"] == "napcat_boot"]
+
+
+def fetch_remote_source(window: tuple) -> dict:
+    """Extend an unpulled gap or open a separate historical FIFO."""
+    from mods import _backfill, connect
+
+    candidates = [source for source in oplog.sources()
+                  if tuple(source["window"]) == window
+                  and source["source_type"] in ("napcat_boot", "napcat_history")]
+    latest = candidates[-1] if candidates else None
+    if latest is not None and latest["state"] == "fetching":
+        return latest
+    if latest is not None and latest["state"] in ("gap", "failed") and not latest["pulled"]:
+        source = oplog.reopen_source(latest["key"], fetch_anchor=latest["fetch_anchor"])
+    else:
+        target = ("g" if window[0] == "group" else "u") + str(window[1])
+        source = oplog.start_source("NapCat 历史 " + target, window, "napcat_history",
+                                    queue_window="new",
+                                    start_seq=latest["stop_cursor"] if latest else None)
+
+    def fetch() -> None:
+        try:
+            _backfill.recover_source(source, connect.call_api)
+        except Exception:
+            traceback.print_exc()
+            try:
+                state = oplog.resolve_source(source["key"])
+                oplog.finish_source(source["key"], gap="本地归档或入列失败；可重试",
+                                    stop_cursor=state["cursor"])
+            except Exception:
+                traceback.print_exc()
+
+    threading.Thread(target=fetch, name="napcat-source-fetch", daemon=True).start()
+    return source
+
+
+def _read_source_page(window: tuple, source: dict, session: llm.Chat | None) -> tuple[list[dict], str | None]:
+    from mods import chatlog
+
+    page_number = source["read_page"]
+    if page_number is None or page_number < 0:
+        return [], None
+    members = _source_pages.read_page(oplog.source_page_root(), source["key"], page_number)
+    output = []
+    used = 0
+    for offset in range(source["read_offset"], len(members)):
+        if offset - source["read_offset"] >= MAIL_PAGE_EVENTS:
+            break
+        member = members[offset]
+        origin = member["origin"]
+        event = chatlog.read_origin(*window, origin)
+        if event is None:
+            return output, f"补回档案位置已丢失：{origin}"
+        event["_history_source"] = "napcat_backfill"
+        event["_history_seq"] = member.get("message_seq")
+        converted = _model_event(event, window[0] == "group")
+        amount = _message_cost(converted) if converted is not None else 0
+        if used + amount > MAIL_PAGE_TOKENS - 300:
+            if output:
+                break
+            if converted is None:
+                return [], "队首补回记录无法投影"
+            excerpt = bounded_excerpt(json.dumps(converted["content"], ensure_ascii=False),
+                                      MAIL_PAGE_TOKENS - 600)
+            converted = {"role": "user", "content":
+                         f"来源窗口={window} origin={origin}；补回消息过长，先读片段：{excerpt}；"
+                         f"用 peek(origin={origin!r}) 继续"}
+        if offset + 1 < len(members):
+            next_page, next_offset = page_number, offset + 1
+        else:
+            next_page = next((page for page in range(page_number - 1, -1, -1)
+                              if source["page_counts"][page]), -1)
+            next_offset = 0
+        recorded = context.mailbox(window).commit_recovered(
+            member["message_id"],
+            lambda arrival: oplog.input_source(AGENT_WINDOW, event, converted, source["key"],
+                                               page_number, offset, next_page, next_offset,
+                                               origin, window, arrival=arrival,
+                                               mentioned=member.get("mentioned", False)))
+        if converted is not None:
+            projected = _echo_relation(_numbered(converted, recorded["id"]), recorded,
+                                       oplog.say_links(AGENT_WINDOW))
+            output.append(projected)
+            if session is not None:
+                session.stream_ids[id(projected)] = recorded["id"]
+        used += _message_cost(converted) if converted is not None else 0
+    return output, None
+
+
+def _read_mail_page(window: tuple, session: llm.Chat | None = None,
+                    through: str | None = None) -> tuple[list[dict], str | None]:
+    """Read one bounded FIFO page, projecting an oversized archived head by prefix."""
+    box = context.mailbox(window)
+    sources = _recovery_sources(window)
+    if not sources:
+        box.prepare_initial_page(MAIL_PAGE_EVENTS)
+    elif any(source["state"] == "fetching" for source in sources):
+        return [], "该窗口离线补回仍在进行；mail 尚未开放正式拉取"
+    prefix = []
+    for source in sources:
+        prefix = box.unread_through(source["pending_boundary"], MAIL_PAGE_EVENTS)
+        if prefix:
+            break
+        if source["remaining"]:
+            return _read_source_page(window, source, session)
+
+    def project(entries: list[context.MailEntry]) -> list[dict]:
+        selected = []
+        used = 0
+        for entry in entries:
+            event = entry.event
+            if "_stream_results" in event:
+                converted = {"role": "user", "content": str(event["_stream_results"]["returns"])}
+            else:
+                located = {**event, "_log_origin": oplog.arrival_origin(entry.arrival), "_live": True}
+                converted = _model_event(located, window[0] == "group")
+            if converted is None:
+                selected.append((entry, None))
+                continue
+            amount = _message_cost(converted)
+            if used + amount > MAIL_PAGE_TOKENS - 300:
+                break
+            selected.append((entry, converted))
+            used += amount
+        if not selected and entries:
+            raise ValueError("队首消息超过单页 token 上限；未消费，请用有界 peek 检查原文")
+        projections = []
+        for entry, converted in selected:
+            event = entry.event
+            if "_stream_results" in event:
+                values = event["_stream_results"]
+                recorded = oplog.read(entry.arrival) or oplog.result(
+                    AGENT_WINDOW, values["source"], values["returns"], entry.arrival)
+                projected = _result_projection(recorded, oplog.say_links(AGENT_WINDOW),
+                                               RESULT_ITEM_TOKENS)
+                projections.append(projected)
+                if session is not None:
+                    session.stream_ids[id(projected)] = recorded["id"]
+                continue
+            recorded = oplog.read(entry.arrival) or oplog.input(
+                AGENT_WINDOW, event, converted, entry.arrival, source_window=window)
+            if converted is not None and recorded is not None:
+                projected = _echo_relation(_numbered(converted, recorded["id"]), recorded,
+                                           oplog.say_links(AGENT_WINDOW))
+                projections.append(projected)
+                if session is not None:
+                    session.stream_ids[id(projected)] = recorded["id"]
+        return projections, len(selected)
+
+    try:
+        entries = prefix if prefix else box.unread(MAIL_PAGE_EVENTS)
+        if through is not None:
+            entries = [entry for entry in entries if oplog.arrival_before_or_at(entry.arrival, through)]
+        if not entries:
+            return [], None
+        selected = []
+        used = 0
+        for entry in entries:
+            if "_stream_results" in entry.event:
+                converted = {"role": "user", "content": str(entry.event["_stream_results"]["returns"])}
+            else:
+                located = {**entry.event, "_log_origin": oplog.arrival_origin(entry.arrival), "_live": True}
+                converted = _model_event(located, window[0] == "group")
+            amount = _message_cost(converted) if converted is not None else 0
+            if used + amount > MAIL_PAGE_TOKENS - 300:
+                break
+            selected.append(entry)
+            used += amount
+        if not selected:
+            from mods import chatlog
+
+            head = entries[0]
+            origin = oplog.arrival_origin(head.arrival)
+            if "_stream_results" in head.event or not origin:
+                return [], "队首消息超过单页上限且缺少可续读档案；未消费"
+            archive = chatlog.read_origin(*window, origin)
+            if archive is None:
+                return [], "队首消息的精确档案不可读取；未消费"
+            converted = _model_event(archive, window[0] == "group")
+            if converted is None:
+                return [], "队首消息的档案投影不可读取；未消费"
+            rendered = json.dumps(converted["content"], ensure_ascii=False)
+            excerpt = bounded_excerpt(rendered, MAIL_PAGE_TOKENS - 400)
+            if not excerpt:
+                return [], "队首消息的档案位置过长；未消费"
+            target = ("g" if window[0] == "group" else "u") + str(window[1])
+            next_offset = len(excerpt)
+            continuation = (f"内容未读完；用 peek(target={target!r}, origin={origin!r}, "
+                            f"offset={next_offset}) 继续" if next_offset < len(rendered)
+                            else "该归档投影已经读完")
+            partial = {"role": "user", "content":
+                       f"来源窗口={target} origin={origin} arrival={head.arrival}；"
+                       f"队首超长消息的正式归档读取片段：{excerpt}\n{continuation}"}
+            if _message_cost(partial) > MAIL_PAGE_TOKENS - 100:
+                return [], "队首消息的档案位置过长；未消费"
+
+            def project_partial(crossed: list[context.MailEntry]) -> list[dict]:
+                if len(crossed) != 1 or crossed[0].arrival != head.arrival:
+                    raise ValueError("待读队首已变化；未消费")
+                recorded = oplog.input(AGENT_WINDOW, head.event, partial, head.arrival,
+                                       source_window=window)
+                if recorded is None:
+                    raise ValueError("队首归档读取未能持久化；未消费")
+                projected = _echo_relation(_numbered(partial, recorded["id"]), recorded,
+                                           oplog.say_links(AGENT_WINDOW))
+                if session is not None:
+                    session.stream_ids[id(projected)] = recorded["id"]
+                return [projected]
+
+            return box.pull(1, project_partial), None
+        projected, _count = box.pull(len(selected), project)
+        return projected, None
+    except ValueError as error:
+        return [], str(error)
 
 
 def _window_storage(window: tuple) -> dict:
@@ -800,6 +1119,8 @@ def _window_storage(window: tuple) -> dict:
     的细节绑在一起。工具激活走同一个理由：`_activate_chat` 手上的 window 就是它的窗口。
     命名空间与 getchatstorage 同一套。
     """
+    if window == AGENT_WINDOW:
+        return storage.get("", "agent")
     kind, key = window
     return storage.get("groups" if kind == "group" else "users", str(key))
 
@@ -811,7 +1132,7 @@ def _agent_hint(window: tuple) -> str:
     value = _window_storage(window).get(_AGENT_HINT_KEY)
     if not isinstance(value, str) or not value.strip():
         return ""
-    return f"本窗口待办（你用 edit_hint 保存，可整体替换或清空）：\n{value}"
+    return f"待办（你用 edit_hint 保存，可整体替换或清空）：\n{value}"
 
 
 def set_agent_hint(window: tuple, text: str) -> None:
@@ -823,13 +1144,13 @@ def set_agent_hint(window: tuple, text: str) -> None:
     storage.save()
 
 
-# 本窗口持久激活的工具模块名，以及各自最后一次被调用的时刻。别和 WINDOW_SETTINGS 里的
+# 会话主体持久激活的工具模块名，以及各自最后一次被调用的时刻。别和 WINDOW_SETTINGS 里的
 # "tools"（工具状态呈现方式）混用，两者住在同一个 storage 字典里。
 _ACTIVE_MODULES_KEY = "active_tools"
 
 
 def _active_modules(window: tuple) -> dict[str, float]:
-    """本窗口上次装着哪些工具模块、各自最后一次被调用是什么时候（激活时装回去）。
+    """本会话主体上次装着哪些工具模块、各自最后一次被调用是什么时候。
 
     WHY: 值是使用时刻，`tools.SessionBinding.restore` 靠它决定哪些模块已经空闲太久、
     该在这一轮收掉。旧格式（只存名字的列表）一律当成"就是刚才用过"——那是这份格式之前
@@ -848,9 +1169,10 @@ def _active_modules(window: tuple) -> dict[str, float]:
 
 
 def _persist_modules(window: tuple):
-    """给 `SessionBinding` 的回调：把本窗口的激活集合写回 storage。
+    """给 `SessionBinding` 的回调：把会话主体的激活集合写回 storage。
 
-    WHY: 激活是**窗口级**状态，不是单轮状态。`_run_chat` 每轮都新建一个 `llm.Chat`，
+    WHY: 主 reader 的激活是**全局主体**状态，私有 .chat 才按窗口存；都不是单轮状态。
+    每轮都新建一个 `llm.Chat`，
     激活如果只活在内存里，模型下一轮会照上一轮装载过的名字去调用（操作历史轨道把那几次
     `load_tools` 原样重建进了上下文），而那一轮的快照里没有这个名字——`llm` 解析时
     `mapping[name]` 抛 KeyError，整个调用被丢掉，那一轮连一条 tool 结果都没有就结束了
@@ -885,8 +1207,8 @@ def _run_hint(window: tuple, turn=None) -> None:
     """求值本窗口的结束提示，并把结果发出去；触发点写在 `chat` 的 `finally`。
 
     WHY: 唯一信号是"循环停下"：`while` 里每个 `return` 和异常都经过 `finally`，而每轮
-    `_run_chat` 返回时不经过，所以不会每句都刷；`if not owner:` 的早退和不带窗口的单轮
-    chat 也走不到这里，于是"真的结束"只算一次、也只由这一轮的持有者来做。
+    `_run_agent` 返回时不经过，所以不会每句都刷；`if not owner:` 的早退和没有来源窗口的
+    恢复轮也不发送窗口结束提示，于是"真的结束"只算一次、也只由这一轮的持有者来做。
 
     WHY: 求值与发送的任何异常都吞掉、只写日志，绝不抛回 `finally`——这段代码是用户自己
     写的、每次聊天都自动跑，让它抛出去就等于一段烂代码能污染聊天主流程的返回路径。
@@ -931,56 +1253,182 @@ def chat(model: str | None = None) -> None:
     event = context.current() or {}
     window = history.window(event)
     if window is None:
-        _run_chat(model, None, event.get("group_id") is not None)
         return
-    turn, owner = context.begin_turn(window)
+    _drive_agent(model, window)
+
+
+def _drive_agent(model: str | None, window: tuple) -> None:
+    turn, owner = context.begin_turn(AGENT_WINDOW)
     if not owner:
-        # 一个窗口只有一个 reader。事件已经在 mail；当前 reader 会在下一次子请求前读到，
-        # 或在收尾时发现仍有未读激活元素并继续。这里不再复制一份 trigger 状态。
         return
     turn._chat_usage_tokens = 0
-    in_group = event.get("group_id") is not None
+    turn.requested_pulls = []
+    turn.blocked_windows = set()
+    turn.associated_windows = {window}
     # WHY: 一次对话 = 这次持有的全过程（多轮 + 插话续写，直到 finally），图片检查台账就
     # 活在这段里：同一张图不重复下载/解析，对话结束即清掉，下次再聊重新检查一遍。
     image_ledger = image.begin_conversation()
+    origin = context.current()
     try:
         while True:
-            _run_chat(model, turn, in_group)
+            context.set_current(None)
+            context.set_agent_mode(True)
+            try:
+                if not _run_agent(model, turn):
+                    return
+            finally:
+                context.set_agent_mode(False)
+                context.set_current(origin)
             if turn.cancelled:
                 return
-            if not context.finish_turn(window, turn):
+            turn.associated_windows.intersection_update(
+                set(oplog.work_windows(AGENT_WINDOW))
+                | {window for window, _count, active in oplog.pending_summary() if active}
+                | {window for window, _through in turn.requested_pulls})
+            if not context.finish_turn(AGENT_WINDOW, turn,
+                                       lambda: bool(turn.mail.unread()) or oplog.has_unnotified()
+                                       or bool(turn.requested_pulls)
+                                       or any(window not in turn.blocked_windows
+                                              for window in oplog.work_windows(AGENT_WINDOW))):
                 return
     finally:
         image.end_conversation(image_ledger)
-        context.end_turn(window, turn)
+        context.end_turn(AGENT_WINDOW, turn)
         # WHY: 循环停下的唯一信号就在这里，见 _run_hint。
-        _run_hint(window, turn)
+        if origin is not None:
+            _run_hint(window, turn)
 
 
-def _run_chat(model: str | None, turn, in_group: bool) -> None:
+def _run_agent(model: str | None, turn) -> bool:
     session = llm.Chat(model=model or get_model(), chat_client=llm.get_client())
-    # WHY: 聊天历史与重建出的工具调用记录由 build_context 一起装配，共用一份 token
-    # 预算。`.chat` 单句请求走的是另一条路：它本来就不读聊天历史，也就不载入工具记录。
-    if turn is not None:
-        # history 重建与 mail 排空共用邮箱锁：路由写 history + 入列也拿同一把锁，因此
-        # 两边看到同一个截面。未读段先从重建里排除，再按 mail 顺序追加；这既保住主观
-        # 到达顺序，也不会让超过 max_events 的未读前缀被一次无声的水位线推进跳过去。
-        def rebuild(unread: list[context.MailEntry]) -> list:
-            _import_legacy(turn.key, in_group)
-            boundary = any(msgs.is_msg(entry.event) and msgs.body(entry.event) in ("聊天开始", "聊天结束")
-                           for entry in unread)
-            return [*([] if boundary else _build_context_snapshot()),
-                    *_mail_context(unread, in_group, turn.key)]
+    session.stream_ids = {}
+    session.recall_offsets = {}
+    session.recalled_legacy_ids = set()
+    session.requested_pulls = turn.requested_pulls
+    session.associated_windows = turn.associated_windows
+    session.notification_ids = []
+    max_events, max_tokens = limit()
+    rows, _used, _blocked = _stream_rows(AGENT_WINDOW, max_tokens, max_events)
+    messages = []
+    for entry, projection in rows:
+        messages.append(projection)
+        session.stream_ids[id(projection)] = entry["id"]
+    notice = oplog.deliver_notifications(AGENT_WINDOW)
+    if notice is not None:
+        session.notification_ids.append(notice["id"])
+        turn.associated_windows.update(map(tuple, notice["windows"]))
+        projection = _notification_projection(notice)
+        messages.append(projection)
+        session.stream_ids[id(projection)] = notice["id"]
+    if not turn.requested_pulls:
+        work = [(window, through) for window, through in oplog.work_targets(AGENT_WINDOW).items()
+                if window not in turn.blocked_windows]
+        if notice is None and work:
+            turn.requested_pulls.append(work[0])
+    if not messages and not turn.requested_pulls and not turn.mail.unread():
+        return True
+    _activate_chat(session, _close_with_user(messages), read_mail=True)
+    session.output_recorded = False
 
-        messages, _pending = turn.mail.rebuild(rebuild)
-        _activate_chat(session, messages, read_mail=True)
-        session.add_context_provider(_interject_provider(turn, in_group, session))
-        session.add_hint(lambda: _pressure_hint(turn._chat_usage_tokens, limit(context.current())[1],
-                                                 window_setting("pressure_percent")))
-        session.should_stop = lambda: turn.cancelled
-    else:
-        _activate_chat(session, build_context())
+    def record_output(assistant, calls):
+        recorded = _record_output(AGENT_WINDOW, assistant, calls, session)
+        for event_id in session.notification_ids:
+            oplog.acknowledge_notification(event_id)
+        session.notification_ids.clear()
+        session.output_recorded = True
+        return recorded
+
+    session.on_output = record_output
+    session.add_context_provider(_agent_provider(turn, session))
+    session.add_hint(_pending_hint)
+    session.add_hint(lambda: _pressure_hint(turn._chat_usage_tokens, limit()[1],
+                                            window_setting("pressure_percent")))
+    session.should_stop = lambda: turn.cancelled
     session.chat(recall_func=get_handler(session), description_cache=description_cache)
+    return session.output_recorded
+
+
+def _credit_recall(session: llm.Chat, result: dict, projection: dict) -> None:
+    if result["name"] != "recall_events" or result["content"] not in projection["content"]:
+        return
+    try:
+        arguments = json.loads(result["arguments"] or "{}")
+        ids = arguments["ids"]
+        offset = arguments.get("offset", 0)
+        if not isinstance(ids, list) or not isinstance(offset, int) or offset < 0:
+            return
+        key = tuple(str(event_id) for event_id in ids)
+        if offset == 0:
+            session.recall_offsets[key] = 0
+        if session.recall_offsets.get(key) != offset:
+            return
+        continuation = re.search(r"\n结果未读完；相同 ids 继续 recall_events\(offset=(\d+)\)$",
+                                 result["content"])
+        if continuation is not None:
+            session.recall_offsets[key] = int(continuation.group(1))
+            return
+        found, _missing = oplog.recall_events(AGENT_WINDOW, key)
+        session.recalled_legacy_ids.update(item["id"] for item in found)
+    except (KeyError, TypeError, ValueError):
+        return
+
+
+def _agent_provider(turn, session: llm.Chat):
+    def provide() -> list[dict]:
+        try:
+            def project_results(entries: list[context.MailEntry]) -> list[dict]:
+                projections = []
+                for entry in entries:
+                    for projection in _mail_context([entry], False, AGENT_WINDOW,
+                                                    RESULT_ITEM_TOKENS):
+                        recorded = oplog.read(entry.arrival)
+                        if recorded is not None:
+                            session.stream_ids[id(projection)] = recorded["id"]
+                        for result in entry.event["_stream_results"]["returns"]:
+                            _credit_recall(session, result, projection)
+                        projections.append(projection)
+                return projections
+
+            unread_results = turn.mail.unread()
+            produced = (turn.mail.pull(min(len(unread_results), RESULT_PAGE_EVENTS), project_results)
+                        if unread_results else [])
+            notice = oplog.deliver_notifications(AGENT_WINDOW)
+            new_notice = notice is not None and notice["id"] not in session.notification_ids
+            if new_notice:
+                session.notification_ids.append(notice["id"])
+                turn.associated_windows.update(map(tuple, notice["windows"]))
+                projection = _notification_projection(notice)
+                produced.append(projection)
+                session.stream_ids[id(projection)] = notice["id"]
+            if not unread_results and notice is None and turn.requested_pulls:
+                window, through = turn.requested_pulls.pop(0)
+                if window[0] == "source":
+                    source = oplog.resolve_source(window[1])
+                    if source is None:
+                        page, error = [], "信源不存在"
+                    elif source["state"] == "fetching":
+                        page, error = [], "信源仍在拉取；FIFO 前端尚未固定"
+                    else:
+                        original_window = tuple(source["window"])
+                        turn.associated_windows.add(original_window)
+                        page, error = _read_source_page(original_window, source, session)
+                        if error is None and oplog.resolve_source(source["key"])["read_count"] > source["read_count"]:
+                            oplog.mark_source_pulled(source["key"])
+                else:
+                    turn.associated_windows.add(window)
+                    page, error = _read_mail_page(window, session, through)
+                produced.extend(page)
+                if error:
+                    turn.blocked_windows.add(window)
+                    produced.append({"role": "user", "content": f"{window} 拉取失败：{error}"})
+            turn._chat_usage_tokens = sum(
+                _message_cost(message) for message in [*session.messages, *produced]
+                if id(message) in session.stream_ids
+            )
+            return produced
+        except Exception as error:
+            raise llm.RequiredContextError("读取中心信息流失败，已停止后续行动") from error
+    return provide
 
 
 _SUBCOMMAND_HELP = (
@@ -989,6 +1437,7 @@ _SUBCOMMAND_HELP = (
     ("model <selection>", "查看指定模型信息"),
     ("models", "列出当前供应商的模型（优先在线列表）"),
     ("use_model [selection]", "设置或重置当前模型"),
+    ("agent [model|use_model|limit|use_setting|ops]", "查看或设置中心 agent 的全局模型、预算、设定与操作记录（管理员）；旧窗口覆盖不自动并入"),
     ("prompt", "查看当前提示词"),
     ("add_prompt [count|list]", "追加聊天或给定提示词"),
     ("setting [name]", "列出或查看设定"),
@@ -1006,13 +1455,13 @@ _SUBCOMMAND_HELP = (
 #limit                  显示两个上限和提醒百分比，并标出值来自本窗口还是默认
 #limit <事件数> <token> [提醒百分比] 写入本窗口的上限；省略百分比则保留原设置
 #limit reset            清掉本窗口的上限与提醒百分比，回落到默认
-未读 mail 不受历史限额丢弃；历史 chatlog 只在主模型实际读到时按文件行定位赋号。"""),
+未读 mail 不受历史限额丢弃；本设置是旧窗口配置，不控制中心 agent。"""),
     ("hint [get|set|default]", """查看、编写或开关本窗口的结束提示（管理员）。
 
 格式：#hint | #hint get | #hint set <代码> | #hint set | #hint default [get|set <代码>]
 本窗口的配置在 chat storage 的 hint 键，全局默认在 storage 的 "" 命名空间；生效的是两者按 {**默认, **窗口} 合并之后 code 非空、on 为真的那份。
 聊天循环停下时求值一次，非 None 的结果作为一条消息发出（自带 # 前缀，不进模型上下文）。
-求值环境是共享动态环境，另外注入 window（本窗口）与 usage（最近一次模型子请求实际收到的已编号事件文本 token 估算，含当轮完整 mail 已读段；不含系统提示与工具 schema）。
+求值环境是共享动态环境，另外注入 window（触发窗口）与 usage（中心 reader 最近一次子请求实际收到的已编号事件文本 token 估算；不含系统提示与工具 schema）。
 #hint              切换本窗口的开关（只写本窗口）
 #hint get          显示合并后生效的代码与开关，并标出代码来自哪里
 #hint set <代码>   写入本窗口的代码并打开开关；set 之后第一个换行起即为源码
@@ -1235,6 +1684,60 @@ def _limit_set(tail: str) -> str:
     return "\n".join(f"{name}: {number}" for name, number in written)
 
 
+def _agent_subcommand(tail: str) -> str:
+    """Only the op-gated #agent entry writes the main agent's global settings."""
+    data = storage.get("", "agent")
+    parts = tail.split()
+    if not parts:
+        events, tokens = (WINDOW_SETTINGS["max_events"][2](data.get("max_events")),
+                          WINDOW_SETTINGS["max_token"][2](data.get("max_token")))
+        pressure = WINDOW_SETTINGS["pressure_percent"][2](data.get("pressure_percent"))
+        return (f"model: {get_model(data)}\nlimit: {events} {tokens} {pressure}%\n"
+                f"image: {get_image_mode(data)}\nreasoning: {get_reasoning_mode(data)}\n"
+                f"tools: {get_tools_mode(data)}\nprompt: {data.get('prompt', '(默认)')}")
+    verb, *arguments = parts
+    if verb == "ops" and arguments == ["clear"]:
+        oplog.clear(AGENT_WINDOW)
+        return "已清空中心 agent 的操作视图；正式号未复用"
+    if verb == "ops" and not arguments:
+        return oplog.render(AGENT_WINDOW) or "中心 agent 还没有操作历史"
+    if verb == "use_model" and len(arguments) <= 1:
+        if arguments:
+            try:
+                llm.resolve_model(llm_config, arguments[0])
+            except ValueError as error:
+                return str(error)
+            data["model"] = arguments[0]
+        else:
+            data.pop("model", None)
+    elif (verb == "limit" and len(arguments) in (2, 3)
+          and all(value.isdecimal() and int(value) > 0 for value in arguments)
+          and (len(arguments) == 2 or int(arguments[2]) <= 100)):
+        data["max_events"], data["max_token"] = map(int, arguments[:2])
+        if len(arguments) == 3:
+            data["pressure_percent"] = int(arguments[2])
+    elif verb == "use_setting" and len(arguments) <= 1:
+        if arguments and arguments[0] not in prompts:
+            return "未找到设定"
+        if arguments:
+            data["prompt"] = arguments[0]
+        else:
+            data.pop("prompt", None)
+    elif verb in ("image", "reasoning", "tools") and len(arguments) == 1:
+        modes = {"image": IMAGE_MODES, "reasoning": REASONING_MODES, "tools": TOOLS_MODES}
+        aliases = {"image": IMAGE_MODE_ALIASES, "reasoning": REASONING_ALIASES,
+                   "tools": TOOLS_MODE_ALIASES}
+        raw = arguments[0].lower()
+        choice = aliases[verb].get(raw, raw)
+        if choice not in modes[verb]:
+            return "设置值不受支持"
+        data[verb] = choice
+    else:
+        return "用法：#agent [use_model [selection]|limit <events> <tokens> [提醒百分比]|use_setting [name]|image/reasoning/tools <mode>|ops [clear]]"
+    storage.save()
+    return _agent_subcommand("")
+
+
 def _subcommand(value: str):
     # WHY: hint 的源码要求原样取（含缩进与换行），所以先留一份没 strip 的原文。
     raw = value
@@ -1242,6 +1745,8 @@ def _subcommand(value: str):
     name, _, tail = value.partition(" ")
     tail = tail.strip()
     data = getchatstorage()
+    if name == "agent":
+        return _agent_subcommand(tail)
     if name == "help" and not tail:
         return _subcommand_help()
     if name == "help" and tail:
@@ -1311,11 +1816,8 @@ def _subcommand(value: str):
     if name == "ops" and not tail:
         # WHY: 操作历史是新加的一份持久存储，人必须能看见它、也能重置它。轨道写歪了
         # (记进了不该记的东西、或者收缩坏了)时，这是不用改代码就能恢复的入口。
-        # WHY: clear 现在是清除操作记录的**唯一**入口，这一条 2026-09-19 反转过。原先
-        # 它的适用面很窄——重开一次聊天，地板抬到新起点，旧记录下一轮就被 sweep 扫掉，
-        # clear 只管"聊天进行中途要清轨道又不想断对话"。而 sweep 恰恰因为这条路径被拆了
-        # （一条「聊天开始」删掉 515 轮，见 build_context 那条 WHY），所以现在边界只改
-        # 可见性，不再清除任何东西。按高度退休落位之前，不用 clear 就永远不减。
+        # WHY: sweep 已拆除，事件流不会因历史预算或聊天中的边界字样物理删除。
+        # clear 仍是人手动清除操作视图的恢复入口，正式号不因此复用。
         window = history.window(context.current() or {})
         return oplog.render(window) or "本窗口还没有操作历史"
     if name == "ops" and tail.strip() == "clear":
@@ -1465,7 +1967,7 @@ def _subcommand_call(event: dict) -> Callable | None:
     subcommand = value[1:].strip().partition(" ")[0]
     if subcommand not in _SUBCOMMAND_NAMES:
         return None
-    if subcommand == "hint" and not op.require_op(event, pattern=r"^#\s*hint"):
+    if subcommand in ("hint", "agent") and not op.require_op(event, pattern=r"^#\s*(hint|agent)"):
         # WHY: hint 是用户可写的代码、跑在特权环境、还每次聊天自动执行，权限
         # 与 .py/.link 同级，所以非 op 连命令面都不给；require_op 已经按节流
         # 约定（同一个人的同类重试）给过提醒，这里只要不接管这条消息。
@@ -1513,7 +2015,9 @@ def capture_chat(event: dict) -> bool:
         return False
     # 红点就是「未读里有激活元素」。若这一项已经被 reader 读过，激活也已经得到处理，
     # 不再为了保留旧 trigger 状态额外开一轮；否则只需确保窗口有一个 reader。
-    if not box.activate(event):
+    kind = ("mention" if msgs.is_msg(event) and _addressed(event, msgs.body(event))
+            else "poke" if msgs.is_poke(event) else "wake")
+    if not box.activate(event, kind):
         return True
     chat()
     return True
@@ -1561,7 +2065,7 @@ def _eager_cache_images(event: dict, model: str) -> None:
 
 def eager_cache_images(event: dict) -> None:
     if msgs.is_msg(event) and "[CQ:image" in event.get("message", ""):
-        data = getchatstorage(event)
+        data = storage.get("", "agent")
         if get_image_mode(data) == "eager":
             model = get_model(data)
             count = len(_message_image_urls(event))
@@ -1602,3 +2106,77 @@ def on_load(ctx) -> None:
     chat_groups = storage.get("", "chat_groups", list)
     description_cache = storage.get("llm_system", "description_cache")
     llm_config = llm.get_client().config
+
+    def resume_recovery() -> None:
+        from mods import _backfill, connect, wait_booted
+
+        if not wait_booted(120):
+            return
+        waiting: dict[tuple, list[dict]] = {}
+        for source in oplog.sources():
+            if source["source_type"] == "napcat_boot" and source["state"] == "fetching":
+                waiting.setdefault(tuple(source["window"]), []).append(source)
+        tasks = list(waiting.values())
+        task_lock = threading.Lock()
+
+        def recover() -> None:
+            while True:
+                with task_lock:
+                    if not tasks:
+                        return
+                    sources = tasks.pop()
+                for source in sources:
+                    try:
+                        _backfill.recover_source(source, connect.call_api)
+                        window = tuple(source["window"])
+
+                        def wake_finished(target: tuple) -> None:
+                            context.wait_turn_end(AGENT_WINDOW)
+                            if target in oplog.work_windows(AGENT_WINDOW):
+                                try:
+                                    _drive_agent(None, target)
+                                except Exception:
+                                    traceback.print_exc()
+
+                        threading.Thread(target=wake_finished, args=(window,),
+                                         name="napcat-backfill-wake", daemon=True).start()
+                    except Exception:
+                        traceback.print_exc()
+                        try:
+                            state = oplog.resolve_source(source["key"])
+                            oplog.finish_source(source["key"], gap="本地归档或入列失败；可重试",
+                                                stop_cursor=state["cursor"])
+                        except Exception:
+                            traceback.print_exc()
+                        break
+
+        for index in range(min(2, len(tasks))):
+            threading.Thread(target=recover, name=f"napcat-backfill-{index}", daemon=True).start()
+
+    threading.Thread(target=resume_recovery, name="napcat-backfill-start", daemon=True).start()
+
+    def resume_pending() -> None:
+        from mods import wait_booted
+
+        if not wait_booted(120):
+            return
+        work = oplog.work_windows(AGENT_WINDOW)
+        results_pending = bool(context.mailbox(AGENT_WINDOW).unread())
+        if not work and not oplog.has_unnotified() and not results_pending:
+            return
+        if work:
+            window = work[0]
+        else:
+            window = next(iter(oplog.unacknowledged_windows()), None)
+            if window is None:
+                window = next((window for window, _count, active in oplog.pending_summary()
+                               if active and window[0] in ("group", "private")), None)
+            if window is None and results_pending:
+                window = AGENT_WINDOW
+        if window is not None:
+            try:
+                _drive_agent(None, window)
+            except Exception:
+                traceback.print_exc()
+
+    threading.Thread(target=resume_pending, name="chat-agent-resume", daemon=True).start()

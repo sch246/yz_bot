@@ -2,7 +2,7 @@
 
 `get_time` 读的是 Bot 宿主机的本地时间，是唯一可信的"现在"。凡是涉及今天几号、现在几点、距某天还有多久、最近的节日或纪念日，都先调用它再计算，不要用训练数据里的日期。
 
-`poke` 发出 QQ 的戳一戳动作，作用范围只有当前这个聊天：群聊里可以戳群里任意成员，私聊里只能戳当前对话者，戳别人会直接失败。它只产生一次戳一戳，不发送任何文字，也拿不到对方的反应；想让对方看到内容还是要正常回复。
+`poke` 发出 QQ 的戳一戳动作：中心会话须明确指定窗口；群聊里可以戳群里任意成员，私聊里只能戳对话者。它不发送文字，也拿不到对方的反应；想让对方看到内容还是要正常回复。
 """
 
 import time
@@ -15,15 +15,27 @@ def get_time() -> str:
     return time.strftime("现在是%Y年%m月%d日%H时%M分%S秒")
 
 
-def poke(user_id: int) -> str:
-    """在当前聊天里戳一戳指定用户，成功返回"已戳用户 <QQ号>"，失败返回带原因的提示。
+def poke(user_id: int, target: str = "") -> str:
+    """在明确目标窗口里戳一戳指定用户，成功返回"已戳用户 <QQ号>"。
 
     @param
     user_id: 目标用户 QQ 号；群聊里可以是任意群成员，私聊里只能是当前对话者
+    target: 中心会话必须明确给 g<群号> 或 u<私聊对端号>；私有会话可留空
     """
-    event = context.current() or {}
-    group_id = event.get("group_id")
-    if group_id is None and int(user_id) != int(event.get("user_id", -1)):
+    if context.agent_mode():
+        from mods import chat
+
+        try:
+            window = chat.parse_target(target)
+        except ValueError as error:
+            return str(error)
+        group_id = window[1] if window[0] == "group" else None
+        peer_id = window[1] if window[0] == "private" else None
+    else:
+        event = context.current() or {}
+        group_id = event.get("group_id")
+        peer_id = event.get("target_id") or event.get("user_id")
+    if group_id is None and int(user_id) != int(peer_id or -1):
         return "戳一戳失败：私聊中只能戳当前对话者"
     params = {"user_id": int(user_id)}
     if group_id is not None:

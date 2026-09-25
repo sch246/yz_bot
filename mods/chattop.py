@@ -77,6 +77,7 @@ def run(body: str):
     event = context.current() or {}
     if event.get("group_id") is not None:
         members = {int(item["user_id"]) for item in identity.memberlist(event["group_id"])}
+        members.add(identity.bot_id())
         total, lines = _lines(usage, members)
     elif op.is_op(event):
         total, lines = _lines(usage)
