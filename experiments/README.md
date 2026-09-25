@@ -9,6 +9,8 @@ their parsing, and records byte hashes and event counts. It does not read
 backfill sidecars or a production `v1_since` marker; unmarked group bodies are
 parsed conservatively as v0. The manifest intentionally omits account and
 window IDs, so `run` requires those facts again.
+For old private records without a sender ID, supply the Bot's actual display
+name; other historical Bot names cannot be inferred from the frozen range.
 
 ```sh
 python experiments/memory_replay.py prepare \

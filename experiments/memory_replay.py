@@ -268,7 +268,8 @@ def _run(prepared: Path, output: Path, kind: str, target: int, bot_id: int, bot_
                  for event in ordered if isinstance(event.get("user_id"), int)}
         identity.qq = bot_id
         identity.name, identity.nicknames = bot_name, [bot_name]
-        identity.get_user_name = lambda user_id: names.get(int(user_id), "未知")
+        identity.get_user_name = lambda user_id: (bot_name if int(user_id) == bot_id
+                                                   else names.get(int(user_id), ""))
         identity.getname = lambda user_id=None, group_id=None: names.get(int(user_id), "未知") if user_id is not None else "未知"
 
         class LiteralClient(llm.LLMClient):
