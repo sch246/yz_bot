@@ -244,6 +244,8 @@ class LLMClient:
         self.clients: dict[str, OpenAI] = {}
         self._description_inflight: dict[tuple[str, object], _DescriptionTask] = {}
         self._description_lock = threading.Lock()
+        self.request_policy: Callable[[str, dict], dict] | None = None
+        self.strict_tools = False
         self.reload_clients()
 
     @staticmethod
@@ -522,6 +524,11 @@ class LLMClient:
             params["tools"] = [tool.description for tool in tools]
             if tool_choice:
                 params["tool_choice"] = tool_choice
+        if self.request_policy is not None:
+            options = self.request_policy(selection, params)
+            if set(options) - {"max_tokens"}:
+                raise ValueError("request policy may only set max_tokens")
+            params.update(options)
         if stream:
             params["stream_options"] = {"include_usage": True}
             return self._stream_response(client, params, selection)
@@ -703,6 +710,8 @@ class LLMClient:
                     call = json.loads(chunk.content)
                     function = call["function"]
                 except Exception as error:
+                    if self.strict_tools:
+                        raise RuntimeError("invalid model tool call") from error
                     # WHY: 这里剩下的只有"协议层就坏了"的情形，没有可自救的东西，
                     # 记录并跳过这一次；"名字不在快照里"已经不算失败，见 UnavailableTool。
                     _log.exception("failed to parse LLM tool call")
@@ -712,6 +721,8 @@ class LLMClient:
                 name = function.get("name") or ""
                 tool = mapping.get(name)
                 if tool is None:
+                    if self.strict_tools:
+                        raise RuntimeError(f"tool is not available in this session: {name}")
                     # WHY: 多半是模型照上一轮的印象直呼（激活态已经变了），或者自己写错。
                     # 丢掉它会让整轮静默结束，所以换成一个会说话的占位工具留在这批调用里。
                     tool = UnavailableTool(name, sorted(mapping))
@@ -720,6 +731,8 @@ class LLMClient:
                     try:
                         arguments = json.loads(function["arguments"] or "{}")
                     except Exception as error:
+                        if self.strict_tools:
+                            raise RuntimeError(f"invalid arguments for tool: {name}") from error
                         _log.exception("failed to parse LLM tool arguments")
                         console.error(f"工具参数解析失败：{error}")
                         tool = UnavailableTool(name, sorted(mapping), f"参数不是合法 JSON（{error}）")
@@ -766,6 +779,8 @@ class LLMClient:
                         on_action(f"{output_id}#{position + 1}" if output_id is not None else None)
                     content = str(tool.call(**arguments))
                 except Exception as error:
+                    if self.strict_tools:
+                        raise
                     content = f"工具调用失败: {type(error).__name__}: {error}"
                     console.error(f" -> {content}")
                 else:
@@ -839,6 +854,7 @@ class Chat:
         self.native_seen_calls: set[str] = set()
         self.active_action: str | None = None
         self.reads_window_mail = False
+        self.fail_fast = False
         if messages is not None:
             self.set_messages(messages)
         if functions is not None:
@@ -886,6 +902,8 @@ class Chat:
             try:
                 value = source() if callable(source) else source
             except Exception:
+                if self.fail_fast:
+                    raise
                 # 提醒坏掉不该让整轮聊天失败：它按定义是可有可无的补充。
                 _log.exception("hint source failed")
                 continue
@@ -996,6 +1014,8 @@ class Chat:
                 results.append(chunk)
             return results
         except Exception as error:
+            if self.fail_fast:
+                raise
             # WHY: 有意吞掉所有异常并把错误变成一条 assistant 消息。Bot 在聊天里必须
             # 说点什么——静默死掉是最糟的失败方式，群里没人知道发生了什么。完整
             # traceback 进 _log，聊天里只留一行；那一行带 `#` 所以不会回流进上下文。

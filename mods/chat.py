@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from contextvars import ContextVar
 from datetime import datetime, timezone
 import json
 import re
@@ -61,6 +62,7 @@ _image_stream = log.stream("image")
 _self_talk = log.stream("msg")
 # hint 求值失败只记日志，所以它有自己的流，不混进聊天流量。
 _hint_stream = log.stream("hint")
+_offline_scope: ContextVar[dict | None] = ContextVar("chat_offline_scope", default=None)
 
 
 def getchatstorage(event: dict | None = None) -> dict:
@@ -256,7 +258,11 @@ def msg2chat(event: dict, in_group: bool = True) -> dict:
                  if isinstance(when, (int, float)) else "未知")
     window = history.window(event)
     author = event.get("user_id")
-    name = identity.getname(author, event.get("group_id")) if author is not None else "未知"
+    if _offline_scope.get() is not None:
+        sender = event.get("sender") or {}
+        name = sender.get("card") or sender.get("nickname") or str(author or "未知")
+    else:
+        name = identity.getname(author, event.get("group_id")) if author is not None else "未知"
     metadata = [f"  <window>{window}</window>",
                 f"  <user_id>{author}</user_id>",
                 f"  <name>{name!r}</name>",
@@ -685,11 +691,14 @@ def init_chat(
              ({"role": "system", "content": f"当前所在群聊:{identity.getgroupname(group)}({group})"}
               if group is not None else {"role": "system", "content": f"当前在私聊:{identity.getname()}({context.current().get('user_id')})"}))
     ui_mode = get_tools_mode() == "ui"
-    tool_context = tool_modules.create_context_message(ui_mode=ui_mode)
+    offline = _offline_scope.get()
+    tool_context = tool_modules.create_context_message(
+        ui_mode=ui_mode, registry=offline["registry"] if offline else None)
     window = AGENT_WINDOW if context.agent_mode() else history.window(context.current() or {})
     session.set_messages([
         *get_prompt(),
         *prompts["base"],
+        *([{"role": "system", "content": offline["fact"]}] if offline else []),
         tool_context,
         state,
         *(messages or []),
@@ -708,10 +717,11 @@ def init_chat(
     binding = tool_modules.bind_session(
         session,
         tool_context,
+        registry=offline["registry"] if offline else None,
         ui_mode=ui_mode,
         visible=(lambda name, module: name not in {
             "agents", "amap", "baidumap", "dianping", "image", "later"
-        } and tool_modules.bot_op_tool_visible(name, module)) if context.agent_mode() else None,
+        } and tool_modules.bot_op_tool_visible(name, module)) if context.agent_mode() and not offline else None,
         persist=_persist_modules(window) if window is not None else None,
     )
     return binding, window
@@ -786,6 +796,9 @@ def get_handler(session: llm.Chat):
     宁可静默一轮、在终端留下证据。
     """
     def handle(chunk: llm.LLMResponse) -> None:
+        offline = _offline_scope.get()
+        if offline is not None:
+            offline["on_chunk"](chunk)
         if chunk.role == "assistant" and chunk.content:
             _self_talk.info(f'[{time.strftime("%H:%M:%S")}]【自言自语】{chunk.content}')
         if chunk.total_tokens:
@@ -1034,7 +1047,7 @@ def _read_mail_page(window: tuple, session: llm.Chat | None = None,
     """Read one bounded FIFO page, projecting an oversized archived head by prefix."""
     box = context.mailbox(window)
     sources = _recovery_sources(window)
-    if not sources:
+    if not sources and _offline_scope.get() is None:
         box.prepare_initial_page(MAIL_PAGE_EVENTS)
     elif any(source["state"] == "fetching" for source in sources):
         return [], "该窗口离线补回仍在进行；mail 尚未开放正式拉取"
@@ -1345,7 +1358,12 @@ def _drive_agent(model: str | None, window: tuple) -> None:
 
 
 def _run_agent(model: str | None, turn) -> bool:
+    offline = _offline_scope.get()
+    if offline is not None and model != offline["model"]:
+        raise RuntimeError("offline replay model changed")
     session = llm.Chat(model=model or get_model(), chat_client=llm.get_client())
+    if offline is not None:
+        session.fail_fast = True
     session.stream_ids = {}
     session.recall_offsets = {}
     session.recalled_legacy_ids = set()
@@ -1467,6 +1485,8 @@ def _agent_provider(turn, session: llm.Chat):
                     page, error = _read_mail_page(window, session, through)
                 produced.extend(page)
                 if error:
+                    if _offline_scope.get() is not None:
+                        raise llm.RequiredContextError(f"离线回放读取失败：{error}")
                     turn.blocked_windows.add(window)
                     produced.append({"role": "user", "content": f"{window} 拉取失败：{error}"})
             turn._chat_usage_tokens = sum(

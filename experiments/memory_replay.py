@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from datetime import date, timedelta
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
+import time
+from types import MappingProxyType
 
 
 MODEL = "deepseek/deepseek-flash"
@@ -109,22 +113,293 @@ def _ordered_snapshot(output: Path, kind: str, target: int, manifest: dict) -> l
     from mods import chatlog
 
     ordered = []
+    overall = hashlib.sha256()
     for entry in manifest["dates"]:
         day = date.fromisoformat(entry["date"])
         path = output / "archive" / day.strftime("%Y-%m") / f"{day:%d}.log"
         raw = path.read_bytes()
         if hashlib.sha256(raw).hexdigest() != entry["sha256"]:
             raise ValueError("frozen archive hash mismatch")
+        overall.update(day.isoformat().encode("ascii") + b"\0" + bytes.fromhex(entry["sha256"]))
         records = chatlog.parse_log(
             raw.decode("utf-8", errors="strict"), kind=kind, target=target,
             day=(day.year, day.month, day.day),
+            origin_path=f"{kind}/{target}/{day:%Y-%m}/{day:%d}.log",
         )
         if len(records) != entry["events"] or any("time" not in record for record in records):
             raise ValueError("frozen archive event count or time mismatch")
         ordered.extend((day, record["time"], position, record)
                        for position, record in enumerate(records))
+    if overall.hexdigest() != manifest["input_sha256"] or len(ordered) != manifest["events"]:
+        raise ValueError("frozen archive aggregate mismatch")
     ordered.sort(key=lambda item: (item[0], item[1], item[2]))
     return [record for _, _, _, record in ordered]
+
+
+OFFLINE_FACT = "正在离线回看已经发生的历史；你不能影响或回复当时的参与者。"
+SAFE_TOOLS = frozenset({
+    "list_tools", "load_tools", "reload_tools", "recall_events", "event_span",
+    "event_links", "cover_events", "say", "pull_mail", "list_unread", "peek", "edit_hint",
+})
+
+
+def _safe_registry(skill_root: Path):
+    from mods import tools
+
+    registry = tools.ToolRegistry(skill_root)
+    registry._initialized = True
+    source = REPOSITORY / "mods" / "tools" / "meta.py"
+    meta = registry._load_python("meta", source, source.read_bytes())
+    selected = {name: tool for name, tool in meta.tools.items() if name in SAFE_TOOLS}
+    if set(selected) != SAFE_TOOLS:
+        raise RuntimeError("offline safe tool set no longer matches production meta")
+    for action in ("load_tools", "reload_tools"):
+        original = selected[action].call
+
+        def only_skills(names, *, original=original):
+            if not isinstance(names, list) or any(
+                not isinstance(name, str) or not name.isidentifier()
+                or not (skill_root / f"{name}.md").is_file()
+                for name in names
+            ):
+                raise RuntimeError("offline tool modules must be existing isolated Markdown Skills")
+            return original(names)
+
+        selected[action].call = only_skills
+        selected[action].description["function"]["description"] = (
+            "只对隔离运行目录中已有的 Markdown Skill 执行该操作；不能访问 Python 模块。")
+    selected["say"].description["function"]["description"] = (
+        "记录离线发言意图并产生模拟回声；绝不发送 QQ 消息。")
+    registry._modules["meta"] = replace(
+        meta,
+        description="离线历史读取、记忆覆盖、Skill 加载、待办与模拟发言",
+        content=("只能使用本轮列出的离线工具。Skill 仅可从隔离目录读取、加载和重载；"
+                 "不能写入 Skill，也不能执行代码、访问网络或发送真实消息。"
+                 "say 只记录发言意图并产生模拟回声，不会回复当时参与者。"),
+        tools=MappingProxyType(selected),
+    )
+    for source in sorted(skill_root.glob("*.md")):
+        registry._modules[source.stem] = registry._load_candidate(source.stem, [source])
+    scan = registry.scan
+
+    def scan_skills():
+        changes = scan()
+        changes["deleted"] = [name for name in changes["deleted"] if name != "meta"]
+        return changes
+
+    registry.scan = scan_skills
+    return registry
+
+
+def _checked_in_skills() -> list[Path]:
+    result = subprocess.run(
+        ["git", "ls-files", "-z", "--", "mods/tools/*.md"],
+        cwd=REPOSITORY, capture_output=True, check=True,
+    )
+    paths = [REPOSITORY / name.decode("utf-8") for name in result.stdout.split(b"\0") if name]
+    return [path for path in paths if path.parent == REPOSITORY / "mods" / "tools"
+            and path.is_file() and not path.is_symlink()]
+
+
+def _read_llm_config(path: Path) -> dict:
+    if (not path.is_file() or path.is_symlink() or path.name == "config.json"
+            or path.name.startswith(".env") or path.resolve().is_relative_to(REPOSITORY)):
+        raise ValueError("--llm-config must be an explicit file outside the repository")
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict) or set(raw) != {"base_url", "api_key"}:
+        raise ValueError("LLM config must contain only literal base_url and api_key")
+    if any(not isinstance(raw[key], str) or not raw[key].strip() or raw[key].startswith("${")
+           for key in ("base_url", "api_key")):
+        raise ValueError("LLM config values must be nonempty literals, not environment references")
+    return raw
+
+
+def _run(prepared: Path, output: Path, kind: str, target: int, bot_id: int, bot_name: str,
+         config: dict, max_calls: int, max_prompt_tokens: int,
+         max_completion_tokens: int) -> dict:
+    from mods import chat, chatlog, connect, context, identity, llm, message, oplog, storage
+
+    if (target <= 0 or bot_id <= 0 or not bot_name.strip()
+            or min(max_calls, max_prompt_tokens, max_completion_tokens) <= 0):
+        raise ValueError("target, bot id, bot name and all budgets must be valid")
+    if connect._server is not None or message._worker is not None or llm.client is not None:
+        raise RuntimeError("run requires a fresh process without a Bot listener, sender or LLM client")
+    manifest = json.loads((prepared / "manifest.json").read_text(encoding="utf-8"))
+    if (manifest.get("schema") != 1 or manifest.get("model") != MODEL
+            or manifest.get("prompt_mode") != PROMPT_MODE
+            or manifest.get("archive_kind") != kind
+            or manifest.get("status") != "prepared-only"
+            or not isinstance(manifest.get("dates"), list)):
+        raise ValueError("prepared manifest is incompatible with this replay")
+    ordered = _ordered_snapshot(prepared, kind, target, manifest)
+    if not ordered:
+        raise ValueError("prepared archive contains no events")
+    output.mkdir(mode=0o700, parents=True)
+    previous_cwd = Path.cwd()
+    old_client, old_root, old_chatlog = llm.client, storage.root_path, chatlog.rootfile
+    old_chat_state = chat.settings, chat.prompts, chat.llm_config, chat.description_cache
+    old_name, old_user_name, old_qq = identity.getname, identity.get_user_name, identity.qq
+    old_bot_name, old_nicknames = identity.name, identity.nicknames
+    transcript: list[dict] = []
+    usage: list[dict] = []
+    runtime_started = False
+    try:
+        os.chdir(output)
+        storage.root_path = "data/storage"
+        chatlog.rootfile = "archive"
+        runtime_started = True
+        archive = Path("archive") / kind / str(target)
+        for entry in manifest["dates"]:
+            day = date.fromisoformat(entry["date"])
+            source = prepared / "archive" / day.strftime("%Y-%m") / f"{day:%d}.log"
+            destination = archive / day.strftime("%Y-%m") / f"{day:%d}.log"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, destination)
+            if hashlib.sha256(destination.read_bytes()).hexdigest() != entry["sha256"]:
+                raise ValueError("isolated archive copy hash mismatch")
+        skills = Path("skills")
+        skills.mkdir(mode=0o700)
+        for source in _checked_in_skills():
+            shutil.copyfile(source, skills / source.name)
+        registry = _safe_registry(skills)
+        names = {int(event["user_id"]): str((event.get("sender") or {}).get("card")
+                                           or (event.get("sender") or {}).get("nickname")
+                                           or event.get("user_id"))
+                 for event in ordered if isinstance(event.get("user_id"), int)}
+        identity.qq = bot_id
+        identity.name, identity.nicknames = bot_name, [bot_name]
+        identity.get_user_name = lambda user_id: names.get(int(user_id), "未知")
+        identity.getname = lambda user_id=None, group_id=None: names.get(int(user_id), "未知") if user_id is not None else "未知"
+
+        class LiteralClient(llm.LLMClient):
+            @staticmethod
+            def _resolve_config_value(value):
+                return value
+
+        client = LiteralClient({"default_model": MODEL, "providers": {"deepseek": {
+            "base_url": config["base_url"], "api_key": config["api_key"],
+            "models": {"deepseek-flash": {"function_calling": True, "vision": False}},
+        }}})
+        client.strict_tools = True
+        llm.client = client
+        chat.settings = []
+        chat.prompts = {}
+        chat.llm_config = client.config
+        chat.description_cache = {}
+
+        def finalize_usage() -> None:
+            if usage and usage[-1]["source"] != "api" and "reserved_completion_tokens" in usage[-1]:
+                usage[-1]["observed_completion_bytes"] = usage[-1]["completion_tokens"]
+                usage[-1]["completion_tokens"] = usage[-1]["reserved_completion_tokens"]
+                usage[-1]["source"] = "reserved-max-no-api-usage"
+
+        def request_policy(selection: str, request: dict) -> dict:
+            finalize_usage()
+            if selection != MODEL:
+                raise RuntimeError("offline replay model changed")
+            if len(usage) >= max_calls:
+                raise RuntimeError("max-calls budget reached")
+            prompt_bound = len(json.dumps(request, ensure_ascii=False).encode("utf-8")) + 1024
+            if sum(row["prompt_tokens"] for row in usage) + prompt_bound > max_prompt_tokens:
+                raise RuntimeError("max-prompt-tokens budget reached")
+            remaining = max_completion_tokens - sum(row["completion_tokens"] for row in usage)
+            if remaining <= 0:
+                raise RuntimeError("max-completion-tokens budget reached")
+            usage.append({"model": selection, "prompt_tokens": prompt_bound,
+                          "completion_tokens": 0, "reserved_completion_tokens": remaining,
+                          "source": "utf8-upper-bound"})
+            return {"max_tokens": remaining}
+
+        def on_chunk(chunk) -> None:
+            if chunk.total_tokens:
+                if (sum(row["prompt_tokens"] for row in usage[:-1]) + chunk.prompt_tokens > max_prompt_tokens
+                        or sum(row["completion_tokens"] for row in usage[:-1])
+                        + chunk.completion_tokens > max_completion_tokens):
+                    raise RuntimeError("provider usage exceeded offline replay budget")
+                usage[-1].update(prompt_tokens=chunk.prompt_tokens,
+                                 completion_tokens=chunk.completion_tokens,
+                                 cached_tokens=chunk.cached_tokens, source="api")
+            elif chunk.role in ("assistant", "tool"):
+                usage[-1]["completion_tokens"] += len(chunk.content.encode("utf-8"))
+
+        client.request_policy = request_policy
+        window = (kind, target)
+        echo_number = 0
+
+        def dry_say(body: str, destination: tuple) -> int:
+            nonlocal echo_number
+            if destination != window:
+                raise RuntimeError("offline say target is outside the prepared window")
+            echo_number += 1
+            message_id = -echo_number
+            event = {"post_type": "message_sent", "message_type": kind,
+                     "message_id": message_id, "message": body, "raw_message": body,
+                     "user_id": bot_id, "time": ordered[-1]["time"] + echo_number,
+                     "sender": {"user_id": bot_id, "nickname": "离线模拟 Bot"}}
+            event["group_id" if kind == "group" else "target_id"] = target
+            box = context.mailbox(window)
+            box.add(event)
+            box.activate(event)
+            transcript.append({"kind": "dry_say", "target": destination, "content": body,
+                               "message_id": message_id, "sent": False,
+                               "occurred_at": time.time()})
+            return message_id
+
+        def forbidden(*_args, **_kwargs):
+            raise RuntimeError("offline replay outbound operation blocked")
+
+        outbound_names = ("send", "sendmsg", "_send_now")
+        original_outbound = {name: getattr(message, name) for name in outbound_names}
+        original_call_api = connect.call_api
+        for name in outbound_names:
+            setattr(message, name, forbidden)
+        connect.call_api = forbidden
+        scope_token = chat._offline_scope.set({"model": MODEL, "fact": OFFLINE_FACT,
+                                               "registry": registry, "on_chunk": on_chunk})
+        send_context = registry.get("meta").tools["say"].call.__globals__["_offline_send_sink"]
+        sink_token = send_context.set(dry_say)
+        try:
+            box = context.mailbox(window)
+            for event in ordered:
+                chatlog._remember_origin(event, event["_log_origin"])
+                box.add(event)
+            box.activate(ordered[-1])
+            chat._drive_agent(MODEL, window)
+        finally:
+            send_context.reset(sink_token)
+            chat._offline_scope.reset(scope_token)
+            for name, original in original_outbound.items():
+                setattr(message, name, original)
+            connect.call_api = original_call_api
+        finalize_usage()
+        storage.save()
+        return {"status": "complete", "events": len(ordered), "model_calls": len(usage),
+                "dry_says": echo_number}
+    finally:
+        if runtime_started:
+            if usage and usage[-1]["source"] != "api" and "reserved_completion_tokens" in usage[-1]:
+                usage[-1]["observed_completion_bytes"] = usage[-1]["completion_tokens"]
+                usage[-1]["completion_tokens"] = usage[-1]["reserved_completion_tokens"]
+                usage[-1]["source"] = "reserved-max-no-api-usage"
+            intentions = {row["message_id"]: row for row in transcript}
+            transcript = []
+            for path in sorted(Path("data/event_stream").glob("????????.jsonl")):
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    row = json.loads(line)
+                    if row.get("kind") == "arrival":
+                        message_id = row.get("event", {}).get("message_id")
+                        if message_id in intentions:
+                            transcript.append(intentions.pop(message_id))
+                    transcript.append(row)
+            transcript.extend(intentions.values())
+        if output.exists():
+            _write_jsonl(output / "transcript.jsonl", transcript)
+            _write_jsonl(output / "usage.jsonl", usage)
+        llm.client, storage.root_path, chatlog.rootfile = old_client, old_root, old_chatlog
+        chat.settings, chat.prompts, chat.llm_config, chat.description_cache = old_chat_state
+        identity.getname, identity.get_user_name, identity.qq = old_name, old_user_name, old_qq
+        identity.name, identity.nicknames = old_bot_name, old_nicknames
+        os.chdir(previous_cwd)
 
 
 def _doctor(output: Path) -> dict:
@@ -250,9 +525,18 @@ def main(argv: list[str] | None = None) -> int:
     prepare.add_argument("--output", required=True)
     doctor = commands.add_parser("doctor", help="run a synthetic no-model/no-send probe")
     doctor.add_argument("--output")
-    run = commands.add_parser("run", help="reserved; paid production-like replay is not wired")
+    run = commands.add_parser("run", help="replay a frozen archive with the isolated central reader")
+    run.add_argument("--prepared", required=True)
     run.add_argument("--output", required=True)
+    run.add_argument("--kind", required=True, choices=("group", "private"))
+    run.add_argument("--target", required=True, type=int)
+    run.add_argument("--bot-id", required=True, type=int)
+    run.add_argument("--bot-name", required=True)
+    run.add_argument("--llm-config", required=True)
     run.add_argument("--confirm-paid", action="store_true")
+    run.add_argument("--max-calls", type=int, required=True)
+    run.add_argument("--max-prompt-tokens", type=int, required=True)
+    run.add_argument("--max-completion-tokens", type=int, required=True)
     args = parser.parse_args(argv)
     try:
         if args.command in (None, "doctor"):
@@ -274,8 +558,16 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"status": result["status"], "events": result["events"],
                               "output": str(output)}, ensure_ascii=False))
         else:
-            raise ValueError("run is disabled: production-safe model, prompt, tool and send injection points are missing")
-    except (OSError, ValueError, UnicodeError, AssertionError) as error:
+            if not args.confirm_paid:
+                raise ValueError("run requires --confirm-paid")
+            prepared = Path(args.prepared).expanduser().resolve()
+            output = _output_path(args.output, prepared)
+            config = _read_llm_config(Path(args.llm_config).expanduser())
+            result = _run(prepared, output, args.kind, args.target, args.bot_id, args.bot_name,
+                          config, args.max_calls, args.max_prompt_tokens,
+                          args.max_completion_tokens)
+            print(json.dumps({**result, "output": str(output)}, ensure_ascii=False))
+    except (OSError, ValueError, UnicodeError, AssertionError, RuntimeError, KeyError) as error:
         print(f"memory replay: {error}", file=sys.stderr)
         return 1
     return 0

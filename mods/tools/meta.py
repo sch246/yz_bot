@@ -149,10 +149,14 @@ Skill 也是可编辑的长期笔记：把可重复使用的经验、做法、�
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 import io
 from typing import Mapping
 
 from mods.tools import current_binding
+
+
+_offline_send_sink: ContextVar[object | None] = ContextVar("meta_offline_send_sink", default=None)
 
 
 def _tool_window():
@@ -498,13 +502,20 @@ def say(text: str, final_call: bool = True, target: str = "") -> str:
     from mods.tools import current_binding
 
     body = str(text)
+    sink = _offline_send_sink.get()
+    if chat._offline_scope.get() is not None and sink is None:
+        raise RuntimeError("offline send sink is missing")
     if not body.strip():
+        if sink is not None:
+            raise ValueError("offline say text is empty")
         return "text 为空，什么都没发。要说话就给出正文"
     destination = {}
     if context.agent_mode():
         try:
             window = chat.parse_target(target)
         except ValueError as error:
+            if sink is not None:
+                raise
             return str(error)
         destination = {"group_id" if window[0] == "group" else "user_id": window[1]}
         current_binding().session.associated_windows.add(window)
@@ -512,16 +523,23 @@ def say(text: str, final_call: bool = True, target: str = "") -> str:
         try:
             window = chat.parse_target(target)
         except ValueError as error:
+            if sink is not None:
+                raise
             return str(error)
         destination = {"group_id" if window[0] == "group" else "user_id": window[1]}
     unconfirmed = (
         "先在下一轮的聊天记录里看它在不在，再决定要不要重发——不要直接重发。"
     )
     try:
-        message_id = message.sendmsg(body, **destination).result(timeout=_SAY_TIMEOUT)
+        message_id = (sink(body, window) if sink is not None
+                      else message.sendmsg(body, **destination).result(timeout=_SAY_TIMEOUT))
     except TimeoutError:
+        if sink is not None:
+            raise
         return f"未确认：等了 {_SAY_TIMEOUT:.0f} 秒还没有结果，这句话可能正在发、也可能已经发出去。" + unconfirmed
     except Exception as error:
+        if sink is not None:
+            raise
         return f"发送失败（{type(error).__name__}）：{error}。这句话没有发出去。"
     if message_id is None:
         return "未确认：对端收下了请求，却没有回一个 message_id，所以这句话可能已经发出去了。" + unconfirmed
