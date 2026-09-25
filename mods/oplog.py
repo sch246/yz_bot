@@ -777,41 +777,74 @@ def recall_events(window: tuple | None, ids: Iterable[str]) -> tuple[list[dict],
         return found, missing
 
 
-def event_span(window: tuple | None, *, anchor: str = "", before: int = 0, after: int = 0,
-               start: str = "", end: str = "", kinds: Iterable[str] = (),
-               source_window: tuple | None = None) -> list[dict]:
-    """Select a bounded span in read order, then filter without reordering it."""
-    if any(not isinstance(value, int) or value < 0 for value in (before, after)):
+def select_events(window: tuple | None, *, ids: Iterable[str] | None = None,
+                  anchor: str = "", before: int = 0, after: int = 0,
+                  start: str = "", end: str = "", kinds: Iterable[str] = (),
+                  source_window: tuple | None = None) -> tuple[list[dict], list[str]]:
+    """Resolve one seed selector, then filter its members without extending the seed."""
+    if any(type(value) is not int or value < 0 for value in (before, after)):
         raise ValueError("before 和 after 必须是非负整数")
-    if bool(anchor) == bool(start or end) or (start or end) and (not start or not end):
-        raise ValueError("请只指定 anchor，或同时指定 start 和 end")
+    if ids is not None and isinstance(ids, (str, bytes)):
+        raise ValueError("ids 必须是正式事件号列表")
+    requested = list(dict.fromkeys(str(value) for value in (ids or ())))
+    has_range = bool(start or end)
+    if sum((bool(requested), bool(anchor), has_range)) != 1 or (has_range and (not start or not end)):
+        raise ValueError("请只指定非空 ids、anchor，或同时指定 start 和 end")
+    if not anchor and (before or after):
+        raise ValueError("before 和 after 只能与 anchor 一起使用")
     if anchor and before + after > 39:
         raise ValueError("一次最多查看含中心的 40 条，请缩小范围")
     allowed_kinds = {"input", "output", "result", "notification"}
     selected_kinds = set(kinds)
     if selected_kinds - allowed_kinds:
         raise ValueError("kinds 只能包含 input、output、result、notification")
+    if source_window is not None and (not isinstance(source_window, tuple)
+                                      or len(source_window) != 2
+                                      or source_window[0] not in ("group", "private")
+                                      or type(source_window[1]) is not int or source_window[1] <= 0):
+        raise ValueError("source 必须是 g<群号> 或 u<私聊对端号>")
     with _lock:
         _restore()
-        timeline = [entry for entry in _events if _accessible(window, entry)
-                    and not (entry["kind"] == "input"
-                    and entry.get("projection") is None)]
-        positions = {entry["id"]: index for index, entry in enumerate(timeline)}
-        for event_id in (anchor, start, end):
-            if event_id and event_id not in positions:
-                raise ValueError(f"找不到可访问的已读事件: {event_id}")
-        if anchor:
-            index = positions[anchor]
-            selected = timeline[max(0, index - before):index + after + 1]
+        missing = []
+        if requested:
+            selected = []
+            for event_id in requested:
+                entry = _by_id.get(event_id)
+                if (entry is None or not _accessible(window, entry)
+                        or (entry["kind"] == "input" and entry.get("projection") is None)):
+                    missing.append(event_id)
+                else:
+                    selected.append(entry)
         else:
-            first, last = positions[start], positions[end]
-            if first > last:
-                raise ValueError("start 必须早于或等于 end")
-            if last - first >= 40:
-                raise ValueError("区间一次最多 40 条；先用 anchor=start、before=0、after=39 查下一段")
-            selected = timeline[first:last + 1]
-        return [entry for entry in selected if (not selected_kinds or entry["kind"] in selected_kinds)
-                and (source_window is None or tuple(entry.get("source_window") or entry["window"]) == source_window)]
+            timeline = [entry for entry in _events if _accessible(window, entry)
+                        and not (entry["kind"] == "input" and entry.get("projection") is None)]
+            positions = {entry["id"]: index for index, entry in enumerate(timeline)}
+            for event_id in (anchor, start, end):
+                if event_id and event_id not in positions:
+                    raise ValueError(f"找不到可访问的已读事件: {event_id}")
+            if anchor:
+                index = positions[anchor]
+                selected = timeline[max(0, index - before):index + after + 1]
+            else:
+                first, last = positions[start], positions[end]
+                if first > last:
+                    raise ValueError("start 必须早于或等于 end")
+                if last - first >= 40:
+                    raise ValueError("区间一次最多 40 条；先用 anchor=start、before=0、after=39 查下一段")
+                selected = timeline[first:last + 1]
+        return ([entry for entry in selected if (not selected_kinds or entry["kind"] in selected_kinds)
+                 and (source_window is None
+                      or tuple(entry.get("source_window") or entry["window"]) == source_window)], missing)
+
+
+def event_span(window: tuple | None, *, anchor: str = "", before: int = 0, after: int = 0,
+               start: str = "", end: str = "", kinds: Iterable[str] = (),
+               source_window: tuple | None = None) -> list[dict]:
+    """List a bounded span in read order, preserving its existing API."""
+    selected, _missing = select_events(window, anchor=anchor, before=before, after=after,
+                                       start=start, end=end, kinds=kinds,
+                                       source_window=source_window)
+    return selected
 
 
 def _register(window: tuple | None, kind: str, **values: Any) -> dict | None:

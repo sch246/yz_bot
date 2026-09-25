@@ -1427,8 +1427,15 @@ def _credit_recall(session: llm.Chat, result: dict, projection: dict) -> None:
         return
     try:
         arguments = json.loads(result["arguments"] or "{}")
-        ids = arguments["ids"]
+        ids = arguments.get("ids")
         offset = arguments.get("offset", 0)
+        if arguments.get("anchor") or arguments.get("start") or arguments.get("end"):
+            if offset != 0:
+                return
+            first_line, separator, _body = result["content"].partition("\n")
+            if not separator or not first_line.startswith("resolved_ids="):
+                return
+            ids = json.loads(first_line[len("resolved_ids="):])
         if not isinstance(ids, list) or not isinstance(offset, int) or offset < 0:
             return
         key = tuple(str(event_id) for event_id in ids)
@@ -1436,7 +1443,7 @@ def _credit_recall(session: llm.Chat, result: dict, projection: dict) -> None:
             session.recall_offsets[key] = 0
         if session.recall_offsets.get(key) != offset:
             return
-        continuation = re.search(r"\n结果未读完；相同 ids 继续 recall_events\(offset=(\d+)\)$",
+        continuation = re.search(r"\n结果未读完；(?:相同 ids|用 resolved_ids 作为显式 ids) 继续 recall_events\(offset=(\d+)\)$",
                                  result["content"])
         if continuation is not None:
             session.recall_offsets[key] = int(continuation.group(1))
