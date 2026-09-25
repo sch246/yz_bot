@@ -49,8 +49,6 @@ AGENT_WINDOW = oplog.AGENT_WINDOW
 MAX_PULL_EVENTS = 500
 INITIAL_MAIL_EVENTS = 8
 MAIL_PULL_TOKENS = 4000
-RESULT_BATCH_EVENTS = 8
-RESULT_ITEM_TOKENS = MAIL_PULL_TOKENS
 NOTICE_TOKENS = 500
 _PRESSURE_PERCENT = 75
 _cost_lock = threading.Lock()
@@ -621,7 +619,7 @@ def _output_projection(entry: dict) -> dict:
 
 
 def _result_projection(entry: dict, links: dict[str, tuple[str, str]],
-                       max_tokens: int = MAIL_PULL_TOKENS) -> dict:
+                       max_tokens: int | None = MAIL_PULL_TOKENS) -> dict:
     lines = []
     for result in entry["returns"]:
         reference = f"{entry['source']}#{result['position'] + 1}"
@@ -632,7 +630,7 @@ def _result_projection(entry: dict, links: dict[str, tuple[str, str]],
                 relation = f" (已确认回声 {linked[0]})"
         lines.append(f"{reference} {result['name']} -> {result['content']}{relation}")
     content = f"[{entry['id']}] 行动返回：\n" + "\n".join(lines)
-    if count_tokens(content) > max_tokens:
+    if max_tokens is not None and count_tokens(content) > max_tokens:
         marker = (f"\n结果未读完；用 recall_events(ids={[entry['id']]!r}, offset=0) "
                   "按字符偏移续读持久化的完整结果")
         content = bounded_excerpt(content, max(1, max_tokens - count_tokens(marker) - 20)) + marker
@@ -746,11 +744,11 @@ def _activate_chat(
     # 改变这一轮是否完成回收。
     session.do_process_image = get_image_mode() != "off"
     session.keep_reasoning = get_reasoning_mode() == "keep"
-    # WHY: `.chat` 只接受单句输入，不读取窗口 mail；它的下次请求必须从原生
-    # 工具配对得到同步返回。只有装了 mail reader 的主会话才能安全撤掉原生载体。
+    # WHY: `.chat` 和子代理仍从原生配对读取同步结果；中心 reader 才把配对
+    # 换成正式输出与紧随其后的整批结果投影。
     session.on_output = (lambda assistant, calls: _record_output(window, assistant, calls, session)
                          if read_mail else oplog.output(window, assistant, calls))
-    session.on_results = _stream_results(window, binding) if read_mail else _private_results(window, binding)
+    session.on_results = _stream_results(window, binding)
     return binding
 
 
@@ -808,25 +806,16 @@ def _stream_results(window, binding):
     def record(source: str, results: list[llm.ToolCallResult]) -> None:
         for result in results:
             binding.touch(result.name)
-        if window is not None:
-            for position, result in enumerate(results):
-                context.mailbox(window).add({"_stream_results": {
-                    "source": source,
-                    "returns": [{"position": position, "name": result.name,
-                                 "arguments": result.arguments, "content": result.content,
-                                 "tool_call_id": result.tool_call_id}],
-                }})
-    return record
-
-
-def _private_results(window, binding):
-    def record(source: str, results: list[llm.ToolCallResult]) -> None:
-        for position, result in enumerate(results):
-            binding.touch(result.name)
-            if window is not None:
-                oplog.result(window, source, [{"position": position, "name": result.name,
-                                              "arguments": result.arguments, "content": result.content,
-                                              "tool_call_id": result.tool_call_id}], "")
+        if window is None:
+            return
+        returns = [{"position": position, "name": result.name,
+                    "arguments": result.arguments, "content": result.content,
+                    "tool_call_id": result.tool_call_id}
+                   for position, result in enumerate(results)]
+        recorded = oplog.result(window, source, returns, "")
+        if window == AGENT_WINDOW and binding.session.reads_window_mail:
+            projection = _result_projection(recorded, oplog.say_links(window), None)
+            binding.session.pending_results.append((recorded, projection))
     return record
 
 
@@ -914,17 +903,33 @@ def _cover_projection(messages: list[dict], members: set[str]) -> None:
                    if not (_visible_stream_ids([message]) & members)]
 
 
-def _mail_context(entries: list[context.MailEntry], in_group: bool, window: tuple,
-                  max_tokens: int = MAIL_PULL_TOKENS) -> list[dict]:
-    """Project a global mailbox of tool results, never a window's chat mail."""
-    output = []
-    for entry in entries:
-        event = entry.event
-        values = event["_stream_results"]
-        recorded = oplog.read(entry.arrival) or oplog.result(window, values["source"], values["returns"], entry.arrival)
-        if recorded is not None and recorded["id"] not in oplog.covered(window) and not recorded.get("condensed"):
-            output.append(_result_projection(recorded, oplog.say_links(window), max_tokens))
-    return output
+def _drain_legacy_results(mail: context.Mailbox) -> list[tuple[dict, dict]]:
+    # WHY: f4d3591 left completed tool batches in the agent mailbox. Drain only
+    # those existing arrivals on the next activation; new code writes R directly.
+    # Delete this bridge after deployment confirms no old pending arrivals remain.
+    if not mail.unread():
+        return []
+
+    def project(entries: list[context.MailEntry]) -> list[tuple[dict, dict]]:
+        rows = []
+        for entry in entries:
+            values = entry.event["_stream_results"]
+            recorded = oplog.read(entry.arrival) or oplog.result(
+                AGENT_WINDOW, values["source"], values["returns"], entry.arrival)
+            rows.append((recorded, _result_projection(recorded, oplog.say_links(AGENT_WINDOW), None)))
+        return rows
+
+    return mail.pull(len(mail.unread()), project)
+
+
+def _merge_stream_rows(rows: list[tuple[dict, dict]], extra: list[tuple[dict, dict]]
+                       ) -> list[tuple[dict, dict]]:
+    if not extra:
+        return rows
+    merged = [*rows, *extra]
+    positions = oplog.event_positions(AGENT_WINDOW, (entry["id"] for entry, _projection in merged))
+    merged.sort(key=lambda item: positions[item[0]["id"]])
+    return merged
 
 
 _boot_sources: list[str] = []
@@ -1077,11 +1082,8 @@ def _pull_mail_events(window: tuple, session: llm.Chat | None,
         used = 0
         for entry in entries:
             event = entry.event
-            if "_stream_results" in event:
-                converted = {"role": "user", "content": str(event["_stream_results"]["returns"])}
-            else:
-                located = {**event, "_log_origin": oplog.arrival_origin(entry.arrival), "_live": True}
-                converted = _model_event(located, window[0] == "group")
+            located = {**event, "_log_origin": oplog.arrival_origin(entry.arrival), "_live": True}
+            converted = _model_event(located, window[0] == "group")
             if converted is None:
                 selected.append((entry, None))
                 continue
@@ -1095,16 +1097,6 @@ def _pull_mail_events(window: tuple, session: llm.Chat | None,
         projections = []
         for entry, converted in selected:
             event = entry.event
-            if "_stream_results" in event:
-                values = event["_stream_results"]
-                recorded = oplog.read(entry.arrival) or oplog.result(
-                    AGENT_WINDOW, values["source"], values["returns"], entry.arrival)
-                projected = _result_projection(recorded, oplog.say_links(AGENT_WINDOW),
-                                               RESULT_ITEM_TOKENS)
-                projections.append(projected)
-                if session is not None:
-                    _remember_stream(session, projected, recorded["id"])
-                continue
             recorded = oplog.read(entry.arrival) or oplog.input(
                 AGENT_WINDOW, event, converted, entry.arrival, source_window=window)
             if converted is not None and recorded is not None:
@@ -1124,11 +1116,8 @@ def _pull_mail_events(window: tuple, session: llm.Chat | None,
         selected = []
         used = 0
         for entry in entries:
-            if "_stream_results" in entry.event:
-                converted = {"role": "user", "content": str(entry.event["_stream_results"]["returns"])}
-            else:
-                located = {**entry.event, "_log_origin": oplog.arrival_origin(entry.arrival), "_live": True}
-                converted = _model_event(located, window[0] == "group")
+            located = {**entry.event, "_log_origin": oplog.arrival_origin(entry.arrival), "_live": True}
+            converted = _model_event(located, window[0] == "group")
             amount = _message_cost(converted) if converted is not None else 0
             if used + amount > MAIL_PULL_TOKENS - 300:
                 break
@@ -1139,7 +1128,7 @@ def _pull_mail_events(window: tuple, session: llm.Chat | None,
 
             head = entries[0]
             origin = oplog.arrival_origin(head.arrival)
-            if "_stream_results" in head.event or not origin:
+            if not origin:
                 return [], "队首消息超过单次 pull 上限且缺少可续读档案；未消费"
             archive = chatlog.read_origin(*window, origin)
             if archive is None:
@@ -1355,8 +1344,7 @@ def _drive_agent(model: str | None, window: tuple) -> None:
                 {window for window, _count, active in oplog.pending_summary() if active}
                 | {window for window, _through, _count in turn.requested_pulls})
             if not context.finish_turn(AGENT_WINDOW, turn,
-                                       lambda: bool(turn.mail.unread()) or oplog.has_unnotified()
-                                       or bool(turn.requested_pulls)):
+                                       lambda: oplog.has_unnotified() or bool(turn.requested_pulls)):
                 return
     finally:
         image.end_conversation(image_ledger)
@@ -1376,6 +1364,7 @@ def _run_agent(model: str | None, turn) -> bool:
     session.stream_ids = {}
     session.recall_offsets = {}
     session.recalled_legacy_ids = set()
+    session.pending_results = []
     session.requested_pulls = turn.requested_pulls
     session.associated_windows = turn.associated_windows
     session.notification_ids = []
@@ -1388,20 +1377,23 @@ def _run_agent(model: str | None, turn) -> bool:
         None if offline is not None else max_tokens,
         None if offline is not None else max_events,
     )
-    messages = []
-    for entry, projection in rows:
-        messages.append(projection)
-        _remember_stream(session, projection, entry["id"])
+    rows.extend(_drain_legacy_results(turn.mail))
     notice = oplog.deliver_notifications(AGENT_WINDOW)
     if notice is not None:
         session.notification_ids.append(notice["id"])
         turn.associated_windows.update(map(tuple, notice["windows"]))
-        projection = _notification_projection(notice)
+        rows = _merge_stream_rows(rows, [(notice, _notification_projection(notice))])
+    messages = []
+    for entry, projection in rows:
         messages.append(projection)
-        _remember_stream(session, projection, notice["id"])
+        _remember_stream(session, projection, entry["id"])
     if not messages and not turn.requested_pulls and not turn.mail.unread():
         return True
     _activate_chat(session, _close_with_user(messages), read_mail=True)
+    for entry, projection in rows:
+        if entry["kind"] == "result":
+            for result in entry["returns"]:
+                _credit_recall(session, result, projection)
     session.output_recorded = False
 
     def record_output(assistant, calls):
@@ -1457,25 +1449,15 @@ def _credit_recall(session: llm.Chat, result: dict, projection: dict) -> None:
 def _agent_provider(turn, session: llm.Chat):
     def provide() -> list[dict]:
         try:
-            def project_results(entries: list[context.MailEntry]) -> list[dict]:
-                projections = []
-                item_budget = max(100, (MAIL_PULL_TOKENS - 300) // len(entries))
-                for entry in entries:
-                    for projection in _mail_context([entry], False, AGENT_WINDOW,
-                                                    item_budget):
-                        recorded = oplog.read(entry.arrival)
-                        if recorded is not None:
-                            _remember_stream(session, projection, recorded["id"])
-                        for result in entry.event["_stream_results"]["returns"]:
-                            _credit_recall(session, result, projection)
-                        projections.append(projection)
-                return projections
-
-            # WHY: Batch only results already present at this request boundary;
-            # never wait for future tools, and reserve one shared input budget.
-            unread_results = turn.mail.unread(RESULT_BATCH_EVENTS)
-            produced = (turn.mail.pull(len(unread_results), project_results)
-                        if unread_results else [])
+            # WHY: This is only a live projection of already durable R events. A
+            # cancelled session drops it; later activations use ordinary history.
+            pending = session.pending_results
+            produced = [projection for _entry, projection in pending]
+            for entry, projection in pending:
+                _remember_stream(session, projection, entry["id"])
+                for result in entry["returns"]:
+                    _credit_recall(session, result, projection)
+            session.pending_results = []
             notice = oplog.deliver_notifications(AGENT_WINDOW)
             new_notice = notice is not None and notice["id"] not in session.notification_ids
             if new_notice:
@@ -1484,10 +1466,8 @@ def _agent_provider(turn, session: llm.Chat):
                 projection = _notification_projection(notice)
                 produced.append(projection)
                 _remember_stream(session, projection, notice["id"])
-            # WHY: pull 的短结果本身也会先进 result mail；若要求 result 与通知都为空
-            # 才兑现请求，模型每次重试都会再制造一个结果，承诺的“下一次请求前读取”便会
-            # 永久饥饿。三类输入各自已有上限，所以同一 boundary 先交付结果/通知、再兑现
-            # 至多一个显式 pull，仍然有界。
+            # WHY: 已完成结果不会饿死显式 pull；同一边界先交付结果与通知，
+            # 再兑现至多一个 pull。
             if turn.requested_pulls:
                 window, through, count = turn.requested_pulls.pop(0)
                 if window[0] == "source":
@@ -2237,15 +2217,12 @@ def on_load(ctx) -> None:
 
         if not wait_booted(120):
             return
-        results_pending = bool(context.mailbox(AGENT_WINDOW).unread())
-        if not oplog.has_unnotified() and not results_pending:
+        if not oplog.has_unnotified():
             return
         window = next(iter(oplog.unacknowledged_windows()), None)
         if window is None:
             window = next((window for window, _count, active in oplog.pending_summary()
                            if active and window[0] in ("group", "private")), None)
-        if window is None and results_pending:
-            window = AGENT_WINDOW
         if window is not None:
             try:
                 _drive_agent(None, window)

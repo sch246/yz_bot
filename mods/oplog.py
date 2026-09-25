@@ -611,6 +611,8 @@ def pending_summary() -> list[tuple[tuple, int, bool]]:
         _restore()
         counts: dict[tuple, list] = {}
         for entry in _ordered_pending():
+            if tuple(entry["window"]) == AGENT_WINDOW and "_stream_results" in entry["event"]:
+                continue
             window = tuple(entry["window"])
             state = counts.setdefault(window, [0, False])
             state[0] += 1
@@ -637,6 +639,8 @@ def pending_details() -> list[dict]:
         _restore()
         details: dict[tuple, dict] = {}
         for entry in _pending.values():
+            if tuple(entry["window"]) == AGENT_WINDOW and "_stream_results" in entry["event"]:
+                continue
             window = tuple(entry["window"])
             detail = details.setdefault(window, {"window": list(window), "unread": 0,
                                                  "ordinary": 0, "mentions": 0,
@@ -925,9 +929,20 @@ def result(window: tuple | None, source: str, returns: list[dict], arrival: str)
 def events(window: tuple | None, include_condensed: bool = False) -> list[dict]:
     with _lock:
         _restore()
-        return [item for item in _windows.get(tuple(window or ()), ()) if not item.get("hidden")
+        return [item for item in _windows.get(tuple(window or ()), ())
+                if not item.get("hidden")
                 and (include_condensed or (not item.get("condensed")
                                            and item["id"] not in _covered.get(tuple(window or ()), ())))]
+
+
+def event_positions(window: tuple | None, ids: Iterable[str]) -> dict[str, int]:
+    """Derive positions from the sole append order."""
+    wanted = set(ids)
+    with _lock:
+        _restore()
+        listed = _events if window == AGENT_WINDOW else _windows.get(tuple(window or ()), ())
+        return {entry["id"]: position for position, entry in enumerate(listed)
+                if entry["id"] in wanted}
 
 
 def covered(window: tuple | None) -> set[str]:
@@ -1064,42 +1079,17 @@ def recall(window: tuple | None, cids: Iterable[str]) -> tuple[list[dict], list[
     return found, sorted(wanted - {entry["cid"] for entry in found})
 
 
-def _pending_calls(window: tuple | None) -> list[dict]:
-    listed = []
-    for arrival in _pending.values():
-        if arrival["window"] != list(window or ()) or "_stream_results" not in arrival["event"]:
-            continue
-        values = arrival["event"]["_stream_results"]
-        source = values["source"]
-        if source not in _by_id or _by_id[source]["window"] != list(window or ()):
-            continue
-        listed.extend({"source": source, **item, "cid": f"{source}#{item['position'] + 1}",
-                       "condensed": bool(_by_id[source].get("condensed"))}
-                      for item in values["returns"])
-    return listed
-
-
-def pending_calls(window: tuple | None, cids: Iterable[str]) -> list[dict]:
-    """Locate arrived but unread results; callers must prove private visibility."""
-    wanted = {str(value) for value in cids}
-    with _lock:
-        _restore()
-        return [item for item in _pending_calls(window) if item["cid"] in wanted]
-
-
 def condense(window: tuple | None, cids: Iterable[str]) -> int:
     wanted = {str(value) for value in cids}
     with _lock:
         _restore()
         live = entries(window)
-        pending = _pending_calls(window)
-        all_calls = [*live, *pending]
-        sources = {entry["source"] for entry in all_calls if entry["cid"] in wanted
+        sources = {entry["source"] for entry in live if entry["cid"] in wanted
                    and not _by_id[entry["source"]].get("condensed")}
-        partial = [entry["cid"] for entry in all_calls if entry["source"] in sources and entry["cid"] not in wanted]
+        partial = [entry["cid"] for entry in live if entry["source"] in sources and entry["cid"] not in wanted]
         for source in sources:
             output_entry = _by_id[source]
-            returned = [entry["position"] for entry in all_calls if entry["source"] == source]
+            returned = [entry["position"] for entry in live if entry["source"] == source]
             if len(returned) != len(output_entry["actions"]) or set(returned) != set(range(len(returned))):
                 raise ValueError("这一输出还有行动未返回，不能收缩")
         if partial:
@@ -1109,7 +1099,7 @@ def condense(window: tuple | None, cids: Iterable[str]) -> int:
             if not entry.get("condensed"):
                 _append({"kind": "condensed", "target": entry["id"], "window": list(window or ())},
                         datetime.now().strftime("%Y%m%d"))
-        return sum(entry["source"] in sources for entry in all_calls)
+        return sum(entry["source"] in sources for entry in live)
 
 
 def clear(window: tuple | None) -> None:

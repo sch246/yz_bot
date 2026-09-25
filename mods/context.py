@@ -271,7 +271,7 @@ class Mailbox:
             return True
 
     def advance(self, project: Callable[[list[MailEntry]], Any] | None = None) -> Any:
-        """Drain the global result mailbox, never a chat window's unread body."""
+        """Advance this mailbox after an optional projection."""
         with self._lock:
             if project is not None:
                 projected = project(list(self._entries[self._read - self._base:]))

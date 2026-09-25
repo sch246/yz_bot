@@ -665,8 +665,8 @@ class LLMClient:
         # 不要退化成"到 N 轮就自动截断"：那会在结论产出之前把前提砍掉。压缩由模型在得出
         # 结论时显式发起，这正是主流 agent 用子代理绕开、而没有正面解决的那件事。
         #
-        # WHY: on_round 在每次请求前读 mail；执行时暂存的原生工具配对必须先替换成
-        # 单条输出投影，才能按顺序读出夹在输出和结果之间的插话。
+        # WHY: 同步结果按模型输出整批登记 R；原生配对只是执行载体，
+        # 中心会话替换后由 on_round 追加已有 R 的投影、通知和 pull。
         while True:
             if should_stop is not None and should_stop():
                 return
@@ -797,8 +797,8 @@ class LLMClient:
             if on_results is not None and output_id is not None:
                 on_results(output_id, results)
             if isinstance(recorded, tuple):
-                # WHY: The native pair is only an execution carrier. Its result would
-                # disclose C before unread mail B in the next provider request.
+                # WHY: The native pair is only an execution carrier. The next
+                # request boundary projects the durable batch after its output.
                 if not any(message is assistant_message for message in messages):
                     raise RuntimeError("执行行动期间丢失模型输出载体，拒绝后续请求")
                 native_ids = {id(message) for message in native_results}
@@ -810,10 +810,8 @@ class LLMClient:
             # 工具自己说「我做的这件事就是本轮的最后一件」——轮正常结束。混用会让
             # chat.chat 外层那句 `if turn.cancelled: return` 把正常结束误判成被取消，于是
             # 不再去看 trigger，等着续跑的那一轮就被丢掉。
-            # WHY: 位置在这一批 tool 结果**全部追加之后**。一批里有几个并发调用，只要其中
-            # 一个声明了结束，这一批的结果都已经进了 messages——它们会跟着 oplog 轨道在
-            # 下一轮重建回来，不会因为提前 return 而丢账。代价是这一批里别的工具的结果，
-            # 模型这一轮看不到了；那是它自己的选择（声明结束的是它）。
+            # WHY: 一批里一个工具声明结束，也须先把整批已完成结果交给 on_results 持久保存；
+            # 正常结束不会为了读这批结果强迫立即续轮；下次只按普通历史读取。
             # WHY: 这一层不认识任何具体工具。谁有资格结束一轮、凭什么结束，全在调用方，
             # 见 mods/chat 给它的那个闭包。这里只问一句「完了吗」。
             if turn_done is not None and turn_done():
@@ -849,9 +847,6 @@ class Chat:
         self.keep_reasoning: bool = True
         self.on_output: Callable[[dict, list[dict]], str | tuple[str, dict] | None] | None = None
         self.on_results: Callable[[str, list[ToolCallResult]], None] | None = None
-        # WHY: 私有模型已通过原生结果读到的行动，主窗口此时仍可能没读 mail。
-        # 这里只存该 Chat 的已读引用，用于限定待编号结果的反查，不复制结果正文或赋号。
-        self.native_seen_calls: set[str] = set()
         self.active_action: str | None = None
         self.reads_window_mail = False
         self.fail_fast = False
@@ -874,7 +869,6 @@ class Chat:
 
     def set_messages(self, messages: list) -> None:
         self.messages = []
-        self.native_seen_calls.clear()
         for value in messages:
             self.add_message(value)
 
@@ -974,18 +968,11 @@ class Chat:
         if user_message is not None:
             self.add_message(user_message)
         callback = recall_func or self.recall_func
-        native_sources: set[str] = set()
-
         def record_output(assistant: dict, calls: list[dict]):
-            recorded = self.on_output(assistant, calls)
-            if isinstance(recorded, str):
-                native_sources.add(recorded)
-            return recorded
+            return self.on_output(assistant, calls)
 
         def record_results(source: str, results: list[ToolCallResult]) -> None:
             self.on_results(source, results)
-            if source in native_sources:
-                self.native_seen_calls.update(f"{source}#{position + 1}" for position in range(len(results)))
 
         try:
             response = self.chat_client.chat(

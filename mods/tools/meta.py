@@ -1,5 +1,7 @@
 '''指导模型增删查改统一工具与 Skill 模块，并说明 last-good、显式应用和当前会话激活原理。
 
+同一模型输出的多个工具调用按顺序执行，却看不到彼此结果；整批完成后立即成为一个正式 result R，正常下一子请求完整读取，不按工具拆分或自动分页。若 `say(final_call=true)` 结束、请求取消或失败，不会只为结果强迫续轮；下次激活按普通历史预算看到 R，需要全文可用 `recall_events`。`peek`／`recall_events` 返回中展示的旧行不是新的 input，不消费未读，也不能确认 `say` 回声；要首次正式读取来源消息请用 `pull`。
+
 ## 直接执行 Python
 
 `exec_code(expr, code, timeout)` 用的是 `.py` 命令那份共享环境：先 `exec(code)`，再 `eval(expr)`，返回 `repr(结果)`。`code` 里的 `print` 输出会被捕获后一起回传，不会发进聊天。环境跨调用持久，上一次定义的变量和函数下一次仍然在。
@@ -115,7 +117,7 @@ Skill 也是可编辑的长期笔记：把可重复使用的经验、做法、�
 
 已读消息和输出也能总结：中心会话调用 `cover_events(["20260923-4", "20260923-5"], "结论")`，参数用的是上文方括号里的正式事件号，不是 QQ `message_id` 或行动位置。也可用 `cover_events(ids=[], conclusion="结论", anchor="20260923-4", before=2, after=3, kinds="input,result")`，或用 `start`／`end` 指定含端点的区间。范围先从唯一已读顺序取最多 40 条原始种子，再筛选种类和来源，不按命中数补足；输出、整批返回、已确认的 `say`／回声是强绑定闭包，实际覆盖成员可能越过范围和筛选条件，也可能超过 40。闭包里有任一成员不可覆盖，整次失败，不丢掉那个成员后继续。覆盖使成员从本轮和后续自动上下文中消失；原号可用 `recall_events` 反查而不解除覆盖，反查总结会显示实际冻结的所有成员，不只是你传入的号。中心会话可跨窗口点名已读或反查过的旧号；未读成员不会被补进覆盖。摘要与聊天消息、输出、返回一样占历史事件数和 token 预算；私有 `.chat` 和子代理不能替中心会话写覆盖。
 
-眼前历史只是全局已读信息流按事件数和 token 选出的可见部分，不是完整记录。新消息先留在有名字的 FIFO；通知只告诉你哪里有消息。所有 FIFO 只用四个动作：`status(source)` 看未读、提及和缺口，`fetch(source)` 从 NapCat 向旧端补取，`peek(source, ...)` 不消耗地预览，`pull(source, count)` 从队首正式读取并取得经历号。窗口名是 `g<群号>` 或 `u<私聊对端号>`，主动 fetch 的旧档有自己的信源 key；四个动作都接受相应的名字。启动补回先于该窗口新实时消息进入原 FIFO；未收束前不能正式 pull。已经读过的旧档信源不会倒插内容，后续 fetch 另开 FIFO。远端历史不保证无缺口。是否继续读取由当前回应和整理需要决定；未读可以留在通知栏，不要只为清空数字而拉取。总结改变默认显示，不删除原文。`peek`／`recall_events` 的整条工具返回各自成为一个新的 result 正式事件；返回正文中展示的多行聊天档案不会逐行获得 input 号，也不会消费 FIFO，更不能充当或确认 `say` 的 QQ 回声。要让未读来源消息取得 input 号须 `pull`；旧 input 若已存在，则按它的正式号 `recall_events`。旧记录本身不变。
+眼前历史只是全局已读信息流按事件数和 token 选出的可见部分，不是完整记录。新消息先留在有名字的 FIFO；通知只告诉你哪里有消息。所有 FIFO 只用四个动作：`status(source)` 看未读、提及和缺口，`fetch(source)` 从 NapCat 向旧端补取，`peek(source, ...)` 不消耗地预览，`pull(source, count)` 从队首正式读取并取得经历号。窗口名是 `g<群号>` 或 `u<私聊对端号>`，主动 fetch 的旧档有自己的信源 key；四个动作都接受相应的名字。启动补回先于该窗口新实时消息进入原 FIFO；未收束前不能正式 pull。已经读过的旧档信源不会倒插内容，后续 fetch 另开 FIFO。远端历史不保证无缺口。是否继续读取由当前回应和整理需要决定；未读可以留在通知栏，不要只为清空数字而拉取。总结改变默认显示，不删除原文。`peek`／`recall_events` 所在同步工具批次整体成为一个 R；返回正文中展示的多行聊天档案不会逐行获得 input 号，也不会消费 FIFO，更不能充当或确认 `say` 的 QQ 回声。要让未读来源消息取得 input 号须 `pull`；旧 input 若已存在，则按它的正式号 `recall_events`。旧记录本身不变。
 
 总结要方便反查：在结论里留下关键来源的正式号，别只写一段没有出处的大块故事。后续总结可以再次引用前一层总结；同一来源也可被多个不同主题的总结引用，不必强行归到唯一父节点。已被覆盖的正式号也可再次点名，与新的可见成员组成另一份总结；这不解除原覆盖。`event_links` 可查输入、输出和工具返回中明确出现的正式号，以及各节点实际覆盖的成员；“出现过编号”、“被覆盖”和“确实支撑某个结论”是三回事，核对原话仍须 `recall_events`。
 
@@ -251,16 +253,8 @@ def condense_ops(cids: list[str], conclusion: str) -> str:
         return "没有指定要收缩的调用"
     session = current_binding().session
     found, unknown = oplog.recall(window, cids)
-    pending = oplog.pending_calls(window, unknown)
-    visible_native = {(str(item.get("tool_call_id")), str(item.get("content")))
-                      for item in session.messages if item.get("role") == "tool"}
-    pending = [item for item in pending if (str(item.get("tool_call_id")), str(item["content"])) in visible_native]
-    pending_ids = {item["cid"] for item in pending}
-    native_ids = [item["tool_call_id"] for item in [*found, *pending] if item.get("tool_call_id")]
+    native_ids = [item["tool_call_id"] for item in found if item.get("tool_call_id")]
     sources = {cid.partition("#")[0] for cid in cids}
-    if pending and not session.condense_native_calls(native_ids, sources=sources, apply=False):
-        pending_ids.clear()
-    unknown = sorted(set(unknown) - pending_ids)
     if unknown:
         return f"操作历史里找不到（已被 #ops clear 清掉，或从未存在）: {', '.join(unknown)}"
     # WHY: 要写两处，因为"上下文"在这一刻有两副身体：当前这轮的 Chat.messages 是活的、
@@ -289,7 +283,7 @@ def condense_ops(cids: list[str], conclusion: str) -> str:
 
 
 def recall_ops(cids: list[str]) -> str:
-    """按 cid 取回工具调用的原文，包括已收缩的结果；私有会话已见的原生返回在窗口 mail 尚未读到时也可取回，但不能提前读取别的会话的未读结果。
+    """按 cid 取回工具调用的原文，包括已收缩的结果。
 
     @param
     cids: 要取回的行动引用，形如 ["20260923-4#1", "20260923-4#2"]
@@ -302,14 +296,6 @@ def recall_ops(cids: list[str]) -> str:
     if not cids:
         return "没有指定要取回的调用"
     found, unknown = oplog.recall(window, cids)
-    if unknown:
-        try:
-            native_seen = current_binding().session.native_seen_calls
-        except RuntimeError:
-            native_seen = set()
-        pending = oplog.pending_calls(window, set(unknown) & native_seen)
-        found.extend(pending)
-        unknown = sorted(set(unknown) - {item["cid"] for item in pending})
     lines = []
     for entry in found:
         members = oplog.coverage_members(window, entry["cid"])
