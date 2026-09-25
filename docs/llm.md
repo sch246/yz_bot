@@ -34,7 +34,7 @@
 
 `event_span(anchor, before, after)` 沿全局已读追加顺序列出中心号前后的有界事件，也可用 `start`／`end` 列出含端点的短区间；`kinds` 和 `source` 只在范围确定后过滤，不重排，也不读取正文。返回的实际正式号可再交给 `recall_events` 或 `cover_events`，后两者仍按明确号处理，并保留各自的可见性和强绑定校验。一次最多跨 40 条，长区间须分段。
 
-中心 reader 每次请求前估算实际送达的已编号事件文本成本；超过全局 `pressure_percent`（默认 75%，由 `#agent limit` 的第三项设置）时，在模型可见末尾 hint 中只显示“上下文占用 N%”。它不计事件条数、不替模型决定如何总结，也不是聊天结束后向 QQ 发状态的 `#hint`。比例只相对全局 `max_token` 历史预算，不等于 API 实际 token 使用率。
+中心 reader 每次请求前估算实际送达的已编号事件文本成本；超过全局 `pressure_percent`（默认 75%，由 `#agent limit` 的第三项设置）时，在模型可见末尾 hint 中只显示“上下文占用 {已用}/{上限} token”，不显示百分比。它不计事件条数、不替模型决定如何总结，也不是聊天结束后向 QQ 发状态的 `#hint`。这里的已用与上限相对全局 `max_token` 历史预算，不等于 API 实际 token 使用量。
 
 中心 agent 可调用 `edit_hint(text)` 整体替换全局待办，空字符串清空；文本以 `agent_hint` 存在全局 `agent` storage。每次模型子请求从该值重新生成末尾 hint，历史中不追加旧版文本（工具行动本身仍留痕），也不会发 QQ 消息。动态未读概况和压力提示是另外两段可重算 hint；向 QQ 发结束状态的 `#hint` 命令仍按来源窗口配置。
 

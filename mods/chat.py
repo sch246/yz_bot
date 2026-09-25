@@ -888,8 +888,7 @@ def _visible_stream_ids(messages: list[dict]) -> set[str]:
 def _pressure_hint(used_tokens: int, max_tokens: int, threshold: int) -> str:
     if used_tokens * 100 <= max_tokens * threshold:
         return ""
-    percent = (used_tokens * 100 + max_tokens - 1) // max_tokens
-    return f"上下文占用{percent}%"
+    return f"上下文占用 {used_tokens}/{max_tokens} token"
 
 
 def _cover_projection(messages: list[dict], members: set[str]) -> None:
@@ -1500,7 +1499,7 @@ _SUBCOMMAND_HELP = (
     ("limit [<事件数> <token> [提醒百分比]|reset]", """查看或设置本窗口的可见事件数、上下文 token 上限与提醒阈值（管理员）。
 
 格式：#limit | #limit <事件数> <token> [提醒百分比] | #limit reset
-两个上限共同裁剪近期已读输入、输出与工具返回；提醒百分比只决定模型末尾何时显示 token 占比。默认值分别为 20、50000、75%；旧 max_msg 值仅在没有 max_events 时读取。
+两个上限共同裁剪近期已读输入、输出与工具返回；提醒百分比只决定模型末尾何时显示上下文 token 用量（已用/上限），不改变显示格式。默认值分别为 20、50000、75%；旧 max_msg 值仅在没有 max_events 时读取。
 #limit                  显示两个上限和提醒百分比，并标出值来自本窗口还是默认
 #limit <事件数> <token> [提醒百分比] 写入本窗口的上限；省略百分比则保留原设置
 #limit reset            清掉本窗口的上限与提醒百分比，回落到默认
