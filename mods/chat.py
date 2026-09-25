@@ -39,20 +39,18 @@ prompts: dict = {}
 chat_groups: list = []
 description_cache: dict = {}
 llm_config: dict = {}
-# WHY: 两个上限的默认值写死在这里，不再读 llm_system/config.json。一是那份配置只在
-# on_load 读一次，改它必须重启才生效，而它描述的本来就是"每窗口配置的缺省"、不是全局
-# 开关；二是那两个数从 LLM 刚出现时就没回头调过，当时的理由（上限本身就小）早不成立了。
-# WHY: 宁可低。事件数现在包含输出与返回，默认 20 可能比旧消息数更早截断；
-# 真需要更长历史的窗口可以自己写覆盖值（见 WINDOW_SETTINGS 与 #limit），
-# 这比让所有窗口默默付大账单好。token 反过来给得宽：卡在预算里会让模型说到一半没法思考，
-# 而一个纯聊天的会话本来就远用不满，所以它的默认值是"够用"而不是"尽量小"。
-DEFAULT_MAX_EVENTS = 20
-DEFAULT_MAX_TOKEN = 50000
+# WHY: 两个上限的默认值写死在这里，不再读 llm_system/config.json；运行期由全局
+# agent storage 覆盖。事件条数只防大量极短事件挤占注意力，token 才是主要预算：20 条会让
+# 密集工具循环过早忘掉刚做过的决定，500 条让模型有机会自行覆盖，40000 token 则保留明确
+# 的成本与注意力边界。独立 `.chat` 沿用同一缺省，但旧窗口覆盖仍原样保留。
+DEFAULT_MAX_EVENTS = 500
+DEFAULT_MAX_TOKEN = 40000
 AGENT_WINDOW = oplog.AGENT_WINDOW
-MAIL_PAGE_EVENTS = 8
-MAIL_PAGE_TOKENS = 4000
-RESULT_PAGE_EVENTS = 8
-RESULT_ITEM_TOKENS = MAIL_PAGE_TOKENS
+MAX_PULL_EVENTS = 500
+INITIAL_MAIL_EVENTS = 8
+MAIL_PULL_TOKENS = 4000
+RESULT_BATCH_EVENTS = 8
+RESULT_ITEM_TOKENS = MAIL_PULL_TOKENS
 NOTICE_TOKENS = 500
 _PRESSURE_PERCENT = 75
 _cost_lock = threading.Lock()
@@ -148,11 +146,10 @@ def _bounded_int(minimum: int, fallback: int, maximum: int | None = None):
     return normalize
 
 
-# 窗口级配置：命令名 -> (storage 键, 默认值, 归一化)。
-# WHY: 读取一律走 window_setting，合并就一句话——窗口里写过的合法值优先，否则默认值。
-# 表是唯一的清单，加一项配置就是加一行；默认值散在各自动归化函数的兜底分支里，改一处就
-# 够。`hint`/`prompt` 不在这张表里：它们是复合值（dict / 列表），缺省来自别的存储，
-# 各自的合并也只有一行，塞进来反而要造间接层。
+# 单值聊天配置：命令名 -> (storage 键, 默认值, 归一化)。
+# WHY: 窗口会话走 window_setting 合并，中心 agent 把自己的全局字典交给同一归一化函数；
+# 表只统一合法值和默认值，不混合两种 storage。`hint`/`prompt` 是复合值（dict / 列表），
+# 缺省来自别的存储，各自的合并也只有一行，塞进来反而要造间接层。
 WINDOW_SETTINGS = {
     "image": ("image", "off", normalize_image_mode),
     "reasoning": ("reasoning", "keep", normalize_reasoning_mode),
@@ -390,12 +387,12 @@ def _notification_projection(entry: dict) -> dict:
                 break
             shown.append(_unread_detail_text(detail))
         omitted = len(details) - len(shown)
-        listing = "；".join(shown) + (f"；还有 {omitted} 个窗口未列出，用 list_unread(offset={len(shown)}) 查看"
+        listing = "；".join(shown) + (f"；还有 {omitted} 个窗口未列出，用 status() 查看"
                                    if omitted else "")
     else:
         listing = "、".join(f"{window[0]}:{window[1]}" for window in entry["windows"])
     content = (f"[{entry['id']}] 新召唤通知：{listing}。"
-               "正文仍在未读队列；普通消息本身不激活；可先 peek，再指定目标 say，随后逐页 pull_mail。")
+               "正文仍在未读 FIFO；普通消息本身不激活。可按回应需要 peek，或用 pull(source, count) 正式读取；未读不要求清空。")
     return {"role": "user", "content": bounded_excerpt(content, NOTICE_TOKENS)}
 
 
@@ -416,13 +413,13 @@ def _pending_hint() -> str:
                                                  for item in [*shown, detail])) > NOTICE_TOKENS - 150:
             break
         shown.append(detail)
-    tail = f"；另有 {len(rows) - len(shown)} 个窗口，用 list_unread(offset={len(shown)}) 查看" if len(rows) > len(shown) else ""
+    tail = f"；另有 {len(rows) - len(shown)} 个窗口，用 status() 查看" if len(rows) > len(shown) else ""
     source_lines = [f"{source['name']} key={source['key']} 未读={source['remaining']} "
                     f"提及={source['mention_count'] - source['read_mention_count']} "
                     f"状态={source['state']}" + (f" 缺口={source['gap']}" if source['gap'] else "")
                     for source in independent[:3]]
     if len(independent) > 3:
-        source_lines.append(f"另有 {len(independent) - 3} 个信源，用 source_status 查看")
+        source_lines.append(f"另有 {len(independent) - 3} 个信源，用 status() 查看")
     parts = [*(_unread_detail_text(detail) for detail in shown), tail, *source_lines]
     return bounded_excerpt("待正式读取：" + "；".join(part for part in parts if part), NOTICE_TOKENS)
 
@@ -466,9 +463,9 @@ def _stream_rows(window: tuple | None, token_limit: int | None,
             converted = _numbered(projection, entry["id"])
             converted = _echo_relation(converted, entry, links)
         elif entry["kind"] == "output":
-            if not entry["actions"]:
+            if not entry["actions"] and not entry["body"]:
                 continue
-            converted = _output_projection(entry, include_body=False)
+            converted = _output_projection(entry)
         elif entry["kind"] == "notification":
             converted = _notification_projection(entry)
         else:
@@ -576,8 +573,8 @@ def _base_prompt() -> list[dict]:
 - 你收到的消息原样带着这两种 CQ 码。reply 里的 message_id 与上文各条消息 <metadata> 中的 <message_id> 对应，据此判断对方在回复哪一条
 - 聊天中可能不会有明显的问题，扮演好角色即可
 - 如无特殊要求，请用中文回复
-- **说话要调 `say`**。直接写在回复正文里的内容不会发出去，那是你这一轮的自言自语
-- 眼前历史是唯一全局已读信息流按预算选出的可见部分，不是全部记录。通知不等于读取；先用 peek 预览，或用 pull_mail 逐页正式读取
+- **说话要调 `say`**。直接写在回复正文里的内容不会发出去，只会留在你自己的输出轨迹里
+- 眼前历史是唯一全局已读信息流按预算选出的可见部分，不是全部记录。通知不等于读取；每个 FIFO 只需 status/fetch/peek/pull 四个动作，只有 pull(source, count) 会从队首正式读取。未读不要求清空
 - 想积累经验就实际写入以后会用的载体：可复用做法写 Markdown Skill 并按需加载，全局待办用 `edit_hint` 保存；只在回复里说“记住了”不会保存它
 - 对外发送必须在 say 里明确写目标 g群号 或 u私聊对端号；没有默认接收窗口
 - `say` 返回这条消息的 message_id；它默认 `final_call=true`，说完这一轮就结束，要接着干活就传 `final_call=false`"""}]
@@ -614,17 +611,17 @@ def _echo_relation(converted: dict, entry: dict, links: dict[str, tuple[str, str
     return {**converted, "content": content + relation}
 
 
-def _output_projection(entry: dict, *, include_body: bool = True) -> dict:
+def _output_projection(entry: dict) -> dict:
     actions = "\n".join(f"{entry['id']}#{position + 1} {action['name']}({action['arguments']})"
                         for position, action in enumerate(entry["actions"]))
     body = entry["body"] if isinstance(entry["body"], str) else str(entry["body"])
-    if not include_body:
-        body = "（正文已省略）"
-    return {"role": "user", "content": f"[{entry['id']}] 自己的输出：{body}\n{actions}"}
+    thought = entry.get("thought")
+    thought_text = f"\n自己的思考：{thought}" if isinstance(thought, str) and thought else ""
+    return {"role": "user", "content": f"[{entry['id']}] 自己的输出：{body}{thought_text}\n{actions}"}
 
 
 def _result_projection(entry: dict, links: dict[str, tuple[str, str]],
-                       max_tokens: int = MAIL_PAGE_TOKENS) -> dict:
+                       max_tokens: int = MAIL_PULL_TOKENS) -> dict:
     lines = []
     for result in entry["returns"]:
         reference = f"{entry['source']}#{result['position'] + 1}"
@@ -783,10 +780,9 @@ def _restore_window_tools(binding, window: tuple | None) -> None:
 def get_handler(session: llm.Chat):
     """The per-chunk sink: self-talk to the terminal, cost to the ledger.
 
-    WHY: 模型写在回复正文里的内容**不再发进聊天**。发言是一次 `say` 调用（见
-    `tools/meta.py`），正文因此退化成这一轮的自言自语：同轮可见，完整输出事件
-    留存以供反查，但后续轮次的模型视图不载入正文，也不进 chatlog。模型下一轮
-    看不到自己想过什么，是刻意的。
+    WHY: 模型写在回复正文里的内容**不发进聊天**。发言仍只能调用 `say`（见
+    `tools/meta.py`）；正文是自己的输出轨迹，会随正式输出事件跨轮重建，直到被覆盖或
+    超出上下文预算。这样模型能记得刚才的计划，但不会把自言自语误当成已发送消息。
 
     WHY: 但它要打到终端。人得看得见模型在想什么，尤其是在它**忘了调 `say`**的时候——那
     种轮对聊天窗口是完全静默的，终端这一行是唯一的痕迹。用 msg 流而不是另开一个，是为了
@@ -835,7 +831,11 @@ def _private_results(window, binding):
 
 
 def _record_output(window, assistant: dict, calls: list[dict], session=None) -> tuple[str, dict] | None:
-    source = oplog.output(window, assistant, calls)
+    offline = _offline_scope.get()
+    source = oplog.output(
+        window, assistant, calls,
+        persist_reasoning=bool(offline and offline.get("persist_reasoning")),
+    )
     if source is None:
         return None
     entry, missing = oplog.recall_events(window, [source])
@@ -876,8 +876,12 @@ def _stream_id(session: llm.Chat, message: dict) -> str | None:
 
 def _prune_stream_ids(session: llm.Chat) -> None:
     live = {id(message) for message in session.messages}
+    # WHY: on_output 会先登记本次输出投影，原生 assistant/tool 载体却要等整批工具完成
+    # 才替换成它。同批工具校验可见号时，这个投影尚不在 messages；只保留 active_action
+    # 所属输出这一条暂存映射，避免 cover_events 让自己的输出永久失去正式号。
+    active_source = str(getattr(session, "active_action", "") or "").partition("#")[0]
     session.stream_ids = {key: pair for key, pair in session.stream_ids.items()
-                          if key in live}
+                          if key in live or active_source and pair[1] == active_source}
 
 
 def _cover_agent_projection(session: llm.Chat, members: set[str]) -> None:
@@ -911,7 +915,7 @@ def _cover_projection(messages: list[dict], members: set[str]) -> None:
 
 
 def _mail_context(entries: list[context.MailEntry], in_group: bool, window: tuple,
-                  max_tokens: int = MAIL_PAGE_TOKENS) -> list[dict]:
+                  max_tokens: int = MAIL_PULL_TOKENS) -> list[dict]:
     """Project a global mailbox of tool results, never a window's chat mail."""
     output = []
     for entry in entries:
@@ -955,23 +959,29 @@ def _recovery_sources(window: tuple) -> list[dict]:
             and source["source_type"] == "napcat_boot"]
 
 
-def fetch_remote_source(window: tuple) -> dict:
-    """Extend an unpulled gap or open a separate historical FIFO."""
+def fetch_remote_source(window: tuple, source_key: str | None = None) -> dict:
+    """Extend the selected unpulled gap or open a separate historical FIFO."""
     from mods import _backfill, connect
 
     candidates = [source for source in oplog.sources()
                   if tuple(source["window"]) == window
                   and source["source_type"] in ("napcat_boot", "napcat_history")]
-    latest = candidates[-1] if candidates else None
-    if latest is not None and latest["state"] == "fetching":
-        return latest
-    if latest is not None and latest["state"] in ("gap", "failed") and not latest["pulled"]:
-        source = oplog.reopen_source(latest["key"], fetch_anchor=latest["fetch_anchor"])
+    selected = (next((source for source in candidates if source["key"] == source_key), None)
+                if source_key is not None else (candidates[-1] if candidates else None))
+    if source_key is not None and selected is None:
+        raise ValueError("信源不属于该窗口或不能从 NapCat 扩展")
+    if selected is not None and selected["state"] == "fetching":
+        return selected
+    if selected is not None and selected["state"] in ("gap", "failed") and not selected["pulled"]:
+        source = oplog.reopen_source(selected["key"], fetch_anchor=selected["fetch_anchor"])
     else:
+        # WHY: 显式对一个旧 key 再 fetch 就从那个 key 的旧端新开 FIFO，不偷偷改用同窗口
+        # 最新 key，也不跨 FIFO 去重。两个信源即使含有重叠原文，也是两次可由 agent 选择的
+        # 重放经历；隐藏重叠会让“这个信源实际保存了什么”失真。
         target = ("g" if window[0] == "group" else "u") + str(window[1])
         source = oplog.start_source("NapCat 历史 " + target, window, "napcat_history",
                                     queue_window="new",
-                                    start_seq=latest["stop_cursor"] if latest else None)
+                                    start_seq=selected["stop_cursor"] if selected else None)
 
     def fetch() -> None:
         try:
@@ -989,7 +999,8 @@ def fetch_remote_source(window: tuple) -> dict:
     return source
 
 
-def _read_source_page(window: tuple, source: dict, session: llm.Chat | None) -> tuple[list[dict], str | None]:
+def _pull_source_events(window: tuple, source: dict, session: llm.Chat | None,
+                        count: int) -> tuple[list[dict], str | None]:
     from mods import chatlog
 
     page_number = source["read_page"]
@@ -999,7 +1010,7 @@ def _read_source_page(window: tuple, source: dict, session: llm.Chat | None) -> 
     output = []
     used = 0
     for offset in range(source["read_offset"], len(members)):
-        if offset - source["read_offset"] >= MAIL_PAGE_EVENTS:
+        if offset - source["read_offset"] >= count:
             break
         member = members[offset]
         origin = member["origin"]
@@ -1010,16 +1021,17 @@ def _read_source_page(window: tuple, source: dict, session: llm.Chat | None) -> 
         event["_history_seq"] = member.get("message_seq")
         converted = _model_event(event, window[0] == "group")
         amount = _message_cost(converted) if converted is not None else 0
-        if used + amount > MAIL_PAGE_TOKENS - 300:
+        if used + amount > MAIL_PULL_TOKENS - 300:
             if output:
                 break
             if converted is None:
                 return [], "队首补回记录无法投影"
             excerpt = bounded_excerpt(json.dumps(converted["content"], ensure_ascii=False),
-                                      MAIL_PAGE_TOKENS - 600)
+                                      MAIL_PULL_TOKENS - 600)
+            target = ("g" if window[0] == "group" else "u") + str(window[1])
             converted = {"role": "user", "content":
                          f"来源窗口={window} origin={origin}；补回消息过长，先读片段：{excerpt}；"
-                         f"用 peek(origin={origin!r}) 继续"}
+                         f"用 peek(source={target!r}, item={origin!r}) 继续"}
         if offset + 1 < len(members):
             next_page, next_offset = page_number, offset + 1
         else:
@@ -1043,22 +1055,22 @@ def _read_source_page(window: tuple, source: dict, session: llm.Chat | None) -> 
     return output, None
 
 
-def _read_mail_page(window: tuple, session: llm.Chat | None = None,
-                    through: str | None = None) -> tuple[list[dict], str | None]:
-    """Read one bounded FIFO page, projecting an oversized archived head by prefix."""
+def _pull_mail_events(window: tuple, session: llm.Chat | None,
+                      through: str | None, count: int) -> tuple[list[dict], str | None]:
+    """Commit up to *count* FIFO events within one bounded model input."""
     box = context.mailbox(window)
     sources = _recovery_sources(window)
     if not sources and _offline_scope.get() is None:
-        box.prepare_initial_page(MAIL_PAGE_EVENTS)
+        box.prepare_initial_tail(INITIAL_MAIL_EVENTS)
     elif any(source["state"] == "fetching" for source in sources):
         return [], "该窗口离线补回仍在进行；mail 尚未开放正式拉取"
     prefix = []
     for source in sources:
-        prefix = box.unread_through(source["pending_boundary"], MAIL_PAGE_EVENTS)
+        prefix = box.unread_through(source["pending_boundary"], count)
         if prefix:
             break
         if source["remaining"]:
-            return _read_source_page(window, source, session)
+            return _pull_source_events(window, source, session, count)
 
     def project(entries: list[context.MailEntry]) -> list[dict]:
         selected = []
@@ -1074,12 +1086,12 @@ def _read_mail_page(window: tuple, session: llm.Chat | None = None,
                 selected.append((entry, None))
                 continue
             amount = _message_cost(converted)
-            if used + amount > MAIL_PAGE_TOKENS - 300:
+            if used + amount > MAIL_PULL_TOKENS - 300:
                 break
             selected.append((entry, converted))
             used += amount
         if not selected and entries:
-            raise ValueError("队首消息超过单页 token 上限；未消费，请用有界 peek 检查原文")
+            raise ValueError("队首消息超过单次 pull 的 token 上限；未消费，请用有界 peek 检查原文")
         projections = []
         for entry, converted in selected:
             event = entry.event
@@ -1104,7 +1116,7 @@ def _read_mail_page(window: tuple, session: llm.Chat | None = None,
         return projections, len(selected)
 
     try:
-        entries = prefix if prefix else box.unread(MAIL_PAGE_EVENTS)
+        entries = prefix if prefix else box.unread(count)
         if through is not None:
             entries = [entry for entry in entries if oplog.arrival_before_or_at(entry.arrival, through)]
         if not entries:
@@ -1118,7 +1130,7 @@ def _read_mail_page(window: tuple, session: llm.Chat | None = None,
                 located = {**entry.event, "_log_origin": oplog.arrival_origin(entry.arrival), "_live": True}
                 converted = _model_event(located, window[0] == "group")
             amount = _message_cost(converted) if converted is not None else 0
-            if used + amount > MAIL_PAGE_TOKENS - 300:
+            if used + amount > MAIL_PULL_TOKENS - 300:
                 break
             selected.append(entry)
             used += amount
@@ -1128,7 +1140,7 @@ def _read_mail_page(window: tuple, session: llm.Chat | None = None,
             head = entries[0]
             origin = oplog.arrival_origin(head.arrival)
             if "_stream_results" in head.event or not origin:
-                return [], "队首消息超过单页上限且缺少可续读档案；未消费"
+                return [], "队首消息超过单次 pull 上限且缺少可续读档案；未消费"
             archive = chatlog.read_origin(*window, origin)
             if archive is None:
                 return [], "队首消息的精确档案不可读取；未消费"
@@ -1136,18 +1148,18 @@ def _read_mail_page(window: tuple, session: llm.Chat | None = None,
             if converted is None:
                 return [], "队首消息的档案投影不可读取；未消费"
             rendered = json.dumps(converted["content"], ensure_ascii=False)
-            excerpt = bounded_excerpt(rendered, MAIL_PAGE_TOKENS - 400)
+            excerpt = bounded_excerpt(rendered, MAIL_PULL_TOKENS - 400)
             if not excerpt:
                 return [], "队首消息的档案位置过长；未消费"
             target = ("g" if window[0] == "group" else "u") + str(window[1])
             next_offset = len(excerpt)
-            continuation = (f"内容未读完；用 peek(target={target!r}, origin={origin!r}, "
+            continuation = (f"内容未读完；用 peek(source={target!r}, item={origin!r}, "
                             f"offset={next_offset}) 继续" if next_offset < len(rendered)
                             else "该归档投影已经读完")
             partial = {"role": "user", "content":
                        f"来源窗口={target} origin={origin} arrival={head.arrival}；"
                        f"队首超长消息的正式归档读取片段：{excerpt}\n{continuation}"}
-            if _message_cost(partial) > MAIL_PAGE_TOKENS - 100:
+            if _message_cost(partial) > MAIL_PULL_TOKENS - 100:
                 return [], "队首消息的档案位置过长；未消费"
 
             def project_partial(crossed: list[context.MailEntry]) -> list[dict]:
@@ -1322,7 +1334,6 @@ def _drive_agent(model: str | None, window: tuple) -> None:
         return
     turn._chat_usage_tokens = 0
     turn.requested_pulls = []
-    turn.blocked_windows = set()
     turn.associated_windows = {window}
     # WHY: 一次对话 = 这次持有的全过程（多轮 + 插话续写，直到 finally），图片检查台账就
     # 活在这段里：同一张图不重复下载/解析，对话结束即清掉，下次再聊重新检查一遍。
@@ -1341,14 +1352,11 @@ def _drive_agent(model: str | None, window: tuple) -> None:
             if turn.cancelled:
                 return
             turn.associated_windows.intersection_update(
-                set(oplog.work_windows(AGENT_WINDOW))
-                | {window for window, _count, active in oplog.pending_summary() if active}
-                | {window for window, _through in turn.requested_pulls})
+                {window for window, _count, active in oplog.pending_summary() if active}
+                | {window for window, _through, _count in turn.requested_pulls})
             if not context.finish_turn(AGENT_WINDOW, turn,
                                        lambda: bool(turn.mail.unread()) or oplog.has_unnotified()
-                                       or bool(turn.requested_pulls)
-                                       or any(window not in turn.blocked_windows
-                                              for window in oplog.work_windows(AGENT_WINDOW))):
+                                       or bool(turn.requested_pulls)):
                 return
     finally:
         image.end_conversation(image_ledger)
@@ -1391,11 +1399,6 @@ def _run_agent(model: str | None, turn) -> bool:
         projection = _notification_projection(notice)
         messages.append(projection)
         _remember_stream(session, projection, notice["id"])
-    if not turn.requested_pulls:
-        work = [(window, through) for window, through in oplog.work_targets(AGENT_WINDOW).items()
-                if window not in turn.blocked_windows]
-        if notice is None and work:
-            turn.requested_pulls.append(work[0])
     if not messages and not turn.requested_pulls and not turn.mail.unread():
         return True
     _activate_chat(session, _close_with_user(messages), read_mail=True)
@@ -1449,7 +1452,7 @@ def _agent_provider(turn, session: llm.Chat):
         try:
             def project_results(entries: list[context.MailEntry]) -> list[dict]:
                 projections = []
-                item_budget = max(100, (MAIL_PAGE_TOKENS - 300) // len(entries))
+                item_budget = max(100, (MAIL_PULL_TOKENS - 300) // len(entries))
                 for entry in entries:
                     for projection in _mail_context([entry], False, AGENT_WINDOW,
                                                     item_budget):
@@ -1462,8 +1465,8 @@ def _agent_provider(turn, session: llm.Chat):
                 return projections
 
             # WHY: Batch only results already present at this request boundary;
-            # never wait for future tools, and reserve one shared page budget.
-            unread_results = turn.mail.unread(RESULT_PAGE_EVENTS)
+            # never wait for future tools, and reserve one shared input budget.
+            unread_results = turn.mail.unread(RESULT_BATCH_EVENTS)
             produced = (turn.mail.pull(len(unread_results), project_results)
                         if unread_results else [])
             notice = oplog.deliver_notifications(AGENT_WINDOW)
@@ -1474,32 +1477,31 @@ def _agent_provider(turn, session: llm.Chat):
                 projection = _notification_projection(notice)
                 produced.append(projection)
                 _remember_stream(session, projection, notice["id"])
-            # WHY: pull_mail 的短结果本身也会先进 result mail；若要求 result 与通知都为空
+            # WHY: pull 的短结果本身也会先进 result mail；若要求 result 与通知都为空
             # 才兑现请求，模型每次重试都会再制造一个结果，承诺的“下一次请求前读取”便会
-            # 永久饥饿。三类输入各自已有页上限，所以同一 boundary 先交付结果/通知、再兑现
-            # 至多一页 pull，仍然有界。
+            # 永久饥饿。三类输入各自已有上限，所以同一 boundary 先交付结果/通知、再兑现
+            # 至多一个显式 pull，仍然有界。
             if turn.requested_pulls:
-                window, through = turn.requested_pulls.pop(0)
+                window, through, count = turn.requested_pulls.pop(0)
                 if window[0] == "source":
                     source = oplog.resolve_source(window[1])
                     if source is None:
-                        page, error = [], "信源不存在"
+                        pulled, error = [], "信源不存在"
                     elif source["state"] == "fetching":
-                        page, error = [], "信源仍在拉取；FIFO 前端尚未固定"
+                        pulled, error = [], "信源仍在拉取；FIFO 前端尚未固定"
                     else:
                         original_window = tuple(source["window"])
                         turn.associated_windows.add(original_window)
-                        page, error = _read_source_page(original_window, source, session)
+                        pulled, error = _pull_source_events(original_window, source, session, count)
                         if error is None and oplog.resolve_source(source["key"])["read_count"] > source["read_count"]:
                             oplog.mark_source_pulled(source["key"])
                 else:
                     turn.associated_windows.add(window)
-                    page, error = _read_mail_page(window, session, through)
-                produced.extend(page)
+                    pulled, error = _pull_mail_events(window, session, through, count)
+                produced.extend(pulled)
                 if error:
                     if _offline_scope.get() is not None:
                         raise llm.RequiredContextError(f"离线回放读取失败：{error}")
-                    turn.blocked_windows.add(window)
                     produced.append({"role": "user", "content": f"{window} 拉取失败：{error}"})
             turn._chat_usage_tokens = sum(
                 _message_cost(message) for message in [*session.messages, *produced]
@@ -1528,14 +1530,14 @@ _SUBCOMMAND_HELP = (
     ("reasoning [keep|drop]", "查看或设置工具循环内是否带回思考内容"),
     ("tools [append|ui]", "查看或设置工具状态的呈现方式"),
     ("ops [clear]", "查看或清空本窗口的操作历史"),
-    ("limit [<事件数> <token> [提醒百分比]|reset]", """查看或设置本窗口的可见事件数、上下文 token 上限与提醒阈值（管理员）。
+    ("limit [<事件数> <token> [提醒百分比]|reset]", """查看或设置中心 agent 的全局可见事件数、上下文 token 上限与提醒阈值（管理员）。
 
 格式：#limit | #limit <事件数> <token> [提醒百分比] | #limit reset
-两个上限共同裁剪近期已读输入、输出与工具返回；提醒百分比只决定模型末尾何时显示上下文 token 用量（已用/上限），不改变显示格式。默认值分别为 20、50000、75%；旧 max_msg 值仅在没有 max_events 时读取。
-#limit                  显示两个上限和提醒百分比，并标出值来自本窗口还是默认
-#limit <事件数> <token> [提醒百分比] 写入本窗口的上限；省略百分比则保留原设置
-#limit reset            清掉本窗口的上限与提醒百分比，回落到默认
-未读 mail 不受历史限额丢弃；本设置是旧窗口配置，不控制中心 agent。"""),
+两个上限共同裁剪中心 agent 近期已读的输入、输出与工具返回；提醒百分比只决定模型末尾何时显示上下文 token 用量（已用/上限），不改变显示格式。默认值分别为 500、40000、75%。
+#limit                  显示全局两个上限和提醒百分比，并标出值来自全局覆盖还是默认
+#limit <事件数> <token> [提醒百分比] 写入全局上限；省略百分比则保留原设置
+#limit reset            清掉全局上限与提醒百分比，回落到默认
+它是 #agent limit 的简写；未读 mail 不受历史限额丢弃。旧窗口覆盖仍只供独立 .chat 兼容。"""),
     ("hint [get|set|default]", """查看、编写或开关本窗口的结束提示（管理员）。
 
 格式：#hint | #hint get | #hint set <代码> | #hint set | #hint default [get|set <代码>]
@@ -1722,30 +1724,30 @@ def _hint_subcommand(raw: str) -> str:
 
 
 def _limit_report() -> str:
-    """`#limit` 查看窗口上限与提醒阈值。"""
-    data = getchatstorage()
+    """`#limit` 查看中心 agent 的全局上限与提醒阈值。"""
+    data = storage.get("", "agent")
     lines = []
     for name in ("max_events", "max_token", "pressure_percent"):
-        key, _default, _normalize = WINDOW_SETTINGS[name]
-        origin = "本窗口" if key in data or name == "max_events" and "max_msg" in data else "默认"
-        value = limit(context.current())[0] if name == "max_events" else window_setting(name, data)
+        key, _default, normalize = WINDOW_SETTINGS[name]
+        origin = "全局" if key in data else "默认"
+        value = normalize(data.get(key))
         lines.append(f"{name}: {value}（{origin}）")
     return "\n".join(lines)
 
 
 def _limit_set(tail: str) -> str:
-    """`#limit <事件数> <token> [提醒百分比]` 写窗口设置；`reset` 回落默认。
+    """`#limit <事件数> <token> [提醒百分比]` 写全局设置；`reset` 回落默认。
 
     WHY: 两个历史上限仍一起写，避免只改其中一个造成难解释的半份配置。提醒百分比
     可选，不写就保留原设置；老的两参数命令因此不会意外重置它。
     """
-    data = getchatstorage()
+    data = storage.get("", "agent")
     if tail.strip() == "reset":
         for name in ("max_events", "max_token", "pressure_percent"):
             data.pop(WINDOW_SETTINGS[name][0], None)
         data.pop("max_msg", None)
         storage.save()
-        return "已重置上限，回落到默认"
+        return "已重置中心 agent 上限，回落到默认"
     parts = tail.split()
     if len(parts) not in (2, 3):
         return "limit 参数错误，可用 #help limit 查看"
@@ -1765,7 +1767,7 @@ def _limit_set(tail: str) -> str:
 
 
 def _agent_subcommand(tail: str) -> str:
-    """Only the op-gated #agent entry writes the main agent's global settings."""
+    """Handle the op-gated detailed entry for the main agent's global settings."""
     data = storage.get("", "agent")
     parts = tail.split()
     if not parts:
@@ -2047,10 +2049,10 @@ def _subcommand_call(event: dict) -> Callable | None:
     subcommand = value[1:].strip().partition(" ")[0]
     if subcommand not in _SUBCOMMAND_NAMES:
         return None
-    if subcommand in ("hint", "agent") and not op.require_op(event, pattern=r"^#\s*(hint|agent)"):
-        # WHY: hint 是用户可写的代码、跑在特权环境、还每次聊天自动执行，权限
-        # 与 .py/.link 同级，所以非 op 连命令面都不给；require_op 已经按节流
-        # 约定（同一个人的同类重试）给过提醒，这里只要不接管这条消息。
+    if subcommand in ("hint", "agent", "limit") and not op.require_op(
+            event, pattern=r"^#\s*(hint|agent|limit)"):
+        # WHY: hint 是用户可写的特权代码；agent 与 limit 修改全局主体设置。三者都不能让
+        # 普通群友就地改写。require_op 已经按节流约定给过提醒，这里只要不接管消息。
         return None
     return lambda value=value: _subcommand(value[1:])
 
@@ -2208,18 +2210,6 @@ def on_load(ctx) -> None:
                 for source in sources:
                     try:
                         _backfill.recover_source(source, connect.call_api)
-                        window = tuple(source["window"])
-
-                        def wake_finished(target: tuple) -> None:
-                            context.wait_turn_end(AGENT_WINDOW)
-                            if target in oplog.work_windows(AGENT_WINDOW):
-                                try:
-                                    _drive_agent(None, target)
-                                except Exception:
-                                    traceback.print_exc()
-
-                        threading.Thread(target=wake_finished, args=(window,),
-                                         name="napcat-backfill-wake", daemon=True).start()
                     except Exception:
                         traceback.print_exc()
                         try:
@@ -2240,19 +2230,15 @@ def on_load(ctx) -> None:
 
         if not wait_booted(120):
             return
-        work = oplog.work_windows(AGENT_WINDOW)
         results_pending = bool(context.mailbox(AGENT_WINDOW).unread())
-        if not work and not oplog.has_unnotified() and not results_pending:
+        if not oplog.has_unnotified() and not results_pending:
             return
-        if work:
-            window = work[0]
-        else:
-            window = next(iter(oplog.unacknowledged_windows()), None)
-            if window is None:
-                window = next((window for window, _count, active in oplog.pending_summary()
-                               if active and window[0] in ("group", "private")), None)
-            if window is None and results_pending:
-                window = AGENT_WINDOW
+        window = next(iter(oplog.unacknowledged_windows()), None)
+        if window is None:
+            window = next((window for window, _count, active in oplog.pending_summary()
+                           if active and window[0] in ("group", "private")), None)
+        if window is None and results_pending:
+            window = AGENT_WINDOW
         if window is not None:
             try:
                 _drive_agent(None, window)

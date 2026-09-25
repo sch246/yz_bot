@@ -20,7 +20,7 @@ from types import MappingProxyType
 
 
 MODEL = "deepseek/deepseek-flash"
-PROMPT_MODE = "production-default-plus-offline-history-fact"
+PROMPT_MODE = "production-default-plus-offline-review-task-v2"
 REPOSITORY = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY))
 
@@ -247,10 +247,90 @@ def _ordered_snapshot(output: Path, kind: str, target: int, manifest: dict) -> l
     return [record for _, _, _, record in ordered]
 
 
-OFFLINE_FACT = "正在离线回看已经发生的历史；你不能影响或回复当时的参与者。"
+OFFLINE_FACT = (
+    "正在离线回看已经发生的历史。本次任务是把这条冻结历史 FIFO 分段正式读完，"
+    "并在过程中自行整理；如何分段与整理由你自己决定。你不能影响或回复当时的参与者。"
+)
+STRATEGIES = {
+    "baseline": "",
+    "progressive-index": (
+        "让历史真实进入统一经历流并形成可反查记忆。status 和 peek 只用于定向，不算正式阅读；"
+        "首次定向后，自主选择有界 pull，并在读取新一段、整理、判断继续或暂停之间循环。"
+        "cover 得到的结论若开始并列累积，也要继续递归整理；同一来源只在未来检索入口确实不同"
+        "（如人物、话题、任务或反例）时进入多个索引。未读数量本身不是继续读取的理由；"
+        "若说不清下一段的用途就暂停，并只用 hint 保存真正未完成的任务或会改变下次行为的自我观察。"
+    ),
+    "bounded-hierarchy": (
+        "让历史真实进入统一经历流并形成可反查记忆。首次可用一次 status 或 peek 定向；"
+        "之后每次只 pull 20 到 40 条，读完一批先整理，再决定是否读取下一批，不连续囤积多批原文。"
+        "cover 结论也是经历：同层结论积累到数个时，把仍值得保留的结论继续收拢成上位节点；"
+        "同一来源可在人物、话题、任务或反例等未来入口确实不同时进入多个索引。"
+        "用 hint 保留当前阶段、下一步和会改变后续行为的自我观察，避免忘记进度后重复预览或回复。"
+    ),
+    "grounded-hierarchy": (
+        "让历史真实进入统一经历流并形成可反查记忆。首次可用一次 status 或 peek 定向；"
+        "之后每次只 pull 16 到 24 条，读完一批先整理并看到结果，再决定是否读取下一批。"
+        "cover 只能填写眼前实际出现过的正式事件号，不要按数字连续性补齐或猜号；需要定位范围时先用"
+        " event_span。积累三个左右的同层总结后，覆盖这些总结所在的旧输出事件，把仍值得保留的内容"
+        "收拢成上位节点；同一来源可在未来检索入口确实不同时进入多个索引。"
+        "用 hint 保留当前阶段、下一步和会改变后续行为的自我观察，避免忘记进度后重复预览或回复。"
+    ),
+    "grounded-loop": (
+        "让历史真实进入统一经历流并形成可反查记忆。首次可用一次 status 或 peek 定向；"
+        "之后每轮只按这个顺序决定下一步：眼前有尚未整理的新输入，就立刻用实际出现过的正式号做一次"
+        "简洁 cover；否则有三个左右仍并列的同层总结，就覆盖这些总结所在的旧输出事件形成上位节点；"
+        "否则 pull 20 条。不要按编号连续性补齐或猜号，需要定位时才用 event_span。"
+        "不要在思考里重新复述或重建全部历史，只需简短确认当前属于上述哪种情况并行动。"
+        "同一来源可在未来检索入口确实不同时进入多个索引；hint 只在阶段或下一步确实改变时更新。"
+    ),
+    "serial-loop": (
+        "让历史真实进入统一经历流并形成可反查记忆。首次可用一次 status 定向；之后每次输出只执行"
+        "一个核心动作，不要在同一次输出里同时 cover 和 pull。眼前有尚未整理的新输入就用实际出现的"
+        "正式号做一次简洁 cover；否则有三个左右仍并列的同层总结，就覆盖这些总结所在的旧输出事件"
+        "形成上位节点；否则 pull 20 条。不要按编号连续性补齐或猜号，需要定位时才用 event_span。"
+        "不要在思考里重新复述全部历史；hint 只在阶段或下一步确实改变时更新。"
+    ),
+    "serial-loop-reasoning": (
+        "让历史真实进入统一经历流并形成可反查记忆。首次可用一次 status 定向；之后每次输出只执行"
+        "一个核心动作，不要在同一次输出里同时 cover 和 pull。眼前有尚未整理的新输入就用实际出现的"
+        "正式号做一次简洁 cover；否则有三个左右仍并列的同层总结，就覆盖这些总结所在的旧输出事件"
+        "形成上位节点；否则 pull 20 条。不要按编号连续性补齐或猜号，需要定位时才用 event_span。"
+        "已完成输出的思考会作为该输出的一部分保留，直到输出被覆盖；把会影响后续行动的判断明确写在"
+        "思考或结论中，不要每轮重新推导。hint 只在阶段或下一步确实改变时更新。"
+    ),
+    "serial-loop-hint": (
+        "让历史真实进入统一经历流并形成可反查记忆。首次可用一次 status 定向；之后每次输出只执行"
+        "一个核心动作，不要在同一次输出里同时 cover 和 pull。眼前有尚未整理的新输入就用实际出现的"
+        "正式号做一次简洁 cover；否则有三个左右仍并列的同层总结，就覆盖这些总结所在的旧输出事件"
+        "形成上位节点；否则 pull 20 条。不要按编号连续性补齐或猜号，需要定位时才用 event_span。"
+        "需要跨请求继续、忘掉后会重新推导的未兑现决定，用 edit_hint 留下足以接续的简短待办；必要时"
+        "附相关正式号、阻碍或决定下一步的理由。成功后更新或清空，工具失败时按实际结果修正。"
+        "不要把可查询的未读数、FIFO 游标、全部根或长期摘要复制进 hint；长期证据仍由 cover 保存。"
+    ),
+    "serial-loop-checkpoint": (
+        "让历史真实进入统一经历流并形成可反查记忆。首次 status 后先用 edit_hint 写下当前目标和下一项"
+        "尚未兑现的动作；之后每次请求先读 hint，除非刚收到的实际结果使它失效，否则直接执行而不重新"
+        "推导。每次输出只执行 cover 或 pull 中的一个核心动作；edit_hint 是附带的工作记忆动作，可以"
+        "与核心动作同批调用。眼前有尚未整理的新输入就用实际出现的正式号做一次简洁 cover；否则有"
+        "三个左右仍并列的同层总结，就覆盖这些总结所在的旧输出事件形成上位节点；否则 pull 20 条。"
+        "只有下一步、阻碍或理由改变时才整体更新 hint，执行完成就删掉对应待办；总长度不超过 200 字。"
+        "不要复制可查询的未读数、FIFO 游标、全部根或长期摘要，不要按编号连续性猜号。"
+    ),
+    "serial-loop-linked": (
+        "让历史真实进入统一经历流并形成可反查记忆。首次可用一次 status 定向；之后每次输出只执行"
+        "一个核心动作，不要在同一次输出里同时 cover 和 pull。眼前有尚未整理的新输入就用实际出现的"
+        "正式号做一次简洁 cover；否则有三个左右仍并列的同层总结，就覆盖这些总结所在的旧输出事件"
+        "形成上位节点；否则 pull 20 条。不要按编号连续性补齐或猜号，需要定位时才用 event_span。"
+        "每次 cover 的 conclusion 都要把保留的每项事实、印象或话题入口就地标注其直接依据号；叶级"
+        "结论引用本批实际输入号，父级结论引用被收拢的旧总结输出号。编号必须紧挨它所支持的语义，"
+        "不能只在末尾列一串成员，也不用为未保留的琐碎内容强造条目。没有语义到下一跳的映射就不算"
+        "完成整理。不要在思考里重演全部历史；hint 只在阶段或下一步确实改变时更新。"
+    ),
+}
+PERSIST_REASONING_STRATEGIES = frozenset({"serial-loop-reasoning"})
 SAFE_TOOLS = frozenset({
     "list_tools", "load_tools", "reload_tools", "recall_events", "event_span",
-    "event_links", "cover_events", "say", "pull_mail", "list_unread", "peek", "edit_hint",
+    "event_links", "cover_events", "say", "status", "peek", "pull", "edit_hint",
 })
 
 
@@ -328,7 +408,7 @@ def _read_llm_config(path: Path) -> dict:
 def _run(prepared: Path, output: Path, kind: str, target: int, bot_id: int, bot_name: str,
          config: dict, max_calls: int, max_prompt_tokens: int,
          max_completion_tokens: int, max_output_tokens_per_call: int,
-         *, resume: bool = False) -> dict:
+         *, strategy: str = "baseline", resume: bool = False) -> dict:
     if resume:
         if not output.is_dir() or output.is_symlink() or output.resolve().is_relative_to(REPOSITORY):
             raise ValueError("resume needs an existing run directory outside the repository")
@@ -337,7 +417,7 @@ def _run(prepared: Path, output: Path, kind: str, target: int, bot_id: int, bot_
     with _locked(output):
         return _run_locked(prepared, output, kind, target, bot_id, bot_name, config,
                            max_calls, max_prompt_tokens, max_completion_tokens,
-                           max_output_tokens_per_call, resume=resume)
+                           max_output_tokens_per_call, strategy=strategy, resume=resume)
 
 
 def _fork(source: Path, output: Path) -> dict:
@@ -366,10 +446,10 @@ def _fork(source: Path, output: Path) -> dict:
 def _run_locked(prepared: Path, output: Path, kind: str, target: int, bot_id: int,
                 bot_name: str, config: dict, max_calls: int, max_prompt_tokens: int,
                 max_completion_tokens: int, max_output_tokens_per_call: int,
-                *, resume: bool) -> dict:
+                *, strategy: str, resume: bool) -> dict:
     from mods import chat, chatlog, connect, context, identity, llm, message, oplog, storage
 
-    if (target <= 0 or bot_id <= 0 or not bot_name.strip()
+    if (target <= 0 or bot_id <= 0 or not bot_name.strip() or strategy not in STRATEGIES
             or min(max_calls, max_prompt_tokens, max_completion_tokens,
                    max_output_tokens_per_call) <= 0):
         raise ValueError("target, bot id, bot name and all budgets must be valid")
@@ -386,12 +466,19 @@ def _run_locked(prepared: Path, output: Path, kind: str, target: int, bot_id: in
     if not ordered:
         raise ValueError("prepared archive contains no events")
     prepared_hash = _hash(prepared / "manifest.json")
+    strategy_hash = hashlib.sha256(STRATEGIES[strategy].encode("utf-8")).hexdigest()
+    persist_reasoning = strategy in PERSIST_REASONING_STRATEGIES
     if resume:
         checkpoint = _verify_checkpoint(output)
         run_manifest = json.loads((output / "run_manifest.json").read_text(encoding="utf-8"))
         if (run_manifest.get("schema") != 1 or run_manifest.get("prepared_sha256") != prepared_hash
                 or run_manifest.get("input_sha256") != manifest["input_sha256"]
                 or run_manifest.get("model") != MODEL or run_manifest.get("prompt_mode") != PROMPT_MODE
+                or run_manifest.get("strategy", "baseline") != strategy
+                or (run_manifest.get("strategy_sha256") is not None
+                    and run_manifest["strategy_sha256"] != strategy_hash)
+                or (run_manifest.get("strategy_sha256") is None and strategy != "baseline")
+                or bool(run_manifest.get("persist_reasoning", False)) != persist_reasoning
                 or run_manifest.get("identity_sha256") != _identity_digest(
                     run_manifest.get("salt", ""), kind, target, bot_id, bot_name)):
             raise ValueError("run manifest differs from requested prepared input or identity")
@@ -402,7 +489,9 @@ def _run_locked(prepared: Path, output: Path, kind: str, target: int, bot_id: in
         salt = os.urandom(16).hex()
         run_manifest = {"schema": 1, "prepared_sha256": prepared_hash,
                         "input_sha256": manifest["input_sha256"], "model": MODEL,
-                        "prompt_mode": PROMPT_MODE, "salt": salt,
+                        "prompt_mode": PROMPT_MODE, "strategy": strategy,
+                        "strategy_sha256": strategy_hash,
+                        "persist_reasoning": persist_reasoning, "salt": salt,
                         "identity_sha256": _identity_digest(salt, kind, target, bot_id, bot_name)}
         _write_json(output / "run_manifest.json", run_manifest)
     previous_cwd = Path.cwd()
@@ -551,7 +640,10 @@ def _run_locked(prepared: Path, output: Path, kind: str, target: int, bot_id: in
             setattr(message, name, forbidden)
         connect.call_api = forbidden
         context.begin_turn = capture_turn
-        scope_token = chat._offline_scope.set({"model": MODEL, "fact": OFFLINE_FACT,
+        extra = STRATEGIES[strategy]
+        replay_prompt = OFFLINE_FACT + (("\n" + extra) if extra else "")
+        scope_token = chat._offline_scope.set({"model": MODEL, "fact": replay_prompt,
+                                               "persist_reasoning": persist_reasoning,
                                                "registry": registry, "on_chunk": on_chunk})
         send_context = registry.get("meta").tools["say"].call.__globals__["_offline_send_sink"]
         sink_token = send_context.set(dry_say)
@@ -760,6 +852,7 @@ def main(argv: list[str] | None = None) -> int:
         run.add_argument("--bot-id", required=True, type=int)
         run.add_argument("--bot-name", required=True)
         run.add_argument("--llm-config", required=True)
+        run.add_argument("--strategy", choices=tuple(STRATEGIES), default="baseline")
         run.add_argument("--confirm-paid", action="store_true")
         run.add_argument("--max-calls", type=int, required=True)
         run.add_argument("--max-prompt-tokens", type=int, required=True)
@@ -803,7 +896,7 @@ def main(argv: list[str] | None = None) -> int:
             result = _run(prepared, output, args.kind, args.target, args.bot_id, args.bot_name,
                           config, args.max_calls, args.max_prompt_tokens,
                           args.max_completion_tokens, args.max_output_tokens_per_call,
-                          resume=args.command == "resume")
+                          strategy=args.strategy, resume=args.command == "resume")
             print(json.dumps({**result, "output": str(output)}, ensure_ascii=False))
     except (OSError, ValueError, UnicodeError, AssertionError, RuntimeError, KeyError) as error:
         print(f"memory replay: {error}", file=sys.stderr)

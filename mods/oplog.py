@@ -706,12 +706,8 @@ def deliver_notifications(agent_window: tuple) -> dict | None:
                          unread=pending_details())
 
 
-def work_windows(agent_window: tuple) -> list[tuple]:
-    return list(work_targets(agent_window))
-
-
 def work_targets(agent_window: tuple) -> dict[tuple, str]:
-    """Pending prefixes frozen by delivered notifications, including after restart."""
+    """Frozen upper bounds for an explicit pull after a delivered notification."""
     with _lock:
         _restore()
         earliest: dict[tuple, str] = {}
@@ -877,10 +873,15 @@ def origin_status(window: tuple | None, origin: str) -> str | None:
         return None
 
 
-def output(window: tuple | None, assistant: dict, calls: list[dict]) -> str | None:
-    recorded = _register(window, "output", body=assistant.get("content", ""),
-                         thought_present=bool(assistant.get("reasoning_content")),
-                         actions=[call["function"] for call in calls])
+def output(window: tuple | None, assistant: dict, calls: list[dict],
+           *, persist_reasoning: bool = False) -> str | None:
+    reasoning = assistant.get("reasoning_content")
+    values = {"body": assistant.get("content", ""),
+              "thought_present": bool(reasoning),
+              "actions": [call["function"] for call in calls]}
+    if persist_reasoning and isinstance(reasoning, str) and reasoning:
+        values["thought"] = reasoning
+    recorded = _register(window, "output", **values)
     return recorded["id"] if recorded else None
 
 

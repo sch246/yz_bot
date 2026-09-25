@@ -143,7 +143,7 @@ class Mailbox:
     docs/working/proposals/mail-and-activation.md 3.0 与九点八。
 
     WHY: 自己带锁，而不是借 `WindowTurn` 的。轮会消失，锁不能跟着消失。聊天记录
-    写入与 mail 入列由 `record` 在这把锁里一次提交；逐页正式读取也拿同一把锁。
+    写入与 mail 入列由 `record` 在这把锁里一次提交；FIFO 正式读取也拿同一把锁。
     """
 
     def __init__(self, key: Any) -> None:
@@ -185,7 +185,7 @@ class Mailbox:
     def commit_recovered(self, message_id: int | str, event_time: int,
                          project: Callable[[str | None], Any], *,
                          event_seq: int | str | None = None) -> Any:
-        """Use one live arrival as the recovered page member when both are the same QQ message."""
+        """Reuse one live arrival when recovery finds the same QQ message."""
         with self._lock:
             start = self._read - self._base
             duplicate = next((entry for entry in self._entries[start:]
@@ -217,7 +217,7 @@ class Mailbox:
     def record(self, event: dict, write: Callable[[], Any]) -> Any:
         """Commit one durable history write and its mailbox entry together.
 
-        The writer runs while the mailbox is locked. A page pull takes that same
+        The writer runs while the mailbox is locked. FIFO consumption takes that same
         lock, so it cannot observe the chatlog write without the mail arrival.
         """
         with self._lock:
@@ -299,7 +299,7 @@ class Mailbox:
     def pull(self, count: int, project: Callable[[list[MailEntry]], Any]) -> Any:
         """Commit only a bounded FIFO prefix after its durable projection succeeds."""
         if count < 1:
-            raise ValueError("mail page must be nonempty")
+            raise ValueError("mail pull must be nonempty")
         with self._lock:
             self._skip_absorbed()
             start = self._read - self._base
@@ -314,7 +314,7 @@ class Mailbox:
             self._skip_absorbed()
             return projected
 
-    def prepare_initial_page(self, count: int) -> None:
+    def prepare_initial_tail(self, count: int) -> None:
         """Apply a durable first-read floor to the live buffer, not a fake read."""
         from mods import oplog
 

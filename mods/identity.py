@@ -162,11 +162,16 @@ def getgroupstorage(group_id: int | None = None) -> dict[str, Any]:
 
 def getname(user_id: int | None = None, group_id: int | None = None) -> str:
     msg = _current()
-    user_id = int(msg["user_id"] if user_id is None else user_id)
+    # WHY: 中心 agent 读取 mail 时没有当前 QQ 事件；显式 id 已足够解析名字，
+    # 不能让私聊回声仅因缺少隐式消息上下文而永久卡在队首。
+    if user_id is None:
+        user_id = int(msg["user_id"])
+    else:
+        user_id = int(user_id)
     custom = storage.get("users", str(user_id)).get("name")
     if custom:
         return str(custom)
-    if group_id is None:
+    if group_id is None and msg is not None:
         group_id = msg.get("group_id")
     if group_id is not None:
         return get_group_user_info(int(group_id), user_id)[1]
