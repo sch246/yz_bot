@@ -1,8 +1,8 @@
 # Offline memory replay
 
-`memory_replay.py` has three commands: `prepare`, `doctor`, and `run`. Never use a
-production runtime directory as an output. Outputs contain chat bodies and model
-prompts; keep them private and do not commit them.
+`memory_replay.py` has five commands: `prepare`, `doctor`, `run`, `resume`, and
+`fork`. Never use a production runtime directory as an output. Outputs contain
+chat bodies and model prompts; keep them private and do not commit them.
 
 `prepare` freezes an explicitly selected range of daily `.log` files, checks
 their parsing, and records byte hashes and event counts. It does not read
@@ -46,13 +46,29 @@ python experiments/memory_replay.py run \
   --max-calls 20 --max-prompt-tokens 200000 --max-completion-tokens 20000
 ```
 
+Each `run` or `resume` invocation has its own three budgets. To continue a
+stopped run, pass the same prepared snapshot, window and Bot identity, literal
+configuration, paid-call confirmation, and fresh budgets, but use `resume` and
+the existing output directory:
+
+```sh
+python experiments/memory_replay.py resume \
+  --prepared /private/prepared --output /private/existing-run \
+  --kind group --target "$TARGET" --bot-id "$BOT_ID" --bot-name "$BOT_NAME" \
+  --llm-config /private/replay-llm.json --confirm-paid \
+  --max-calls 20 --max-prompt-tokens 200000 --max-completion-tokens 20000
+```
+
 The prompt budget uses the UTF-8 byte size of the outgoing request plus a
 protocol margin as a conservative pre-request bound. The completion budget is
 sent to DeepSeek as
 `max_tokens` on each request; if API usage is missing, the whole reserved
 completion allowance is charged before another request. `usage.jsonl` prefers
-API usage when present. Any stop or failure is nonzero; `transcript.jsonl` and
-`usage.jsonl` remain for inspection.
+API usage when present and labels each segment. Budget, connection, and
+incomplete-response stops create a resumable checkpoint only after durable
+model actions are settled; other failures leave no new checkpoint and require
+inspection rather than blind retry. `segment-NNNN.json` records each stop reason
+and incremental usage; transcript and usage are appended, never overwritten.
 
 The run creates its own `archive/`, `data/storage/`, `data/event_stream/`, and
 `skills/` under the new output directory, leaving `prepared/` unchanged. Archive
@@ -72,3 +88,23 @@ it; such an intention remains blocked rather than silently gaining a new tool.
 Python tools, shell, browser, commands, remote history, image/network tools,
 and arbitrary file access are unavailable. This is an environmental difference,
 not a second implementation of memory rules.
+
+`resume` verifies the prepared manifest, every isolated file hash, model and
+prompt mode, and a salted fingerprint of the supplied window/Bot identity
+before touching runtime state. The manifest contains no plaintext account or
+window IDs or chat content. A process lock prevents simultaneous writers.
+The production oplog rebuilds unread FIFO, formal IDs, cover and tool results;
+isolated storage restores hint and active Skills. A killed process or tampered
+run is not a safe checkpoint and is refused.
+
+To compare independent continuations from one stopped checkpoint:
+
+```sh
+python experiments/memory_replay.py fork \
+  --source /private/existing-run --output /private/new-branch
+```
+
+The new directory must not exist and must be outside the repository. `fork`
+copies and verifies all files, writes a checkpoint-hash lineage record, and
+does not share writable event-stream or storage files with its source. Resume
+each branch separately with the same prepared snapshot and identity.

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import date, timedelta
+import fcntl
 import hashlib
 import json
 import os
@@ -49,6 +51,115 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
     with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
         for row in rows:
             stream.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def _write_json(path: Path, value: dict) -> None:
+    temporary = path.with_name(path.name + ".new")
+    with temporary.open("x", encoding="utf-8") as stream:
+        json.dump(value, stream, ensure_ascii=False, indent=2)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def _hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _file_hashes(root: Path) -> dict[str, str]:
+    result = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise ValueError("run contains a symlink")
+        relative = str(path.relative_to(root))
+        if path.is_file() and relative not in (".lock", "checkpoint.json"):
+            result[relative] = _hash(path)
+    return result
+
+
+@contextmanager
+def _locked(root: Path):
+    descriptor = os.open(root / ".lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError("run is already locked by another process") from error
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def _verify_checkpoint(root: Path) -> dict:
+    checkpoint = json.loads((root / "checkpoint.json").read_text(encoding="utf-8"))
+    if checkpoint.get("schema") != 1 or checkpoint.get("files") != _file_hashes(root):
+        raise ValueError("checkpoint file hashes differ; refusing resume or fork")
+    segment = checkpoint.get("segment")
+    rows = checkpoint.get("journal_rows")
+    if (type(segment) is not int or segment < 1 or type(rows) is not int or rows < 0
+            or not (root / f"segment-{segment:04d}.json").is_file()
+            or json.loads((root / f"segment-{segment:04d}.json").read_text(encoding="utf-8"))
+               .get("journal_rows") != rows
+            or len(_journal_rows(root)) != rows):
+        raise ValueError("checkpoint metadata differs from the event journal")
+    return checkpoint
+
+
+def _checkpoint(root: Path, segment: int, journal_rows: int) -> None:
+    _write_json(root / "checkpoint.json", {"schema": 1, "segment": segment,
+                                            "journal_rows": journal_rows,
+                                            "files": _file_hashes(root)})
+
+
+def _identity_digest(salt: str, kind: str, target: int, bot_id: int, bot_name: str) -> str:
+    raw = json.dumps([salt, kind, target, bot_id, bot_name], ensure_ascii=False,
+                     separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _journal_rows(root: Path) -> list[dict]:
+    rows = []
+    for path in sorted((root / "data/event_stream").glob("????????.jsonl")):
+        rows.extend(json.loads(line) for line in path.read_text(encoding="utf-8").splitlines())
+    return rows
+
+
+def _assert_settled(rows: list[dict]) -> None:
+    returned: dict[str, set[int]] = {}
+    for row in rows:
+        if row["kind"] == "result":
+            returned.setdefault(row["source"], set()).update(
+                item["position"] for item in row["returns"])
+        elif row["kind"] == "arrival" and "_stream_results" in row["event"]:
+            result = row["event"]["_stream_results"]
+            returned.setdefault(result["source"], set()).update(
+                item["position"] for item in result["returns"])
+    for row in rows:
+        if row["kind"] == "output" and set(range(len(row["actions"]))) != returned.get(row["id"], set()):
+            raise RuntimeError("model action has no durable result; checkpoint is unsafe")
+
+
+def _assert_storage_saved(storage_module) -> None:
+    for namespace, values in storage_module.storage.items():
+        for name, value in values.items():
+            path = Path(storage_module._path(namespace, name))
+            state = storage_module._states.get((namespace, name))
+            if (not path.is_file() or state is None or
+                    state.baseline_digest != storage_module._serialize_reporting(value)[1]):
+                raise RuntimeError("isolated storage was not fully saved; checkpoint is unsafe")
+
+
+def _append_jsonl(path: Path, rows: list[dict]) -> None:
+    with path.open("a", encoding="utf-8") as stream:
+        for row in rows:
+            stream.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def _prepare(root: Path, kind: str, target: int, first: date, last: date, output: Path) -> dict:
@@ -216,7 +327,43 @@ def _read_llm_config(path: Path) -> dict:
 
 def _run(prepared: Path, output: Path, kind: str, target: int, bot_id: int, bot_name: str,
          config: dict, max_calls: int, max_prompt_tokens: int,
-         max_completion_tokens: int) -> dict:
+         max_completion_tokens: int, *, resume: bool = False) -> dict:
+    if resume:
+        if not output.is_dir() or output.is_symlink() or output.resolve().is_relative_to(REPOSITORY):
+            raise ValueError("resume needs an existing run directory outside the repository")
+    else:
+        output.mkdir(mode=0o700, parents=True)
+    with _locked(output):
+        return _run_locked(prepared, output, kind, target, bot_id, bot_name, config,
+                           max_calls, max_prompt_tokens, max_completion_tokens, resume=resume)
+
+
+def _fork(source: Path, output: Path) -> dict:
+    if not source.is_dir() or source.is_symlink() or source.resolve().is_relative_to(REPOSITORY):
+        raise ValueError("fork source must be an existing run outside the repository")
+    with _locked(source):
+        checkpoint = _verify_checkpoint(source)
+        output.mkdir(mode=0o700, parents=True)
+        try:
+            shutil.copytree(source, output, dirs_exist_ok=True,
+                            ignore=lambda directory, _names: (
+                                {".lock", "checkpoint.json"} if Path(directory) == source else set()))
+            if _file_hashes(output) != checkpoint["files"]:
+                raise ValueError("fork copy does not match the source checkpoint")
+            _write_json(output / "lineage.json", {
+                "parent_checkpoint_sha256": _hash(source / "checkpoint.json"),
+                "parent_segment": checkpoint["segment"],
+            })
+            _checkpoint(output, checkpoint["segment"], checkpoint["journal_rows"])
+        except BaseException:
+            shutil.rmtree(output)
+            raise
+    return {"status": "forked", "segment": checkpoint["segment"]}
+
+
+def _run_locked(prepared: Path, output: Path, kind: str, target: int, bot_id: int,
+                bot_name: str, config: dict, max_calls: int, max_prompt_tokens: int,
+                max_completion_tokens: int, *, resume: bool) -> dict:
     from mods import chat, chatlog, connect, context, identity, llm, message, oplog, storage
 
     if (target <= 0 or bot_id <= 0 or not bot_name.strip()
@@ -234,7 +381,26 @@ def _run(prepared: Path, output: Path, kind: str, target: int, bot_id: int, bot_
     ordered = _ordered_snapshot(prepared, kind, target, manifest)
     if not ordered:
         raise ValueError("prepared archive contains no events")
-    output.mkdir(mode=0o700, parents=True)
+    prepared_hash = _hash(prepared / "manifest.json")
+    if resume:
+        checkpoint = _verify_checkpoint(output)
+        run_manifest = json.loads((output / "run_manifest.json").read_text(encoding="utf-8"))
+        if (run_manifest.get("schema") != 1 or run_manifest.get("prepared_sha256") != prepared_hash
+                or run_manifest.get("input_sha256") != manifest["input_sha256"]
+                or run_manifest.get("model") != MODEL or run_manifest.get("prompt_mode") != PROMPT_MODE
+                or run_manifest.get("identity_sha256") != _identity_digest(
+                    run_manifest.get("salt", ""), kind, target, bot_id, bot_name)):
+            raise ValueError("run manifest differs from requested prepared input or identity")
+        segment = checkpoint["segment"] + 1
+        prior_rows = checkpoint["journal_rows"]
+    else:
+        segment, prior_rows = 1, 0
+        salt = os.urandom(16).hex()
+        run_manifest = {"schema": 1, "prepared_sha256": prepared_hash,
+                        "input_sha256": manifest["input_sha256"], "model": MODEL,
+                        "prompt_mode": PROMPT_MODE, "salt": salt,
+                        "identity_sha256": _identity_digest(salt, kind, target, bot_id, bot_name)}
+        _write_json(output / "run_manifest.json", run_manifest)
     previous_cwd = Path.cwd()
     old_client, old_root, old_chatlog = llm.client, storage.root_path, chatlog.rootfile
     old_chat_state = chat.settings, chat.prompts, chat.llm_config, chat.description_cache
@@ -243,24 +409,34 @@ def _run(prepared: Path, output: Path, kind: str, target: int, bot_id: int, bot_
     transcript: list[dict] = []
     usage: list[dict] = []
     runtime_started = False
+    stop_reason = "complete"
+    result = None
     try:
         os.chdir(output)
         storage.root_path = "data/storage"
         chatlog.rootfile = "archive"
         runtime_started = True
-        archive = Path("archive") / kind / str(target)
-        for entry in manifest["dates"]:
-            day = date.fromisoformat(entry["date"])
-            source = prepared / "archive" / day.strftime("%Y-%m") / f"{day:%d}.log"
-            destination = archive / day.strftime("%Y-%m") / f"{day:%d}.log"
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source, destination)
-            if hashlib.sha256(destination.read_bytes()).hexdigest() != entry["sha256"]:
-                raise ValueError("isolated archive copy hash mismatch")
+        if not resume:
+            archive = Path("archive") / kind / str(target)
+            for entry in manifest["dates"]:
+                day = date.fromisoformat(entry["date"])
+                source = prepared / "archive" / day.strftime("%Y-%m") / f"{day:%d}.log"
+                destination = archive / day.strftime("%Y-%m") / f"{day:%d}.log"
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, destination)
+                if hashlib.sha256(destination.read_bytes()).hexdigest() != entry["sha256"]:
+                    raise ValueError("isolated archive copy hash mismatch")
         skills = Path("skills")
-        skills.mkdir(mode=0o700)
-        for source in _checked_in_skills():
-            shutil.copyfile(source, skills / source.name)
+        if not resume:
+            skills.mkdir(mode=0o700)
+            for source in _checked_in_skills():
+                shutil.copyfile(source, skills / source.name)
+        else:
+            storage.load()
+            if storage.load_errors:
+                raise ValueError("isolated storage has unreadable files")
+            if len(_journal_rows(Path.cwd())) != prior_rows:
+                raise ValueError("checkpoint journal row count differs")
         registry = _safe_registry(skills)
         names = {int(event["user_id"]): str((event.get("sender") or {}).get("card")
                                            or (event.get("sender") or {}).get("nickname")
@@ -325,7 +501,11 @@ def _run(prepared: Path, output: Path, kind: str, target: int, bot_id: int, bot_
 
         client.request_policy = request_policy
         window = (kind, target)
-        echo_number = 0
+        echo_number = max((-row["event"]["message_id"] for row in _journal_rows(Path.cwd())
+                           if row.get("kind") == "arrival"
+                           and row["event"].get("post_type") == "message_sent"
+                           and isinstance(row["event"].get("message_id"), int)
+                           and row["event"]["message_id"] < 0), default=0) if resume else 0
 
         def dry_say(body: str, destination: tuple) -> int:
             nonlocal echo_number
@@ -352,55 +532,95 @@ def _run(prepared: Path, output: Path, kind: str, target: int, bot_id: int, bot_
         outbound_names = ("send", "sendmsg", "_send_now")
         original_outbound = {name: getattr(message, name) for name in outbound_names}
         original_call_api = connect.call_api
+        original_begin_turn = context.begin_turn
+        captured_turn = None
+
+        def capture_turn(key):
+            nonlocal captured_turn
+            turn, owner = original_begin_turn(key)
+            if key == oplog.AGENT_WINDOW and owner:
+                captured_turn = turn
+            return turn, owner
+
         for name in outbound_names:
             setattr(message, name, forbidden)
         connect.call_api = forbidden
+        context.begin_turn = capture_turn
         scope_token = chat._offline_scope.set({"model": MODEL, "fact": OFFLINE_FACT,
                                                "registry": registry, "on_chunk": on_chunk})
         send_context = registry.get("meta").tools["say"].call.__globals__["_offline_send_sink"]
         sink_token = send_context.set(dry_say)
         try:
             box = context.mailbox(window)
-            for event in ordered:
-                chatlog._remember_origin(event, event["_log_origin"])
-                box.add(event)
-            box.activate(ordered[-1])
-            chat._drive_agent(MODEL, window)
+            if not resume:
+                for event in ordered:
+                    chatlog._remember_origin(event, event["_log_origin"])
+                    box.add(event)
+                box.activate(ordered[-1])
+            try:
+                chat._drive_agent(MODEL, window)
+            except Exception as error:
+                stop_reason = str(error)
+                if not (type(error).__name__ in {
+                    "APIConnectionError", "APITimeoutError", "RateLimitError", "APIStatusError"
+                } or stop_reason in {
+                    "max-calls budget reached", "max-prompt-tokens budget reached",
+                    "max-completion-tokens budget reached"
+                } or
+                        stop_reason.startswith("模型流未完整结束") or
+                        stop_reason.startswith("模型响应未完整结束") or
+                        stop_reason.startswith("模型流缺少结束标记") or
+                        stop_reason.startswith("模型在结束标记后继续生成")):
+                    raise
         finally:
             send_context.reset(sink_token)
             chat._offline_scope.reset(scope_token)
             for name, original in original_outbound.items():
                 setattr(message, name, original)
             connect.call_api = original_call_api
+            context.begin_turn = original_begin_turn
+        if captured_turn is not None and captured_turn.requested_pulls:
+            raise RuntimeError("a requested pull was not committed; checkpoint is unsafe")
         finalize_usage()
-        storage.save()
-        return {"status": "complete", "events": len(ordered), "model_calls": len(usage),
-                "dry_says": echo_number}
+        result = {"status": "complete" if stop_reason == "complete" else "stopped",
+                  "stop_reason": stop_reason, "events": len(ordered),
+                  "model_calls": len(usage), "dry_says": echo_number, "segment": segment}
+        return result
     finally:
-        if runtime_started:
-            if usage and usage[-1]["source"] != "api" and "reserved_completion_tokens" in usage[-1]:
-                usage[-1]["observed_completion_bytes"] = usage[-1]["completion_tokens"]
-                usage[-1]["completion_tokens"] = usage[-1]["reserved_completion_tokens"]
-                usage[-1]["source"] = "reserved-max-no-api-usage"
-            intentions = {row["message_id"]: row for row in transcript}
-            transcript = []
-            for path in sorted(Path("data/event_stream").glob("????????.jsonl")):
-                for line in path.read_text(encoding="utf-8").splitlines():
-                    row = json.loads(line)
+        try:
+            if runtime_started and result is not None:
+                finalize_usage()
+                storage.save()
+                _assert_storage_saved(storage)
+                rows = _journal_rows(Path.cwd())
+                if len(rows) < prior_rows:
+                    raise RuntimeError("event journal shrank during replay")
+                _assert_settled(rows)
+                intentions = {row["message_id"]: row for row in transcript}
+                transcript = []
+                for row in rows[prior_rows:]:
                     if row.get("kind") == "arrival":
                         message_id = row.get("event", {}).get("message_id")
                         if message_id in intentions:
                             transcript.append(intentions.pop(message_id))
                     transcript.append(row)
-            transcript.extend(intentions.values())
-        if output.exists():
-            _write_jsonl(output / "transcript.jsonl", transcript)
-            _write_jsonl(output / "usage.jsonl", usage)
-        llm.client, storage.root_path, chatlog.rootfile = old_client, old_root, old_chatlog
-        chat.settings, chat.prompts, chat.llm_config, chat.description_cache = old_chat_state
-        identity.getname, identity.get_user_name, identity.qq = old_name, old_user_name, old_qq
-        identity.name, identity.nicknames = old_bot_name, old_nicknames
-        os.chdir(previous_cwd)
+                transcript.extend(intentions.values())
+                _append_jsonl(Path("transcript.jsonl"), transcript)
+                _append_jsonl(Path("usage.jsonl"), [{"segment": segment, **row} for row in usage])
+                _write_json(Path(f"segment-{segment:04d}.json"), {
+                    "segment": segment, "status": result["status"],
+                    "stop_reason": stop_reason, "model_calls": len(usage),
+                    "prompt_tokens": sum(row["prompt_tokens"] for row in usage),
+                    "completion_tokens": sum(row["completion_tokens"] for row in usage),
+                    "journal_rows": len(rows),
+                })
+                _checkpoint(Path.cwd(), segment, len(rows))
+        finally:
+            llm.client, storage.root_path, chatlog.rootfile = old_client, old_root, old_chatlog
+            chat.settings, chat.prompts, chat.llm_config, chat.description_cache = old_chat_state
+            identity.getname, identity.get_user_name, identity.qq = old_name, old_user_name, old_qq
+            identity.name, identity.nicknames = old_bot_name, old_nicknames
+            os.chdir(previous_cwd)
 
 
 def _doctor(output: Path) -> dict:
@@ -526,18 +746,22 @@ def main(argv: list[str] | None = None) -> int:
     prepare.add_argument("--output", required=True)
     doctor = commands.add_parser("doctor", help="run a synthetic no-model/no-send probe")
     doctor.add_argument("--output")
-    run = commands.add_parser("run", help="replay a frozen archive with the isolated central reader")
-    run.add_argument("--prepared", required=True)
-    run.add_argument("--output", required=True)
-    run.add_argument("--kind", required=True, choices=("group", "private"))
-    run.add_argument("--target", required=True, type=int)
-    run.add_argument("--bot-id", required=True, type=int)
-    run.add_argument("--bot-name", required=True)
-    run.add_argument("--llm-config", required=True)
-    run.add_argument("--confirm-paid", action="store_true")
-    run.add_argument("--max-calls", type=int, required=True)
-    run.add_argument("--max-prompt-tokens", type=int, required=True)
-    run.add_argument("--max-completion-tokens", type=int, required=True)
+    for command in ("run", "resume"):
+        run = commands.add_parser(command, help="run one isolated central-reader segment")
+        run.add_argument("--prepared", required=True)
+        run.add_argument("--output", required=True)
+        run.add_argument("--kind", required=True, choices=("group", "private"))
+        run.add_argument("--target", required=True, type=int)
+        run.add_argument("--bot-id", required=True, type=int)
+        run.add_argument("--bot-name", required=True)
+        run.add_argument("--llm-config", required=True)
+        run.add_argument("--confirm-paid", action="store_true")
+        run.add_argument("--max-calls", type=int, required=True)
+        run.add_argument("--max-prompt-tokens", type=int, required=True)
+        run.add_argument("--max-completion-tokens", type=int, required=True)
+    fork = commands.add_parser("fork", help="clone a stopped run into a new isolated directory")
+    fork.add_argument("--source", required=True)
+    fork.add_argument("--output", required=True)
     args = parser.parse_args(argv)
     try:
         if args.command in (None, "doctor"):
@@ -558,15 +782,21 @@ def main(argv: list[str] | None = None) -> int:
             result = _prepare(root, args.kind, args.target, args.first, args.last, output)
             print(json.dumps({"status": result["status"], "events": result["events"],
                               "output": str(output)}, ensure_ascii=False))
+        elif args.command == "fork":
+            source = Path(args.source).expanduser().resolve()
+            output = _output_path(args.output, source)
+            result = _fork(source, output)
+            print(json.dumps({**result, "output": str(output)}, ensure_ascii=False))
         else:
             if not args.confirm_paid:
-                raise ValueError("run requires --confirm-paid")
+                raise ValueError("run and resume require --confirm-paid")
             prepared = Path(args.prepared).expanduser().resolve()
-            output = _output_path(args.output, prepared)
+            output = (_output_path(args.output, prepared) if args.command == "run"
+                      else Path(args.output).expanduser().resolve())
             config = _read_llm_config(Path(args.llm_config).expanduser())
             result = _run(prepared, output, args.kind, args.target, args.bot_id, args.bot_name,
                           config, args.max_calls, args.max_prompt_tokens,
-                          args.max_completion_tokens)
+                          args.max_completion_tokens, resume=args.command == "resume")
             print(json.dumps({**result, "output": str(output)}, ensure_ascii=False))
     except (OSError, ValueError, UnicodeError, AssertionError, RuntimeError, KeyError) as error:
         print(f"memory replay: {error}", file=sys.stderr)
