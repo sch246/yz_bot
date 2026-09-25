@@ -327,7 +327,8 @@ def _read_llm_config(path: Path) -> dict:
 
 def _run(prepared: Path, output: Path, kind: str, target: int, bot_id: int, bot_name: str,
          config: dict, max_calls: int, max_prompt_tokens: int,
-         max_completion_tokens: int, *, resume: bool = False) -> dict:
+         max_completion_tokens: int, max_output_tokens_per_call: int,
+         *, resume: bool = False) -> dict:
     if resume:
         if not output.is_dir() or output.is_symlink() or output.resolve().is_relative_to(REPOSITORY):
             raise ValueError("resume needs an existing run directory outside the repository")
@@ -335,7 +336,8 @@ def _run(prepared: Path, output: Path, kind: str, target: int, bot_id: int, bot_
         output.mkdir(mode=0o700, parents=True)
     with _locked(output):
         return _run_locked(prepared, output, kind, target, bot_id, bot_name, config,
-                           max_calls, max_prompt_tokens, max_completion_tokens, resume=resume)
+                           max_calls, max_prompt_tokens, max_completion_tokens,
+                           max_output_tokens_per_call, resume=resume)
 
 
 def _fork(source: Path, output: Path) -> dict:
@@ -363,11 +365,13 @@ def _fork(source: Path, output: Path) -> dict:
 
 def _run_locked(prepared: Path, output: Path, kind: str, target: int, bot_id: int,
                 bot_name: str, config: dict, max_calls: int, max_prompt_tokens: int,
-                max_completion_tokens: int, *, resume: bool) -> dict:
+                max_completion_tokens: int, max_output_tokens_per_call: int,
+                *, resume: bool) -> dict:
     from mods import chat, chatlog, connect, context, identity, llm, message, oplog, storage
 
     if (target <= 0 or bot_id <= 0 or not bot_name.strip()
-            or min(max_calls, max_prompt_tokens, max_completion_tokens) <= 0):
+            or min(max_calls, max_prompt_tokens, max_completion_tokens,
+                   max_output_tokens_per_call) <= 0):
         raise ValueError("target, bot id, bot name and all budgets must be valid")
     if connect._server is not None or message._worker is not None or llm.client is not None:
         raise RuntimeError("run requires a fresh process without a Bot listener, sender or LLM client")
@@ -482,10 +486,11 @@ def _run_locked(prepared: Path, output: Path, kind: str, target: int, bot_id: in
             remaining = max_completion_tokens - sum(row["completion_tokens"] for row in usage)
             if remaining <= 0:
                 raise RuntimeError("max-completion-tokens budget reached")
+            allowance = min(remaining, max_output_tokens_per_call)
             usage.append({"model": selection, "prompt_tokens": prompt_bound,
-                          "completion_tokens": 0, "reserved_completion_tokens": remaining,
+                          "completion_tokens": 0, "reserved_completion_tokens": allowance,
                           "source": "utf8-upper-bound"})
-            return {"max_tokens": remaining}
+            return {"max_tokens": allowance}
 
         def on_chunk(chunk) -> None:
             if chunk.total_tokens:
@@ -759,6 +764,7 @@ def main(argv: list[str] | None = None) -> int:
         run.add_argument("--max-calls", type=int, required=True)
         run.add_argument("--max-prompt-tokens", type=int, required=True)
         run.add_argument("--max-completion-tokens", type=int, required=True)
+        run.add_argument("--max-output-tokens-per-call", type=int, required=True)
     fork = commands.add_parser("fork", help="clone a stopped run into a new isolated directory")
     fork.add_argument("--source", required=True)
     fork.add_argument("--output", required=True)
@@ -796,7 +802,8 @@ def main(argv: list[str] | None = None) -> int:
             config = _read_llm_config(Path(args.llm_config).expanduser())
             result = _run(prepared, output, args.kind, args.target, args.bot_id, args.bot_name,
                           config, args.max_calls, args.max_prompt_tokens,
-                          args.max_completion_tokens, resume=args.command == "resume")
+                          args.max_completion_tokens, args.max_output_tokens_per_call,
+                          resume=args.command == "resume")
             print(json.dumps({**result, "output": str(output)}, ensure_ascii=False))
     except (OSError, ValueError, UnicodeError, AssertionError, RuntimeError, KeyError) as error:
         print(f"memory replay: {error}", file=sys.stderr)

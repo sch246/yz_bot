@@ -43,7 +43,8 @@ python experiments/memory_replay.py run \
   --prepared /private/prepared --output /private/new-run \
   --kind group --target "$TARGET" --bot-id "$BOT_ID" --bot-name "$BOT_NAME" \
   --llm-config /private/replay-llm.json --confirm-paid \
-  --max-calls 20 --max-prompt-tokens 200000 --max-completion-tokens 20000
+  --max-calls 20 --max-prompt-tokens 200000 --max-completion-tokens 20000 \
+  --max-output-tokens-per-call 12000
 ```
 
 Each `run` or `resume` invocation has its own three budgets. To continue a
@@ -56,14 +57,15 @@ python experiments/memory_replay.py resume \
   --prepared /private/prepared --output /private/existing-run \
   --kind group --target "$TARGET" --bot-id "$BOT_ID" --bot-name "$BOT_NAME" \
   --llm-config /private/replay-llm.json --confirm-paid \
-  --max-calls 20 --max-prompt-tokens 200000 --max-completion-tokens 20000
+  --max-calls 20 --max-prompt-tokens 200000 --max-completion-tokens 20000 \
+  --max-output-tokens-per-call 12000
 ```
 
 The prompt budget uses the UTF-8 byte size of the outgoing request plus a
 protocol margin as a conservative pre-request bound. The completion budget is
-sent to DeepSeek as
-`max_tokens` on each request; if API usage is missing, the whole reserved
-completion allowance is charged before another request. `usage.jsonl` prefers
+the whole segment's allowance; `--max-output-tokens-per-call` independently
+caps one DeepSeek response. If API usage is missing, that request's reserved
+allowance is charged before another request. `usage.jsonl` prefers
 API usage when present and labels each segment. Budget, connection, and
 incomplete-response stops create a resumable checkpoint only after durable
 model actions are settled; other failures leave no new checkpoint and require
