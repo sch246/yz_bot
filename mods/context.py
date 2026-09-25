@@ -182,14 +182,16 @@ class Mailbox:
             return [entry for entry in self._entries[start:boundary + 1]
                     if entry.arrival not in self._absorbed][:count]
 
-    def commit_recovered(self, message_id: int | str, project: Callable[[str | None], Any]) -> Any:
+    def commit_recovered(self, message_id: int | str, event_time: int,
+                         project: Callable[[str | None], Any]) -> Any:
         """Use one live arrival as the recovered page member when both are the same QQ message."""
         with self._lock:
             start = self._read - self._base
             duplicate = next((entry for entry in self._entries[start:]
                               if entry.arrival not in self._absorbed
                               and entry.event.get("message_id") is not None
-                              and str(entry.event["message_id"]) == str(message_id)), None)
+                              and str(entry.event["message_id"]) == str(message_id)
+                              and entry.event.get("time") == event_time), None)
             value = project(duplicate.arrival if duplicate is not None else None)
             if duplicate is not None:
                 self._absorbed.add(duplicate.arrival)
@@ -223,9 +225,12 @@ class Mailbox:
 
                 message_id = (event.get("message_id") if event.get("post_type") in ("message", "message_sent")
                               else None)
-                existing = oplog.pending_message(self.key, message_id) if message_id is not None else None
+                event_time = event.get("time")
+                existing = (oplog.pending_message(self.key, message_id, event_time)
+                            if message_id is not None else None)
                 entry = next((item for item in self._entries if item.arrival == existing), None)
-                if entry is None and not (message_id is not None and oplog.message_seen(self.key, message_id)):
+                if entry is None and not (message_id is not None
+                                          and oplog.message_seen(self.key, message_id, event_time)):
                     self._add(event)
                 else:
                     self._aliases[id(event)] = event, entry

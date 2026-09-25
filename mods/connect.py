@@ -200,7 +200,12 @@ def on_load(ctx) -> None:
     # WHY: The archive anchor and mail boundary must both predate live ingress;
     # otherwise a newly received message could hide the offline gap. Chat's
     # normal on_load is later, so only its preparation hook runs here.
-    chat.prepare_recovery_sources()
+    try:
+        chat.prepare_recovery_sources()
+    except Exception:
+        # WHY: Offline recovery is optional; a broken archive must not prevent
+        # the required OneBot listener from accepting fresh messages.
+        _log.exception("offline recovery preparation failed; live ingress continues")
     with _server_lock:
         if _server is not None:
             return

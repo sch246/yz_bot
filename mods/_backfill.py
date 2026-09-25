@@ -34,13 +34,13 @@ def _prior_boot_members(source: dict, root: Path) -> tuple[tempfile.TemporaryDir
     try:
         database = sqlite3.connect(Path(temporary.name) / "members.sqlite3")
         database.execute("PRAGMA cache_size=-2048")
-        database.execute("CREATE TABLE members (message_id TEXT PRIMARY KEY)")
+        database.execute("CREATE TABLE members (origin TEXT PRIMARY KEY)")
         with database:
             for candidate in earlier:
                 for page_number in range(candidate["pages"]):
                     database.executemany(
                         "INSERT OR IGNORE INTO members VALUES (?)",
-                        ((str(int(member["message_id"])),) for member in
+                        ((member["origin"],) for member in
                          _source_pages.read_page(root, candidate["key"], page_number)))
         return temporary, database
     except BaseException:
@@ -50,7 +50,7 @@ def _prior_boot_members(source: dict, root: Path) -> tuple[tempfile.TemporaryDir
         raise
 
 
-def recover_source(source: dict, call_api) -> dict:
+def recover_source(source: dict, call_api, *, manual: bool = False) -> dict:
     """Resume a frozen source; fetched history never enters the realtime router."""
     key = source["key"]
     kind, target = source["window"]
@@ -82,12 +82,12 @@ def recover_source(source: dict, call_api) -> dict:
                 raise RuntimeError("回填档案未逐条返回稳定位置")
             members = []
             for row, origin in zip(rows, origins):
-                pending = oplog.pending_message((kind, target), row["message_id"])
+                pending = oplog.pending_message((kind, target), row["message_id"], row["time"])
                 boundary = state["pending_boundary"]
                 if pending is not None and boundary is not None and oplog.arrival_before_or_at(pending, boundary):
                     continue
                 if prior_members is not None and prior_members.execute(
-                        "SELECT 1 FROM members WHERE message_id=?", (str(int(row["message_id"])),)).fetchone():
+                        "SELECT 1 FROM members WHERE origin=?", (origin,)).fetchone():
                     continue
                 member = {"origin": origin, "message_id": row["message_id"],
                           "message_seq": int(row["message_seq"]), "time": int(row["time"]),
@@ -103,9 +103,22 @@ def recover_source(source: dict, call_api) -> dict:
         if pending is not None:
             save_page(pending)
 
+        # WHY: Boot with no trustworthy anchor reads just the recent page;
+        # finding older history is an explicit fetch. A missing anchor has a
+        # bounded retryable gap rather than an unbounded startup crawl.
+        if state["fetch_anchor"] is not None:
+            request_budget = 20
+        elif state["source_type"] == "napcat_boot" and not manual:
+            request_budget = 1
+        else:
+            request_budget = None
         result = _napcat_history.crawl_history(
             kind, int(target), call_api=call_api, save_page=save_page,
-            anchor_message_id=state["fetch_anchor"], start_seq=state["cursor"], count=PAGE_SIZE)
+            anchor_message_id=state["fetch_anchor"], anchor_time=state.get("anchor_time"),
+            start_seq=state["cursor"], count=PAGE_SIZE,
+            max_requests=request_budget,
+            earliest_time=(state["anchor_time"] - 86400 if not manual and state.get("anchor_time") is not None
+                           and state["fetch_anchor"] is not None else None))
         gap = ("远端历史到尽头但没有遇到本地锚点" if state["fetch_anchor"] is not None
                and not result["anchor_found"] else None)
         return oplog.finish_source(key, gap=gap, stop_cursor=result["oldest_seq"])

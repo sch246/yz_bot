@@ -271,10 +271,11 @@ def condense_ops(cids: list[str], conclusion: str) -> str:
     if window == chat.AGENT_WINDOW:
         remove_ids = sources | {entry["id"] for entry in oplog.events(window, True)
                                 if entry["kind"] == "result" and entry["source"] in sources}
-        removed = sum(session.stream_ids.get(id(message)) in remove_ids
+        removed = sum(chat._stream_id(session, message) in remove_ids
                       for message in session.messages)
         session.messages[:] = [message for message in session.messages
-                               if session.stream_ids.get(id(message)) not in remove_ids]
+                               if chat._stream_id(session, message) not in remove_ids]
+        chat._prune_stream_ids(session)
     else:
         removed = chat._condense_projection(session.messages, window, sources)
     removed += session.condense_native_calls(native_ids, sources=sources)
@@ -775,7 +776,7 @@ def peek_napcat(target: str, before: str = "", limit: int = 8, seq: str = "", of
     """
     import json
 
-    from mods import chat, connect, context
+    from mods import _napcat_history, chat, connect, context
 
     session = current_binding().session
     if not context.agent_mode() or not session.reads_window_mail:
@@ -807,10 +808,18 @@ def peek_napcat(target: str, before: str = "", limit: int = 8, seq: str = "", of
     rows = data.get("messages") if isinstance(data, dict) else None
     if not isinstance(rows, list):
         return "NapCat 历史响应缺少 messages 列表；未读未减少"
+    try:
+        sequences = [_napcat_history._number(row.get("message_seq"), "message_seq")
+                     for row in rows if isinstance(row, dict)]
+        if len(sequences) != len(rows) or len(sequences) != len(set(sequences)):
+            raise ValueError("duplicate or malformed message_seq")
+    except ValueError:
+        return "NapCat 历史序号重复或畸形；未读未减少"
+    rows.sort(key=lambda row: int(row["message_seq"]))
     if before and not seq:
-        rows = [row for row in rows if str(row.get("message_seq")) != before]
+        rows = [row for row in rows if int(row["message_seq"]) != int(before)]
     if seq:
-        rows = [row for row in rows if str(row.get("message_seq")) == seq]
+        rows = [row for row in rows if int(row["message_seq"]) == int(seq)]
     else:
         rows = rows[-limit:]
     if not rows:

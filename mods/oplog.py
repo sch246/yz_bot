@@ -27,19 +27,21 @@ _lock = RLock()
 _root: Path | None = None
 _events: list[dict] = []
 _by_id: dict[str, dict] = {}
+_by_arrival: dict[str, dict] = {}
 _windows: dict[tuple, list[dict]] = {}
 _next: dict[str, int] = {}
 _pending: dict[str, dict] = {}
 _notified: set[str] = set()
 _floors: dict[tuple, str | None] = {}
-_arrival_links: dict[str | None, list[str | None]] = {None: [None, None]}
-_arrival_ranks: dict[str, int] = {}
+# WHY: Arrival journal replay and dict insertion order are the FIFO authority;
+# there is no before-insertion caller, so a historical linked list is redundant.
+_arrival_order: dict[str, int] = {}
 _covered: dict[tuple, set[str]] = {}
 _coverage_nodes: dict[str, list[str]] = {}
 _mentioned_by: dict[str, list[str]] = {}
 _origins: dict[tuple[tuple, str], dict] = {}
 _sources: dict[str, dict] = {}
-_seen_messages: set[tuple[tuple, str]] = set()
+_seen_messages: set[tuple[tuple, str, int]] = set()
 _failed = False
 
 
@@ -58,13 +60,19 @@ def source_page_root() -> Path:
     return _directory() / "pages"
 
 
-def _input_message_identity(entry: dict, sources: dict[str, dict]) -> tuple[tuple, str] | None:
-    if entry["kind"] != "input" or entry["event"].get("message_id") is None:
+def _message_identity(window: tuple, event: dict) -> tuple[tuple, str, int] | None:
+    if event.get("message_id") is None or type(event.get("time")) is not int:
+        return None
+    value = str(event["message_id"])
+    return window, str(int(value)) if value.lstrip("-").isdecimal() else value, event["time"]
+
+
+def _input_message_identity(entry: dict, sources: dict[str, dict]) -> tuple[tuple, str, int] | None:
+    if entry["kind"] != "input":
         return None
     window = (sources[entry["source"]]["window"] if entry.get("source")
               else entry.get("source_window") or entry["window"])
-    value = str(entry["event"]["message_id"])
-    return tuple(window), str(int(value)) if value.lstrip("-").isdecimal() else value
+    return _message_identity(tuple(window), entry["event"])
 
 
 def _restore() -> None:
@@ -79,7 +87,7 @@ def _restore() -> None:
     pending: dict[str, dict] = {}
     notified: set[str] = set()
     floors: dict[tuple, str | None] = {}
-    arrival_links: dict[str | None, list[str | None]] = {None: [None, None]}
+    arrival_order: dict[str, int] = {}
     covered: dict[tuple, set[str]] = {}
     coverage_nodes: dict[str, list[str]] = {}
     mentioned_by: dict[str, list[str]] = {}
@@ -91,7 +99,7 @@ def _restore() -> None:
         for line in data[:complete].splitlines():
             entry = json.loads(line.decode("utf-8"))
             _apply(entry, restored, indexes, windows, counters, pending, covered, coverage_nodes,
-                   origins, mentioned_by, notified, floors, arrival_links, sources)
+                   origins, mentioned_by, notified, floors, arrival_order, sources)
         if complete != len(data):
             # WHY: Only a missing final newline is a crash tail. A malformed complete
             # row is corruption, never permission to silently skip committed facts.
@@ -111,6 +119,8 @@ def _restore() -> None:
     _events[:] = restored
     _by_id.clear()
     _by_id.update(indexes)
+    _by_arrival.clear()
+    _by_arrival.update((entry["arrival"], entry) for entry in restored if entry.get("arrival"))
     _windows.clear()
     _windows.update(windows)
     _next.clear()
@@ -121,9 +131,8 @@ def _restore() -> None:
     _notified.update(notified)
     _floors.clear()
     _floors.update(floors)
-    _arrival_links.clear()
-    _arrival_links.update(arrival_links)
-    _arrival_ranks.clear()
+    _arrival_order.clear()
+    _arrival_order.update(arrival_order)
     _covered.clear()
     _covered.update(covered)
     _coverage_nodes.clear()
@@ -163,13 +172,6 @@ def _reference_candidates(entry: dict) -> Iterable[str]:
             yield match.group(1)
 
 
-def _arrival_sequence(links: dict[str | None, list[str | None]]) -> Iterable[str]:
-    arrival = links[None][1]
-    while arrival is not None:
-        yield arrival
-        arrival = links[arrival][1]
-
-
 def _validate_source_page(entry: dict, state: dict) -> None:
     if state["state"] != "fetching":
         raise ValueError("source fetch is not running")
@@ -205,7 +207,9 @@ def _validate_source_read(entry: dict, state: dict, pending: dict[str, dict]) ->
     if arrival is not None:
         linked = pending.get(arrival)
         if (linked is None or linked["window"] != state["window"]
-                or str(linked["event"].get("message_id")) != str(entry["event"].get("message_id"))):
+                or _message_identity(tuple(linked["window"]), linked["event"]) is None
+                or _message_identity(tuple(linked["window"]), linked["event"])
+                   != _message_identity(tuple(linked["window"]), entry["event"])):
             raise ValueError("source read does not match its live arrival")
 
 
@@ -214,19 +218,10 @@ def _apply(
     counters: dict[str, int], pending: dict[str, dict], covered: dict[tuple, set[str]],
     coverage_nodes: dict[str, list[str]], origins: dict[tuple[tuple, str], dict],
     mentioned_by: dict[str, list[str]], notified: set[str], floors: dict[tuple, str | None],
-    arrival_links: dict[str | None, list[str | None]], sources: dict[str, dict],
+    arrival_order: dict[str, int], sources: dict[str, dict],
 ) -> None:
     if entry["kind"] == "arrival":
-        before = entry.get("before")
-        if before is not None:
-            if before not in pending or pending[before]["window"] != entry["window"]:
-                raise ValueError("arrival before must name a pending arrival in the same window")
-            previous = arrival_links[before][0]
-        else:
-            previous = arrival_links[None][0]
-        arrival_links[entry["arrival"]] = [previous, before]
-        arrival_links[previous][1] = entry["arrival"]
-        arrival_links[before][0] = entry["arrival"]
+        arrival_order[entry["arrival"]] = len(arrival_order)
         source = entry.get("source")
         if source is not None:
             if source not in sources or sources[source]["queue_window"] != entry["window"]:
@@ -241,6 +236,7 @@ def _apply(
                            "queue_window": entry.get("queue_window", entry["window"]),
                            "source_type": entry["source_type"], "pulled": False,
                            "state": "fetching", "anchor": entry.get("anchor"),
+                           "anchor_time": entry.get("anchor_time"),
                            "fetch_anchor": entry.get("anchor"),
                            "cursor": entry.get("start_seq"), "stop_cursor": None,
                            "pending_boundary": entry.get("pending_boundary"),
@@ -301,13 +297,10 @@ def _apply(
         window = tuple(entry["window"])
         floors[window] = entry["before"]
         if entry["before"] is not None:
-            for arrival in _arrival_sequence(arrival_links):
-                if arrival not in pending:
-                    continue
-                if tuple(pending[arrival]["window"]) == window and not pending[arrival].get("fetched"):
+            boundary = arrival_order[entry["before"]]
+            for arrival, item in list(pending.items()):
+                if arrival_order[arrival] <= boundary and tuple(item["window"]) == window and not item.get("fetched"):
                     pending.pop(arrival)
-                if arrival == entry["before"]:
-                    break
         return
     if entry["kind"] == "notification_ack":
         notice = indexes[entry["notification"]]
@@ -390,9 +383,6 @@ def _append(entry: dict, day: str) -> None:
     if _failed:
         raise RuntimeError("event stream write failed; refusing further actions")
     if entry["kind"] == "arrival":
-        before = entry.get("before")
-        if before is not None and (before not in _pending or _pending[before]["window"] != entry["window"]):
-            raise ValueError("arrival before must name a pending arrival in the same window")
         source = entry.get("source")
         if source is not None:
             if source not in _sources or _sources[source]["queue_window"] != entry["window"]:
@@ -418,25 +408,21 @@ def _append(entry: dict, day: str) -> None:
         _failed = True
         raise
     _apply(entry, _events, _by_id, _windows, _next, _pending, _covered, _coverage_nodes,
-           _origins, _mentioned_by, _notified, _floors, _arrival_links, _sources)
+           _origins, _mentioned_by, _notified, _floors, _arrival_order, _sources)
     identity = _input_message_identity(entry, _sources)
     if identity is not None:
         _seen_messages.add(identity)
-    if entry["kind"] == "arrival":
-        _arrival_ranks.clear()
+    if entry.get("id") and entry.get("arrival"):
+        _by_arrival[entry["arrival"]] = entry
 
 
 def _ordered_pending(window: tuple | None = None) -> list[dict]:
-    return [_pending[arrival] for arrival in _arrival_sequence(_arrival_links)
-            if arrival in _pending and (window is None or _pending[arrival]["window"] == list(window))]
+    return [entry for entry in _pending.values()
+            if window is None or entry["window"] == list(window)]
 
 
 def _arrival_before_or_at(arrival: str, through: str) -> bool:
-    if len(_arrival_ranks) != len(_arrival_links) - 1:
-        _arrival_ranks.clear()
-        _arrival_ranks.update((item, position) for position, item in enumerate(
-            _arrival_sequence(_arrival_links)))
-    return _arrival_ranks[arrival] <= _arrival_ranks[through]
+    return _arrival_order[arrival] <= _arrival_order[through]
 
 
 def _source_snapshot(state: dict) -> dict:
@@ -447,8 +433,7 @@ def _source_snapshot(state: dict) -> dict:
             "remaining": state["member_count"] - state["read_count"]}
 
 
-def arrive(window: tuple, event: dict, *, activated: bool = False, origin: str | None = None,
-           before: str | None = None) -> str:
+def arrive(window: tuple, event: dict, *, activated: bool = False, origin: str | None = None) -> str:
     from mods import chatlog
 
     with _lock:
@@ -457,8 +442,6 @@ def arrive(window: tuple, event: dict, *, activated: bool = False, origin: str |
         entry = {"kind": "arrival", "window": list(window), "arrival": arrival_id,
                  "arrived_at": time.time(), "event": event, "activated": activated,
                  "origin": origin if origin is not None else chatlog.consume_origin(event)}
-        if before is not None:
-            entry["before"] = before
         _append(entry, datetime.now().strftime("%Y%m%d"))
         return arrival_id
 
@@ -469,25 +452,27 @@ def unread(window: tuple) -> list[dict]:
         return _ordered_pending(window)
 
 
-def pending_message(window: tuple, message_id: int | str) -> str | None:
+def pending_message(window: tuple, message_id: int | str, event_time: int) -> str | None:
     """Find an unread QQ message identity from its original chat window."""
     with _lock:
         _restore()
+        identity = _message_identity(window, {"message_id": message_id, "time": event_time})
+        if identity is None:
+            return None
         return next((entry["arrival"] for entry in _pending.values()
                      if (tuple(_sources[entry["source"]]["window"]) if entry.get("source")
                          else tuple(entry["window"])) == window
                      if entry["event"].get("message_id") is not None
-                     and str(entry["event"]["message_id"]) == str(message_id)), None)
+                     and _message_identity(window, entry["event"]) == identity), None)
 
 
-def message_seen(window: tuple, message_id: int | str) -> bool:
+def message_seen(window: tuple, message_id: int | str, event_time: int) -> bool:
     """Check pending and already-read inputs for the same original QQ message."""
     with _lock:
         _restore()
-        if pending_message(window, message_id) is not None:
+        if pending_message(window, message_id, event_time) is not None:
             return True
-        value = str(message_id)
-        return (window, str(int(value)) if value.lstrip("-").isdecimal() else value) in _seen_messages
+        return _message_identity(window, {"message_id": message_id, "time": event_time}) in _seen_messages
 
 
 def arrival_origin(arrival: str) -> str | None:
@@ -497,6 +482,7 @@ def arrival_origin(arrival: str) -> str | None:
 
 
 def start_source(name: str, window: tuple, source_type: str, *, anchor: str | None = None,
+                 anchor_time: int | None = None,
                  queue_window: tuple | str | None = None,
                  start_seq: str | None = None) -> dict:
     """Start a named fetch; 'new' creates a separate durable FIFO for a repeated pull."""
@@ -513,7 +499,8 @@ def start_source(name: str, window: tuple, source_type: str, *, anchor: str | No
         boundary = existing[-1]["arrival"] if existing else None
         _append({"kind": "source_start", "source": source, "name": name,
                  "window": list(window), "queue_window": list(queue_window),
-                 "source_type": source_type, "anchor": anchor, "start_seq": start_seq,
+                 "source_type": source_type, "anchor": anchor, "anchor_time": anchor_time,
+                 "start_seq": start_seq,
                  "pending_boundary": boundary}, datetime.now().strftime("%Y%m%d"))
         return _source_snapshot(_sources[source])
 
@@ -639,8 +626,23 @@ def pending_details() -> list[dict]:
     """Unread window counts and wake metadata, never unread bodies."""
     with _lock:
         _restore()
-        windows = dict.fromkeys(tuple(entry["window"]) for entry in _ordered_pending())
-        return [_pending_detail(window) for window in windows]
+        details: dict[tuple, dict] = {}
+        for entry in _pending.values():
+            window = tuple(entry["window"])
+            detail = details.setdefault(window, {"window": list(window), "unread": 0,
+                                                 "ordinary": 0, "mentions": 0,
+                                                 "other_wakes": 0, "wake_sources": []})
+            detail["unread"] += 1
+            if not entry.get("activated"):
+                detail["ordinary"] += 1
+                continue
+            kind = entry.get("activation_kind", "wake")
+            detail["mentions" if kind == "mention" else "other_wakes"] += 1
+            if len(detail["wake_sources"]) < 3:
+                detail["wake_sources"].append({"kind": kind,
+                                               "user_id": entry["event"].get("user_id"),
+                                               "time": entry["event"].get("time")})
+        return list(details.values())
 
 
 def has_unnotified() -> bool:
@@ -680,18 +682,19 @@ def deliver_notifications(agent_window: tuple) -> dict | None:
         for entry in _windows.get(agent_window, ()):
             if entry["kind"] == "notification" and not entry.get("acknowledged"):
                 return entry
-        activated = [entry for entry in _ordered_pending()
-                     if entry.get("activated") and entry["arrival"] not in _notified]
+        activated = []
+        latest: dict[tuple, str] = {}
+        for entry in _pending.values():
+            latest[tuple(entry["window"])] = entry["arrival"]
+            if entry.get("activated") and entry["arrival"] not in _notified:
+                activated.append(entry)
         if not activated:
             return None
-        latest: dict[tuple, str] = {}
-        for entry in _ordered_pending():
-            latest[tuple(entry["window"])] = entry["arrival"]
         windows = list(dict.fromkeys(tuple(entry["window"]) for entry in activated))
         return _register(agent_window, "notification", arrivals=[entry["arrival"] for entry in activated],
                          through={str(window): latest[window] for window in windows},
                          windows=[list(window) for window in windows],
-                         unread=[_pending_detail(window) for window in latest])
+                         unread=pending_details())
 
 
 def work_windows(agent_window: tuple) -> list[tuple]:
@@ -702,6 +705,9 @@ def work_targets(agent_window: tuple) -> dict[tuple, str]:
     """Pending prefixes frozen by delivered notifications, including after restart."""
     with _lock:
         _restore()
+        earliest: dict[tuple, str] = {}
+        for arrival, pending in _pending.items():
+            earliest.setdefault(tuple(pending["window"]), arrival)
         targets: dict[tuple, str] = {}
         for entry in _windows.get(agent_window, ()):
             if entry["kind"] == "notification":
@@ -710,9 +716,7 @@ def work_targets(agent_window: tuple) -> dict[tuple, str]:
                     if key in targets:
                         continue
                     target = entry["through"][str(key)]
-                    if any(tuple(pending["window"]) == key
-                           and _arrival_before_or_at(arrival, target)
-                           for arrival, pending in _pending.items()):
+                    if key in earliest and _arrival_before_or_at(earliest[key], target):
                         targets[key] = target
         return targets
 
@@ -741,7 +745,7 @@ def activate(arrival: str, kind: str = "wake") -> None:
 def read(arrival: str) -> dict | None:
     with _lock:
         _restore()
-        return next((entry for entry in reversed(_events) if entry.get("arrival") == arrival), None)
+        return _by_arrival.get(arrival)
 
 
 def recall_events(window: tuple | None, ids: Iterable[str]) -> tuple[list[dict], list[str]]:

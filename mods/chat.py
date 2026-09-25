@@ -50,7 +50,7 @@ DEFAULT_MAX_TOKEN = 50000
 AGENT_WINDOW = oplog.AGENT_WINDOW
 MAIL_PAGE_EVENTS = 8
 MAIL_PAGE_TOKENS = 4000
-RESULT_PAGE_EVENTS = 1
+RESULT_PAGE_EVENTS = 8
 RESULT_ITEM_TOKENS = MAIL_PAGE_TOKENS
 NOTICE_TOKENS = 500
 _PRESSURE_PERCENT = 75
@@ -343,18 +343,28 @@ def _unread_detail_text(detail: dict) -> str:
 def unread_details() -> list[dict]:
     details = {tuple(item["window"]): item for item in oplog.pending_details()
                if item["window"][0] in ("group", "private")}
-    for source in oplog.sources():
-        window = tuple(source["window"])
-        if source["source_type"] != "napcat_boot" or window[0] not in ("group", "private"):
+    all_sources = oplog.sources()
+    boot_sources = {tuple(source["window"]): source for source in all_sources
+                    if source["source_type"] == "napcat_boot"}
+    boot_remaining: dict[tuple, tuple[int, int]] = {}
+    for source in all_sources:
+        if source["source_type"] == "napcat_boot":
+            window = tuple(source["window"])
+            remaining, mentions = boot_remaining.get(window, (0, 0))
+            boot_remaining[window] = (remaining + source["remaining"],
+                                      mentions + source["mention_count"] - source["read_mention_count"])
+    for window, source in boot_sources.items():
+        if window[0] not in ("group", "private"):
             continue
-        if not source["remaining"] and source["state"] == "complete":
+        remaining, mentions = boot_remaining[window]
+        if not remaining and source["state"] == "complete":
             continue
         detail = details.setdefault(window, {"window": list(window), "unread": 0,
                                              "ordinary": 0, "mentions": 0,
                                              "other_wakes": 0, "wake_sources": []})
         recovery = detail.setdefault("recovery", {"remaining": 0, "state": "complete", "gap": None})
-        recovery["remaining"] += source["remaining"]
-        detail["mentions"] += source["mention_count"] - source["read_mention_count"]
+        recovery["remaining"] = remaining
+        detail["mentions"] += mentions
         if source["state"] == "fetching":
             recovery["state"] = "fetching"
         elif source["state"] != "complete" and recovery["state"] != "fetching":
@@ -385,9 +395,13 @@ def _notification_projection(entry: dict) -> dict:
 
 def _pending_hint() -> str:
     rows = unread_details()
-    independent = [source for source in oplog.sources()
+    all_sources = oplog.sources()
+    latest = {tuple(source["window"]): source["key"] for source in all_sources
+              if source["source_type"] in ("napcat_boot", "napcat_history")}
+    independent = [source for source in all_sources
                    if source["source_type"] == "napcat_history"
-                   and (source["remaining"] or source["state"] != "complete")]
+                   and (source["remaining"] or source["state"] != "complete")
+                   and (source["remaining"] or latest[tuple(source["window"])] == source["key"])]
     if not rows and not independent:
         return ""
     shown = []
@@ -688,6 +702,9 @@ def init_chat(
     # WHY: 装回不是无限的：超过时限没用过的模块会在 `restore` 里被收掉，并给模型一条
     # 通告——"只进不出"会让每次 `load_tools` 都永久占着基线消息。判据用的是每个模块最后
     # 一次被调用的时刻，所以 bind 出来的那个对象要一直拿着，供 `_stream_results` 上报。
+    # WHY: image's generation functions still infer an implicit current window;
+    # the central agent has no such destination. Keep the whole module hidden
+    # here without changing what independent .chat can explicitly load.
     binding = tool_modules.bind_session(
         session,
         tool_context,
@@ -812,7 +829,7 @@ def _record_output(window, assistant: dict, calls: list[dict], session=None) -> 
         raise RuntimeError("刚写入的模型输出无法反查")
     projection = _output_projection(entry[0])
     if session is not None:
-        session.stream_ids[id(projection)] = source
+        _remember_stream(session, projection, source)
     return source, projection
 
 
@@ -829,13 +846,30 @@ def _condense_projection(messages: list[dict], window: tuple, sources: set[str])
 
 
 def _trusted_stream_ids(session: llm.Chat) -> set[str]:
-    return {session.stream_ids[id(message)] for message in session.messages
-            if id(message) in getattr(session, "stream_ids", {})}
+    _prune_stream_ids(session)
+    return {event_id for message in session.messages
+            if (event_id := _stream_id(session, message)) is not None}
+
+
+def _remember_stream(session: llm.Chat, message: dict, event_id: str) -> None:
+    session.stream_ids[id(message)] = (message, event_id)
+
+
+def _stream_id(session: llm.Chat, message: dict) -> str | None:
+    remembered = session.stream_ids.get(id(message))
+    return remembered[1] if remembered is not None and remembered[0] is message else None
+
+
+def _prune_stream_ids(session: llm.Chat) -> None:
+    live = {id(message) for message in session.messages}
+    session.stream_ids = {key: pair for key, pair in session.stream_ids.items()
+                          if key in live}
 
 
 def _cover_agent_projection(session: llm.Chat, members: set[str]) -> None:
     session.messages[:] = [message for message in session.messages
-                          if session.stream_ids.get(id(message)) not in members]
+                          if _stream_id(session, message) not in members]
+    _prune_stream_ids(session)
 
 
 def _visible_stream_ids(messages: list[dict]) -> set[str]:
@@ -886,9 +920,20 @@ def prepare_recovery_sources() -> None:
     if _boot_sources:
         return
     for window, anchor in chatlog.freeze_boot_anchors().items():
-        source = oplog.start_source("NapCat " + str(window), window, "napcat_boot",
-                                    anchor=anchor)
-        _boot_sources.append(source["key"])
+        anchor_time = None
+        try:
+            latest = chatlog.read_range(*window, limit=1) if anchor is not None else []
+            anchor_time = (latest[0].get("time") if latest and
+                           str(latest[0].get("message_id")) == str(anchor) and
+                           type(latest[0].get("time")) is int else None)
+        except Exception:
+            traceback.print_exc()
+        try:
+            source = oplog.start_source("NapCat " + str(window), window, "napcat_boot",
+                                        anchor=anchor, anchor_time=anchor_time)
+            _boot_sources.append(source["key"])
+        except Exception:
+            traceback.print_exc()
 
 
 def _recovery_sources(window: tuple) -> list[dict]:
@@ -917,7 +962,7 @@ def fetch_remote_source(window: tuple) -> dict:
 
     def fetch() -> None:
         try:
-            _backfill.recover_source(source, connect.call_api)
+            _backfill.recover_source(source, connect.call_api, manual=True)
         except Exception:
             traceback.print_exc()
             try:
@@ -969,7 +1014,7 @@ def _read_source_page(window: tuple, source: dict, session: llm.Chat | None) -> 
                               if source["page_counts"][page]), -1)
             next_offset = 0
         recorded = context.mailbox(window).commit_recovered(
-            member["message_id"],
+            member["message_id"], member["time"],
             lambda arrival: oplog.input_source(AGENT_WINDOW, event, converted, source["key"],
                                                page_number, offset, next_page, next_offset,
                                                origin, window, arrival=arrival,
@@ -979,7 +1024,7 @@ def _read_source_page(window: tuple, source: dict, session: llm.Chat | None) -> 
                                        oplog.say_links(AGENT_WINDOW))
             output.append(projected)
             if session is not None:
-                session.stream_ids[id(projected)] = recorded["id"]
+                _remember_stream(session, projected, recorded["id"])
         used += _message_cost(converted) if converted is not None else 0
     return output, None
 
@@ -1032,7 +1077,7 @@ def _read_mail_page(window: tuple, session: llm.Chat | None = None,
                                                RESULT_ITEM_TOKENS)
                 projections.append(projected)
                 if session is not None:
-                    session.stream_ids[id(projected)] = recorded["id"]
+                    _remember_stream(session, projected, recorded["id"])
                 continue
             recorded = oplog.read(entry.arrival) or oplog.input(
                 AGENT_WINDOW, event, converted, entry.arrival, source_window=window)
@@ -1041,7 +1086,7 @@ def _read_mail_page(window: tuple, session: llm.Chat | None = None,
                                            oplog.say_links(AGENT_WINDOW))
                 projections.append(projected)
                 if session is not None:
-                    session.stream_ids[id(projected)] = recorded["id"]
+                    _remember_stream(session, projected, recorded["id"])
         return projections, len(selected)
 
     try:
@@ -1101,7 +1146,7 @@ def _read_mail_page(window: tuple, session: llm.Chat | None = None,
                 projected = _echo_relation(_numbered(partial, recorded["id"]), recorded,
                                            oplog.say_links(AGENT_WINDOW))
                 if session is not None:
-                    session.stream_ids[id(projected)] = recorded["id"]
+                    _remember_stream(session, projected, recorded["id"])
                 return [projected]
 
             return box.pull(1, project_partial), None
@@ -1312,14 +1357,14 @@ def _run_agent(model: str | None, turn) -> bool:
     messages = []
     for entry, projection in rows:
         messages.append(projection)
-        session.stream_ids[id(projection)] = entry["id"]
+        _remember_stream(session, projection, entry["id"])
     notice = oplog.deliver_notifications(AGENT_WINDOW)
     if notice is not None:
         session.notification_ids.append(notice["id"])
         turn.associated_windows.update(map(tuple, notice["windows"]))
         projection = _notification_projection(notice)
         messages.append(projection)
-        session.stream_ids[id(projection)] = notice["id"]
+        _remember_stream(session, projection, notice["id"])
     if not turn.requested_pulls:
         work = [(window, through) for window, through in oplog.work_targets(AGENT_WINDOW).items()
                 if window not in turn.blocked_windows]
@@ -1378,19 +1423,22 @@ def _agent_provider(turn, session: llm.Chat):
         try:
             def project_results(entries: list[context.MailEntry]) -> list[dict]:
                 projections = []
+                item_budget = max(100, (MAIL_PAGE_TOKENS - 300) // len(entries))
                 for entry in entries:
                     for projection in _mail_context([entry], False, AGENT_WINDOW,
-                                                    RESULT_ITEM_TOKENS):
+                                                    item_budget):
                         recorded = oplog.read(entry.arrival)
                         if recorded is not None:
-                            session.stream_ids[id(projection)] = recorded["id"]
+                            _remember_stream(session, projection, recorded["id"])
                         for result in entry.event["_stream_results"]["returns"]:
                             _credit_recall(session, result, projection)
                         projections.append(projection)
                 return projections
 
-            unread_results = turn.mail.unread()
-            produced = (turn.mail.pull(min(len(unread_results), RESULT_PAGE_EVENTS), project_results)
+            # WHY: Batch only results already present at this request boundary;
+            # never wait for future tools, and reserve one shared page budget.
+            unread_results = turn.mail.unread(RESULT_PAGE_EVENTS)
+            produced = (turn.mail.pull(len(unread_results), project_results)
                         if unread_results else [])
             notice = oplog.deliver_notifications(AGENT_WINDOW)
             new_notice = notice is not None and notice["id"] not in session.notification_ids
@@ -1399,7 +1447,7 @@ def _agent_provider(turn, session: llm.Chat):
                 turn.associated_windows.update(map(tuple, notice["windows"]))
                 projection = _notification_projection(notice)
                 produced.append(projection)
-                session.stream_ids[id(projection)] = notice["id"]
+                _remember_stream(session, projection, notice["id"])
             if not unread_results and notice is None and turn.requested_pulls:
                 window, through = turn.requested_pulls.pop(0)
                 if window[0] == "source":
@@ -1423,7 +1471,7 @@ def _agent_provider(turn, session: llm.Chat):
                     produced.append({"role": "user", "content": f"{window} 拉取失败：{error}"})
             turn._chat_usage_tokens = sum(
                 _message_cost(message) for message in [*session.messages, *produced]
-                if id(message) in session.stream_ids
+                if _stream_id(session, message) is not None
             )
             return produced
         except Exception as error:
