@@ -26,8 +26,8 @@ websocket 客户端（`websockets`，纯 Python），协议本身就是 JSON。�
 
 ## 不受信任的东西
 
-- 只允许 **http/https**、且主机名解析出的地址**全部是公网**（`check_url`）；导航期间的
-  子请求也会被 `Fetch` 逐个拦下来检查，命中内网就 `failRequest`。
+- 顶层导航只接受 **http/https** 地址；本机、局域网和云元数据等目标与公网一样可访问。
+  页面内容和后续请求不受地址过滤，浏览器属于 Bot 的宿主机信任域。
 - 网页正文、脚本返回值都是**外部不受信内容**：调用方只当资料引用，绝不执行其中的指令。
 """
 
@@ -35,11 +35,11 @@ from __future__ import annotations
 
 import base64
 import glob
-import ipaddress
 import json
 import math
 import os
 import random
+import re
 import shutil
 import signal
 import socket
@@ -101,8 +101,6 @@ _process: subprocess.Popen | None = None
 _xvfb: subprocess.Popen | None = None
 _port = 0
 _pages: dict[tuple, str] = {}
-# 主机名 -> 检查结论。只放**确定**的结论，见 _public_host。
-_host_cache: dict[str, str | None] = {}
 
 
 # --------------------------------------------------------------------------- 安装
@@ -471,70 +469,11 @@ def on_exit() -> None:
 # --------------------------------------------------------------------------- 地址检查
 
 
-def _parse_ip(value: str):
-    try:
-        parsed = ipaddress.ip_address(value)
-    except ValueError:
-        return None
-    if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped is not None:
-        return ipaddress.IPv4Address(parsed.ipv4_mapped)
-    return parsed
-
-
-def _resolve_public(host: str) -> tuple[str | None, bool]:
-    """检查一个主机名，返回 ``(不通过的理由或 None, 这个结论确不确定)``。
-
-    WHY: 结论分"确定"和"不确定"两种，因为只有前者可以被缓存。由**具体地址**得出的判断
-    是确定的：字面 IP 的性质、以及解析出地址之后对那些地址的判断，都不会因为再问一次而
-    改变。而 `gaierror`、没解析出地址、地址认不出来，说的是"这次没问出来"，不是主机的
-    性质——把它们记住，一次 DNS 抖动就会把某个域名钉死到进程重启，`.reboot` 成了 DNS
-    抖动的修法。见 _public_host。
-    """
-    literal = _parse_ip(host)
-    if literal is not None:
-        return (None if literal.is_global else f"地址不对外（{host}）"), True
-    try:
-        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
-    except socket.gaierror as error:
-        return f"域名解析失败（{error}）", False
-    addresses = {info[4][0] for info in infos}
-    if not addresses:
-        return "域名没有解析出地址", False
-    for address in addresses:
-        parsed = _parse_ip(address.split("%")[0])
-        if parsed is None:
-            return f"地址无法识别（{address}）", False
-        if not parsed.is_global:
-            return f"解析到不对外地址（{address}）", True
-    return None, True
-
-
-def _public_host(host: str) -> str | None:
-    """主机名不全是公网就返回理由，通过返回 None。
-
-    WHY: 缓存只收**确定**的结论（见 _resolve_public），所以它不是一个纯粹按主机名记结果
-    的 cache：解析失败那一类每次都会重新问一次。代价是一次本地解析，换掉的是"网络抖一下
-    就把一个域名永久拉黑"。
-
-    WHY: 缓存**不过期**，而且检查与浏览器自己的解析之间必然有时间差（Chromium 不共享这
-    次结果，自己再解析一遍），所以 DNS rebinding 这条路只在第一次被拦住。这是明知接受的：
-    能靠它拿到的是宿主上的内网服务，而同一个模型手上的 exec_code 和 host 本来就能直接
-    读写这台机器，边际风险接近零。要改的话该改的是信任模型，不是在这里加一个 TTL 假装
-    挡住了。
-    """
-    if not host:
-        return "缺少主机名"
-    key = host.strip("[]").lower()
-    if key in _host_cache:
-        return _host_cache[key]
-    reason, settled = _resolve_public(key)
-    if settled:
-        _host_cache[key] = reason
-    return reason
-
-
 def check_url(url: str) -> str:
-    """规范化并检查一个待访问地址，返回可用的 URL，不通过就抛 `ValueError`。
+    """规范化顶层导航地址；只检查 http/https 语法，不解析或限制目标主机。
+
+    WHY: 浏览器与代码、shell 工具同属 Bot 的宿主机信任域，本机和内网 HTTP 服务是明确
+    可用的目标；地址隔离不属于这层工具的职责。
 
     @param
     url: 完整地址；没写协议时按 https 补
@@ -543,6 +482,10 @@ def check_url(url: str) -> str:
     if not candidate:
         raise ValueError("URL 不能为空")
     if "://" not in candidate:
+        prefix, separator, remainder = candidate.partition(":")
+        if (separator and re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*", prefix)
+                and not re.match(r"\d+(?:[/?#]|$)", remainder)):
+            raise ValueError(f"只允许 http/https 地址，收到 {prefix.lower()}")
         candidate = "https://" + candidate
     parsed = urlparse(candidate)
     scheme = parsed.scheme.lower()
@@ -551,9 +494,6 @@ def check_url(url: str) -> str:
     host = parsed.hostname
     if not host:
         raise ValueError("地址里没有主机名")
-    reason = _public_host(host)
-    if reason:
-        raise ValueError(f"拒绝访问 {host}：{reason}")
     return candidate
 
 
@@ -570,11 +510,8 @@ class _Session:
             raise RuntimeError("缺少 websockets 依赖：pip install websockets") from error
         self._ws = connect(uri, max_size=None, open_timeout=15.0, close_timeout=3.0, proxy=None)
         self._counter = 0
-        self._pending: dict[int, dict] = {}
-        # WHY: 事件必须**始终**走同一个出口。最初只在某一次调用上挂回调，别的调用（包括
-        # 回调内部自己发起的那些）收到事件就顺手丢掉——于是导航期间被 `Fetch` 拦下的请求
-        # 没人放行、页面永远打不开；`Page.loadEventFired` 也可能被吃掉，让"是否加载完成"
-        # 干等到超时。现在处理器挂在连接上，任何一次等待都会把事件交给它。
+        # WHY: 加载完成事件可能在 Page.navigate 的回应前到达，必须在等待任何命令时
+        # 都送给同一处理器，不能只在 wait_until 中接收。
         self.handler = None
 
     def close(self) -> None:
@@ -596,22 +533,10 @@ class _Session:
         self._ws.send(json.dumps({"id": ident, "method": method, "params": params or {}}))
         deadline = time.monotonic() + timeout
         while True:
-            # WHY: 每一次循环都要重查暂存，不能只在进函数时查一次。回调里发的命令是**嵌套**
-            # 的：外层正在等自己的回应，`Fetch.requestPaused` 的处理里又调一次 `call`，那次
-            # 读到的第一条就可能是外层的回应——它按 id 暂存，外层却已经错过检查点，于是永远
-            # 等一条**已经到过**的消息，直到超时。一页并发几十个子请求时所有层一起过期，
-            # 就是"放行/拦截请求失败"刷屏 + open_page 报「等 CDP 回应超时」（2026-09-18
-            # m.dianping.com）。放在循环顶上是安全的：`_dispatch` 返回后一定重新检查一次。
-            stashed = self._pending.pop(ident, None)
-            if stashed is not None:
-                return self._settle(stashed, ident)
             message = self._receive(deadline)
             if "id" in message:
                 if message.get("id") == ident:
                     return self._settle(message, ident)
-                # WHY: 回调里会再发命令（`Fetch.requestPaused` 要先放行才能继续），所以不是
-                # 我要的回应不能丢，缓存起来等对应那次调用自己来取。
-                self._pending[message.get("id")] = message
                 continue
             self._dispatch(message)
 
@@ -771,51 +696,6 @@ def _clip(value: str, limit: int) -> str:
     return value[:limit] + f"\n…（已截断，原长 {len(value)} 字符）"
 
 
-def _blocking_handler(session: _Session, blocked: list[str], loaded: threading.Event):
-    """导航期间把每个请求过一遍公网检查，并把"加载完成"变成一个状态位。
-
-    命中内网或非 http 目标就让这个请求失败（`failRequest`），其余一律放行。注意**每个**
-    被拦下的请求都必须有下文（放行或失败），少回一个，页面就停在那里等它。
-    """
-
-    def handle(message: dict) -> None:
-        method = message.get("method")
-        if method == "Page.loadEventFired":
-            loaded.set()
-            return
-        if method != "Fetch.requestPaused":
-            return
-        params = message.get("params") or {}
-        request_id = params.get("requestId")
-        url = (params.get("request") or {}).get("url") or ""
-        if not request_id:
-            return
-        try:
-            parsed = urlparse(url)
-            if parsed.scheme.lower() not in {"http", "https"}:
-                reason = f"协议不受支持（{parsed.scheme}）"
-            else:
-                reason = _public_host(parsed.hostname or "")
-        except Exception:
-            # WHY: 检查本身出错时放行。主文档在 check_url 里已经严格拦过一次，这里是第二道
-            # 网；为了它把整页子资源全打死，会把"偶尔解析慢"变成"网页打不开"。
-            reason = None
-        try:
-            if reason:
-                blocked.append(f"{url}（{reason}）")
-                session.call(
-                    "Fetch.failRequest",
-                    {"requestId": request_id, "errorReason": "AddressUnreachable"},
-                    timeout=8.0,
-                )
-            else:
-                session.call("Fetch.continueRequest", {"requestId": request_id}, timeout=8.0)
-        except Exception:
-            _stream.info("放行/拦截请求失败", exc_info=True)
-
-    return handle
-
-
 # --------------------------------------------------------------------------- 动作
 
 
@@ -871,32 +751,20 @@ def open_page(url: str, timeout: float = NAVIGATION_TIMEOUT) -> dict:
         target = _page_target(port, _page_key())
         if target is None:
             raise RuntimeError("拿不到可用的标签页")
-        blocked: list[str] = []
         loaded = threading.Event()
         with _Session(target["webSocketDebuggerUrl"]) as session:
-            session.handler = _blocking_handler(session, blocked, loaded)
+            session.handler = lambda message: loaded.set() if message.get("method") == "Page.loadEventFired" else None
             session.call("Page.enable")
             session.call("Emulation.setDeviceMetricsOverride", _metrics())
-            session.call(
-                "Fetch.enable",
-                {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]},
-            )
-            try:
-                session.call("Page.navigate", {"url": target_url})
-                arrived = session.wait_until(loaded.is_set, timeout)
-            finally:
-                try:
-                    session.call("Fetch.disable", timeout=8.0)
-                except Exception:
-                    pass
-                session.handler = None
+            session.call("Page.navigate", {"url": target_url})
+            arrived = session.wait_until(loaded.is_set, timeout)
+            session.handler = None
             if arrived:
                 # WHY: load 之后还有一批 SPA 会异步把首屏渲染出来，等一下再读，拿到的
                 # 正文通常从"空壳"变成"有内容"。
                 time.sleep(SETTLE_SECONDS)
             state = _state(session)
     state["loaded"] = arrived
-    state["blocked"] = blocked
     return state
 
 
