@@ -10,7 +10,7 @@ import sqlite3
 import threading
 import time
 from contextlib import closing
-from typing import Any, Iterable, Iterator, MutableMapping
+from typing import Any, Iterable, Iterator
 from uuid import uuid4
 
 
@@ -96,12 +96,13 @@ def _origin(path: Path, line: int, root: str | os.PathLike | None) -> str:
     return f"{path.relative_to(_base(root))}:{line}"
 
 
-def _iter_sidecar(path: Path, root: str | os.PathLike | None) -> Iterator[tuple[int, int, dict[str, Any]]]:
+def _iter_sidecar(path: Path, root: str | os.PathLike | None, *, offset: int = 0,
+                  line: int = 0) -> Iterator[tuple[int, int, dict[str, Any]]]:
     """Isolate an uncommitted final fragment; reject a bad complete line."""
     if not path.exists():
         return
     with path.open("r+b") as file:
-        line = 0
+        file.seek(offset)
         while True:
             offset = file.tell()
             chunk = file.readline()
@@ -135,38 +136,18 @@ def _iter_sidecar(path: Path, root: str | os.PathLike | None) -> Iterator[tuple[
             yield line, offset, message
 
 
-def _read_sidecar(path: Path, root: str | os.PathLike | None) -> list[dict[str, Any]]:
-    return [message for _, _, message in _iter_sidecar(path, root)]
-
-
-def _ordinary_ids(path: Path, root: str | os.PathLike | None) -> dict[str, str]:
-    if not path.is_file():
-        return {}
-    from mods import chatlog
-
-    found: dict[str, str] = {}
-    with path.open(encoding="utf-8") as file:
-        for line_number, line in enumerate(file, 1):
-            if line.startswith("    "):
-                continue
-            head = chatlog._split_head(line.rstrip("\r\n"))
-            if head is None or not head["message_id"]:
-                continue
-            try:
-                message_id = _message_id(head["message_id"])
-            except ValueError:
-                continue
-            found.setdefault(message_id, _origin(path, line_number, root))
-    return found
-
-
 def _index(directory: Path) -> sqlite3.Connection:
     """Open a disposable index; the JSONL and DD.log files remain authoritative."""
     database = sqlite3.connect(directory / ".backfill-index.sqlite3")
     database.execute("CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, size INTEGER, mtime INTEGER, "
                      "inode INTEGER, offset INTEGER, lines INTEGER)")
-    database.execute("CREATE TABLE IF NOT EXISTS ids (path TEXT, message_id TEXT, line INTEGER, "
-                     "PRIMARY KEY (path, message_id))")
+    columns = {row[1] for row in database.execute("PRAGMA table_info(ids)")}
+    if not {"stamp", "seq"} <= columns:
+        if columns:
+            database.execute("DROP TABLE ids")
+        database.execute("DELETE FROM files")
+    database.execute("CREATE TABLE IF NOT EXISTS ids (path TEXT, message_id TEXT, stamp INTEGER, "
+                     "seq INTEGER, line INTEGER, PRIMARY KEY (path, message_id, stamp, seq))")
     database.execute("CREATE TABLE IF NOT EXISTS lines (path TEXT, line INTEGER, offset INTEGER, "
                      "PRIMARY KEY (path, line))")
     return database
@@ -196,12 +177,14 @@ def _refresh(database: sqlite3.Connection, path: Path, root: str | os.PathLike |
     offset = previous[3] if incremental else 0
     if sidecar:
         for lines, offset, message in _iter_sidecar(path, root):
-            database.execute("INSERT OR IGNORE INTO ids VALUES (?, ?, ?)",
-                             (key, _message_id(message["message_id"]), lines))
+            database.execute("INSERT OR IGNORE INTO ids VALUES (?, ?, ?, ?, ?)",
+                             (key, _message_id(message["message_id"]), _time(message["time"]),
+                              _sequence(message["message_seq"]), lines))
             database.execute("INSERT INTO lines VALUES (?, ?, ?)", (key, lines, offset))
         offset = path.stat().st_size
     else:
         from mods import chatlog
+        day = chatlog.day_of(path)
 
         with path.open("rb") as file:
             file.seek(offset)
@@ -223,36 +206,45 @@ def _refresh(database: sqlite3.Connection, path: Path, root: str | os.PathLike |
                     message_id = _message_id(head["message_id"])
                 except ValueError:
                     continue
-                database.execute("INSERT OR IGNORE INTO ids VALUES (?, ?, ?)", (key, message_id, lines))
+                database.execute("INSERT OR IGNORE INTO ids VALUES (?, ?, ?, ?, ?)",
+                                 (key, message_id, chatlog._epoch(day, head["stamp"]), 0, lines))
     stat = path.stat()
     database.execute("INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?, ?, ?)",
                      (key, stat.st_size, stat.st_mtime_ns, stat.st_ino, offset, lines))
     return lines
 
 
-def _indexed_ids(database: sqlite3.Connection, path: Path, ids: set[str],
-                 root: str | os.PathLike | None) -> dict[str, str]:
+def _indexed_keys(database: sqlite3.Connection, path: Path, keys: set[tuple[str, int, int]],
+                  root: str | os.PathLike | None) -> dict[tuple[str, int, int], str]:
     _refresh(database, path, root)
     key = str(path.relative_to(_base(root)))
-    found: dict[str, str] = {}
-    requested = tuple(ids)
+    found: dict[tuple[str, int, int], str] = {}
+    by_stamp: dict[tuple[str, int], list[tuple[str, int, int]]] = {}
+    for identity in keys:
+        by_stamp.setdefault(identity[:2], []).append(identity)
+    requested = tuple({message_id for message_id, _, _ in keys})
     for start in range(0, len(requested), 500):
         batch = requested[start:start + 500]
         placeholders = ",".join("?" for _ in batch)
-        for message_id, line in database.execute(
-                f"SELECT message_id, line FROM ids WHERE path=? AND message_id IN ({placeholders})",
+        for message_id, stamp, sequence, line in database.execute(
+                f"SELECT message_id, stamp, seq, line FROM ids "
+                f"WHERE path=? AND message_id IN ({placeholders}) ORDER BY line",
                 (key, *batch)):
-            found[message_id] = _origin(path, line, root)
+            for identity in by_stamp.get((message_id, stamp), ()):
+                if not path.name.endswith(_SUFFIX) or identity[2] == sequence:
+                    found.setdefault(identity, _origin(path, line, root))
     return found
 
 
 def _lookup_locked(database: sqlite3.Connection, kind: str, target: int | str,
-                   ids: set[str], since: int, until: int,
-                   root: str | os.PathLike | None) -> dict[str, str]:
+                   keys: set[tuple[str, int, int]],
+                   root: str | os.PathLike | None) -> dict[tuple[str, int, int], str]:
     from mods import chatlog
 
     directory = _window(kind, target, root)
-    seen: dict[str, str] = {}
+    seen: dict[tuple[str, int, int], str] = {}
+    since = min(stamp for _, stamp, _ in keys)
+    until = max(stamp for _, stamp, _ in keys)
     for pattern in ("*.log", "*" + _SUFFIX):
         for path in sorted(directory.rglob(pattern)):
             ordinary = path if pattern == "*.log" else path.with_name(path.name.removesuffix(_SUFFIX) + ".log")
@@ -261,65 +253,29 @@ def _lookup_locked(database: sqlite3.Connection, kind: str, target: int | str,
                 continue
             start, end = chatlog._day_bounds(day)
             if start <= until and end > since:
-                for message_id, origin in _indexed_ids(database, path, ids - seen.keys(), root).items():
-                    seen.setdefault(message_id, origin)
-            if len(seen) == len(ids):
+                for identity, origin in _indexed_keys(database, path, keys - seen.keys(), root).items():
+                    seen.setdefault(identity, origin)
+            if len(seen) == len(keys):
                 return seen
     return seen
 
 
-def lookup_origins(
-    kind: str, target: int | str, message_ids: Iterable[int | str], since: int, until: int,
-    *, root: str | os.PathLike | None = None,
-) -> dict[str, str]:
-    """Return stable origins only for requested QQ ids, without a window-sized map."""
-    if until < since:
-        raise ValueError("回填窗口终点早于起点")
+def lookup_origin(kind: str, target: int | str, message_id: int | str, stamp: int,
+                  sequence: int | None = None, *, root: str | os.PathLike | None = None) -> str | None:
+    """Match a live event to one archived original, never by QQ id alone."""
     directory = _window(kind, target, root)
-    ids = {_message_id(message_id) for message_id in message_ids}
-    if not ids or not directory.is_dir():
-        return {}
+    path = sidecar_path(kind, target, stamp, root=root)
+    if not path.is_file():
+        return None
     from mods import chatlog
 
     with chatlog._append_lock, _lock, closing(_index(directory)) as database, database:
-        return _lookup_locked(database, kind, target, ids, since, until, root)
-
-
-def index_window(
-    kind: str,
-    target: int | str,
-    since: int,
-    until: int,
-    *,
-    root: str | os.PathLike | None = None,
-) -> dict[str, str]:
-    """Index QQ ids once for a time window; reuse the returned map across pages."""
-    if until < since:
-        raise ValueError("回填窗口终点早于起点")
-    directory = _window(kind, target, root)
-    seen: dict[str, str] = {}
-    if not directory.is_dir():
-        return seen
-    from mods import chatlog
-
-    with chatlog._append_lock, _lock:
-        for path in sorted(directory.rglob("*.log")):
-            day = chatlog.day_of(path)
-            if day is None:
-                continue
-            start, end = chatlog._day_bounds(day)
-            if start <= until and end > since:
-                for message_id, origin in _ordinary_ids(path, root).items():
-                    seen.setdefault(message_id, origin)
-        for path in sorted(directory.rglob("*" + _SUFFIX)):
-            day = chatlog.day_of(path.with_name(path.name.removesuffix(_SUFFIX) + ".log"))
-            if day is None:
-                continue
-            start, end = chatlog._day_bounds(day)
-            if start <= until and end > since:
-                for line, message in enumerate(_read_sidecar(path, root), 1):
-                    seen.setdefault(_message_id(message["message_id"]), _origin(path, line, root))
-    return seen
+        _refresh(database, path, root)
+        rows = database.execute("SELECT seq, line FROM ids WHERE path=? AND message_id=? AND stamp=?",
+                                (str(path.relative_to(_base(root))), _message_id(message_id), _time(stamp))).fetchall()
+        if sequence is not None:
+            rows = [row for row in rows if row[0] == _sequence(sequence)]
+        return _origin(path, rows[0][1], root) if len(rows) == 1 else None
 
 
 def append_messages(
@@ -327,13 +283,12 @@ def append_messages(
     target: int | str,
     messages: Iterable[dict[str, Any]],
     *,
-    seen: MutableMapping[str, str] | None = None,
     root: str | os.PathLike | None = None,
 ) -> list[str]:
     """Durably append missing originals; return one existing/new origin per input.
 
     An ordinary DD.log is checked again under its writer lock immediately before
-    each day batch, so a live event after ``index_window`` still wins overlap.
+    each day batch, so a live event after an earlier page still wins overlap.
     """
     incoming = list(messages)
     keys = [_validate(message) for message in incoming]
@@ -342,51 +297,58 @@ def append_messages(
         _validate_window(message, kind, target)
     if not incoming:
         return []
-    if seen is None:
-        seen = {}
     from mods import chatlog
 
-    result: list[str] = []
-    loaded: dict[Path, tuple[dict[str, str], int]] = {}
     directory = _window(kind, target, root)
-    _ensure_directory(directory)
-    ids = {message_id for message_id, _, _ in keys}
-    stamps = [stamp for _, stamp, _ in keys]
-    with chatlog._append_lock, _lock, closing(_index(directory)) as database, database:
-        window_seen = _lookup_locked(database, kind, target, ids, min(stamps), max(stamps), root)
-        for message, (message_id, stamp, _sequence_number) in zip(incoming, keys):
-            path = sidecar_path(kind, target, stamp, root=root)
-            if path not in loaded:
-                ordinary = path.with_name(path.name.removesuffix(_SUFFIX) + ".log")
-                day_seen = _indexed_ids(database, ordinary, ids, root)
-                for existing_id, origin in _indexed_ids(database, path, ids - day_seen.keys(), root).items():
-                    day_seen.setdefault(existing_id, origin)
-                loaded[path] = day_seen, _refresh(database, path, root)
-            day_seen, line_count = loaded[path]
-            origin = day_seen.get(message_id) or seen.get(message_id) or window_seen.get(message_id)
-            if origin is None:
+    identities = set(keys)
+    with chatlog._window_lock(directory), chatlog._append_lock, _lock:
+        _ensure_directory(directory)
+        with closing(_index(directory)) as database, database:
+            result: list[str] = []
+            seen: dict[tuple[str, int, int], str] = {}
+            loaded: dict[Path, tuple[dict[tuple[str, int, int], str], int]] = {}
+            pending: dict[Path, list[tuple[tuple[str, int, int], int, bytes]]] = {}
+            window_seen = _lookup_locked(database, kind, target, identities, root)
+            for message, identity in zip(incoming, keys):
+                message_id, stamp, sequence = identity
+                path = sidecar_path(kind, target, stamp, root=root)
+                if path not in loaded:
+                    ordinary = path.with_name(path.name.removesuffix(_SUFFIX) + ".log")
+                    day_seen = _indexed_keys(database, ordinary, identities, root)
+                    for existing_identity, origin in _indexed_keys(database, path, identities - day_seen.keys(), root).items():
+                        day_seen.setdefault(existing_identity, origin)
+                    loaded[path] = day_seen, _refresh(database, path, root)
+                day_seen, line_count = loaded[path]
+                origin = day_seen.get(identity) or seen.get(identity) or window_seen.get(identity)
+                if origin is None:
+                    encoded = (json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+                    line_count += 1
+                    loaded[path] = day_seen, line_count
+                    origin = _origin(path, line_count, root)
+                    day_seen[identity] = origin
+                    pending.setdefault(path, []).append((identity, line_count, encoded))
+                seen[identity] = origin
+                result.append(origin)
+            for path, entries in pending.items():
                 _ensure_directory(path.parent)
                 new_file = not path.exists()
-                encoded = (json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+                offsets = []
                 with path.open("ab") as file:
-                    offset = file.tell()
-                    file.write(encoded)
+                    for identity, line_count, encoded in entries:
+                        offsets.append((identity, line_count, file.tell()))
+                        file.write(encoded)
                     file.flush()
                     os.fsync(file.fileno())
                 if new_file:
                     _sync_directory(path.parent)
-                line_count += 1
-                loaded[path] = day_seen, line_count
-                origin = _origin(path, line_count, root)
-                day_seen[message_id] = origin
                 key = str(path.relative_to(_base(root)))
-                database.execute("INSERT OR IGNORE INTO ids VALUES (?, ?, ?)", (key, message_id, line_count))
-                database.execute("INSERT INTO lines VALUES (?, ?, ?)", (key, line_count, offset))
+                database.executemany("INSERT OR IGNORE INTO ids VALUES (?, ?, ?, ?, ?)",
+                                     ((key, *identity, line_count) for identity, line_count, _ in offsets))
+                database.executemany("INSERT INTO lines VALUES (?, ?, ?)",
+                                     ((key, line_count, offset) for _, line_count, offset in offsets))
                 stat = path.stat()
                 database.execute("INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?, ?, ?)",
-                                 (key, stat.st_size, stat.st_mtime_ns, stat.st_ino, stat.st_size, line_count))
-            seen[message_id] = origin
-            result.append(origin)
+                                 (key, stat.st_size, stat.st_mtime_ns, stat.st_ino, stat.st_size, loaded[path][1]))
     return result
 
 

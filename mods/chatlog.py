@@ -22,13 +22,20 @@ LOAD_AFTER = ("storage", "history", "identity")
 rootfile = "chatlog"
 logger = logging.getLogger(__name__)
 _append_lock = threading.RLock()
-_reader_lock = threading.Lock()
+_window_locks_lock = threading.Lock()
+_window_locks: dict[Path, threading.RLock] = {}
 _boot_anchors: dict[tuple[str, int], str | None] | None = None
 _line_positions: dict[str, tuple[int, int]] = {}
 _live_origins: dict[int, tuple[dict, str]] = {}
 _recall_lock = threading.Lock()
 _recalls: dict[tuple[str, int], set[str]] = {}
 _live_recalls: dict[tuple[str, int], set[str]] = {}
+
+
+def _window_lock(directory: Path) -> threading.RLock:
+    key = directory.resolve()
+    with _window_locks_lock:
+        return _window_locks.setdefault(key, threading.RLock())
 
 
 def recall_key(message_id: Any) -> str:
@@ -138,7 +145,7 @@ def display(record: str) -> str:
 def _append(path: str, text: str) -> tuple[str, str]:
     """Append one record and return its stable file/head-line locator."""
     encoded = text.encode("utf-8")
-    with _append_lock:
+    with _window_lock(Path(path).parent.parent), _append_lock:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "a+b") as file:
             file.seek(0, os.SEEK_END)
@@ -173,20 +180,16 @@ def consume_origin(event: dict) -> str | None:
 
 def append_backfill_page(kind: str, target: int, messages: list[dict]) -> list[str]:
     """Commit a remote page without building a window-sized identity map."""
-    with _append_lock:
-        return _backfill_archive.append_messages(kind, target, messages, root=rootfile)
+    return _backfill_archive.append_messages(kind, target, messages, root=rootfile)
 
 
 def _existing_backfill_origin(kind: str, target: int, event: dict) -> str | None:
     message_id = event.get("message_id")
     if message_id is None:
         return None
-    path = _backfill_archive.sidecar_path(kind, target, int(event["time"]), root=rootfile)
-    if not path.is_file():
-        return None
-    return _backfill_archive.lookup_origins(
-        kind, target, [message_id], int(event["time"]), int(event["time"]), root=rootfile
-    ).get(recall_key(message_id))
+    return _backfill_archive.lookup_origin(
+        kind, target, message_id, int(event["time"]), event.get("message_seq"), root=rootfile
+    )
 
 
 def get_path(root: str, timestamp: int | float) -> str:
@@ -344,7 +347,7 @@ def _message(msg: dict[str, Any]) -> str:
         group_id = int(target)
         title, display = identity.get_group_user_info(group_id, sender_id)
         rendered = format_message(msg, display, title)
-        with _append_lock:
+        with _window_lock(window_path(kind, group_id)), _append_lock:
             try:
                 archived = _existing_backfill_origin(kind, group_id, msg)
             except (OSError, ValueError):
@@ -361,7 +364,7 @@ def _message(msg: dict[str, Any]) -> str:
     # Without it the Bot's own line and the peer's line differ only by a nickname
     # anyone can change, so a private window has no reliable author at all.
     rendered = format_message(msg, display)
-    with _append_lock:
+    with _window_lock(window_path(kind, window_user)), _append_lock:
         try:
             archived = _existing_backfill_origin(kind, window_user, msg)
         except (OSError, ValueError):
@@ -954,12 +957,22 @@ def _day_paths(kind: str, target: int | str | None, day: tuple[int, int, int],
 
 
 def _reader_index(directory: Path) -> sqlite3.Connection:
-    """Disposable byte-offset view; day files, never SQLite, own the history."""
+    """Disposable byte-offset view; day files, never SQLite, own the history.
+
+    WHY: The index avoids reparsing old days for each small archive page.  Its
+    offsets and merge order are derived from the log and sidecar, and can be
+    discarded and rebuilt without changing any recorded message.
+    """
     database = sqlite3.connect(directory / ".archive-reader.sqlite3")
     database.execute("PRAGMA temp_store=FILE")
     database.execute("PRAGMA cache_size=-2048")
     database.execute("CREATE TABLE IF NOT EXISTS reader_files (day TEXT, source INTEGER, size INTEGER, "
-                     "mtime INTEGER, inode INTEGER, PRIMARY KEY (day, source))")
+                     "mtime INTEGER, inode INTEGER, lines INTEGER, tail_line INTEGER, "
+                     "tail_offset INTEGER, PRIMARY KEY (day, source))")
+    columns = {row[1] for row in database.execute("PRAGMA table_info(reader_files)")}
+    for column in ("lines", "tail_line", "tail_offset"):
+        if column not in columns:
+            database.execute(f"ALTER TABLE reader_files ADD COLUMN {column} INTEGER")
     database.execute("CREATE TABLE IF NOT EXISTS reader_rows (day TEXT, source INTEGER, line INTEGER, "
                      "offset INTEGER, end INTEGER, stamp INTEGER, seq INTEGER, message_id TEXT, "
                      "position INTEGER, visible INTEGER, PRIMARY KEY (day, source, line))")
@@ -977,53 +990,87 @@ def _file_stamp(path: Path) -> tuple[int, int, int] | None:
 
 def _index_day(database: sqlite3.Connection, kind: str, target: int | str | None,
                day: tuple[int, int, int], root: str | os.PathLike | None) -> str:
-    """Rebuild a changed day as a disk-backed merge, never a day-sized Python list."""
+    """Refresh changed source tails, then merge indexed rows on disk."""
     ordinary, sidecar = _day_paths(kind, target, day, root)
     day_key = f"{day[0]:04d}-{day[1]:02d}-{day[2]:02d}"
-    paths = (ordinary, sidecar)
-    stamps = (_file_stamp(ordinary), _file_stamp(sidecar) if kind != "bot" else None)
-    indexed = {source: (size, mtime, inode) for source, size, mtime, inode in database.execute(
-        "SELECT source, size, mtime, inode FROM reader_files WHERE day=?", (day_key,))}
-    if indexed == {source: stamp for source, stamp in enumerate(stamps) if stamp is not None}:
+    paths = (sidecar, ordinary)
+    stamps = (_file_stamp(sidecar) if kind != "bot" else None, _file_stamp(ordinary))
+    indexed = {row[0]: row[1:] for row in database.execute(
+        "SELECT source, size, mtime, inode, lines, tail_line, tail_offset "
+        "FROM reader_files WHERE day=?", (day_key,))}
+    if {source: state[:3] for source, state in indexed.items()} == {
+            source: stamp for source, stamp in enumerate(stamps) if stamp is not None}:
         return day_key
     with database:
-        database.execute("DELETE FROM reader_rows WHERE day=?", (day_key,))
-        database.execute("DELETE FROM reader_files WHERE day=?", (day_key,))
-        if stamps[0] is not None:
-            with ordinary.open("rb") as file:
-                line_number = 0
-                head_line = None
-                head_offset = None
-                head_text = None
-                while True:
-                    offset = file.tell()
-                    chunk = file.readline()
-                    if not chunk:
-                        break
-                    line_number += 1
-                    if chunk.startswith(b"    ") or not chunk.strip():
-                        continue
+        for source, path in enumerate(paths):
+            stamp = stamps[source]
+            previous = indexed.get(source)
+            if stamp is None:
+                database.execute("DELETE FROM reader_rows WHERE day=? AND source=?", (day_key, source))
+                database.execute("DELETE FROM reader_files WHERE day=? AND source=?", (day_key, source))
+                continue
+            if previous is not None and previous[:3] == stamp:
+                continue
+            if previous is not None:
+                old_size, _, old_inode, old_lines, old_tail_line, old_tail_offset = previous
+            incremental = (previous is not None and old_lines is not None
+                           and old_inode == stamp[2] and stamp[0] > old_size)
+            if not incremental:
+                database.execute("DELETE FROM reader_rows WHERE day=? AND source=?", (day_key, source))
+            if source == 1:
+                if incremental and old_tail_line is not None:
+                    offset, line_number = old_tail_offset, old_tail_line - 1
+                    database.execute("DELETE FROM reader_rows WHERE day=? AND source=1 AND offset>=?",
+                                     (day_key, offset))
+                elif incremental:
+                    offset, line_number = old_size, old_lines
+                else:
+                    offset, line_number = 0, 0
+                tail_line = tail_offset = head_line = head_offset = head_text = None
+                with ordinary.open("rb") as file:
+                    file.seek(offset)
+                    while True:
+                        head_end = file.tell()
+                        chunk = file.readline()
+                        if not chunk:
+                            break
+                        line_number += 1
+                        if chunk.startswith(b"    ") or not chunk.strip():
+                            continue
+                        if head_line is not None:
+                            _index_ordinary(database, day_key, kind, target, day, head_line,
+                                            head_offset, head_end, head_text)
+                        head_line, head_offset = line_number, head_end
+                        head_text = chunk.decode("utf-8")
                     if head_line is not None:
                         _index_ordinary(database, day_key, kind, target, day, head_line,
-                                        head_offset, offset, head_text)
-                    head_line, head_offset = line_number, offset
-                    head_text = chunk.decode("utf-8")
-                if head_line is not None:
-                    _index_ordinary(database, day_key, kind, target, day, head_line,
-                                    head_offset, file.tell(), head_text)
-        if stamps[1] is not None:
-            for line, offset, message in _backfill_archive._iter_sidecar(sidecar, rootfile if root is None else root):
-                database.execute(
-                    "INSERT INTO reader_rows VALUES (?, 0, ?, ?, NULL, ?, ?, ?, NULL, 1)",
-                    (day_key, line, offset, int(message["time"]), int(message["message_seq"]),
-                     recall_key(message["message_id"])),
-                )
+                                        head_offset, file.tell(), head_text)
+                        tail_line, tail_offset = head_line, head_offset
+                if incremental and tail_line is None:
+                    tail_line, tail_offset = old_tail_line, old_tail_offset
+                lines = line_number
+            else:
+                lines = old_lines if incremental else 0
+                offset = old_size if incremental else 0
+                for line, position, message in _backfill_archive._iter_sidecar(
+                        sidecar, rootfile if root is None else root, offset=offset, line=lines):
+                    database.execute(
+                        "INSERT INTO reader_rows VALUES (?, 0, ?, ?, NULL, ?, ?, ?, NULL, 1)",
+                        (day_key, line, position, int(message["time"]), int(message["message_seq"]),
+                         recall_key(message["message_id"])),
+                    )
+                    lines = line
+                tail_line = tail_offset = None
+            current = _file_stamp(path)
+            database.execute("INSERT OR REPLACE INTO reader_files VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                             (day_key, source, *current, lines, tail_line, tail_offset))
+        database.execute("UPDATE reader_rows SET position=NULL, visible=1 WHERE day=?", (day_key,))
         ordinary_rows = iter(database.execute(
-            "SELECT source, line, stamp, message_id FROM reader_rows WHERE day=? AND source=1 ORDER BY line",
+            "SELECT source, line, stamp, seq, message_id FROM reader_rows WHERE day=? AND source=1 ORDER BY line",
             (day_key,)))
         sidecar_rows = iter(database.execute(
-            "SELECT source, line, stamp, message_id FROM reader_rows WHERE day=? AND source=0 "
-            "ORDER BY stamp, seq, CAST(line AS TEXT)", (day_key,)))
+            "SELECT source, line, stamp, seq, message_id FROM reader_rows WHERE day=? AND source=0 "
+            "ORDER BY stamp, seq, line", (day_key,)))
         additional = next(sidecar_rows, None)
         position = 0
         for row in ordinary_rows:
@@ -1034,10 +1081,6 @@ def _index_day(database: sqlite3.Connection, kind: str, target: int | str | None
         while additional is not None:
             position = _place_row(database, day_key, additional, position)
             additional = next(sidecar_rows, None)
-        for source, path in enumerate(paths):
-            stamp = _file_stamp(path) if source == 0 or kind != "bot" else None
-            if stamp is not None:
-                database.execute("INSERT INTO reader_files VALUES (?, ?, ?, ?, ?)", (day_key, source, *stamp))
     return day_key
 
 
@@ -1057,10 +1100,11 @@ def _index_ordinary(database: sqlite3.Connection, day_key: str, kind: str,
 
 
 def _place_row(database: sqlite3.Connection, day_key: str, row: tuple, position: int) -> int:
-    source, line, _stamp, message_id = row
+    source, line, stamp, sequence, message_id = row
     if message_id is not None:
-        database.execute("UPDATE reader_rows SET visible=0 WHERE day=? AND message_id=? AND visible=1",
-                         (day_key, message_id))
+        database.execute("UPDATE reader_rows SET visible=0 WHERE day=? AND message_id=? AND stamp=? "
+                         "AND visible=1 AND (source=1 OR ?=1 OR seq=?)",
+                         (day_key, message_id, stamp, source, sequence))
     database.execute("UPDATE reader_rows SET position=?, visible=1 WHERE day=? AND source=? AND line=?",
                      (position, day_key, source, line))
     return position + 1
@@ -1142,7 +1186,7 @@ def read_origin(
     if not directory.is_dir():
         raise ValueError("chatlog 游标不是记录定位")
     bot_names, names_complete = _bot_identities()
-    with _append_lock, _backfill_archive._lock, _reader_lock, closing(_reader_index(directory)) as database:
+    with _window_lock(directory), closing(_reader_index(directory)) as database:
         day, _, row = _locate_origin(kind, target, origin, root, database)
         return _read_indexed_record(kind, target, day, row, _bot_id() if bot_id is None else bot_id,
                                     _switch_moment(), bot_names, names_complete, root)
@@ -1196,7 +1240,7 @@ def read_range(
     if limit is not None and limit <= 0 and before is None:
         return []
     records: list[dict[str, Any]] = []
-    with _append_lock, _backfill_archive._lock, _reader_lock, closing(_reader_index(directory)) as database:
+    with _window_lock(directory), closing(_reader_index(directory)) as database:
         cursor_day = cursor_position = None
         if before is not None:
             cursor_day, cursor_position, _ = _locate_origin(kind, target, before, root, database)
@@ -1336,7 +1380,7 @@ def _restore_window(kind: str, target: int, count: int, floor: int) -> list[dict
     directory = window_path(kind, target)
     if not directory.is_dir():
         return got
-    with _append_lock, _backfill_archive._lock, _reader_lock, closing(_reader_index(directory)) as database:
+    with _window_lock(directory), closing(_reader_index(directory)) as database:
         database.execute("CREATE TEMP TABLE reader_recalls (message_id TEXT PRIMARY KEY)")
         for day in _archive_days(directory):
             start, end = _day_bounds(day)
