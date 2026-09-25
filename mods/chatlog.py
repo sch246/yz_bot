@@ -970,9 +970,17 @@ def _reader_index(directory: Path) -> sqlite3.Connection:
                      "mtime INTEGER, inode INTEGER, lines INTEGER, tail_line INTEGER, "
                      "tail_offset INTEGER, PRIMARY KEY (day, source))")
     columns = {row[1] for row in database.execute("PRAGMA table_info(reader_files)")}
+    migrated = False
     for column in ("lines", "tail_line", "tail_offset"):
         if column not in columns:
             database.execute(f"ALTER TABLE reader_files ADD COLUMN {column} INTEGER")
+            migrated = True
+    if migrated:
+        # WHY: Old rows know file stamps but not an incremental tail. Keeping
+        # them would also preserve the old lexicographic sidecar tie order until
+        # that day changes. Dropping only the derived file stamps makes the next
+        # bounded read rebuild from the authoritative day files.
+        database.execute("DELETE FROM reader_files")
     database.execute("CREATE TABLE IF NOT EXISTS reader_rows (day TEXT, source INTEGER, line INTEGER, "
                      "offset INTEGER, end INTEGER, stamp INTEGER, seq INTEGER, message_id TEXT, "
                      "position INTEGER, visible INTEGER, PRIMARY KEY (day, source, line))")
@@ -1052,14 +1060,18 @@ def _index_day(database: sqlite3.Connection, kind: str, target: int | str | None
             else:
                 lines = old_lines if incremental else 0
                 offset = old_size if incremental else 0
-                for line, position, message in _backfill_archive._iter_sidecar(
-                        sidecar, rootfile if root is None else root, offset=offset, line=lines):
-                    database.execute(
-                        "INSERT INTO reader_rows VALUES (?, 0, ?, ?, NULL, ?, ?, ?, NULL, 1)",
-                        (day_key, line, position, int(message["time"]), int(message["message_seq"]),
-                         recall_key(message["message_id"])),
-                    )
-                    lines = line
+                # Lock order stays window -> archive. The iterator may isolate
+                # and truncate a crash tail, so two readers must not repair the
+                # same sidecar concurrently.
+                with _backfill_archive._lock:
+                    for line, position, message in _backfill_archive._iter_sidecar(
+                            sidecar, rootfile if root is None else root, offset=offset, line=lines):
+                        database.execute(
+                            "INSERT INTO reader_rows VALUES (?, 0, ?, ?, NULL, ?, ?, ?, NULL, 1)",
+                            (day_key, line, position, int(message["time"]), int(message["message_seq"]),
+                             recall_key(message["message_id"])),
+                        )
+                        lines = line
                 tail_line = tail_offset = None
             current = _file_stamp(path)
             database.execute("INSERT OR REPLACE INTO reader_files VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1102,9 +1114,14 @@ def _index_ordinary(database: sqlite3.Connection, day_key: str, kind: str,
 def _place_row(database: sqlite3.Connection, day_key: str, row: tuple, position: int) -> int:
     source, line, stamp, sequence, message_id = row
     if message_id is not None:
-        database.execute("UPDATE reader_rows SET visible=0 WHERE day=? AND message_id=? AND stamp=? "
-                         "AND visible=1 AND (source=1 OR ?=1 OR seq=?)",
-                         (day_key, message_id, stamp, source, sequence))
+        if source == 0:
+            database.execute("UPDATE reader_rows SET visible=0 WHERE day=? AND source=0 "
+                             "AND message_id=? AND stamp=? AND seq=? AND visible=1",
+                             (day_key, message_id, stamp, sequence))
+        else:
+            database.execute("UPDATE reader_rows SET visible=0 WHERE day=? AND source=1 "
+                             "AND message_id=? AND stamp=? AND visible=1",
+                             (day_key, message_id, stamp))
     database.execute("UPDATE reader_rows SET position=?, visible=1 WHERE day=? AND source=? AND line=?",
                      (position, day_key, source, line))
     return position + 1
@@ -1316,7 +1333,18 @@ def freeze_boot_anchors() -> dict[tuple[str, int], str | None]:
     global _boot_anchors
     with _append_lock:
         if _boot_anchors is None:
-            _boot_anchors = {window: last_message_anchor(*window) for window in known_windows()}
+            anchors = {}
+            for window in known_windows():
+                try:
+                    anchors[window] = last_message_anchor(*window)
+                except (OSError, UnicodeError, ValueError):
+                    # WHY: One damaged window must not erase every other
+                    # recovery boundary. None means there is no trustworthy
+                    # anchor, so boot takes only its recent remote page and
+                    # leaves the rest as an explicit gap instead of guessing.
+                    logger.exception("无法冻结 %s 的离线补回锚点，按无可靠锚点处理", window)
+                    anchors[window] = None
+            _boot_anchors = anchors
         return dict(_boot_anchors)
 
 

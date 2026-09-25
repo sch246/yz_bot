@@ -38,7 +38,6 @@ def crawl_history(
     start_seq: int | str | None = None,
     count: int = 100,
     max_requests: int | None = None,
-    earliest_time: int | None = None,
 ) -> dict[str, Any]:
     """Persist each older page before requesting the next one.
 
@@ -52,11 +51,10 @@ def crawl_history(
     anchor and all older rows on its page are excluded from persistence. The
     result distinguishes reaching it from an empty remote page before it was
     found; ``oldest_seq`` is the reached anchor or last committed cursor.
-    A short nonempty page is never treated as the end. A request budget or
-    local-anchor time bound reports a resumable gap after committed progress.
-    On an API,
-    format, or cursor failure, ``HistoryGap`` reports progress without
-    advancing past the uncommitted page. A persistence exception propagates.
+    A short nonempty page is never treated as the end. An explicit request
+    budget reports a resumable gap after committed progress. On an API, format,
+    or cursor failure, ``HistoryGap`` reports progress without advancing past
+    the uncommitted page. A persistence exception propagates.
     """
     if kind not in ("group", "private"):
         raise ValueError("kind must be 'group' or 'private'")
@@ -77,7 +75,7 @@ def crawl_history(
 
     while True:
         if max_requests is not None and requests >= max_requests:
-            raise gap("request budget reached before local anchor")
+            raise gap("request budget reached before source end")
         params: dict[str, Any] = {target_field: target, "count": count + (cursor is not None),
                                   "disable_get_url": True, "parse_mult_msg": False}
         if cursor is not None:
@@ -132,21 +130,10 @@ def crawl_history(
         if matches:
             anchor_seq = numbered[matches[0]][0]
             numbered = numbered[matches[0] + 1:]
-        passed_time = False
-        if earliest_time is not None and not matches:
-            if any(type(item[2].get("time")) is not int for item in numbered):
-                raise gap("remote message has no reliable time")
-            passed_time = any(item[2]["time"] < earliest_time for item in numbered)
-            if passed_time:
-                numbered = [item for item in numbered if item[2]["time"] >= earliest_time]
         page = [item[2] for item in numbered]
         if page:
             save_page(page)
             saved += len(page)
-        if passed_time:
-            if numbered:
-                cursor = numbered[0][0]
-            raise gap("remote history passed local anchor time")
         if matches:
             return {"stop_reason": "anchor", "anchor_found": True,
                     "requests": requests, "saved": saved,

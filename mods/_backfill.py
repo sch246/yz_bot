@@ -82,7 +82,8 @@ def recover_source(source: dict, call_api, *, manual: bool = False) -> dict:
                 raise RuntimeError("回填档案未逐条返回稳定位置")
             members = []
             for row, origin in zip(rows, origins):
-                pending = oplog.pending_message((kind, target), row["message_id"], row["time"])
+                pending = oplog.pending_message((kind, target), row["message_id"], row["time"],
+                                                row["message_seq"])
                 boundary = state["pending_boundary"]
                 if pending is not None and boundary is not None and oplog.arrival_before_or_at(pending, boundary):
                     continue
@@ -104,21 +105,16 @@ def recover_source(source: dict, call_api, *, manual: bool = False) -> dict:
             save_page(pending)
 
         # WHY: Boot with no trustworthy anchor reads just the recent page;
-        # finding older history is an explicit fetch. A missing anchor has a
-        # bounded retryable gap rather than an unbounded startup crawl.
-        if state["fetch_anchor"] is not None:
-            request_budget = 20
-        elif state["source_type"] == "napcat_boot" and not manual:
-            request_budget = 1
-        else:
-            request_budget = None
+        # finding older history is an explicit fetch. A reliable frozen anchor
+        # must instead be followed until it is found, the upstream ends, or the
+        # paging chain actually fails; an arbitrary page cap would manufacture
+        # a gap in a long but otherwise continuous offline interval.
+        request_budget = (1 if state["fetch_anchor"] is None
+                          and state["source_type"] == "napcat_boot" and not manual else None)
         result = _napcat_history.crawl_history(
             kind, int(target), call_api=call_api, save_page=save_page,
             anchor_message_id=state["fetch_anchor"], anchor_time=state.get("anchor_time"),
-            start_seq=state["cursor"], count=PAGE_SIZE,
-            max_requests=request_budget,
-            earliest_time=(state["anchor_time"] - 86400 if not manual and state.get("anchor_time") is not None
-                           and state["fetch_anchor"] is not None else None))
+            start_seq=state["cursor"], count=PAGE_SIZE, max_requests=request_budget)
         gap = ("远端历史到尽头但没有遇到本地锚点" if state["fetch_anchor"] is not None
                and not result["anchor_found"] else None)
         return oplog.finish_source(key, gap=gap, stop_cursor=result["oldest_seq"])

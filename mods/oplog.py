@@ -41,7 +41,7 @@ _coverage_nodes: dict[str, list[str]] = {}
 _mentioned_by: dict[str, list[str]] = {}
 _origins: dict[tuple[tuple, str], dict] = {}
 _sources: dict[str, dict] = {}
-_seen_messages: set[tuple[tuple, str, int]] = set()
+_seen_messages: set[tuple[tuple, str, int, str | None]] = set()
 _failed = False
 
 
@@ -60,14 +60,19 @@ def source_page_root() -> Path:
     return _directory() / "pages"
 
 
-def _message_identity(window: tuple, event: dict) -> tuple[tuple, str, int] | None:
+def _message_identity(window: tuple, event: dict) -> tuple[tuple, str, int, str | None] | None:
     if event.get("message_id") is None or type(event.get("time")) is not int:
         return None
     value = str(event["message_id"])
-    return window, str(int(value)) if value.lstrip("-").isdecimal() else value, event["time"]
+    sequence = event.get("message_seq")
+    if sequence is not None:
+        sequence = str(sequence)
+        sequence = str(int(sequence)) if sequence.lstrip("-").isdecimal() else sequence
+    return (window, str(int(value)) if value.lstrip("-").isdecimal() else value,
+            event["time"], sequence)
 
 
-def _input_message_identity(entry: dict, sources: dict[str, dict]) -> tuple[tuple, str, int] | None:
+def _input_message_identity(entry: dict, sources: dict[str, dict]) -> tuple[tuple, str, int, str | None] | None:
     if entry["kind"] != "input":
         return None
     window = (sources[entry["source"]]["window"] if entry.get("source")
@@ -452,11 +457,13 @@ def unread(window: tuple) -> list[dict]:
         return _ordered_pending(window)
 
 
-def pending_message(window: tuple, message_id: int | str, event_time: int) -> str | None:
+def pending_message(window: tuple, message_id: int | str, event_time: int,
+                    event_seq: int | str | None = None) -> str | None:
     """Find an unread QQ message identity from its original chat window."""
     with _lock:
         _restore()
-        identity = _message_identity(window, {"message_id": message_id, "time": event_time})
+        identity = _message_identity(window, {"message_id": message_id, "time": event_time,
+                                              "message_seq": event_seq})
         if identity is None:
             return None
         return next((entry["arrival"] for entry in _pending.values()
@@ -466,13 +473,15 @@ def pending_message(window: tuple, message_id: int | str, event_time: int) -> st
                      and _message_identity(window, entry["event"]) == identity), None)
 
 
-def message_seen(window: tuple, message_id: int | str, event_time: int) -> bool:
+def message_seen(window: tuple, message_id: int | str, event_time: int,
+                 event_seq: int | str | None = None) -> bool:
     """Check pending and already-read inputs for the same original QQ message."""
     with _lock:
         _restore()
-        if pending_message(window, message_id, event_time) is not None:
+        if pending_message(window, message_id, event_time, event_seq) is not None:
             return True
-        return _message_identity(window, {"message_id": message_id, "time": event_time}) in _seen_messages
+        return _message_identity(window, {"message_id": message_id, "time": event_time,
+                                          "message_seq": event_seq}) in _seen_messages
 
 
 def arrival_origin(arrival: str) -> str | None:

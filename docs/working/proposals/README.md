@@ -2,14 +2,14 @@
 
 本目录同时保存仍未实现的提案和已经完成的架构迁移记录。当前事实只能由 `docs/architecture.md`、`docs/interaction-model.md` 与 `docs/runtime.md` 断言；完成项用于解释取舍和旧能力去向。
 
-**先找方向：**[中心化聊天软件阅读计划](chat-client-reading.md)与[NapCat 离线恢复](offline-message-backfill.md)已在当前工作树接线，真实停机空窗尚未验收；[压缩与消息模型交接](condense-and-unify-handoff.md)保存此前主线与已落地部分；[统一信息流实施记录](unified-event-stream.md)区分现行接线和未完成的压缩树；[方向索引](long-term-roadmap.md)单列其它长期计划。运行进程须重启才使用新代码，现行合同以正式文档和代码为准。
+**先找方向：**[中心化聊天软件阅读计划](chat-client-reading.md)与[NapCat 离线恢复](offline-message-backfill.md)已在主线代码接线，真实停机空窗尚未验收；[压缩与消息模型交接](condense-and-unify-handoff.md)保存此前主线与已落地部分；[统一信息流实施记录](unified-event-stream.md)区分现行接线和未完成的压缩树；[方向索引](long-term-roadmap.md)单列其它长期计划。部署进程须完整重启才使用对应版本，现行合同以正式文档和代码为准。
 
 - [新代码架构与一次性切换](code-organization.md)（已完成；调查摘要见[旧代码组织现状](../code-organization-analysis.md)）
 - [Mods 两阶段加载](mods-loading.md)（已实现）
 - [Mods 模块手册](module-manual.md)与[源码覆盖索引](source-coverage.md)（迁移记录）
 - [Storage 加载校验与历史恢复](storage-and-history.md)（热同步已实施，剩余部分仍是提案）
 - [统一消息模型：窗口、正文与双向转换](message-model.md)（已实施；行格式协议已移入[chatlog 记录格式](../../chatlog-format.md)，运行事实见[运行架构](../../architecture.md)，本篇保留取舍与被排除的做法）
-- [重启后的离线消息恢复](offline-message-backfill.md)（当前工作树已接入启动补回、按日 sidecar、持久页与有名信源；真实停机空窗尚未验收，不重放入站行为）
+- [重启后的离线消息恢复](offline-message-backfill.md)（主线代码已接入启动补回、按日 sidecar、持久页与有名信源；真实停机空窗尚未验收，不重放入站行为）
 - [数组消息格式迁移](array-message-format.md)（长期方向，尚未切换 NapCat 或迁移 CQ 字符串消费者）
 - [LLF 纯文本工具调用迁移](llf-tool-protocol.md)（长期方向，尚未替换原生工具调用与结果协议）
 - [可自维护的同相上下文](self-maintaining-context.md)（未实现；记录长期记忆、外显状态转移与自修改的北极星语义及证伪条件；[讨论来源与演化索引](self-maintaining-context-discussion.md)保留原话与修正链）

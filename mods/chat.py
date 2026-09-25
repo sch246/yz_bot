@@ -1018,7 +1018,8 @@ def _read_source_page(window: tuple, source: dict, session: llm.Chat | None) -> 
             lambda arrival: oplog.input_source(AGENT_WINDOW, event, converted, source["key"],
                                                page_number, offset, next_page, next_offset,
                                                origin, window, arrival=arrival,
-                                               mentioned=member.get("mentioned", False)))
+                                               mentioned=member.get("mentioned", False)),
+            event_seq=member.get("message_seq"))
         if converted is not None:
             projected = _echo_relation(_numbered(converted, recorded["id"]), recorded,
                                        oplog.say_links(AGENT_WINDOW))

@@ -167,47 +167,21 @@ def _refresh(database: sqlite3.Connection, path: Path, root: str | os.PathLike |
     if not force and previous and previous[:3] == (stat.st_size, stat.st_mtime_ns, stat.st_ino):
         return previous[4]
 
-    sidecar = path.name.endswith(_SUFFIX)
-    incremental = (not force and not sidecar and previous is not None and previous[2] == stat.st_ino
+    if not path.name.endswith(_SUFFIX):
+        raise ValueError("回填身份索引只接受 sidecar 档案")
+    incremental = (not force and previous is not None and previous[2] == stat.st_ino
                    and stat.st_size > previous[0])
     if not incremental:
         database.execute("DELETE FROM ids WHERE path=?", (key,))
         database.execute("DELETE FROM lines WHERE path=?", (key,))
     lines = previous[4] if incremental else 0
     offset = previous[3] if incremental else 0
-    if sidecar:
-        for lines, offset, message in _iter_sidecar(path, root):
-            database.execute("INSERT OR IGNORE INTO ids VALUES (?, ?, ?, ?, ?)",
-                             (key, _message_id(message["message_id"]), _time(message["time"]),
-                              _sequence(message["message_seq"]), lines))
-            database.execute("INSERT INTO lines VALUES (?, ?, ?)", (key, lines, offset))
-        offset = path.stat().st_size
-    else:
-        from mods import chatlog
-        day = chatlog.day_of(path)
-
-        with path.open("rb") as file:
-            file.seek(offset)
-            while True:
-                start = file.tell()
-                chunk = file.readline()
-                if not chunk or not chunk.endswith(b"\n"):
-                    offset = start
-                    break
-                lines += 1
-                offset = file.tell()
-                line = chunk.decode("utf-8")
-                if line.startswith("    "):
-                    continue
-                head = chatlog._split_head(line.rstrip("\r\n"))
-                if head is None or not head["message_id"]:
-                    continue
-                try:
-                    message_id = _message_id(head["message_id"])
-                except ValueError:
-                    continue
-                database.execute("INSERT OR IGNORE INTO ids VALUES (?, ?, ?, ?, ?)",
-                                 (key, message_id, chatlog._epoch(day, head["stamp"]), 0, lines))
+    for lines, offset, message in _iter_sidecar(path, root, offset=offset, line=lines):
+        database.execute("INSERT OR IGNORE INTO ids VALUES (?, ?, ?, ?, ?)",
+                         (key, _message_id(message["message_id"]), _time(message["time"]),
+                          _sequence(message["message_seq"]), lines))
+        database.execute("INSERT INTO lines VALUES (?, ?, ?)", (key, lines, offset))
+    offset = path.stat().st_size
     stat = path.stat()
     database.execute("INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?, ?, ?)",
                      (key, stat.st_size, stat.st_mtime_ns, stat.st_ino, offset, lines))
@@ -230,9 +204,10 @@ def _indexed_keys(database: sqlite3.Connection, path: Path, keys: set[tuple[str,
                 f"SELECT message_id, stamp, seq, line FROM ids "
                 f"WHERE path=? AND message_id IN ({placeholders}) ORDER BY line",
                 (key, *batch)):
-            for identity in by_stamp.get((message_id, stamp), ()):
-                if not path.name.endswith(_SUFFIX) or identity[2] == sequence:
-                    found.setdefault(identity, _origin(path, line, root))
+            candidates = [identity for identity in by_stamp.get((message_id, stamp), ())
+                          if identity[2] == sequence]
+            for identity in candidates:
+                found.setdefault(identity, _origin(path, line, root))
     return found
 
 
@@ -245,18 +220,17 @@ def _lookup_locked(database: sqlite3.Connection, kind: str, target: int | str,
     seen: dict[tuple[str, int, int], str] = {}
     since = min(stamp for _, stamp, _ in keys)
     until = max(stamp for _, stamp, _ in keys)
-    for pattern in ("*.log", "*" + _SUFFIX):
-        for path in sorted(directory.rglob(pattern)):
-            ordinary = path if pattern == "*.log" else path.with_name(path.name.removesuffix(_SUFFIX) + ".log")
-            day = chatlog.day_of(ordinary)
-            if day is None:
-                continue
-            start, end = chatlog._day_bounds(day)
-            if start <= until and end > since:
-                for identity, origin in _indexed_keys(database, path, keys - seen.keys(), root).items():
-                    seen.setdefault(identity, origin)
-            if len(seen) == len(keys):
-                return seen
+    for path in sorted(directory.rglob("*" + _SUFFIX)):
+        ordinary = path.with_name(path.name.removesuffix(_SUFFIX) + ".log")
+        day = chatlog.day_of(ordinary)
+        if day is None:
+            continue
+        start, end = chatlog._day_bounds(day)
+        if start <= until and end > since:
+            for identity, origin in _indexed_keys(database, path, keys - seen.keys(), root).items():
+                seen.setdefault(identity, origin)
+        if len(seen) == len(keys):
+            return seen
     return seen
 
 
@@ -287,8 +261,9 @@ def append_messages(
 ) -> list[str]:
     """Durably append missing originals; return one existing/new origin per input.
 
-    An ordinary DD.log is checked again under its writer lock immediately before
-    each day batch, so a live event after an earlier page still wins overlap.
+    Only sidecar rows with the complete ``message_id + time + message_seq``
+    identity are reused. Ordinary DD.log lacks ``message_seq`` and therefore
+    never suppresses a possibly distinct remote original.
     """
     incoming = list(messages)
     keys = [_validate(message) for message in incoming]
@@ -313,10 +288,7 @@ def append_messages(
                 message_id, stamp, sequence = identity
                 path = sidecar_path(kind, target, stamp, root=root)
                 if path not in loaded:
-                    ordinary = path.with_name(path.name.removesuffix(_SUFFIX) + ".log")
-                    day_seen = _indexed_keys(database, ordinary, identities, root)
-                    for existing_identity, origin in _indexed_keys(database, path, identities - day_seen.keys(), root).items():
-                        day_seen.setdefault(existing_identity, origin)
+                    day_seen = _indexed_keys(database, path, identities, root)
                     loaded[path] = day_seen, _refresh(database, path, root)
                 day_seen, line_count = loaded[path]
                 origin = day_seen.get(identity) or seen.get(identity) or window_seen.get(identity)
@@ -331,16 +303,12 @@ def append_messages(
                 result.append(origin)
             for path, entries in pending.items():
                 _ensure_directory(path.parent)
-                new_file = not path.exists()
                 offsets = []
                 with path.open("ab") as file:
                     for identity, line_count, encoded in entries:
                         offsets.append((identity, line_count, file.tell()))
                         file.write(encoded)
                     file.flush()
-                    os.fsync(file.fileno())
-                if new_file:
-                    _sync_directory(path.parent)
                 key = str(path.relative_to(_base(root)))
                 database.executemany("INSERT OR IGNORE INTO ids VALUES (?, ?, ?, ?, ?)",
                                      ((key, *identity, line_count) for identity, line_count, _ in offsets))
@@ -349,6 +317,17 @@ def append_messages(
                 stat = path.stat()
                 database.execute("INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?, ?, ?)",
                                  (key, stat.st_size, stat.st_mtime_ns, stat.st_ino, stat.st_size, loaded[path][1]))
+            # WHY: A prior attempt may have written complete bytes and then
+            # failed fsync. On retry every identity already matches, so `pending`
+            # is empty; sync every involved sidecar before the derived index may
+            # commit and report durable success. Directory fsync is repeated too
+            # because a failed first attempt cannot prove the filename durable.
+            for path in loaded:
+                if not path.is_file():
+                    continue
+                with path.open("rb") as file:
+                    os.fsync(file.fileno())
+                _sync_directory(path.parent)
     return result
 
 
