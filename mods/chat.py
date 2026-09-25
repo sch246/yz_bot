@@ -1466,7 +1466,11 @@ def _agent_provider(turn, session: llm.Chat):
                 projection = _notification_projection(notice)
                 produced.append(projection)
                 _remember_stream(session, projection, notice["id"])
-            if not unread_results and notice is None and turn.requested_pulls:
+            # WHY: pull_mail 的短结果本身也会先进 result mail；若要求 result 与通知都为空
+            # 才兑现请求，模型每次重试都会再制造一个结果，承诺的“下一次请求前读取”便会
+            # 永久饥饿。三类输入各自已有页上限，所以同一 boundary 先交付结果/通知、再兑现
+            # 至多一页 pull，仍然有界。
+            if turn.requested_pulls:
                 window, through = turn.requested_pulls.pop(0)
                 if window[0] == "source":
                     source = oplog.resolve_source(window[1])
