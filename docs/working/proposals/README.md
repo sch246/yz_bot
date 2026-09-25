@@ -13,6 +13,7 @@
 - [数组消息格式迁移](array-message-format.md)（长期方向，尚未切换 NapCat 或迁移 CQ 字符串消费者）
 - [LLF 纯文本工具调用迁移](llf-tool-protocol.md)（长期方向，尚未替换原生工具调用与结果协议）
 - [可自维护的同相上下文](self-maintaining-context.md)（未实现；记录长期记忆、外显状态转移与自修改的北极星语义及证伪条件；[讨论来源与演化索引](self-maintaining-context-discussion.md)保留原话与修正链）
+- [长期记忆离线回放实验](memory-replay-evaluation.md)（实施中；以真实连续群聊、当前生产提示和 `deepseek/deepseek-flash` 比较自主整理策略，所有发送与运行数据隔离）
 - [检索索引：把子代理找过的路存下来](retrieval-index.md)（未实现；缓存子代理的检索路径而不是结论，失效判据由模型自写的校验命令给出）
 - [统一信息流：读时编号与完整输出事件](unified-event-stream.md)（已提交读时编号、受限首层覆盖和反查，最新代码尚未部署；长期退休暂缓，不要求 LLF）
 - [压缩、遗忘与消息模型：交接与待办](condense-and-unify-handoff.md)（索引，不是提案；跨 chat-condense / message-model / self-message-echo 三份，回答「走到哪、下一步、谁在等谁」，未决项各自标明卡住谁）
