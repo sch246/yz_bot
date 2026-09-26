@@ -1,6 +1,6 @@
 '''指导模型增删查改统一工具与 Skill 模块，并说明 last-good、显式应用和当前会话激活原理。
 
-同一模型输出的多个工具调用按顺序执行，却看不到彼此结果；整批完成后立即成为一个正式 result R，正常下一子请求完整读取，不按工具拆分或自动分页。若 `say(final_call=true)` 结束、请求取消或失败，不会只为结果强迫续轮；下次激活按普通历史预算看到 R，需要全文可用 `recall_events`。`mentions`／`read_messages`／`recall_events` 返回中展示的旧内容不是新的 input，不消费未读，也不能确认 `say` 回声；要首次正式读取来源消息请用 `pull`。
+同一模型输出的多个工具调用按顺序执行，却看不到彼此结果；整批完成后立即成为一个正式 result R，正常下一子请求完整读取，不按工具拆分或自动分页。若 `say(final_call=true)` 结束、请求取消或失败，不会只为结果强迫续轮；下次激活按普通历史预算看到 R，需要全文可用 `recall_events`。`take` 是未读消息正式阅读的主名，`pull` 仅为前缀别名；`mentions` 是提及筛选别名。`read_messages` 选中的档案消息也在下一请求作为正式 input 阅读；`recall_events` 仍同步返回旧经历，不消费未读。
 
 ## 直接执行 Python
 
@@ -103,7 +103,7 @@ Skill 也是可编辑的长期笔记：把可重复使用的经验、做法、�
 
 下划线 helper 不是独立模块，它的变化不会单独出现在 `list_tools` 中。修改 helper 后要显式 reload 所有 import 它的模块。
 
-`reload_tools` 换得动的只有 `mods/tools/` 下的那一个文件（外加它的下划线 helper）。它 `import` 的 `mods.*`——包括这套机制自己的 `mods/tools/__init__.py`——是进程启动时的那份，改了要重启才生效，典型症状是“说明书和工具清单里有、调用时 AttributeError”。这条边界的完整说明在仓库的 `docs/runtime.md`（“热更换得动什么”一节），需要重启时用 op 工具集的 `send_command` 注入 `.reboot`；重启后先检查未读通知与 FIFO 状态，不要假设旧调用会重放。
+`reload_tools` 换得动的只有 `mods/tools/` 下的那一个文件（外加它的下划线 helper）。它 `import` 的 `mods.*`——包括这套机制自己的 `mods/tools/__init__.py`——是进程启动时的那份，改了要重启才生效，典型症状是“说明书和工具清单里有、调用时 AttributeError”。这条边界的完整说明在仓库的 `docs/runtime.md`（“热更换得动什么”一节），需要重启时用 op 工具集的 `send_command` 注入 `.reboot`；重启后先检查未读通知与信源状态，不要假设旧调用会重放。
 
 ## 删除
 
@@ -119,13 +119,13 @@ Skill 也是可编辑的长期笔记：把可重复使用的经验、做法、�
 
 已读消息和输出也能总结：中心会话调用 `cover_events(["20260923-4", "20260923-5"], "结论")`，参数用的是上文方括号里的正式事件号，不是 QQ `message_id` 或行动位置。也可用 `cover_events(ids=[], conclusion="结论", anchor="20260923-4", before=2, after=3, kinds="input,result")`，或用 `start`／`end` 指定含端点的区间。覆盖范围没有条数上限；先从唯一已读顺序取原始种子，再筛选种类和来源，不按命中数补足。输出、整批返回、已确认的 `say`／回声是强绑定闭包，实际覆盖成员可能越过范围和筛选条件。闭包里有任一成员不可覆盖，整次失败，不丢掉那个成员后继续。覆盖使成员从本轮和后续自动上下文中消失；原号可用 `recall_events` 反查而不解除覆盖，反查总结会显示实际冻结的所有成员，不只是你传入的号。中心会话可跨窗口点名已读或反查过的旧号；未读成员不会被补进覆盖。摘要与聊天消息、输出、返回一样占历史事件数和 token 预算；私有 `.chat` 和子代理不能替中心会话写覆盖。
 
-眼前历史只是全局已读信息流按事件数和 token 选出的可见部分，不是完整记录。新消息先留在有名字的 FIFO；通知列出当前水位后的全部未读唤醒。FIFO 有五个动作：`status(source)` 看数量与缺口，`mentions(source)` 看尚未消费的 @／提及及其 `message_id`，`fetch(source)` 从 NapCat 向旧端补取，`pull(source, count)` 从队首正式读取并取得经历号，`mark_read(source)` 把调用时已存在的队列水位推到底。通知已看见不等于消息已读：在 `pull` 或 `mark_read` 推进水位前，它们仍属于新的未读集合；但红点本身不会反复启动你，只有后来出现新唤醒时才再次叫你，并重列当时水位后的完整集合。`mark_read` 不把正文伪装成经历，只在你已经通过档案查询掌握足够上下文，或明确决定不再顺序读时使用。窗口名是 `g<群号>` 或 `u<私聊对端号>`，主动 fetch 的旧档有自己的信源 key。启动补回先于该窗口新实时消息进入原 FIFO；未收束前不能 pull、标为已读或枚举完整提及。已经读过的旧档信源不会倒插内容，后续 fetch 另开 FIFO。远端历史不保证无缺口。
+眼前历史只是全局已读信息流按事件数和 token 选出的可见部分，不是完整记录。新消息先留在有名字的有序未读信源；通知列出当前全部未读唤醒。`status(source)` 看数量与缺口，`take(source, count, ids, arrival, origin, message_id, mentions_only)` 选择任意未读成员并安排下一请求正式阅读，`mentions(source)` 是只选提及的薄入口，`fetch(source)` 从 NapCat 向旧端补取，`mark_read(source)` 把调用时已有的成员设为已读但不伪造 input。`pull(source, count)` 只作为 take 的前缀别名。通知已看见不等于消息已读；红点本身不会反复启动你，只有后来出现新唤醒时才再次叫你，并重列当时全部未读唤醒。窗口名是 `g<群号>` 或 `u<私聊对端号>`，主动 fetch 的旧档有自己的信源 key。启动补回先于该窗口新实时消息进入原信源；未收束前不能正式阅读或标为已读。已经读过的旧档信源不会倒插内容，后续 fetch 另开信源。远端历史不保证无缺口。用 `exec_code` 可调用 `ctx["chat"].unread_members(source)` 取得脱离内部权威的 `list[dict]`，用普通 Python 筛选后把其中 `key` 列表交给 `take(ids=...)`；修改快照不会修改未读事实。
 
-聊天档案不属于 FIFO。`read_messages(window, message_id, before, after)` 可在指定窗口中按 QQ `message_id` 查前后文；若号码歧义，加 `timestamp` 或改用 `origin`。它和 `mentions`一样作为单个同步 R 直接返回，不消耗 FIFO、不给逐条档案分配 input 号，也不能充当或确认 `say` 回声。消息已经 pull 或标为已读后仍可从 chatlog 查阅。已读 input 若有正式号，则也可用 `recall_events`。总结只改变默认显示，不删除原文。
+聊天档案不属于未读信源。`read_messages(window, message_id, before, after)` 可在指定窗口中按 QQ `message_id` 选前后文；若号码歧义，加 `timestamp` 或改用 `origin`。它的同步 R 只确认安排，正文在下一子请求作为逐条正式 input 出现；命中当前 live/source 未读成员也一并消费。已读档案可再次阅读，产生新的 archive input，但不冒充 live 回声；`say_links` 只确认实际接收的回声。已读 input 也可用 `recall_events` 反查。总结只改变默认显示，不删除原文。
 
 总结要方便反查：在结论里留下关键来源的正式号，别只写一段没有出处的大块故事。后续总结可以再次引用前一层总结；同一来源也可被多个不同主题的总结引用，不必强行归到唯一父节点。已被覆盖的正式号也可再次点名，与新的可见成员组成另一份总结；这不解除原覆盖。`event_links` 可查输入、输出和工具返回中明确出现的正式号，以及各节点实际覆盖的成员；“出现过编号”、“被覆盖”和“确实支撑某个结论”是三回事，核对原话仍须 `recall_events`。
 
-普通输入、完整输出及整批工具返回都可用 `recall_events(["20260923-4"])` 按正式号反查；也可用 `recall_events(start="20260923-4", end="20260923-8", source="g123")` 直接读取短范围。它一次同步返回完整选择，取得一个新的 result 号，不进入 FIFO、不做字符分页，也不把正文里的旧事件移动、复制或重新编号。范围返回列出实际冻结的 `resolved_ids`。若总结这次探索，通常覆盖这次 recall 的输出和结果，并在结论中引用旧号；结果真正进入上下文后，直接覆盖其中旧号也是允许的另一次明确选择。
+普通输入、完整输出及整批工具返回都可用 `recall_events(["20260923-4"])` 按正式号反查；也可用 `recall_events(start="20260923-4", end="20260923-8", source="g123")` 直接读取短范围。它一次同步返回完整选择，取得一个新的 result 号，不进入未读信源、不做字符分页，也不把正文里的旧事件移动、复制或重新编号。范围返回列出实际冻结的 `resolved_ids`。若总结这次探索，通常覆盖这次 recall 的输出和结果，并在结论中引用旧号；结果真正进入上下文后，直接覆盖其中旧号也是允许的另一次明确选择。
 
 `recall_events` 和 `event_links` 都能用 `anchor` 加前后数量，或用 `start`／`end` 指定有界区间；`kinds` 和 `source` 只在选定范围内筛选，不改变经历顺序。`event_links` 只返回一跳关系，不读取正文、不授予覆盖信用。不要把这些选择器用于未读信源、原生操作号或 `say` 回声关联。
 
@@ -140,7 +140,7 @@ Skill 也是可编辑的长期笔记：把可重复使用的经验、做法、�
 `say(text, target, final_call)` 是你**唯一**的发言方式——直接写在回复正文里的内容不会发出去，那是你的自言自语；它会作为自己的输出轨迹保留，但聊天参与者收不到。中心会话每次发言必须写明 `target="g<群号>"` 或 `target="u<私聊对端号>"`，不能凭最近读到谁来猜接收窗口。
 
 - 返回值就是这条消息的 `message_id`。它可用于与聊天记录里的回声核对；要覆盖这句话，用回声读入后的信息流正式号，不用此 `message_id` 当 `cover_events` 的参数。
-- `final_call` 默认 **true**：说完这句，当前工具循环结束；同一批里其它工具的结果这次看不到。只有已产生但尚未读到的工具结果、新召唤或显式安排的 pull 会让中心 reader 接着运行；FIFO 里仍有未读本身不会强迫续轮。若要在当前循环接着干活，显式传 `final_call=false`。
+- `final_call` 默认 **true**：说完这句，当前工具循环结束；同一批里其它工具的结果这次看不到。只有已产生但尚未读到的工具结果、新召唤或显式安排的 take 会让中心 reader 接着运行；信源里仍有未读本身不会强迫续轮。若要在当前循环接着干活，显式传 `final_call=false`。
 - 发送**失败**或**未确认**时，不管 `final_call` 传了什么，都会照常再跑一轮，让你看到发生了什么。"未确认"的意思是请求被收下了但没给回号码，消息很可能已经发出去——别直接重发，先看下一轮的聊天记录。
 - 一次 `say` 发一条消息。要发几条就调几次，最后一条传默认的 `final_call=true`。
 
@@ -476,40 +476,55 @@ def say(text: str, final_call: bool = True, target: str = "") -> str:
     return str(message_id)
 
 
-def _pull_window(target: str, count: int) -> str:
-    """安排在下一次模型请求前从指定窗口 FIFO 队首正式读取若干条。
+def take(source: str, count: int = _DEFAULT_PULL_COUNT, ids: list[str] | None = None,
+         arrival: str = "", origin: str = "", message_id: str = "",
+         mentions_only: bool = False) -> str:
+    """选择一个信源的未读成员，在下一次模型请求前登记为正式 input。
 
     @param
-    target: g<群号> 或 u<私聊对端号>，必须明确指定
-    count: 希望读取的事件数，1 到 500；单次输入预算可能使实际数量更少
+    source: g<群号>、u<私聊对端号> 或独立信源 key
+    count: 无显式定位时从筛选结果前缀取多少条，1 到 500
+    ids: 可选稳定成员 key 列表；Python 可从 chat.unread_members(source) 取得脱离权威的快照
+    arrival: 可选实时消息的精确 arrival
+    origin: 可选精确档案位置
+    message_id: 可选 QQ 消息号；同号多条时应改用 ids 或 origin
+    mentions_only: 只选择当前未读提及；mentions 工具是此选项的薄入口
     """
     from mods import chat, context
 
     session = current_binding().session
     if not context.agent_mode() or not session.reads_window_mail:
-        return "只有中心 reader 可以正式拉取 mail"
-    try:
-        window = chat.parse_target(target)
-    except ValueError as error:
-        return str(error)
-    if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= chat.MAX_PULL_EVENTS:
+        return "只有中心 reader 可以正式阅读信源"
+    if type(count) is not int or not 1 <= count <= chat.MAX_PULL_EVENTS:
         return f"count 必须是 1..{chat.MAX_PULL_EVENTS}"
-    if len(session.requested_pulls) >= 4:
-        return "已有 4 个 pull 等待兑现，请先阅读返回再继续"
-    from mods import oplog
-
-    through = oplog.work_targets(chat.AGENT_WINDOW).get(window)
-    if through is None:
-        through = oplog.latest_pending_arrival(window)
-    sources = chat._recovery_sources(window)
-    if any(source["state"] == "fetching" for source in sources):
-        return f"{target} 的离线补回仍在进行，首次正式拉取须等它收束"
-    if through is None and not any(source["remaining"] for source in sources):
-        return f"{target} 当前没有待正式读取的 mail"
+    if ids is not None and (not isinstance(ids, list) or any(not isinstance(key, str) for key in ids)):
+        return "ids 必须是稳定成员 key 列表"
+    if sum((bool(ids), bool(arrival), bool(origin), bool(message_id))) > 1:
+        return "ids、arrival、origin、message_id 只能指定一种"
+    try:
+        members = chat.unread_members(source)
+    except ValueError as error:
+        return f"未安排正式阅读：{error}"
+    if mentions_only:
+        members = [member for member in members if member["mentioned"]]
+    if ids:
+        wanted = set(ids)
+        members = [member for member in members if member["key"] in wanted]
+    elif arrival:
+        members = [member for member in members if member.get("arrival") == arrival]
+    elif origin:
+        members = [member for member in members if member["origin"] == origin]
+    elif message_id:
+        members = [member for member in members if str(member["message_id"]) == message_id]
+        if len(members) > 1:
+            return "message_id 命中多条，请用 origin 或稳定成员 key 消歧义"
+    selected = members if ids or arrival or origin or message_id else members[:count]
+    if not selected:
+        return "该信源没有匹配的未读成员；未安排阅读"
+    window = tuple(selected[0]["window"])
     session.associated_windows.add(window)
-    session.requested_pulls.append((window, through, count))
-    return (f"已安排下一次请求前从 {target} 队首读取最多 {count} 条；"
-            "受单次输入预算限制，实际可能更少")
+    session.requested_reads.append({"window": list(window), "members": selected})
+    return f"已安排下一次模型请求前正式阅读 {len(selected)} 条；正文不在工具结果中返回"
 
 
 def _source_status_line(source: dict) -> str:
@@ -521,7 +536,7 @@ def _source_status_line(source: dict) -> str:
 
 
 def status(source: str = "") -> str:
-    """查看 FIFO 通知栏；可查看全部活跃信源，也可精确查看一个窗口或历史信源，不读取正文。
+    """查看未读通知栏；可查看全部活跃信源，也可精确查看一个窗口或历史信源，不读取正文。
 
     @param
     source: 留空查看全部活跃信源；或填 g<群号>、u<私聊对端号>、fetch 返回的信源 key
@@ -577,7 +592,7 @@ def status(source: str = "") -> str:
         lines.extend(f"无待读内容的历史信源缺口：{reason}，{count} 个信源"
                      for reason, count in history_gap_counts.items())
         if not lines:
-            return "当前没有待处理的 FIFO；未读未减少"
+            return "当前没有待处理的未读信源；未读未减少"
         lines.append("可用 status(source) 按具体 g/u 窗口或历史信源 key 查看完整状态")
     rendered = "\n".join(lines)
     excerpt = chat.bounded_excerpt(rendered, chat.MAIL_PULL_TOKENS - 1000)
@@ -592,7 +607,7 @@ def status(source: str = "") -> str:
 
 
 def fetch(source: str) -> str:
-    """从 NapCat 向前补一个信源；未读缺口可续接，已读信源会从旧端另开 FIFO。
+    """从 NapCat 向前补一个信源；未读缺口可续接，已读信源会从旧端另开信源。
 
     @param
     source: g<群号>、u<私聊对端号>，或已有历史信源 key
@@ -614,81 +629,32 @@ def fetch(source: str) -> str:
     current_binding().session.associated_windows.add(window)
     source = chat.fetch_remote_source(window, source_key)
     return (f"信源 {source['key']}（{source['name']}）状态={source['state']}；"
-            "后台持续追到锚点或上游尽头，完成前不能正式 pull；用 status 查看进度")
-
-
-def _pull_source(source: str, count: int) -> str:
-    """安排下次请求前从指定独立信源 FIFO 队首正式读取若干条。
-
-    @param
-    source: fetch 返回的信源 key
-    count: 希望读取的事件数，1 到 500；单次输入预算可能使实际数量更少
-    """
-    from mods import chat, context, oplog
-
-    session = current_binding().session
-    if not context.agent_mode() or not session.reads_window_mail:
-        return "只有中心 reader 可以正式拉取信源"
-    state = oplog.resolve_source(source)
-    if state is None or state["key"] != source:
-        return "找不到该信源 key"
-    if state["source_type"] == "napcat_boot":
-        return "启动补回属于原窗口 FIFO，请用对应的 g/u 窗口名 pull"
-    if state["state"] == "fetching":
-        return "该信源还在拉取，队首尚未固定"
-    if not state["remaining"]:
-        return "该信源已经读完"
-    if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= chat.MAX_PULL_EVENTS:
-        return f"count 必须是 1..{chat.MAX_PULL_EVENTS}"
-    if len(session.requested_pulls) >= 4:
-        return "已有 4 个 pull 等待兑现，请先阅读返回再继续"
-    session.associated_windows.add(tuple(state["window"]))
-    session.requested_pulls.append((("source", source), None, count))
-    return f"已安排下一次请求前从信源 {source} 队首读取最多 {count} 条"
+            "后台持续追到锚点或上游尽头，完成前不能正式 take；用 status 查看进度")
 
 
 def mentions(source: str) -> str:
-    """直接返回一个 FIFO 中尚未正式读取的 @／提及正文与 message_id；不推进水位。
+    """安排下一次模型请求前正式阅读未读 @／提及；take 的筛选别名。
 
     @param
     source: g<群号>、u<私聊对端号>，或 fetch 返回的独立信源 key
     """
-    import json
+    from mods import chat
 
-    from mods import chat, context, oplog
-
-    if not context.agent_mode() or not current_binding().session.reads_window_mail:
-        return "只有中心 reader 可以查看未读提及"
-    try:
-        window = chat.parse_target(source)
-        state = None
-    except ValueError:
-        state = oplog.resolve_source(source)
-        if state is None or state["key"] != source:
-            return "找不到该窗口或信源 key"
-        window = tuple(state["window"])
-    current_binding().session.associated_windows.add(window)
-    try:
-        found = chat.unread_mentions(window, state)
-    except ValueError as error:
-        return f"未查看：{error}"
-    return json.dumps(found, ensure_ascii=False) if found else "该 FIFO 没有未读 @／提及；水位未变"
+    return take(source, count=chat.MAX_PULL_EVENTS, mentions_only=True)
 
 
 def read_messages(window: str, message_id: str = "", origin: str = "", timestamp: int = 0,
                   before: int = 4, after: int = 4) -> str:
-    """在指定聊天窗口的本地档案中，按 QQ message_id 或稳定 origin 直接返前后文。不消费 FIFO，已读或标为已读后仍可查。
+    """从本地档案选消息，在下一次模型请求前作为正式 input 阅读；已读档案可再次阅读。
 
     @param
     window: g<群号> 或 u<私聊对端号>
     message_id: QQ 消息号；与 origin 二选一
-    origin: mentions/read_messages 返回的稳定档案位置；与 message_id 二选一
+    origin: 稳定档案位置；与 message_id 二选一
     timestamp: message_id 命中多条时用来消歧义的 Unix 整数秒；0 表示不指定
     before: 锚点之前返回多少条档案记录，非负整数
     after: 锚点之后返回多少条档案记录，非负整数
     """
-    import json
-
     from mods import chat, chatlog, context
 
     if not context.agent_mode() or not current_binding().session.reads_window_mail:
@@ -713,20 +679,17 @@ def read_messages(window: str, message_id: str = "", origin: str = "", timestamp
         )
     except ValueError as error:
         return f"未查看：{error}"
-    result = []
-    for record in records:
-        projection = chat._model_event(record, target[0] == "group")
-        if projection is not None:
-            result.append({"origin": record.get("_log_origin"),
-                           "message_id": record.get("message_id"),
-                           "time": record.get("time"),
-                           "content": projection["content"]})
-    return (json.dumps(result, ensure_ascii=False) if result
-            else "本地档案没有命中可见记录；FIFO 水位未变")
+    selected = [record for record in records
+                if chat._model_event(record, target[0] == "group") is not None]
+    if not selected:
+        return "本地档案没有命中可见记录；未安排阅读"
+    current_binding().session.requested_reads.append(
+        {"window": list(target), "records": selected})
+    return f"已安排下一次模型请求前从档案正式阅读 {len(selected)} 条；正文不在工具结果中返回"
 
 
 def mark_read(source: str) -> str:
-    """将一个 FIFO 在调用时已存在的全部未读标为已读。这些内容不取得经历号，但仍可用 read_messages 查档。
+    """将一个信源在调用时已存在的全部未读设为已读。这些内容不取得经历号，但仍可用 read_messages 再读档案。
 
     @param
     source: g<群号>、u<私聊对端号>，或 fetch 返回的独立信源 key
@@ -736,7 +699,7 @@ def mark_read(source: str) -> str:
     from mods import chat, context, oplog
 
     if not context.agent_mode() or not current_binding().session.reads_window_mail:
-        return "只有中心 reader 可以推进未读水位"
+        return "只有中心 reader 可以设为已读"
     try:
         window = chat.parse_target(source)
         state = None
@@ -745,7 +708,7 @@ def mark_read(source: str) -> str:
         if state is None or state["key"] != source:
             return "找不到该窗口或信源 key"
         if state["source_type"] == "napcat_boot":
-            return "启动补回属于原窗口 FIFO，请用对应的 g/u 窗口名标为已读"
+            return "启动补回属于原窗口信源，请用对应的 g/u 窗口名标为已读"
         window = tuple(state["window"])
     current_binding().session.associated_windows.add(window)
     try:
@@ -757,19 +720,13 @@ def mark_read(source: str) -> str:
 
 
 def pull(source: str, count: int = _DEFAULT_PULL_COUNT) -> str:
-    """安排下一次模型请求前从一个 FIFO 队首正式读取若干条。
+    """take(source, count) 的前缀薄别名；新调用请优先使用 take。
 
     @param
     source: g<群号>、u<私聊对端号>，或 fetch 返回的信源 key
     count: 希望读取的事件数，1 到 500；单次输入预算可能使实际数量更少
     """
-    from mods import chat
-
-    try:
-        chat.parse_target(source)
-    except ValueError:
-        return _pull_source(source, count)
-    return _pull_window(source, count)
+    return take(source, count=count)
 
 
 def edit_hint(text: str) -> str:
@@ -817,6 +774,7 @@ __all__ = [
     "cover_events",
     "say",
     "status",
+    "take",
     "mentions",
     "fetch",
     "pull",

@@ -31,7 +31,6 @@ _windows: dict[tuple, list[dict]] = {}
 _next: dict[str, int] = {}
 _pending: dict[str, dict] = {}
 _notified: set[str] = set()
-_floors: dict[tuple, str | None] = {}
 # WHY: Arrival journal replay and dict insertion order are the FIFO authority;
 # there is no before-insertion caller, so a historical linked list is redundant.
 _arrival_order: dict[str, int] = {}
@@ -90,7 +89,6 @@ def _restore() -> None:
     counters: dict[str, int] = {}
     pending: dict[str, dict] = {}
     notified: set[str] = set()
-    floors: dict[tuple, str | None] = {}
     arrival_order: dict[str, int] = {}
     covered: dict[tuple, set[str]] = {}
     coverage_nodes: dict[str, list[str]] = {}
@@ -104,7 +102,7 @@ def _restore() -> None:
         for line in data[:complete].splitlines():
             entry = json.loads(line.decode("utf-8"))
             _apply(entry, restored, indexes, windows, counters, pending, covered, coverage_nodes,
-                   origins, mentioned_by, notified, floors, arrival_order, sources, seen_messages)
+                   origins, mentioned_by, notified, arrival_order, sources, seen_messages)
         if complete != len(data):
             # WHY: Only a missing final newline is a crash tail. A malformed complete
             # row is corruption, never permission to silently skip committed facts.
@@ -134,8 +132,6 @@ def _restore() -> None:
     _pending.update(pending)
     _notified.clear()
     _notified.update(notified)
-    _floors.clear()
-    _floors.update(floors)
     _arrival_order.clear()
     _arrival_order.update(arrival_order)
     _covered.clear()
@@ -248,25 +244,22 @@ def _validate_source_page(entry: dict, state: dict) -> None:
         raise ValueError("source page must be the next page with a nonnegative count")
 
 
-def _previous_nonempty_page(state: dict, before: int) -> int:
-    return next((page for page in range(before - 1, -1, -1)
-                 if state["page_counts"][page]), -1)
+def _source_positions(state: dict):
+    for page in range(state["pages"] - 1, -1, -1):
+        for offset in range(state["page_counts"][page]):
+            if (page, offset) not in state["read_positions"]:
+                yield page, offset
 
 
 def _validate_source_read(entry: dict, state: dict, pending: dict[str, dict]) -> None:
     if state["state"] == "fetching":
         raise ValueError("source is not sealed")
     page, offset = entry["page"], entry["offset"]
-    if (type(page) is not int or type(offset) is not int
-            or (page, offset) != (state["read_page"], state["read_offset"])):
-        raise ValueError("source read cursor is stale")
-    if page < 0 or offset >= state["page_counts"][page]:
-        raise ValueError("source read cursor is exhausted")
-    next_position = ((page, offset + 1) if offset + 1 < state["page_counts"][page]
-                     else (_previous_nonempty_page(state, page), 0))
-    if (type(entry["next_page"]) is not int or type(entry["next_offset"]) is not int
-            or (entry["next_page"], entry["next_offset"]) != next_position):
-        raise ValueError("source read successor is not contiguous")
+    if (type(page) is not int or type(offset) is not int or page < 0
+            or page >= state["pages"] or offset < 0
+            or offset >= state["page_counts"][page]
+            or (page, offset) in state["read_positions"]):
+        raise ValueError("source member is absent or already read")
     if entry["source_window"] != state["window"]:
         raise ValueError("source read provenance is invalid")
     arrival = entry.get("arrival")
@@ -279,30 +272,27 @@ def _validate_source_read(entry: dict, state: dict, pending: dict[str, dict]) ->
             raise ValueError("source read does not match its live arrival")
 
 
-def _source_successor(state: dict, page: int, offset: int, count: int) -> tuple[int, int]:
-    if type(count) is not int or count < 1 or count > state["member_count"] - state["read_count"]:
-        raise ValueError("source mark-read count is invalid")
-    current_page, current_offset = page, offset
-    remaining = count
-    while remaining:
-        if current_page < 0 or current_offset >= state["page_counts"][current_page]:
-            raise ValueError("source mark-read cursor is exhausted")
-        available = state["page_counts"][current_page] - current_offset
-        if remaining < available:
-            return current_page, current_offset + remaining
-        remaining -= available
-        current_page, current_offset = _previous_nonempty_page(state, current_page), 0
-    return current_page, current_offset
-
-
 def _validate_source_mark_read(entry: dict, state: dict, pending: dict[str, dict]) -> None:
     if state["state"] == "fetching":
         raise ValueError("source is not sealed")
-    page, offset = entry["page"], entry["offset"]
-    if (type(page) is not int or type(offset) is not int
-            or (page, offset) != (state["read_page"], state["read_offset"])):
-        raise ValueError("source mark-read cursor is stale")
-    _source_successor(state, page, offset, entry["count"])
+    positions = entry.get("positions")
+    if positions is None:
+        if type(entry.get("count")) is not int or entry["count"] < 1:
+            raise ValueError("source mark-read count is invalid")
+        positions = [list(position) for position in list(_source_positions(state))[:entry["count"]]]
+        if not positions or tuple(positions[0]) != (entry["page"], entry["offset"]):
+            raise ValueError("source mark-read cursor is stale")
+    if (not isinstance(positions, list) or not positions
+            or any(not isinstance(position, list) or len(position) != 2
+                   or any(type(value) is not int for value in position)
+                   or position[0] < 0 or position[0] >= state["pages"]
+                   or position[1] < 0 or position[1] >= state["page_counts"][position[0]]
+                   or tuple(position) in state["read_positions"] for position in positions)):
+        raise ValueError("source mark-read positions are invalid")
+    if len(positions) != len({tuple(position) for position in positions}):
+        raise ValueError("source mark-read positions are duplicated")
+    if type(entry.get("count")) is not int or len(positions) != entry["count"]:
+        raise ValueError("source mark-read count is invalid")
     mentions = entry.get("mention_count", 0)
     if (type(mentions) is not int or not 0 <= mentions <= entry["count"]
             or state["read_mention_count"] + mentions > state["mention_count"]):
@@ -318,7 +308,7 @@ def _apply(
     entry: dict, recorded: list[dict], indexes: dict[str, dict], windows: dict[tuple, list[dict]],
     counters: dict[str, int], pending: dict[str, dict], covered: dict[tuple, set[str]],
     coverage_nodes: dict[str, list[str]], origins: dict[tuple[tuple, str], dict],
-    mentioned_by: dict[str, list[str]], notified: set[str], floors: dict[tuple, str | None],
+    mentioned_by: dict[str, list[str]], notified: set[str],
     arrival_order: dict[str, int], sources: dict[str, dict],
     seen_messages: set[tuple[tuple, str, int, str | None]],
 ) -> None:
@@ -344,7 +334,7 @@ def _apply(
                            "pending_boundary": entry.get("pending_boundary"),
                            "pages": 0, "page_counts": [], "member_count": 0,
                            "mention_count": 0, "read_mention_count": 0,
-                           "read_page": None, "read_offset": 0, "read_count": 0,
+                           "read_positions": set(),
                            "gap": None, "previous_gaps": [], "error": None}
         return
     if entry["kind"] == "source_page":
@@ -372,8 +362,6 @@ def _apply(
         state["stop_cursor"] = entry.get("stop_cursor", state["cursor"])
         if state["gap"]:
             state["previous_gaps"].append(state["gap"])
-        if state["read_page"] is None and not state["read_count"]:
-            state["read_page"] = _previous_nonempty_page(state, state["pages"])
         return
     if entry["kind"] == "source_reopen":
         state = sources[entry["source"]]
@@ -384,8 +372,6 @@ def _apply(
         state["fetch_anchor"] = entry.get("fetch_anchor")
         state["gap"] = None
         state["error"] = None
-        state["read_page"] = None
-        state["read_offset"] = 0
         return
     if entry["kind"] == "source_pulled":
         sources[entry["source"]]["pulled"] = True
@@ -397,7 +383,6 @@ def _apply(
         return
     if entry["kind"] == "floor":
         window = tuple(entry["window"])
-        floors[window] = entry["before"]
         if entry["before"] is not None:
             boundary = arrival_order[entry["before"]]
             for arrival, item in list(pending.items()):
@@ -422,13 +407,13 @@ def _apply(
                 seen_messages.add(identity)
         return
     if entry["kind"] == "source_mark_read":
-        # 历史信源的水位住在页内游标里；这条和上面的 window discard
-        # 是同一个用户动作的两种底层投影，都不伪造 input。
+        # 历史信源的已读坐标只由日志重放派生；和 window mark_read 一样不伪造 input。
         state = sources[entry["source"]]
         _validate_source_mark_read(entry, state, pending)
-        state["read_page"], state["read_offset"] = _source_successor(
-            state, entry["page"], entry["offset"], entry["count"])
-        state["read_count"] += entry["count"]
+        positions = entry.get("positions")
+        if positions is None:
+            positions = [list(position) for position in list(_source_positions(state))[:entry["count"]]]
+        state["read_positions"].update(map(tuple, positions))
         state["read_mention_count"] += entry.get("mention_count", 0)
         state["pulled"] = True
         for arrival in entry.get("arrivals", []):
@@ -506,9 +491,7 @@ def _apply(
         origins[key] = entry
     if source_read:
         state = sources[entry["source"]]
-        state["read_page"] = entry["next_page"]
-        state["read_offset"] = entry["next_offset"]
-        state["read_count"] += 1
+        state["read_positions"].add((entry["page"], entry["offset"]))
         state["read_mention_count"] += bool(entry.get("mentioned"))
         state["pulled"] = True
     if entry.get("arrival"):
@@ -564,7 +547,7 @@ def _append(entry: dict, day: str) -> None:
         _failed = True
         raise
     _apply(entry, _events, _by_id, _windows, _next, _pending, _covered, _coverage_nodes,
-           _origins, _mentioned_by, _notified, _floors, _arrival_order, _sources,
+           _origins, _mentioned_by, _notified, _arrival_order, _sources,
            _seen_messages)
     if entry.get("id") and entry.get("arrival"):
         _by_arrival[entry["arrival"]] = entry
@@ -584,7 +567,9 @@ def _source_snapshot(state: dict) -> dict:
             "queue_window": list(state["queue_window"]),
             "page_counts": list(state["page_counts"]),
             "previous_gaps": list(state["previous_gaps"]),
-            "remaining": state["member_count"] - state["read_count"]}
+            "read_positions": set(state["read_positions"]),
+            "read_count": len(state["read_positions"]),
+            "remaining": state["member_count"] - len(state["read_positions"])}
 
 
 def arrive(window: tuple, event: dict, *, activated: bool = False, origin: str | None = None) -> str:
@@ -616,15 +601,15 @@ def mark_arrivals_read(window: tuple, arrivals: Iterable[str]) -> int:
         return len(selected)
 
 
-def mark_source_read(source: str, count: int, mention_count: int,
+def mark_source_read(source: str, positions: Iterable[tuple[int, int]], mention_count: int,
                      arrivals: Iterable[str] = ()) -> dict:
     """Advance one sealed source without presenting its members to the model."""
     with _lock:
         _restore()
         state = _sources[source]
+        selected = [list(position) for position in positions]
         entry = {"kind": "source_mark_read", "source": source,
-                 "page": state["read_page"], "offset": state["read_offset"],
-                 "count": count, "mention_count": mention_count,
+                 "positions": selected, "count": len(selected), "mention_count": mention_count,
                  "arrivals": list(arrivals)}
         _append(entry, datetime.now().strftime("%Y%m%d"))
         return _source_snapshot(_sources[source])
@@ -737,14 +722,6 @@ def reopen_source(source: str, *, fetch_anchor: str | None = None) -> dict:
         return _source_snapshot(_sources[source])
 
 
-def mark_source_pulled(source: str) -> dict:
-    with _lock:
-        _restore()
-        if not _sources[source]["pulled"]:
-            _append({"kind": "source_pulled", "source": source}, datetime.now().strftime("%Y%m%d"))
-        return _source_snapshot(_sources[source])
-
-
 def sources() -> list[dict]:
     """List all sources, including empty queues that are fetching or have gaps."""
     with _lock:
@@ -761,22 +738,6 @@ def resolve_source(name_or_key: str) -> dict | None:
             state = next((item for item in reversed(list(_sources.values()))
                           if item["name"] == name_or_key), None)
         return _source_snapshot(state) if state is not None else None
-
-
-def prepare_window(window: tuple, page_size: int) -> None:
-    """Freeze an initial daily-reading floor without claiming older arrivals were read."""
-    with _lock:
-        _restore()
-        if (window in _floors
-                or any(entry["kind"] == "input" for entry in _windows.get(window, ()))
-                or any(entry["kind"] == "input" and entry.get("source_window") == list(window)
-                       for entry in _events)):
-            return
-        pending = _ordered_pending(window)
-        if pending:
-            before = pending[-page_size - 1]["arrival"] if len(pending) > page_size else None
-            _append({"kind": "floor", "window": list(window), "before": before},
-                    datetime.now().strftime("%Y%m%d"))
 
 
 def pending_summary() -> list[tuple[tuple, int, bool]]:
@@ -893,26 +854,6 @@ def deliver_notifications(agent_window: tuple) -> dict | None:
                                        "message_id": entry["event"].get("message_id")}
                                       for entry in activated],
                          unread=pending_details())
-
-
-def work_targets(agent_window: tuple) -> dict[tuple, str]:
-    """Frozen upper bounds for an explicit pull after a delivered notification."""
-    with _lock:
-        _restore()
-        earliest: dict[tuple, str] = {}
-        for arrival, pending in _pending.items():
-            earliest.setdefault(tuple(pending["window"]), arrival)
-        targets: dict[tuple, str] = {}
-        for entry in _windows.get(agent_window, ()):
-            if entry["kind"] == "notification":
-                for window in entry["windows"]:
-                    key = tuple(window)
-                    if key in targets:
-                        continue
-                    target = entry["through"][str(key)]
-                    if key in earliest and _arrival_before_or_at(earliest[key], target):
-                        targets[key] = target
-        return targets
 
 
 def latest_pending_arrival(window: tuple) -> str | None:
@@ -1050,18 +991,30 @@ def input(window: tuple | None, event: dict, projection: dict | None, arrival: s
                          source_window=list(source_window) if source_window is not None else original)
 
 
+def input_archive(window: tuple, event: dict, projection: dict, origin: str,
+                  source_window: tuple, *, arrival: str | None = None,
+                  source: str | None = None, page: int | None = None,
+                  offset: int | None = None, mentioned: bool = False) -> dict:
+    """Record an archive reread and consume any matching unread member."""
+    values = {"event": event, "projection": projection, "origin": origin,
+              "source_window": list(source_window), "archive": True}
+    if arrival is not None:
+        values["arrival"] = arrival
+    if source is not None:
+        values.update(source=source, page=page, offset=offset, mentioned=mentioned)
+    return _register(window, "input", **values)
+
+
 def input_source(window: tuple, event: dict, projection: dict | None, source: str,
-                 page: int, offset: int, next_page: int, next_offset: int,
-                 origin: str | None, source_window: tuple,
+                 page: int, offset: int, origin: str | None, source_window: tuple,
                  arrival: str | None = None, mentioned: bool = False) -> dict:
-    """Index one sealed page member and advance its read cursor in the same append."""
+    """Index one sealed page member; replay derives the unread holes."""
     with _lock:
         _restore()
         if window is None:
             raise ValueError("source input needs a read window")
         values = {"event": event, "projection": projection, "source": source,
-                  "page": page, "offset": offset, "next_page": next_page,
-                  "next_offset": next_offset, "origin": origin,
+                  "page": page, "offset": offset, "origin": origin,
                   "source_window": list(source_window), "mentioned": mentioned}
         if arrival is not None:
             values["arrival"] = arrival
@@ -1200,7 +1153,8 @@ def cover(window: tuple, node: str, ids: Iterable[str], visible: set[str]) -> se
             closure = expanded
         for event_id in closure:
             entry = _by_id[event_id]
-            if (entry["kind"] == "input" and entry["event"].get("post_type") == "message_sent"
+            if (entry["kind"] == "input" and not entry.get("archive") and not entry.get("source")
+                    and entry["event"].get("post_type") == "message_sent"
                     and event_id not in linked_echoes):
                 raise ValueError("自发回声尚无唯一已读 say 返回，不能孤立覆盖")
             if entry["kind"] == "output":
@@ -1242,7 +1196,8 @@ def say_links(window: tuple | None) -> dict[str, tuple[str, str]]:
     echoes: dict[str, list[str]] = {}
     returns: dict[str, list[str]] = {}
     for entry in recorded:
-        if entry["kind"] == "input" and entry["event"].get("post_type") == "message_sent":
+        if (entry["kind"] == "input" and not entry.get("archive") and not entry.get("source")
+                and entry["event"].get("post_type") == "message_sent"):
             message_id = entry["event"].get("message_id")
             if message_id is not None:
                 echoes.setdefault(str(message_id), []).append(entry["id"])

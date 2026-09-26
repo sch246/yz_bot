@@ -134,14 +134,14 @@ class MailEntry:
 
 
 class Mailbox:
-    """In-memory view of one window's durable unread FIFO.
+    """In-memory view of one window's ordered unread members.
 
     WHY: 它按**窗口**登记，和 `_turns` **并列**，而且**不随一轮生灭**。轮是一次
     生成的生命周期，邮箱是持久 arrival 日志当前未读部分的内存镜像；正式读取和标为
-    已读都先写 oplog，再推进这里的水位。
+    已读都先写 oplog，再精确隐藏这里的成员。
 
     WHY: 自己带锁，而不是借 `WindowTurn` 的。轮会消失，锁不能跟着消失。聊天记录
-    写入与 mail 入列由 `record` 在这把锁里一次提交；FIFO 正式读取也拿同一把锁。
+    写入与 mail 入列由 `record` 在这把锁里一次提交；正式读取也拿同一把锁。
     """
 
     def __init__(self, key: Any) -> None:
@@ -153,7 +153,7 @@ class Mailbox:
         self._base = 0
         self._aliases: dict[int, tuple[dict, MailEntry | None]] = {}
         self._absorbed: set[str] = set()
-        # 水位线：序号 < `_read` 的条目都已经进过这个窗口的上下文了。
+        # `_read` 只标记已清理的连续头部；中间已读洞留在 `_absorbed`。
         self._read = 0
         from mods import oplog
         self._entries = [MailEntry(index, item["event"], item["activated"], item["arrival"])
@@ -268,23 +268,6 @@ class Mailbox:
             entry.activated = True
             return True
 
-    def advance(self, project: Callable[[list[MailEntry]], Any] | None = None) -> Any:
-        """Advance this mailbox after an optional projection."""
-        with self._lock:
-            if project is not None:
-                projected = project(list(self._entries[self._read - self._base:]))
-                self._advance()
-                return projected
-            return self._advance()
-
-    def _advance(self) -> list[MailEntry]:
-        self._skip_absorbed()
-        start = self._read - self._base
-        crossed = list(self._entries[start:])
-        self._read = self._base + len(self._entries)
-        self._trim()
-        return crossed
-
     def unread(self, count: int | None = None) -> list[MailEntry]:
         """Look at what has not entered the context yet, without consuming it."""
         with self._lock:
@@ -323,20 +306,6 @@ class Mailbox:
             self._absorbed.update(arrivals)
             self._skip_absorbed()
             return value
-
-    def prepare_initial_tail(self, count: int) -> None:
-        """Apply a durable first-read floor to the live buffer, not a fake read."""
-        from mods import oplog
-
-        with self._lock:
-            oplog.prepare_window(self.key, count)
-            allowed = {entry["arrival"] for entry in oplog.unread(self.key)}
-            while self._read < self._base + len(self._entries):
-                entry = self._entries[self._read - self._base]
-                if entry.arrival in allowed:
-                    break
-                self._read += 1
-            self._trim()
 
     def has_activation(self) -> bool:
         """Return whether an unread activated entry keeps the red dot lit."""
