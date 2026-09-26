@@ -1,22 +1,15 @@
 from __future__ import annotations
 
-import ast
-from contextvars import ContextVar
-from datetime import datetime, timezone
 import json
 import re
 import threading
-import time
 import traceback
 from typing import Callable
 
-from mods import _source_pages, context, cq, history, identity, image, llm, log, message, msgs, op, oplog, py, storage, text, thread, tools as tool_modules
-from mods.command import command
-from mods.capture import capture
-from mods.llm import pricing
+from mods import _source_pages, context, identity, llm, oplog
 
 import mods.chat as _chat_root
-from . import view as _view, reader as _reader, agent as _agent, subcommands as _subcommands
+from . import view as _view
 
 
 def _addressed(event: dict, value: str) -> bool:
@@ -33,34 +26,6 @@ def parse_target(target: str) -> tuple[str, int]:
     if matched is None:
         raise ValueError("目标必须是 g<群号> 或 u<私聊对端号>")
     return ("group" if matched[1] == "g" else "private"), int(matched[2])
-
-
-def _unread_detail_text(detail: dict, *, include_wakes: bool = True) -> str:
-    window = detail["window"]
-    target = ("g" if window[0] == "group" else "u") + str(window[1])
-    sources = ""
-    if include_wakes:
-        # WHY: notification 会持久化当时的 unread 快照；旧快照没有 ordinal，
-        # 而且重建历史通知时本就不展示这份已过期的唤醒位置。
-        sources = ", ".join(
-            f"{item['kind']}"
-            + (f" 作者={item['user_id']}" if item.get("user_id") is not None else "")
-            + f" 时间={item['time']}"
-            + (f" 未读序号={item['ordinal']}" if item.get("ordinal") is not None else "")
-            for item in detail["wake_sources"])
-    recovery = detail.get("recovery")
-    extra = ((f" 补回未读={recovery['remaining']} 补回状态={recovery['state']}"
-              + (f" 缺口={recovery['gap']}" if recovery.get("gap") else ""))
-             if recovery else "")
-    return (f"{target} 未读={detail['unread']} 普通={detail['ordinary']} "
-            f"@/提及={detail['mentions']} 其他唤醒={detail['other_wakes']}"
-            + (f" 最近唤醒：{sources}" if include_wakes and sources else "") + extra)
-
-
-def _activation_text(item: dict) -> str:
-    window = item["window"]
-    target = ("g" if window[0] == "group" else "u") + str(window[1])
-    return f"{target} {item['kind']} 作者={item.get('user_id')} 时间={item.get('time')}"
 
 
 def unread_details() -> list[dict]:
@@ -114,6 +79,40 @@ def unread_details() -> list[dict]:
     return list(details.values())
 
 
+def _pending_hint() -> str:
+    rows = unread_details()
+    all_sources = oplog.sources()
+    latest = {tuple(source["window"]): source["key"] for source in all_sources
+              if source["source_type"] in ("napcat_boot", "napcat_history")}
+    independent = [source for source in all_sources
+                   if source["source_type"] == "napcat_history"
+                   and (source["remaining"] or source["state"] != "complete")
+                   and (source["remaining"] or latest[tuple(source["window"])] == source["key"])]
+    if not rows and not independent:
+        return ""
+    shown = []
+    for detail in rows:
+        if len(shown) >= 10 or _chat_root.count_tokens("；".join(_view._unread_detail_text(item, include_wakes=False)
+                                                 for item in [*shown, detail])) > _chat_root.NOTICE_TOKENS - 150:
+            break
+        shown.append(detail)
+    tail = f"；另有 {len(rows) - len(shown)} 个窗口，用 status() 查看" if len(rows) > len(shown) else ""
+    source_lines = []
+    for source in independent[:3]:
+        mentions = [f"{ordinal}@{member.get('time')}"
+                    for ordinal, (_page, _offset, member) in enumerate(
+                        _source_unread_members(source), 1) if member.get("mentioned")]
+        source_lines.append(f"{source['name']} key={source['key']} 未读={source['remaining']} "
+                            f"提及={source['mention_count'] - source['read_mention_count']} "
+                            f"提及未读序号@时间={','.join(mentions)} 状态={source['state']}"
+                            + (f" 缺口={source['gap']}" if source['gap'] else ""))
+    if len(independent) > 3:
+        source_lines.append(f"另有 {len(independent) - 3} 个信源，用 status() 查看")
+    parts = [*(_view._unread_detail_text(detail) for detail in shown), tail, *source_lines]
+    return _chat_root.bounded_excerpt("待正式读取（当前快照；take 执行时重算序号）："
+                           + "；".join(part for part in parts if part), _chat_root.NOTICE_TOKENS)
+
+
 def _drain_legacy_results() -> list[tuple[dict, dict]]:
     # WHY: f4d3591 left completed tool batches in the agent mailbox. Drain only
     # those existing arrivals on the next activation; new code writes R directly.
@@ -149,8 +148,9 @@ def prepare_recovery_sources() -> None:
         except Exception:
             traceback.print_exc()
         try:
-            source = oplog.start_source("NapCat " + str(window), window, "napcat_boot",
-                                        anchor=anchor, anchor_time=anchor_time)
+            with context.window_lock(window):
+                source = oplog.start_source("NapCat " + str(window), window, "napcat_boot",
+                                            anchor=anchor, anchor_time=anchor_time)
             _boot_sources.append(source["key"])
         except Exception:
             traceback.print_exc()
@@ -166,25 +166,26 @@ def fetch_remote_source(window: tuple, source_key: str | None = None) -> dict:
     """Extend an unread gap or open a separate historical source."""
     from mods import _backfill, connect
 
-    candidates = [source for source in oplog.sources()
-                  if tuple(source["window"]) == window
-                  and source["source_type"] in ("napcat_boot", "napcat_history")]
-    selected = (next((source for source in candidates if source["key"] == source_key), None)
-                if source_key is not None else (candidates[-1] if candidates else None))
-    if source_key is not None and selected is None:
-        raise ValueError("信源不属于该窗口或不能从 NapCat 扩展")
-    if selected is not None and selected["state"] == "fetching":
-        return selected
-    if selected is not None and selected["state"] in ("gap", "failed") and not selected["pulled"]:
-        source = oplog.reopen_source(selected["key"], fetch_anchor=selected["fetch_anchor"])
-    else:
-        # WHY: 显式对一个旧 key 再 fetch 就从那个 key 的旧端新开信源，不偷偷改用同窗口
-        # 最新 key，也不跨信源去重。两个信源即使含有重叠原文，也是两次可由 agent 选择的
-        # 重放经历；隐藏重叠会让“这个信源实际保存了什么”失真。
-        target = ("g" if window[0] == "group" else "u") + str(window[1])
-        source = oplog.start_source("NapCat 历史 " + target, window, "napcat_history",
-                                    queue_window="new",
-                                    start_seq=selected["stop_cursor"] if selected else None)
+    with context.window_lock(window):
+        candidates = [source for source in oplog.sources()
+                      if tuple(source["window"]) == window
+                      and source["source_type"] in ("napcat_boot", "napcat_history")]
+        selected = (next((source for source in candidates if source["key"] == source_key), None)
+                    if source_key is not None else (candidates[-1] if candidates else None))
+        if source_key is not None and selected is None:
+            raise ValueError("信源不属于该窗口或不能从 NapCat 扩展")
+        if selected is not None and selected["state"] == "fetching":
+            return selected
+        if selected is not None and selected["state"] in ("gap", "failed") and not selected["pulled"]:
+            source = oplog.reopen_source(selected["key"], fetch_anchor=selected["fetch_anchor"])
+        else:
+            # WHY: 显式对一个旧 key 再 fetch 就从那个 key 的旧端新开信源，不偷偷改用同窗口
+            # 最新 key，也不跨信源去重。两个信源即使含有重叠原文，也是两次可由 agent 选择的
+            # 重放经历；隐藏重叠会让“这个信源实际保存了什么”失真。
+            target = ("g" if window[0] == "group" else "u") + str(window[1])
+            source = oplog.start_source("NapCat 历史 " + target, window, "napcat_history",
+                                        queue_window="new",
+                                        start_seq=selected["stop_cursor"] if selected else None)
 
     def fetch() -> None:
         try:
@@ -192,9 +193,10 @@ def fetch_remote_source(window: tuple, source_key: str | None = None) -> dict:
         except Exception:
             traceback.print_exc()
             try:
-                state = oplog.resolve_source(source["key"])
-                oplog.finish_source(source["key"], gap="本地归档或入列失败；可重试",
-                                    stop_cursor=state["cursor"])
+                with context.window_lock(window):
+                    state = oplog.resolve_source(source["key"])
+                    oplog.finish_source(source["key"], gap="本地归档或入列失败；可重试",
+                                        stop_cursor=state["cursor"])
             except Exception:
                 traceback.print_exc()
 
@@ -211,18 +213,18 @@ def _take_source_events(window: tuple, source: dict, session: llm.Chat | None,
     output = []
     pages = {}
     for page_number, offset in positions:
-        if oplog.source_position_read(source["key"], page_number, offset):
-            continue
-        members = pages.setdefault(page_number, _source_pages.read_page(
-            oplog.source_page_root(), source["key"], page_number))
-        member = members[offset]
-        origin = member["origin"]
-        event = chatlog.read_origin(*window, origin)
-        if event is None:
-            return output, f"补回档案位置已丢失：{origin}"
-        event["_history_source"] = "napcat_backfill"
-        event["_history_seq"] = member.get("message_seq")
         with context.window_lock(window):
+            if oplog.source_position_read(source["key"], page_number, offset):
+                continue
+            members = pages.setdefault(page_number, _source_pages.read_page(
+                oplog.source_page_root(), source["key"], page_number))
+            member = members[offset]
+            origin = member["origin"]
+            event = chatlog.read_origin(*window, origin)
+            if event is None:
+                return output, f"补回档案位置已丢失：{origin}"
+            event["_history_source"] = "napcat_backfill"
+            event["_history_seq"] = member.get("message_seq")
             arrival = oplog.pending_message(window, member["message_id"], member["time"],
                                             member.get("message_seq"))
             projected = _formal_input(
@@ -321,7 +323,7 @@ def source_status(source: str = "") -> str:
                 return "找不到该窗口或信源 key"
             lines = [_source_status_line(state)]
         else:
-            lines = [_unread_detail_text(detail) for detail in details
+            lines = [_view._unread_detail_text(detail) for detail in details
                      if tuple(detail["window"]) == window]
             lines.extend(_source_status_line(state) for state in sources
                          if tuple(state["window"]) == window
@@ -340,7 +342,7 @@ def source_status(source: str = "") -> str:
                 reason = recovery["gap"].split("; cursor=", 1)[0]
                 gap_counts[reason] = gap_counts.get(reason, 0) + 1
             else:
-                lines.append(_unread_detail_text(detail))
+                lines.append(_view._unread_detail_text(detail))
         for state in sources:
             if state["source_type"] != "napcat_history":
                 continue
@@ -483,7 +485,7 @@ def _formal_input(session: llm.Chat | None, window: tuple, event: dict,
         projection = _view._echo_relation(projection, recorded,
                                           oplog.say_links(_chat_root.AGENT_WINDOW))
     if session is not None:
-        _agent._remember_stream(session, projection, recorded["id"])
+        _view._remember_stream(session, projection, recorded["id"])
     return projection
 
 

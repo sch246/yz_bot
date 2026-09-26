@@ -170,7 +170,14 @@ def _dispatch(event):
     return None
 
 
-dispatch = thread.to_thread(None)(_dispatch)
+def _dispatch_releasing(event):
+    try:
+        return _dispatch(event)
+    finally:
+        context.release_arrival(event)
+
+
+dispatch = thread.to_thread(None)(_dispatch_releasing)
 exec_links = dispatch
 
 

@@ -126,7 +126,6 @@ _window_locks: dict[Any, threading.RLock] = {}
 _window_locks_guard = threading.Lock()
 _arrival_links: dict[int, tuple[dict, str | None]] = {}
 _arrival_links_guard = threading.Lock()
-_ARRIVAL_LINK_LIMIT = 4096
 
 
 def window_lock(key: Any) -> threading.RLock:
@@ -136,11 +135,17 @@ def window_lock(key: Any) -> threading.RLock:
 
 
 def remember_arrival(event: dict, arrival: str | None) -> None:
-    """Keep a bounded strong reference to the router's event-to-arrival decision."""
+    """Keep the decision only for this dispatch; never evict an in-flight capture."""
     with _arrival_links_guard:
         _arrival_links[id(event)] = (event, arrival)
-        if len(_arrival_links) > _ARRIVAL_LINK_LIMIT:
-            _arrival_links.pop(next(iter(_arrival_links)))
+
+
+def release_arrival(event: dict) -> None:
+    """Release a completed dispatch without evicting another in-flight event."""
+    with _arrival_links_guard:
+        linked = _arrival_links.get(id(event))
+        if linked is not None and linked[0] is event:
+            del _arrival_links[id(event)]
 
 
 def event_arrival(event: dict) -> str | None:

@@ -18,7 +18,7 @@ from mods.capture import capture
 from mods.llm import pricing
 
 
-LOAD_AFTER = ("history", "identity", "image", "llm", "oplog", "storage")
+LOAD_AFTER = ("chatlog", "history", "identity", "image", "llm", "oplog", "storage")
 
 IMAGE_MODES = ("off", "lazy", "eager")
 IMAGE_MODE_ALIASES = {"0": "off", "1": "lazy", "2": "eager"}
@@ -415,11 +415,11 @@ def _record_output(window, assistant: dict, calls: list[dict], session=None) -> 
               if session is not None and window == AGENT_WINDOW and session.preserve_native else None)
     if native is not None:
         session.native_sources.add(source)
-        _agent._remember_stream(session, assistant, source)
+        _view._remember_stream(session, assistant, source)
         return source
     projection = _view._output_projection(entry[0], show_thought=session.keep_reasoning if session else True)
     if session is not None:
-        _agent._remember_stream(session, projection, source)
+        _view._remember_stream(session, projection, source)
     return source, projection
 
 
@@ -805,7 +805,8 @@ def on_load(ctx) -> None:
     global settings, prompts, chat_groups, description_cache, llm_config
     from mods import is_available
 
-    missing = [name for name in ("identity", "image", "llm", "storage") if not is_available(name)]
+    missing = [name for name in ("chatlog", "identity", "image", "llm", "storage")
+               if not is_available(name)]
     if missing:
         raise RuntimeError("chat requires available mods: " + ", ".join(missing))
 
@@ -839,9 +840,10 @@ def on_load(ctx) -> None:
                     except Exception:
                         traceback.print_exc()
                         try:
-                            state = oplog.resolve_source(source["key"])
-                            oplog.finish_source(source["key"], gap="本地归档或入列失败；可重试",
-                                                stop_cursor=state["cursor"])
+                            with context.window_lock(tuple(source["window"])):
+                                state = oplog.resolve_source(source["key"])
+                                oplog.finish_source(source["key"], gap="本地归档或入列失败；可重试",
+                                                    stop_cursor=state["cursor"])
                         except Exception:
                             traceback.print_exc()
                         break

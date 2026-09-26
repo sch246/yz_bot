@@ -1,22 +1,12 @@
 from __future__ import annotations
 
-import ast
-from contextvars import ContextVar
-from datetime import datetime, timezone
 import json
 import re
-import threading
-import time
-import traceback
-from typing import Callable
 
-from mods import _source_pages, context, cq, history, identity, image, llm, log, message, msgs, op, oplog, py, storage, text, thread, tools as tool_modules
-from mods.command import command
-from mods.capture import capture
-from mods.llm import pricing
+from mods import context, image, llm, message, oplog
 
 import mods.chat as _chat_root
-from . import view as _view, reader as _reader, agent as _agent, subcommands as _subcommands
+from . import view as _view, reader as _reader
 
 def _stream_results(window, binding):
     def record(source: str, results: list[llm.ToolCallResult],
@@ -33,7 +23,7 @@ def _stream_results(window, binding):
                     raise RuntimeError("刚写入的模型输出无法反查")
                 tag = _view._event_refs(found[0])
                 session.messages.append(tag)
-                _remember_stream(session, tag, source)
+                _view._remember_stream(session, tag, source)
             return
         returns = [{"position": position, "name": result.name,
                     "arguments": result.arguments, "content": result.content,
@@ -43,14 +33,14 @@ def _stream_results(window, binding):
         if window == _chat_root.AGENT_WINDOW and binding.session.reads_window_mail:
             if source in session.native_sources and len(native_results) == len(results):
                 for message, result in zip(native_results, returns):
-                    _remember_stream(session, message, recorded["id"])
+                    _view._remember_stream(session, message, recorded["id"])
                     _credit_recall(session, result, message)
                 found, missing = oplog.recall_events(window, [source])
                 if missing:
                     raise RuntimeError("刚写入的模型输出无法反查")
                 tag = _view._event_refs(found[0], recorded)
                 session.messages.append(tag)
-                _remember_stream(session, tag, source)
+                _view._remember_stream(session, tag, source)
             else:
                 projection = _view._result_projection(recorded, oplog.say_links(window))
                 session.pending_results.append((recorded, projection))
@@ -62,10 +52,6 @@ def _trusted_stream_ids(session: llm.Chat) -> set[str]:
     _prune_stream_ids(session)
     return {event_id for message in session.messages
             if (event_id := _stream_id(session, message)) is not None}
-
-
-def _remember_stream(session: llm.Chat, message: dict, event_id: str) -> None:
-    session.stream_ids[id(message)] = (message, event_id)
 
 
 def _stream_id(session: llm.Chat, message: dict) -> str | None:
@@ -136,13 +122,13 @@ def _drive_agent(model: str | None, window: tuple) -> None:
             finally:
                 context.set_agent_mode(False)
                 context.set_current(origin)
+            turn.requested_reads.clear()
             if turn.cancelled:
                 return
             turn.associated_windows.intersection_update(
-                {window for window, _count, active in oplog.pending_summary() if active}
-                | {tuple(request["window"]) for request in turn.requested_reads})
+                {window for window, _count, active in oplog.pending_summary() if active})
             if not context.finish_turn(_chat_root.AGENT_WINDOW, turn,
-                                       lambda: oplog.has_unnotified() or bool(turn.requested_reads)):
+                                       oplog.has_unnotified):
                 return
     finally:
         image.end_conversation(image_ledger)
@@ -187,7 +173,7 @@ def _run_agent(model: str | None, turn) -> bool:
     messages = []
     for entry, projection in rows:
         messages.append(projection)
-        _remember_stream(session, projection, entry["id"])
+        _view._remember_stream(session, projection, entry["id"])
     if not messages and not turn.requested_reads:
         return True
     _chat_root._activate_chat(session, _view._close_with_user(messages), read_mail=True)
@@ -207,7 +193,7 @@ def _run_agent(model: str | None, turn) -> bool:
 
     session.on_output = record_output
     session.add_context_provider(_agent_provider(turn, session))
-    session.add_hint(_view._pending_hint)
+    session.add_hint(_reader._pending_hint)
     session.add_hint(lambda: _pressure_hint(turn._chat_usage_tokens, _chat_root.limit()[1],
                                             _chat_root.window_setting("pressure_percent")))
     session.should_stop = lambda: turn.cancelled
@@ -237,7 +223,7 @@ def _agent_provider(turn, session: llm.Chat):
             pending = session.pending_results
             produced = [projection for _entry, projection in pending]
             for entry, projection in pending:
-                _remember_stream(session, projection, entry["id"])
+                _view._remember_stream(session, projection, entry["id"])
                 for result in entry["returns"]:
                     _credit_recall(session, result, projection)
             session.pending_results = []
@@ -248,7 +234,7 @@ def _agent_provider(turn, session: llm.Chat):
                 turn.associated_windows.update(map(tuple, notice["windows"]))
                 projection = _view._notification_projection(notice)
                 produced.append(projection)
-                _remember_stream(session, projection, notice["id"])
+                _view._remember_stream(session, projection, notice["id"])
             # WHY: 同一请求边界先交付完整 R 与新通知，再按安排顺序兑现本批全部读取。
             while turn.requested_reads:
                 request = turn.requested_reads.pop(0)

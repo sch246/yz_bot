@@ -148,7 +148,12 @@ def _assert_settled(rows: list[dict]) -> None:
             returned.setdefault(result["source"], set()).update(
                 item["position"] for item in result["returns"])
     for row in rows:
-        if row["kind"] == "output" and set(range(len(row["actions"]))) != returned.get(row["id"], set()):
+        if row["kind"] != "output":
+            continue
+        assistant = row.get("assistant")
+        calls = (assistant.get("tool_calls") or [] if isinstance(assistant, dict)
+                 else row.get("actions") or [])
+        if set(range(len(calls))) != returned.get(row["id"], set()):
             raise RuntimeError("model action has no durable result; checkpoint is unsafe")
 
 
@@ -462,8 +467,9 @@ def _run_locked(prepared: Path, output: Path, kind: str, target: int, bot_id: in
             or min(max_calls, max_prompt_tokens, max_completion_tokens,
                    max_output_tokens_per_call) <= 0):
         raise ValueError("target, bot id, bot name and all budgets must be valid")
-    if connect._server is not None or message._worker is not None or llm.client is not None:
-        raise RuntimeError("run requires a fresh process without a Bot listener, sender or LLM client")
+    if (connect._server is not None or message._worker is not None or llm.client is not None
+            or storage._worker is not None or storage._observer is not None):
+        raise RuntimeError("run requires a fresh process without Bot or storage workers")
     manifest = json.loads((prepared / "manifest.json").read_text(encoding="utf-8"))
     if (manifest.get("schema") != 1 or manifest.get("model") != MODEL
             or manifest.get("prompt_mode") != PROMPT_MODE

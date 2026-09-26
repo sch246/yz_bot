@@ -73,7 +73,10 @@ The selected strategy and its text hash are recorded in `run_manifest.json`;
 ```
 
 Values are literal; no `.env`, production `config.json`, or production storage
-is loaded. Put the configuration in a private file with restrictive permissions.
+is loaded. `run` and `resume` require a fresh process with no Bot listener,
+sender, LLM client, or storage background worker/observer; they refuse to swap
+storage bindings in a partially started Bot. Put the configuration in a private
+file with restrictive permissions.
 `run` requires explicit paid-call confirmation and all three positive budgets:
 
 ```sh

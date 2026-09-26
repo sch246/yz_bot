@@ -1,22 +1,12 @@
 from __future__ import annotations
 
-import ast
-from contextvars import ContextVar
-from datetime import datetime, timezone
 import json
 import re
-import threading
 import time
-import traceback
-from typing import Callable
 
-from mods import _source_pages, context, cq, history, identity, image, llm, log, message, msgs, op, oplog, py, storage, text, thread, tools as tool_modules
-from mods.command import command
-from mods.capture import capture
-from mods.llm import pricing
+from mods import context, cq, history, identity, message, msgs, oplog, storage
 
 import mods.chat as _chat_root
-from . import view as _view, reader as _reader, agent as _agent, subcommands as _subcommands
 
 
 def has_at(user_id: int):
@@ -135,22 +125,54 @@ def _model_event(event: dict, in_group: bool) -> dict | None:
     return event2chat(event, in_group)
 
 
+def _unread_detail_text(detail: dict, *, include_wakes: bool = True) -> str:
+    window = detail["window"]
+    target = ("g" if window[0] == "group" else "u") + str(window[1])
+    sources = ""
+    if include_wakes:
+        # WHY: notification 会持久化当时的 unread 快照；旧快照没有 ordinal，
+        # 而且重建历史通知时本就不展示这份已过期的唤醒位置。
+        sources = ", ".join(
+            f"{item['kind']}"
+            + (f" 作者={item['user_id']}" if item.get("user_id") is not None else "")
+            + f" 时间={item['time']}"
+            + (f" 未读序号={item['ordinal']}" if item.get("ordinal") is not None else "")
+            for item in detail["wake_sources"])
+    recovery = detail.get("recovery")
+    extra = ((f" 补回未读={recovery['remaining']} 补回状态={recovery['state']}"
+              + (f" 缺口={recovery['gap']}" if recovery.get("gap") else ""))
+             if recovery else "")
+    return (f"{target} 未读={detail['unread']} 普通={detail['ordinary']} "
+            f"@/提及={detail['mentions']} 其他唤醒={detail['other_wakes']}"
+            + (f" 最近唤醒：{sources}" if include_wakes and sources else "") + extra)
+
+
+def _activation_text(item: dict) -> str:
+    window = item["window"]
+    target = ("g" if window[0] == "group" else "u") + str(window[1])
+    return f"{target} {item['kind']} 作者={item.get('user_id')} 时间={item.get('time')}"
+
+
+def _remember_stream(session, message: dict, event_id: str) -> None:
+    session.stream_ids[id(message)] = (message, event_id)
+
+
 def _notification_projection(entry: dict) -> dict:
     details = entry.get("unread", ())
     if details:
         shown = []
         for detail in details:
-            candidate = "；".join([*shown, _reader._unread_detail_text(detail, include_wakes=False)])
+            candidate = "；".join([*shown, _unread_detail_text(detail, include_wakes=False)])
             if _chat_root.count_tokens(candidate) > _chat_root.NOTICE_TOKENS - 150:
                 break
-            shown.append(_reader._unread_detail_text(detail, include_wakes=False))
+            shown.append(_unread_detail_text(detail, include_wakes=False))
         omitted = len(details) - len(shown)
         listing = "；".join(shown) + (f"；还有 {omitted} 个窗口未列出，用 status() 查看"
                                    if omitted else "")
     else:
         listing = "、".join(f"{window[0]}:{window[1]}" for window in entry["windows"])
     activations = entry.get("activations", ())
-    activation_listing = ("；".join(_reader._activation_text(item) for item in activations)
+    activation_listing = ("；".join(_activation_text(item) for item in activations)
                           if activations else "旧版通知未记录逐条唤醒")
     content = (f"[{entry['id']}] 新召唤通知（创建时快照，未读序号可能已变化）。当时全部未读唤醒：{activation_listing}。"
                f"未读概况：{listing}。"
@@ -159,40 +181,6 @@ def _notification_projection(entry: dict) -> dict:
                "read_messages 按 message_id 选择档案。通知已看见不等于消息已读；"
                "未读红点不会自行反复唤醒，之后的新唤醒仍会再次带上这份完整未读集合。")
     return {"role": "user", "content": content}
-
-
-def _pending_hint() -> str:
-    rows = _reader.unread_details()
-    all_sources = oplog.sources()
-    latest = {tuple(source["window"]): source["key"] for source in all_sources
-              if source["source_type"] in ("napcat_boot", "napcat_history")}
-    independent = [source for source in all_sources
-                   if source["source_type"] == "napcat_history"
-                   and (source["remaining"] or source["state"] != "complete")
-                   and (source["remaining"] or latest[tuple(source["window"])] == source["key"])]
-    if not rows and not independent:
-        return ""
-    shown = []
-    for detail in rows:
-        if len(shown) >= 10 or _chat_root.count_tokens("；".join(_reader._unread_detail_text(item, include_wakes=False)
-                                                 for item in [*shown, detail])) > _chat_root.NOTICE_TOKENS - 150:
-            break
-        shown.append(detail)
-    tail = f"；另有 {len(rows) - len(shown)} 个窗口，用 status() 查看" if len(rows) > len(shown) else ""
-    source_lines = []
-    for source in independent[:3]:
-        mentions = [f"{ordinal}@{member.get('time')}"
-                    for ordinal, (_page, _offset, member) in enumerate(
-                        _reader._source_unread_members(source), 1) if member.get("mentioned")]
-        source_lines.append(f"{source['name']} key={source['key']} 未读={source['remaining']} "
-                            f"提及={source['mention_count'] - source['read_mention_count']} "
-                            f"提及未读序号@时间={','.join(mentions)} 状态={source['state']}"
-                            + (f" 缺口={source['gap']}" if source['gap'] else ""))
-    if len(independent) > 3:
-        source_lines.append(f"另有 {len(independent) - 3} 个信源，用 status() 查看")
-    parts = [*(_reader._unread_detail_text(detail) for detail in shown), tail, *source_lines]
-    return _chat_root.bounded_excerpt("待正式读取（当前快照；take 执行时重算序号）："
-                           + "；".join(part for part in parts if part), _chat_root.NOTICE_TOKENS)
 
 
 def _message_cost(converted: dict) -> int:
@@ -375,7 +363,16 @@ def agent_rows(max_tokens: int, max_events: int, *, model: str | None,
         rows, _used, _blocked = _stream_rows(
             _chat_root.AGENT_WINDOW, max_tokens, max_events,
             native_model=model, show_thought=show_thought, keep_latest=True)
-        data["history_start"] = rows[0][0]["id"] if rows else None
+        start = rows[0][0]["id"] if rows else None
+        if rows and rows[0][0]["kind"] == "result":
+            entries = oplog.events(_chat_root.AGENT_WINDOW)
+            position = next((index for index, entry in enumerate(entries)
+                             if entry["id"] == start), None)
+            if (position is not None and position > 0
+                    and entries[position - 1]["kind"] == "output"
+                    and rows[0][0].get("source") == entries[position - 1]["id"]):
+                start = entries[position - 1]["id"]
+        data["history_start"] = start
         if turn is not None:
             turn.history_start = data["history_start"]
         storage.save()

@@ -248,13 +248,18 @@ def recv(event: dict | None):
         return "heartbeat"
     if msgs.is_notify(event) and event.get("sub_type") == "input_status":
         return "input-status"
+    route = None
     try:
-        return _route(event)
+        route = _route(event)
+        return route
     except context.InteractionCancelled:
         return "cancelled"
     except Exception as error:
         _report_error(error)
         return "error"
+    finally:
+        if route != "link":
+            context.release_arrival(event)
 
 
 def run() -> None:

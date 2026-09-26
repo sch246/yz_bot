@@ -7,7 +7,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 
-from mods import _napcat_history, _source_pages, chatlog, oplog
+from mods import _napcat_history, _source_pages, chatlog, context, oplog
 
 
 logger = logging.getLogger(__name__)
@@ -68,8 +68,9 @@ def recover_source(source: dict, call_api, *, manual: bool = False) -> dict:
                 cursor, orphan = _source_pages.read_page_info(root, key, state["pages"])
             except (FileNotFoundError, _source_pages.IncompletePageError):
                 break
-            state = oplog.publish_source_page(key, state["pages"], cursor, len(orphan),
-                                              sum(member.get("mentioned", False) for member in orphan))
+            with context.window_lock((kind, target)):
+                state = oplog.publish_source_page(key, state["pages"], cursor, len(orphan),
+                                                  sum(member.get("mentioned", False) for member in orphan))
             _source_pages.delete_pending(root, key, state["pages"] - 1)
 
         def save_page(rows: list[dict]) -> None:
@@ -77,28 +78,29 @@ def recover_source(source: dict, call_api, *, manual: bool = False) -> dict:
             from mods import chat, msgs
 
             _source_pages.write_pending(root, key, state["pages"], rows)
-            origins = chatlog.append_backfill_page(kind, target, rows)
-            if len(origins) != len(rows):
-                raise RuntimeError("回填档案未逐条返回稳定位置")
-            members = []
-            for row, origin in zip(rows, origins):
-                pending = oplog.pending_message((kind, target), row["message_id"], row["time"],
-                                                row["message_seq"])
-                boundary = state["pending_boundary"]
-                if pending is not None and boundary is not None and oplog.arrival_before_or_at(pending, boundary):
-                    continue
-                if prior_members is not None and prior_members.execute(
-                        "SELECT 1 FROM members WHERE origin=?", (origin,)).fetchone():
-                    continue
-                member = {"origin": origin, "message_id": row["message_id"],
-                          "message_seq": int(row["message_seq"]), "time": int(row["time"]),
-                          "mentioned": chat.reader._addressed(row, msgs.body(row))}
-                members.append(member)
-            cursor = str(rows[0]["message_seq"])
-            _source_pages.write_page(root, key, state["pages"], members, cursor=cursor)
-            state = oplog.publish_source_page(key, state["pages"], cursor, len(members),
-                                              sum(member["mentioned"] for member in members))
-            _source_pages.delete_pending(root, key, state["pages"] - 1)
+            with context.window_lock((kind, target)):
+                origins = chatlog.append_backfill_page(kind, target, rows)
+                if len(origins) != len(rows):
+                    raise RuntimeError("回填档案未逐条返回稳定位置")
+                members = []
+                for row, origin in zip(rows, origins):
+                    pending = oplog.pending_message((kind, target), row["message_id"], row["time"],
+                                                    row["message_seq"])
+                    boundary = state["pending_boundary"]
+                    if pending is not None and boundary is not None and oplog.arrival_before_or_at(pending, boundary):
+                        continue
+                    if prior_members is not None and prior_members.execute(
+                            "SELECT 1 FROM members WHERE origin=?", (origin,)).fetchone():
+                        continue
+                    member = {"origin": origin, "message_id": row["message_id"],
+                              "message_seq": int(row["message_seq"]), "time": int(row["time"]),
+                              "mentioned": chat.reader._addressed(row, msgs.body(row))}
+                    members.append(member)
+                cursor = str(rows[0]["message_seq"])
+                _source_pages.write_page(root, key, state["pages"], members, cursor=cursor)
+                state = oplog.publish_source_page(key, state["pages"], cursor, len(members),
+                                                  sum(member["mentioned"] for member in members))
+                _source_pages.delete_pending(root, key, state["pages"] - 1)
 
         pending = _source_pages.read_pending(root, key, state["pages"])
         if pending is not None:
@@ -117,10 +119,12 @@ def recover_source(source: dict, call_api, *, manual: bool = False) -> dict:
             start_seq=state["cursor"], count=PAGE_SIZE, max_requests=request_budget)
         gap = ("远端历史到尽头但没有遇到本地锚点" if state["fetch_anchor"] is not None
                and not result["anchor_found"] else None)
-        return oplog.finish_source(key, gap=gap, stop_cursor=result["oldest_seq"])
+        with context.window_lock((kind, target)):
+            return oplog.finish_source(key, gap=gap, stop_cursor=result["oldest_seq"])
     except _napcat_history.HistoryGap as error:
-        return oplog.finish_source(key, gap=f"{error.reason}; cursor={error.cursor}",
-                                   stop_cursor=error.cursor)
+        with context.window_lock((kind, target)):
+            return oplog.finish_source(key, gap=f"{error.reason}; cursor={error.cursor}",
+                                       stop_cursor=error.cursor)
     except Exception:
         logger.exception("NapCat source recovery stopped before a durable page commit")
         raise
