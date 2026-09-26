@@ -23,6 +23,7 @@
 - [压缩与反查：现状、目标与历史](chat-condense.md)（当前机制与已定中心化方向；早期 `condense_ops`、`floor` 和退休推导另见[历史归档](chat-condense-history.md)）
 - [中心化聊天软件：最近预览、顺序拉取与逐页积累](chat-client-reading.md)（中心 reader、有界正式号范围查询、NapCat 预览与补回信源已接线；运行进程尚未切换）
 - [中心 reader 与事件流的低熵收束](reader-low-entropy-refactor.md)（未实施；以 oplog 为唯一未读权威，删除 Mailbox 镜像，收束 reader/meta/provenance 边界）
+- [大文件拆分：先搬家，再简化](split-large-files.md)（未实施；与上一篇同题的对照方案：先把 `chat.py` 等纯搬进文件夹并机械证明未改行为，再逐项拍板 Mailbox 与 oplog 写前校验）
 - [给 agent 做一个聊天软件：主观时间轴，以及它推翻的东西](chat-client-for-an-agent.md)（保留两条时间轴的论点和需复核的推论；新的实施顺序见阅读计划，经历如何遗忘仍未解）
 - [mail 与激活：把「谁进上下文」和「什么让它跑」拆开](mail-and-activation.md)（待办 3b 的第 3 步主动跳过，第 6 步已提交；主会话现改为通知、非消费预览和有界 FIFO 拉取，第 7 步仍等异步回调消费者）
 - [私聊窗口的身份](window-identity.md)（已实现；`user_id` 是作者、`target_id` 是那条私聊，「谁发的」与「发到哪」不再共用一个字段）
