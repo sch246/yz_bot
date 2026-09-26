@@ -187,16 +187,16 @@ cond 或 action 报错会写应用日志并把 traceback 回传当前聊天。co
 - `.chat` 直接发起一次 LLM 请求。
 - `.chattop [月份]` 查看某个自然月累计的调用次数与费用（月份为 1..12 指今年，或 `YYYY-MM`；默认当前月）。
 
-主要入口不是点命令，而是 link 中的 `chatting` 节点。在允许聊天的群或私聊中，以下行为可触发：
+主聊天入口不是点命令，而是 `mods.chat.capture_chat`；旧 `cond()`／`call()` 仅保留公开兼容名。在允许聊天的群或私聊中，以下行为可触发：
 
 - @ Bot；
 - 以“柚子，”开头；
 - 戳一戳 Bot；
 - `#...` 聊天控制命令。
 
-只有戳 Bot 会立即触发 LLM；群内其它成员互戳会记入近期群聊上下文，在下一次聊天触发时以群聊事件的形式提供给模型。
+只有戳 Bot 会立即触发 LLM；群内其它成员互戳会登记为窗口未读，不单独唤醒模型，之后经正式阅读才作为群聊事件进入中心已读流。
 
-主聊天现由一位中心 agent 跨窗口处理。op 专属 `#agent` 查看全局主设置；`#agent use_model [provider/model]`、`#agent use_setting [name]`、`#agent image|reasoning|tools <mode>` 和 `#agent limit <事件数> <token> [提醒百分比]` 修改主设置。`#limit` 是 `#agent limit` 的全局快捷入口；`#use_model`、`#image`、`#prompt` 等旧命令仍只写当前窗口的旧配置，旧值不自动并入中心主设置。`聊天开始/聊天结束`是普通内容。中心开局只看到不含正文的通知快照；尾部 hint 给当前未读提及的时间和未读序号，不显示 QQ `message_id`。`status` 看有序未读成员，`take(source, start=1, count=8)` 按工具执行时当前未读序号选连续范围；已读和跳过不计数，精确 key/arrival/origin/message_id 是高级入口。`mentions` 正式消费至多 500 条未读提及，`pull` 是前缀别名。正式 input 保存发起输出号 `read_by` 和工具名 `read_via`；跨过的已读/跳过桥附属新 input，超过 5 条折叠中间项。`fetch` 建立历史信源；`read_messages` 按窗口的 QQ `message_id` 或档案 `origin` 选取附近记录，也走同一正式阅读路径，命中未读成员时一并消费。`mark_read` 跳过调用时已有的未读成员，保留发起输出号供 `skipped_by` 投影，不伪造 input。`recall_events` 可按正式号、中心半径或起止区间直接返回已读经历。`say` 必须明确 `target="g<群号>"` 或 `target="u<私聊对端号>"`，直接写模型回复正文不会发送。`#hint` 仍是独立的 QQ 收尾状态机制，op 专属，见 [LLM 文档](llm.md)。
+主聊天现由一位中心 agent 跨窗口处理。op 专属 `#agent` 查看全局主设置；`#agent use_model [provider/model]`、`#agent use_setting [name]`、`#agent image|reasoning|tools <mode>` 和 `#agent limit <事件数> <token> [提醒百分比]` 修改主设置。`#limit` 是 `#agent limit` 的全局快捷入口；两个上限只在首次激活时选择历史起点，之后不滑窗；`#agent reset_start` 安排下次激活重选起点。超过提醒阈值会提示占用，达到 token 上限要求模型先压缩但不拦截工具。`#use_model`、`#image`、`#prompt` 等旧命令仍只写当前窗口的旧配置，旧值不自动并入中心主设置。`聊天开始/聊天结束`是普通内容。中心开局只看到不含正文的通知快照；尾部 hint 给当前未读提及的时间和未读序号，不显示 QQ `message_id`。`status` 看有序未读成员，`take(source, start=1, count=8)` 按工具执行时当前未读序号选连续范围；已读和跳过不计数，精确 key/arrival/origin/message_id 是高级入口。`mentions` 选择至多 500 条未读提及，`pull` 是前缀别名；同批安排的阅读在下一 provider 请求前按顺序全部全文登记，没有下一请求则不消费。正式 input 保存发起输出号 `read_by` 和工具名 `read_via`；跨过的已读/跳过桥附属新 input，超过 5 条折叠中间项。`fetch` 建立历史信源；`read_messages` 按窗口的 QQ `message_id` 或档案 `origin` 选取附近记录，也走同一正式阅读路径，命中未读成员时一并消费。`mark_read` 跳过调用时已有的未读成员，保留发起输出号供 `skipped_by` 投影，不伪造 input。`recall_events` 可按正式号、中心半径或起止区间直接返回已读经历。`say` 必须明确 `target="g<群号>"` 或 `target="u<私聊对端号>"`，直接写模型回复正文不会发送。`#hint` 仍是独立的 QQ 收尾状态机制，op 专属，见 [LLM 文档](llm.md)。
 
 LLM 开局默认激活 `meta` 模块，直接获得一个 `.py` 共享环境执行工具和三个工具模块管理工具。system 提示会列出 `mods/tools` 中每个 last-good Python/Markdown 模块的第一行描述；模型用 `load_tools` 把所需模块的余下说明与整组函数激活到当前任务，用 `list_tools` 查看活动状态和磁盘差异，用 `reload_tools` 显式应用修改。现有模块覆盖戳一戳、图片、时间、延时任务、天气、用户 storage、子模型任务分派和 MC 百科查询；不会自动热加载或注入变化提示。历史上明确禁用的工具只在 `mods/tools/disable/README.md` 留有决策记录，仓库中没有对应实现。工具 schema、模块格式、循环回写和高权限边界见独立的 [LLM 文档](llm.md)。
 

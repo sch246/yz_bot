@@ -19,7 +19,7 @@
 - [运行边界与交互测试](docs/runtime.md)：NapCat 接入、真实消息路径，以及如何避免测试影响正在运行的实例。
 - [当前维护队列](docs/working/current-issues.md)：已经确认要修的缺陷、接受的现行约束，以及仍可选的加固项。
 - [旧代码组织调查](docs/working/code-organization-analysis.md)：切换前 `main.py`、`funcs.py`、动态名称环境和 import 副作用的历史摘要。
-- [设计与迁移记录](docs/working/proposals/README.md)：已完成的 Mods 切换记录，以及仍未实现的 Storage 历史、异常日志、权限和多项目共存提案。
+- [设计与迁移记录](docs/working/proposals/README.md)：已完成但尚待部署/重启的中心 reader 收束记录、已完成的 Mods 切换记录，以及仍未实现的 Storage 历史、异常日志、权限和多项目共存提案；代码已实现不等于当前运行进程已切换。
 - [当前 link 反应快照](docs/working/link-reactions.md)：`data/storage/links.json` 中当前动态反应的可读索引；它是会随在线配置变化的工作快照。
 - [命令开发指南](COMMANDS.md)：新增命令时使用的实现级资料。预期交互语义以交互文档为准，当前精确语法以命令 docstring/`.help` 为准；若代码与设计意图冲突，应记录差异，而不是静默任选一边。
 
