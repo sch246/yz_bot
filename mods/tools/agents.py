@@ -72,6 +72,8 @@ def assign_tasks(prompt: str, tasks: str, tools: str, model: str = "deepseek/dee
             session.chat(recall_func=collect)
             _stream.info(f"线程 {worker_id}: LLM 子任务完成")
             return task_value, "".join(pieces).strip()
+        except oplog.PersistenceError:
+            raise
         except Exception as error:
             _stream.info(f"线程 {worker_id}: LLM 子任务失败：{error}")
             return task_value, f"ERROR: {error}"

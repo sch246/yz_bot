@@ -138,6 +138,101 @@ def _validate_read_provenance(entry: dict, indexes: dict[str, dict]) -> None:
         raise ValueError("input read_via is invalid")
 
 
+def _validate(entry: dict, indexes: dict[str, dict], pending: dict[str, dict],
+              coverage_nodes: dict[str, list[str]], arrival_order: dict[str, int],
+              sources: dict[str, dict]) -> None:
+    """Reject an invalid row before either append or replay mutates an index."""
+    kind = entry["kind"]
+    _validate_read_provenance(entry, indexes)
+    if kind in ("source_page", "source_progress", "source_finish", "source_reopen",
+                "source_pulled", "source_mark_read") and entry["source"] not in sources:
+        raise ValueError("source does not exist")
+    if kind == "arrival":
+        if entry["arrival"] in arrival_order:
+            raise ValueError("duplicate arrival")
+        source = entry.get("source")
+        if source is not None and (source not in sources or sources[source]["queue_window"] != entry["window"]):
+            raise ValueError("arrival source does not match its window")
+    elif kind == "source_start":
+        if entry["source"] in sources:
+            raise ValueError("duplicate source")
+    elif kind == "source_page":
+        _validate_source_page(entry, sources[entry["source"]])
+        if "cursor" not in entry:
+            raise ValueError("source page has no cursor")
+    elif kind == "source_progress":
+        state = sources[entry["source"]]
+        if state["state"] != "fetching":
+            raise ValueError("source fetch is not running")
+        if entry["cursor"] is not None and entry["cursor"] != state["cursor"]:
+            raise ValueError("source cursor advances only with a committed page")
+    elif kind == "source_finish":
+        if sources[entry["source"]]["state"] != "fetching":
+            raise ValueError("source fetch is not running")
+        if entry.get("state") not in ("complete", "gap", "failed"):
+            raise ValueError("source finish state is invalid")
+    elif kind == "source_reopen":
+        state = sources[entry["source"]]
+        if state["state"] == "fetching" or state["pulled"]:
+            raise ValueError("only an unpulled sealed source can extend")
+        if entry["cursor"] is None and state["state"] not in ("gap", "failed"):
+            raise ValueError("source has no reliable remote cursor")
+    elif kind == "floor":
+        if entry["before"] is not None and entry["before"] not in arrival_order:
+            raise ValueError("floor arrival does not exist")
+    elif kind == "mark_read":
+        window = tuple(entry["window"])
+        arrivals = entry.get("arrivals")
+        ordered = [arrival for arrival, item in pending.items() if tuple(item["window"]) == window]
+        if (not isinstance(arrivals, list) or not arrivals
+                or len(arrivals) != len(set(arrivals))
+                or ordered[:len(arrivals)] != arrivals):
+            raise ValueError("mark-read must consume one exact pending prefix")
+    elif kind == "source_mark_read":
+        _validate_source_mark_read(entry, sources[entry["source"]], pending)
+    elif kind == "notification_ack":
+        notice = indexes[entry["notification"]]
+        if notice["kind"] != "notification":
+            raise ValueError("notification ack does not name a notification")
+    elif kind == "condensed":
+        if entry["target"] not in indexes:
+            raise ValueError("condensed target does not exist")
+    elif kind == "cover":
+        window = tuple(entry["window"])
+        source = entry["node"].partition("#")[0]
+        if (entry["node"] in coverage_nodes or source not in indexes
+                or tuple(indexes[source]["window"]) != window or any(
+                member not in indexes or not _accessible(window, indexes[member])
+                for member in entry["members"])):
+            raise ValueError("覆盖日志引用了不存在或不可访问的事件")
+    if kind in ("input", "result") and entry.get("arrival") and entry["arrival"] not in pending:
+        raise ValueError("arrival was already consumed or does not exist")
+    if kind == "input" and entry.get("source") and entry["source"] not in sources:
+        raise ValueError("input source does not exist")
+    if kind == "input" and "page" in entry:
+        _validate_source_read(entry, sources[entry["source"]], pending)
+    if "id" in entry:
+        event_id = entry["id"]
+        if not isinstance(entry.get("window"), list):
+            raise ValueError("formal event window is invalid")
+        if not isinstance(event_id, str) or event_id.count("-") != 1:
+            raise ValueError("invalid event id")
+        if event_id in indexes:
+            raise ValueError(f"duplicate event id: {event_id}")
+        day, number = event_id.split("-", 1)
+        if not day.isdecimal() or not number.isdecimal():
+            raise ValueError("invalid event id")
+        if kind == "result" and entry["source"] not in indexes:
+            raise ValueError("result source does not exist")
+        if kind == "output" and isinstance(entry.get("assistant"), dict):
+            if any(not isinstance(call, dict) or "function" not in call
+                   for call in entry["assistant"].get("tool_calls", ())):
+                raise ValueError("output tool calls are invalid")
+        if kind == "input":
+            _input_message_identity(entry, sources)
+        list(_reference_candidates(entry))
+
+
 def _apply(
     entry: dict, recorded: list[dict], indexes: dict[str, dict], windows: dict[tuple, list[dict]],
     counters: dict[str, int], pending: dict[str, dict], covered: dict[tuple, set[str]],
@@ -148,7 +243,6 @@ def _apply(
     arrival_members: dict[str, dict], arrival_skips: dict[str, dict],
     source_arrivals: set[str],
 ) -> None:
-    _validate_read_provenance(entry, indexes)
     if entry["kind"] == "arrival":
         arrival_order[entry["arrival"]] = len(arrival_order)
         arrival_members[entry["arrival"]] = {
@@ -156,16 +250,10 @@ def _apply(
             "origin": entry.get("origin"), "source": entry.get("source"),
             "order": arrival_order[entry["arrival"]],
         }
-        source = entry.get("source")
-        if source is not None:
-            if source not in sources or sources[source]["queue_window"] != entry["window"]:
-                raise ValueError("arrival source does not match its window")
         pending[entry["arrival"]] = entry
         return
     if entry["kind"] == "source_start":
         source = entry["source"]
-        if source in sources:
-            raise ValueError("duplicate source")
         sources[source] = {"key": source, "name": entry["name"], "window": entry["window"],
                            "queue_window": entry.get("queue_window", entry["window"]),
                            "source_type": entry["source_type"], "pulled": False,
@@ -182,7 +270,6 @@ def _apply(
         return
     if entry["kind"] == "source_page":
         state = sources[entry["source"]]
-        _validate_source_page(entry, state)
         state["page_counts"].append(entry["member_count"])
         state["pages"] += 1
         state["member_count"] += entry["member_count"]
@@ -197,8 +284,6 @@ def _apply(
         return
     if entry["kind"] == "source_finish":
         state = sources[entry["source"]]
-        if state["state"] != "fetching":
-            raise ValueError("source fetch is not running")
         state["state"] = entry["state"]
         state["gap"] = entry.get("gap")
         state["error"] = entry.get("error")
@@ -208,8 +293,6 @@ def _apply(
         return
     if entry["kind"] == "source_reopen":
         state = sources[entry["source"]]
-        if state["state"] == "fetching" or state["pulled"]:
-            raise ValueError("only an unpulled sealed source can extend")
         state["state"] = "fetching"
         state["cursor"] = entry["cursor"]
         state["fetch_anchor"] = entry.get("fetch_anchor")
@@ -237,12 +320,6 @@ def _apply(
         # 所以它没有正式事件号。原文权威仍是 chatlog，之后可按 message_id/origin 查回。
         window = tuple(entry["window"])
         arrivals = entry["arrivals"]
-        ordered = [arrival for arrival, item in pending.items()
-                   if tuple(item["window"]) == window]
-        if (not isinstance(arrivals, list) or not arrivals
-                or len(arrivals) != len(set(arrivals))
-                or ordered[:len(arrivals)] != arrivals):
-            raise ValueError("mark-read must consume one exact pending prefix")
         for arrival in arrivals:
             marked = pending.pop(arrival)
             arrival_skips[arrival] = entry
@@ -253,7 +330,6 @@ def _apply(
     if entry["kind"] == "source_mark_read":
         # 历史信源的已读坐标只由日志重放派生；和 window mark_read 一样不伪造 input。
         state = sources[entry["source"]]
-        _validate_source_mark_read(entry, state, pending)
         positions = entry.get("positions")
         if positions is None:
             positions = [list(position) for position in list(_source_positions(state))[:entry["count"]]]
@@ -270,8 +346,6 @@ def _apply(
         return
     if entry["kind"] == "notification_ack":
         notice = indexes[entry["notification"]]
-        if notice["kind"] != "notification":
-            raise ValueError("notification ack does not name a notification")
         notice["acknowledged"] = True
         notified.update(notice["arrivals"])
         return
@@ -282,12 +356,6 @@ def _apply(
         return
     if entry["kind"] == "cover":
         window = tuple(entry["window"])
-        source = entry["node"].partition("#")[0]
-        if (entry["node"] in coverage_nodes or source not in indexes
-                or tuple(indexes[source]["window"]) != window or any(
-                member not in indexes or not _accessible(window, indexes[member])
-                for member in entry["members"])):
-            raise ValueError("覆盖日志引用了不存在或不可访问的事件")
         # WHY: 覆盖只改变默认投影，原事件仍须能按稳定号反查；多次覆盖同一成员
         # 只是多条结论边，不能把它从原索引里删除或改写。
         coverage_nodes[entry["node"]] = list(entry["members"])
@@ -304,11 +372,7 @@ def _apply(
         entry["body"] = assistant.get("content") or ""
         entry["thought_present"] = bool(assistant.get("reasoning_content"))
         entry["actions"] = [call["function"] for call in assistant.get("tool_calls", ())]
-    if source_read:
-        _validate_source_read(entry, sources[entry["source"]], pending)
     event_id = entry["id"]
-    if event_id in indexes:
-        raise ValueError(f"duplicate event id: {event_id}")
     mentions = []
     seen_mentions = set()
     for reference in _reference_candidates(entry):

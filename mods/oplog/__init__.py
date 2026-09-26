@@ -46,10 +46,18 @@ _seen_messages: set[tuple[tuple, str, int, str | None]] = set()
 _failed = False
 
 from .replay import (
-    _accessible, _apply, _input_message_identity, _message_identity,
-    _reference_candidates, _source_positions, _validate_read_provenance,
-    _validate_source_mark_read, _validate_source_page, _validate_source_read,
+    _accessible, _apply, _message_identity, _reference_candidates, _validate,
 )
+
+
+class PersistenceError(RuntimeError):
+    """The durable stream is uncertain; no further actions may be dispatched."""
+
+
+def raise_if_failed() -> None:
+    with _lock:
+        if _failed:
+            raise PersistenceError("event stream write failed; refusing further actions")
 
 
 def _directory() -> Path:
@@ -89,6 +97,7 @@ def _restore() -> None:
         complete = data.rfind(b"\n") + 1
         for line in data[:complete].splitlines():
             entry = json.loads(line.decode("utf-8"))
+            _validate(entry, indexes, pending, coverage_nodes, arrival_order, sources)
             _apply(entry, restored, indexes, windows, counters, pending, covered, coverage_nodes,
                    origins, mentioned_by, notified, arrival_order, sources, seen_messages,
                    arrival_members, arrival_skips, source_arrivals)
@@ -211,35 +220,10 @@ def iter_events(start: str | None = None, stop: str | None = None) -> Iterable[d
 
 def _append(entry: dict, day: str) -> None:
     global _failed
-    # WHY: 追加可能在写入或 fsync 中途失败，磁盘上可能已有这条或残尾；继续行动会让
+    # WHY: 追加、fsync 或落盘后的索引应用可能失败，磁盘上可能已有这条或残尾；继续行动会让
     # 外部副作用失去可信的来源记录。保持失败直到重启恢复检查磁盘，而非在进程内重试编号。
-    if _failed:
-        raise RuntimeError("event stream write failed; refusing further actions")
-    _validate_read_provenance(entry, _by_id)
-    if entry["kind"] == "arrival":
-        source = entry.get("source")
-        if source is not None:
-            if source not in _sources or _sources[source]["queue_window"] != entry["window"]:
-                raise ValueError("arrival source does not match its window")
-    if entry["kind"] == "source_start" and entry["source"] in _sources:
-        raise ValueError("duplicate source")
-    if entry["kind"] == "source_page":
-        _validate_source_page(entry, _sources[entry["source"]])
-    if entry["kind"] == "input" and "page" in entry:
-        _validate_source_read(entry, _sources[entry["source"]], _pending)
-    if entry["kind"] == "mark_read":
-        window = tuple(entry["window"])
-        ordered = [arrival for arrival, item in _pending.items()
-                   if tuple(item["window"]) == window]
-        arrivals = entry.get("arrivals")
-        if (not isinstance(arrivals, list) or not arrivals
-                or len(arrivals) != len(set(arrivals))
-                or ordered[:len(arrivals)] != arrivals):
-            raise ValueError("mark-read must consume one exact pending prefix")
-    if entry["kind"] == "source_mark_read":
-        _validate_source_mark_read(entry, _sources[entry["source"]], _pending)
-    if entry["kind"] in ("input", "result") and entry.get("arrival") and entry["arrival"] not in _pending:
-        raise ValueError("arrival was already consumed or does not exist")
+    raise_if_failed()
+    _validate(entry, _by_id, _pending, _coverage_nodes, _arrival_order, _sources)
     path = _root / f"{day}.jsonl"
     line = (json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
     try:
@@ -249,14 +233,16 @@ def _append(entry: dict, day: str) -> None:
             stream.write(line)
             stream.flush()
             os.fsync(stream.fileno())
-    except BaseException:
+        _apply(entry, _events, _by_id, _windows, _next, _pending, _covered, _coverage_nodes,
+               _origins, _mentioned_by, _notified, _arrival_order, _sources,
+               _seen_messages, _arrival_members, _arrival_skips, _source_arrivals)
+        if entry.get("id") and entry.get("arrival"):
+            _by_arrival.setdefault(entry["arrival"], entry)
+    except BaseException as error:
         _failed = True
-        raise
-    _apply(entry, _events, _by_id, _windows, _next, _pending, _covered, _coverage_nodes,
-           _origins, _mentioned_by, _notified, _arrival_order, _sources,
-           _seen_messages, _arrival_members, _arrival_skips, _source_arrivals)
-    if entry.get("id") and entry.get("arrival"):
-        _by_arrival.setdefault(entry["arrival"], entry)
+        if not isinstance(error, Exception):
+            raise
+        raise PersistenceError("event stream write failed; refusing further actions") from error
 
 
 def _ordered_pending(window: tuple | None = None) -> list[dict]:
@@ -434,10 +420,6 @@ def start_source(name: str, window: tuple, source_type: str, *, anchor: str | No
 def source_progress(source: str, *, cursor: str | None = None, gap: str | None = None) -> dict:
     with _lock:
         _restore()
-        if _sources[source]["state"] != "fetching":
-            raise ValueError("source fetch is not running")
-        if cursor is not None and cursor != _sources[source]["cursor"]:
-            raise ValueError("source cursor advances only with a committed page")
         _append({"kind": "source_progress", "source": source,
                  "cursor": _sources[source]["cursor"], "gap": gap},
                 datetime.now().strftime("%Y%m%d"))
@@ -459,8 +441,6 @@ def finish_source(source: str, *, gap: str | None = None, error: str | None = No
                   stop_cursor: str | None = None) -> dict:
     with _lock:
         _restore()
-        if _sources[source]["state"] != "fetching":
-            raise ValueError("source fetch is not running")
         state = "failed" if error is not None else "gap" if gap is not None else "complete"
         _append({"kind": "source_finish", "source": source, "state": state,
                  "gap": gap, "error": error, "stop_cursor": stop_cursor},
@@ -474,8 +454,6 @@ def reopen_source(source: str, *, fetch_anchor: str | None = None) -> dict:
         _restore()
         state = _sources[source]
         cursor = state["stop_cursor"] or state["cursor"]
-        if cursor is None and state["state"] not in ("gap", "failed"):
-            raise ValueError("source has no reliable remote cursor")
         _append({"kind": "source_reopen", "source": source, "cursor": cursor,
                  "fetch_anchor": fetch_anchor}, datetime.now().strftime("%Y%m%d"))
         return _source_snapshot(_sources[source])

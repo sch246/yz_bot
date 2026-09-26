@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from openai import OpenAI
 
 from mods import image, watchdog
+from mods.oplog import PersistenceError, raise_if_failed
 from . import console
 from .models import (
     BYTECAT_PROVIDER_CONFIG,
@@ -764,6 +765,7 @@ class LLMClient:
                 return
             results: list[ToolCallResult] = []
             for position, (call, tool, arguments) in enumerate(pending_calls):
+                raise_if_failed()
                 if should_stop is not None and should_stop():
                     # WHY: 这是 ^C 够得到的最后一个检查点。工具是同步执行的，原先只在这一批
                     # 全部跑完之后才有机会看这个标记——于是这批里只要有一个调用卡住，排在它
@@ -781,6 +783,8 @@ class LLMClient:
                     if on_action is not None:
                         on_action(f"{output_id}#{position + 1}" if output_id is not None else None)
                     content = str(tool.call(**arguments))
+                except PersistenceError:
+                    raise
                 except Exception as error:
                     if self.strict_tools:
                         raise
@@ -977,6 +981,8 @@ class Chat:
                     callback(chunk)
                 results.append(chunk)
             return results
+        except PersistenceError:
+            raise
         except Exception as error:
             if self.fail_fast:
                 raise
