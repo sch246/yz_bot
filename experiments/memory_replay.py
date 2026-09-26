@@ -457,6 +457,14 @@ def _fork(source: Path, output: Path) -> dict:
     return {"status": "forked", "segment": checkpoint["segment"]}
 
 
+def _require_fresh_process() -> None:
+    from mods import connect, llm, message, storage
+
+    if (connect._server is not None or message._worker is not None or llm.client is not None
+            or storage._worker is not None or storage._observer is not None):
+        raise RuntimeError("offline replay requires a fresh process without Bot or storage workers")
+
+
 def _run_locked(prepared: Path, output: Path, kind: str, target: int, bot_id: int,
                 bot_name: str, config: dict, max_calls: int, max_prompt_tokens: int,
                 max_completion_tokens: int, max_output_tokens_per_call: int,
@@ -467,9 +475,7 @@ def _run_locked(prepared: Path, output: Path, kind: str, target: int, bot_id: in
             or min(max_calls, max_prompt_tokens, max_completion_tokens,
                    max_output_tokens_per_call) <= 0):
         raise ValueError("target, bot id, bot name and all budgets must be valid")
-    if (connect._server is not None or message._worker is not None or llm.client is not None
-            or storage._worker is not None or storage._observer is not None):
-        raise RuntimeError("run requires a fresh process without Bot or storage workers")
+    _require_fresh_process()
     manifest = json.loads((prepared / "manifest.json").read_text(encoding="utf-8"))
     if (manifest.get("schema") != 1 or manifest.get("model") != MODEL
             or manifest.get("prompt_mode") != PROMPT_MODE
@@ -741,6 +747,7 @@ def _run_locked(prepared: Path, output: Path, kind: str, target: int, bot_id: in
 def _doctor(output: Path) -> dict:
     from mods import connect, message, oplog, storage
 
+    _require_fresh_process()
     root = output / "runtime"
     root.mkdir(mode=0o700)
     old_storage_root = storage.root_path
@@ -764,8 +771,6 @@ def _doctor(output: Path) -> dict:
     try:
         for name, value in old_oplog_state.items():
             setattr(oplog, name, None if name == "_root" else type(value)())
-        if connect._server is not None or message._worker is not None:
-            raise AssertionError("doctor has a live listener or send worker")
         try:
             message.sendmsg("synthetic probe", group_id=1)
         except AssertionError as error:

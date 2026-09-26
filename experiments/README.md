@@ -21,6 +21,7 @@ python experiments/memory_replay.py prepare \
 `doctor` (also the default command) creates synthetic records and probes the
 production oplog FIFO without a model or sender. It prints its temporary
 output path; `doctor --output /private/new-directory` selects one explicitly.
+It requires a fresh process without Bot or storage background workers.
 
 `run` uses the production center reader, context assembly, tool binding,
 ordered unread set, oplog, cover/recall, hint, and default base prompt. It adds one common replay
@@ -73,7 +74,7 @@ The selected strategy and its text hash are recorded in `run_manifest.json`;
 ```
 
 Values are literal; no `.env`, production `config.json`, or production storage
-is loaded. `run` and `resume` require a fresh process with no Bot listener,
+is loaded. `run`, `resume`, and `doctor` require a fresh process with no Bot listener,
 sender, LLM client, or storage background worker/observer; they refuse to swap
 storage bindings in a partially started Bot. Put the configuration in a private
 file with restrictive permissions.

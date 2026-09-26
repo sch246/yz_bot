@@ -125,7 +125,7 @@ def _run_bash(command_text: str):
     return cq.escape2(output) if output else None
 
 
-def _route(event: dict) -> str | None:
+def _route_event(event: dict) -> str | None:
     context.set_current(event)
     chatlog = _optional("chatlog")
     chat = _optional("chat")
@@ -238,6 +238,17 @@ def _route(event: dict) -> str | None:
     return None
 
 
+def _route(event: dict) -> str | None:
+    """Release synchronous arrivals here; asynchronous link releases on completion."""
+    route = None
+    try:
+        route = _route_event(event)
+        return route
+    finally:
+        if route != "link":
+            context.release_arrival(event)
+
+
 def recv(event: dict | None):
     """Consume one raw OneBot event without hiding the route ordering."""
     if event is None:
@@ -248,18 +259,13 @@ def recv(event: dict | None):
         return "heartbeat"
     if msgs.is_notify(event) and event.get("sub_type") == "input_status":
         return "input-status"
-    route = None
     try:
-        route = _route(event)
-        return route
+        return _route(event)
     except context.InteractionCancelled:
         return "cancelled"
     except Exception as error:
         _report_error(error)
         return "error"
-    finally:
-        if route != "link":
-            context.release_arrival(event)
 
 
 def run() -> None:
