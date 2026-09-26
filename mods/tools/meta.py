@@ -160,7 +160,6 @@ from mods.tools import current_binding
 
 _offline_send_sink: ContextVar[object | None] = ContextVar("meta_offline_send_sink", default=None)
 _DEFAULT_PULL_COUNT = 8
-_STATUS_TOKENS = 3000
 
 
 def _tool_window():
@@ -238,21 +237,6 @@ def load_tools(names: list[str]) -> str:
     return _format_results(current_binding().load(names))
 
 
-def _select_events(window, *, ids=None, anchor: str = "", before: int = 0, after: int = 0,
-                   start: str = "", end: str = "", kinds: str = "", source: str = ""):
-    from mods import chat, oplog
-
-    if not isinstance(kinds, str):
-        raise ValueError("kinds 只能包含 input、output、result、notification")
-    if not isinstance(source, str):
-        raise ValueError("source 必须是 g<群号> 或 u<私聊对端号>")
-    selected_kinds = [kind.strip() for kind in kinds.split(",")] if kinds else []
-    if any(not kind for kind in selected_kinds):
-        raise ValueError("kinds 只能包含 input、output、result、notification")
-    source_window = chat.parse_target(source) if source else None
-    return oplog.select_events(window, ids=ids, anchor=anchor, before=before, after=after,
-                               start=start, end=end, kinds=selected_kinds,
-                               source_window=source_window)
 
 
 def recall_events(ids: list[str] | None = None, anchor: str = "",
@@ -270,26 +254,12 @@ def recall_events(ids: list[str] | None = None, anchor: str = "",
     kinds: 可选逗号分隔 input、output、result、notification；只筛选种子
     source: 可选 g<群号> 或 u<私聊对端号> 来源窗口；只筛选种子
     """
-    import json
-
-    from mods import oplog
-
     window = _tool_window()
     if window is None:
         return "当前不在聊天窗口里"
-    try:
-        selected, missing = _select_events(window, ids=ids, anchor=anchor, before=before,
-                                           after=after, start=start, end=end,
-                                           kinds=kinds, source=source)
-    except ValueError as error:
-        return f"未反查：{error}"
-    resolved_ids = [entry["id"] for entry in selected]
-    found, unavailable = oplog.recall_events(window, resolved_ids)
-    missing = list(dict.fromkeys([*missing, *unavailable]))
-    if not found and not missing:
-        return "范围内没有符合筛选条件的已读事件"
-    return json.dumps({"resolved_ids": resolved_ids, "events": found, "missing": missing},
-                      ensure_ascii=False)
+    from mods import chat
+
+    return chat.agent.recall_events(window, ids, anchor, before, after, start, end, kinds, source)
 
 
 def event_links(ids: list[str] | None = None, anchor: str = "", before: int = 0,
@@ -307,23 +277,12 @@ def event_links(ids: list[str] | None = None, anchor: str = "", before: int = 0,
     kinds: 可选逗号分隔 input、output、result、notification；只筛选查询根
     source: 可选 g<群号> 或 u<私聊对端号> 来源窗口；只筛选查询根
     """
-    import json
-
-    from mods import oplog
-
     window = _tool_window()
     if window is None:
         return "当前不在聊天窗口里"
-    try:
-        selected, missing = _select_events(window, ids=ids, anchor=anchor, before=before,
-                                           after=after, start=start, end=end,
-                                           kinds=kinds, source=source)
-    except ValueError as error:
-        return f"未查询关系：{error}"
-    found = oplog.reference_links(window, [entry["id"] for entry in selected])
-    if missing:
-        found["找不到"] = missing
-    return json.dumps(found, ensure_ascii=False)
+    from mods import chat
+
+    return chat.agent.event_links(window, ids, anchor, before, after, start, end, kinds, source)
 
 
 def cover_events(ids: list[str], conclusion: str, anchor: str = "", before: int = 0,
@@ -342,32 +301,14 @@ def cover_events(ids: list[str], conclusion: str, anchor: str = "", before: int 
     kinds: 可选逗号分隔 input、output、result、notification；只筛选种子
     source: 可选 g<群号> 或 u<私聊对端号> 来源窗口；只筛选种子
     """
-    from mods import chat, oplog
+    from mods import chat
 
     window = _tool_window()
     session = current_binding().session
     if window is None or not session.reads_window_mail or not session.active_action:
         return "仅主窗口正在读取 mail 的会话能覆盖信息流；私有 .chat 和子代理不可覆盖"
-    if not conclusion.strip():
-        return "请给出非空结论"
-    try:
-        selected, missing = _select_events(window, ids=ids, anchor=anchor, before=before,
-                                           after=after, start=start, end=end,
-                                           kinds=kinds, source=source)
-        if missing:
-            raise ValueError("不是本窗口已读事件: " + ", ".join(missing))
-        visible = (chat.agent._trusted_stream_ids(session) | getattr(session, "recalled_ids", set())
-                   if window == chat.AGENT_WINDOW
-                   else chat.agent._visible_stream_ids(session.messages))
-        members = oplog.cover(window, session.active_action,
-                              [entry["id"] for entry in selected], visible)
-    except ValueError as error:
-        return f"未覆盖：{error}"
-    if window == chat.AGENT_WINDOW:
-        chat.agent._cover_agent_projection(session, members)
-    else:
-        chat.agent._cover_projection(session.messages, members)
-    return f"已覆盖 {len(members)} 条已读事件；原编号仍可用 recall_events 反查"
+    return chat.agent.cover_stream(session, window, ids, conclusion, anchor, before,
+                                   after, start, end, kinds, source)
 
 
 def attach_image(uri: str, note: str = "") -> str:
@@ -485,59 +426,10 @@ def _take(source: str, count: int, start: int, ids: list[str] | None,
     session = current_binding().session
     if not context.agent_mode() or not session.reads_window_mail:
         return "只有中心 reader 可以正式阅读信源"
-    if type(count) is not int or not 1 <= count <= chat.MAX_PULL_EVENTS:
-        return f"count 必须是 1..{chat.MAX_PULL_EVENTS}"
-    if type(start) is not int or start < 1:
-        return "start 必须是从 1 起的当前未读序号"
-    if ids is not None and (not isinstance(ids, list) or any(not isinstance(key, str) for key in ids)):
-        return "ids 必须是稳定成员 key 列表"
-    if sum((ids is not None, bool(arrival), bool(origin), bool(message_id))) > 1:
-        return "ids、arrival、origin、message_id 只能指定一种"
-    if start != 1 and any((ids is not None, arrival, origin, message_id)):
-        return "start 只能用于未读范围选择，不能与精确定位并用"
-    selected = []
-    try:
-        if ids is not None or arrival:
-            for key in dict.fromkeys(ids if ids is not None else [arrival]):
-                member = chat.reader._unread_member_by_key(source, key)
-                if member is not None and (not mentions_only or member["mentioned"]):
-                    selected.append(member)
-        else:
-            for ordinal, (member, _event) in enumerate(chat.reader._iter_unread_metadata(source), 1):
-                if ordinal < start:
-                    continue
-                if mentions_only and not member["mentioned"]:
-                    continue
-                if origin and member["origin"] != origin:
-                    continue
-                if message_id and str(member["message_id"]) != message_id:
-                    continue
-                selected.append(member)
-                if not origin and not message_id and len(selected) >= count:
-                    break
-    except ValueError as error:
-        return f"未安排正式阅读：{error}"
-    if message_id and len(selected) > 1:
-        return "message_id 命中多条，请用 origin 或稳定成员 key 消歧义"
-    if not selected:
-        return "该信源没有匹配的未读成员；未安排阅读"
-    if ids is not None and len(selected) > 1:
-        keys = {member["key"] for member in selected}
-        ranks = {member["key"]: position
-                 for position, member in enumerate(chat.reader._all_source_members(source))
-                 if member["key"] in keys}
-        selected.sort(key=lambda member: ranks[member["key"]])
-    window = tuple(selected[0]["window"])
-    session.associated_windows.add(window)
-    session.requested_reads.append({"window": list(window), "source": source,
-                                    "members": selected, "read_by": _output_id(session),
-                                    "read_via": via})
-    return f"已安排下一次模型请求前正式阅读 {len(selected)} 条；正文不在工具结果中返回"
+    return chat.reader.arrange_take(session, source, count, start, ids, arrival,
+                                    origin, message_id, mentions_only, via)
 
 
-def _output_id(session) -> str | None:
-    action = getattr(session, "active_action", None)
-    return str(action).partition("#")[0] if action else None
 
 
 def take(source: str, count: int = _DEFAULT_PULL_COUNT, ids: list[str] | None = None,
@@ -559,12 +451,6 @@ def take(source: str, count: int = _DEFAULT_PULL_COUNT, ids: list[str] | None = 
                  mentions_only, "take")
 
 
-def _source_status_line(source: dict) -> str:
-    return (f"{source['key']} {source['name']} 窗口={tuple(source['window'])} "
-            f"状态={source['state']} 未读={source['remaining']} "
-            f"提及={source['mention_count'] - source['read_mention_count']} "
-            f"已拉取={source['pulled']}"
-            + (f" 缺口={source['gap']}" if source['gap'] else ""))
 
 
 def status(source: str = "") -> str:
@@ -573,69 +459,11 @@ def status(source: str = "") -> str:
     @param
     source: 留空查看全部活跃信源；或填 g<群号>、u<私聊对端号>、fetch 返回的信源 key
     """
-    from mods import chat, context, oplog
+    from mods import chat, context
 
     if not context.agent_mode() or not current_binding().session.reads_window_mail:
         return "只有中心 reader 可以查看信源状态"
-    details = chat.unread_details()
-    sources = oplog.sources()
-    if source:
-        try:
-            window = chat.parse_target(source)
-        except ValueError:
-            state = oplog.resolve_source(source)
-            if state is None or state["key"] != source:
-                return "找不到该窗口或信源 key"
-            lines = [_source_status_line(state)]
-        else:
-            lines = [chat.reader._unread_detail_text(detail) for detail in details
-                     if tuple(detail["window"]) == window]
-            lines.extend(_source_status_line(state) for state in sources
-                         if tuple(state["window"]) == window
-                         and (state["remaining"] or state["state"] != "complete"))
-            if not lines:
-                lines = [f"{source} 当前没有未读、补回缺口或活跃历史信源"]
-    else:
-        lines = []
-        gap_counts = {}
-        history_gap_counts = {}
-        for detail in details:
-            recovery = detail.get("recovery")
-            if (recovery and recovery.get("gap") and not detail["unread"]
-                    and not detail["mentions"] and not detail["other_wakes"]
-                    and not recovery["remaining"]):
-                reason = recovery["gap"].split("; cursor=", 1)[0]
-                gap_counts[reason] = gap_counts.get(reason, 0) + 1
-            else:
-                lines.append(chat.reader._unread_detail_text(detail))
-        for state in sources:
-            if state["source_type"] != "napcat_history":
-                continue
-            if (state["remaining"] or state["mention_count"] > state["read_mention_count"]
-                    or state["state"] == "fetching"):
-                lines.append(_source_status_line(state))
-            elif state["gap"]:
-                reason = state["gap"].split("; cursor=", 1)[0]
-                history_gap_counts[reason] = history_gap_counts.get(reason, 0) + 1
-            elif state["state"] != "complete":
-                lines.append(_source_status_line(state))
-        lines.extend(f"无待读内容的窗口缺口：{reason}，{count} 个窗口"
-                     for reason, count in gap_counts.items())
-        lines.extend(f"无待读内容的历史信源缺口：{reason}，{count} 个信源"
-                     for reason, count in history_gap_counts.items())
-        if not lines:
-            return "当前没有待处理的未读信源；未读未减少"
-        lines.append("可用 status(source) 按具体 g/u 窗口或历史信源 key 查看完整状态")
-    rendered = "\n".join(lines)
-    excerpt = chat.bounded_excerpt(rendered, _STATUS_TOKENS)
-    if len(excerpt) < len(rendered):
-        complete_lines = excerpt.splitlines()
-        if excerpt and not excerpt.endswith("\n") and rendered[len(excerpt)] != "\n":
-            complete_lines.pop()
-        return "\n".join([*complete_lines,
-                          "状态过多，返回已截断；可用 status(source) 按具体窗口或信源 key 查询",
-                          "未读未减少"])
-    return rendered + "\n未读未减少"
+    return chat.reader.source_status(source)
 
 
 def fetch(source: str) -> str:
@@ -644,24 +472,11 @@ def fetch(source: str) -> str:
     @param
     source: g<群号>、u<私聊对端号>，或已有历史信源 key
     """
-    from mods import chat, context, oplog
+    from mods import chat, context
 
     if not context.agent_mode() or not current_binding().session.reads_window_mail:
         return "只有中心 reader 可以拉取信源"
-    try:
-        window = chat.parse_target(source)
-    except ValueError:
-        state = oplog.resolve_source(source)
-        if state is None or state["key"] != source:
-            return "找不到该窗口或信源 key"
-        window = tuple(state["window"])
-        source_key = state["key"]
-    else:
-        source_key = None
-    current_binding().session.associated_windows.add(window)
-    source = chat.fetch_remote_source(window, source_key)
-    return (f"信源 {source['key']}（{source['name']}）状态={source['state']}；"
-            "后台持续追到锚点或上游尽头，完成前不能正式 take；用 status 查看进度")
+    return chat.reader.fetch_source(current_binding().session, source)
 
 
 def mentions(source: str) -> str:
@@ -687,38 +502,12 @@ def read_messages(window: str, message_id: str = "", origin: str = "", timestamp
     before: 锚点之前返回多少条档案记录，非负整数
     after: 锚点之后返回多少条档案记录，非负整数
     """
-    from mods import chat, chatlog, context
+    from mods import chat, context
 
     if not context.agent_mode() or not current_binding().session.reads_window_mail:
         return "只有中心 reader 可以查阅聊天档案"
-    try:
-        target = chat.parse_target(window)
-    except ValueError as error:
-        return str(error)
-    if not message_id and not origin:
-        return "请指定 message_id 或 origin"
-    if message_id and origin:
-        return "message_id 与 origin 只能指定一个"
-    current_binding().session.associated_windows.add(target)
-    try:
-        records = chatlog.read_around(
-            *target,
-            message_id=message_id or None,
-            origin=origin or None,
-            timestamp=timestamp or None,
-            before=before,
-            after=after,
-        )
-    except ValueError as error:
-        return f"未查看：{error}"
-    selected = [record for record in records
-                if chat.view._model_event(record, target[0] == "group") is not None]
-    if not selected:
-        return "本地档案没有命中可见记录；未安排阅读"
-    current_binding().session.requested_reads.append(
-        {"window": list(target), "records": selected,
-         "read_by": _output_id(current_binding().session), "read_via": "read_messages"})
-    return f"已安排下一次模型请求前从档案正式阅读 {len(selected)} 条；正文不在工具结果中返回"
+    return chat.reader.arrange_archive(current_binding().session, window, message_id,
+                                        origin, timestamp, before, after)
 
 
 def mark_read(source: str) -> str:
@@ -729,28 +518,11 @@ def mark_read(source: str) -> str:
     """
     import json
 
-    from mods import chat, context, oplog
+    from mods import chat, context
 
     if not context.agent_mode() or not current_binding().session.reads_window_mail:
         return "只有中心 reader 可以设为已读"
-    try:
-        window = chat.parse_target(source)
-        state = None
-    except ValueError:
-        state = oplog.resolve_source(source)
-        if state is None or state["key"] != source:
-            return "找不到该窗口或信源 key"
-        if state["source_type"] == "napcat_boot":
-            return "启动补回属于原窗口信源，请用对应的 g/u 窗口名标为已读"
-        window = tuple(state["window"])
-    current_binding().session.associated_windows.add(window)
-    try:
-        read_by = _output_id(current_binding().session)
-        result = (chat.mark_window_read(window, read_by=read_by) if state is None
-                  else chat.mark_source_read(state, read_by=read_by))
-    except ValueError as error:
-        return f"未标为已读：{error}"
-    return json.dumps(result, ensure_ascii=False)
+    return chat.reader.mark_source(current_binding().session, source)
 
 
 def pull(source: str, count: int = _DEFAULT_PULL_COUNT) -> str:

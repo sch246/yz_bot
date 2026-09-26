@@ -282,3 +282,112 @@ def _agent_provider(turn, session: llm.Chat):
         except Exception as error:
             raise llm.RequiredContextError("读取中心信息流失败，已停止后续行动") from error
     return provide
+
+def select_events(window, *, ids=None, anchor: str = "", before: int = 0, after: int = 0,
+                   start: str = "", end: str = "", kinds: str = "", source: str = ""):
+    if not isinstance(kinds, str):
+        raise ValueError("kinds 只能包含 input、output、result、notification")
+    if not isinstance(source, str):
+        raise ValueError("source 必须是 g<群号> 或 u<私聊对端号>")
+    selected_kinds = [kind.strip() for kind in kinds.split(",")] if kinds else []
+    if any(not kind for kind in selected_kinds):
+        raise ValueError("kinds 只能包含 input、output、result、notification")
+    source_window = _reader.parse_target(source) if source else None
+    return oplog.select_events(window, ids=ids, anchor=anchor, before=before, after=after,
+                               start=start, end=end, kinds=selected_kinds,
+                               source_window=source_window)
+
+
+def recall_events(window, ids: list[str] | None = None, anchor: str = "",
+                  before: int = 0, after: int = 0, start: str = "", end: str = "",
+                  kinds: str = "", source: str = "") -> str:
+    """按正式号或一段已读经历直接返回输入、完整输出和结果；中心会话可跨窗口查旧号。整次调用只有一个 result，正文中的旧事件不重新编号。
+
+    @param
+    ids: 显式正式号列表；与 anchor 或 start/end 二选一，范围调用可省略
+    anchor: 中心正式号；可用 before/after 取邻近已读事件
+    before: anchor 之前的原始事件数，不按筛选命中补足
+    after: anchor 之后的原始事件数，不按筛选命中补足
+    start: 含端点的区间起点；须同时给 end
+    end: 含端点的区间终点；须同时给 start
+    kinds: 可选逗号分隔 input、output、result、notification；只筛选种子
+    source: 可选 g<群号> 或 u<私聊对端号> 来源窗口；只筛选种子
+    """
+    try:
+        selected, missing = select_events(window, ids=ids, anchor=anchor, before=before,
+                                           after=after, start=start, end=end,
+                                           kinds=kinds, source=source)
+    except ValueError as error:
+        return f"未反查：{error}"
+    resolved_ids = [entry["id"] for entry in selected]
+    found, unavailable = oplog.recall_events(window, resolved_ids)
+    missing = list(dict.fromkeys([*missing, *unavailable]))
+    if not found and not missing:
+        return "范围内没有符合筛选条件的已读事件"
+    return json.dumps({"resolved_ids": resolved_ids, "events": found, "missing": missing},
+                      ensure_ascii=False)
+
+
+def event_links(window, ids: list[str] | None = None, anchor: str = "", before: int = 0,
+                after: int = 0, start: str = "", end: str = "", kinds: str = "",
+                source: str = "") -> str:
+    """按正式号查看一跳关系；输出的 reads 是实际读入的 input 号，非位置推断。
+
+    @param
+    ids: 显式正式号列表；与 anchor 或 start/end 二选一，范围调用可省略
+    anchor: 中心正式号；可用 before/after 取邻近已读事件
+    before: anchor 之前的原始事件数
+    after: anchor 之后的原始事件数
+    start: 含端点的区间起点；须同时给 end
+    end: 含端点的区间终点；须同时给 start
+    kinds: 可选逗号分隔 input、output、result、notification；只筛选查询根
+    source: 可选 g<群号> 或 u<私聊对端号> 来源窗口；只筛选查询根
+    """
+    try:
+        selected, missing = select_events(window, ids=ids, anchor=anchor, before=before,
+                                           after=after, start=start, end=end,
+                                           kinds=kinds, source=source)
+    except ValueError as error:
+        return f"未查询关系：{error}"
+    found = oplog.reference_links(window, [entry["id"] for entry in selected])
+    if missing:
+        found["找不到"] = missing
+    return json.dumps(found, ensure_ascii=False)
+
+
+def cover_stream(session, window, ids: list[str], conclusion: str, anchor: str = "", before: int = 0,
+                 after: int = 0, start: str = "", end: str = "", kinds: str = "",
+                 source: str = "") -> str:
+    """将本次主窗口可见或此前已覆盖的事件归入这次行动的结论；成员不再自动载入，但仍可按原编号反查。关联的整批输出、返回和已确认 say 回声必须一同覆盖。
+
+    @param
+    ids: 显式正式号列表；与 anchor 或 start/end 二选一，范围调用请传 []
+    conclusion: 你从这些事件得出的结论，写出供后续子请求保留的摘要
+    anchor: 中心正式号；可用 before/after 取邻近已读事件
+    before: anchor 之前的原始事件数
+    after: anchor 之后的原始事件数
+    start: 含端点的区间起点；须同时给 end
+    end: 含端点的区间终点；须同时给 start
+    kinds: 可选逗号分隔 input、output、result、notification；只筛选种子
+    source: 可选 g<群号> 或 u<私聊对端号> 来源窗口；只筛选种子
+    """
+    if not conclusion.strip():
+        return "请给出非空结论"
+    try:
+        selected, missing = select_events(window, ids=ids, anchor=anchor, before=before,
+                                           after=after, start=start, end=end,
+                                           kinds=kinds, source=source)
+        if missing:
+            raise ValueError("不是本窗口已读事件: " + ", ".join(missing))
+        visible = (_trusted_stream_ids(session) | getattr(session, "recalled_ids", set())
+                   if window == _chat_root.AGENT_WINDOW
+                   else _visible_stream_ids(session.messages))
+        members = oplog.cover(window, session.active_action,
+                              [entry["id"] for entry in selected], visible)
+    except ValueError as error:
+        return f"未覆盖：{error}"
+    if window == _chat_root.AGENT_WINDOW:
+        _cover_agent_projection(session, members)
+    else:
+        _cover_projection(session.messages, members)
+    return f"已覆盖 {len(members)} 条已读事件；原编号仍可用 recall_events 反查"

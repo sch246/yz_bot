@@ -238,6 +238,234 @@ def _take_source_events(window: tuple, source: dict, session: llm.Chat | None,
             output.append(projected)
     return output, None
 
+_STATUS_TOKENS = 3000
+
+def arrange_take(session, source: str, count: int, start: int, ids: list[str] | None,
+          arrival: str, origin: str, message_id: str,
+          mentions_only: bool, via: str) -> str:
+    if type(count) is not int or not 1 <= count <= _chat_root.MAX_PULL_EVENTS:
+        return f"count 必须是 1..{_chat_root.MAX_PULL_EVENTS}"
+    if type(start) is not int or start < 1:
+        return "start 必须是从 1 起的当前未读序号"
+    if ids is not None and (not isinstance(ids, list) or any(not isinstance(key, str) for key in ids)):
+        return "ids 必须是稳定成员 key 列表"
+    if sum((ids is not None, bool(arrival), bool(origin), bool(message_id))) > 1:
+        return "ids、arrival、origin、message_id 只能指定一种"
+    if start != 1 and any((ids is not None, arrival, origin, message_id)):
+        return "start 只能用于未读范围选择，不能与精确定位并用"
+    selected = []
+    try:
+        if ids is not None or arrival:
+            for key in dict.fromkeys(ids if ids is not None else [arrival]):
+                member = _unread_member_by_key(source, key)
+                if member is not None and (not mentions_only or member["mentioned"]):
+                    selected.append(member)
+        else:
+            for ordinal, (member, _event) in enumerate(_iter_unread_metadata(source), 1):
+                if ordinal < start:
+                    continue
+                if mentions_only and not member["mentioned"]:
+                    continue
+                if origin and member["origin"] != origin:
+                    continue
+                if message_id and str(member["message_id"]) != message_id:
+                    continue
+                selected.append(member)
+                if not origin and not message_id and len(selected) >= count:
+                    break
+    except ValueError as error:
+        return f"未安排正式阅读：{error}"
+    if message_id and len(selected) > 1:
+        return "message_id 命中多条，请用 origin 或稳定成员 key 消歧义"
+    if not selected:
+        return "该信源没有匹配的未读成员；未安排阅读"
+    if ids is not None and len(selected) > 1:
+        keys = {member["key"] for member in selected}
+        ranks = {member["key"]: position
+                 for position, member in enumerate(_all_source_members(source))
+                 if member["key"] in keys}
+        selected.sort(key=lambda member: ranks[member["key"]])
+    window = tuple(selected[0]["window"])
+    session.associated_windows.add(window)
+    session.requested_reads.append({"window": list(window), "source": source,
+                                    "members": selected, "read_by": _output_id(session),
+                                    "read_via": via})
+    return f"已安排下一次模型请求前正式阅读 {len(selected)} 条；正文不在工具结果中返回"
+
+
+def _output_id(session) -> str | None:
+    action = getattr(session, "active_action", None)
+    return str(action).partition("#")[0] if action else None
+
+
+def _source_status_line(source: dict) -> str:
+    return (f"{source['key']} {source['name']} 窗口={tuple(source['window'])} "
+            f"状态={source['state']} 未读={source['remaining']} "
+            f"提及={source['mention_count'] - source['read_mention_count']} "
+            f"已拉取={source['pulled']}"
+            + (f" 缺口={source['gap']}" if source['gap'] else ""))
+
+
+def source_status(source: str = "") -> str:
+    """查看未读通知栏；可查看全部活跃信源，也可精确查看一个窗口或历史信源，不读取正文。
+
+    @param
+    source: 留空查看全部活跃信源；或填 g<群号>、u<私聊对端号>、fetch 返回的信源 key
+    """
+    details = unread_details()
+    sources = oplog.sources()
+    if source:
+        try:
+            window = parse_target(source)
+        except ValueError:
+            state = oplog.resolve_source(source)
+            if state is None or state["key"] != source:
+                return "找不到该窗口或信源 key"
+            lines = [_source_status_line(state)]
+        else:
+            lines = [_unread_detail_text(detail) for detail in details
+                     if tuple(detail["window"]) == window]
+            lines.extend(_source_status_line(state) for state in sources
+                         if tuple(state["window"]) == window
+                         and (state["remaining"] or state["state"] != "complete"))
+            if not lines:
+                lines = [f"{source} 当前没有未读、补回缺口或活跃历史信源"]
+    else:
+        lines = []
+        gap_counts = {}
+        history_gap_counts = {}
+        for detail in details:
+            recovery = detail.get("recovery")
+            if (recovery and recovery.get("gap") and not detail["unread"]
+                    and not detail["mentions"] and not detail["other_wakes"]
+                    and not recovery["remaining"]):
+                reason = recovery["gap"].split("; cursor=", 1)[0]
+                gap_counts[reason] = gap_counts.get(reason, 0) + 1
+            else:
+                lines.append(_unread_detail_text(detail))
+        for state in sources:
+            if state["source_type"] != "napcat_history":
+                continue
+            if (state["remaining"] or state["mention_count"] > state["read_mention_count"]
+                    or state["state"] == "fetching"):
+                lines.append(_source_status_line(state))
+            elif state["gap"]:
+                reason = state["gap"].split("; cursor=", 1)[0]
+                history_gap_counts[reason] = history_gap_counts.get(reason, 0) + 1
+            elif state["state"] != "complete":
+                lines.append(_source_status_line(state))
+        lines.extend(f"无待读内容的窗口缺口：{reason}，{count} 个窗口"
+                     for reason, count in gap_counts.items())
+        lines.extend(f"无待读内容的历史信源缺口：{reason}，{count} 个信源"
+                     for reason, count in history_gap_counts.items())
+        if not lines:
+            return "当前没有待处理的未读信源；未读未减少"
+        lines.append("可用 status(source) 按具体 g/u 窗口或历史信源 key 查看完整状态")
+    rendered = "\n".join(lines)
+    excerpt = _chat_root.bounded_excerpt(rendered, _STATUS_TOKENS)
+    if len(excerpt) < len(rendered):
+        complete_lines = excerpt.splitlines()
+        if excerpt and not excerpt.endswith("\n") and rendered[len(excerpt)] != "\n":
+            complete_lines.pop()
+        return "\n".join([*complete_lines,
+                          "状态过多，返回已截断；可用 status(source) 按具体窗口或信源 key 查询",
+                          "未读未减少"])
+    return rendered + "\n未读未减少"
+
+
+def fetch_source(session, source: str) -> str:
+    """从 NapCat 向前补一个信源；未读缺口可续接，已读信源会从旧端另开信源。
+
+    @param
+    source: g<群号>、u<私聊对端号>，或已有历史信源 key
+    """
+    try:
+        window = parse_target(source)
+    except ValueError:
+        state = oplog.resolve_source(source)
+        if state is None or state["key"] != source:
+            return "找不到该窗口或信源 key"
+        window = tuple(state["window"])
+        source_key = state["key"]
+    else:
+        source_key = None
+    session.associated_windows.add(window)
+    source = fetch_remote_source(window, source_key)
+    return (f"信源 {source['key']}（{source['name']}）状态={source['state']}；"
+            "后台持续追到锚点或上游尽头，完成前不能正式 take；用 status 查看进度")
+
+
+def arrange_archive(session, window: str, message_id: str = "", origin: str = "", timestamp: int = 0,
+                  before: int = 4, after: int = 4) -> str:
+    """从本地档案选消息，在下一次模型请求前作为正式 input 阅读；已读档案可再次阅读。
+
+    @param
+    window: g<群号> 或 u<私聊对端号>
+    message_id: QQ 消息号；与 origin 二选一
+    origin: 稳定档案位置；与 message_id 二选一
+    timestamp: message_id 命中多条时用来消歧义的 Unix 整数秒；0 表示不指定
+    before: 锚点之前返回多少条档案记录，非负整数
+    after: 锚点之后返回多少条档案记录，非负整数
+    """
+    from mods import chatlog
+
+    try:
+        target = parse_target(window)
+    except ValueError as error:
+        return str(error)
+    if not message_id and not origin:
+        return "请指定 message_id 或 origin"
+    if message_id and origin:
+        return "message_id 与 origin 只能指定一个"
+    session.associated_windows.add(target)
+    try:
+        records = chatlog.read_around(
+            *target,
+            message_id=message_id or None,
+            origin=origin or None,
+            timestamp=timestamp or None,
+            before=before,
+            after=after,
+        )
+    except ValueError as error:
+        return f"未查看：{error}"
+    selected = [record for record in records
+                if _view._model_event(record, target[0] == "group") is not None]
+    if not selected:
+        return "本地档案没有命中可见记录；未安排阅读"
+    session.requested_reads.append(
+        {"window": list(target), "records": selected,
+         "read_by": _output_id(session), "read_via": "read_messages"})
+    return f"已安排下一次模型请求前从档案正式阅读 {len(selected)} 条；正文不在工具结果中返回"
+
+
+def mark_source(session, source: str) -> str:
+    """将一个信源在调用时已存在的全部未读设为已读。这些内容不取得经历号，但仍可用 read_messages 再读档案。
+
+    @param
+    source: g<群号>、u<私聊对端号>，或 fetch 返回的独立信源 key
+    """
+    import json
+
+    try:
+        window = parse_target(source)
+        state = None
+    except ValueError:
+        state = oplog.resolve_source(source)
+        if state is None or state["key"] != source:
+            return "找不到该窗口或信源 key"
+        if state["source_type"] == "napcat_boot":
+            return "启动补回属于原窗口信源，请用对应的 g/u 窗口名标为已读"
+        window = tuple(state["window"])
+    session.associated_windows.add(window)
+    try:
+        read_by = _output_id(session)
+        result = (mark_window_read(window, read_by=read_by) if state is None
+                  else mark_source_read(state, read_by=read_by))
+    except ValueError as error:
+        return f"未标为已读：{error}"
+    return json.dumps(result, ensure_ascii=False)
+
 
 def _formal_input(session: llm.Chat | None, window: tuple, event: dict,
                   read_by: str | None, read_via: str | None, bridge: dict | None,
