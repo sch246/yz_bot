@@ -117,7 +117,7 @@
 | `change.py` | 易经起卦与 `.change` | `change.py` | 保留为叶子功能 |
 | `chattop.py` | LLM 调用统计查看 | `chattop.py` | 随 `chat` 保留 |
 | `cpp.py` | C++ 临时编译和交互子进程 | `cpp.py` 与 `_code/funcs.py` 的 `run_process`/`read_process` | 保留为按需启动的设备叶子功能 |
-| `dir.py` | `.dir` 的 zip 目录收发 | `dir.py` | 保留命令名，调用 `file`；不复制文件实现 |
+| `directory.py` | `.dir` 的 zip 目录收发 | `directory.py` | 保留命令名，调用 `file`；不复制文件实现；文件名避开 Python 内置 `dir()` |
 | `echo.py` | `.echo` | `echo.py` | 保留 |
 | `edit.py` | 文件编辑 session、分页、撤销重做和 `.edit` | `edit.py` | 保留；storage 读取移入 `on_load` |
 | `help.py` | 可用命令列表和 docstring 查询 | `help.py` | 保留；只读 `command` 注册表 |

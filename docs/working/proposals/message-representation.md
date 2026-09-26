@@ -125,7 +125,7 @@ plain(event) -> str             # 去掉前导 reply/at 之后、供入口前缀
 入口（`^C`、`.`、`!`、`#!`、`柚子，`）改读 `plain(event)`；link 条件读什么单独决定（见 §5）。模型侧由 `msg2chat` 把 segments 渲染成结构化文本，例如把 reply 变成 metadata 里的一行 `<reply_to>`、把 at 渲染成号码加名字。
 
 - 收益：本体不再被改写，chatlog 与 history 自然一致；§2.2 的半截剥离变成「一次算清楚」；死字段可以删掉；模型第一次拿到回复关系。
-- 代价：每个 `event["message"]` 的消费点都要判断该用原文还是 `plain`（当前有 `file.py:200`、`dir.py:41`、`msgs.is_cq/is_img`、`chatlog._message`、`link` 条件等）。这不是机械替换，要一处一处定。
+- 代价：每个 `event["message"]` 的消费点都要判断该用原文还是 `plain`（当前有 `file.py:200`、`directory.py:41`、`msgs.is_cq/is_img`、`chatlog._message`、`link` 条件等）。这不是机械替换，要一处一处定。
 
 **已取其前半，且 `plain()` 没有单独存在——`body()` 就是它。** 落地的判据是一句话：**解释**消息的地方读 `msgs.body()`，**存储和显示**消息的地方读原始 `message`；按此逐处定过的消费点是 bot 路由前缀、link 条件与四处输入收集、chat 的 `#` 过滤与唤醒判定（`has_at` 改读 `msgs.at_cq()`）、`py.match`、`py.chat_input`、`history._predicate`、翻页导航、cave 收集与确认、file/dir 的确认与单 CQ 取值、jrrp、cpp、edit。模型、chatlog、图片预缓存继续读原文，这是有意的。没做的是后半：`segments()` 与模型侧的结构化渲染仍然不存在，`msg_split` 依旧只认 image。
 

@@ -73,7 +73,7 @@ def set(path, force=False):
     return _receive(reply, path)
 
 
-@command
+@command(name="dir")
 def run(body: str):
     """压缩发送或接收解压宿主机目录（管理员）。
 

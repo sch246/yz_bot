@@ -24,12 +24,16 @@ def _owner(function: Callable) -> str:
     return parts[-1]
 
 
-def command(function: Callable):
-    """Register by module and function name; the decorator takes no arguments."""
+def command(function: Callable | None = None, *, name: str | None = None):
+    """Register by module/function name, or an explicit public command name."""
+    if function is None:
+        return lambda decorated: command(decorated, name=name)
     if not callable(function):
-        raise TypeError("@command does not accept arguments")
+        raise TypeError("@command expects a callable")
     owner = _owner(function)
-    command_name = owner if function.__name__ == "run" else f"{owner}.{function.__name__}"
+    command_name = name or (
+        owner if function.__name__ == "run" else f"{owner}.{function.__name__}"
+    )
     if re.search(r"\s", command_name):
         raise ValueError(f"invalid command name: {command_name!r}")
     existing = _commands.get(command_name)

@@ -80,7 +80,7 @@ mods/
   llm/                   # 模型执行入口；模型目录、工具和值类型在内部聚合
     __init__.py models.py tools.py types.py
   chat.py
-  file.py dir.py edit.py op.py reboot.py shutdown.py
+  file.py directory.py edit.py op.py reboot.py shutdown.py
   ...                    # 普通命令和设备/娱乐叶子模块
 ```
 

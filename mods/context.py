@@ -134,13 +134,11 @@ class MailEntry:
 
 
 class Mailbox:
-    """One window's buffer: what arrived and has not entered the context yet.
+    """In-memory view of one window's durable unread FIFO.
 
-    WHY: 它按**窗口**登记，和 `_turns` **并列**，而且**不随一轮生灭**——这是它和
-    `WindowTurn` 最重要的区别，也是把它摘出来的全部理由。轮是一次生成的生命周期，
-    邮箱是这个窗口的东西；以后它还要升级成追加式的时序记录（「柚子什么时候知道的」
-    这条轴今天没有任何地方记着），那更是跨轮的。见
-    docs/working/proposals/mail-and-activation.md 3.0 与九点八。
+    WHY: 它按**窗口**登记，和 `_turns` **并列**，而且**不随一轮生灭**。轮是一次
+    生成的生命周期，邮箱是持久 arrival 日志当前未读部分的内存镜像；正式读取和标为
+    已读都先写 oplog，再推进这里的水位。
 
     WHY: 自己带锁，而不是借 `WindowTurn` 的。轮会消失，锁不能跟着消失。聊天记录
     写入与 mail 入列由 `record` 在这把锁里一次提交；FIFO 正式读取也拿同一把锁。
@@ -314,6 +312,18 @@ class Mailbox:
             self._skip_absorbed()
             return projected
 
+    def absorb(self, arrivals: list[str], commit: Callable[[], Any]) -> Any:
+        """Commit linked external consumption, then hide matching local arrivals."""
+        with self._lock:
+            pending = {entry.arrival for entry in self._entries[self._read - self._base:]
+                       if entry.arrival not in self._absorbed}
+            if any(arrival not in pending for arrival in arrivals):
+                raise ValueError("mail linked arrivals changed before commit")
+            value = commit()
+            self._absorbed.update(arrivals)
+            self._skip_absorbed()
+            return value
+
     def prepare_initial_tail(self, count: int) -> None:
         """Apply a durable first-read floor to the live buffer, not a fake read."""
         from mods import oplog
@@ -340,12 +350,8 @@ class Mailbox:
         """Drop consumed entries past the retention tail; never drop unread ones.
 
         WHY: 只修剪**水位线之前**的。之后的那些是「还没进过上下文」，丢了就是丢消息，
-        而这个模块是它们在内存里唯一的落点。之前的那些今天没有任何消费者，留一小段
-        纯粹为了出事时能看，所以一个上界就够。
-
-        WHY: 这是**临时**的内存形态。主观时间轴（「柚子什么时候知道的」）最终要落成
-        追加式文件，那时候「留多少」由存储回答，不再由这个上界回答。删除条件：
-        mail 升级成时序记录之后。见 docs/working/proposals/mail-and-activation.md 第五节。
+        也会让当前进程漏消息。已读事实已经由 oplog 持久化，内存旧对象只留一个小尾巴
+        供同轮别名解析，超过上界即可修剪；重建仍以 oplog 为准。
         """
         consumed = self._read - self._base
         if consumed > _MAILBOX_RETAIN:

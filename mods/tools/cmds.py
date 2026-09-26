@@ -13,11 +13,8 @@
 
 from __future__ import annotations
 
-import logging
 import re
 import time
-
-_log = logging.getLogger(__name__)
 
 _match_at = re.compile(r"^\[CQ:at,qq=([0-9]+)\]$")
 _match_window = re.compile(r"^([guGU]?)([0-9]+)$")
@@ -70,7 +67,6 @@ def run_command(text: str, target: str = "", sender: str = "", capture: bool = T
     if not capture:
         from mods import connect
 
-        _receipt(command_text, executor, group_id, user_id)
         connect._events.put(event)
         return f"已投递，由主循环执行：{command_text}"
     return _capture(event, command_text, executor, delegated)
@@ -198,18 +194,6 @@ def _name_of(user_id) -> str:
     except Exception:
         pass
     return identity.user_names.get(int(user_id)) or f"QQ{user_id}"
-
-
-def _receipt(command: str, executor, group_id, user_id) -> None:
-    """在窗口里留一行谁投递了什么；发不出去不该让投递本身失败。"""
-    from mods import cq, message
-
-    destination = {"group_id": group_id} if group_id is not None else {"user_id": user_id}
-    try:
-        message.send(f"以 {_name_of(executor)} 的身份投递：{cq.escape(command)}", **destination)
-    except Exception:
-        _log.exception("投递回执发送失败：%s", command)
-
 
 def _event(text: str, group_id, user_id, author) -> dict:
     """顶层 ``user_id`` 是作者（两种窗口一致）；私聊的窗口另写在 ``target_id`` 上。"""

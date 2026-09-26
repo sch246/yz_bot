@@ -196,7 +196,7 @@ cond 或 action 报错会写应用日志并把 traceback 回传当前聊天。co
 
 只有戳 Bot 会立即触发 LLM；群内其它成员互戳会记入近期群聊上下文，在下一次聊天触发时以群聊事件的形式提供给模型。
 
-主聊天现由一位中心 agent 跨窗口处理。op 专属 `#agent` 查看全局主设置；`#agent use_model [provider/model]`、`#agent use_setting [name]`、`#agent image|reasoning|tools <mode>` 和 `#agent limit <事件数> <token> [提醒百分比]` 修改主设置，`#agent ops [clear]` 查看或清理中心操作视图。`#limit` 是 `#agent limit` 的全局快捷入口；`#use_model`、`#image`、`#prompt` 等旧命令仍只写当前窗口的旧配置，旧值不自动并入中心主设置。`聊天开始/聊天结束`是普通内容。中心开局只看到不含正文的通知；每个 g/u 窗口或历史 key 都通过 `status/fetch/peek/pull` 四个信源动作管理，只有 `pull` 会把正文正式读进经历流。`event_span` 可按正式号选一小段已读经历。`say` 必须明确 `target="g<群号>"` 或 `target="u<私聊对端号>"`，直接写模型回复正文不会发送。`#hint` 仍是独立的 QQ 收尾状态机制，op 专属，见 [LLM 文档](llm.md)。
+主聊天现由一位中心 agent 跨窗口处理。op 专属 `#agent` 查看全局主设置；`#agent use_model [provider/model]`、`#agent use_setting [name]`、`#agent image|reasoning|tools <mode>` 和 `#agent limit <事件数> <token> [提醒百分比]` 修改主设置。`#limit` 是 `#agent limit` 的全局快捷入口；`#use_model`、`#image`、`#prompt` 等旧命令仍只写当前窗口的旧配置，旧值不自动并入中心主设置。`聊天开始/聊天结束`是普通内容。中心开局只看到不含正文的通知；FIFO 用 `status/mentions/fetch/pull/mark_read` 管理，只有 `pull` 把正文正式读进经历流，`mark_read` 只推进调用时的未读水位。`read_messages` 可按指定窗口的 QQ `message_id` 或档案 `origin` 直接查附近记录，不依赖未读状态。`recall_events` 可按正式号、中心半径或起止区间直接返回已读经历。`say` 必须明确 `target="g<群号>"` 或 `target="u<私聊对端号>"`，直接写模型回复正文不会发送。`#hint` 仍是独立的 QQ 收尾状态机制，op 专属，见 [LLM 文档](llm.md)。
 
 LLM 开局默认激活 `meta` 模块，直接获得一个 `.py` 共享环境执行工具和三个工具模块管理工具。system 提示会列出 `mods/tools` 中每个 last-good Python/Markdown 模块的第一行描述；模型用 `load_tools` 把所需模块的余下说明与整组函数激活到当前任务，用 `list_tools` 查看活动状态和磁盘差异，用 `reload_tools` 显式应用修改。现有模块覆盖戳一戳、图片、时间、延时任务、天气、用户 storage、子模型任务分派和 MC 百科查询；不会自动热加载或注入变化提示。历史上明确禁用的工具只在 `mods/tools/disable/README.md` 留有决策记录，仓库中没有对应实现。工具 schema、模块格式、循环回写和高权限边界见独立的 [LLM 文档](llm.md)。
 

@@ -281,7 +281,7 @@ def run(body: str):
         if os.path.isfile(path):
             return _get(path)
         if os.path.isdir(path):
-            from mods import dir as directory
+            from mods import directory
 
             return directory.get(path)
         return "目标不存在"

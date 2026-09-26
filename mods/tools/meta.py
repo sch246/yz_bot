@@ -1,6 +1,6 @@
 '''指导模型增删查改统一工具与 Skill 模块，并说明 last-good、显式应用和当前会话激活原理。
 
-同一模型输出的多个工具调用按顺序执行，却看不到彼此结果；整批完成后立即成为一个正式 result R，正常下一子请求完整读取，不按工具拆分或自动分页。若 `say(final_call=true)` 结束、请求取消或失败，不会只为结果强迫续轮；下次激活按普通历史预算看到 R，需要全文可用 `recall_events`。`peek`／`recall_events` 返回中展示的旧行不是新的 input，不消费未读，也不能确认 `say` 回声；要首次正式读取来源消息请用 `pull`。
+同一模型输出的多个工具调用按顺序执行，却看不到彼此结果；整批完成后立即成为一个正式 result R，正常下一子请求完整读取，不按工具拆分或自动分页。若 `say(final_call=true)` 结束、请求取消或失败，不会只为结果强迫续轮；下次激活按普通历史预算看到 R，需要全文可用 `recall_events`。`mentions`／`read_messages`／`recall_events` 返回中展示的旧内容不是新的 input，不消费未读，也不能确认 `say` 回声；要首次正式读取来源消息请用 `pull`。
 
 ## 直接执行 Python
 
@@ -11,6 +11,8 @@
 只有 Bot 自身拥有 op 权限时可用，否则返回"权限不足"。
 
 环境里预置了 Bot 的全部动态导出名：`send`/`sendmsg` 发消息，`getname`/`setname`/`getstorage`/`getgroupstorage`/`memberlist` 读写身份与存储，`data` 是持久字典，`prompts` 是提示词集合，`run_action` 触发 link 动作，还有 `os`、`json`、`re`、`time`、`random`、`math`、`datetime` 等标准库；`ctx` 是模块名到模块对象的字典，各个 `mods` 模块也能直接按名字使用。不确定有什么就先自查，例如 `exec_code("sorted(k for k in globals() if not k.startswith('_'))")`。
+
+跨较长时间检查自己的经历时，可加载 `self_inspection` Skill，并用 `ctx["oplog"].iter_events(start, stop)` 逐条读取磁盘记录；不要为临时筛选继续增加专用工具，也不要调用会全量恢复历史的内部容器。
 
 它与 Bot 共享同一个宿主信任域，不是沙箱：会真实发消息、读写磁盘、改动运行中的状态。用之前先确认没有现成工具能做这件事，并避免 `input(...)`（会阻塞等待聊天回复）和长时间运行的代码。异常以 traceback 回传，可据此修正重试。需要反复使用的能力应当沉淀成下面的工具模块，而不是每次都 `exec_code`。
 
@@ -107,27 +109,25 @@ Skill 也是可编辑的长期笔记：把可重复使用的经验、做法、�
 
 先确认精确模块名和源文件，再删除对应的单个 `mods/tools/foo.py` 或 `.md`，不要宽泛递归删除。随后调用 `reload_tools(["foo"])`；registry 发现源文件缺失后才删除 last-good，并从当前 Chat 移除模块内容和函数，当前会话的激活记录一并清除。只删文件但不 reload 时旧 last-good 仍有效。`meta.py` 是恢复入口，不能删除。删除 helper 前先检查并 reload 所有受影响模块。
 
-## 操作历史与结论收缩
+## 统一经历与覆盖反查
 
-每次模型输出（正文、多个行动；思考只保留“曾有思考”标记）只有一个 `YYYYMMDD-N` 号；该输出内部行动用 `YYYYMMDD-N#位置` 指名。消息和工具结果也在被读到时进入同一信息流。结果可能在下一次模型请求才读到，未读不占正式号。
+每次模型输出（思考、正文、多个行动）只有一个 `YYYYMMDD-N` 号；该输出内部行动用 `YYYYMMDD-N#位置` 指名。新的中心输出保存完整原生思考，旧输出可能只有“曾有思考”标记。消息和工具结果也在被读到时进入同一信息流。结果可能在下一次模型请求才读到，未读不占正式号。
 
-这些记录跨轮按读到的先后重建，未收缩的结果保留原文。中心会话用 `cover_events` 总结已读事件；私有 `.chat` 仍可用 `condense_ops(["20260923-4#1", "20260923-4#2"], "结论")` 收缩原生工具配对。
+这些记录跨轮按读到的先后重建。中心会话统一用 `cover_events` 总结输入、输出和结果，不再维护另一套按原生工具调用位置收缩的历史。
 
 结论写在 `conclusion` 参数里就够了，工具不会把它再返回一遍：这次调用本身留在上下文里，参数里的结论就是它的记录。
 
-已读消息和输出也能总结：中心会话调用 `cover_events(["20260923-4", "20260923-5"], "结论")`，参数用的是上文方括号里的正式事件号，不是 QQ `message_id` 或行动位置。也可用 `cover_events(ids=[], conclusion="结论", anchor="20260923-4", before=2, after=3, kinds="input,result")`，或用 `start`／`end` 指定含端点的区间。范围先从唯一已读顺序取最多 40 条原始种子，再筛选种类和来源，不按命中数补足；输出、整批返回、已确认的 `say`／回声是强绑定闭包，实际覆盖成员可能越过范围和筛选条件，也可能超过 40。闭包里有任一成员不可覆盖，整次失败，不丢掉那个成员后继续。覆盖使成员从本轮和后续自动上下文中消失；原号可用 `recall_events` 反查而不解除覆盖，反查总结会显示实际冻结的所有成员，不只是你传入的号。中心会话可跨窗口点名已读或反查过的旧号；未读成员不会被补进覆盖。摘要与聊天消息、输出、返回一样占历史事件数和 token 预算；私有 `.chat` 和子代理不能替中心会话写覆盖。
+已读消息和输出也能总结：中心会话调用 `cover_events(["20260923-4", "20260923-5"], "结论")`，参数用的是上文方括号里的正式事件号，不是 QQ `message_id` 或行动位置。也可用 `cover_events(ids=[], conclusion="结论", anchor="20260923-4", before=2, after=3, kinds="input,result")`，或用 `start`／`end` 指定含端点的区间。覆盖范围没有条数上限；先从唯一已读顺序取原始种子，再筛选种类和来源，不按命中数补足。输出、整批返回、已确认的 `say`／回声是强绑定闭包，实际覆盖成员可能越过范围和筛选条件。闭包里有任一成员不可覆盖，整次失败，不丢掉那个成员后继续。覆盖使成员从本轮和后续自动上下文中消失；原号可用 `recall_events` 反查而不解除覆盖，反查总结会显示实际冻结的所有成员，不只是你传入的号。中心会话可跨窗口点名已读或反查过的旧号；未读成员不会被补进覆盖。摘要与聊天消息、输出、返回一样占历史事件数和 token 预算；私有 `.chat` 和子代理不能替中心会话写覆盖。
 
-眼前历史只是全局已读信息流按事件数和 token 选出的可见部分，不是完整记录。新消息先留在有名字的 FIFO；通知只告诉你哪里有消息。所有 FIFO 只用四个动作：`status(source)` 看未读、提及和缺口，`fetch(source)` 从 NapCat 向旧端补取，`peek(source, ...)` 不消耗地预览，`pull(source, count)` 从队首正式读取并取得经历号。窗口名是 `g<群号>` 或 `u<私聊对端号>`，主动 fetch 的旧档有自己的信源 key；四个动作都接受相应的名字。启动补回先于该窗口新实时消息进入原 FIFO；未收束前不能正式 pull。已经读过的旧档信源不会倒插内容，后续 fetch 另开 FIFO。远端历史不保证无缺口。是否继续读取由当前回应和整理需要决定；未读可以留在通知栏，不要只为清空数字而拉取。总结改变默认显示，不删除原文。`peek`／`recall_events` 所在同步工具批次整体成为一个 R；返回正文中展示的多行聊天档案不会逐行获得 input 号，也不会消费 FIFO，更不能充当或确认 `say` 的 QQ 回声。要让未读来源消息取得 input 号须 `pull`；旧 input 若已存在，则按它的正式号 `recall_events`。旧记录本身不变。
+眼前历史只是全局已读信息流按事件数和 token 选出的可见部分，不是完整记录。新消息先留在有名字的 FIFO；通知只告诉你哪里有消息。FIFO 有五个动作：`status(source)` 看数量与缺口，`mentions(source)` 看尚未消费的 @／提及及其 `message_id`，`fetch(source)` 从 NapCat 向旧端补取，`pull(source, count)` 从队首正式读取并取得经历号，`mark_read(source)` 把调用时已存在的队列水位推到底。`mark_read` 不把正文伪装成经历，只在你已经通过档案查询掌握足够上下文，或明确决定不再顺序读时使用。窗口名是 `g<群号>` 或 `u<私聊对端号>`，主动 fetch 的旧档有自己的信源 key。启动补回先于该窗口新实时消息进入原 FIFO；未收束前不能 pull、标为已读或枚举完整提及。已经读过的旧档信源不会倒插内容，后续 fetch 另开 FIFO。远端历史不保证无缺口。是否继续读取由当前回应和整理需要决定；未读可以留在通知栏，不要只为清空数字而拉取。
+
+聊天档案不属于 FIFO。`read_messages(window, message_id, before, after)` 可在指定窗口中按 QQ `message_id` 查前后文；若号码歧义，加 `timestamp` 或改用 `origin`。它和 `mentions`一样作为单个同步 R 直接返回，不消耗 FIFO、不给逐条档案分配 input 号，也不能充当或确认 `say` 回声。消息已经 pull 或标为已读后仍可从 chatlog 查阅。已读 input 若有正式号，则也可用 `recall_events`。总结只改变默认显示，不删除原文。
 
 总结要方便反查：在结论里留下关键来源的正式号，别只写一段没有出处的大块故事。后续总结可以再次引用前一层总结；同一来源也可被多个不同主题的总结引用，不必强行归到唯一父节点。已被覆盖的正式号也可再次点名，与新的可见成员组成另一份总结；这不解除原覆盖。`event_links` 可查输入、输出和工具返回中明确出现的正式号，以及各节点实际覆盖的成员；“出现过编号”、“被覆盖”和“确实支撑某个结论”是三回事，核对原话仍须 `recall_events`。
 
-收缩是**可逆**的：结果离开后续模型视图，原文仍可用 `recall_ops(["20260923-4#1"])` 取回。`#ops clear` 清空操作视图，但不重用号码或物理删除事件。
+普通输入、完整输出及整批工具返回都可用 `recall_events(["20260923-4"])` 按正式号反查；也可用 `recall_events(start="20260923-4", end="20260923-8", source="g123")` 直接读取短范围。它一次同步返回完整选择，取得一个新的 result 号，不进入 FIFO、不做字符分页，也不把正文里的旧事件移动、复制或重新编号。范围返回列出实际冻结的 `resolved_ids`。若总结这次探索，通常覆盖这次 recall 的输出和结果，并在结论中引用旧号；结果真正进入上下文后，直接覆盖其中旧号也是允许的另一次明确选择。
 
-普通输入、完整输出及整批工具返回都可用 `recall_events(["20260923-4"])` 按正式号反查；也可用 `recall_events(start="20260923-4", end="20260923-8", source="g123")` 先解析 IDs 再读取短范围。范围结果会列出实际冻结的 `resolved_ids`；结果未读完时，用这组显式 `ids` 加返回的 `offset` 续读，不再重算范围。反查的整条返回取得一个新的 result 号，正文里引用的旧事件不移动、不复制、不重新编号，也不消耗未读 FIFO。若总结这次探索，通常覆盖这次 recall 的输出和结果，并在结论中引用旧号；完整读完后直接覆盖旧号也是允许的另一次明确选择，不是默认等价。只有工具结果真正进入上下文且全部读完，旧号才可供中心会话直接覆盖；反查不自动把整份原文放回后续上下文。
-
-不必穷举相邻编号：`event_span(anchor="20260923-4", before=5, after=5)` 按唯一的已读经历顺序列出中心前后的小段正式号；也可用 `start`／`end` 指定有界区间。`kinds` 和 `source` 只在选定范围内筛选，不改变顺序，也不会自动读出正文。同样的范围可直接用于 `event_links(anchor="20260923-4", before=2, after=2, kinds="result")` 查一跳关系；筛选只限制查询根，邻接边完整返回，不读取正文、不授予覆盖信用。不要把这个选择器用于未读信源、原生操作号或 `say` 回声关联。
-
-同一输出里的多个行动必须一起点名收缩；尚未返回的行动不能收缩。
+`recall_events` 和 `event_links` 都能用 `anchor` 加前后数量，或用 `start`／`end` 指定有界区间；`kinds` 和 `source` 只在选定范围内筛选，不改变经历顺序。`event_links` 只返回一跳关系，不读取正文、不授予覆盖信用。不要把这些选择器用于未读信源、原生操作号或 `say` 回声关联。
 
 中心会话只载入一条全局经历的可见后缀；旧窗口正式号仍能按原号跨窗口反查，不复制或改号。更早的结果没被删除，仍能按引用取回。
 
@@ -237,78 +237,6 @@ def load_tools(names: list[str]) -> str:
     return _format_results(current_binding().load(names))
 
 
-def condense_ops(cids: list[str], conclusion: str) -> str:
-    """把已经得出结论的几次工具调用移出上下文，只留下你在 conclusion 里写的结论。查完资料、确认完状态、修完一个文件之后调用它。原文不会被删除，之后可以用 recall_ops 按同样的 cid 取回。
-
-    @param
-    cids: 要收缩的行动引用，形如 ["20260923-4#1", "20260923-4#2"]
-    conclusion: 这几次调用得出的结论，写成后面还用得上的一句话；它留在这次调用里，不会被再返回一遍
-    """
-    from mods import context, history, oplog
-
-    window = _tool_window()
-    if window is None:
-        return "当前不在聊天窗口里，没有操作历史"
-    if not cids:
-        return "没有指定要收缩的调用"
-    session = current_binding().session
-    found, unknown = oplog.recall(window, cids)
-    native_ids = [item["tool_call_id"] for item in found if item.get("tool_call_id")]
-    sources = {cid.partition("#")[0] for cid in cids}
-    if unknown:
-        return f"操作历史里找不到（已被 #ops clear 清掉，或从未存在）: {', '.join(unknown)}"
-    # WHY: 要写两处，因为"上下文"在这一刻有两副身体：当前这轮的 Chat.messages 是活的、
-    # 正在被工具循环追加，而 oplog 是明天重建时读的那份。只动 store 的话，这一轮不会变短
-    # ——而长工具循环恰恰是最需要当场省下 token 的场景；只动 messages 的话，明天重建又
-    # 把它们原样搬回来。两步没有先后要求：recall 看的是全量条目，不受标记影响。
-    dropped = oplog.condense(window, cids)
-    if not dropped:
-        # 已经收缩过：当前上下文里那几条早就不在了，不必再去动活的那份。
-        return "这几次调用已经收缩过了"
-    from mods import chat
-
-    if window == chat.AGENT_WINDOW:
-        remove_ids = sources | {entry["id"] for entry in oplog.events(window, True)
-                                if entry["kind"] == "result" and entry["source"] in sources}
-        removed = sum(chat._stream_id(session, message) in remove_ids
-                      for message in session.messages)
-        session.messages[:] = [message for message in session.messages
-                               if chat._stream_id(session, message) not in remove_ids]
-        chat._prune_stream_ids(session)
-    else:
-        removed = chat._condense_projection(session.messages, window, sources)
-    removed += session.condense_native_calls(native_ids, sources=sources)
-    # 这里刻意不回显 conclusion：它已经在这次调用的 arguments 里，回显就是第二个副本。
-    return f"已收缩 {dropped} 条操作，当前上下文移除 {removed} 条消息；需要时可用 recall_ops 取回原文"
-
-
-def recall_ops(cids: list[str]) -> str:
-    """按 cid 取回工具调用的原文，包括已收缩的结果。
-
-    @param
-    cids: 要取回的行动引用，形如 ["20260923-4#1", "20260923-4#2"]
-    """
-    from mods import context, history, oplog
-
-    window = _tool_window()
-    if window is None:
-        return "当前不在聊天窗口里，没有操作历史"
-    if not cids:
-        return "没有指定要取回的调用"
-    found, unknown = oplog.recall(window, cids)
-    lines = []
-    for entry in found:
-        members = oplog.coverage_members(window, entry["cid"])
-        lines.append(
-            f"[{entry['cid']}]{'(已收缩)' if entry.get('condensed') else ''} "
-            f"{entry['name']}({entry['arguments']})\n{entry['content']}"
-            + ("\n已冻结覆盖成员: " + ", ".join(members) if members is not None else "")
-        )
-    if unknown:
-        lines.append(f"找不到（已被 #ops clear 清掉，或从未存在）: {', '.join(unknown)}")
-    return "\n\n".join(lines) if lines else "没有取回任何内容"
-
-
 def _select_events(window, *, ids=None, anchor: str = "", before: int = 0, after: int = 0,
                    start: str = "", end: str = "", kinds: str = "", source: str = ""):
     from mods import chat, oplog
@@ -326,14 +254,13 @@ def _select_events(window, *, ids=None, anchor: str = "", before: int = 0, after
                                source_window=source_window)
 
 
-def recall_events(ids: list[str] | None = None, offset: int = 0, anchor: str = "",
+def recall_events(ids: list[str] | None = None, anchor: str = "",
                   before: int = 0, after: int = 0, start: str = "", end: str = "",
                   kinds: str = "", source: str = "") -> str:
-    """按正式号或一段已读经历反查输入、完整输出和结果；中心会话可跨窗口查旧号。整条返回才是新的 result，正文中的旧事件不重新编号。
+    """按正式号或一段已读经历直接返回输入、完整输出和结果；中心会话可跨窗口查旧号。整次调用只有一个 result，正文中的旧事件不重新编号。
 
     @param
     ids: 显式正式号列表；与 anchor 或 start/end 二选一，范围调用可省略
-    offset: 长结果的字符偏移；范围首查须为 0，续读改用返回的 resolved_ids 作为显式 ids
     anchor: 中心正式号；可用 before/after 取邻近已读事件
     before: anchor 之前的原始事件数，不按筛选命中补足
     after: anchor 之后的原始事件数，不按筛选命中补足
@@ -344,16 +271,11 @@ def recall_events(ids: list[str] | None = None, offset: int = 0, anchor: str = "
     """
     import json
 
-    from mods import chat, oplog
+    from mods import oplog
 
     window = _tool_window()
     if window is None:
         return "当前不在聊天窗口里"
-    if type(offset) is not int or offset < 0:
-        return "offset 必须是非负整数"
-    ranged = bool(anchor or start or end)
-    if ranged and offset:
-        return "范围续读须改用上次返回的 resolved_ids 作为显式 ids，并传 offset"
     try:
         selected, missing = _select_events(window, ids=ids, anchor=anchor, before=before,
                                            after=after, start=start, end=end,
@@ -361,56 +283,12 @@ def recall_events(ids: list[str] | None = None, offset: int = 0, anchor: str = "
     except ValueError as error:
         return f"未反查：{error}"
     resolved_ids = [entry["id"] for entry in selected]
-    found, _missing = oplog.recall_events(window, resolved_ids)
-    items = [json.dumps(item, ensure_ascii=False) for item in found]
-    if missing:
-        items.append("找不到: " + ", ".join(missing))
-    if not items:
+    found, unavailable = oplog.recall_events(window, resolved_ids)
+    missing = list(dict.fromkeys([*missing, *unavailable]))
+    if not found and not missing:
         return "范围内没有符合筛选条件的已读事件"
-    rendered = "\n".join(items)
-    if offset >= len(rendered):
-        return "已经读到这些事件的末尾"
-    segment = rendered[offset:]
-    prefix = "resolved_ids=" + json.dumps(resolved_ids, ensure_ascii=False) + "\n" if ranged else ""
-    excerpt = chat.bounded_excerpt(segment, chat.MAIL_PULL_TOKENS - 1120 - chat.count_tokens(prefix))
-    if len(excerpt) < len(segment):
-        instruction = ("用 resolved_ids 作为显式 ids" if ranged else "相同 ids")
-        return prefix + excerpt + f"\n结果未读完；{instruction} 继续 recall_events(offset={offset + len(excerpt)})"
-    return prefix + excerpt
-
-
-def event_span(anchor: str = "", before: int | None = None, after: int | None = None,
-               start: str = "", end: str = "",
-               kinds: str = "", source: str = "") -> str:
-    """按唯一已读顺序列出某个正式号附近或两个正式号之间的小段；先选范围再筛选，不读取正文。
-
-    @param
-    anchor: 中心正式事件号；与 start/end 二选一
-    before: 中心之前的已读事件数，默认 5；不按编号数字差或筛选命中数计算
-    after: 中心之后的已读事件数，默认 5
-    start: 区间起点正式号；与 end 一起使用，含端点
-    end: 区间终点正式号；与 start 一起使用，含端点
-    kinds: 可选，逗号分隔 input、output、result、notification；先定范围再筛选
-    source: 可选来源窗口，g<群号> 或 u<私聊对端号>；只筛选，不决定排列
-    """
-    import json
-
-    window = _tool_window()
-    if window is None:
-        return "当前不在聊天窗口里"
-    try:
-        selected, _missing = _select_events(window, anchor=anchor,
-                                            before=(5 if anchor else 0) if before is None else before,
-                                            after=(5 if anchor else 0) if after is None else after,
-                                            start=start, end=end, kinds=kinds, source=source)
-    except ValueError as error:
-        return f"未找到范围：{error}"
-    if not selected:
-        return "范围内没有符合筛选条件的已读事件"
-    return json.dumps([{"id": entry["id"], "kind": entry["kind"],
-                        "window": entry["window"],
-                        "source_window": entry.get("source_window")}
-                       for entry in selected], ensure_ascii=False)
+    return json.dumps({"resolved_ids": resolved_ids, "events": found, "missing": missing},
+                      ensure_ascii=False)
 
 
 def event_links(ids: list[str] | None = None, anchor: str = "", before: int = 0,
@@ -477,7 +355,7 @@ def cover_events(ids: list[str], conclusion: str, anchor: str = "", before: int 
                                            kinds=kinds, source=source)
         if missing:
             raise ValueError("不是本窗口已读事件: " + ", ".join(missing))
-        visible = (chat._trusted_stream_ids(session) | getattr(session, "recalled_legacy_ids", set())
+        visible = (chat._trusted_stream_ids(session) | getattr(session, "recalled_ids", set())
                    if window == chat.AGENT_WINDOW
                    else chat._visible_stream_ids(session.messages))
         members = oplog.cover(window, session.active_action,
@@ -535,12 +413,11 @@ def say(text: str, final_call: bool = True, target: str = "") -> str:
     "哪些工具终结一轮"的表，那会把判断从调用点搬到一张猜出来的清单上。
 
     WHY: 正文**不转义**。模型是 CQ 原生的一方：收到的消息原样带 CQ 码，写出去的也照原样
-    发，往返因此闭合。在这里 `cq.escape` 会让它写的 at 和图片变成字面文本。这与
-    `op._receipt` 那条相反的规矩不冲突——那里转义的是**命令原文**，是记录，不是发言。
+    发，往返因此闭合。在这里 `cq.escape` 会让它写的 at 和图片变成字面文本。
 
     WHY: 它住在 meta 而不是自己一个模块，因为发言是模型**永远**该有的能力，而
     `tools._BASE_MODULE_NAME` 是单数、基础模块只有一个。meta 早就不只是"管工具模块"了
-    （`condense_ops`/`recall_ops` 管的是上下文），它实际是那组不可卸载的基础能力，`say`
+    （事件反查和覆盖工具也管上下文），它实际是那组不可卸载的基础能力，`say`
     属于这一组。改成支持多个基础模块也行，代价是那条"基础模块的导出不加模块名前缀"的
     规则会多出命名冲突的可能，眼下不值得。
 
@@ -672,16 +549,46 @@ def status(source: str = "") -> str:
             if not lines:
                 lines = [f"{source} 当前没有未读、补回缺口或活跃历史信源"]
     else:
-        lines = [chat._unread_detail_text(detail) for detail in details]
-        lines.extend(_source_status_line(state) for state in sources
-                     if state["source_type"] == "napcat_history"
-                     and (state["remaining"] or state["state"] != "complete"))
+        lines = []
+        gap_counts = {}
+        history_gap_counts = {}
+        for detail in details:
+            recovery = detail.get("recovery")
+            if (recovery and recovery.get("gap") and not detail["unread"]
+                    and not detail["mentions"] and not detail["other_wakes"]
+                    and not recovery["remaining"]):
+                reason = recovery["gap"].split("; cursor=", 1)[0]
+                gap_counts[reason] = gap_counts.get(reason, 0) + 1
+            else:
+                lines.append(chat._unread_detail_text(detail))
+        for state in sources:
+            if state["source_type"] != "napcat_history":
+                continue
+            if (state["remaining"] or state["mention_count"] > state["read_mention_count"]
+                    or state["state"] == "fetching"):
+                lines.append(_source_status_line(state))
+            elif state["gap"]:
+                reason = state["gap"].split("; cursor=", 1)[0]
+                history_gap_counts[reason] = history_gap_counts.get(reason, 0) + 1
+            elif state["state"] != "complete":
+                lines.append(_source_status_line(state))
+        lines.extend(f"无待读内容的窗口缺口：{reason}，{count} 个窗口"
+                     for reason, count in gap_counts.items())
+        lines.extend(f"无待读内容的历史信源缺口：{reason}，{count} 个信源"
+                     for reason, count in history_gap_counts.items())
         if not lines:
             return "当前没有待处理的 FIFO；未读未减少"
+        lines.append("可用 status(source) 按具体 g/u 窗口或历史信源 key 查看完整状态")
     rendered = "\n".join(lines)
     excerpt = chat.bounded_excerpt(rendered, chat.MAIL_PULL_TOKENS - 1000)
-    suffix = "\n状态过多，返回已截断；可按具体窗口或信源 key 查询" if len(excerpt) < len(rendered) else ""
-    return excerpt + suffix + "\n未读未减少"
+    if len(excerpt) < len(rendered):
+        complete_lines = excerpt.splitlines()
+        if excerpt and not excerpt.endswith("\n") and rendered[len(excerpt)] != "\n":
+            complete_lines.pop()
+        return "\n".join([*complete_lines,
+                          "状态过多，返回已截断；可用 status(source) 按具体窗口或信源 key 查询",
+                          "未读未减少"])
+    return rendered + "\n未读未减少"
 
 
 def fetch(source: str) -> str:
@@ -740,133 +647,113 @@ def _pull_source(source: str, count: int) -> str:
     return f"已安排下一次请求前从信源 {source} 队首读取最多 {count} 条"
 
 
-def _peek_source(source: str, limit: int) -> str:
-    """预览独立信源 FIFO 当前队首，不消耗未读；长正文请按返回的 origin 调 peek。
+def mentions(source: str) -> str:
+    """直接返回一个 FIFO 中尚未正式读取的 @／提及正文与 message_id；不推进水位。
 
     @param
-    source: fetch 返回的信源 key
-    limit: 最多预览多少条，1 到 8
+    source: g<群号>、u<私聊对端号>，或 fetch 返回的独立信源 key
     """
-    from mods import _source_pages, chat, chatlog, context, oplog
+    import json
+
+    from mods import chat, context, oplog
 
     if not context.agent_mode() or not current_binding().session.reads_window_mail:
-        return "只有中心 reader 可以预览信源"
-    if not isinstance(limit, int) or not 1 <= limit <= 8:
-        return "limit 必须是 1..8"
-    state = oplog.resolve_source(source)
-    if state is None or state["key"] != source:
-        return "找不到该信源 key"
-    if state["state"] == "fetching":
-        return "信源仍在拉取，FIFO 队首尚未固定"
-    current_binding().session.associated_windows.add(tuple(state["window"]))
-    page_number = state["read_page"]
-    offset = state["read_offset"]
-    lines = []
-    while page_number is not None and page_number >= 0 and len(lines) < limit:
-        members = _source_pages.read_page(oplog.source_page_root(), source, page_number)
-        for member in members[offset:]:
-            record = chatlog.read_origin(*state["window"], member["origin"])
-            if record is None:
-                return "信源档案位置丢失；未读未减少"
-            projection = chat._model_event(record, state["window"][0] == "group")
-            if projection is not None:
-                body = chat.bounded_excerpt(str(projection["content"]), 900)
-                lines.append(f"origin={member['origin']} message_id={member['message_id']}: {body}")
-            if len(lines) >= limit:
-                break
-        page_number -= 1
-        offset = 0
-    return ("\n".join(lines) if lines else "没有可预览的未读内容") + "\n未读未减少"
+        return "只有中心 reader 可以查看未读提及"
+    try:
+        window = chat.parse_target(source)
+        state = None
+    except ValueError:
+        state = oplog.resolve_source(source)
+        if state is None or state["key"] != source:
+            return "找不到该窗口或信源 key"
+        window = tuple(state["window"])
+    current_binding().session.associated_windows.add(window)
+    try:
+        found = chat.unread_mentions(window, state)
+    except ValueError as error:
+        return f"未查看：{error}"
+    return json.dumps(found, ensure_ascii=False) if found else "该 FIFO 没有未读 @／提及；水位未变"
 
 
-def _peek_window(target: str, before: str, limit: int, origin: str, offset: int) -> str:
-    """预览指定窗口最近或旧档的有界片段，不减少未读。
+def read_messages(window: str, message_id: str = "", origin: str = "", timestamp: int = 0,
+                  before: int = 4, after: int = 4) -> str:
+    """在指定聊天窗口的本地档案中，按 QQ message_id 或稳定 origin 直接返前后文。不消费 FIFO，已读或标为已读后仍可查。
 
     @param
-    target: g<群号> 或 u<私聊对端号>，必须明确指定
-    before: 上次返回的 next_before 档案位置；留空预览最新
-    limit: 最多查看的记录数，1 到 8
-    origin: 单条过长时返回的 continue_item，续读这一条时填入；通常留空
-    offset: 与 origin 一起使用，继续读取同一记录的字符偏移；通常为 0
+    window: g<群号> 或 u<私聊对端号>
+    message_id: QQ 消息号；与 origin 二选一
+    origin: mentions/read_messages 返回的稳定档案位置；与 message_id 二选一
+    timestamp: message_id 命中多条时用来消歧义的 Unix 整数秒；0 表示不指定
+    before: 锚点之前返回多少条档案记录，非负整数
+    after: 锚点之后返回多少条档案记录，非负整数
     """
     import json
 
     from mods import chat, chatlog, context
 
     if not context.agent_mode() or not current_binding().session.reads_window_mail:
-        return "只有中心 reader 可以预览聊天档案"
+        return "只有中心 reader 可以查阅聊天档案"
     try:
-        window = chat.parse_target(target)
+        target = chat.parse_target(window)
     except ValueError as error:
         return str(error)
-    current_binding().session.associated_windows.add(window)
-    if (not isinstance(limit, int) or not 1 <= limit <= 8
-            or not isinstance(offset, int) or offset < 0 or offset and not origin):
-        return "limit 必须是 1..8；offset 必须配合 continue_item 且为非负整数"
-    if origin:
-        record = chatlog.read_origin(*window, origin)
-        if record is None:
-            return "找不到该窗口的精确档案位置；未读未减少"
-        records = [record]
-    else:
-        records = chatlog.read_range(*window, limit=limit, before=before or None)
-    if not records:
-        return "没有更早的档案记录；未读未减少"
-    lines = []
-    used = 0
-    cursor = before
+    if not message_id and not origin:
+        return "请指定 message_id 或 origin"
+    if message_id and origin:
+        return "message_id 与 origin 只能指定一个"
+    current_binding().session.associated_windows.add(target)
+    try:
+        records = chatlog.read_around(
+            *target,
+            message_id=message_id or None,
+            origin=origin or None,
+            timestamp=timestamp or None,
+            before=before,
+            after=after,
+        )
+    except ValueError as error:
+        return f"未查看：{error}"
+    result = []
     for record in records:
-        origin = record.get("_log_origin")
-        if not origin:
-            return "档案记录缺少稳定位置，拒绝无游标预览"
-        projection = chat._model_event(record, window[0] == "group")
-        if projection is None:
-            cursor = origin
-            continue
-        rendered = json.dumps(projection["content"], ensure_ascii=False)
-        segment = rendered[offset:] if not lines else rendered
-        if not segment and origin:
-            return f"该记录已读到末尾；next_before={origin}; 未读未减少"
-        excerpt = chat.bounded_excerpt(segment, max(1, chat.MAIL_PULL_TOKENS - used - 1000))
-        if len(excerpt) < len(segment):
-            if lines:
-                break
-            return (f"{target} origin={origin} 预览片段：{excerpt}\n"
-                    f"continue_item={origin}; next_offset={offset + len(excerpt)}; 未读未减少")
-        lines.append(f"{target} origin={origin}: {segment}")
-        used += chat.count_tokens(segment)
-        cursor = origin
-    return ("\n".join(reversed(lines)) if lines else "这一段没有可见聊天记录") + (
-        f"\nnext_before={cursor or '(end)'}; next_offset=0; 未读未减少")
+        projection = chat._model_event(record, target[0] == "group")
+        if projection is not None:
+            result.append({"origin": record.get("_log_origin"),
+                           "message_id": record.get("message_id"),
+                           "time": record.get("time"),
+                           "content": projection["content"]})
+    return (json.dumps(result, ensure_ascii=False) if result
+            else "本地档案没有命中可见记录；FIFO 水位未变")
 
 
-def peek(source: str, before: str = "", count: int = 8, item: str = "", offset: int = 0) -> str:
-    """预览一个窗口档案或独立 FIFO，不消耗未读；窗口档案可用稳定锚点向前查看。整条返回是一个 result，档案行不是 input，也不能确认 say 回声。
+def mark_read(source: str) -> str:
+    """将一个 FIFO 在调用时已存在的全部未读标为已读。这些内容不取得经历号，但仍可用 read_messages 查档。
 
     @param
-    source: g<群号>、u<私聊对端号>，或 fetch 返回的信源 key
-    before: 窗口档案的排他锚点；留空看最新。独立 FIFO 留空，只看当前队首
-    count: 最多查看多少条，1 到 8
-    item: 单条窗口档案过长时，填上次返回的 continue_item
-    offset: 与 item 一起继续读取同一条正文的字符偏移
+    source: g<群号>、u<私聊对端号>，或 fetch 返回的独立信源 key
     """
+    import json
+
     from mods import chat, context, oplog
 
     if not context.agent_mode() or not current_binding().session.reads_window_mail:
-        return "只有中心 reader 可以预览信源"
+        return "只有中心 reader 可以推进未读水位"
     try:
-        chat.parse_target(source)
+        window = chat.parse_target(source)
+        state = None
     except ValueError:
         state = oplog.resolve_source(source)
         if state is None or state["key"] != source:
             return "找不到该窗口或信源 key"
-        if item:
-            target = ("g" if state["window"][0] == "group" else "u") + str(state["window"][1])
-            return _peek_window(target, "", count, item, offset)
-        if before or offset:
-            return "独立 FIFO 只预览当前队首；前进请用 pull，长正文续读请传 item 和 offset"
-        return _peek_source(source, count)
-    return _peek_window(source, before, count, item, offset)
+        if state["source_type"] == "napcat_boot":
+            return "启动补回属于原窗口 FIFO，请用对应的 g/u 窗口名标为已读"
+        window = tuple(state["window"])
+    current_binding().session.associated_windows.add(window)
+    try:
+        result = (chat.mark_window_read(window) if state is None
+                  else chat.mark_source_read(state))
+    except ValueError as error:
+        return f"未标为已读：{error}"
+    return json.dumps(result, ensure_ascii=False)
 
 
 def pull(source: str, count: int = _DEFAULT_PULL_COUNT) -> str:
@@ -930,18 +817,17 @@ __all__ = [
     "cover_events",
     "say",
     "status",
+    "mentions",
     "fetch",
-    "peek",
     "pull",
+    "mark_read",
+    "read_messages",
     "edit_hint",
     "exec_code",
     "list_tools",
     "reload_tools",
     "load_tools",
-    "condense_ops",
-    "recall_ops",
     "recall_events",
-    "event_span",
     "event_links",
     "attach_image",
 ]

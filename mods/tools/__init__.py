@@ -282,8 +282,8 @@ class ToolRegistry:
         exports = _explicit_exports(candidate, path)
         # WHY: 只要求四个恢复入口都在，不再要求 __all__ 与它完全相等。原先是相等（含顺序），
         # 那是迁移带来的附带收紧；承重的一直只有"少一个模型就没法自救"，docs/llm.md 记的
-        # 也是这条。放宽是给 meta 加 condense_ops 时逼出来的：相等的写法让 meta 多导出一个
-        # 函数就整个加载失败，而那正是恢复入口所在的模块，失败等于全盘瘫痪。
+        # 也是这条。meta 还承载聊天、信源和记忆基础能力；若要求精确相等，新增任一基础函数
+        # 都会让恢复入口所在模块整体加载失败。
         if name == _BASE_MODULE_NAME:
             absent = [tool_name for tool_name in _BASE_TOOL_NAMES if tool_name not in exports]
             if absent:

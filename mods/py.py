@@ -118,6 +118,11 @@ _EXPORT_SPECS = {
     "repeat": ("later", "repeat"),
 }
 
+# WHY: Minecraft is a device capability, not part of the dynamic evaluator's
+# minimum viable environment.  If its private configuration is absent or
+# invalid, omit only these aliases so `.py`, link, later and todo remain usable.
+_OPTIONAL_EXPORT_MODULES = {"minecraft"}
+
 
 def _build_exports(loaded):
     from mods import is_available
@@ -129,14 +134,17 @@ def _build_exports(loaded):
     forward_definitions = {"later", "link"}
     for public_name, (module_name, attribute) in _EXPORT_SPECS.items():
         module = loaded.get(module_name)
-        if (
-            module is None
-            or not hasattr(module, attribute)
-            or (
-                module_name not in forward_definitions
-                and not is_available(module_name)
-            )
-        ):
+        if module is None:
+            if module_name in _OPTIONAL_EXPORT_MODULES:
+                continue
+            missing.append(f"{public_name}={module_name}.{attribute}")
+            continue
+        if not hasattr(module, attribute):
+            missing.append(f"{public_name}={module_name}.{attribute}")
+            continue
+        if module_name not in forward_definitions and not is_available(module_name):
+            if module_name in _OPTIONAL_EXPORT_MODULES:
+                continue
             missing.append(f"{public_name}={module_name}.{attribute}")
             continue
         exports[public_name] = getattr(module, attribute)

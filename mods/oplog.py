@@ -19,7 +19,6 @@ from mods import INFRA
 
 PHASE = INFRA
 LOAD_AFTER = ("storage",)
-DISPLAY_CHARS = 200
 AGENT_WINDOW = ("agent", 0)
 _REFERENCE = re.compile(r"(?<![A-Za-z0-9_-])(\d{8}-[1-9]\d*(?:#[1-9]\d*)?)(?![A-Za-z0-9_#-])")
 
@@ -98,13 +97,14 @@ def _restore() -> None:
     mentioned_by: dict[str, list[str]] = {}
     origins: dict[tuple[tuple, str], dict] = {}
     sources: dict[str, dict] = {}
+    seen_messages: set[tuple[tuple, str, int, str | None]] = set()
     for path in sorted(directory.glob("????????.jsonl")):
         data = path.read_bytes()
         complete = data.rfind(b"\n") + 1
         for line in data[:complete].splitlines():
             entry = json.loads(line.decode("utf-8"))
             _apply(entry, restored, indexes, windows, counters, pending, covered, coverage_nodes,
-                   origins, mentioned_by, notified, floors, arrival_order, sources)
+                   origins, mentioned_by, notified, floors, arrival_order, sources, seen_messages)
         if complete != len(data):
             # WHY: Only a missing final newline is a crash tail. A malformed complete
             # row is corruption, never permission to silently skip committed facts.
@@ -149,8 +149,7 @@ def _restore() -> None:
     _sources.clear()
     _sources.update(sources)
     _seen_messages.clear()
-    _seen_messages.update(identity for entry in restored
-                          if (identity := _input_message_identity(entry, sources)) is not None)
+    _seen_messages.update(seen_messages)
     _root = directory
     _failed = False
 
@@ -175,6 +174,68 @@ def _reference_candidates(entry: dict) -> Iterable[str]:
     for value in texts:
         for match in _REFERENCE.finditer(str(value)):
             yield match.group(1)
+
+
+def _event_bound(value: str | None, name: str) -> tuple[str, int] | None:
+    if value is None or value == "":
+        return None
+    match = re.fullmatch(r"(\d{8})-([1-9]\d*)", value)
+    if match is None:
+        raise ValueError(f"{name} 必须是 YYYYMMDD-N 正式事件号")
+    return match.group(1), int(match.group(2))
+
+
+def iter_events(start: str | None = None, stop: str | None = None) -> Iterable[dict]:
+    """Iterate detached formal experiences and cover facts straight from disk.
+
+    ``start`` is inclusive and ``stop`` is exclusive.  Both are optional
+    formal event ids.  Cover rows have no id; they appear at their physical
+    journal position between the selected formal events.  The iterator does
+    not restore or mutate live oplog state.
+    """
+    lower = _event_bound(start, "start")
+    upper = _event_bound(stop, "stop")
+    if lower is not None and upper is not None and lower >= upper:
+        raise ValueError("start 必须早于 stop")
+    directory = _directory()
+    started = lower is None
+    for path in sorted(directory.glob("????????.jsonl")):
+        day = path.stem
+        if lower is not None and day < lower[0]:
+            continue
+        if upper is not None and day > upper[0]:
+            break
+        size = path.stat().st_size
+        with path.open("rb") as stream:
+            while stream.tell() < size:
+                line = stream.readline(size - stream.tell())
+                # WHY: Freeze the visible prefix so a live append cannot make one
+                # inspection chase the file forever.  A concurrent crash-tail
+                # recovery may shorten that prefix, in which case EOF also ends it.
+                if not line or not line.endswith(b"\n"):
+                    break
+                entry = json.loads(line.decode("utf-8"))
+                event_id = entry.get("id")
+                if event_id is not None:
+                    position = _event_bound(event_id, "journal id")
+                    if upper is not None and position >= upper:
+                        return
+                    if not started:
+                        if position < lower:
+                            continue
+                        started = True
+                    if entry.get("kind") not in ("input", "output", "result", "notification"):
+                        continue
+                    if entry["kind"] == "output" and isinstance(entry.get("assistant"), dict):
+                        assistant = entry["assistant"]
+                        entry["body"] = assistant.get("content") or ""
+                        entry["thought_present"] = bool(assistant.get("reasoning_content"))
+                        entry["actions"] = [call["function"]
+                                            for call in assistant.get("tool_calls", ())]
+                    entry["references"] = list(dict.fromkeys(_reference_candidates(entry)))
+                    yield entry
+                elif started and entry.get("kind") == "cover":
+                    yield entry
 
 
 def _validate_source_page(entry: dict, state: dict) -> None:
@@ -218,12 +279,48 @@ def _validate_source_read(entry: dict, state: dict, pending: dict[str, dict]) ->
             raise ValueError("source read does not match its live arrival")
 
 
+def _source_successor(state: dict, page: int, offset: int, count: int) -> tuple[int, int]:
+    if type(count) is not int or count < 1 or count > state["member_count"] - state["read_count"]:
+        raise ValueError("source mark-read count is invalid")
+    current_page, current_offset = page, offset
+    remaining = count
+    while remaining:
+        if current_page < 0 or current_offset >= state["page_counts"][current_page]:
+            raise ValueError("source mark-read cursor is exhausted")
+        available = state["page_counts"][current_page] - current_offset
+        if remaining < available:
+            return current_page, current_offset + remaining
+        remaining -= available
+        current_page, current_offset = _previous_nonempty_page(state, current_page), 0
+    return current_page, current_offset
+
+
+def _validate_source_mark_read(entry: dict, state: dict, pending: dict[str, dict]) -> None:
+    if state["state"] == "fetching":
+        raise ValueError("source is not sealed")
+    page, offset = entry["page"], entry["offset"]
+    if (type(page) is not int or type(offset) is not int
+            or (page, offset) != (state["read_page"], state["read_offset"])):
+        raise ValueError("source mark-read cursor is stale")
+    _source_successor(state, page, offset, entry["count"])
+    mentions = entry.get("mention_count", 0)
+    if (type(mentions) is not int or not 0 <= mentions <= entry["count"]
+            or state["read_mention_count"] + mentions > state["mention_count"]):
+        raise ValueError("source mark-read mention count is invalid")
+    arrivals = entry.get("arrivals", [])
+    if (not isinstance(arrivals, list) or len(arrivals) != len(set(arrivals))
+            or any(arrival not in pending or pending[arrival]["window"] != state["window"]
+                   for arrival in arrivals)):
+        raise ValueError("source mark-read arrivals are invalid")
+
+
 def _apply(
     entry: dict, recorded: list[dict], indexes: dict[str, dict], windows: dict[tuple, list[dict]],
     counters: dict[str, int], pending: dict[str, dict], covered: dict[tuple, set[str]],
     coverage_nodes: dict[str, list[str]], origins: dict[tuple[tuple, str], dict],
     mentioned_by: dict[str, list[str]], notified: set[str], floors: dict[tuple, str | None],
     arrival_order: dict[str, int], sources: dict[str, dict],
+    seen_messages: set[tuple[tuple, str, int, str | None]],
 ) -> None:
     if entry["kind"] == "arrival":
         arrival_order[entry["arrival"]] = len(arrival_order)
@@ -307,6 +404,39 @@ def _apply(
                 if arrival_order[arrival] <= boundary and tuple(item["window"]) == window and not item.get("fetched"):
                     pending.pop(arrival)
         return
+    if entry["kind"] == "mark_read":
+        # WHY: 「标为已读」只推进持久未读水位，不是主体真正读到的一段经历，
+        # 所以它没有正式事件号。原文权威仍是 chatlog，之后可按 message_id/origin 查回。
+        window = tuple(entry["window"])
+        arrivals = entry["arrivals"]
+        ordered = [arrival for arrival, item in pending.items()
+                   if tuple(item["window"]) == window]
+        if (not isinstance(arrivals, list) or not arrivals
+                or len(arrivals) != len(set(arrivals))
+                or ordered[:len(arrivals)] != arrivals):
+            raise ValueError("mark-read must consume one exact pending prefix")
+        for arrival in arrivals:
+            marked = pending.pop(arrival)
+            identity = _message_identity(window, marked["event"])
+            if identity is not None:
+                seen_messages.add(identity)
+        return
+    if entry["kind"] == "source_mark_read":
+        # 历史信源的水位住在页内游标里；这条和上面的 window discard
+        # 是同一个用户动作的两种底层投影，都不伪造 input。
+        state = sources[entry["source"]]
+        _validate_source_mark_read(entry, state, pending)
+        state["read_page"], state["read_offset"] = _source_successor(
+            state, entry["page"], entry["offset"], entry["count"])
+        state["read_count"] += entry["count"]
+        state["read_mention_count"] += entry.get("mention_count", 0)
+        state["pulled"] = True
+        for arrival in entry.get("arrivals", []):
+            marked = pending.pop(arrival)
+            identity = _message_identity(tuple(state["window"]), marked["event"])
+            if identity is not None:
+                seen_messages.add(identity)
+        return
     if entry["kind"] == "notification_ack":
         notice = indexes[entry["notification"]]
         if notice["kind"] != "notification":
@@ -314,6 +444,8 @@ def _apply(
         notice["acknowledged"] = True
         notified.update(notice["arrivals"])
         return
+    # WHY: 新代码不再产生 condensed/clear；这里只重放既有生产日志，避免升级后
+    # 旧事件突然重新出现或让事件流因未知记录无法启动。旧日志退休后即可一起删除。
     if entry["kind"] == "condensed":
         indexes[entry["target"]]["condensed"] = True
         return
@@ -336,6 +468,11 @@ def _apply(
                 existing["hidden"] = True
         return
     source_read = entry["kind"] == "input" and "page" in entry
+    if entry["kind"] == "output" and isinstance(entry.get("assistant"), dict):
+        assistant = entry["assistant"]
+        entry["body"] = assistant.get("content") or ""
+        entry["thought_present"] = bool(assistant.get("reasoning_content"))
+        entry["actions"] = [call["function"] for call in assistant.get("tool_calls", ())]
     if source_read:
         _validate_source_read(entry, sources[entry["source"]], pending)
     event_id = entry["id"]
@@ -379,6 +516,9 @@ def _apply(
         if entry["kind"] == "input" and arrival is not None and arrival.get("source"):
             sources[arrival["source"]]["pulled"] = True
         pending.pop(entry["arrival"], None)
+    identity = _input_message_identity(entry, sources)
+    if identity is not None:
+        seen_messages.add(identity)
 
 
 def _append(entry: dict, day: str) -> None:
@@ -398,6 +538,17 @@ def _append(entry: dict, day: str) -> None:
         _validate_source_page(entry, _sources[entry["source"]])
     if entry["kind"] == "input" and "page" in entry:
         _validate_source_read(entry, _sources[entry["source"]], _pending)
+    if entry["kind"] == "mark_read":
+        window = tuple(entry["window"])
+        ordered = [arrival for arrival, item in _pending.items()
+                   if tuple(item["window"]) == window]
+        arrivals = entry.get("arrivals")
+        if (not isinstance(arrivals, list) or not arrivals
+                or len(arrivals) != len(set(arrivals))
+                or ordered[:len(arrivals)] != arrivals):
+            raise ValueError("mark-read must consume one exact pending prefix")
+    if entry["kind"] == "source_mark_read":
+        _validate_source_mark_read(entry, _sources[entry["source"]], _pending)
     if entry["kind"] in ("input", "result") and entry.get("arrival") and entry["arrival"] not in _pending:
         raise ValueError("arrival was already consumed or does not exist")
     path = _root / f"{day}.jsonl"
@@ -413,10 +564,8 @@ def _append(entry: dict, day: str) -> None:
         _failed = True
         raise
     _apply(entry, _events, _by_id, _windows, _next, _pending, _covered, _coverage_nodes,
-           _origins, _mentioned_by, _notified, _floors, _arrival_order, _sources)
-    identity = _input_message_identity(entry, _sources)
-    if identity is not None:
-        _seen_messages.add(identity)
+           _origins, _mentioned_by, _notified, _floors, _arrival_order, _sources,
+           _seen_messages)
     if entry.get("id") and entry.get("arrival"):
         _by_arrival[entry["arrival"]] = entry
 
@@ -455,6 +604,30 @@ def unread(window: tuple) -> list[dict]:
     with _lock:
         _restore()
         return _ordered_pending(window)
+
+
+def mark_arrivals_read(window: tuple, arrivals: Iterable[str]) -> int:
+    """Durably mark one exact unread window prefix without assigning event ids."""
+    with _lock:
+        _restore()
+        selected = list(arrivals)
+        _append({"kind": "mark_read", "window": list(window), "arrivals": selected},
+                datetime.now().strftime("%Y%m%d"))
+        return len(selected)
+
+
+def mark_source_read(source: str, count: int, mention_count: int,
+                     arrivals: Iterable[str] = ()) -> dict:
+    """Advance one sealed source without presenting its members to the model."""
+    with _lock:
+        _restore()
+        state = _sources[source]
+        entry = {"kind": "source_mark_read", "source": source,
+                 "page": state["read_page"], "offset": state["read_offset"],
+                 "count": count, "mention_count": mention_count,
+                 "arrivals": list(arrivals)}
+        _append(entry, datetime.now().strftime("%Y%m%d"))
+        return _source_snapshot(_sources[source])
 
 
 def pending_message(window: tuple, message_id: int | str, event_time: int,
@@ -796,8 +969,6 @@ def select_events(window: tuple | None, *, ids: Iterable[str] | None = None,
         raise ValueError("请只指定非空 ids、anchor，或同时指定 start 和 end")
     if not anchor and (before or after):
         raise ValueError("before 和 after 只能与 anchor 一起使用")
-    if anchor and before + after > 39:
-        raise ValueError("一次最多查看含中心的 40 条，请缩小范围")
     allowed_kinds = {"input", "output", "result", "notification"}
     selected_kinds = set(kinds)
     if selected_kinds - allowed_kinds:
@@ -833,22 +1004,10 @@ def select_events(window: tuple | None, *, ids: Iterable[str] | None = None,
                 first, last = positions[start], positions[end]
                 if first > last:
                     raise ValueError("start 必须早于或等于 end")
-                if last - first >= 40:
-                    raise ValueError("区间一次最多 40 条；先用 anchor=start、before=0、after=39 查下一段")
                 selected = timeline[first:last + 1]
         return ([entry for entry in selected if (not selected_kinds or entry["kind"] in selected_kinds)
                  and (source_window is None
                       or tuple(entry.get("source_window") or entry["window"]) == source_window)], missing)
-
-
-def event_span(window: tuple | None, *, anchor: str = "", before: int = 0, after: int = 0,
-               start: str = "", end: str = "", kinds: Iterable[str] = (),
-               source_window: tuple | None = None) -> list[dict]:
-    """List a bounded span in read order, preserving its existing API."""
-    selected, _missing = select_events(window, anchor=anchor, before=before, after=after,
-                                       start=start, end=end, kinds=kinds,
-                                       source_window=source_window)
-    return selected
 
 
 def _register(window: tuple | None, kind: str, **values: Any) -> dict | None:
@@ -911,13 +1070,23 @@ def origin_status(window: tuple | None, origin: str) -> str | None:
 
 
 def output(window: tuple | None, assistant: dict, calls: list[dict],
-           *, persist_reasoning: bool = False) -> str | None:
+           *, persist_reasoning: bool = False, model: str | None = None) -> str | None:
     reasoning = assistant.get("reasoning_content")
-    values = {"body": assistant.get("content", ""),
-              "thought_present": bool(reasoning),
-              "actions": [call["function"] for call in calls]}
-    if persist_reasoning and isinstance(reasoning, str) and reasoning:
-        values["thought"] = reasoning
+    if model is not None:
+        # WHY: The provider's original assistant shape is the only durable
+        # execution transcript. body/actions are reconstructed by _apply for
+        # coverage and older readers, rather than written as a second version.
+        values = {"model": model, "protocol": "openai_chat_completions",
+                  "assistant": {key: assistant[key] for key in
+                                ("role", "content", "reasoning_content") if key in assistant}}
+        if calls:
+            values["assistant"]["tool_calls"] = calls
+    else:
+        values = {"body": assistant.get("content", ""),
+                  "thought_present": bool(reasoning),
+                  "actions": [call["function"] for call in calls]}
+        if persist_reasoning and isinstance(reasoning, str) and reasoning:
+            values["thought"] = reasoning
     recorded = _register(window, "output", **values)
     return recorded["id"] if recorded else None
 
@@ -933,16 +1102,6 @@ def events(window: tuple | None, include_condensed: bool = False) -> list[dict]:
                 if not item.get("hidden")
                 and (include_condensed or (not item.get("condensed")
                                            and item["id"] not in _covered.get(tuple(window or ()), ())))]
-
-
-def event_positions(window: tuple | None, ids: Iterable[str]) -> dict[str, int]:
-    """Derive positions from the sole append order."""
-    wanted = set(ids)
-    with _lock:
-        _restore()
-        listed = _events if window == AGENT_WINDOW else _windows.get(tuple(window or ()), ())
-        return {entry["id"]: position for position, entry in enumerate(listed)
-                if entry["id"] in wanted}
 
 
 def covered(window: tuple | None) -> set[str]:
@@ -1061,66 +1220,6 @@ def cover(window: tuple, node: str, ids: Iterable[str], visible: set[str]) -> se
 
 def _call(entry: dict) -> str:
     return f"{entry['source']}#{entry['position'] + 1}"
-
-
-def entries(window: tuple | None, include_condensed: bool = False) -> list[dict]:
-    with _lock:
-        _restore()
-        listed = _events if window == AGENT_WINDOW else events(window, include_condensed)
-        return [{**entry, **item, "cid": _call({**entry, **item})}
-                for entry in listed if entry["kind"] == "result" and not entry.get("hidden")
-                and (include_condensed or not entry.get("condensed"))
-                for item in entry["returns"]]
-
-
-def recall(window: tuple | None, cids: Iterable[str]) -> tuple[list[dict], list[str]]:
-    wanted = {str(value) for value in cids}
-    found = [entry for entry in entries(window, True) if entry["cid"] in wanted]
-    return found, sorted(wanted - {entry["cid"] for entry in found})
-
-
-def condense(window: tuple | None, cids: Iterable[str]) -> int:
-    wanted = {str(value) for value in cids}
-    with _lock:
-        _restore()
-        live = entries(window)
-        sources = {entry["source"] for entry in live if entry["cid"] in wanted
-                   and not _by_id[entry["source"]].get("condensed")}
-        partial = [entry["cid"] for entry in live if entry["source"] in sources and entry["cid"] not in wanted]
-        for source in sources:
-            output_entry = _by_id[source]
-            returned = [entry["position"] for entry in live if entry["source"] == source]
-            if len(returned) != len(output_entry["actions"]) or set(returned) != set(range(len(returned))):
-                raise ValueError("这一输出还有行动未返回，不能收缩")
-        if partial:
-            raise ValueError("同一输出里的行动必须一起收缩，还差: " + ", ".join(sorted(partial)))
-        for entry in [*(_by_id[source] for source in sources),
-                      *{item["id"]: item for item in live if item["source"] in sources}.values()]:
-            if not entry.get("condensed"):
-                _append({"kind": "condensed", "target": entry["id"], "window": list(window or ())},
-                        datetime.now().strftime("%Y%m%d"))
-        return sum(entry["source"] in sources for entry in live)
-
-
-def clear(window: tuple | None) -> None:
-    if window is None:
-        return
-    with _lock:
-        _restore()
-        _append({"kind": "clear", "window": list(window)}, datetime.now().strftime("%Y%m%d"))
-
-
-def render(window: tuple | None) -> str | None:
-    listed = entries(window, True)
-    if not listed:
-        return None
-    def short(value: Any) -> str:
-        shown = " ".join(str(value).split())
-        return shown if len(shown) <= DISPLAY_CHARS else shown[:DISPLAY_CHARS] + "…"
-    return "\n".join(["本窗口的操作历史:", *(
-        f"- [{entry['cid']}]{'(已收缩)' if entry.get('condensed') else ''} "
-        f"{entry['name']}({short(entry['arguments'])}) -> {short(entry['content'])}"
-        for entry in listed)])
 
 
 def say_links(window: tuple | None) -> dict[str, tuple[str, str]]:

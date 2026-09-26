@@ -41,8 +41,8 @@ organized, and that repeated indexing needs distinct future lookup purposes.
 for each batch to be organized before another is read, then folds several
 same-level conclusions into a higher node.
 `--strategy grounded-hierarchy` narrows pulls to 16-to-24 events and explicitly
-forbids guessing IDs from numeric continuity; ranges must first be grounded with
-`event_span`.
+forbids guessing IDs from numeric continuity; bounded review uses the range
+parameters of `recall_events` directly.
 `--strategy grounded-loop` uses the same grounded IDs but gives each round a
 short priority order: cover new input, otherwise fold several summaries,
 otherwise pull 20 events. It explicitly avoids replaying the whole history in
@@ -119,7 +119,7 @@ and a simulated echo with a synthetic ID, never calls the QQ sender. No listener
 NapCat client, Bot boot, or real model call is involved in `doctor`; only `run`
 can call the explicitly configured model.
 
-For safety, the model sees only historical peek/FIFO, cover/recall, Skill
+For safety, the model sees only historical archive/FIFO, cover/recall, Skill
 list/load/reload, hint editing, and dry `say`. Skills are copied from checked-in
 Markdown files into the run directory. Skill *writing* is unavailable in this
 baseline because production uses unrestricted host/file/code capabilities for

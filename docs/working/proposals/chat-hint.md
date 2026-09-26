@@ -58,7 +58,7 @@
 **求值**：
 - **环境**：共享动态环境 `py.loc` 的**一份副本**（读名字照旧；代码里的赋值只落副本，跑完 `py.loc` 一个键都不多，见「实现注」），作者拿到的名字与 `.py`、link 一致（`sendmsg`/`getlog`/`storage`/`identity`…）。
 - **语义**：**上升为 `py.eval_last(source, environment)`**（13:58 待定 4 选 b）——前面各行 `exec`，最后一行 `eval`；末行为空、以 `#` 开头、或结果为 `None` → 不发。顺手把 `link._eval_last` 那份私有实现改为调用它，消掉重复（**要紧接着 reload `py` 和 `link`**）。
-- **注入名字**：`window`（`history.window(...)`）、`usage`（`chat.context_usage()` 的返回值）。
+- **注入名字**：`window`（`history.window(...)`）、`usage`（最后一次中心请求的事件文本 token 估算）、`event_count`（该请求里的不同正式事件数）、`context_limit`（该请求实际使用的事件数/token 上限）。后三项在中心 agent 仍活跃时冻结，不能等退出 agent 模式后再从原触发窗口猜。
 - **输出**：发到窗口的消息自带 `#` 前缀（`"#" + cq.escape(str(result))`），`_selected_events` 因此跳过它——统计不回流进模型、也不自指。
 
 **“已用上下文”**：`chat.context_usage()` 是唯一出口，hint 只调它、不自己算。**本地估算（13:22 定）**：即 `get_msgs(return_token=True)` 的 `used`（统计进上下文的那部分聊天消息文本 token）。零新状态；它是**下界**。

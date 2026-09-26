@@ -986,6 +986,8 @@ def _reader_index(directory: Path) -> sqlite3.Connection:
                      "position INTEGER, visible INTEGER, PRIMARY KEY (day, source, line))")
     database.execute("CREATE INDEX IF NOT EXISTS reader_order ON reader_rows (day, position)")
     database.execute("CREATE INDEX IF NOT EXISTS reader_ids ON reader_rows (day, message_id, visible)")
+    database.execute("CREATE INDEX IF NOT EXISTS reader_window_ids "
+                     "ON reader_rows (message_id, visible, day, position)")
     return database
 
 
@@ -1282,6 +1284,106 @@ def read_range(
                 if limit is not None and len(records) >= limit:
                     return records[:limit]
     return records
+
+
+def read_around(
+    kind: str,
+    target: int | str,
+    *,
+    message_id: int | str | None = None,
+    origin: str | None = None,
+    timestamp: int | None = None,
+    before: int = 0,
+    after: int = 0,
+    bot_id: int | None = None,
+    root: str | os.PathLike | None = None,
+) -> list[dict[str, Any]]:
+    """Read one window around an exact archived message, oldest first.
+
+    ``message_id`` is only a lookup key, not assumed globally unique.  An
+    ambiguous match must be narrowed with ``timestamp`` or the returned stable
+    ``origin``.  Reading the archive never consumes a mailbox or assigns input
+    event ids.
+    """
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+           for value in (before, after)):
+        raise ValueError("before 和 after 必须是非负整数")
+    if timestamp is not None and (isinstance(timestamp, bool) or not isinstance(timestamp, int)):
+        raise ValueError("timestamp 必须是整数秒")
+    if (message_id is None) == (origin is None):
+        raise ValueError("请只指定 message_id 或 origin")
+    directory = window_path(kind, target, root)
+    if not directory.is_dir():
+        return []
+    if bot_id is None:
+        bot_id = _bot_id()
+    switch = _switch_moment()
+    bot_names, names_complete = _bot_identities()
+    days = _archive_days(directory)
+    with _window_lock(directory), closing(_reader_index(directory)) as database:
+        indexed = [(day, _index_day(database, kind, target, day, root)) for day in days]
+        anchor_day = anchor_position = anchor_row = None
+        if origin is not None:
+            anchor_day, anchor_position, anchor_row = _locate_origin(
+                kind, target, origin, root, database)
+            if timestamp is not None:
+                record = _read_indexed_record(kind, target, anchor_day, anchor_row, bot_id,
+                                              switch, bot_names, names_complete, root)
+                if record.get("time") != timestamp:
+                    return []
+        else:
+            key = recall_key(message_id)
+            candidates = []
+            for day, day_key in indexed:
+                query = ("SELECT source, line, offset, end, position, stamp FROM reader_rows "
+                         "WHERE day=? AND visible=1 AND message_id=?")
+                params: tuple[Any, ...] = (day_key, key)
+                if timestamp is not None:
+                    query += " AND stamp=?"
+                    params += (timestamp,)
+                candidates.extend((day, row) for row in database.execute(query, params))
+            if not candidates:
+                return []
+            if len(candidates) != 1:
+                choices = []
+                for day, row in candidates:
+                    record = _read_indexed_record(kind, target, day, row[:4], bot_id,
+                                                  switch, bot_names, names_complete, root)
+                    choices.append(f"origin={record.get('_log_origin')} time={record.get('time')}")
+                raise ValueError("message_id 在该窗口命中多条记录，请加 timestamp 或改用 origin："
+                                 + "；".join(choices))
+            anchor_day, row = candidates[0]
+            anchor_position, anchor_row = row[4], row[:4]
+        day_index = days.index(anchor_day)
+
+        def rows_on(day_index: int, clause: str, params: tuple[Any, ...], order: str,
+                    count: int) -> list[tuple[tuple[int, int, int], tuple]]:
+            if count <= 0:
+                return []
+            day, day_key = indexed[day_index]
+            rows = database.execute(
+                "SELECT source, line, offset, end, position FROM reader_rows "
+                f"WHERE day=? AND visible=1 {clause} ORDER BY position {order} LIMIT ?",
+                (day_key, *params, count),
+            )
+            return [(day, row) for row in rows]
+
+        older = rows_on(day_index, "AND position<?", (anchor_position,), "DESC", before)
+        for index in range(day_index + 1, len(days)):
+            if len(older) >= before:
+                break
+            older.extend(rows_on(index, "", (), "DESC", before - len(older)))
+        newer = rows_on(day_index, "AND position>?", (anchor_position,), "ASC", after)
+        for index in range(day_index - 1, -1, -1):
+            if len(newer) >= after:
+                break
+            newer.extend(rows_on(index, "", (), "ASC", after - len(newer)))
+        selected = [*reversed(older), (anchor_day, (*anchor_row, anchor_position)), *newer]
+        return [
+            _read_indexed_record(kind, target, day, row[:4], bot_id, switch,
+                                 bot_names, names_complete, root)
+            for day, row in selected
+        ]
 
 
 def known_windows() -> list[tuple[str, int]]:

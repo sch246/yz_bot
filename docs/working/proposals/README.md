@@ -14,6 +14,9 @@
 - [LLF 纯文本工具调用迁移](llf-tool-protocol.md)（长期方向，尚未替换原生工具调用与结果协议）
 - [可自维护的同相上下文](self-maintaining-context.md)（研究提案；中心主体与 reader 已部分落地，当前分开追问系统能力上限与可逆实践反馈；其余外显状态转移和自修改仍待证；[讨论来源与演化索引](self-maintaining-context-discussion.md)保留原话与修正链）
 - [长期记忆离线回放实验](memory-replay-evaluation.md)（实施中；现分开验证系统是否允许运行中产生的改进被后续真实消费，以及怎样通过可逆重放形成实践反馈；固定召回指标只作诊断，所有发送与运行数据隔离）
+- [记忆估值与索引演进](memory-valuation-and-index-evolution.md)（研究提案；把 MDL、压缩进步、结构可达、实际路径和使用结果作为需要分别解释的派生观察，先离线校准，不自动晋级、淡出或删除记忆）
+- [记忆与自我演化研究地图](memory-and-self-evolution-research.md)（外部研究记录，不是运行合同；区分论文证据、本项目迁移推论和适用边界，串起长期记忆、经验 Skill、任务层学习与元层改进）
+- [可编程经历数据](programmable-experience-data.md)（实施计划；复用现有 `exec_code`，先以磁盘惰性迭代验证模型能否自由查询和自审，不新增 world/snapshot/记忆 manager，也不把全量历史放进内存）
 - [检索索引：把子代理找过的路存下来](retrieval-index.md)（未实现；缓存子代理的检索路径而不是结论，失效判据由模型自写的校验命令给出）
 - [统一信息流：读时编号与完整输出事件](unified-event-stream.md)（已提交读时编号、受限首层覆盖和反查，最新代码尚未部署；长期退休暂缓，不要求 LLF）
 - [压缩、遗忘与消息模型：交接与待办](condense-and-unify-handoff.md)（索引，不是提案；跨 chat-condense / message-model / self-message-echo 三份，回答「走到哪、下一步、谁在等谁」，未决项各自标明卡住谁）

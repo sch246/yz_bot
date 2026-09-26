@@ -6,9 +6,6 @@
 （`connect._events`），由主线程按真实路由处理——命令、shell、link、聊天都和真人触发的一模
 一样；工具调用本身立刻返回，不阻塞当前这轮生成。
 
-- 每次投递都会先在目标窗口留一行「以 Bot 身份投递：<命令>」，无条件、你关不掉。它是窗口里
-  的人唯一能看见这次操作的地方，所以不要因为"命令自己会有输出"就觉得它多余，也不要为了少
-  一条消息而绕开这个工具。
 - 这是让模型**真正重启自己**的唯一路径：`.reboot` 的退出动作必须落在主线程（外层
   `run.py` 认退出码 233），而工具调用跑在 worker 线程里，直接 `raise SystemExit(233)`
   只会打死那个线程，进程照常活着。
@@ -24,14 +21,11 @@
 
 from __future__ import annotations
 
-import logging
 import re
 import time
 
 # 门控声明：只有 Bot 获得 op 权限时才看得到、加载得了这个模块。
 BOT_OP_ONLY = True
-
-_log = logging.getLogger(__name__)
 
 _match_window = re.compile(r"^([guGU]?)([0-9]+)$")
 
@@ -40,7 +34,7 @@ def send_command(text: str, target: str = "") -> str:
     """以 Bot 自己的身份执行一条命令，走真实路由；立刻返回投递结果，不等它跑完。
 
     @param
-    text: 命令原文，例如 .reboot、.chattop、!ls、#ops；首字符决定它走哪条路
+    text: 命令原文，例如 .reboot、.chattop、!ls、#limit；首字符决定它走哪条路
     target: 这条命令属于哪个窗口：g<群号>、u<QQ号>，留空表示当前窗口
     """
     from mods import connect, context, identity, op
@@ -55,38 +49,9 @@ def send_command(text: str, target: str = "") -> str:
     if isinstance(window, str):
         return window
     group_id, user_id = window
-    _receipt(command, group_id, user_id)
     connect._events.put(_event(command, group_id, user_id))
     where = f"群{group_id}" if group_id is not None else f"私聊{user_id}"
     return f"已投递到{where}，由主循环执行：{command}"
-
-
-def _receipt(command: str, group_id, user_id) -> None:
-    """Leave one visible line in the target window before the command runs.
-
-    WHY: 这条回执是**无条件**的，因为"以 Bot 身份执行一条命令"是唯一一处人在窗口里看不见
-    发起者的动作。多数命令自己会留下痕迹（`.reboot` 的「重启中」、`!` 的输出），但那是命令
-    的性质，不是这条路的性质：一条没有输出的命令就会成为一次无痕的操作。窗口里的人能看见
-    它，才谈得上事后追问和制止。
-
-    WHY: 先发回执再投递。两边各走各的队列，所以严格顺序保证不了；但回执先入队，正常情况下
-    它排在命令自己的输出前面，而 `.reboot` 那种同步发完就退出的更是如此。
-
-    WHY: 命令原文要 `cq.escape`。它是模型写的字符串，里面的 `[CQ:...]` 一旦原样发出去就会
-    被当成真的 at、图片或回复——回执是给人看的记录，不该顺手替模型发一次动作。
-
-    WHY: 不加 `#` 前缀。这条回执确实是 Bot 做过的事，应当和别的发言一样进聊天记录、也进
-    下一轮上下文；`#` 是"不进模型上下文"的前缀，用在这里等于让它自己看不见自己干过什么。
-    """
-    from mods import cq, message
-
-    destination = {"group_id": group_id} if group_id is not None else {"user_id": user_id}
-    try:
-        message.send(f"以 Bot 身份投递：{cq.escape(command)}", **destination)
-    except Exception:
-        # 回执发不出去不该让命令投递本身失败——那会让"能不能执行"取决于"能不能说话"。
-        _log.exception("send_command 回执发送失败：%s", command)
-
 
 def _resolve_window(target: str, current: dict):
     """Turn ``target`` into ``(group_id, user_id)``; a string means a complaint."""

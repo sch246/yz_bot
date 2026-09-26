@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Generator, Iterable
+from collections.abc import Callable, Generator
 import json
 import logging
 import os
@@ -653,7 +653,7 @@ class LLMClient:
             reasoning_content=reasoning_content,
         )
 
-    def chat(self, messages: list[dict], tools: list[Tool] | Callable[[], list[Tool]] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None, on_round: Callable[[], list[dict]] | None = None, should_stop: Callable[[], bool] | None = None, hints: Callable[[], list[dict]] | None = None, keep_reasoning: bool = True, on_output: Callable[[dict, list[dict]], str | tuple[str, dict] | None] | None = None, on_results: Callable[[str, list[ToolCallResult]], None] | None = None, turn_done: Callable[[], bool] | None = None, on_action: Callable[[str | None], None] | None = None) -> Generator[LLMResponse, None, None]:
+    def chat(self, messages: list[dict], tools: list[Tool] | Callable[[], list[Tool]] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None, on_round: Callable[[], list[dict]] | None = None, should_stop: Callable[[], bool] | None = None, hints: Callable[[], list[dict]] | None = None, keep_reasoning: bool = True, on_output: Callable[[dict, list[dict]], str | tuple[str, dict] | None] | None = None, on_results: Callable[[str, list[ToolCallResult], list[dict]], None] | None = None, turn_done: Callable[[], bool] | None = None, on_action: Callable[[str | None], None] | None = None, preserve_native: bool = False) -> Generator[LLMResponse, None, None]:
         # Every message appended below is printed live as it happens, so each
         # further round only logs what it has not shown yet -- usually nothing.
         logged = 0
@@ -665,8 +665,8 @@ class LLMClient:
         # 不要退化成"到 N 轮就自动截断"：那会在结论产出之前把前提砍掉。压缩由模型在得出
         # 结论时显式发起，这正是主流 agent 用子代理绕开、而没有正面解决的那件事。
         #
-        # WHY: 同步结果按模型输出整批登记 R；原生配对只是执行载体，
-        # 中心会话替换后由 on_round 追加已有 R 的投影、通知和 pull。
+        # WHY: 同步结果按模型输出整批登记 R；中心会话若可完整保存原生
+        # assistant/tool 配对就留在 messages，其他模型由 on_round 追加 R 的文本投影。
         while True:
             if should_stop is not None and should_stop():
                 return
@@ -740,17 +740,18 @@ class LLMClient:
                 pending_calls.append((call, tool, arguments))
 
             assistant_message = {"role": assistant.role, "content": assistant.content}
-            # WHY: 原生载体在执行行动时仍保留思考字段，供不读取 mail 的单句请求和
-            # 独立子代理使用；连续聊天完成行动后撤掉载体，不再传思考原文。
-            # drop 仍置空串而非删字段，避免向 DeepSeek 编造「从未思考」。
+            # WHY: on_output 必须先看到供应商原样的 assistant；之后私有会话的
+            # drop 才可把思考置为空串。中心完整配对不修改这个对象，以免输出
+            # 正文及其缓存前缀与事件日志分叉。
             if assistant.reasoning_content is not None:
-                assistant_message["reasoning_content"] = assistant.reasoning_content if keep_reasoning else ""
+                assistant_message["reasoning_content"] = assistant.reasoning_content
             if pending_calls:
                 assistant_message["tool_calls"] = [call for call, _, _ in pending_calls]
-            recorded_output = {**assistant_message, "reasoning_content": assistant.reasoning_content}
-            recorded = on_output(recorded_output, assistant_message.get("tool_calls", [])) if on_output else None
+            recorded = on_output(assistant_message, assistant_message.get("tool_calls", [])) if on_output else None
             output_id = recorded[0] if isinstance(recorded, tuple) else recorded
-            if isinstance(recorded, str) and pending_calls:
+            if not keep_reasoning and assistant.reasoning_content is not None and not preserve_native:
+                assistant_message["reasoning_content"] = ""
+            if isinstance(recorded, str) and pending_calls and not preserve_native:
                 references = ", ".join(f"{recorded}#{position + 1}" for position in range(len(pending_calls)))
                 assistant_message["content"] = f"{assistant_message['content']}\n行动引用：{references}"
             messages.append(assistant_message)
@@ -758,6 +759,8 @@ class LLMClient:
             if not pending_calls:
                 if isinstance(recorded, tuple):
                     messages[-1:] = [recorded[1]]
+                elif preserve_native and isinstance(recorded, str) and on_results is not None:
+                    on_results(recorded, [], [])
                 return
             results: list[ToolCallResult] = []
             for position, (call, tool, arguments) in enumerate(pending_calls):
@@ -767,7 +770,7 @@ class LLMClient:
                     # 后面的每一个都照跑，^C 迟迟不生效。已经补齐的 tool 消息就留在那儿：这一轮
                     # 的 messages 随轮次结束丢弃（每轮都从 history 重建），不做半轮修补。
                     if results and on_results is not None and output_id is not None:
-                        on_results(output_id, results)
+                        on_results(output_id, results, [])
                     return
                 function = call["function"]
                 # WHY: 登记这次调用期间 spawn 的子进程，^C 才能真的把它们 kill 掉（卡住的
@@ -795,10 +798,10 @@ class LLMClient:
                               for result in results]
             messages.extend(native_results)
             if on_results is not None and output_id is not None:
-                on_results(output_id, results)
+                on_results(output_id, results, native_results)
             if isinstance(recorded, tuple):
-                # WHY: The native pair is only an execution carrier. The next
-                # request boundary projects the durable batch after its output.
+                # WHY: A tuple means this output cannot be reconstructed as a
+                # native pair; replace its execution carrier with the text view.
                 if not any(message is assistant_message for message in messages):
                     raise RuntimeError("执行行动期间丢失模型输出载体，拒绝后续请求")
                 native_ids = {id(message) for message in native_results}
@@ -842,11 +845,12 @@ class Chat:
         # 它和 system 提示词一样支持用函数生成，只是重置时机不同：system 在建会话时定一次，
         # hint 每个子请求重来一次。
         self.hints: list[Callable[[], str] | str] = []
-        # WHY: 默认保留原生载体的思考，供单句请求和独立子代理工具循环；连续
-        # 聊天在下一次子请求前把载体换成统一投影，keep/drop 均不保留全文。
+        # WHY: 中心 agent 的完整输出与结果留在原生载体中；私有会话仍按
+        # keep/drop 控制本轮工具循环的思考字段。
         self.keep_reasoning: bool = True
+        self.preserve_native: bool = False
         self.on_output: Callable[[dict, list[dict]], str | tuple[str, dict] | None] | None = None
-        self.on_results: Callable[[str, list[ToolCallResult]], None] | None = None
+        self.on_results: Callable[[str, list[ToolCallResult], list[dict]], None] | None = None
         self.active_action: str | None = None
         self.reads_window_mail = False
         self.fail_fast = False
@@ -926,34 +930,6 @@ class Chat:
                 collected.append(value if isinstance(value, dict) else {"role": "user", "content": str(value)})
         return collected
 
-    def condense_native_calls(self, tool_call_ids: Iterable[str], *, sources: set[str] | None = None,
-                              apply: bool = True) -> int:
-        """Remove completed native execution pairs from a private Chat's live view."""
-        requested = {str(value) for value in tool_call_ids if value}
-        if not requested:
-            return 0
-        drop: set[int] = set()
-        for index, message in enumerate(self.messages):
-            calls = message.get("tool_calls")
-            if not calls:
-                continue
-            if sources and not any(f"{source}#" in str(message.get("content", "")) for source in sources):
-                continue
-            group = {str(call["id"]) for call in calls}
-            if not group & requested:
-                continue
-            if group - requested:
-                raise ValueError("同一输出里的行动必须一起收缩")
-            answered = {position for position, value in enumerate(self.messages)
-                        if value.get("role") == "tool" and str(value.get("tool_call_id")) in group}
-            if len(answered) != len(group):
-                raise ValueError("这一输出仍有行动未返回，不能收缩")
-            drop.add(index)
-            drop.update(answered)
-        if apply:
-            self.messages[:] = [message for index, message in enumerate(self.messages) if index not in drop]
-        return len(drop)
-
     def get_tools(self) -> list[Tool]:
         """Build the current request's frozen tool snapshot."""
         return list(self.functions.values())
@@ -971,8 +947,8 @@ class Chat:
         def record_output(assistant: dict, calls: list[dict]):
             return self.on_output(assistant, calls)
 
-        def record_results(source: str, results: list[ToolCallResult]) -> None:
-            self.on_results(source, results)
+        def record_results(source: str, results: list[ToolCallResult], native_results: list[dict]) -> None:
+            self.on_results(source, results, native_results)
 
         try:
             response = self.chat_client.chat(
@@ -993,6 +969,7 @@ class Chat:
                 # 开始时的 None 按值交进去，say 后来安装的回调永远到不了检查点。
                 lambda: self.turn_done() if self.turn_done is not None else False,
                 lambda reference: setattr(self, "active_action", reference),
+                self.preserve_native,
             )
             results = []
             for chunk in response:

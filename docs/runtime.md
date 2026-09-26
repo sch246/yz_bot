@@ -48,7 +48,7 @@ uv run --frozen python run.py --smoke
 
 终端中的 `smoke required core loaded; optional failures do not fail this check: X/Y` 表示：`Y` 个 Module Import 成功进入 `ctx`，其中 `X` 个完成 Load 进入 `available`。它不表示仓库总 Module 数，也不承诺 `X == Y`。后续 `optional import failures` / `optional load failures` 才说明缺失功能。
 
-临时 fixture 目前只提供最小 config/pyload，不复制设备配置。例如缺少 `data/device/minecraft.json` 时，`minecraft` 会失败，并可能使依赖其动态导出的 `mcf`、`py`、`link`、`later`、`todo` 连锁不可用；只要 required core 仍成立，退出码仍为 0。这证明核心闭环可启动，不证明这些设备功能失败，也不能据此判定生产迁移失败。
+临时 fixture 目前只提供最小 config/pyload，不复制设备配置。例如缺少 `data/device/minecraft.json` 时，`minecraft` 及直接依赖它的 `mcf` 会失败；Minecraft 的动态平铺别名随之缺席，但核心 `py` 环境以及依赖它的 `link`、`later`、`todo` 仍会加载。只要 required core 仍成立，退出码仍为 0。这证明核心闭环可启动，不证明这些设备功能失败，也不能据此判定生产迁移失败。
 
 若当前任务要求“所有 Module 都成功”，不能把现有 smoke 的退出 0 当作该断言；应检查失败列表，并为目标可选功能提供脱敏的临时设备 fixture，或另建明确的严格验证入口。
 
@@ -132,7 +132,7 @@ HTTP 200 只表示事件已被本地监听器接收，不表示命令或回复�
 
 代码内还有 `recvmsg()`，可从 `.py` 或 link action 递归构造一条消息进入 `mods.bot.recv()`。它同样走真实状态和真实副作用，只是省略了 NapCat 入站网络；它把 `sender_id` **同时**写进顶层 `user_id` 和 `sender.user_id`，而权限判定读的是**作者**（`sender.user_id`，缺失时回落 `user_id`），所以它的分量等同于「以被伪造者的身份执行」。顶层 `user_id` 两种窗口下都是**作者**；窗口由 `group_id`（群）或 `target_id`（私聊那条的对端）决定，所以「谁发的」与「发到哪个窗口」是两件事，只有前者决定权限。
 
-op 工具集的 `send_command` 是第三条同类入口，但它不走 `bot.recv()`，而是把事件投进 `connect._events`——也就是 `5701` 入站用的**同一条队列**，由主线程按真实路由处理。这个差别是关键：`recvmsg` 在**调用者线程**里同步跑完整轮路由，而 `.reboot`/`.shutdown` 的 `SystemExit` 必须落在主线程才退得掉进程，所以工具调用线程里只能投队列。它同样以 Bot 自己的身份执行（作者写在 `sender.user_id` 与顶层 `user_id`，私聊的窗口另写 `target_id`，见上一条），目录、工具预检与下游命令都读取同一份 `config.bot_permissions.op`，不再依赖当前消息作者或 Bot 账号恰好在 `ops` 名单里。投递前会**无条件**在目标窗口发一行「以 Bot 身份投递：<命令>」（命令原文经 `cq.escape`，所以不会顺手替模型发一次 at 或图片）：这是唯一一处人在窗口里看不见发起者的动作，多数命令自己会留下痕迹，但那是命令的性质而不是这条路的性质——没有输出的命令否则就是一次无痕操作。回执发不出去不会让投递失败。
+op 工具集的 `send_command` 是第三条同类入口，但它不走 `bot.recv()`，而是把事件投进 `connect._events`——也就是 `5701` 入站用的**同一条队列**，由主线程按真实路由处理。这个差别是关键：`recvmsg` 在**调用者线程**里同步跑完整轮路由，而 `.reboot`/`.shutdown` 的 `SystemExit` 必须落在主线程才退得掉进程，所以工具调用线程里只能投队列。它同样以 Bot 自己的身份执行（作者写在 `sender.user_id` 与顶层 `user_id`，私聊的窗口另写 `target_id`，见上一条），目录、工具预检与下游命令都读取同一份 `config.bot_permissions.op`，不再依赖当前消息作者或 Bot 账号恰好在 `ops` 名单里。投递动作本身不额外向 QQ 发送可见回执；命令事件仍进入真实路由与聊天记录，命令自己的输出照常发送。
 
 模型工具不把“谁触发了这一轮”当作安全边界：混合上下文里任何人的文字本来都可能影响模型，按触发者切换权限挡不住这条路径，反而会让同一串工作随消息顺序掉权限。这里明确选择 Bot 的固定权限。代行仍是独立路径：`cmds__run_command(sender=X)` 把事件作者写成 X，下游命令按 X 的 `ops` 成员关系判定；Bot 自身没有 op 权限时，模型不能代行人类 op。`recvmsg(sender_id=X)` 是可编程环境中的函数，不直接作为模型工具暴露。
 
