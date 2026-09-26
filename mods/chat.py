@@ -1071,7 +1071,7 @@ _boot_sources: list[str] = []
 
 
 def prepare_recovery_sources() -> None:
-    """Freeze archive anchors and FIFO boundaries before live ingress opens."""
+    """Freeze archive anchors and unread insertion boundaries before live ingress opens."""
     from mods import chatlog
 
     if _boot_sources:
@@ -1100,7 +1100,7 @@ def _recovery_sources(window: tuple) -> list[dict]:
 
 
 def fetch_remote_source(window: tuple, source_key: str | None = None) -> dict:
-    """Extend the selected unpulled gap or open a separate historical FIFO."""
+    """Extend an unread gap or open a separate historical source."""
     from mods import _backfill, connect
 
     candidates = [source for source in oplog.sources()
@@ -1115,8 +1115,8 @@ def fetch_remote_source(window: tuple, source_key: str | None = None) -> dict:
     if selected is not None and selected["state"] in ("gap", "failed") and not selected["pulled"]:
         source = oplog.reopen_source(selected["key"], fetch_anchor=selected["fetch_anchor"])
     else:
-        # WHY: 显式对一个旧 key 再 fetch 就从那个 key 的旧端新开 FIFO，不偷偷改用同窗口
-        # 最新 key，也不跨 FIFO 去重。两个信源即使含有重叠原文，也是两次可由 agent 选择的
+        # WHY: 显式对一个旧 key 再 fetch 就从那个 key 的旧端新开信源，不偷偷改用同窗口
+        # 最新 key，也不跨信源去重。两个信源即使含有重叠原文，也是两次可由 agent 选择的
         # 重放经历；隐藏重叠会让“这个信源实际保存了什么”失真。
         target = ("g" if window[0] == "group" else "u") + str(window[1])
         source = oplog.start_source("NapCat 历史 " + target, window, "napcat_history",
@@ -1374,10 +1374,10 @@ def _mark_mail_prefix_read(window: tuple, entries: list[context.MailEntry]) -> t
 
 
 def mark_window_read(window: tuple, count: int | None = None) -> dict:
-    """Mark a frozen window FIFO prefix as read without creating input events."""
+    """Mark the current ordered unread prefix as read without creating input events."""
     sources = _recovery_sources(window)
     if any(source["state"] == "fetching" for source in sources):
-        raise ValueError("该窗口离线补回仍在进行，FIFO 前端尚未固定")
+        raise ValueError("该窗口离线补回仍在进行，未读前端尚未固定")
     box = context.mailbox(window)
     through = oplog.latest_pending_arrival(window)
     frozen_sources = {source["key"]: source["remaining"] for source in sources}
@@ -1419,7 +1419,7 @@ def mark_window_read(window: tuple, count: int | None = None) -> dict:
 
 def mark_source_read(source: dict, count: int | None = None) -> dict:
     if source["state"] == "fetching":
-        raise ValueError("该信源仍在拉取，FIFO 前端尚未固定")
+        raise ValueError("该信源仍在拉取，未读前端尚未固定")
     amount = source["remaining"] if count is None else min(count, source["remaining"])
     marked, mentions, remaining = _mark_source_events_read(tuple(source["window"]), source, amount)
     return {"marked_read": marked, "mentions": mentions, "remaining": remaining}

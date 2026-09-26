@@ -31,8 +31,8 @@ _windows: dict[tuple, list[dict]] = {}
 _next: dict[str, int] = {}
 _pending: dict[str, dict] = {}
 _notified: set[str] = set()
-# WHY: Arrival journal replay and dict insertion order are the FIFO authority;
-# there is no before-insertion caller, so a historical linked list is redundant.
+# WHY: Arrival journal replay and dict insertion order preserve live members'
+# relative order; there is no before-insertion caller, so a linked list is redundant.
 _arrival_order: dict[str, int] = {}
 _covered: dict[tuple, set[str]] = {}
 _coverage_nodes: dict[str, list[str]] = {}
@@ -659,7 +659,7 @@ def start_source(name: str, window: tuple, source_type: str, *, anchor: str | No
                  anchor_time: int | None = None,
                  queue_window: tuple | str | None = None,
                  start_seq: str | None = None) -> dict:
-    """Start a named fetch; 'new' creates a separate durable FIFO for a repeated pull."""
+    """Start a named fetch; 'new' creates a separate durable unread source."""
     with _lock:
         _restore()
         source = uuid4().hex
@@ -717,7 +717,7 @@ def finish_source(source: str, *, gap: str | None = None, error: str | None = No
 
 
 def reopen_source(source: str, *, fetch_anchor: str | None = None) -> dict:
-    """Extend the front of a sealed FIFO only until its first successful pull."""
+    """Extend a sealed source only before any member is read or marked read."""
     with _lock:
         _restore()
         state = _sources[source]

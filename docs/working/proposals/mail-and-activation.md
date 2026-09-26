@@ -6,7 +6,7 @@
 > 不含 mail 也不含激活。
 >
 > 事实以代码为准，行号是写这份时的位置。**推论**一律标出，未经草籽确认。
-> 执行进度见[交接索引](condense-and-unify-handoff.md)。本篇保留 mail 方案的历史推导；当前行为已改为中心 agent、有界 FIFO `pull`、未读提及 `mentions`、独立档案 `read_messages` 与明确的 `mark_read`，见[中心化聊天软件阅读](chat-client-reading.md)。下文旧 `peek` 只是历史设计，不是当前工具。
+> 执行进度见[交接索引](condense-and-unify-handoff.md)。本篇保留 mail 方案的历史推导；当前行为是中心 agent 从有序未读中用 `take` 选择任意成员，`mentions` 仅筛选未读提及，`read_messages` 选档案消息，三者在下一次模型请求中正式阅读；`mark_read` 只设为已读。详见[交互模型](../../interaction-model.md)。下文旧 `peek`、整段排空及连续 FIFO 消费均属历史设计，不是当前工具或语义。
 
 ## 一、这份要回答什么
 
@@ -103,7 +103,7 @@ window 上没有 turn →  matched 才 call() → chat() → begin_turn(owner=Tr
 
 ## 三、目标形状
 
-### 3.0 排空规则（2026-09-20 旧裁决，当前代码仍执行）
+### 3.0 排空规则（2026-09-20 旧裁决，当前代码已不执行）
 
 > mail 准确来说性质更像缓冲区——**如果其中有激活的元素，那么会在下一次可用时整个放入上下文**。
 
@@ -780,7 +780,7 @@ chatlog 按时间分片，因为它的查询是「最近 N 条」。树的查询
 | ~~6~~ **已完成** | 接管阶段 0 的 hook 时机：`_activate_chat` 统一执行 `inc_call_count` → `init_chat` 装配 → `_restore_window_tools`，纯 `init_chat` 不再带生命周期副作用 | **已验**：每次顶层激活仍计数一次、恢复一次；`.chat`、mail reader 与重启接续都走同一入口；空闲回收仍使用原时间戳与原 ttl；子会话不计顶层次数 |
 | 7 **暂缓** | 有实际异步回调消费者时，再按它的负载在第 5 步已有的 `activated` 之外补 `kind` 与非消息载荷，同时补回第 3 步跳过的种类标记与按种类渲染；不要预先猜一个无人使用的形状 | 消息条目的渲染逐字不变；回调形状不假装成 QQ 消息 |
 | 8 **转入现行阅读计划** | 原先「先窗口级留形状、拉取默认当前窗口」的顺序已被草籽否决；第一阶段直接是[单一中心 agent](chat-client-reading.md)，事件来源与行动目标显式 | 不沿隐式当前窗口发言或读取私人状态 |
-| 9 **转入现行阅读计划** | 全局 hint 按窗口列普通待收取消息、`@`／提及；`mentions` 与 `read_messages` 不推进 mail 水位，正式内容按 FIFO 有界拉取，模型可明确 `mark_read`，不沿用「整段排空全部未读」 | 回复后仍可继续顺序拉取；通知是否已递交与正文是否收取分别记录，重复看到同一来源是新经历 |
+| 9 **当时阅读计划（已退役）** | 当时由全局 hint 列普通待收取消息、`@`／提及；`mentions` 与 `read_messages` 不推进 mail 水位，正式内容按 FIFO 有界拉取 | 现行 `take` 可任选成员，`mentions`／`read_messages` 也安排正式 input；见[交互模型](../../interaction-model.md) |
 
 第 4 步是整件事里唯一能悄悄丢消息的地方，其它步都是结构搬运。
 
