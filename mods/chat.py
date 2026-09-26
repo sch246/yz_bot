@@ -327,18 +327,27 @@ def parse_target(target: str) -> tuple[str, int]:
     return ("group" if matched[1] == "g" else "private"), int(matched[2])
 
 
-def _unread_detail_text(detail: dict) -> str:
+def _unread_detail_text(detail: dict, *, include_wakes: bool = True) -> str:
     window = detail["window"]
     target = ("g" if window[0] == "group" else "u") + str(window[1])
-    sources = ", ".join(f"{item['kind']} 作者={item['user_id']} 时间={item['time']}"
-                        for item in detail["wake_sources"])
+    sources = ", ".join(
+        f"{item['kind']} 作者={item['user_id']} 时间={item['time']}"
+        + (f" message_id={item['message_id']}" if item.get("message_id") is not None else "")
+        for item in detail["wake_sources"])
     recovery = detail.get("recovery")
     extra = ((f" 补回未读={recovery['remaining']} 补回状态={recovery['state']}"
               + (f" 缺口={recovery['gap']}" if recovery.get("gap") else ""))
              if recovery else "")
     return (f"{target} 未读={detail['unread']} 普通={detail['ordinary']} "
             f"@/提及={detail['mentions']} 其他唤醒={detail['other_wakes']}"
-            + (f" 唤醒来源：{sources}" if sources else "") + extra)
+            + (f" 最近唤醒：{sources}" if include_wakes and sources else "") + extra)
+
+
+def _activation_text(item: dict) -> str:
+    window = item["window"]
+    target = ("g" if window[0] == "group" else "u") + str(window[1])
+    return (f"{target} {item['kind']} 作者={item.get('user_id')} 时间={item.get('time')}"
+            + (f" message_id={item['message_id']}" if item.get("message_id") is not None else ""))
 
 
 def unread_details() -> list[dict]:
@@ -380,20 +389,25 @@ def _notification_projection(entry: dict) -> dict:
     if details:
         shown = []
         for detail in details:
-            candidate = "；".join([*shown, _unread_detail_text(detail)])
+            candidate = "；".join([*shown, _unread_detail_text(detail, include_wakes=False)])
             if count_tokens(candidate) > NOTICE_TOKENS - 150:
                 break
-            shown.append(_unread_detail_text(detail))
+            shown.append(_unread_detail_text(detail, include_wakes=False))
         omitted = len(details) - len(shown)
         listing = "；".join(shown) + (f"；还有 {omitted} 个窗口未列出，用 status() 查看"
                                    if omitted else "")
     else:
         listing = "、".join(f"{window[0]}:{window[1]}" for window in entry["windows"])
-    content = (f"[{entry['id']}] 新召唤通知：{listing}。"
+    activations = entry.get("activations", ())
+    activation_listing = ("；".join(_activation_text(item) for item in activations)
+                          if activations else "旧版通知未记录逐条唤醒")
+    content = (f"[{entry['id']}] 新召唤通知。当前水位后的全部未读唤醒：{activation_listing}。"
+               f"未读概况：{listing}。"
                "正文仍在未读 FIFO；普通消息本身不激活。"
                "可用 mentions(source) 看未读提及，按 message_id 用 read_messages 查附近档案，"
-               "或用 pull(source, count) 正式读取；未读不要求清空。")
-    return {"role": "user", "content": bounded_excerpt(content, NOTICE_TOKENS)}
+               "或用 pull(source, count) 正式读取。通知已看见不等于消息已读；"
+               "未读红点不会自行反复唤醒，之后的新唤醒仍会再次带上这份完整未读集合。")
+    return {"role": "user", "content": content}
 
 
 def _pending_hint() -> str:
@@ -690,7 +704,7 @@ def _base_prompt() -> list[dict]:
 - 聊天中可能不会有明显的问题，扮演好角色即可
 - 如无特殊要求，请用中文回复
 - **说话要调 `say`**。直接写在回复正文里的内容不会发出去，只会留在你自己的输出轨迹里
-- 眼前历史是唯一全局已读信息流按预算选出的可见部分，不是全部记录。通知不等于读取；用 status 看 FIFO 概况、mentions 看未读提及、pull 正式顺序读取、mark_read 把当前未读水位推到底。read_messages 是不依赖 FIFO 的聊天档案查询。未读不要求清空
+- 眼前历史是唯一全局已读信息流按预算选出的可见部分，不是全部记录。通知不等于读取；通知列出当前水位后的全部未读唤醒，它们在 pull 或 mark_read 推进水位前始终是新消息，红点仍亮。红点本身不会反复启动你，后来有新唤醒时才再叫一次并重列完整集合。用 status 看 FIFO 概况、mentions 看未读提及、pull 正式顺序读取、mark_read 把当前未读水位推到底。read_messages 是不依赖 FIFO 的聊天档案查询
 - 想积累经验就实际写入以后会用的载体：可复用做法写 Markdown Skill 并按需加载，全局待办用 `edit_hint` 保存；只在回复里说“记住了”不会保存它
 - 对外发送必须在 say 里明确写目标 g群号 或 u私聊对端号；没有默认接收窗口
 - `say` 返回这条消息的 message_id；它默认 `final_call=true`，说完这一轮就结束，要接着干活就传 `final_call=false`"""}]
