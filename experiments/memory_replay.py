@@ -648,7 +648,7 @@ def _run_locked(prepared: Path, output: Path, kind: str, target: int, bot_id: in
                 # WHY: requested_reads lives only for this drive. If a budget stops
                 # before the next provider request, no input fact exists and those
                 # members remain unread for a later replay to choose again.
-                chat._drive_agent(MODEL, window)
+                chat.agent._drive_agent(MODEL, window)
             except Exception as error:
                 stop_reason = str(error)
                 if not (type(error).__name__ in {

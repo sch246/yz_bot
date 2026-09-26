@@ -92,7 +92,7 @@ def recover_source(source: dict, call_api, *, manual: bool = False) -> dict:
                     continue
                 member = {"origin": origin, "message_id": row["message_id"],
                           "message_seq": int(row["message_seq"]), "time": int(row["time"]),
-                          "mentioned": chat._addressed(row, msgs.body(row))}
+                          "mentioned": chat.reader._addressed(row, msgs.body(row))}
                 members.append(member)
             cursor = str(rows[0]["message_seq"])
             _source_pages.write_page(root, key, state["pages"], members, cursor=cursor)

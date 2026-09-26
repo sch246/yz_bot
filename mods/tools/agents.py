@@ -56,7 +56,7 @@ def assign_tasks(prompt: str, tasks: str, tools: str, model: str = "deepseek/dee
                 from mods import chat
 
                 session.on_output = lambda assistant, calls: oplog.output(window, assistant, calls)
-                session.on_results = chat._stream_results(window, binding)
+                session.on_results = chat.agent._stream_results(window, binding)
             pieces = []
 
             def collect(chunk: llm.LLMResponse) -> None:

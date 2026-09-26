@@ -355,17 +355,17 @@ def cover_events(ids: list[str], conclusion: str, anchor: str = "", before: int 
                                            kinds=kinds, source=source)
         if missing:
             raise ValueError("不是本窗口已读事件: " + ", ".join(missing))
-        visible = (chat._trusted_stream_ids(session) | getattr(session, "recalled_ids", set())
+        visible = (chat.agent._trusted_stream_ids(session) | getattr(session, "recalled_ids", set())
                    if window == chat.AGENT_WINDOW
-                   else chat._visible_stream_ids(session.messages))
+                   else chat.agent._visible_stream_ids(session.messages))
         members = oplog.cover(window, session.active_action,
                               [entry["id"] for entry in selected], visible)
     except ValueError as error:
         return f"未覆盖：{error}"
     if window == chat.AGENT_WINDOW:
-        chat._cover_agent_projection(session, members)
+        chat.agent._cover_agent_projection(session, members)
     else:
-        chat._cover_projection(session.messages, members)
+        chat.agent._cover_projection(session.messages, members)
     return f"已覆盖 {len(members)} 条已读事件；原编号仍可用 recall_events 反查"
 
 
@@ -498,11 +498,11 @@ def _take(source: str, count: int, start: int, ids: list[str] | None,
     try:
         if ids is not None or arrival:
             for key in dict.fromkeys(ids if ids is not None else [arrival]):
-                member = chat._unread_member_by_key(source, key)
+                member = chat.reader._unread_member_by_key(source, key)
                 if member is not None and (not mentions_only or member["mentioned"]):
                     selected.append(member)
         else:
-            for ordinal, (member, _event) in enumerate(chat._iter_unread_metadata(source), 1):
+            for ordinal, (member, _event) in enumerate(chat.reader._iter_unread_metadata(source), 1):
                 if ordinal < start:
                     continue
                 if mentions_only and not member["mentioned"]:
@@ -523,7 +523,7 @@ def _take(source: str, count: int, start: int, ids: list[str] | None,
     if ids is not None and len(selected) > 1:
         keys = {member["key"] for member in selected}
         ranks = {member["key"]: position
-                 for position, member in enumerate(chat._all_source_members(source))
+                 for position, member in enumerate(chat.reader._all_source_members(source))
                  if member["key"] in keys}
         selected.sort(key=lambda member: ranks[member["key"]])
     window = tuple(selected[0]["window"])
@@ -587,7 +587,7 @@ def status(source: str = "") -> str:
                 return "找不到该窗口或信源 key"
             lines = [_source_status_line(state)]
         else:
-            lines = [chat._unread_detail_text(detail) for detail in details
+            lines = [chat.reader._unread_detail_text(detail) for detail in details
                      if tuple(detail["window"]) == window]
             lines.extend(_source_status_line(state) for state in sources
                          if tuple(state["window"]) == window
@@ -606,7 +606,7 @@ def status(source: str = "") -> str:
                 reason = recovery["gap"].split("; cursor=", 1)[0]
                 gap_counts[reason] = gap_counts.get(reason, 0) + 1
             else:
-                lines.append(chat._unread_detail_text(detail))
+                lines.append(chat.reader._unread_detail_text(detail))
         for state in sources:
             if state["source_type"] != "napcat_history":
                 continue
@@ -711,7 +711,7 @@ def read_messages(window: str, message_id: str = "", origin: str = "", timestamp
     except ValueError as error:
         return f"未查看：{error}"
     selected = [record for record in records
-                if chat._model_event(record, target[0] == "group") is not None]
+                if chat.view._model_event(record, target[0] == "group") is not None]
     if not selected:
         return "本地档案没有命中可见记录；未安排阅读"
     current_binding().session.requested_reads.append(
