@@ -2059,7 +2059,8 @@ def _agent_provider(turn, session: llm.Chat):
                         raise llm.RequiredContextError(f"离线回放读取失败：{error}")
                     remaining = request.get("members") or request.get("records") or []
                     produced.append({"role": "user", "content":
-                                     f"[{request.get('read_by') or '旧版读取'}] {window} 正式阅读部分失败："
+                                     f"读取请求 read_by={request.get('read_by') or 'unknown'} "
+                                     f"{window} 正式阅读部分失败："
                                      f"本次已兑现 {len(pulled)} 条，"
                                      f"尚未兑现 {len(remaining)} 条；{error}。"
                                      "原计划停止，未兑现成员仍未读；请重新调用 take 选择较窄范围，"
