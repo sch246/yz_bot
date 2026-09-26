@@ -252,7 +252,7 @@ def msg2chat(event: dict, in_group: bool = True) -> dict:
                  if isinstance(when, (int, float)) else "未知")
     window = history.window(event)
     author = event.get("user_id")
-    if _offline_scope.get() is not None:
+    if _offline_scope.get() is not None or event.get("_bridge_original"):
         sender = event.get("sender") or {}
         name = sender.get("card") or sender.get("nickname") or str(author or "未知")
     else:
@@ -330,8 +330,7 @@ def _unread_detail_text(detail: dict, *, include_wakes: bool = True) -> str:
     window = detail["window"]
     target = ("g" if window[0] == "group" else "u") + str(window[1])
     sources = ", ".join(
-        f"{item['kind']} 作者={item['user_id']} 时间={item['time']}"
-        + (f" message_id={item['message_id']}" if item.get("message_id") is not None else "")
+        f"{item['kind']} 作者={item['user_id']} 时间={item['time']} 未读序号={item['ordinal']}"
         for item in detail["wake_sources"])
     recovery = detail.get("recovery")
     extra = ((f" 补回未读={recovery['remaining']} 补回状态={recovery['state']}"
@@ -345,8 +344,7 @@ def _unread_detail_text(detail: dict, *, include_wakes: bool = True) -> str:
 def _activation_text(item: dict) -> str:
     window = item["window"]
     target = ("g" if window[0] == "group" else "u") + str(window[1])
-    return (f"{target} {item['kind']} 作者={item.get('user_id')} 时间={item.get('time')}"
-            + (f" message_id={item['message_id']}" if item.get("message_id") is not None else ""))
+    return f"{target} {item['kind']} 作者={item.get('user_id')} 时间={item.get('time')}"
 
 
 def unread_details() -> list[dict]:
@@ -380,6 +378,23 @@ def unread_details() -> list[dict]:
             recovery["state"] = source["state"]
         if source["gap"]:
             recovery["gap"] = source["gap"]
+    for window, detail in details.items():
+        if detail.get("recovery", {}).get("state") == "fetching":
+            detail["wake_sources"] = []
+            continue
+        target = ("g" if window[0] == "group" else "u") + str(window[1])
+        pending = {entry["arrival"]: entry for entry in oplog.unread(window)}
+        wakes = []
+        for ordinal, (member, _event) in enumerate(_iter_unread_metadata(target), 1):
+            live = pending.get(member.get("arrival"))
+            kind = (live.get("activation_kind", "wake") if live and live.get("activated")
+                    else "mention" if member.get("mentioned") else None)
+            if kind:
+                wakes.append({"kind": kind, "user_id": (live["event"].get("user_id")
+                              if live else member.get("user_id")),
+                              "time": (live["event"].get("time") if live else member.get("time")),
+                              "ordinal": ordinal})
+        detail["wake_sources"] = wakes
     return list(details.values())
 
 
@@ -400,10 +415,10 @@ def _notification_projection(entry: dict) -> dict:
     activations = entry.get("activations", ())
     activation_listing = ("；".join(_activation_text(item) for item in activations)
                           if activations else "旧版通知未记录逐条唤醒")
-    content = (f"[{entry['id']}] 新召唤通知。当前全部未读唤醒：{activation_listing}。"
+    content = (f"[{entry['id']}] 新召唤通知（创建时快照，未读序号可能已变化）。当时全部未读唤醒：{activation_listing}。"
                f"未读概况：{listing}。"
                "正文仍在未读信源；普通消息本身不激活。"
-               "可用 take(source, count) 选择正式阅读，mentions(source) 只选未读提及，"
+               "可用 take(source, start, count) 按执行时未读序号选范围正式阅读，mentions(source) 正式读入未读提及，"
                "read_messages 按 message_id 选择档案。通知已看见不等于消息已读；"
                "未读红点不会自行反复唤醒，之后的新唤醒仍会再次带上这份完整未读集合。")
     return {"role": "user", "content": content}
@@ -422,19 +437,25 @@ def _pending_hint() -> str:
         return ""
     shown = []
     for detail in rows:
-        if len(shown) >= 10 or count_tokens("；".join(_unread_detail_text(item)
+        if len(shown) >= 10 or count_tokens("；".join(_unread_detail_text(item, include_wakes=False)
                                                  for item in [*shown, detail])) > NOTICE_TOKENS - 150:
             break
         shown.append(detail)
     tail = f"；另有 {len(rows) - len(shown)} 个窗口，用 status() 查看" if len(rows) > len(shown) else ""
-    source_lines = [f"{source['name']} key={source['key']} 未读={source['remaining']} "
-                    f"提及={source['mention_count'] - source['read_mention_count']} "
-                    f"状态={source['state']}" + (f" 缺口={source['gap']}" if source['gap'] else "")
-                    for source in independent[:3]]
+    source_lines = []
+    for source in independent[:3]:
+        mentions = [f"{ordinal}@{member.get('time')}"
+                    for ordinal, (_page, _offset, member) in enumerate(
+                        _source_unread_members(source), 1) if member.get("mentioned")]
+        source_lines.append(f"{source['name']} key={source['key']} 未读={source['remaining']} "
+                            f"提及={source['mention_count'] - source['read_mention_count']} "
+                            f"提及未读序号@时间={','.join(mentions)} 状态={source['state']}"
+                            + (f" 缺口={source['gap']}" if source['gap'] else ""))
     if len(independent) > 3:
         source_lines.append(f"另有 {len(independent) - 3} 个信源，用 status() 查看")
     parts = [*(_unread_detail_text(detail) for detail in shown), tail, *source_lines]
-    return bounded_excerpt("待正式读取：" + "；".join(part for part in parts if part), NOTICE_TOKENS)
+    return bounded_excerpt("待正式读取（当前快照；take 执行时重算序号）："
+                           + "；".join(part for part in parts if part), NOTICE_TOKENS)
 
 
 def _message_cost(converted: dict) -> int:
@@ -703,7 +724,7 @@ def _base_prompt() -> list[dict]:
 - 聊天中可能不会有明显的问题，扮演好角色即可
 - 如无特殊要求，请用中文回复
 - **说话要调 `say`**。直接写在回复正文里的内容不会发出去，只会留在你自己的输出轨迹里
-- 眼前历史是唯一全局已读信息流按预算选出的可见部分，不是全部记录。通知不等于读取；通知列出当前全部未读唤醒，它们在 take 或 mark_read 前仍未读，红点仍亮。红点本身不会反复启动你，后来有新唤醒时才再叫一次并重列完整集合。用 status 看信源概况、take 选择正式阅读、mentions 只选未读提及、mark_read 把当前成员设为已读。read_messages 从聊天档案选消息并在下一请求正式阅读
+- 眼前历史是唯一全局已读信息流按预算选出的可见部分，不是全部记录。通知不等于读取；通知是创建时快照，尾部 hint 给当前未读提及的时间和未读序号（所有未读都计数，已读/跳过不计数）。take(source, start, count) 在工具执行时按当前未读序号选范围；已读/跳过桥会随新 input 展示，原已读正式号不变。正式输入的 read_by 是发起工具的输出号，read_via 是公开工具名；mark_read 只跳过并留下 skipped_by，不伪造 input。mentions 正式消费至多 500 条未读提及。红点本身不会反复启动你，后来有新唤醒时才再叫一次并重列完整集合。read_messages 从聊天档案选消息并在下一请求正式阅读
 - 想积累经验就实际写入以后会用的载体：可复用做法写 Markdown Skill 并按需加载，全局待办用 `edit_hint` 保存；只在回复里说“记住了”不会保存它
 - 对外发送必须在 say 里明确写目标 g群号 或 u私聊对端号；没有默认接收窗口
 - `say` 返回这条消息的 message_id；它默认 `final_call=true`，说完这一轮就结束，要接着干活就传 `final_call=false`"""}]
@@ -724,6 +745,28 @@ def _numbered(converted: dict, event_id: str) -> dict:
     if isinstance(content, str):
         return {**converted, "content": prefix + content}
     return {**converted, "content": [{"type": "text", "text": prefix}, *content]}
+
+
+def _provenance_projection(converted: dict | None, actor: str | None,
+                           via: str | None, *, skipped: bool = False) -> dict | None:
+    if converted is None or not actor or not via:
+        return converted
+    prefix = "skipped" if skipped else "read"
+    tags = f"  <{prefix}_by>{actor}</{prefix}_by>\n  <{prefix}_via>{via}</{prefix}_via>"
+    content = converted["content"]
+    if isinstance(content, list):
+        first = content[0]
+        if first.get("type") == "text" and "</metadata>" in first.get("text", ""):
+            first = {**first, "text": first["text"].replace("</metadata>", tags + "\n</metadata>", 1)}
+            return {**converted, "content": [first, *content[1:]]}
+        return {**converted, "content": [{"type": "text", "text":
+                 f"<provenance>\n{tags}\n</provenance>"}, *content]}
+    return {**converted, "content": content + f"\n<provenance>\n{tags}\n</provenance>"}
+
+
+def _read_projection(converted: dict | None, read_by: str | None,
+                     read_via: str | None) -> dict | None:
+    return _provenance_projection(converted, read_by, read_via)
 
 
 def _echo_relation(converted: dict, entry: dict, links: dict[str, tuple[str, str]]) -> dict:
@@ -1140,7 +1183,9 @@ def fetch_remote_source(window: tuple, source_key: str | None = None) -> dict:
 
 
 def _take_source_events(window: tuple, source: dict, session: llm.Chat | None,
-                        positions: list[tuple[int, int]], budget: int = MAIL_PULL_TOKENS) -> tuple[list[dict], str | None]:
+                        positions: list[tuple[int, int]], budget: int = MAIL_PULL_TOKENS,
+                        *, read_by: str | None = None, read_via: str | None = None,
+                        bridge: list[dict] | None = None) -> tuple[list[dict], str | None]:
     from mods import chatlog
 
     output = []
@@ -1158,9 +1203,13 @@ def _take_source_events(window: tuple, source: dict, session: llm.Chat | None,
             return output, f"补回档案位置已丢失：{origin}"
         event["_history_source"] = "napcat_backfill"
         event["_history_seq"] = member.get("message_seq")
-        converted = _model_event(event, window[0] == "group")
+        converted = _read_projection(_model_event(event, window[0] == "group"), read_by, read_via)
+        if converted is not None and bridge:
+            converted = _with_bridge(converted, bridge)
         amount = _message_cost(converted) if converted is not None else 0
         if used + amount > budget - 300:
+            if bridge:
+                return output, "来源桥超过本次输入预算；未消费后续成员"
             if output:
                 break
             if converted is None:
@@ -1178,7 +1227,8 @@ def _take_source_events(window: tuple, source: dict, session: llm.Chat | None,
             member["message_id"], member["time"],
             lambda arrival: oplog.input_source(AGENT_WINDOW, event, converted, source["key"],
                                                page_number, offset, origin, window, arrival=arrival,
-                                               mentioned=member.get("mentioned", False)),
+                                               mentioned=member.get("mentioned", False),
+                                               read_by=read_by, read_via=read_via),
             event_seq=member.get("message_seq"))
         if converted is not None:
             projected = _echo_relation(_numbered(converted, recorded["id"]), recorded,
@@ -1203,6 +1253,118 @@ def _source_unread_members(source: dict, count: int | None = None):
             yielded += 1
             if count is not None and yielded >= count:
                 return
+
+
+def _all_source_members(source: str):
+    """Yield the source's original sequence, including consumed positions."""
+    try:
+        window = parse_target(source)
+    except ValueError:
+        state = oplog.resolve_source(source)
+        if state is None or state["key"] != source or state["source_type"] == "napcat_boot":
+            raise ValueError("找不到该窗口或信源 key")
+        for page in range(state["pages"] - 1, -1, -1):
+            for offset, member in enumerate(_source_pages.read_page(
+                    oplog.source_page_root(), state["key"], page)):
+                yield _source_member(state, tuple(state["window"]), page, offset, member)
+        return
+    arrivals = oplog.arrival_members(window)
+    cursor = 0
+    for state in _recovery_sources(window):
+        boundary = state["arrival_boundary"]
+        while cursor < len(arrivals) and arrivals[cursor]["order"] < boundary:
+            yield {**arrivals[cursor], "key": arrivals[cursor]["arrival"]}
+            cursor += 1
+        for page in range(state["pages"] - 1, -1, -1):
+            for offset, member in enumerate(_source_pages.read_page(
+                    oplog.source_page_root(), state["key"], page)):
+                yield _source_member(state, window, page, offset, member)
+    for member in arrivals[cursor:]:
+        yield {**member, "key": member["arrival"]}
+
+
+def _bridge_member(member: dict) -> dict | None:
+    if member.get("source"):
+        return oplog.source_member_provenance(member["source"], member["page"], member["offset"])
+    return oplog.arrival_member_provenance(member["arrival"])
+
+
+def _source_bridges(source: str, before_key: str, after_key: str) -> list[dict]:
+    if not before_key:
+        return []
+    crossed = []
+    between = False
+    for member in _all_source_members(source):
+        if member["key"] == before_key:
+            between = True
+            continue
+        if member["key"] == after_key:
+            return crossed if between else []
+        if between and _bridge_member(member) is not None:
+            crossed.append(member)
+    return []
+
+
+def _bridge_projection(member: dict) -> dict:
+    from mods import chatlog
+
+    provenance = _bridge_member(member)
+    if provenance["kind"] == "read":
+        recorded = provenance["input"]
+        converted = recorded.get("projection")
+        excerpt = (converted is not None and isinstance(converted["content"], str)
+                   and ("正式读取片段" in converted["content"]
+                        or "补回消息过长，先读片段" in converted["content"]))
+        if converted is not None and not excerpt:
+            content = converted["content"]
+            if (isinstance(content, list) and content
+                    and content[0].get("text") == "<source_bridge>\n"):
+                end = next((index for index, part in enumerate(content)
+                            if part.get("text") == "</source_bridge>\n"), None)
+                if end is not None:
+                    converted = {**converted, "content": content[end + 1:]}
+            return _numbered(converted, recorded["id"])
+        event = recorded["event"]
+    else:
+        event = (chatlog.read_origin(*member["window"], member["origin"])
+                 if member.get("origin") else oplog.arrival_event(member["arrival"]))
+    if event is None:
+        raise ValueError(f"桥成员原文已丢失：{member['key']}")
+    event = {**event, "_bridge_original": True}
+    if member.get("source"):
+        event["_history_source"] = "napcat_backfill"
+        event["_history_seq"] = member.get("message_seq")
+    else:
+        event["_live"] = True
+        event["_log_origin"] = member.get("origin")
+    converted = _model_event(event, member["window"][0] == "group")
+    if converted is None:
+        raise ValueError(f"桥成员无法投影：{member['key']}")
+    if provenance["kind"] == "skipped":
+        by = provenance["by"] or ""
+        return _provenance_projection(converted, by, "mark_read", skipped=True)
+    recorded = provenance["input"]
+    return _numbered(_read_projection(converted, recorded.get("read_by"), recorded.get("read_via")),
+                     provenance["input"]["id"])
+
+
+def _with_bridge(converted: dict, bridge: list[dict]) -> dict:
+    if not bridge:
+        return converted
+    shown = bridge if len(bridge) <= 5 else [bridge[0], bridge[-1]]
+    parts = [{"type": "text", "text": "<source_bridge>\n"}]
+    for index, member in enumerate(shown):
+        if index and len(bridge) > 5:
+            parts.append({"type": "text", "text":
+                          f"已折叠 {len(bridge) - 2} 条已读/跳过消息\n"})
+        parts.append({"type": "text", "text": f"<source_member key={member['key']!r}>\n"})
+        original = _bridge_projection(member)["content"]
+        parts.extend(original if isinstance(original, list) else [{"type": "text", "text": original}])
+        parts.append({"type": "text", "text": "\n</source_member>\n"})
+    parts.append({"type": "text", "text": "</source_bridge>\n"})
+    content = converted["content"]
+    return {**converted, "content": [*parts, *(content if isinstance(content, list)
+                                            else [{"type": "text", "text": content}])]}
 
 
 def _iter_unread_metadata(source: str):
@@ -1272,6 +1434,8 @@ def _source_member(source, window, page, offset, member) -> dict:
     return {"key": f"{source['key']}:{page}:{offset}", "source": source["key"],
             "page": page, "offset": offset, "window": list(window),
             "origin": member["origin"], "message_id": member["message_id"],
+            "user_id": member.get("user_id"), "time": member.get("time"),
+            "message_seq": member.get("message_seq"),
             "mentioned": bool(member.get("mentioned"))}
 
 
@@ -1327,7 +1491,8 @@ def _mail_message_identity(message_id, event_time, message_seq) -> tuple[str, in
     return value, event_time, sequence
 
 
-def _mark_source_events_read(window: tuple, source: dict, count: int) -> tuple[int, int, int]:
+def _mark_source_events_read(window: tuple, source: dict, count: int,
+                             read_by: str | None = None) -> tuple[int, int, int]:
     pending = {}
     for entry in oplog.unread(window):
         event = entry["event"]
@@ -1351,12 +1516,13 @@ def _mark_source_events_read(window: tuple, source: dict, count: int) -> tuple[i
         return 0, 0, source["remaining"]
     state = context.mailbox(window).absorb(
         arrivals,
-        lambda: oplog.mark_source_read(source["key"], positions, mention_count, arrivals),
+        lambda: oplog.mark_source_read(source["key"], positions, mention_count, arrivals, read_by),
     )
     return selected, mention_count, state["remaining"]
 
 
-def _mark_mail_prefix_read(window: tuple, entries: list[context.MailEntry]) -> tuple[int, int]:
+def _mark_mail_prefix_read(window: tuple, entries: list[context.MailEntry],
+                           read_by: str | None = None) -> tuple[int, int]:
     if not entries:
         return 0, 0
     arrivals = [entry.arrival for entry in entries]
@@ -1367,13 +1533,14 @@ def _mark_mail_prefix_read(window: tuple, entries: list[context.MailEntry]) -> t
     def commit(crossed: list[context.MailEntry]) -> int:
         if [entry.arrival for entry in crossed] != arrivals:
             raise ValueError("待读队首已变化；未标为已读")
-        return oplog.mark_arrivals_read(window, arrivals)
+        return oplog.mark_arrivals_read(window, arrivals, read_by)
 
     marked = context.mailbox(window).pull(len(entries), commit)
     return marked, mentions
 
 
-def mark_window_read(window: tuple, count: int | None = None) -> dict:
+def mark_window_read(window: tuple, count: int | None = None,
+                     read_by: str | None = None) -> dict:
     """Mark the current ordered unread prefix as read without creating input events."""
     sources = _recovery_sources(window)
     if any(source["state"] == "fetching" for source in sources):
@@ -1391,7 +1558,7 @@ def mark_window_read(window: tuple, count: int | None = None) -> dict:
         if budget is not None and marked >= budget:
             break
         prefix = box.unread_through(original["pending_boundary"], allowance(len(box.unread())))
-        removed, mentioned = _mark_mail_prefix_read(window, prefix)
+        removed, mentioned = _mark_mail_prefix_read(window, prefix, read_by)
         marked += removed
         mentions += mentioned
         if budget is not None and marked >= budget:
@@ -1400,7 +1567,7 @@ def mark_window_read(window: tuple, count: int | None = None) -> dict:
         available = min(state["remaining"], frozen_sources[original["key"]])
         amount = allowance(available)
         if amount:
-            removed, mentioned, _remaining = _mark_source_events_read(window, state, amount)
+            removed, mentioned, _remaining = _mark_source_events_read(window, state, amount, read_by)
             marked += removed
             mentions += mentioned
     if budget is None or marked < budget:
@@ -1409,7 +1576,7 @@ def mark_window_read(window: tuple, count: int | None = None) -> dict:
             entries = [entry for entry in entries
                        if oplog.arrival_before_or_at(entry.arrival, through)]
         entries = entries[:allowance(len(entries))]
-        removed, mentioned = _mark_mail_prefix_read(window, entries)
+        removed, mentioned = _mark_mail_prefix_read(window, entries, read_by)
         marked += removed
         mentions += mentioned
     return {"marked_read": marked, "mentions": mentions,
@@ -1417,16 +1584,19 @@ def mark_window_read(window: tuple, count: int | None = None) -> dict:
                                          for source in sources)}
 
 
-def mark_source_read(source: dict, count: int | None = None) -> dict:
+def mark_source_read(source: dict, count: int | None = None,
+                     read_by: str | None = None) -> dict:
     if source["state"] == "fetching":
         raise ValueError("该信源仍在拉取，未读前端尚未固定")
     amount = source["remaining"] if count is None else min(count, source["remaining"])
-    marked, mentions, remaining = _mark_source_events_read(tuple(source["window"]), source, amount)
+    marked, mentions, remaining = _mark_source_events_read(tuple(source["window"]), source,
+                                                           amount, read_by)
     return {"marked_read": marked, "mentions": mentions, "remaining": remaining}
 
 
-def _take_members(session: llm.Chat, selected: list[dict]) -> tuple[list[dict], str | None]:
+def _take_members(session: llm.Chat, request: dict) -> tuple[list[dict], str | None]:
     """Commit selected members one by one before projecting the next request."""
+    selected = request["members"]
     output = []
     used = 0
     while selected:
@@ -1434,6 +1604,7 @@ def _take_members(session: llm.Chat, selected: list[dict]) -> tuple[list[dict], 
             break
         member = selected[0]
         window = tuple(member["window"])
+        bridge = _source_bridges(request["source"], request.get("last_key", ""), member["key"])
         if "source" in member:
             source = oplog.resolve_source(member["source"])
             if source is None or oplog.source_position_read(
@@ -1442,11 +1613,14 @@ def _take_members(session: llm.Chat, selected: list[dict]) -> tuple[list[dict], 
                 continue
             projected, error = _take_source_events(
                 window, source, session, [(member["page"], member["offset"])],
-                MAIL_PULL_TOKENS - used)
+                MAIL_PULL_TOKENS - used, read_by=request.get("read_by"),
+                read_via=request.get("read_via"), bridge=bridge)
             if error:
                 return output, error
             output.extend(projected)
             used += sum(_message_cost(item) for item in projected)
+            if projected:
+                request["last_key"] = member["key"]
             selected.pop(0)
             continue
         arrival = member["arrival"]
@@ -1456,9 +1630,14 @@ def _take_members(session: llm.Chat, selected: list[dict]) -> tuple[list[dict], 
             selected.pop(0)
             continue
         located = {**entry.event, "_log_origin": oplog.arrival_origin(arrival), "_live": True}
-        converted = _model_event(located, window[0] == "group")
+        converted = _read_projection(_model_event(located, window[0] == "group"),
+                                     request.get("read_by"), request.get("read_via"))
+        if converted is not None:
+            converted = _with_bridge(converted, bridge)
         amount = _message_cost(converted) if converted is not None else 0
         if converted is not None and used + amount > MAIL_PULL_TOKENS - 300:
+            if bridge:
+                return output, "来源桥超过本次输入预算；未消费后续成员"
             if output:
                 break
             excerpt = bounded_excerpt(json.dumps(converted["content"], ensure_ascii=False),
@@ -1474,18 +1653,21 @@ def _take_members(session: llm.Chat, selected: list[dict]) -> tuple[list[dict], 
         # exactly-once delivery is not promised. Never replace a whole mailbox
         # snapshot here: a concurrent arrival must remain unread.
         recorded = box.absorb([arrival], lambda: oplog.input(
-            AGENT_WINDOW, entry.event, converted, arrival, source_window=window))
+            AGENT_WINDOW, entry.event, converted, arrival, source_window=window,
+            read_by=request.get("read_by"), read_via=request.get("read_via")))
         if converted is not None:
             projection = _echo_relation(_numbered(converted, recorded["id"]), recorded,
                                         oplog.say_links(AGENT_WINDOW))
             output.append(projection)
             _remember_stream(session, projection, recorded["id"])
         used += amount
+        request["last_key"] = member["key"]
         selected.pop(0)
     return output, None
 
 
-def _take_archive(session: llm.Chat, records: list[dict], window: tuple) -> tuple[list[dict], str | None]:
+def _take_archive(session: llm.Chat, request: dict, window: tuple) -> tuple[list[dict], str | None]:
+    records = request["records"]
     output = []
     used = 0
     while records:
@@ -1496,7 +1678,8 @@ def _take_archive(session: llm.Chat, records: list[dict], window: tuple) -> tupl
         if not origin:
             return output, "档案记录缺少稳定 origin"
         event = {**record, "_history_source": "archive", "_live": False}
-        converted = _model_event(event, window[0] == "group")
+        converted = _read_projection(_model_event(event, window[0] == "group"),
+                                     request.get("read_by"), request.get("read_via"))
         if converted is None:
             records.pop(0)
             continue
@@ -1526,7 +1709,9 @@ def _take_archive(session: llm.Chat, records: list[dict], window: tuple) -> tupl
                    "offset": source_member[2], "mentioned": source_member[3]}
                   if source_member is not None else {})
         commit = lambda: oplog.input_archive(AGENT_WINDOW, record, converted, origin,
-                                             window, arrival=arrival, **values)
+                                             window, arrival=arrival,
+                                             read_by=request.get("read_by"),
+                                             read_via=request.get("read_via"), **values)
         recorded = (context.mailbox(window).absorb([arrival], commit)
                     if arrival is not None else commit())
         projection = _numbered(converted, recorded["id"])
@@ -1832,9 +2017,9 @@ def _agent_provider(turn, session: llm.Chat):
                 window = tuple(request["window"])
                 turn.associated_windows.add(window)
                 if "records" in request:
-                    pulled, error = _take_archive(session, request["records"], window)
+                    pulled, error = _take_archive(session, request, window)
                 else:
-                    pulled, error = _take_members(session, request["members"])
+                    pulled, error = _take_members(session, request)
                 produced.extend(pulled)
                 if error is None and (request.get("members") or request.get("records")):
                     turn.requested_reads.insert(0, request)

@@ -34,6 +34,9 @@ _notified: set[str] = set()
 # WHY: Arrival journal replay and dict insertion order preserve live members'
 # relative order; there is no before-insertion caller, so a linked list is redundant.
 _arrival_order: dict[str, int] = {}
+_arrival_members: dict[str, dict] = {}
+_arrival_skips: dict[str, dict] = {}
+_source_arrivals: set[str] = set()
 _covered: dict[tuple, set[str]] = {}
 _coverage_nodes: dict[str, list[str]] = {}
 _mentioned_by: dict[str, list[str]] = {}
@@ -90,6 +93,9 @@ def _restore() -> None:
     pending: dict[str, dict] = {}
     notified: set[str] = set()
     arrival_order: dict[str, int] = {}
+    arrival_members: dict[str, dict] = {}
+    arrival_skips: dict[str, dict] = {}
+    source_arrivals: set[str] = set()
     covered: dict[tuple, set[str]] = {}
     coverage_nodes: dict[str, list[str]] = {}
     mentioned_by: dict[str, list[str]] = {}
@@ -102,7 +108,8 @@ def _restore() -> None:
         for line in data[:complete].splitlines():
             entry = json.loads(line.decode("utf-8"))
             _apply(entry, restored, indexes, windows, counters, pending, covered, coverage_nodes,
-                   origins, mentioned_by, notified, arrival_order, sources, seen_messages)
+                   origins, mentioned_by, notified, arrival_order, sources, seen_messages,
+                   arrival_members, arrival_skips, source_arrivals)
         if complete != len(data):
             # WHY: Only a missing final newline is a crash tail. A malformed complete
             # row is corruption, never permission to silently skip committed facts.
@@ -123,7 +130,9 @@ def _restore() -> None:
     _by_id.clear()
     _by_id.update(indexes)
     _by_arrival.clear()
-    _by_arrival.update((entry["arrival"], entry) for entry in restored if entry.get("arrival"))
+    for entry in restored:
+        if entry.get("arrival"):
+            _by_arrival.setdefault(entry["arrival"], entry)
     _windows.clear()
     _windows.update(windows)
     _next.clear()
@@ -134,6 +143,12 @@ def _restore() -> None:
     _notified.update(notified)
     _arrival_order.clear()
     _arrival_order.update(arrival_order)
+    _arrival_members.clear()
+    _arrival_members.update(arrival_members)
+    _arrival_skips.clear()
+    _arrival_skips.update(arrival_skips)
+    _source_arrivals.clear()
+    _source_arrivals.update(source_arrivals)
     _covered.clear()
     _covered.update(covered)
     _coverage_nodes.clear()
@@ -304,6 +319,21 @@ def _validate_source_mark_read(entry: dict, state: dict, pending: dict[str, dict
         raise ValueError("source mark-read arrivals are invalid")
 
 
+def _validate_read_provenance(entry: dict, indexes: dict[str, dict]) -> None:
+    if entry["kind"] not in ("input", "mark_read", "source_mark_read"):
+        return
+    read_by = entry.get("read_by")
+    if read_by is None:
+        return
+    output = indexes.get(read_by)
+    if (not isinstance(read_by, str) or output is None or output["kind"] != "output"
+            or "#" in read_by):
+        raise ValueError("read provenance must name a prior formal output")
+    if entry["kind"] == "input" and entry.get("read_via") not in (
+            "take", "pull", "mentions", "read_messages"):
+        raise ValueError("input read_via is invalid")
+
+
 def _apply(
     entry: dict, recorded: list[dict], indexes: dict[str, dict], windows: dict[tuple, list[dict]],
     counters: dict[str, int], pending: dict[str, dict], covered: dict[tuple, set[str]],
@@ -311,9 +341,17 @@ def _apply(
     mentioned_by: dict[str, list[str]], notified: set[str],
     arrival_order: dict[str, int], sources: dict[str, dict],
     seen_messages: set[tuple[tuple, str, int, str | None]],
+    arrival_members: dict[str, dict], arrival_skips: dict[str, dict],
+    source_arrivals: set[str],
 ) -> None:
+    _validate_read_provenance(entry, indexes)
     if entry["kind"] == "arrival":
         arrival_order[entry["arrival"]] = len(arrival_order)
+        arrival_members[entry["arrival"]] = {
+            "arrival": entry["arrival"], "window": entry["window"],
+            "origin": entry.get("origin"), "source": entry.get("source"),
+            "order": arrival_order[entry["arrival"]],
+        }
         source = entry.get("source")
         if source is not None:
             if source not in sources or sources[source]["queue_window"] != entry["window"]:
@@ -332,9 +370,10 @@ def _apply(
                            "fetch_anchor": entry.get("anchor"),
                            "cursor": entry.get("start_seq"), "stop_cursor": None,
                            "pending_boundary": entry.get("pending_boundary"),
+                           "arrival_boundary": len(arrival_order),
                            "pages": 0, "page_counts": [], "member_count": 0,
                            "mention_count": 0, "read_mention_count": 0,
-                           "read_positions": set(),
+                           "read_positions": set(), "read_entries": {}, "skip_entries": {},
                            "gap": None, "previous_gaps": [], "error": None}
         return
     if entry["kind"] == "source_page":
@@ -402,6 +441,7 @@ def _apply(
             raise ValueError("mark-read must consume one exact pending prefix")
         for arrival in arrivals:
             marked = pending.pop(arrival)
+            arrival_skips[arrival] = entry
             identity = _message_identity(window, marked["event"])
             if identity is not None:
                 seen_messages.add(identity)
@@ -414,10 +454,12 @@ def _apply(
         if positions is None:
             positions = [list(position) for position in list(_source_positions(state))[:entry["count"]]]
         state["read_positions"].update(map(tuple, positions))
+        state["skip_entries"].update((tuple(position), entry) for position in positions)
         state["read_mention_count"] += entry.get("mention_count", 0)
         state["pulled"] = True
         for arrival in entry.get("arrivals", []):
             marked = pending.pop(arrival)
+            source_arrivals.add(arrival)
             identity = _message_identity(tuple(state["window"]), marked["event"])
             if identity is not None:
                 seen_messages.add(identity)
@@ -492,12 +534,15 @@ def _apply(
     if source_read:
         state = sources[entry["source"]]
         state["read_positions"].add((entry["page"], entry["offset"]))
+        state["read_entries"][(entry["page"], entry["offset"])] = entry
         state["read_mention_count"] += bool(entry.get("mentioned"))
         state["pulled"] = True
     if entry.get("arrival"):
         arrival = pending.get(entry["arrival"])
         if entry["kind"] == "input" and arrival is not None and arrival.get("source"):
             sources[arrival["source"]]["pulled"] = True
+        if source_read:
+            source_arrivals.add(entry["arrival"])
         pending.pop(entry["arrival"], None)
     identity = _input_message_identity(entry, sources)
     if identity is not None:
@@ -510,6 +555,7 @@ def _append(entry: dict, day: str) -> None:
     # 外部副作用失去可信的来源记录。保持失败直到重启恢复检查磁盘，而非在进程内重试编号。
     if _failed:
         raise RuntimeError("event stream write failed; refusing further actions")
+    _validate_read_provenance(entry, _by_id)
     if entry["kind"] == "arrival":
         source = entry.get("source")
         if source is not None:
@@ -548,9 +594,9 @@ def _append(entry: dict, day: str) -> None:
         raise
     _apply(entry, _events, _by_id, _windows, _next, _pending, _covered, _coverage_nodes,
            _origins, _mentioned_by, _notified, _arrival_order, _sources,
-           _seen_messages)
+           _seen_messages, _arrival_members, _arrival_skips, _source_arrivals)
     if entry.get("id") and entry.get("arrival"):
-        _by_arrival[entry["arrival"]] = entry
+        _by_arrival.setdefault(entry["arrival"], entry)
 
 
 def _ordered_pending(window: tuple | None = None) -> list[dict]:
@@ -563,7 +609,8 @@ def _arrival_before_or_at(arrival: str, through: str) -> bool:
 
 
 def _source_snapshot(state: dict) -> dict:
-    return {**{key: value for key, value in state.items() if key != "read_positions"},
+    return {**{key: value for key, value in state.items()
+               if key not in ("read_positions", "read_entries", "skip_entries")},
             "window": list(state["window"]),
             "queue_window": list(state["queue_window"]),
             "page_counts": list(state["page_counts"]),
@@ -577,6 +624,50 @@ def source_position_read(source: str, page: int, offset: int) -> bool:
     with _lock:
         _restore()
         return (page, offset) in _sources[source]["read_positions"]
+
+
+def source_member_provenance(source: str, page: int, offset: int) -> dict | None:
+    """Return the first input or skip fact for a page position."""
+    with _lock:
+        _restore()
+        state = _sources[source]
+        position = (page, offset)
+        recorded = state["read_entries"].get(position)
+        if recorded is not None:
+            return {"kind": "read", "input": recorded}
+        skipped = state["skip_entries"].get(position)
+        return {"kind": "skipped", "by": skipped.get("read_by")} if skipped else None
+
+
+def arrival_members(window: tuple) -> list[dict]:
+    """Replay-derived lightweight source order, excluding page-linked live duplicates."""
+    with _lock:
+        _restore()
+        return [member.copy() for arrival, member in _arrival_members.items()
+                if tuple(member["window"]) == window and arrival not in _source_arrivals]
+
+
+def arrival_member_provenance(arrival: str) -> dict | None:
+    with _lock:
+        _restore()
+        recorded = _by_arrival.get(arrival)
+        if recorded is not None and recorded["kind"] == "input":
+            return {"kind": "read", "input": recorded}
+        skipped = _arrival_skips.get(arrival)
+        return {"kind": "skipped", "by": skipped.get("read_by")} if skipped else None
+
+
+def arrival_event(arrival: str) -> dict | None:
+    """Load a rare origin-less skipped arrival from its journal, not a body cache."""
+    with _lock:
+        _restore()
+        for path in sorted(_root.glob("????????.jsonl")):
+            with path.open(encoding="utf-8") as stream:
+                for line in stream:
+                    entry = json.loads(line)
+                    if entry["kind"] == "arrival" and entry["arrival"] == arrival:
+                        return entry["event"]
+    return None
 
 
 def arrive(window: tuple, event: dict, *, activated: bool = False, origin: str | None = None) -> str:
@@ -598,18 +689,19 @@ def unread(window: tuple) -> list[dict]:
         return _ordered_pending(window)
 
 
-def mark_arrivals_read(window: tuple, arrivals: Iterable[str]) -> int:
+def mark_arrivals_read(window: tuple, arrivals: Iterable[str], read_by: str | None = None) -> int:
     """Durably mark one exact unread window prefix without assigning event ids."""
     with _lock:
         _restore()
         selected = list(arrivals)
-        _append({"kind": "mark_read", "window": list(window), "arrivals": selected},
+        _append({"kind": "mark_read", "window": list(window), "arrivals": selected,
+                 "read_by": read_by},
                 datetime.now().strftime("%Y%m%d"))
         return len(selected)
 
 
 def mark_source_read(source: str, positions: Iterable[tuple[int, int]], mention_count: int,
-                     arrivals: Iterable[str] = ()) -> dict:
+                     arrivals: Iterable[str] = (), read_by: str | None = None) -> dict:
     """Advance one sealed source without presenting its members to the model."""
     with _lock:
         _restore()
@@ -617,7 +709,7 @@ def mark_source_read(source: str, positions: Iterable[tuple[int, int]], mention_
         selected = [list(position) for position in positions]
         entry = {"kind": "source_mark_read", "source": source,
                  "positions": selected, "count": len(selected), "mention_count": mention_count,
-                 "arrivals": list(arrivals)}
+                 "arrivals": list(arrivals), "read_by": read_by}
         _append(entry, datetime.now().strftime("%Y%m%d"))
         return _source_snapshot(_sources[source])
 
@@ -764,15 +856,16 @@ def pending_summary() -> list[tuple[tuple, int, bool]]:
 def _pending_detail(window: tuple, through: str | None = None) -> dict:
     rows = [(entry["arrival"], entry) for entry in _ordered_pending(window)
             if through is None or _arrival_before_or_at(entry["arrival"], through)]
-    wakes = [entry for _arrival, entry in rows if entry.get("activated")]
+    wakes = [(ordinal, entry) for ordinal, (_arrival, entry) in enumerate(rows, 1)
+             if entry.get("activated")]
     return {"window": list(window), "unread": len(rows), "ordinary": len(rows) - len(wakes),
             "mentions": sum(entry.get("activation_kind") == "mention" for entry in wakes),
             "other_wakes": sum(entry.get("activation_kind") != "mention" for entry in wakes),
             "wake_sources": [{"kind": entry.get("activation_kind", "wake"),
                               "user_id": entry["event"].get("user_id"),
                               "time": entry["event"].get("time"),
-                              "message_id": entry["event"].get("message_id")}
-                             for entry in wakes[-3:]]}
+                              "ordinal": ordinal}
+                             for ordinal, entry in wakes[-3:]]}
 
 
 def pending_details() -> list[dict]:
@@ -788,6 +881,7 @@ def pending_details() -> list[dict]:
                                                  "ordinary": 0, "mentions": 0,
                                                  "other_wakes": 0, "wake_sources": []})
             detail["unread"] += 1
+            ordinal = detail["unread"]
             if not entry.get("activated"):
                 detail["ordinary"] += 1
                 continue
@@ -796,7 +890,7 @@ def pending_details() -> list[dict]:
             detail["wake_sources"].append({"kind": kind,
                                            "user_id": entry["event"].get("user_id"),
                                            "time": entry["event"].get("time"),
-                                           "message_id": entry["event"].get("message_id")})
+                                           "ordinal": ordinal})
             del detail["wake_sources"][:-3]
         return list(details.values())
 
@@ -857,8 +951,7 @@ def deliver_notifications(agent_window: tuple) -> dict | None:
                          activations=[{"window": list(entry["window"]),
                                        "kind": entry.get("activation_kind", "wake"),
                                        "user_id": entry["event"].get("user_id"),
-                                       "time": entry["event"].get("time"),
-                                       "message_id": entry["event"].get("message_id")}
+                                       "time": entry["event"].get("time")}
                                       for entry in activated],
                          unread=pending_details())
 
@@ -986,7 +1079,8 @@ def _register(window: tuple | None, kind: str, **values: Any) -> dict | None:
 
 
 def input(window: tuple | None, event: dict, projection: dict | None, arrival: str,
-          source_window: tuple | None = None) -> dict | None:
+          source_window: tuple | None = None, *, read_by: str | None = None,
+          read_via: str | None = None) -> dict | None:
     with _lock:
         _restore()
         pending = _pending.get(arrival, {})
@@ -995,16 +1089,19 @@ def input(window: tuple | None, event: dict, projection: dict | None, arrival: s
                     else list(window or ()))
         return _register(window, "input", event=event, projection=projection, arrival=arrival,
                          origin=origin, source=pending.get("source"),
-                         source_window=list(source_window) if source_window is not None else original)
+                         source_window=list(source_window) if source_window is not None else original,
+                         read_by=read_by, read_via=read_via)
 
 
 def input_archive(window: tuple, event: dict, projection: dict, origin: str,
                   source_window: tuple, *, arrival: str | None = None,
                   source: str | None = None, page: int | None = None,
-                  offset: int | None = None, mentioned: bool = False) -> dict:
+                  offset: int | None = None, mentioned: bool = False,
+                  read_by: str | None = None, read_via: str | None = None) -> dict:
     """Record an archive reread and consume any matching unread member."""
     values = {"event": event, "projection": projection, "origin": origin,
-              "source_window": list(source_window), "archive": True}
+              "source_window": list(source_window), "archive": True,
+              "read_by": read_by, "read_via": read_via}
     if arrival is not None:
         values["arrival"] = arrival
     if source is not None:
@@ -1014,7 +1111,8 @@ def input_archive(window: tuple, event: dict, projection: dict, origin: str,
 
 def input_source(window: tuple, event: dict, projection: dict | None, source: str,
                  page: int, offset: int, origin: str | None, source_window: tuple,
-                 arrival: str | None = None, mentioned: bool = False) -> dict:
+                 arrival: str | None = None, mentioned: bool = False,
+                 read_by: str | None = None, read_via: str | None = None) -> dict:
     """Index one sealed page member; replay derives the unread holes."""
     with _lock:
         _restore()
@@ -1022,7 +1120,8 @@ def input_source(window: tuple, event: dict, projection: dict | None, source: st
             raise ValueError("source input needs a read window")
         values = {"event": event, "projection": projection, "source": source,
                   "page": page, "offset": offset, "origin": origin,
-                  "source_window": list(source_window), "mentioned": mentioned}
+                  "source_window": list(source_window), "mentioned": mentioned,
+                  "read_by": read_by, "read_via": read_via}
         if arrival is not None:
             values["arrival"] = arrival
         return _register(window, "input", **values)
@@ -1097,7 +1196,14 @@ def reference_links(window: tuple | None, ids: Iterable[str]) -> dict[str, dict]
     with _lock:
         _restore()
         selected = {}
-        for event_id in dict.fromkeys(str(value) for value in ids):
+        requested = list(dict.fromkeys(str(value) for value in ids))
+        outputs = {event_id for event_id in requested
+                   if event_id in _by_id and _by_id[event_id]["kind"] == "output"}
+        reads: dict[str, list[str]] = {event_id: [] for event_id in outputs}
+        for item in _events:
+            if item["kind"] == "input" and item.get("read_by") in reads:
+                reads[item["read_by"]].append(item["id"])
+        for event_id in requested:
             entry = _by_id.get(event_id)
             if (entry is None or not _accessible(window, entry)
                     or (entry["kind"] == "input" and entry.get("projection") is None)):
@@ -1110,6 +1216,7 @@ def reference_links(window: tuple | None, ids: Iterable[str]) -> dict[str, dict]
                            if node.partition("#")[0] == event_id},
                 "covered_by": covered_by,
                 "source": entry.get("source") if entry["kind"] == "result" else None,
+                "reads": reads.get(event_id, []),
             }
         return selected
 
