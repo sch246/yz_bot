@@ -19,7 +19,7 @@ python experiments/memory_replay.py prepare \
 ```
 
 `doctor` (also the default command) creates synthetic records and probes the
-production Mailbox and oplog without a model or sender. It prints its temporary
+production oplog FIFO without a model or sender. It prints its temporary
 output path; `doctor --output /private/new-directory` selects one explicitly.
 
 `run` uses the production center reader, context assembly, tool binding,
@@ -112,7 +112,7 @@ and incremental usage; transcript and usage are appended, never overwritten.
 
 The run creates its own `archive/`, `data/storage/`, `data/event_stream/`, and
 `skills/` under the new output directory, leaving `prepared/` unchanged. Archive
-events enter the real Mailbox in day/time/file order, start unread, and receive
+events enter the real oplog in day/time/file order, start unread, and receive
 formal IDs on reading. An arranged take without a next model request remains
 unconsumed; it creates no durable input fact and is not part of a checkpoint.
 Model outputs and tool results enter the same oplog; `say` records an intention

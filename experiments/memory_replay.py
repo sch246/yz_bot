@@ -23,6 +23,14 @@ MODEL = "deepseek/deepseek-flash"
 PROMPT_MODE = "production-default-plus-offline-review-task-v3"
 REPOSITORY = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY))
+_OPLOG_BINDINGS = ("_root", "_events", "_by_id", "_by_arrival", "_windows", "_next",
+                   "_pending", "_notified", "_arrival_order", "_arrival_members",
+                   "_arrival_skips", "_source_arrivals", "_covered", "_coverage_nodes",
+                   "_mentioned_by", "_origins", "_sources", "_seen_messages", "_failed")
+_CONTEXT_BINDINGS = ("_local", "_latest", "_waiters", "_turns", "_window_locks", "_arrival_links")
+_CHATLOG_BINDINGS = ("_boot_anchors", "_line_positions", "_live_origins", "_window_locks",
+                     "_recalls", "_live_recalls")
+_STORAGE_BINDINGS = ("storage", "load_errors", "_states", "_pending_file_events")
 
 
 def _days(first: date, last: date):
@@ -497,7 +505,15 @@ def _run_locked(prepared: Path, output: Path, kind: str, target: int, bot_id: in
         _write_json(output / "run_manifest.json", run_manifest)
     previous_cwd = Path.cwd()
     old_client, old_root, old_chatlog = llm.client, storage.root_path, chatlog.rootfile
-    old_chat_state = chat.settings, chat.prompts, chat.llm_config, chat.description_cache
+    old_chat_state = (chat.settings, chat.prompts, chat.chat_groups,
+                      chat.llm_config, chat.description_cache)
+    old_oplog_state = {name: getattr(oplog, name) for name in _OPLOG_BINDINGS}
+    old_context_state = {name: getattr(context, name) for name in _CONTEXT_BINDINGS}
+    old_chatlog_state = {name: getattr(chatlog, name) for name in _CHATLOG_BINDINGS}
+    old_storage_state = {name: getattr(storage, name) for name in _STORAGE_BINDINGS}
+    outbound_names = ("send", "sendmsg", "_send_now")
+    original_outbound = {name: getattr(message, name) for name in outbound_names}
+    original_call_api = connect.call_api
     old_name, old_user_name, old_qq = identity.getname, identity.get_user_name, identity.qq
     old_bot_name, old_nicknames = identity.name, identity.nicknames
     transcript: list[dict] = []
@@ -506,6 +522,14 @@ def _run_locked(prepared: Path, output: Path, kind: str, target: int, bot_id: in
     stop_reason = "complete"
     result = None
     try:
+        for name, value in old_oplog_state.items():
+            setattr(oplog, name, None if name == "_root" else type(value)())
+        for name, value in old_context_state.items():
+            setattr(context, name, None if name == "_latest" else type(value)())
+        for name, value in old_chatlog_state.items():
+            setattr(chatlog, name, None if name == "_boot_anchors" else type(value)())
+        for name, value in old_storage_state.items():
+            setattr(storage, name, type(value)())
         os.chdir(output)
         storage.root_path = "data/storage"
         chatlog.rootfile = "archive"
@@ -555,6 +579,7 @@ def _run_locked(prepared: Path, output: Path, kind: str, target: int, bot_id: in
         llm.client = client
         chat.settings = []
         chat.prompts = {}
+        chat.chat_groups = []
         chat.llm_config = client.config
         chat.description_cache = {}
 
@@ -613,9 +638,8 @@ def _run_locked(prepared: Path, output: Path, kind: str, target: int, bot_id: in
                      "user_id": bot_id, "time": ordered[-1]["time"] + echo_number,
                      "sender": {"user_id": bot_id, "nickname": "离线模拟 Bot"}}
             event["group_id" if kind == "group" else "target_id"] = target
-            box = context.mailbox(window)
-            box.add(event)
-            box.activate(event)
+            arrival = oplog.arrive(window, event)
+            oplog.activate(arrival)
             transcript.append({"kind": "dry_say", "target": destination, "content": body,
                                "message_id": message_id, "sent": False,
                                "occurred_at": time.time()})
@@ -624,50 +648,37 @@ def _run_locked(prepared: Path, output: Path, kind: str, target: int, bot_id: in
         def forbidden(*_args, **_kwargs):
             raise RuntimeError("offline replay outbound operation blocked")
 
-        outbound_names = ("send", "sendmsg", "_send_now")
-        original_outbound = {name: getattr(message, name) for name in outbound_names}
-        original_call_api = connect.call_api
         for name in outbound_names:
             setattr(message, name, forbidden)
         connect.call_api = forbidden
         extra = STRATEGIES[strategy]
         replay_prompt = OFFLINE_FACT + (("\n" + extra) if extra else "")
-        scope_token = chat._offline_scope.set({"model": MODEL, "fact": replay_prompt,
-                                               "persist_reasoning": persist_reasoning,
-                                               "registry": registry, "on_chunk": on_chunk})
         send_context = registry.get("meta").tools["say"].call.__globals__["_offline_send_sink"]
-        sink_token = send_context.set(dry_say)
+        if not resume:
+            last_arrival = None
+            for event in ordered:
+                last_arrival = oplog.arrive(window, event, origin=event["_log_origin"])
+            oplog.activate(last_arrival)
         try:
-            box = context.mailbox(window)
-            if not resume:
-                for event in ordered:
-                    chatlog._remember_origin(event, event["_log_origin"])
-                    box.add(event)
-                box.activate(ordered[-1])
-            try:
-                # WHY: requested_reads lives only for this drive. If a budget stops
-                # before the next provider request, no input fact exists and those
-                # members remain unread for a later replay to choose again.
-                chat.agent._drive_agent(MODEL, window)
-            except Exception as error:
-                stop_reason = str(error)
-                if not (type(error).__name__ in {
-                    "APIConnectionError", "APITimeoutError", "RateLimitError", "APIStatusError"
-                } or stop_reason in {
-                    "max-calls budget reached", "max-prompt-tokens budget reached",
-                    "max-completion-tokens budget reached"
-                } or
-                        stop_reason.startswith("模型流未完整结束") or
-                        stop_reason.startswith("模型响应未完整结束") or
-                        stop_reason.startswith("模型流缺少结束标记") or
-                        stop_reason.startswith("模型在结束标记后继续生成")):
-                    raise
-        finally:
-            send_context.reset(sink_token)
-            chat._offline_scope.reset(scope_token)
-            for name, original in original_outbound.items():
-                setattr(message, name, original)
-            connect.call_api = original_call_api
+            # WHY: requested_reads lives only for this drive. If a budget stops
+            # before the next provider request, no input fact exists and those
+            # members remain unread for a later replay to choose again.
+            chat.run_offline(MODEL, window, fact=replay_prompt, registry=registry,
+                             on_chunk=on_chunk, persist_reasoning=persist_reasoning,
+                             send_context=send_context, send_sink=dry_say)
+        except Exception as error:
+            stop_reason = str(error)
+            if not (type(error).__name__ in {
+                "APIConnectionError", "APITimeoutError", "RateLimitError", "APIStatusError"
+            } or stop_reason in {
+                "max-calls budget reached", "max-prompt-tokens budget reached",
+                "max-completion-tokens budget reached"
+            } or
+                    stop_reason.startswith("模型流未完整结束") or
+                    stop_reason.startswith("模型响应未完整结束") or
+                    stop_reason.startswith("模型流缺少结束标记") or
+                    stop_reason.startswith("模型在结束标记后继续生成")):
+                raise
         finalize_usage()
         result = {"status": "complete" if stop_reason == "complete" else "stopped",
                   "stop_reason": stop_reason, "events": len(ordered),
@@ -704,18 +715,30 @@ def _run_locked(prepared: Path, output: Path, kind: str, target: int, bot_id: in
                 _checkpoint(Path.cwd(), segment, len(rows))
         finally:
             llm.client, storage.root_path, chatlog.rootfile = old_client, old_root, old_chatlog
-            chat.settings, chat.prompts, chat.llm_config, chat.description_cache = old_chat_state
+            chat.settings, chat.prompts, chat.chat_groups, chat.llm_config, chat.description_cache = old_chat_state
+            for name, value in old_oplog_state.items():
+                setattr(oplog, name, value)
+            for name, value in old_context_state.items():
+                setattr(context, name, value)
+            for name, value in old_chatlog_state.items():
+                setattr(chatlog, name, value)
+            for name, value in old_storage_state.items():
+                setattr(storage, name, value)
+            for name, original in original_outbound.items():
+                setattr(message, name, original)
+            connect.call_api = original_call_api
             identity.getname, identity.get_user_name, identity.qq = old_name, old_user_name, old_qq
             identity.name, identity.nicknames = old_bot_name, old_nicknames
             os.chdir(previous_cwd)
 
 
 def _doctor(output: Path) -> dict:
-    from mods import connect, context, message, oplog, storage
+    from mods import connect, message, oplog, storage
 
     root = output / "runtime"
     root.mkdir(mode=0o700)
     old_storage_root = storage.root_path
+    old_oplog_state = {name: getattr(oplog, name) for name in _OPLOG_BINDINGS}
     original_send = message.send
     original_sendmsg = message.sendmsg
     original_send_now = message._send_now
@@ -733,6 +756,8 @@ def _doctor(output: Path) -> dict:
     connect.call_api = block_outbound
     storage.root_path = str(root / "data" / "storage")
     try:
+        for name, value in old_oplog_state.items():
+            setattr(oplog, name, None if name == "_root" else type(value)())
         if connect._server is not None or message._worker is not None:
             raise AssertionError("doctor has a live listener or send worker")
         try:
@@ -762,21 +787,20 @@ def _doctor(output: Path) -> dict:
             raise AssertionError("day/time/file-order replay is unstable")
 
         window = ("group", 1)
-        box = context.Mailbox(window)
         for event in ordered:
-            box.add(event)
-        if [item.event["message_id"] for item in box.unread()] != [2, 1, 3]:
-            raise AssertionError("production Mailbox FIFO differs")
+            oplog.arrive(window, event, origin=event["_log_origin"])
+        if [item["event"]["message_id"] for item in oplog.unread(window)] != [2, 1, 3]:
+            raise AssertionError("production oplog FIFO differs")
 
         def project(entries):
-            return [oplog.input(oplog.AGENT_WINDOW, entry.event,
-                                {"role": "user", "content": entry.event["message"]},
-                                entry.arrival, source_window=window)["id"]
+            return [oplog.input(oplog.AGENT_WINDOW, entry["event"],
+                                {"role": "user", "content": entry["event"]["message"]},
+                                entry["arrival"], source_window=window)["id"]
                     for entry in entries]
 
-        first_page = box.pull(2, project)
-        second_page = box.pull(2, project)
-        if len(first_page) != 2 or len(second_page) != 1 or box.unread():
+        first_page = project(oplog.unread(window)[:2])
+        second_page = project(oplog.unread(window)[:2])
+        if len(first_page) != 2 or len(second_page) != 1 or oplog.unread(window):
             raise AssertionError("production FIFO did not drain in bounded pages")
         recalled, missing = oplog.recall_events(oplog.AGENT_WINDOW, first_page + second_page)
         if missing or [entry["event"]["message_id"] for entry in recalled] != [2, 1, 3]:
@@ -815,6 +839,8 @@ def _doctor(output: Path) -> dict:
                 "runtime_isolated": True}
     finally:
         storage.root_path = old_storage_root
+        for name, value in old_oplog_state.items():
+            setattr(oplog, name, value)
         message.send = original_send
         message.sendmsg = original_sendmsg
         message._send_now = original_send_now

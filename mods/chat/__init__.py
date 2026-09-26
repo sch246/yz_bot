@@ -572,6 +572,23 @@ def chat(model: str | None = None) -> None:
     _agent._drive_agent(model, window)
 
 
+def run_offline(model: str, window: tuple, *, fact: str, registry,
+                on_chunk: Callable, persist_reasoning: bool,
+                send_context, send_sink: Callable) -> None:
+    """Drive the production reader with an explicit temporary replay scope."""
+    scope = _offline_scope.set({"model": model, "fact": fact,
+                                "persist_reasoning": persist_reasoning,
+                                "registry": registry, "on_chunk": on_chunk})
+    try:
+        sink = send_context.set(send_sink)
+        try:
+            _agent._drive_agent(model, window)
+        finally:
+            send_context.reset(sink)
+    finally:
+        _offline_scope.reset(scope)
+
+
 def _in_chat_scope(event: dict) -> bool:
     """这个窗口开了聊天吗——群要在白名单里，私聊一律算开。"""
     group_id = event.get("group_id")
@@ -588,11 +605,27 @@ def _mail_candidate(event: dict) -> bool:
 
 
 def record_event(event: dict, write: Callable[[], object]) -> object:
-    """Write chat history and enqueue the same event as one window transaction."""
+    """Write chat history and register the arrival under one window lock."""
     window = history.window(event)
     if window is None or not _mail_candidate(event):
         return write()
-    return context.mailbox(window).record(event, write)
+    with context.window_lock(window):
+        result = write()
+        if result is None:
+            return result
+        message_id = (event.get("message_id") if event.get("post_type") in ("message", "message_sent")
+                      else None)
+        arrival = (oplog.pending_message(window, message_id, event.get("time"),
+                                         event.get("message_seq")) if message_id is not None else None)
+        if arrival is None and message_id is not None and oplog.message_seen(
+                window, message_id, event.get("time"), event.get("message_seq")):
+            from mods import chatlog
+
+            chatlog.consume_origin(event)
+        elif arrival is None:
+            arrival = oplog.arrive(window, event)
+        context.remember_arrival(event, arrival)
+        return result
 
 
 def activation_signal(event: dict) -> bool:
@@ -681,16 +714,19 @@ def capture_chat(event: dict) -> bool:
     window = history.window(event)
     if window is None or not _mail_candidate(event):
         return False
-    box = context.mailbox(window)
-    box.ensure(event)
-    if not matched:
-        return False
-    # 红点就是「未读里有激活元素」。若这一项已经被 reader 读过，激活也已经得到处理，
-    # 不再为了保留旧 trigger 状态额外开一轮；否则只需确保窗口有一个 reader。
-    kind = ("mention" if msgs.is_msg(event) and _reader._addressed(event, msgs.body(event))
-            else "poke" if msgs.is_poke(event) else "wake")
-    if not box.activate(event, kind):
-        return True
+    with context.window_lock(window):
+        arrival = context.event_arrival(event)
+        if not matched:
+            return False
+        if arrival is None:
+            return True
+        pending = next((entry for entry in oplog.unread(window)
+                        if entry["arrival"] == arrival), None)
+        if pending is None or pending["activated"]:
+            return True
+        kind = ("mention" if msgs.is_msg(event) and _reader._addressed(event, msgs.body(event))
+                else "poke" if msgs.is_poke(event) else "wake")
+        oplog.activate(arrival, kind)
     chat()
     return True
 

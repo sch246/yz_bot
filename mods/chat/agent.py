@@ -174,7 +174,7 @@ def _run_agent(model: str | None, turn) -> bool:
     rows = _view.agent_rows(max_tokens, max_events,
                             model=session.model if show_thought else None,
                             show_thought=show_thought, turn=turn)
-    rows.extend(_reader._drain_legacy_results(turn.mail))
+    rows.extend(_reader._drain_legacy_results())
     notice = oplog.deliver_notifications(_chat_root.AGENT_WINDOW)
     if notice is not None:
         session.notification_ids.append(notice["id"])
@@ -188,7 +188,7 @@ def _run_agent(model: str | None, turn) -> bool:
     for entry, projection in rows:
         messages.append(projection)
         _remember_stream(session, projection, entry["id"])
-    if not messages and not turn.requested_reads and not turn.mail.unread():
+    if not messages and not turn.requested_reads:
         return True
     _chat_root._activate_chat(session, _view._close_with_user(messages), read_mail=True)
     for entry, projection in rows:

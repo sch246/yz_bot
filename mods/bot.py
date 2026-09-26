@@ -133,9 +133,8 @@ def _route(event: dict) -> str | None:
         # The prefix and the body chatlog formats are one line of terminal
         # output, so they are one record rather than two racing writes.
         writer = lambda: chatlog.write(event)
-        # Chat history and the matching window-mail entry are one commit.  A
-        # concurrent context rebuild takes the same mailbox lock, so it cannot
-        # observe one without the other.
+        # Chat history and its durable arrival share the window lock. A concurrent
+        # formal reader cannot observe one without the other.
         written = chat.record_event(event, writer) if chat is not None else writer()
         if written is not None:
             body = chatlog.display(written).removesuffix("\n")

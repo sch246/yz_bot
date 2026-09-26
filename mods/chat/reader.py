@@ -114,23 +114,20 @@ def unread_details() -> list[dict]:
     return list(details.values())
 
 
-def _drain_legacy_results(mail: context.Mailbox) -> list[tuple[dict, dict]]:
+def _drain_legacy_results() -> list[tuple[dict, dict]]:
     # WHY: f4d3591 left completed tool batches in the agent mailbox. Drain only
     # those existing arrivals on the next activation; new code writes R directly.
     # Delete this bridge after deployment confirms no old pending arrivals remain.
-    if not mail.unread():
-        return []
-
-    def project(entries: list[context.MailEntry]) -> list[tuple[dict, dict]]:
-        rows = []
-        for entry in entries:
-            values = entry.event["_stream_results"]
-            recorded = oplog.read(entry.arrival) or oplog.result(
-                _chat_root.AGENT_WINDOW, values["source"], values["returns"], entry.arrival)
-            rows.append((recorded, _view._result_projection(recorded, oplog.say_links(_chat_root.AGENT_WINDOW))))
-        return rows
-
-    return mail.pull(len(mail.unread()), project)
+    rows = []
+    for entry in oplog.unread(_chat_root.AGENT_WINDOW):
+        values = entry["event"].get("_stream_results")
+        if values is None:
+            continue
+        recorded = oplog.result(_chat_root.AGENT_WINDOW, values["source"],
+                                values["returns"], entry["arrival"])
+        rows.append((recorded, _view._result_projection(
+            recorded, oplog.say_links(_chat_root.AGENT_WINDOW))))
+    return rows
 
 
 _boot_sources: list[str] = []
@@ -225,15 +222,16 @@ def _take_source_events(window: tuple, source: dict, session: llm.Chat | None,
             return output, f"补回档案位置已丢失：{origin}"
         event["_history_source"] = "napcat_backfill"
         event["_history_seq"] = member.get("message_seq")
-        projected = _formal_input(
-            session, window, event, read_by, read_via, bridge,
-            lambda converted: context.mailbox(window).commit_recovered(
-            member["message_id"], member["time"],
-            lambda arrival: oplog.input_source(_chat_root.AGENT_WINDOW, event, converted, source["key"],
-                                               page_number, offset, origin, window, arrival=arrival,
-                                               mentioned=member.get("mentioned", False),
-                                               read_by=read_by, read_via=read_via),
-            event_seq=member.get("message_seq")), echo=True)
+        with context.window_lock(window):
+            arrival = oplog.pending_message(window, member["message_id"], member["time"],
+                                            member.get("message_seq"))
+            projected = _formal_input(
+                session, window, event, read_by, read_via, bridge,
+                lambda converted: oplog.input_source(
+                    _chat_root.AGENT_WINDOW, event, converted, source["key"],
+                    page_number, offset, origin, window, arrival=arrival,
+                    mentioned=member.get("mentioned", False),
+                    read_by=read_by, read_via=read_via), echo=True)
         if projected is not None:
             output.append(projected)
     return output, None
@@ -636,21 +634,20 @@ def _iter_unread_metadata(source: str):
         sources = _recovery_sources(window)
         if any(item["state"] == "fetching" for item in sources):
             raise ValueError("该窗口离线补回仍在进行")
-        pending = context.mailbox(window).unread()
-        pending_meta = {item["arrival"]: item for item in oplog.unread(window)}
+        pending = oplog.unread(window)
         start = 0
         for item in sources:
             boundary = item["pending_boundary"]
             end = (next((index for index in range(start, len(pending))
-                         if not oplog.arrival_before_or_at(pending[index].arrival, boundary)),
+                         if not oplog.arrival_before_or_at(pending[index]["arrival"], boundary)),
                         len(pending)) if boundary is not None else start)
             for entry in pending[start:end]:
-                yield _live_member(entry, window, pending_meta), entry.event
+                yield _live_member(entry, window), entry["event"]
             for page, offset, member in _source_unread_members(item):
                 yield _source_member(item, window, page, offset, member), None
             start = end
         for entry in pending[start:]:
-            yield _live_member(entry, window, pending_meta), entry.event
+            yield _live_member(entry, window), entry["event"]
     except ValueError:
         state = oplog.resolve_source(source)
         if state is None or state["key"] != source:
@@ -683,13 +680,12 @@ def unread_members(source: str, limit: int | None = None) -> list[dict]:
     return result
 
 
-def _live_member(entry, window, pending_meta) -> dict:
-    pending = pending_meta.get(entry.arrival, {})
-    event = entry.event
-    return {"key": entry.arrival, "arrival": entry.arrival,
-            "window": list(window), "origin": pending.get("origin"),
+def _live_member(entry: dict, window: tuple) -> dict:
+    event = entry["event"]
+    return {"key": entry["arrival"], "arrival": entry["arrival"],
+            "window": list(window), "origin": entry.get("origin"),
             "message_id": event.get("message_id"), "mentioned":
-            pending.get("activation_kind") == "mention"}
+            entry.get("activation_kind") == "mention"}
 
 
 def _source_member(source, window, page, offset, member) -> dict:
@@ -755,105 +751,102 @@ def _mail_message_identity(message_id, event_time, message_seq) -> tuple[str, in
 
 def _mark_source_events_read(window: tuple, source: dict, count: int,
                              read_by: str | None = None) -> tuple[int, int, int]:
-    pending = {}
-    for entry in oplog.unread(window):
-        event = entry["event"]
-        identity = _mail_message_identity(event.get("message_id"), event.get("time"),
-                                          event.get("message_seq"))
-        if identity is not None:
-            pending[identity] = entry["arrival"]
-    arrivals = []
-    positions = []
-    selected = mention_count = 0
-    for page, offset, member in _source_unread_members(source, count):
-        positions.append((page, offset))
-        selected += 1
-        mention_count += bool(member.get("mentioned"))
-        identity = _mail_message_identity(member.get("message_id"), member.get("time"),
-                                          member.get("message_seq"))
-        arrival = pending.get(identity)
-        if arrival is not None and arrival not in arrivals:
-            arrivals.append(arrival)
-    if not selected:
-        return 0, 0, source["remaining"]
-    state = context.mailbox(window).absorb(
-        arrivals,
-        lambda: oplog.mark_source_read(source["key"], positions, mention_count, arrivals, read_by),
-    )
-    return selected, mention_count, state["remaining"]
+    with context.window_lock(window):
+        pending = {}
+        for entry in oplog.unread(window):
+            event = entry["event"]
+            identity = _mail_message_identity(event.get("message_id"), event.get("time"),
+                                              event.get("message_seq"))
+            if identity is not None:
+                pending[identity] = entry["arrival"]
+        arrivals = []
+        positions = []
+        selected = mention_count = 0
+        for page, offset, member in _source_unread_members(source, count):
+            positions.append((page, offset))
+            selected += 1
+            mention_count += bool(member.get("mentioned"))
+            identity = _mail_message_identity(member.get("message_id"), member.get("time"),
+                                              member.get("message_seq"))
+            arrival = pending.get(identity)
+            if arrival is not None and arrival not in arrivals:
+                arrivals.append(arrival)
+        if not selected:
+            return 0, 0, source["remaining"]
+        state = oplog.mark_source_read(source["key"], positions, mention_count, arrivals, read_by)
+        return selected, mention_count, state["remaining"]
 
 
-def _mark_mail_prefix_read(window: tuple, entries: list[context.MailEntry],
-                           read_by: str | None = None) -> tuple[int, int]:
+def _mark_arrival_prefix_read(window: tuple, entries: list[dict],
+                              read_by: str | None = None) -> tuple[int, int]:
     if not entries:
         return 0, 0
-    arrivals = [entry.arrival for entry in entries]
-    pending = {entry["arrival"]: entry for entry in oplog.unread(window)}
-    mentions = sum(pending[arrival].get("activation_kind") == "mention"
-                   for arrival in arrivals)
-
-    def commit(crossed: list[context.MailEntry]) -> int:
-        if [entry.arrival for entry in crossed] != arrivals:
-            raise ValueError("待读队首已变化；未标为已读")
-        return oplog.mark_arrivals_read(window, arrivals, read_by)
-
-    marked = context.mailbox(window).pull(len(entries), commit)
+    arrivals = [entry["arrival"] for entry in entries]
+    mentions = sum(entry.get("activation_kind") == "mention" for entry in entries)
+    marked = oplog.mark_arrivals_read(window, arrivals, read_by)
     return marked, mentions
 
 
 def mark_window_read(window: tuple, count: int | None = None,
                      read_by: str | None = None) -> dict:
     """Mark the current ordered unread prefix as read without creating input events."""
-    sources = _recovery_sources(window)
-    if any(source["state"] == "fetching" for source in sources):
-        raise ValueError("该窗口离线补回仍在进行，未读前端尚未固定")
-    box = context.mailbox(window)
-    through = oplog.latest_pending_arrival(window)
-    frozen_sources = {source["key"]: source["remaining"] for source in sources}
-    budget = count
-    marked = mentions = 0
+    with context.window_lock(window):
+        sources = _recovery_sources(window)
+        if any(source["state"] == "fetching" for source in sources):
+            raise ValueError("该窗口离线补回仍在进行，未读前端尚未固定")
+        through = oplog.latest_pending_arrival(window)
+        frozen_sources = {source["key"]: source["remaining"] for source in sources}
+        marked = mentions = 0
 
-    def allowance(available: int) -> int:
-        return available if budget is None else min(available, budget - marked)
+        def allowance(available: int) -> int:
+            return available if count is None else min(available, count - marked)
 
-    for original in sources:
-        if budget is not None and marked >= budget:
-            break
-        prefix = box.unread_through(original["pending_boundary"], allowance(len(box.unread())))
-        removed, mentioned = _mark_mail_prefix_read(window, prefix, read_by)
-        marked += removed
-        mentions += mentioned
-        if budget is not None and marked >= budget:
-            break
-        state = oplog.resolve_source(original["key"])
-        available = min(state["remaining"], frozen_sources[original["key"]])
-        amount = allowance(available)
-        if amount:
-            removed, mentioned, _remaining = _mark_source_events_read(window, state, amount, read_by)
+        for original in sources:
+            if count is not None and marked >= count:
+                break
+            boundary = original["pending_boundary"]
+            pending = oplog.unread(window)
+            prefix = ([entry for entry in pending
+                       if oplog.arrival_before_or_at(entry["arrival"], boundary)]
+                      if boundary is not None else [])
+            removed, mentioned = _mark_arrival_prefix_read(
+                window, prefix[:allowance(len(prefix))], read_by)
             marked += removed
             mentions += mentioned
-    if budget is None or marked < budget:
-        entries = box.unread()
-        if through is not None:
-            entries = [entry for entry in entries
-                       if oplog.arrival_before_or_at(entry.arrival, through)]
-        entries = entries[:allowance(len(entries))]
-        removed, mentioned = _mark_mail_prefix_read(window, entries, read_by)
-        marked += removed
-        mentions += mentioned
-    return {"marked_read": marked, "mentions": mentions,
-            "remaining": len(box) + sum(oplog.resolve_source(source["key"])["remaining"]
-                                         for source in sources)}
+            if count is not None and marked >= count:
+                break
+            state = oplog.resolve_source(original["key"])
+            available = min(state["remaining"], frozen_sources[original["key"]])
+            amount = allowance(available)
+            if amount:
+                removed, mentioned, _remaining = _mark_source_events_read(
+                    window, state, amount, read_by)
+                marked += removed
+                mentions += mentioned
+        if count is None or marked < count:
+            pending = oplog.unread(window)
+            if through is not None:
+                pending = [entry for entry in pending
+                           if oplog.arrival_before_or_at(entry["arrival"], through)]
+            removed, mentioned = _mark_arrival_prefix_read(
+                window, pending[:allowance(len(pending))], read_by)
+            marked += removed
+            mentions += mentioned
+        return {"marked_read": marked, "mentions": mentions,
+                "remaining": len(oplog.unread(window)) + sum(
+                    oplog.resolve_source(source["key"])["remaining"] for source in sources)}
 
 
 def mark_source_read(source: dict, count: int | None = None,
                      read_by: str | None = None) -> dict:
-    if source["state"] == "fetching":
-        raise ValueError("该信源仍在拉取，未读前端尚未固定")
-    amount = source["remaining"] if count is None else min(count, source["remaining"])
-    marked, mentions, remaining = _mark_source_events_read(tuple(source["window"]), source,
-                                                           amount, read_by)
-    return {"marked_read": marked, "mentions": mentions, "remaining": remaining}
+    window = tuple(source["window"])
+    with context.window_lock(window):
+        source = oplog.resolve_source(source["key"])
+        if source["state"] == "fetching":
+            raise ValueError("该信源仍在拉取，未读前端尚未固定")
+        amount = source["remaining"] if count is None else min(count, source["remaining"])
+        marked, mentions, remaining = _mark_source_events_read(window, source, amount, read_by)
+        return {"marked_read": marked, "mentions": mentions, "remaining": remaining}
 
 
 def _take_members(session: llm.Chat, request: dict) -> tuple[list[dict], str | None]:
@@ -886,24 +879,26 @@ def _take_members(session: llm.Chat, request: dict) -> tuple[list[dict], str | N
             selected.pop(0)
             continue
         arrival = member["arrival"]
-        box = context.mailbox(window)
-        entry = next((item for item in box.unread() if item.arrival == arrival), None)
+        with context.window_lock(window):
+            entry = next((item for item in oplog.unread(window)
+                          if item["arrival"] == arrival), None)
+            if entry is not None:
+                located = {**entry["event"], "_log_origin": entry.get("origin"), "_live": True}
+                # WHY: I is durable before hiding this exact arrival. A provider failure
+                # after request assembly can leave it read but unprocessed; exactly-once
+                # delivery is not promised. The oplog validates this exact arrival.
+                projection = _formal_input(
+                    session, window, located, request.get("read_by"), request.get("read_via"), bridge,
+                    lambda converted: oplog.input(
+                        _chat_root.AGENT_WINDOW, entry["event"], converted, arrival,
+                        source_window=window, read_by=request.get("read_by"),
+                        read_via=request.get("read_via")), echo=True)
         if entry is None:
             selected.pop(0)
             if selected:
                 bridge_plan = _source_bridge_plan(request["source"],
                                                   request.get("last_key", ""), selected)
             continue
-        located = {**entry.event, "_log_origin": oplog.arrival_origin(arrival), "_live": True}
-        # WHY: I is durable before hiding this exact arrival. A provider failure
-        # after request assembly can therefore leave it read but unprocessed;
-        # exactly-once delivery is not promised. Never replace a whole mailbox
-        # snapshot here: a concurrent arrival must remain unread.
-        projection = _formal_input(
-            session, window, located, request.get("read_by"), request.get("read_via"), bridge,
-            lambda converted: box.absorb([arrival], lambda: oplog.input(
-                _chat_root.AGENT_WINDOW, entry.event, converted, arrival, source_window=window,
-                read_by=request.get("read_by"), read_via=request.get("read_via"))), echo=True)
         if projection is not None:
             output.append(projection)
         request["last_key"] = member["key"]
@@ -920,31 +915,31 @@ def _take_archive(session: llm.Chat, request: dict, window: tuple) -> tuple[list
         if not origin:
             return output, "档案记录缺少稳定 origin"
         event = {**record, "_history_source": "archive", "_live": False}
-        arrival = next((item["arrival"] for item in oplog.unread(window)
-                        if item.get("origin") == origin), None)
-        if arrival is None and record.get("message_id") is not None and type(record.get("time")) is int:
-            arrival = oplog.pending_message(window, record["message_id"], record["time"],
-                                            record.get("message_seq"))
-        source_member = next((item for source in oplog.sources()
-                              if tuple(source["window"]) == window and source["state"] != "fetching"
-                              for page, offset, member in _source_unread_members(source)
-                              if member["origin"] == origin
-                              for item in [(source["key"], page, offset,
-                                            bool(member.get("mentioned")))]), None)
-        values = ({"source": source_member[0], "page": source_member[1],
-                   "offset": source_member[2], "mentioned": source_member[3]}
-                  if source_member is not None else {})
-        def commit(converted: dict | None) -> dict:
-            write = lambda: oplog.input_archive(_chat_root.AGENT_WINDOW, record, converted, origin,
-                                                window, arrival=arrival,
-                                                read_by=request.get("read_by"),
-                                                read_via=request.get("read_via"), **values)
-            return (context.mailbox(window).absorb([arrival], write)
-                    if arrival is not None else write())
+        with context.window_lock(window):
+            arrival = next((item["arrival"] for item in oplog.unread(window)
+                            if item.get("origin") == origin), None)
+            if arrival is None and record.get("message_id") is not None and type(record.get("time")) is int:
+                arrival = oplog.pending_message(window, record["message_id"], record["time"],
+                                                record.get("message_seq"))
+            source_member = next((item for source in oplog.sources()
+                                  if tuple(source["window"]) == window and source["state"] != "fetching"
+                                  for page, offset, member in _source_unread_members(source)
+                                  if member["origin"] == origin
+                                  for item in [(source["key"], page, offset,
+                                                bool(member.get("mentioned")))]), None)
+            values = ({"source": source_member[0], "page": source_member[1],
+                       "offset": source_member[2], "mentioned": source_member[3]}
+                      if source_member is not None else {})
 
-        projection = _formal_input(session, window, event, request.get("read_by"),
-                                   request.get("read_via"), None, commit, echo=False,
-                                   skip_unprojectable=True)
+            def commit(converted: dict | None) -> dict:
+                return oplog.input_archive(_chat_root.AGENT_WINDOW, record, converted, origin,
+                                           window, arrival=arrival,
+                                           read_by=request.get("read_by"),
+                                           read_via=request.get("read_via"), **values)
+
+            projection = _formal_input(session, window, event, request.get("read_by"),
+                                       request.get("read_via"), None, commit, echo=False,
+                                       skip_unprojectable=True)
         if projection is not None:
             output.append(projection)
         records.pop(0)
