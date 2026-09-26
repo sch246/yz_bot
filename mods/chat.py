@@ -329,11 +329,16 @@ def parse_target(target: str) -> tuple[str, int]:
 def _unread_detail_text(detail: dict, *, include_wakes: bool = True) -> str:
     window = detail["window"]
     target = ("g" if window[0] == "group" else "u") + str(window[1])
-    sources = ", ".join(
-        f"{item['kind']}"
-        + (f" 作者={item['user_id']}" if item.get("user_id") is not None else "")
-        + f" 时间={item['time']} 未读序号={item['ordinal']}"
-        for item in detail["wake_sources"])
+    sources = ""
+    if include_wakes:
+        # WHY: notification 会持久化当时的 unread 快照；旧快照没有 ordinal，
+        # 而且重建历史通知时本就不展示这份已过期的唤醒位置。
+        sources = ", ".join(
+            f"{item['kind']}"
+            + (f" 作者={item['user_id']}" if item.get("user_id") is not None else "")
+            + f" 时间={item['time']}"
+            + (f" 未读序号={item['ordinal']}" if item.get("ordinal") is not None else "")
+            for item in detail["wake_sources"])
     recovery = detail.get("recovery")
     extra = ((f" 补回未读={recovery['remaining']} 补回状态={recovery['state']}"
               + (f" 缺口={recovery['gap']}" if recovery.get("gap") else ""))
