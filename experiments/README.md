@@ -22,9 +22,9 @@ python experiments/memory_replay.py prepare \
 production Mailbox and oplog without a model or sender. It prints its temporary
 output path; `doctor --output /private/new-directory` selects one explicitly.
 
-`run` uses the production center reader, context assembly, tool binding, FIFO,
-oplog, cover/recall, hint, and default base prompt. It adds one common replay
-task: formally read the frozen FIFO in bounded pieces and organize it, while
+`run` uses the production center reader, context assembly, tool binding,
+ordered unread set, oplog, cover/recall, hint, and default base prompt. It adds one common replay
+task: formally read the frozen unread set in bounded pieces and organize it, while
 leaving the choice of piece size and organization to the model. It also states
 that the history has already happened and cannot be answered or changed. This
 task is shared by every strategy arm; it is not a memory-management strategy.
@@ -34,28 +34,29 @@ rather than becoming a successful chat reply. It requires an explicit two-field
 JSON LLM configuration file outside this repository:
 
 `--strategy baseline` adds nothing beyond that common task. The currently
-available comparison arm, `--strategy progressive-index`, explains that preview
-is not formal reading, that accumulated cover conclusions should themselves be
-organized, and that repeated indexing needs distinct future lookup purposes.
-`--strategy bounded-hierarchy` additionally asks for 20-to-40-event pulls and
+available comparison arm, `--strategy progressive-index`, explains that `status`
+only orients while `mentions` and `read_messages` arrange formal reading. It
+also asks that accumulated cover conclusions be organized, and that repeated
+indexing serve distinct future lookup purposes.
+`--strategy bounded-hierarchy` additionally asks for 20-to-40-event takes and
 for each batch to be organized before another is read, then folds several
 same-level conclusions into a higher node.
-`--strategy grounded-hierarchy` narrows pulls to 16-to-24 events and explicitly
+`--strategy grounded-hierarchy` narrows takes to 16-to-24 events and explicitly
 forbids guessing IDs from numeric continuity; bounded review uses the range
 parameters of `recall_events` directly.
 `--strategy grounded-loop` uses the same grounded IDs but gives each round a
 short priority order: cover new input, otherwise fold several summaries,
-otherwise pull 20 events. It explicitly avoids replaying the whole history in
+otherwise take 20 events. It explicitly avoids replaying the whole history in
 reasoning.
 `--strategy serial-loop` additionally permits only one core action per output,
-so a leaf cover cannot immediately pull another batch and starve parent folding.
+so a leaf cover cannot immediately take another batch and starve parent folding.
 `--strategy serial-loop-reasoning` uses the same instruction but also persists
 completed reasoning with its output until that output is covered. This flag is
 isolated to the experiment and is recorded in `run_manifest.json`; it does not
 change production reasoning storage.
 `--strategy serial-loop-hint` keeps reasoning ephemeral and instead asks the
 model to put only unresolved cross-request decisions in the replaceable hint;
-derivable FIFO or graph state must not be copied there.
+derivable unread or graph state must not be copied there.
 `--strategy serial-loop-checkpoint` makes that behavior observable: it requires
 one initial hint checkpoint, then updates the hint only when the next unresolved
 action changes and caps it at 200 characters.
@@ -112,14 +113,14 @@ and incremental usage; transcript and usage are appended, never overwritten.
 The run creates its own `archive/`, `data/storage/`, `data/event_stream/`, and
 `skills/` under the new output directory, leaving `prepared/` unchanged. Archive
 events enter the real Mailbox in day/time/file order, start unread, and receive
-formal IDs on reading. The production first-read floor is disabled only within
-this offline scope so the beginning of the selected range is not skipped.
+formal IDs on reading. An arranged take without a next model request remains
+unconsumed; it creates no durable input fact and is not part of a checkpoint.
 Model outputs and tool results enter the same oplog; `say` records an intention
 and a simulated echo with a synthetic ID, never calls the QQ sender. No listener,
 NapCat client, Bot boot, or real model call is involved in `doctor`; only `run`
 can call the explicitly configured model.
 
-For safety, the model sees only historical archive/FIFO, cover/recall, Skill
+For safety, the model sees only historical archive/unread members, cover/recall, Skill
 list/load/reload, hint editing, and dry `say`. Skills are copied from checked-in
 Markdown files into the run directory. Skill *writing* is unavailable in this
 baseline because production uses unrestricted host/file/code capabilities for
@@ -139,7 +140,7 @@ implemented by exposing general production file or host access.
 prompt mode, and a salted fingerprint of the supplied window/Bot identity
 before touching runtime state. The manifest contains no plaintext account or
 window IDs or chat content. A process lock prevents simultaneous writers.
-The production oplog rebuilds unread FIFO, formal IDs, cover and tool results;
+The production oplog rebuilds unread members, formal IDs, cover and tool results;
 isolated storage restores hint and active Skills. A killed process or tampered
 run is not a safe checkpoint and is refused.
 

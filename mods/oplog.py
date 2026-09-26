@@ -563,13 +563,20 @@ def _arrival_before_or_at(arrival: str, through: str) -> bool:
 
 
 def _source_snapshot(state: dict) -> dict:
-    return {**state, "window": list(state["window"]),
+    return {**{key: value for key, value in state.items() if key != "read_positions"},
+            "window": list(state["window"]),
             "queue_window": list(state["queue_window"]),
             "page_counts": list(state["page_counts"]),
             "previous_gaps": list(state["previous_gaps"]),
-            "read_positions": set(state["read_positions"]),
             "read_count": len(state["read_positions"]),
             "remaining": state["member_count"] - len(state["read_positions"])}
+
+
+def source_position_read(source: str, page: int, offset: int) -> bool:
+    """Check one derived page-coordinate fact without copying all read positions."""
+    with _lock:
+        _restore()
+        return (page, offset) in _sources[source]["read_positions"]
 
 
 def arrive(window: tuple, event: dict, *, activated: bool = False, origin: str | None = None) -> str:

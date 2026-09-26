@@ -499,26 +499,30 @@ def take(source: str, count: int = _DEFAULT_PULL_COUNT, ids: list[str] | None = 
         return f"count 必须是 1..{chat.MAX_PULL_EVENTS}"
     if ids is not None and (not isinstance(ids, list) or any(not isinstance(key, str) for key in ids)):
         return "ids 必须是稳定成员 key 列表"
-    if sum((bool(ids), bool(arrival), bool(origin), bool(message_id))) > 1:
+    if sum((ids is not None, bool(arrival), bool(origin), bool(message_id))) > 1:
         return "ids、arrival、origin、message_id 只能指定一种"
+    selected = []
     try:
-        members = chat.unread_members(source)
+        if ids is not None or arrival:
+            for key in dict.fromkeys(ids if ids is not None else [arrival]):
+                member = chat._unread_member_by_key(source, key)
+                if member is not None and (not mentions_only or member["mentioned"]):
+                    selected.append(member)
+        else:
+            for member, _event in chat._iter_unread_metadata(source):
+                if mentions_only and not member["mentioned"]:
+                    continue
+                if origin and member["origin"] != origin:
+                    continue
+                if message_id and str(member["message_id"]) != message_id:
+                    continue
+                selected.append(member)
+                if not origin and not message_id and len(selected) >= count:
+                    break
     except ValueError as error:
         return f"未安排正式阅读：{error}"
-    if mentions_only:
-        members = [member for member in members if member["mentioned"]]
-    if ids:
-        wanted = set(ids)
-        members = [member for member in members if member["key"] in wanted]
-    elif arrival:
-        members = [member for member in members if member.get("arrival") == arrival]
-    elif origin:
-        members = [member for member in members if member["origin"] == origin]
-    elif message_id:
-        members = [member for member in members if str(member["message_id"]) == message_id]
-        if len(members) > 1:
-            return "message_id 命中多条，请用 origin 或稳定成员 key 消歧义"
-    selected = members if ids or arrival or origin or message_id else members[:count]
+    if message_id and len(selected) > 1:
+        return "message_id 命中多条，请用 origin 或稳定成员 key 消歧义"
     if not selected:
         return "该信源没有匹配的未读成员；未安排阅读"
     window = tuple(selected[0]["window"])

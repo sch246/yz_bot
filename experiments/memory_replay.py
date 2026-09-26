@@ -20,7 +20,7 @@ from types import MappingProxyType
 
 
 MODEL = "deepseek/deepseek-flash"
-PROMPT_MODE = "production-default-plus-offline-review-task-v2"
+PROMPT_MODE = "production-default-plus-offline-review-task-v3"
 REPOSITORY = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY))
 
@@ -248,79 +248,79 @@ def _ordered_snapshot(output: Path, kind: str, target: int, manifest: dict) -> l
 
 
 OFFLINE_FACT = (
-    "正在离线回看已经发生的历史。本次任务是把这条冻结历史 FIFO 分段正式读完，"
+    "正在离线回看已经发生的历史。本次任务是从这条冻结历史的有序未读集合分段正式阅读，"
     "并在过程中自行整理；如何分段与整理由你自己决定。你不能影响或回复当时的参与者。"
 )
 STRATEGIES = {
     "baseline": "",
     "progressive-index": (
-        "让历史真实进入统一经历流并形成可反查记忆。status、mentions 和 read_messages 只用于定向，不算正式阅读；"
-        "首次定向后，自主选择有界 pull，并在读取新一段、整理、判断继续或暂停之间循环。"
+        "让历史真实进入统一经历流并形成可反查记忆。status 只用于定向；mentions 和 read_messages 都会安排正式阅读。"
+        "状态定向后，自主选择有界 take，并在读取新一段、整理、判断继续或暂停之间循环。"
         "cover 得到的结论若开始并列累积，也要继续递归整理；同一来源只在未来检索入口确实不同"
         "（如人物、话题、任务或反例）时进入多个索引。未读数量本身不是继续读取的理由；"
         "若说不清下一段的用途就暂停，并只用 hint 保存真正未完成的任务或会改变下次行为的自我观察。"
     ),
     "bounded-hierarchy": (
-        "让历史真实进入统一经历流并形成可反查记忆。首次可用一次 status、mentions 或 read_messages 定向；"
-        "之后每次只 pull 20 到 40 条，读完一批先整理，再决定是否读取下一批，不连续囤积多批原文。"
+        "让历史真实进入统一经历流并形成可反查记忆。首次可用一次 status 定向；"
+        "之后每次只 take 20 到 40 条，读完一批先整理，再决定是否读取下一批，不连续囤积多批原文。"
         "cover 结论也是经历：同层结论积累到数个时，把仍值得保留的结论继续收拢成上位节点；"
         "同一来源可在人物、话题、任务或反例等未来入口确实不同时进入多个索引。"
-        "用 hint 保留当前阶段、下一步和会改变后续行为的自我观察，避免忘记进度后重复预览或回复。"
+        "用 hint 保留当前阶段、下一步和会改变后续行为的自我观察，避免忘记进度后重复阅读或回复。"
     ),
     "grounded-hierarchy": (
-        "让历史真实进入统一经历流并形成可反查记忆。首次可用一次 status、mentions 或 read_messages 定向；"
-        "之后每次只 pull 16 到 24 条，读完一批先整理并看到结果，再决定是否读取下一批。"
+        "让历史真实进入统一经历流并形成可反查记忆。首次可用一次 status 定向；"
+        "之后每次只 take 16 到 24 条，读完一批先整理并看到结果，再决定是否读取下一批。"
         "cover 只能填写眼前实际出现过的正式事件号，不要按数字连续性补齐或猜号；需要回看范围时用"
         " recall_events 的 anchor 或 start/end。积累三个左右的同层总结后，覆盖这些总结所在的旧输出事件，把仍值得保留的内容"
         "收拢成上位节点；同一来源可在未来检索入口确实不同时进入多个索引。"
-        "用 hint 保留当前阶段、下一步和会改变后续行为的自我观察，避免忘记进度后重复预览或回复。"
+        "用 hint 保留当前阶段、下一步和会改变后续行为的自我观察，避免忘记进度后重复阅读或回复。"
     ),
     "grounded-loop": (
-        "让历史真实进入统一经历流并形成可反查记忆。首次可用一次 status、mentions 或 read_messages 定向；"
+        "让历史真实进入统一经历流并形成可反查记忆。首次可用一次 status 定向；"
         "之后每轮只按这个顺序决定下一步：眼前有尚未整理的新输入，就立刻用实际出现过的正式号做一次"
         "简洁 cover；否则有三个左右仍并列的同层总结，就覆盖这些总结所在的旧输出事件形成上位节点；"
-        "否则 pull 20 条。不要按编号连续性补齐或猜号，需要回看时才用 recall_events 的范围参数。"
+        "否则 take 20 条。不要按编号连续性补齐或猜号，需要回看时才用 recall_events 的范围参数。"
         "不要在思考里重新复述或重建全部历史，只需简短确认当前属于上述哪种情况并行动。"
         "同一来源可在未来检索入口确实不同时进入多个索引；hint 只在阶段或下一步确实改变时更新。"
     ),
     "serial-loop": (
         "让历史真实进入统一经历流并形成可反查记忆。首次可用一次 status 定向；之后每次输出只执行"
-        "一个核心动作，不要在同一次输出里同时 cover 和 pull。眼前有尚未整理的新输入就用实际出现的"
+        "一个核心动作，不要在同一次输出里同时 cover 和 take。眼前有尚未整理的新输入就用实际出现的"
         "正式号做一次简洁 cover；否则有三个左右仍并列的同层总结，就覆盖这些总结所在的旧输出事件"
-        "形成上位节点；否则 pull 20 条。不要按编号连续性补齐或猜号，需要回看时才用 recall_events 的范围参数。"
+        "形成上位节点；否则 take 20 条。不要按编号连续性补齐或猜号，需要回看时才用 recall_events 的范围参数。"
         "不要在思考里重新复述全部历史；hint 只在阶段或下一步确实改变时更新。"
     ),
     "serial-loop-reasoning": (
         "让历史真实进入统一经历流并形成可反查记忆。首次可用一次 status 定向；之后每次输出只执行"
-        "一个核心动作，不要在同一次输出里同时 cover 和 pull。眼前有尚未整理的新输入就用实际出现的"
+        "一个核心动作，不要在同一次输出里同时 cover 和 take。眼前有尚未整理的新输入就用实际出现的"
         "正式号做一次简洁 cover；否则有三个左右仍并列的同层总结，就覆盖这些总结所在的旧输出事件"
-        "形成上位节点；否则 pull 20 条。不要按编号连续性补齐或猜号，需要回看时才用 recall_events 的范围参数。"
+        "形成上位节点；否则 take 20 条。不要按编号连续性补齐或猜号，需要回看时才用 recall_events 的范围参数。"
         "已完成输出的思考会作为该输出的一部分保留，直到输出被覆盖；把会影响后续行动的判断明确写在"
         "思考或结论中，不要每轮重新推导。hint 只在阶段或下一步确实改变时更新。"
     ),
     "serial-loop-hint": (
         "让历史真实进入统一经历流并形成可反查记忆。首次可用一次 status 定向；之后每次输出只执行"
-        "一个核心动作，不要在同一次输出里同时 cover 和 pull。眼前有尚未整理的新输入就用实际出现的"
+        "一个核心动作，不要在同一次输出里同时 cover 和 take。眼前有尚未整理的新输入就用实际出现的"
         "正式号做一次简洁 cover；否则有三个左右仍并列的同层总结，就覆盖这些总结所在的旧输出事件"
-        "形成上位节点；否则 pull 20 条。不要按编号连续性补齐或猜号，需要回看时才用 recall_events 的范围参数。"
+        "形成上位节点；否则 take 20 条。不要按编号连续性补齐或猜号，需要回看时才用 recall_events 的范围参数。"
         "需要跨请求继续、忘掉后会重新推导的未兑现决定，用 edit_hint 留下足以接续的简短待办；必要时"
         "附相关正式号、阻碍或决定下一步的理由。成功后更新或清空，工具失败时按实际结果修正。"
-        "不要把可查询的未读数、FIFO 游标、全部根或长期摘要复制进 hint；长期证据仍由 cover 保存。"
+        "不要把可查询的未读数、未读坐标、全部根或长期摘要复制进 hint；长期证据仍由 cover 保存。"
     ),
     "serial-loop-checkpoint": (
         "让历史真实进入统一经历流并形成可反查记忆。首次 status 后先用 edit_hint 写下当前目标和下一项"
         "尚未兑现的动作；之后每次请求先读 hint，除非刚收到的实际结果使它失效，否则直接执行而不重新"
-        "推导。每次输出只执行 cover 或 pull 中的一个核心动作；edit_hint 是附带的工作记忆动作，可以"
+        "推导。每次输出只执行 cover 或 take 中的一个核心动作；edit_hint 是附带的工作记忆动作，可以"
         "与核心动作同批调用。眼前有尚未整理的新输入就用实际出现的正式号做一次简洁 cover；否则有"
-        "三个左右仍并列的同层总结，就覆盖这些总结所在的旧输出事件形成上位节点；否则 pull 20 条。"
+        "三个左右仍并列的同层总结，就覆盖这些总结所在的旧输出事件形成上位节点；否则 take 20 条。"
         "只有下一步、阻碍或理由改变时才整体更新 hint，执行完成就删掉对应待办；总长度不超过 200 字。"
-        "不要复制可查询的未读数、FIFO 游标、全部根或长期摘要，不要按编号连续性猜号。"
+        "不要复制可查询的未读数、未读坐标、全部根或长期摘要，不要按编号连续性猜号。"
     ),
     "serial-loop-linked": (
         "让历史真实进入统一经历流并形成可反查记忆。首次可用一次 status 定向；之后每次输出只执行"
-        "一个核心动作，不要在同一次输出里同时 cover 和 pull。眼前有尚未整理的新输入就用实际出现的"
+        "一个核心动作，不要在同一次输出里同时 cover 和 take。眼前有尚未整理的新输入就用实际出现的"
         "正式号做一次简洁 cover；否则有三个左右仍并列的同层总结，就覆盖这些总结所在的旧输出事件"
-        "形成上位节点；否则 pull 20 条。不要按编号连续性补齐或猜号，需要回看时才用 recall_events 的范围参数。"
+        "形成上位节点；否则 take 20 条。不要按编号连续性补齐或猜号，需要回看时才用 recall_events 的范围参数。"
         "每次 cover 的 conclusion 都要把保留的每项事实、印象或话题入口就地标注其直接依据号；叶级"
         "结论引用本批实际输入号，父级结论引用被收拢的旧总结输出号。编号必须紧挨它所支持的语义，"
         "不能只在末尾列一串成员，也不用为未保留的琐碎内容强造条目。没有语义到下一跳的映射就不算"
@@ -330,7 +330,7 @@ STRATEGIES = {
 PERSIST_REASONING_STRATEGIES = frozenset({"serial-loop-reasoning"})
 SAFE_TOOLS = frozenset({
     "list_tools", "load_tools", "reload_tools", "recall_events",
-    "event_links", "cover_events", "say", "status", "mentions", "read_messages", "pull",
+    "event_links", "cover_events", "say", "status", "mentions", "read_messages", "take", "pull",
     "edit_hint",
 })
 
@@ -627,20 +627,9 @@ def _run_locked(prepared: Path, output: Path, kind: str, target: int, bot_id: in
         outbound_names = ("send", "sendmsg", "_send_now")
         original_outbound = {name: getattr(message, name) for name in outbound_names}
         original_call_api = connect.call_api
-        original_begin_turn = context.begin_turn
-        captured_turn = None
-
-        def capture_turn(key):
-            nonlocal captured_turn
-            turn, owner = original_begin_turn(key)
-            if key == oplog.AGENT_WINDOW and owner:
-                captured_turn = turn
-            return turn, owner
-
         for name in outbound_names:
             setattr(message, name, forbidden)
         connect.call_api = forbidden
-        context.begin_turn = capture_turn
         extra = STRATEGIES[strategy]
         replay_prompt = OFFLINE_FACT + (("\n" + extra) if extra else "")
         scope_token = chat._offline_scope.set({"model": MODEL, "fact": replay_prompt,
@@ -656,6 +645,9 @@ def _run_locked(prepared: Path, output: Path, kind: str, target: int, bot_id: in
                     box.add(event)
                 box.activate(ordered[-1])
             try:
+                # WHY: requested_reads lives only for this drive. If a budget stops
+                # before the next provider request, no input fact exists and those
+                # members remain unread for a later replay to choose again.
                 chat._drive_agent(MODEL, window)
             except Exception as error:
                 stop_reason = str(error)
@@ -676,9 +668,6 @@ def _run_locked(prepared: Path, output: Path, kind: str, target: int, bot_id: in
             for name, original in original_outbound.items():
                 setattr(message, name, original)
             connect.call_api = original_call_api
-            context.begin_turn = original_begin_turn
-        if captured_turn is not None and captured_turn.requested_pulls:
-            raise RuntimeError("a requested pull was not committed; checkpoint is unsafe")
         finalize_usage()
         result = {"status": "complete" if stop_reason == "complete" else "stopped",
                   "stop_reason": stop_reason, "events": len(ordered),

@@ -1147,8 +1147,7 @@ def _take_source_events(window: tuple, source: dict, session: llm.Chat | None,
     used = 0
     pages = {}
     for page_number, offset in positions:
-        current = oplog.resolve_source(source["key"])
-        if (current is None or (page_number, offset) in current["read_positions"]):
+        if oplog.source_position_read(source["key"], page_number, offset):
             continue
         members = pages.setdefault(page_number, _source_pages.read_page(
             oplog.source_page_root(), source["key"], page_number))
@@ -1198,7 +1197,7 @@ def _source_unread_members(source: dict, count: int | None = None):
     for page_number in range(source["pages"] - 1, -1, -1):
         members = _source_pages.read_page(oplog.source_page_root(), source["key"], page_number)
         for offset, member in enumerate(members):
-            if (page_number, offset) in source["read_positions"]:
+            if oplog.source_position_read(source["key"], page_number, offset):
                 continue
             yield page_number, offset, member
             yielded += 1
@@ -1206,11 +1205,8 @@ def _source_unread_members(source: dict, count: int | None = None):
                 return
 
 
-def unread_members(source: str) -> list[dict]:
-    """Return detached ordinary unread members for Python selection."""
-    from copy import deepcopy
-    from mods import chatlog
-
+def _iter_unread_metadata(source: str):
+    """Yield stable unread descriptions without opening archive message bodies."""
     try:
         window = parse_target(source)
         sources = _recovery_sources(window)
@@ -1218,21 +1214,19 @@ def unread_members(source: str) -> list[dict]:
             raise ValueError("该窗口离线补回仍在进行")
         pending = context.mailbox(window).unread()
         pending_meta = {item["arrival"]: item for item in oplog.unread(window)}
-        rows = []
         start = 0
         for item in sources:
             boundary = item["pending_boundary"]
-            end = (next((index + 1 for index in range(start, len(pending))
-                         if pending[index].arrival == boundary), start)
-                   if boundary is not None else start)
-            rows.extend(_live_member(entry, window, pending_meta, deepcopy)
-                        for entry in pending[start:end])
-            rows.extend(_source_member(item, window, page, offset, member, chatlog, deepcopy)
-                        for page, offset, member in _source_unread_members(item))
+            end = (next((index for index in range(start, len(pending))
+                         if not oplog.arrival_before_or_at(pending[index].arrival, boundary)),
+                        len(pending)) if boundary is not None else start)
+            for entry in pending[start:end]:
+                yield _live_member(entry, window, pending_meta), entry.event
+            for page, offset, member in _source_unread_members(item):
+                yield _source_member(item, window, page, offset, member), None
             start = end
-        rows.extend(_live_member(entry, window, pending_meta, deepcopy)
-                    for entry in pending[start:])
-        return rows
+        for entry in pending[start:]:
+            yield _live_member(entry, window, pending_meta), entry.event
     except ValueError:
         state = oplog.resolve_source(source)
         if state is None or state["key"] != source:
@@ -1242,27 +1236,84 @@ def unread_members(source: str) -> list[dict]:
         if state["state"] == "fetching":
             raise ValueError("该信源仍在拉取")
         window = tuple(state["window"])
-        return [_source_member(state, window, page, offset, member, chatlog, deepcopy)
-                for page, offset, member in _source_unread_members(state)]
+        for page, offset, member in _source_unread_members(state):
+            yield _source_member(state, window, page, offset, member), None
 
 
-def _live_member(entry, window, pending_meta, deepcopy) -> dict:
+def unread_members(source: str, limit: int | None = None) -> list[dict]:
+    """Return detached unread dicts; use limit to avoid materializing a large source."""
+    from copy import deepcopy
+    from mods import chatlog
+
+    if limit is not None and (type(limit) is not int or limit < 0):
+        raise ValueError("limit 必须是非负整数或 None")
+    result = []
+    for member, live_event in _iter_unread_metadata(source):
+        if limit is not None and len(result) >= limit:
+            break
+        event = (live_event if live_event is not None else
+                 chatlog.read_origin(*member["window"], member["origin"]))
+        if event is None:
+            raise ValueError(f"信源档案位置已丢失：{member['origin']}")
+        result.append({**member, "event": deepcopy(event)})
+    return result
+
+
+def _live_member(entry, window, pending_meta) -> dict:
     pending = pending_meta.get(entry.arrival, {})
-    event = deepcopy(entry.event)
+    event = entry.event
     return {"key": entry.arrival, "arrival": entry.arrival,
             "window": list(window), "origin": pending.get("origin"),
             "message_id": event.get("message_id"), "mentioned":
-            pending.get("activation_kind") == "mention", "event": event}
+            pending.get("activation_kind") == "mention"}
 
 
-def _source_member(source, window, page, offset, member, chatlog, deepcopy) -> dict:
-    event = chatlog.read_origin(*window, member["origin"])
-    if event is None:
-        raise ValueError(f"信源档案位置已丢失：{member['origin']}")
+def _source_member(source, window, page, offset, member) -> dict:
     return {"key": f"{source['key']}:{page}:{offset}", "source": source["key"],
             "page": page, "offset": offset, "window": list(window),
             "origin": member["origin"], "message_id": member["message_id"],
-            "mentioned": bool(member.get("mentioned")), "event": deepcopy(event)}
+            "mentioned": bool(member.get("mentioned"))}
+
+
+def _unread_member_by_key(source: str, key: str) -> dict | None:
+    """Resolve one stable member without scanning or reading other message bodies."""
+    try:
+        window = parse_target(source)
+    except ValueError:
+        named_source = oplog.resolve_source(source)
+        if named_source is None or named_source["key"] != source:
+            raise ValueError("找不到该窗口或信源 key")
+        if named_source["source_type"] == "napcat_boot":
+            raise ValueError("启动补回属于原窗口信源")
+        window = tuple(named_source["window"])
+    else:
+        named_source = None
+        if any(item["state"] == "fetching" for item in _recovery_sources(window)):
+            raise ValueError("该窗口离线补回仍在进行")
+    if ":" in key:
+        source_key, page_text, offset_text = key.rsplit(":", 2)
+        if not page_text.isdecimal() or not offset_text.isdecimal():
+            return None
+        state = oplog.resolve_source(source_key)
+        page, offset = int(page_text), int(offset_text)
+        if (state is None or state["state"] == "fetching"
+                or tuple(state["window"]) != window
+                or (named_source is None and state["source_type"] != "napcat_boot")
+                or (named_source is not None and source_key != named_source["key"])
+                or page >= state["pages"] or offset >= state["page_counts"][page]
+                or oplog.source_position_read(source_key, page, offset)):
+            return None
+        member = _source_pages.read_page(oplog.source_page_root(), source_key, page)[offset]
+        return _source_member(state, window, page, offset, member)
+    if named_source is not None:
+        return None
+    pending = next((item for item in oplog.unread(window) if item["arrival"] == key), None)
+    if pending is None:
+        return None
+    event = pending["event"]
+    return {"key": key, "arrival": key, "window": list(window),
+            "origin": pending.get("origin"), "message_id": event.get("message_id"),
+            "mentioned": pending.get("activation_kind") == "mention"}
 
 
 def _mail_message_identity(message_id, event_time, message_seq) -> tuple[str, int, str | None] | None:
@@ -1385,7 +1436,8 @@ def _take_members(session: llm.Chat, selected: list[dict]) -> tuple[list[dict], 
         window = tuple(member["window"])
         if "source" in member:
             source = oplog.resolve_source(member["source"])
-            if source is None or (member["page"], member["offset"]) in source["read_positions"]:
+            if source is None or oplog.source_position_read(
+                    member["source"], member["page"], member["offset"]):
                 selected.pop(0)
                 continue
             projected, error = _take_source_events(
