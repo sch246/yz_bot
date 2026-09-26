@@ -330,7 +330,9 @@ def _unread_detail_text(detail: dict, *, include_wakes: bool = True) -> str:
     window = detail["window"]
     target = ("g" if window[0] == "group" else "u") + str(window[1])
     sources = ", ".join(
-        f"{item['kind']} 作者={item['user_id']} 时间={item['time']} 未读序号={item['ordinal']}"
+        f"{item['kind']}"
+        + (f" 作者={item['user_id']}" if item.get("user_id") is not None else "")
+        + f" 时间={item['time']} 未读序号={item['ordinal']}"
         for item in detail["wake_sources"])
     recovery = detail.get("recovery")
     extra = ((f" 补回未读={recovery['remaining']} 补回状态={recovery['state']}"
@@ -1185,7 +1187,7 @@ def fetch_remote_source(window: tuple, source_key: str | None = None) -> dict:
 def _take_source_events(window: tuple, source: dict, session: llm.Chat | None,
                         positions: list[tuple[int, int]], budget: int = MAIL_PULL_TOKENS,
                         *, read_by: str | None = None, read_via: str | None = None,
-                        bridge: list[dict] | None = None) -> tuple[list[dict], str | None]:
+                        bridge: dict | None = None) -> tuple[list[dict], str | None]:
     from mods import chatlog
 
     output = []
@@ -1203,7 +1205,8 @@ def _take_source_events(window: tuple, source: dict, session: llm.Chat | None,
             return output, f"补回档案位置已丢失：{origin}"
         event["_history_source"] = "napcat_backfill"
         event["_history_seq"] = member.get("message_seq")
-        converted = _read_projection(_model_event(event, window[0] == "group"), read_by, read_via)
+        original = _model_event(event, window[0] == "group")
+        converted = _read_projection(original, read_by, read_via)
         if converted is not None and bridge:
             converted = _with_bridge(converted, bridge)
         amount = _message_cost(converted) if converted is not None else 0
@@ -1214,13 +1217,14 @@ def _take_source_events(window: tuple, source: dict, session: llm.Chat | None,
                 break
             if converted is None:
                 return [], "补回记录无法投影"
-            excerpt = bounded_excerpt(json.dumps(converted["content"], ensure_ascii=False),
+            excerpt = bounded_excerpt(json.dumps(original["content"], ensure_ascii=False),
                                       max(100, budget - 600))
             target = ("g" if window[0] == "group" else "u") + str(window[1])
             converted = {"role": "user", "content":
                          f"来源窗口={window} origin={origin}；补回消息过长，先读片段：{excerpt}；"
                          f"完整正文可用 read_messages(window={target!r}, origin={origin!r}, "
                          "before=0, after=0) 查阅"}
+            converted = _read_projection(converted, read_by, read_via)
             if _message_cost(converted) > budget - 100:
                 return output, "补回记录超过本次输入预算；未消费"
         recorded = context.mailbox(window).commit_recovered(
@@ -1289,20 +1293,36 @@ def _bridge_member(member: dict) -> dict | None:
     return oplog.arrival_member_provenance(member["arrival"])
 
 
-def _source_bridges(source: str, before_key: str, after_key: str) -> list[dict]:
-    if not before_key:
-        return []
-    crossed = []
-    between = False
+def _source_bridge_plan(source: str, before_key: str, selected: list[dict]) -> dict[str, dict | None]:
+    """Scan source order once for this provider batch; retain only fold endpoints."""
+    keys = {member["key"] for member in selected}
+    if len(keys) == 1 and not before_key:
+        return {next(iter(keys)): None}
+    plan = {}
+    crossed = {"count": 0, "shown": []}
+    active = not before_key
+    first = True
     for member in _all_source_members(source):
-        if member["key"] == before_key:
-            between = True
+        key = member["key"]
+        if key == before_key:
+            active = True
             continue
-        if member["key"] == after_key:
-            return crossed if between else []
-        if between and _bridge_member(member) is not None:
-            crossed.append(member)
-    return []
+        if key in keys:
+            plan[key] = crossed if active and (before_key or not first) and crossed["count"] else None
+            crossed = {"count": 0, "shown": []}
+            active = True
+            first = False
+            if len(plan) == len(keys):
+                break
+        elif active and (before_key or not first) and _bridge_member(member) is not None:
+            crossed["count"] += 1
+            if crossed["count"] <= 5:
+                crossed["shown"].append(member)
+            elif crossed["count"] == 6:
+                crossed["shown"] = [crossed["shown"][0], member]
+            else:
+                crossed["shown"][-1] = member
+    return plan
 
 
 def _bridge_projection(member: dict) -> dict:
@@ -1341,22 +1361,22 @@ def _bridge_projection(member: dict) -> dict:
     if converted is None:
         raise ValueError(f"桥成员无法投影：{member['key']}")
     if provenance["kind"] == "skipped":
-        by = provenance["by"] or ""
-        return _provenance_projection(converted, by, "mark_read", skipped=True)
+        return _provenance_projection(converted, provenance["by"] or "unknown",
+                                      "mark_read", skipped=True)
     recorded = provenance["input"]
     return _numbered(_read_projection(converted, recorded.get("read_by"), recorded.get("read_via")),
                      provenance["input"]["id"])
 
 
-def _with_bridge(converted: dict, bridge: list[dict]) -> dict:
+def _with_bridge(converted: dict, bridge: dict | None) -> dict:
     if not bridge:
         return converted
-    shown = bridge if len(bridge) <= 5 else [bridge[0], bridge[-1]]
+    shown = bridge["shown"]
     parts = [{"type": "text", "text": "<source_bridge>\n"}]
     for index, member in enumerate(shown):
-        if index and len(bridge) > 5:
+        if index and bridge["count"] > 5:
             parts.append({"type": "text", "text":
-                          f"已折叠 {len(bridge) - 2} 条已读/跳过消息\n"})
+                          f"已折叠 {bridge['count'] - 2} 条已读/跳过消息\n"})
         parts.append({"type": "text", "text": f"<source_member key={member['key']!r}>\n"})
         original = _bridge_projection(member)["content"]
         parts.extend(original if isinstance(original, list) else [{"type": "text", "text": original}])
@@ -1599,17 +1619,21 @@ def _take_members(session: llm.Chat, request: dict) -> tuple[list[dict], str | N
     selected = request["members"]
     output = []
     used = 0
+    bridge_plan = _source_bridge_plan(request["source"], request.get("last_key", ""), selected)
     while selected:
         if used >= MAIL_PULL_TOKENS - 400:
             break
         member = selected[0]
         window = tuple(member["window"])
-        bridge = _source_bridges(request["source"], request.get("last_key", ""), member["key"])
+        bridge = bridge_plan.get(member["key"])
         if "source" in member:
             source = oplog.resolve_source(member["source"])
             if source is None or oplog.source_position_read(
                     member["source"], member["page"], member["offset"]):
                 selected.pop(0)
+                if selected:
+                    bridge_plan = _source_bridge_plan(request["source"],
+                                                      request.get("last_key", ""), selected)
                 continue
             projected, error = _take_source_events(
                 window, source, session, [(member["page"], member["offset"])],
@@ -1628,10 +1652,13 @@ def _take_members(session: llm.Chat, request: dict) -> tuple[list[dict], str | N
         entry = next((item for item in box.unread() if item.arrival == arrival), None)
         if entry is None:
             selected.pop(0)
+            if selected:
+                bridge_plan = _source_bridge_plan(request["source"],
+                                                  request.get("last_key", ""), selected)
             continue
         located = {**entry.event, "_log_origin": oplog.arrival_origin(arrival), "_live": True}
-        converted = _read_projection(_model_event(located, window[0] == "group"),
-                                     request.get("read_by"), request.get("read_via"))
+        original = _model_event(located, window[0] == "group")
+        converted = _read_projection(original, request.get("read_by"), request.get("read_via"))
         if converted is not None:
             converted = _with_bridge(converted, bridge)
         amount = _message_cost(converted) if converted is not None else 0
@@ -1640,11 +1667,13 @@ def _take_members(session: llm.Chat, request: dict) -> tuple[list[dict], str | N
                 return output, "来源桥超过本次输入预算；未消费后续成员"
             if output:
                 break
-            excerpt = bounded_excerpt(json.dumps(converted["content"], ensure_ascii=False),
+            excerpt = bounded_excerpt(json.dumps(original["content"], ensure_ascii=False),
                                       MAIL_PULL_TOKENS - 600)
             converted = {"role": "user", "content":
                          f"来源窗口={window} origin={member.get('origin')} arrival={arrival}；"
                          f"消息过长，正式读取片段：{excerpt}；完整正文可用 read_messages 按 origin 再读"}
+            converted = _read_projection(converted, request.get("read_by"),
+                                         request.get("read_via"))
             if _message_cost(converted) > MAIL_PULL_TOKENS - 100:
                 return output, "消息过长且无法投影；未消费"
             amount = _message_cost(converted)
@@ -1678,8 +1707,8 @@ def _take_archive(session: llm.Chat, request: dict, window: tuple) -> tuple[list
         if not origin:
             return output, "档案记录缺少稳定 origin"
         event = {**record, "_history_source": "archive", "_live": False}
-        converted = _read_projection(_model_event(event, window[0] == "group"),
-                                     request.get("read_by"), request.get("read_via"))
+        original = _model_event(event, window[0] == "group")
+        converted = _read_projection(original, request.get("read_by"), request.get("read_via"))
         if converted is None:
             records.pop(0)
             continue
@@ -1687,10 +1716,12 @@ def _take_archive(session: llm.Chat, request: dict, window: tuple) -> tuple[list
         if used + amount > MAIL_PULL_TOKENS - 300:
             if output:
                 break
-            excerpt = bounded_excerpt(json.dumps(converted["content"], ensure_ascii=False),
+            excerpt = bounded_excerpt(json.dumps(original["content"], ensure_ascii=False),
                                       MAIL_PULL_TOKENS - 600)
             converted = {"role": "user", "content":
                          f"来源窗口={window} origin={origin}；档案消息过长，正式读取片段：{excerpt}"}
+            converted = _read_projection(converted, request.get("read_by"),
+                                         request.get("read_via"))
             amount = _message_cost(converted)
             if amount > MAIL_PULL_TOKENS - 100:
                 return output, "档案记录过长且无法投影；未消费"
@@ -2026,7 +2057,13 @@ def _agent_provider(turn, session: llm.Chat):
                 if error:
                     if _offline_scope.get() is not None:
                         raise llm.RequiredContextError(f"离线回放读取失败：{error}")
-                    produced.append({"role": "user", "content": f"{window} 正式阅读失败：{error}"})
+                    remaining = request.get("members") or request.get("records") or []
+                    produced.append({"role": "user", "content":
+                                     f"[{request.get('read_by') or '旧版读取'}] {window} 正式阅读部分失败："
+                                     f"本次已兑现 {len(pulled)} 条，"
+                                     f"尚未兑现 {len(remaining)} 条；{error}。"
+                                     "原计划停止，未兑现成员仍未读；请重新调用 take 选择较窄范围，"
+                                     "或用 read_messages 查档案。"})
             turn._chat_usage_tokens = sum(
                 _message_cost(message) for message in [*session.messages, *produced]
                 if _stream_id(session, message) is not None

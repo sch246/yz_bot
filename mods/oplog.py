@@ -853,21 +853,6 @@ def pending_summary() -> list[tuple[tuple, int, bool]]:
         return [(window, count, active) for window, (count, active) in counts.items()]
 
 
-def _pending_detail(window: tuple, through: str | None = None) -> dict:
-    rows = [(entry["arrival"], entry) for entry in _ordered_pending(window)
-            if through is None or _arrival_before_or_at(entry["arrival"], through)]
-    wakes = [(ordinal, entry) for ordinal, (_arrival, entry) in enumerate(rows, 1)
-             if entry.get("activated")]
-    return {"window": list(window), "unread": len(rows), "ordinary": len(rows) - len(wakes),
-            "mentions": sum(entry.get("activation_kind") == "mention" for entry in wakes),
-            "other_wakes": sum(entry.get("activation_kind") != "mention" for entry in wakes),
-            "wake_sources": [{"kind": entry.get("activation_kind", "wake"),
-                              "user_id": entry["event"].get("user_id"),
-                              "time": entry["event"].get("time"),
-                              "ordinal": ordinal}
-                             for ordinal, entry in wakes[-3:]]}
-
-
 def pending_details() -> list[dict]:
     """Unread window counts and wake metadata, never unread bodies."""
     with _lock:
