@@ -23,7 +23,7 @@ LOAD_AFTER = ("history", "identity", "image", "llm", "oplog", "storage")
 IMAGE_MODES = ("off", "lazy", "eager")
 IMAGE_MODE_ALIASES = {"0": "off", "1": "lazy", "2": "eager"}
 
-# WHY: 中心 keep 保留原生思考直到 cover 或历史预算淘汰；drop 以无思考的
+# WHY: 中心 keep 保留原生思考直到 cover；drop 以无思考的
 # 文本投影省 token。独立 .chat 的 keep/drop 仍只影响本轮工具循环。
 REASONING_MODES = ("keep", "drop")
 REASONING_ALIASES = {"on": "keep", "off": "drop", "1": "keep", "0": "drop"}
@@ -40,14 +40,13 @@ chat_groups: list = []
 description_cache: dict = {}
 llm_config: dict = {}
 # WHY: 两个上限的默认值写死在这里，不再读 llm_system/config.json；运行期由全局
-# agent storage 覆盖。事件条数只防大量极短事件挤占注意力，token 才是主要预算：20 条会让
-# 密集工具循环过早忘掉刚做过的决定，500 条让模型有机会自行覆盖，40000 token 则保留明确
-# 的成本与注意力边界。独立 `.chat` 沿用同一缺省，但旧窗口覆盖仍原样保留。
+# agent storage 覆盖。两个值只在首次激活或显式重置时决定起点；此后不自动遗忘。
+# 500 条避免极短事件挤占首次视野，40000 token 是自主压缩的信号。独立 `.chat`
+# 沿用同一缺省及原有窗口裁剪，旧窗口覆盖仍原样保留。
 DEFAULT_MAX_EVENTS = 500
 DEFAULT_MAX_TOKEN = 40000
 AGENT_WINDOW = oplog.AGENT_WINDOW
 MAX_PULL_EVENTS = 500
-MAIL_PULL_TOKENS = 4000
 NOTICE_TOKENS = 500
 _PRESSURE_PERCENT = 75
 _cost_lock = threading.Lock()
@@ -377,8 +376,8 @@ def get_handler(session: llm.Chat):
     """The per-chunk sink: self-talk to the terminal, cost to the ledger.
 
     WHY: 模型写在回复正文里的内容**不发进聊天**。发言仍只能调用 `say`（见
-    `tools/meta.py`）；正文是自己的输出轨迹，会随正式输出事件跨轮重建，直到被覆盖或
-    超出上下文预算。这样模型能记得刚才的计划，但不会把自言自语误当成已发送消息。
+    `tools/meta.py`）；正文是自己的输出轨迹，会随正式输出事件跨轮重建，直到被覆盖。
+    这样模型能记得刚才的计划，但不会把自言自语误当成已发送消息。
 
     WHY: 但它要打到终端。人得看得见模型在想什么，尤其是在它**忘了调 `say`**的时候——那
     种轮对聊天窗口是完全静默的，终端这一行是唯一的痕迹。用 msg 流而不是另开一个，是为了

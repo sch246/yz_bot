@@ -206,13 +206,12 @@ def fetch_remote_source(window: tuple, source_key: str | None = None) -> dict:
 
 
 def _take_source_events(window: tuple, source: dict, session: llm.Chat | None,
-                        positions: list[tuple[int, int]], budget: int = _chat_root.MAIL_PULL_TOKENS,
+                        positions: list[tuple[int, int]],
                         *, read_by: str | None = None, read_via: str | None = None,
                         bridge: dict | None = None) -> tuple[list[dict], str | None]:
     from mods import chatlog
 
     output = []
-    used = 0
     pages = {}
     for page_number, offset in positions:
         if oplog.source_position_read(source["key"], page_number, offset):
@@ -226,43 +225,40 @@ def _take_source_events(window: tuple, source: dict, session: llm.Chat | None,
             return output, f"补回档案位置已丢失：{origin}"
         event["_history_source"] = "napcat_backfill"
         event["_history_seq"] = member.get("message_seq")
-        original = _view._model_event(event, window[0] == "group")
-        converted = _view._read_projection(original, read_by, read_via)
-        if converted is not None and bridge:
-            converted = _with_bridge(converted, bridge)
-        amount = _view._message_cost(converted) if converted is not None else 0
-        if used + amount > budget - 300:
-            if bridge:
-                return output, "来源桥超过本次输入预算；未消费后续成员"
-            if output:
-                break
-            if converted is None:
-                return [], "补回记录无法投影"
-            excerpt = _chat_root.bounded_excerpt(json.dumps(original["content"], ensure_ascii=False),
-                                      max(100, budget - 600))
-            target = ("g" if window[0] == "group" else "u") + str(window[1])
-            converted = {"role": "user", "content":
-                         f"来源窗口={window} origin={origin}；补回消息过长，先读片段：{excerpt}；"
-                         f"完整正文可用 read_messages(window={target!r}, origin={origin!r}, "
-                         "before=0, after=0) 查阅"}
-            converted = _view._read_projection(converted, read_by, read_via)
-            if _view._message_cost(converted) > budget - 100:
-                return output, "补回记录超过本次输入预算；未消费"
-        recorded = context.mailbox(window).commit_recovered(
+        projected = _formal_input(
+            session, window, event, read_by, read_via, bridge,
+            lambda converted: context.mailbox(window).commit_recovered(
             member["message_id"], member["time"],
             lambda arrival: oplog.input_source(_chat_root.AGENT_WINDOW, event, converted, source["key"],
                                                page_number, offset, origin, window, arrival=arrival,
                                                mentioned=member.get("mentioned", False),
                                                read_by=read_by, read_via=read_via),
-            event_seq=member.get("message_seq"))
-        if converted is not None:
-            projected = _view._echo_relation(_view._numbered(converted, recorded["id"]), recorded,
-                                       oplog.say_links(_chat_root.AGENT_WINDOW))
+            event_seq=member.get("message_seq")), echo=True)
+        if projected is not None:
             output.append(projected)
-            if session is not None:
-                _agent._remember_stream(session, projected, recorded["id"])
-        used += _view._message_cost(converted) if converted is not None else 0
     return output, None
+
+
+def _formal_input(session: llm.Chat | None, window: tuple, event: dict,
+                  read_by: str | None, read_via: str | None, bridge: dict | None,
+                  commit: Callable[[dict | None], dict], *, echo: bool,
+                  skip_unprojectable: bool = False) -> dict | None:
+    converted = _view._read_projection(_view._model_event(event, window[0] == "group"),
+                                       read_by, read_via)
+    if converted is None and skip_unprojectable:
+        return None
+    if converted is not None and bridge:
+        converted = _with_bridge(converted, bridge)
+    recorded = commit(converted)
+    if converted is None:
+        return None
+    projection = _view._numbered(converted, recorded["id"])
+    if echo:
+        projection = _view._echo_relation(projection, recorded,
+                                          oplog.say_links(_chat_root.AGENT_WINDOW))
+    if session is not None:
+        _agent._remember_stream(session, projection, recorded["id"])
+    return projection
 
 
 def _source_unread_members(source: dict, count: int | None = None):
@@ -353,10 +349,7 @@ def _bridge_projection(member: dict) -> dict:
     if provenance["kind"] == "read":
         recorded = provenance["input"]
         converted = recorded.get("projection")
-        excerpt = (converted is not None and isinstance(converted["content"], str)
-                   and ("正式读取片段" in converted["content"]
-                        or "补回消息过长，先读片段" in converted["content"]))
-        if converted is not None and not excerpt:
+        if converted is not None:
             content = converted["content"]
             if (isinstance(content, list) and content
                     and content[0].get("text") == "<source_bridge>\n"):
@@ -639,11 +632,8 @@ def _take_members(session: llm.Chat, request: dict) -> tuple[list[dict], str | N
     """Commit selected members one by one before projecting the next request."""
     selected = request["members"]
     output = []
-    used = 0
     bridge_plan = _source_bridge_plan(request["source"], request.get("last_key", ""), selected)
     while selected:
-        if used >= _chat_root.MAIL_PULL_TOKENS - 400:
-            break
         member = selected[0]
         window = tuple(member["window"])
         bridge = bridge_plan.get(member["key"])
@@ -658,12 +648,11 @@ def _take_members(session: llm.Chat, request: dict) -> tuple[list[dict], str | N
                 continue
             projected, error = _take_source_events(
                 window, source, session, [(member["page"], member["offset"])],
-                _chat_root.MAIL_PULL_TOKENS - used, read_by=request.get("read_by"),
+                read_by=request.get("read_by"),
                 read_via=request.get("read_via"), bridge=bridge)
             if error:
                 return output, error
             output.extend(projected)
-            used += sum(_view._message_cost(item) for item in projected)
             if projected:
                 request["last_key"] = member["key"]
             selected.pop(0)
@@ -678,39 +667,17 @@ def _take_members(session: llm.Chat, request: dict) -> tuple[list[dict], str | N
                                                   request.get("last_key", ""), selected)
             continue
         located = {**entry.event, "_log_origin": oplog.arrival_origin(arrival), "_live": True}
-        original = _view._model_event(located, window[0] == "group")
-        converted = _view._read_projection(original, request.get("read_by"), request.get("read_via"))
-        if converted is not None:
-            converted = _with_bridge(converted, bridge)
-        amount = _view._message_cost(converted) if converted is not None else 0
-        if converted is not None and used + amount > _chat_root.MAIL_PULL_TOKENS - 300:
-            if bridge:
-                return output, "来源桥超过本次输入预算；未消费后续成员"
-            if output:
-                break
-            excerpt = _chat_root.bounded_excerpt(json.dumps(original["content"], ensure_ascii=False),
-                                      _chat_root.MAIL_PULL_TOKENS - 600)
-            converted = {"role": "user", "content":
-                         f"来源窗口={window} origin={member.get('origin')} arrival={arrival}；"
-                         f"消息过长，正式读取片段：{excerpt}；完整正文可用 read_messages 按 origin 再读"}
-            converted = _view._read_projection(converted, request.get("read_by"),
-                                         request.get("read_via"))
-            if _view._message_cost(converted) > _chat_root.MAIL_PULL_TOKENS - 100:
-                return output, "消息过长且无法投影；未消费"
-            amount = _view._message_cost(converted)
         # WHY: I is durable before hiding this exact arrival. A provider failure
         # after request assembly can therefore leave it read but unprocessed;
         # exactly-once delivery is not promised. Never replace a whole mailbox
         # snapshot here: a concurrent arrival must remain unread.
-        recorded = box.absorb([arrival], lambda: oplog.input(
-            _chat_root.AGENT_WINDOW, entry.event, converted, arrival, source_window=window,
-            read_by=request.get("read_by"), read_via=request.get("read_via")))
-        if converted is not None:
-            projection = _view._echo_relation(_view._numbered(converted, recorded["id"]), recorded,
-                                        oplog.say_links(_chat_root.AGENT_WINDOW))
+        projection = _formal_input(
+            session, window, located, request.get("read_by"), request.get("read_via"), bridge,
+            lambda converted: box.absorb([arrival], lambda: oplog.input(
+                _chat_root.AGENT_WINDOW, entry.event, converted, arrival, source_window=window,
+                read_by=request.get("read_by"), read_via=request.get("read_via"))), echo=True)
+        if projection is not None:
             output.append(projection)
-            _agent._remember_stream(session, projection, recorded["id"])
-        used += amount
         request["last_key"] = member["key"]
         selected.pop(0)
     return output, None
@@ -719,33 +686,12 @@ def _take_members(session: llm.Chat, request: dict) -> tuple[list[dict], str | N
 def _take_archive(session: llm.Chat, request: dict, window: tuple) -> tuple[list[dict], str | None]:
     records = request["records"]
     output = []
-    used = 0
     while records:
-        if used >= _chat_root.MAIL_PULL_TOKENS - 400:
-            break
         record = records[0]
         origin = record.get("_log_origin")
         if not origin:
             return output, "档案记录缺少稳定 origin"
         event = {**record, "_history_source": "archive", "_live": False}
-        original = _view._model_event(event, window[0] == "group")
-        converted = _view._read_projection(original, request.get("read_by"), request.get("read_via"))
-        if converted is None:
-            records.pop(0)
-            continue
-        amount = _view._message_cost(converted)
-        if used + amount > _chat_root.MAIL_PULL_TOKENS - 300:
-            if output:
-                break
-            excerpt = _chat_root.bounded_excerpt(json.dumps(original["content"], ensure_ascii=False),
-                                      _chat_root.MAIL_PULL_TOKENS - 600)
-            converted = {"role": "user", "content":
-                         f"来源窗口={window} origin={origin}；档案消息过长，正式读取片段：{excerpt}"}
-            converted = _view._read_projection(converted, request.get("read_by"),
-                                         request.get("read_via"))
-            amount = _view._message_cost(converted)
-            if amount > _chat_root.MAIL_PULL_TOKENS - 100:
-                return output, "档案记录过长且无法投影；未消费"
         arrival = next((item["arrival"] for item in oplog.unread(window)
                         if item.get("origin") == origin), None)
         if arrival is None and record.get("message_id") is not None and type(record.get("time")) is int:
@@ -760,15 +706,18 @@ def _take_archive(session: llm.Chat, request: dict, window: tuple) -> tuple[list
         values = ({"source": source_member[0], "page": source_member[1],
                    "offset": source_member[2], "mentioned": source_member[3]}
                   if source_member is not None else {})
-        commit = lambda: oplog.input_archive(_chat_root.AGENT_WINDOW, record, converted, origin,
-                                             window, arrival=arrival,
-                                             read_by=request.get("read_by"),
-                                             read_via=request.get("read_via"), **values)
-        recorded = (context.mailbox(window).absorb([arrival], commit)
-                    if arrival is not None else commit())
-        projection = _view._numbered(converted, recorded["id"])
-        output.append(projection)
-        _agent._remember_stream(session, projection, recorded["id"])
-        used += amount
+        def commit(converted: dict | None) -> dict:
+            write = lambda: oplog.input_archive(_chat_root.AGENT_WINDOW, record, converted, origin,
+                                                window, arrival=arrival,
+                                                read_by=request.get("read_by"),
+                                                read_via=request.get("read_via"), **values)
+            return (context.mailbox(window).absorb([arrival], write)
+                    if arrival is not None else write())
+
+        projection = _formal_input(session, window, event, request.get("read_by"),
+                                   request.get("read_via"), None, commit, echo=False,
+                                   skip_unprojectable=True)
+        if projection is not None:
+            output.append(projection)
         records.pop(0)
     return output, None

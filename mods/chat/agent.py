@@ -102,6 +102,9 @@ def _visible_stream_ids(messages: list[dict]) -> set[str]:
 
 
 def _pressure_hint(used_tokens: int, max_tokens: int, threshold: int) -> str:
+    if used_tokens >= max_tokens:
+        return (f"上下文占用 {used_tokens}/{max_tokens} token；"
+                "请先用 cover_events 压缩已读经历，再做别的事。")
     if used_tokens * 100 <= max_tokens * threshold:
         return ""
     return f"上下文占用 {used_tokens}/{max_tokens} token"
@@ -166,16 +169,11 @@ def _run_agent(model: str | None, turn) -> bool:
     max_events, max_tokens = _chat_root.limit()
     turn._chat_limit = (max_events, max_tokens)
     show_thought = _chat_root.get_reasoning_mode() == "keep"
-    # WHY: 离线回放从空种子开始，正式读到的内容只能由模型 cover；若每次重建 Chat
-    # 仍取近期后缀，实验会被滑窗偷偷救活，测到的就不是自主整理。生产路径继续使用两个
-    # 上限，只有显式 offline scope 投影全部仍可见事件，直到模型整理或真实请求失败。
-    rows, _used, _blocked = _view._stream_rows(
-        _chat_root.AGENT_WINDOW,
-        None if offline is not None else max_tokens,
-        None if offline is not None else max_events,
-        native_model=session.model if show_thought else None,
-        show_thought=show_thought,
-    )
+    # WHY: 上限只在首次激活或手动重置时固定历史起点；之后不滑窗。即使起点
+    # 对应事件后来被 cover，仍沿用原位置，模型须自己压缩而不能靠自动遗忘。
+    rows = _view.agent_rows(max_tokens, max_events,
+                            model=session.model if show_thought else None,
+                            show_thought=show_thought, turn=turn)
     rows.extend(_reader._drain_legacy_results(turn.mail))
     notice = oplog.deliver_notifications(_chat_root.AGENT_WINDOW)
     if notice is not None:
@@ -251,9 +249,8 @@ def _agent_provider(turn, session: llm.Chat):
                 projection = _view._notification_projection(notice)
                 produced.append(projection)
                 _remember_stream(session, projection, notice["id"])
-            # WHY: 已完成结果不会饿死显式 take；同一边界先交付结果与通知，
-            # 再按登记顺序兑现至多一个 take。
-            if turn.requested_reads:
+            # WHY: 同一请求边界先交付完整 R 与新通知，再按安排顺序兑现本批全部读取。
+            while turn.requested_reads:
                 request = turn.requested_reads.pop(0)
                 window = tuple(request["window"])
                 turn.associated_windows.add(window)
@@ -262,8 +259,6 @@ def _agent_provider(turn, session: llm.Chat):
                 else:
                     pulled, error = _reader._take_members(session, request)
                 produced.extend(pulled)
-                if error is None and (request.get("members") or request.get("records")):
-                    turn.requested_reads.insert(0, request)
                 if error:
                     if _chat_root._offline_scope.get() is not None:
                         raise llm.RequiredContextError(f"离线回放读取失败：{error}")
@@ -273,7 +268,7 @@ def _agent_provider(turn, session: llm.Chat):
                                      f"{window} 正式阅读部分失败："
                                      f"本次已兑现 {len(pulled)} 条，"
                                      f"尚未兑现 {len(remaining)} 条；{error}。"
-                                     "原计划停止，未兑现成员仍未读；请重新调用 take 选择较窄范围，"
+                                     "原计划停止，未兑现成员仍未读；请重新选择，"
                                      "或用 read_messages 查档案。"})
             turn._chat_usage_tokens = sum(
                 _view._message_cost(message) for message in [*session.messages, *produced]

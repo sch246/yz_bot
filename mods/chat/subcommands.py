@@ -25,7 +25,7 @@ _SUBCOMMAND_HELP = (
     ("model <selection>", "查看指定模型信息"),
     ("models", "列出当前供应商的模型（优先在线列表）"),
     ("use_model [selection]", "设置或重置当前模型"),
-    ("agent [model|use_model|limit|use_setting|ops]", "查看或设置中心 agent 的全局模型、预算、设定与操作记录（管理员）；旧窗口覆盖不自动并入"),
+    ("agent [model|use_model|limit|reset_start|use_setting|ops]", "查看或设置中心 agent 的全局模型、预算、设定与操作记录（管理员）；reset_start 在下一次激活时重选历史起点"),
     ("prompt", "查看当前提示词"),
     ("add_prompt [count|list]", "追加聊天或给定提示词"),
     ("setting [name]", "列出或查看设定"),
@@ -38,7 +38,7 @@ _SUBCOMMAND_HELP = (
     ("limit [<事件数> <token> [提醒百分比]|reset]", """查看或设置中心 agent 的全局可见事件数、上下文 token 上限与提醒阈值（管理员）。
 
 格式：#limit | #limit <事件数> <token> [提醒百分比] | #limit reset
-两个上限共同裁剪中心 agent 近期已读的输入、输出与工具返回；提醒百分比只决定模型末尾何时显示上下文 token 用量（已用/上限），不改变显示格式。默认值分别为 500、40000、75%。
+两个上限只在首次激活或 #agent reset_start 后决定历史起点；之后不自动裁剪。提醒百分比决定模型末尾何时显示上下文 token 用量（已用/上限），达到 token 上限时要求先压缩。默认值分别为 500、40000、75%。
 #limit                  显示全局两个上限和提醒百分比，并标出值来自全局覆盖还是默认
 #limit <事件数> <token> [提醒百分比] 写入全局上限；省略百分比则保留原设置
 #limit reset            清掉全局上限与提醒百分比，回落到默认
@@ -283,6 +283,10 @@ def _agent_subcommand(tail: str) -> str:
                 f"image: {_chat_root.get_image_mode(data)}\nreasoning: {_chat_root.get_reasoning_mode(data)}\n"
                 f"tools: {_chat_root.get_tools_mode(data)}\nprompt: {data.get('prompt', '(默认)')}")
     verb, *arguments = parts
+    if verb == "reset_start" and not arguments:
+        data.pop("history_start", None)
+        storage.save()
+        return "已安排在下一次激活时重选中心历史起点"
     if verb == "use_model" and len(arguments) <= 1:
         if arguments:
             try:
@@ -315,7 +319,7 @@ def _agent_subcommand(tail: str) -> str:
             return "设置值不受支持"
         data[verb] = choice
     else:
-        return "用法：#agent [use_model [selection]|limit <events> <tokens> [提醒百分比]|use_setting [name]|image/reasoning/tools <mode>|ops [clear]]"
+        return "用法：#agent [use_model [selection]|limit <events> <tokens> [提醒百分比]|reset_start|use_setting [name]|image/reasoning/tools <mode>|ops [clear]]"
     storage.save()
     return _agent_subcommand("")
 

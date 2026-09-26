@@ -1,6 +1,6 @@
 '''指导模型增删查改统一工具与 Skill 模块，并说明 last-good、显式应用和当前会话激活原理。
 
-同一模型输出的多个工具调用按顺序执行，却看不到彼此结果；整批完成后立即成为一个正式 result R，正常下一子请求完整读取，不按工具拆分或自动分页。若 `say(final_call=true)` 结束、请求取消或失败，不会只为结果强迫续轮；下次激活按普通历史预算看到 R，需要全文可用 `recall_events`。`take` 是未读消息正式阅读的主名，`pull` 仅为前缀别名；`mentions` 是提及筛选别名。`read_messages` 选中的档案消息也在下一请求作为正式 input 阅读；`recall_events` 仍同步返回旧经历，不消费未读。
+同一模型输出的多个工具调用按顺序执行，却看不到彼此结果；整批完成后立即成为一个正式 result R，正常下一子请求完整读取，不按工具拆分或自动分页。若 `say(final_call=true)` 结束、请求取消或失败，不会只为结果强迫续轮；下次激活从固定历史起点重建 R，需要全文可用 `recall_events`。`take` 是未读消息正式阅读的主名，`pull` 仅为前缀别名；`mentions` 是提及筛选别名。`read_messages` 选中的档案消息也在下一请求作为正式 input 阅读；`recall_events` 仍同步返回旧经历，不消费未读。
 
 ## 直接执行 Python
 
@@ -117,9 +117,9 @@ Skill 也是可编辑的长期笔记：把可重复使用的经验、做法、�
 
 结论写在 `conclusion` 参数里就够了，工具不会把它再返回一遍：这次调用本身留在上下文里，参数里的结论就是它的记录。
 
-已读消息和输出也能总结：中心会话调用 `cover_events(["20260923-4", "20260923-5"], "结论")`，参数用的是上文方括号里的正式事件号，不是 QQ `message_id` 或行动位置。也可用 `cover_events(ids=[], conclusion="结论", anchor="20260923-4", before=2, after=3, kinds="input,result")`，或用 `start`／`end` 指定含端点的区间。覆盖范围没有条数上限；先从唯一已读顺序取原始种子，再筛选种类和来源，不按命中数补足。输出、整批返回、已确认的 `say`／回声是强绑定闭包，实际覆盖成员可能越过范围和筛选条件。闭包里有任一成员不可覆盖，整次失败，不丢掉那个成员后继续。覆盖使成员从本轮和后续自动上下文中消失；原号可用 `recall_events` 反查而不解除覆盖，反查总结会显示实际冻结的所有成员，不只是你传入的号。中心会话可跨窗口点名已读或反查过的旧号；未读成员不会被补进覆盖。摘要与聊天消息、输出、返回一样占历史事件数和 token 预算；私有 `.chat` 和子代理不能替中心会话写覆盖。
+已读消息和输出也能总结：中心会话调用 `cover_events(["20260923-4", "20260923-5"], "结论")`，参数用的是上文方括号里的正式事件号，不是 QQ `message_id` 或行动位置。也可用 `cover_events(ids=[], conclusion="结论", anchor="20260923-4", before=2, after=3, kinds="input,result")`，或用 `start`／`end` 指定含端点的区间。覆盖范围没有条数上限；先从唯一已读顺序取原始种子，再筛选种类和来源，不按命中数补足。输出、整批返回、已确认的 `say`／回声是强绑定闭包，实际覆盖成员可能越过范围和筛选条件。闭包里有任一成员不可覆盖，整次失败，不丢掉那个成员后继续。覆盖使成员从本轮和后续自动上下文中消失；原号可用 `recall_events` 反查而不解除覆盖，反查总结会显示实际冻结的所有成员，不只是你传入的号。中心会话可跨窗口点名已读或反查过的旧号；未读成员不会被补进覆盖。摘要与聊天消息、输出、返回一样属于已读历史；上限只决定首次历史起点，之后须主动压缩；私有 `.chat` 和子代理不能替中心会话写覆盖。
 
-眼前历史只是全局已读信息流按事件数和 token 选出的可见部分，不是完整记录。新消息先留在有名字的有序未读信源；通知是创建时快照，尾部 hint 显示当前未读提及的时间和未读序号。`status(source)` 看数量与缺口，`take(source, start=1, count=8)` 在工具执行时按当前未读成员序号选连续范围，已读/跳过不计数；`ids`、`arrival`、`origin`、`message_id` 是高级精确入口。`mentions(source)` 正式消费至多 500 条未读提及，不是只看通知；`pull(source, count)` 是前缀别名。正式 input 保留自己的号，并记录发起输出 `read_by` 和实际工具 `read_via`；来源顺序中跨过的已读/跳过桥附在本次新 input 内，已读桥保留旧正式号，跳过桥显示 `skipped_by` 而没有旧 input 号。`mark_read(source)` 把调用时已有的成员跳过，不伪造 input；`fetch(source)` 从 NapCat 向旧端补取。通知已看见不等于消息已读；红点本身不会反复启动你，只有后来出现新唤醒时才再次叫你。窗口名是 `g<群号>` 或 `u<私聊对端号>`，主动 fetch 的旧档有自己的信源 key。启动补回先于该窗口新实时消息进入原信源；未收束前不能正式阅读或标为已读。已经读过的旧档信源不会倒插内容，后续 fetch 另开信源。远端历史不保证无缺口。用 `exec_code` 可调用 `ctx["chat"].unread_members(source)` 取得脱离内部权威的 `list[dict]`，用普通 Python 筛选后把其中 `key` 列表交给 `take(ids=...)`；修改快照不会修改未读事实。
+眼前历史从首次选定的起点持续追加，不是完整记录。新消息先留在有名字的有序未读信源；通知是创建时快照，尾部 hint 显示当前未读提及的时间和未读序号。`status(source)` 看数量与缺口，`take(source, start=1, count=8)` 在工具执行时按当前未读成员序号选连续范围，已读/跳过不计数；`ids`、`arrival`、`origin`、`message_id` 是高级精确入口。`mentions(source)` 正式消费至多 500 条未读提及，不是只看通知；`pull(source, count)` 是前缀别名。正式 input 保留自己的号，并记录发起输出 `read_by` 和实际工具 `read_via`；来源顺序中跨过的已读/跳过桥附在本次新 input 内，已读桥保留旧正式号，跳过桥显示 `skipped_by` 而没有旧 input 号。`mark_read(source)` 把调用时已有的成员跳过，不伪造 input；`fetch(source)` 从 NapCat 向旧端补取。通知已看见不等于消息已读；红点本身不会反复启动你，只有后来出现新唤醒时才再次叫你。窗口名是 `g<群号>` 或 `u<私聊对端号>`，主动 fetch 的旧档有自己的信源 key。启动补回先于该窗口新实时消息进入原信源；未收束前不能正式阅读或标为已读。已经读过的旧档信源不会倒插内容，后续 fetch 另开信源。远端历史不保证无缺口。用 `exec_code` 可调用 `ctx["chat"].unread_members(source)` 取得脱离内部权威的 `list[dict]`，用普通 Python 筛选后把其中 `key` 列表交给 `take(ids=...)`；修改快照不会修改未读事实。
 
 聊天档案不属于未读信源。`read_messages(window, message_id, before, after)` 可在指定窗口中按 QQ `message_id` 选前后文；若号码歧义，加 `timestamp` 或改用 `origin`。它的同步 R 只确认安排，正文在下一子请求作为逐条正式 input 出现；命中当前 live/source 未读成员也一并消费。已读档案可再次阅读，产生新的 archive input，但不冒充 live 回声；`say_links` 只确认实际接收的回声。已读 input 也可用 `recall_events` 反查。总结只改变默认显示，不删除原文。
 
@@ -129,7 +129,7 @@ Skill 也是可编辑的长期笔记：把可重复使用的经验、做法、�
 
 `recall_events` 和 `event_links` 都能用 `anchor` 加前后数量，或用 `start`／`end` 指定有界区间；`kinds` 和 `source` 只在选定范围内筛选，不改变经历顺序。`event_links` 的输出 `reads` 是该输出实际导致正式读入的 input 号，不靠位置推断；其它一跳关系不读取正文、不授予覆盖信用。不要把这些选择器用于未读信源、原生操作号或 `say` 回声关联。
 
-中心会话只载入一条全局经历的可见后缀；旧窗口正式号仍能按原号跨窗口反查，不复制或改号。更早的结果没被删除，仍能按引用取回。
+中心会话从固定起点载入一条全局经历；旧窗口正式号仍能按原号跨窗口反查，不复制或改号。更早的结果没被删除，仍能按引用取回。
 
 ## 全局待办
 
@@ -160,6 +160,7 @@ from mods.tools import current_binding
 
 _offline_send_sink: ContextVar[object | None] = ContextVar("meta_offline_send_sink", default=None)
 _DEFAULT_PULL_COUNT = 8
+_STATUS_TOKENS = 3000
 
 
 def _tool_window():
@@ -626,7 +627,7 @@ def status(source: str = "") -> str:
             return "当前没有待处理的未读信源；未读未减少"
         lines.append("可用 status(source) 按具体 g/u 窗口或历史信源 key 查看完整状态")
     rendered = "\n".join(lines)
-    excerpt = chat.bounded_excerpt(rendered, chat.MAIL_PULL_TOKENS - 1000)
+    excerpt = chat.bounded_excerpt(rendered, _STATUS_TOKENS)
     if len(excerpt) < len(rendered):
         complete_lines = excerpt.splitlines()
         if excerpt and not excerpt.endswith("\n") and rendered[len(excerpt)] != "\n":
@@ -757,7 +758,7 @@ def pull(source: str, count: int = _DEFAULT_PULL_COUNT) -> str:
 
     @param
     source: g<群号>、u<私聊对端号>，或 fetch 返回的信源 key
-    count: 希望读取的事件数，1 到 500；单次输入预算可能使实际数量更少
+    count: 希望读取的事件数，1 到 500；选中的消息在下一请求全文读入
     """
     return _take(source, count, 1, None, "", "", "", False, "pull")
 

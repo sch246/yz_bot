@@ -272,7 +272,7 @@ def _event_refs(output: dict, result: dict | None = None) -> dict:
 
 def _stream_rows(window: tuple | None, token_limit: int | None,
                  event_limit: int | None, native_model: str | None = None,
-                 show_thought: bool = True
+                 show_thought: bool = True, keep_latest: bool = False
                  ) -> tuple[list[tuple[dict, dict]], int, bool]:
     """Select one visible suffix by event count and projected token cost."""
     entries = oplog.events(window)
@@ -296,7 +296,7 @@ def _stream_rows(window: tuple | None, token_limit: int | None,
         if native is not None:
             native.append((entries[index - 1], _event_refs(entries[index - 1], entry)))
             amount = sum(_message_cost(message) for _source, message in native)
-            if token_limit is not None and used + amount > token_limit:
+            if (picked or not keep_latest) and token_limit is not None and used + amount > token_limit:
                 # WHY: A pair which no longer fits as original messages can
                 # still carry its facts in the bounded text view. Both events
                 # enter together; no provider sees an orphaned tool message.
@@ -304,7 +304,7 @@ def _stream_rows(window: tuple | None, token_limit: int | None,
                                                                   show_thought=show_thought)),
                           (entry, _result_projection(entry, links))]
                 amount = sum(_message_cost(message) for _source, message in native)
-            if ((event_limit is not None and picked_events + 2 > event_limit)
+            if (picked or not keep_latest) and ((event_limit is not None and picked_events + 2 > event_limit)
                     or (token_limit is not None and used + amount > token_limit)):
                 blocked = True
                 break
@@ -313,7 +313,7 @@ def _stream_rows(window: tuple | None, token_limit: int | None,
             picked_events += 2
             used += amount
             continue
-        if event_limit is not None and picked_events >= event_limit:
+        if (picked or not keep_latest) and event_limit is not None and picked_events >= event_limit:
             blocked = True
             break
         if entry["kind"] == "input":
@@ -341,10 +341,10 @@ def _stream_rows(window: tuple | None, token_limit: int | None,
             if native_output is not None:
                 native_rows = [(entry, native_output), (entry, _event_refs(entry))]
                 amount = sum(_message_cost(message) for _source, message in native_rows)
-                if token_limit is not None and used + amount > token_limit:
+                if (picked or not keep_latest) and token_limit is not None and used + amount > token_limit:
                     native_rows = [(entry, _output_projection(entry, show_thought=show_thought))]
                     amount = _message_cost(native_rows[0][1])
-                if token_limit is not None and used + amount > token_limit:
+                if (picked or not keep_latest) and token_limit is not None and used + amount > token_limit:
                     blocked = True
                     break
                 picked.extend(reversed(native_rows))
@@ -357,7 +357,7 @@ def _stream_rows(window: tuple | None, token_limit: int | None,
         else:
             converted = _result_projection(entry, links)
         amount = _message_cost(converted)
-        if token_limit is not None and used + amount > token_limit:
+        if (picked or not keep_latest) and token_limit is not None and used + amount > token_limit:
             blocked = True
             break
         picked.append((entry, converted))
@@ -365,6 +365,37 @@ def _stream_rows(window: tuple | None, token_limit: int | None,
         used += amount
     picked.reverse()
     return picked, used, blocked
+
+
+def agent_rows(max_tokens: int, max_events: int, *, model: str | None,
+               show_thought: bool, turn=None) -> list[tuple[dict, dict]]:
+    """Freeze the first visible start once, then show every later visible event."""
+    data = storage.get("", "agent")
+    if (turn is None or not hasattr(turn, "history_start")) and "history_start" not in data:
+        rows, _used, _blocked = _stream_rows(
+            _chat_root.AGENT_WINDOW, max_tokens, max_events,
+            native_model=model, show_thought=show_thought, keep_latest=True)
+        data["history_start"] = rows[0][0]["id"] if rows else None
+        if turn is not None:
+            turn.history_start = data["history_start"]
+        storage.save()
+        return rows
+    rows, _used, _blocked = _stream_rows(
+        _chat_root.AGENT_WINDOW, None, None,
+        native_model=model, show_thought=show_thought)
+    if turn is not None and not hasattr(turn, "history_start"):
+        turn.history_start = data["history_start"]
+    start = turn.history_start if turn is not None else data["history_start"]
+    if start is None:
+        return rows
+
+    def order(event_id: str) -> tuple[int, int]:
+        day, sequence = event_id.split("-", 1)
+        return int(day), int(sequence)
+
+    boundary = order(start)
+    return [(entry, projection) for entry, projection in rows
+            if order(entry["id"]) >= boundary]
 
 
 def get_msgs(token_limit: int | None = None, return_token: bool = False):
@@ -391,7 +422,7 @@ def _base_prompt() -> list[dict]:
 - 聊天中可能不会有明显的问题，扮演好角色即可
 - 如无特殊要求，请用中文回复
 - **说话要调 `say`**。直接写在回复正文里的内容不会发出去，只会留在你自己的输出轨迹里
-- 眼前历史是唯一全局已读信息流按预算选出的可见部分，不是全部记录。通知不等于读取；通知是创建时快照，尾部 hint 给当前未读提及的时间和未读序号（所有未读都计数，已读/跳过不计数）。take(source, start, count) 在工具执行时按当前未读序号选范围；已读/跳过桥会随新 input 展示，原已读正式号不变。正式输入的 read_by 是发起工具的输出号，read_via 是公开工具名；mark_read 只跳过并留下 skipped_by，不伪造 input。mentions 正式消费至多 500 条未读提及。红点本身不会反复启动你，后来有新唤醒时才再叫一次并重列完整集合。read_messages 从聊天档案选消息并在下一请求正式阅读
+- 眼前历史是唯一全局已读信息流从固定起点至今的可见部分，不是全部记录；达到上下文上限要先用 cover_events 压缩，不会自动滑窗。通知不等于读取；通知是创建时快照，尾部 hint 给当前未读提及的时间和未读序号（所有未读都计数，已读/跳过不计数）。take(source, start, count) 在工具执行时按当前未读序号选范围；已读/跳过桥会随新 input 展示，原已读正式号不变。正式输入的 read_by 是发起工具的输出号，read_via 是公开工具名；mark_read 只跳过并留下 skipped_by，不伪造 input。mentions 正式消费至多 500 条未读提及。红点本身不会反复启动你，后来有新唤醒时才再叫一次并重列完整集合。read_messages 从聊天档案选消息并在下一请求正式阅读
 - 想积累经验就实际写入以后会用的载体：可复用做法写 Markdown Skill 并按需加载，全局待办用 `edit_hint` 保存；只在回复里说“记住了”不会保存它
 - 对外发送必须在 say 里明确写目标 g群号 或 u私聊对端号；没有默认接收窗口
 - `say` 返回这条消息的 message_id；它默认 `final_call=true`，说完这一轮就结束，要接着干活就传 `final_call=false`"""}]
