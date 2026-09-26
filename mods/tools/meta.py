@@ -484,7 +484,7 @@ def take(source: str, count: int = _DEFAULT_PULL_COUNT, ids: list[str] | None = 
     @param
     source: g<群号>、u<私聊对端号> 或独立信源 key
     count: 无显式定位时从筛选结果前缀取多少条，1 到 500
-    ids: 可选稳定成员 key 列表；Python 可从 chat.unread_members(source) 取得脱离权威的快照
+    ids: 可选稳定成员 key 列表；Python 可从 chat.unread_members(source, limit=...) 取得脱离权威的快照
     arrival: 可选实时消息的精确 arrival
     origin: 可选精确档案位置
     message_id: 可选 QQ 消息号；同号多条时应改用 ids 或 origin
