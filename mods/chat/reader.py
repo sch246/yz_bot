@@ -124,8 +124,7 @@ def _drain_legacy_results() -> list[tuple[dict, dict]]:
             continue
         recorded = oplog.result(_chat_root.AGENT_WINDOW, values["source"],
                                 values["returns"], entry["arrival"])
-        rows.append((recorded, _view._result_projection(
-            recorded, oplog.say_links(_chat_root.AGENT_WINDOW))))
+        rows.append((recorded, _view._result_projection(recorded)))
     return rows
 
 
@@ -475,15 +474,22 @@ def _formal_input(session: llm.Chat | None, window: tuple, event: dict,
                                        read_by, read_via)
     if converted is None and skip_unprojectable:
         return None
+    if (converted is not None and echo and event.get("post_type") == "message_sent"
+            and event.get("message_id") is not None):
+        reference = oplog.sent_by(event["message_id"], window)
+        if reference is not None:
+            content = converted["content"]
+            metadata = content[0]
+            converted = {**converted, "content": [
+                {**metadata, "text": metadata["text"].replace(
+                    "</metadata>", f"  <sent_by>{reference}</sent_by>\n</metadata>", 1)},
+                *content[1:]]}
     if converted is not None and bridge:
         converted = _with_bridge(converted, bridge)
     recorded = commit(converted)
     if converted is None:
         return None
     projection = _view._numbered(converted, recorded["id"])
-    if echo:
-        projection = _view._echo_relation(projection, recorded,
-                                          oplog.say_links(_chat_root.AGENT_WINDOW))
     if session is not None:
         _view._remember_stream(session, projection, recorded["id"])
     return projection

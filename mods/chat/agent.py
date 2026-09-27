@@ -42,7 +42,7 @@ def _stream_results(window, binding):
                 session.messages.append(tag)
                 _view._remember_stream(session, tag, source)
             else:
-                projection = _view._result_projection(recorded, oplog.say_links(window))
+                projection = _view._result_projection(recorded)
                 session.pending_results.append((recorded, projection))
     return record
 
@@ -360,7 +360,7 @@ def event_links(window, ids: list[str] | None = None, anchor: str = "", before: 
 def cover_stream(session, window, ids: list[str], conclusion: str, anchor: str = "", before: int = 0,
                  after: int = 0, start: str = "", end: str = "", kinds: str = "",
                  source: str = "") -> str:
-    """将本次主窗口可见或此前已覆盖的事件归入这次行动的结论；成员不再自动载入，但仍可按原编号反查。关联的整批输出、返回和已确认 say 回声必须一同覆盖。
+    """将本次主窗口可见或此前已覆盖的事件归入这次行动的结论；成员不再自动载入，但仍可按原编号反查。关联的整批输出和返回必须一同覆盖。
 
     @param
     ids: 显式正式号列表；与 anchor 或 start/end 二选一，范围调用请传 []

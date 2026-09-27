@@ -271,7 +271,6 @@ def _stream_rows(window: tuple | None, token_limit: int | None,
                  ) -> tuple[list[tuple[dict, dict]], int, bool]:
     """Select one visible suffix by event count and projected token cost."""
     entries = oplog.events(window)
-    links = oplog.say_links(window)
     picked: list[tuple[dict, dict]] = []
     used = 0
     picked_events = 0
@@ -296,7 +295,7 @@ def _stream_rows(window: tuple | None, token_limit: int | None,
                 # enter together; no provider sees an orphaned tool message.
                 native = [(entries[index - 1], _output_projection(entries[index - 1],
                                                                   show_thought=show_thought)),
-                          (entry, _result_projection(entry, links))]
+                          (entry, _result_projection(entry))]
                 amount = sum(_message_cost(message) for _source, message in native)
             if (picked or not keep_latest) and ((event_limit is not None and picked_events + 2 > event_limit)
                     or (token_limit is not None and used + amount > token_limit)):
@@ -315,7 +314,6 @@ def _stream_rows(window: tuple | None, token_limit: int | None,
             if projection is None:
                 continue
             converted = _numbered(projection, entry["id"])
-            converted = _echo_relation(converted, entry, links)
         elif entry["kind"] == "output":
             if not entry["actions"] and not entry["body"]:
                 if not native_model or _native_assistant(entry, native_model) is None:
@@ -339,7 +337,7 @@ def _stream_rows(window: tuple | None, token_limit: int | None,
         elif entry["kind"] == "notification":
             converted = _notification_projection(entry)
         else:
-            converted = _result_projection(entry, links)
+            converted = _result_projection(entry)
         amount = _message_cost(converted)
         if (picked or not keep_latest) and token_limit is not None and used + amount > token_limit:
             blocked = True
@@ -435,20 +433,6 @@ def _read_projection(converted: dict | None, read_by: str | None,
     return _provenance_projection(converted, read_by, read_via)
 
 
-def _echo_relation(converted: dict, entry: dict, links: dict[str, tuple[str, str]]) -> dict:
-    event = entry["event"]
-    if event.get("post_type") != "message_sent" or event.get("message_id") is None:
-        return converted
-    linked = links.get(str(event["message_id"]))
-    if linked is None or linked[0] != entry["id"]:
-        return converted
-    relation = f"（已确认由 {linked[1]} say 发出）"
-    content = converted["content"]
-    if isinstance(content, list):
-        return {**converted, "content": [content[0], {"type": "text", "text": relation}, *content[1:]]}
-    return {**converted, "content": content + relation}
-
-
 def _output_projection(entry: dict, *, show_thought: bool = True) -> dict:
     actions = "\n".join(f"{entry['id']}#{position + 1} {action['name']}({action['arguments']})"
                         for position, action in enumerate(entry["actions"]))
@@ -460,16 +444,11 @@ def _output_projection(entry: dict, *, show_thought: bool = True) -> dict:
     return {"role": "user", "content": f"[{entry['id']}] 自己的输出：{body}{thought_text}\n{actions}"}
 
 
-def _result_projection(entry: dict, links: dict[str, tuple[str, str]]) -> dict:
+def _result_projection(entry: dict) -> dict:
     lines = []
     for result in entry["returns"]:
         reference = f"{entry['source']}#{result['position'] + 1}"
-        relation = ""
-        if result["name"] == "say" and str(result["content"]).lstrip("-").isdecimal():
-            linked = links.get(str(result["content"]))
-            if linked and linked[1] == reference:
-                relation = f" (已确认回声 {linked[0]})"
-        lines.append(f"{reference} {result['name']} -> {result['content']}{relation}")
+        lines.append(f"{reference} {result['name']} -> {result['content']}")
     content = f"[{entry['id']}] 行动返回：\n" + "\n".join(lines)
     return {"role": "user", "content": content}
 
