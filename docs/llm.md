@@ -203,7 +203,7 @@ hint 与追加式上下文是两层，判据是一句话：**频繁变化、且�
 
 统一正式号表示中心信息流的登记顺序，不表示各 QQ 窗口的消息发生顺序；极窄的取消窗口里，已登记的同步 R 可能尚未送进模型。独立 `.chat` 和子代理可先在私有请求中读到原生工具返回，不替中心消费 `oplog` 未读；旧 per-window 正式号保留原身份，中心可按原号反查。
 
-DeepSeek 在带 `tools` 的 thinking 请求中要求最后一条 `user` 后的每条 `assistant` 携带 `reasoning_content`；`chat._close_with_user` 以系统声明形式补一个收尾 `user`，不为供应商编造过往思考。此规则最小报文于 2026-09-17 验证；其他供应商不依赖该字段。
+DeepSeek 在带 `tools` 的 thinking 请求中要求最后一条 `user` 后的每条 `assistant` 携带 `reasoning_content`；`chat.view._closing_hint` 在持久 provider 产物之后检查尾部，仅在需要时为 outgoing 附加临时 `user` hint，不写入 `Chat.messages`、oplog 或持久前缀，也不为供应商编造过往思考。此规则最小报文于 2026-09-17 验证；其他供应商不依赖该字段。
 
 ### 思考内容开关
 
