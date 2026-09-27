@@ -62,11 +62,11 @@ def translate(entry: dict, state: dict) -> dict:
                 "arrivals": entry.get("arrivals", []), "read_by": entry.get("read_by")}
     if kind == "condensed":
         target = state["indexes"][entry["target"]]
-        return {"kind": "hide_events", "ids": [entry["target"],
+        return {"kind": "hide_events", "visibility": "collapsed", "ids": [entry["target"],
                 *(item["id"] for item in state["events"]
                   if item["kind"] == "result" and item["source"] == target["id"])]}
     if kind == "clear":
-        return {"kind": "hide_events", "ids": [item["id"] for item in
+        return {"kind": "hide_events", "visibility": "hidden", "ids": [item["id"] for item in
                 state["windows"].get(tuple(entry["window"]), ()) if item["kind"] == "result"]}
     if kind == "floor":
         before = entry["before"]

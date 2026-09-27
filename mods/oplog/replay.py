@@ -26,15 +26,34 @@ _REQUIRED = {
     "notification": ("id", "window", "version", "windows", "arrivals", "activations"),
 }
 _FORMAL = {"input", "output", "result", "notification"}
+_FORMAT_FIELDS = {
+    "activation": {"activation_kind"},
+    "source_start": {"queue_window"},
+    "source_page": {"mention_count"},
+    "source_finish": {"stop_cursor"},
+    "mark_read": {"read_by"},
+    "source_mark_read": {"positions", "mention_count", "arrivals", "read_by"},
+    "input": {"read_by", "read_via"},
+    "output": {"assistant"},
+    "notification": {"version", "activations"},
+}
+
+
+class FormatShapeError(ValueError):
+    """A row has an unsupported vocabulary or representation version."""
 
 
 def _validate_shape(entry: dict) -> None:
     """Check the current disk vocabulary before replay can reinterpret a row."""
-    if not isinstance(entry, dict) or entry.get("kind") not in _REQUIRED:
-        raise ValueError("unknown event stream row kind")
+    if not isinstance(entry, dict):
+        raise ValueError("event stream row must be an object")
+    if entry.get("kind") not in _REQUIRED:
+        raise FormatShapeError("unknown event stream row kind")
     kind = entry["kind"]
-    if any(field not in entry for field in _REQUIRED[kind]):
-        raise ValueError(f"invalid {kind} row shape")
+    missing = set(_REQUIRED[kind]) - entry.keys()
+    if missing:
+        error = FormatShapeError if missing <= _FORMAT_FIELDS.get(kind, set()) else ValueError
+        raise error(f"invalid {kind} row shape")
     if (kind in _FORMAL) != ("id" in entry):
         raise ValueError("formal event id does not match row kind")
     if "window" in entry and not isinstance(entry["window"], list):
@@ -50,9 +69,10 @@ def _validate_shape(entry: dict) -> None:
         raise ValueError("input provenance is invalid")
     if kind == "notification" and (entry["version"] != 2
                                    or not isinstance(entry["activations"], list)):
-        raise ValueError("notification row shape is old")
+        error = FormatShapeError if entry["version"] != 2 else ValueError
+        raise error("notification row shape is invalid")
     if kind == "output" and not isinstance(entry["assistant"], dict):
-        raise ValueError("output row shape is old")
+        raise ValueError("output assistant must be an object")
     if kind == "output":
         assistant = entry["assistant"]
         calls = assistant.get("tool_calls", [])
@@ -76,9 +96,9 @@ def _validate_shape(entry: dict) -> None:
                                           for item in entry["activations"])):
         raise ValueError("notification facts are invalid")
     if kind == "source_mark_read" and not isinstance(entry["positions"], list):
-        raise ValueError("source mark-read shape is old")
+        raise ValueError("source mark-read positions are invalid")
     if kind == "source_start" and not isinstance(entry["queue_window"], list):
-        raise ValueError("source start shape is old")
+        raise ValueError("source start queue window is invalid")
 
 
 def _validate_internal_shape(entry: dict) -> None:
@@ -86,7 +106,8 @@ def _validate_internal_shape(entry: dict) -> None:
             *_REQUIRED, "hide_events", "drop_arrivals"):
         raise ValueError("adapter returned unknown row kind")
     if entry["kind"] == "hide_events":
-        if not isinstance(entry.get("ids"), list):
+        if not isinstance(entry.get("ids"), list) or entry.get("visibility") not in (
+                "hidden", "collapsed"):
             raise ValueError("invalid visibility translation")
     elif entry["kind"] == "drop_arrivals":
         if not isinstance(entry.get("arrivals"), list):
@@ -434,7 +455,7 @@ def _apply(
         return
     if entry["kind"] == "hide_events":
         for event_id in entry["ids"]:
-            indexes[event_id]["hidden"] = True
+            indexes[event_id][entry["visibility"]] = True
         return
     if entry["kind"] == "cover":
         window = tuple(entry["window"])
@@ -462,8 +483,8 @@ def _apply(
             mentions.append(reference)
     entry["_mentions"] = mentions
     day, number = event_id.split("-", 1)
-    if entry["kind"] == "result" and indexes[entry["source"]].get("hidden"):
-        entry["hidden"] = True
+    if entry["kind"] == "result" and indexes[entry["source"]].get("collapsed"):
+        entry["collapsed"] = True
     counters[day] = max(counters.get(day, 0), int(number))
     recorded.append(entry)
     indexes[event_id] = entry

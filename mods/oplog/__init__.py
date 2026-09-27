@@ -49,7 +49,7 @@ _legacy_adapter = None
 
 from .replay import (
     _accessible, _apply, _complete_output, _message_identity, _reference_candidates, _validate,
-    _validate_shape, _validate_internal_shape,
+    _validate_shape, _validate_internal_shape, FormatShapeError,
 )
 
 
@@ -218,7 +218,7 @@ def _internalize(entry: dict, state: dict) -> tuple[dict, bool]:
     try:
         _validate_shape(entry)
         return entry, False
-    except (KeyError, TypeError, ValueError) as error:
+    except FormatShapeError as error:
         if _legacy_adapter is None:
             raise _LegacyFormatError("unsupported event stream shape") from error
     try:
@@ -862,8 +862,9 @@ def events(window: tuple | None, include_condensed: bool = False) -> list[dict]:
     with _lock:
         _restore()
         return [item for item in _windows.get(tuple(window or ()), ())
-                if (include_condensed or (not item.get("hidden")
-                                          and item["id"] not in _covered.get(tuple(window or ()), ())))]
+                if not item.get("hidden")
+                and (include_condensed or (not item.get("collapsed")
+                                           and item["id"] not in _covered.get(tuple(window or ()), ())))]
 
 
 def covered(window: tuple | None) -> set[str]:
@@ -963,7 +964,8 @@ def cover(window: tuple, node: str, ids: Iterable[str], visible: set[str]) -> se
             if (entry is None or not _accessible(window, entry)
                     or (event_id not in visible and event_id not in _covered.get(window, ())
                         and not (window == AGENT_WINDOW and event_id in _covered.get(tuple(entry["window"]), ())))
-                    or entry.get("hidden") or (entry["kind"] == "input" and entry.get("projection") is None)):
+                    or entry.get("hidden") or entry.get("collapsed")
+                    or (entry["kind"] == "input" and entry.get("projection") is None)):
                 raise ValueError(f"覆盖成员不在当前主窗口可见已读流中: {event_id}")
         _append({"kind": "cover", "window": list(window), "node": node,
                  "members": sorted(closure)}, datetime.now().strftime("%Y%m%d"))
