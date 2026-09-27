@@ -10,7 +10,7 @@
 
 ## 生成
 
-两个生成函数把图片保存为 Bot 本地文件，返回 `file://` 绝对路径，不自动发送。要发给用户，用 `say(text="[CQ:image,file=file:///绝对路径]", target="g群号或u私聊对端号")` 明确选择目标。你看不到成品，所以不要在回复里描述生成结果长什么样。
+两个生成函数把图片保存进 Bot 的临时图片缓存，返回 `file://` 绝对路径，不自动发送；缓存闲置 15 天后可能清理，要及时使用。要发给用户，用 `say(text="[CQ:image,file=file:///绝对路径]", target="g群号或u私聊对端号")` 明确选择目标。你看不到成品，所以不要在回复里描述生成结果长什么样。
 
 `create_image_from_references` 用 `image_uris`（每行一个 URI）提供参考的人物、风格或待修改的原图，`prompt` 写想要的新画面；没有参考图时用 `create_image`。
 
@@ -25,14 +25,10 @@ import binascii
 import os
 from pathlib import Path
 import re
-from uuid import uuid4
 
 import requests
 
 from mods import image as image_mod, llm, op
-
-
-GENERATED_DIR = Path("data/files/generated")
 
 
 def recognize_image(image_uri: str, prompt: str = "") -> str:
@@ -63,7 +59,7 @@ def _validate_generation(prompt: str, size: str, quality: str, n: int, output_fo
     return None
 
 
-def _store_generated_images(response: requests.Response, output_format: str) -> str:
+def _store_generated_images(response: requests.Response) -> str:
     if not response.ok:
         return f"生图失败：API 返回 HTTP {response.status_code}"
     try:
@@ -81,10 +77,8 @@ def _store_generated_images(response: requests.Response, output_format: str) -> 
     for value in images:
         try:
             content = base64.b64decode(value, validate=True)
-            GENERATED_DIR.mkdir(parents=True, exist_ok=True)
-            path = (GENERATED_DIR / f"{uuid4().hex}.{output_format}").resolve()
-            path.write_bytes(content)
-            saved.append(path.as_uri())
+            path, _mime, _digest = image_mod.cache_image_bytes(content)
+            saved.append(Path(path).resolve().as_uri())
         except (binascii.Error, OSError, ValueError) as error:
             return f"已生成 {len(images)} 张图片，已保存 {len(saved)} 张：{saved}；保存失败：{error}"
     return "已生成图片，本地路径：\n" + "\n".join(saved)
@@ -109,7 +103,7 @@ def create_image(prompt: str, size: str = "1024x1024", quality: str = "auto", n:
         response = requests.post(f"{base_url}/images/generations", headers={"Authorization": f"Bearer {api_key}"}, json={"model": "gpt-image-2", "prompt": prompt.strip(), "size": size, "quality": quality, "n": n, "output_format": output_format}, timeout=(10, 300))
     except requests.RequestException as error:
         return f"生图失败：请求异常（{type(error).__name__}）"
-    return _store_generated_images(response, output_format)
+    return _store_generated_images(response)
 
 
 def create_image_from_references(prompt: str, image_uris: str, size: str = "1024x1024", quality: str = "auto", n: int = 1, output_format: str = "png") -> str:
@@ -143,7 +137,7 @@ def create_image_from_references(prompt: str, image_uris: str, size: str = "1024
             response = requests.post(f"{base_url}/images/edits", headers={"Authorization": f"Bearer {api_key}"}, data={"model": "gpt-image-2", "prompt": prompt.strip(), "size": size, "quality": quality, "n": n, "output_format": output_format}, files=files, timeout=(10, 300))
     except (requests.RequestException, OSError, ValueError) as error:
         return f"参考图生图失败：{error}"
-    return _store_generated_images(response, output_format)
+    return _store_generated_images(response)
 
 
 __all__ = ["recognize_image", "create_image", "create_image_from_references"]

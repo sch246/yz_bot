@@ -20,9 +20,9 @@ def poke(user_id: int, target: str = "") -> str:
 
     @param
     user_id: 目标用户 QQ 号；群聊里可以是任意群成员，私聊里只能是当前对话者
-    target: 中心会话必须明确给 g<群号> 或 u<私聊对端号>；私有会话可留空
+    target: g<群号> 或 u<私聊对端号>；显式目标优先，中心会话必须填写
     """
-    if context.agent_mode():
+    if target or context.agent_mode():
         from mods import chat
 
         try:

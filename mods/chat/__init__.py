@@ -235,6 +235,8 @@ def init_chat(
         session,
         tool_context,
         registry=offline["registry"] if offline else None,
+        visible=(lambda name, module: name not in {"baidumap", "dianping"}
+                 and tool_modules.bot_op_tool_visible(name, module)) if not offline else None,
         persist=_persist_modules,
     )
     return binding, window

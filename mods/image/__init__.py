@@ -330,6 +330,13 @@ def _store_content_image(content: bytes, mime: str, digest: str, target_dir: str
     return path, resolved_mime, digest
 
 
+def cache_image_bytes(content: bytes, target_dir: str = TEMP_PATH, max_bytes: int = MAX_LOCAL_IMAGE_BYTES) -> tuple[str, str, str]:
+    """Validate generated image bytes and store them in the expiring content cache."""
+    mime, digest = _validate_image_bytes(content, max_bytes)
+    maybe_prune_image_cache(target_dir)
+    return _store_content_image(content, mime, digest, target_dir, max_bytes)
+
+
 def _download_image_to_cache(uri: str, target_dir: str, max_bytes: int) -> tuple[str, str, str]:
     _stream.info(f"⬇️ 正在下载图片：{_display_uri(uri)}")
     try:
