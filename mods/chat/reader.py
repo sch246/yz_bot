@@ -632,7 +632,7 @@ def _bridge_projection(member: dict) -> dict:
         return _view._provenance_projection(converted, provenance["by"] or "unknown",
                                       "mark_read", skipped=True)
     recorded = provenance["input"]
-    return _view._numbered(_view._read_projection(converted, recorded.get("read_by"), recorded.get("read_via")),
+    return _view._numbered(_view._read_projection(converted, recorded["read_by"], recorded["read_via"]),
                      provenance["input"]["id"])
 
 

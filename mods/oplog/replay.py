@@ -7,6 +7,105 @@ from collections.abc import Iterable
 from . import AGENT_WINDOW, _REFERENCE
 
 
+_REQUIRED = {
+    "arrival": ("window", "arrival", "event"),
+    "activation": ("arrival", "activation_kind"),
+    "source_start": ("source", "name", "window", "queue_window", "source_type"),
+    "source_page": ("source", "page_number", "member_count", "mention_count", "cursor"),
+    "source_progress": ("source", "cursor"),
+    "source_finish": ("source", "state", "stop_cursor"),
+    "source_reopen": ("source", "cursor"),
+    "source_pulled": ("source",),
+    "mark_read": ("window", "arrivals", "read_by"),
+    "source_mark_read": ("source", "positions", "count", "mention_count", "arrivals", "read_by"),
+    "notification_ack": ("notification",),
+    "cover": ("window", "node", "members"),
+    "input": ("id", "window", "event", "projection", "read_by", "read_via"),
+    "output": ("id", "window", "assistant"),
+    "result": ("id", "window", "source", "returns"),
+    "notification": ("id", "window", "version", "windows", "arrivals", "activations"),
+}
+_FORMAL = {"input", "output", "result", "notification"}
+
+
+def _validate_shape(entry: dict) -> None:
+    """Check the current disk vocabulary before replay can reinterpret a row."""
+    if not isinstance(entry, dict) or entry.get("kind") not in _REQUIRED:
+        raise ValueError("unknown event stream row kind")
+    kind = entry["kind"]
+    if any(field not in entry for field in _REQUIRED[kind]):
+        raise ValueError(f"invalid {kind} row shape")
+    if (kind in _FORMAL) != ("id" in entry):
+        raise ValueError("formal event id does not match row kind")
+    if "window" in entry and not isinstance(entry["window"], list):
+        raise ValueError("event window must be a list")
+    if kind == "arrival" and not isinstance(entry["event"], dict):
+        raise ValueError("arrival event must be an object")
+    if kind == "input" and (not isinstance(entry["event"], dict)
+                            or entry["projection"] is not None
+                            and not isinstance(entry["projection"], dict)):
+        raise ValueError("input event or projection is invalid")
+    if kind == "input" and (entry["read_by"] is not None and not isinstance(entry["read_by"], str)
+                            or entry["read_via"] is not None and not isinstance(entry["read_via"], str)):
+        raise ValueError("input provenance is invalid")
+    if kind == "notification" and (entry["version"] != 2
+                                   or not isinstance(entry["activations"], list)):
+        raise ValueError("notification row shape is old")
+    if kind == "output" and not isinstance(entry["assistant"], dict):
+        raise ValueError("output row shape is old")
+    if kind == "output":
+        assistant = entry["assistant"]
+        calls = assistant.get("tool_calls", [])
+        if (assistant.get("role") != "assistant"
+                or not isinstance(assistant.get("content"), (str, type(None)))
+                or not isinstance(calls, list)
+                or any(not isinstance(call, dict) or not isinstance(call.get("function"), dict)
+                       or not isinstance(call["function"].get("name"), str)
+                       or not isinstance(call["function"].get("arguments"), str)
+                       for call in calls)):
+            raise ValueError("output assistant is invalid")
+    if kind == "result" and (not isinstance(entry["returns"], list) or any(
+            not isinstance(item, dict) or type(item.get("position")) is not int
+            or not isinstance(item.get("name"), str) or "content" not in item
+            for item in entry["returns"])):
+        raise ValueError("result returns are invalid")
+    if kind == "notification" and (not isinstance(entry["windows"], list)
+                                   or not isinstance(entry["arrivals"], list)
+                                   or any(not isinstance(item, dict) or not isinstance(item.get("window"), list)
+                                          or not isinstance(item.get("kind"), str)
+                                          for item in entry["activations"])):
+        raise ValueError("notification facts are invalid")
+    if kind == "source_mark_read" and not isinstance(entry["positions"], list):
+        raise ValueError("source mark-read shape is old")
+    if kind == "source_start" and not isinstance(entry["queue_window"], list):
+        raise ValueError("source start shape is old")
+
+
+def _validate_internal_shape(entry: dict) -> None:
+    if not isinstance(entry, dict) or entry.get("kind") not in (
+            *_REQUIRED, "hide_events", "drop_arrivals"):
+        raise ValueError("adapter returned unknown row kind")
+    if entry["kind"] == "hide_events":
+        if not isinstance(entry.get("ids"), list):
+            raise ValueError("invalid visibility translation")
+    elif entry["kind"] == "drop_arrivals":
+        if not isinstance(entry.get("arrivals"), list):
+            raise ValueError("invalid arrival translation")
+    elif entry["kind"] == "output" and entry.get("assistant") is None:
+        if any(field not in entry for field in ("id", "window", "body", "actions")) or not isinstance(
+                entry["actions"], list) or any(
+                not isinstance(action, dict) or not isinstance(action.get("name"), str)
+                or not isinstance(action.get("arguments"), str)
+                for action in entry["actions"]):
+            raise ValueError("invalid non-native output translation")
+    elif entry["kind"] == "notification" and "projection" in entry:
+        if any(field not in entry for field in ("id", "window", "windows", "arrivals")) or not isinstance(
+                entry["projection"], dict):
+            raise ValueError("invalid notification translation")
+    else:
+        _validate_shape(entry)
+
+
 def _accessible(window: tuple | None, entry: dict) -> bool:
     return entry["window"] == list(window or ()) or window == AGENT_WINDOW
 
@@ -53,21 +152,23 @@ def _reference_candidates(entry: dict) -> Iterable[str]:
             yield match.group(1)
 
 
+def _complete_output(entry: dict) -> None:
+    assistant = entry.get("assistant")
+    if assistant is None:
+        return
+    entry["body"] = assistant.get("content") or ""
+    entry["thought_present"] = bool(assistant.get("reasoning_content"))
+    entry["actions"] = [call["function"] for call in assistant.get("tool_calls", ())]
+
+
 def _validate_source_page(entry: dict, state: dict) -> None:
     if state["state"] != "fetching":
         raise ValueError("source fetch is not running")
     if (type(entry["page_number"]) is not int or entry["page_number"] != state["pages"]
             or type(entry["member_count"]) is not int or entry["member_count"] < 0
-            or type(entry.get("mention_count", 0)) is not int
-            or not 0 <= entry.get("mention_count", 0) <= entry["member_count"]):
+            or type(entry["mention_count"]) is not int
+            or not 0 <= entry["mention_count"] <= entry["member_count"]):
         raise ValueError("source page must be the next page with a nonnegative count")
-
-
-def _source_positions(state: dict):
-    for page in range(state["pages"] - 1, -1, -1):
-        for offset in range(state["page_counts"][page]):
-            if (page, offset) not in state["read_positions"]:
-                yield page, offset
 
 
 def _validate_source_read(entry: dict, state: dict, pending: dict[str, dict]) -> None:
@@ -94,13 +195,7 @@ def _validate_source_read(entry: dict, state: dict, pending: dict[str, dict]) ->
 def _validate_source_mark_read(entry: dict, state: dict, pending: dict[str, dict]) -> None:
     if state["state"] == "fetching":
         raise ValueError("source is not sealed")
-    positions = entry.get("positions")
-    if positions is None:
-        if type(entry.get("count")) is not int or entry["count"] < 1:
-            raise ValueError("source mark-read count is invalid")
-        positions = [list(position) for position in list(_source_positions(state))[:entry["count"]]]
-        if not positions or tuple(positions[0]) != (entry["page"], entry["offset"]):
-            raise ValueError("source mark-read cursor is stale")
+    positions = entry["positions"]
     if (not isinstance(positions, list) or not positions
             or any(not isinstance(position, list) or len(position) != 2
                    or any(type(value) is not int for value in position)
@@ -112,11 +207,11 @@ def _validate_source_mark_read(entry: dict, state: dict, pending: dict[str, dict
         raise ValueError("source mark-read positions are duplicated")
     if type(entry.get("count")) is not int or len(positions) != entry["count"]:
         raise ValueError("source mark-read count is invalid")
-    mentions = entry.get("mention_count", 0)
+    mentions = entry["mention_count"]
     if (type(mentions) is not int or not 0 <= mentions <= entry["count"]
             or state["read_mention_count"] + mentions > state["mention_count"]):
         raise ValueError("source mark-read mention count is invalid")
-    arrivals = entry.get("arrivals", [])
+    arrivals = entry["arrivals"]
     if (not isinstance(arrivals, list) or len(arrivals) != len(set(arrivals))
             or any(arrival not in pending or pending[arrival]["window"] != state["window"]
                    for arrival in arrivals)):
@@ -126,7 +221,7 @@ def _validate_source_mark_read(entry: dict, state: dict, pending: dict[str, dict
 def _validate_read_provenance(entry: dict, indexes: dict[str, dict]) -> None:
     if entry["kind"] not in ("input", "mark_read", "source_mark_read"):
         return
-    read_by = entry.get("read_by")
+    read_by = entry["read_by"]
     if read_by is None:
         return
     output = indexes.get(read_by)
@@ -158,8 +253,6 @@ def _validate(entry: dict, indexes: dict[str, dict], pending: dict[str, dict],
             raise ValueError("duplicate source")
     elif kind == "source_page":
         _validate_source_page(entry, sources[entry["source"]])
-        if "cursor" not in entry:
-            raise ValueError("source page has no cursor")
     elif kind == "source_progress":
         state = sources[entry["source"]]
         if state["state"] != "fetching":
@@ -169,7 +262,7 @@ def _validate(entry: dict, indexes: dict[str, dict], pending: dict[str, dict],
     elif kind == "source_finish":
         if sources[entry["source"]]["state"] != "fetching":
             raise ValueError("source fetch is not running")
-        if entry.get("state") not in ("complete", "gap", "failed"):
+        if entry["state"] not in ("complete", "gap", "failed"):
             raise ValueError("source finish state is invalid")
     elif kind == "source_reopen":
         state = sources[entry["source"]]
@@ -177,12 +270,12 @@ def _validate(entry: dict, indexes: dict[str, dict], pending: dict[str, dict],
             raise ValueError("only an unpulled sealed source can extend")
         if entry["cursor"] is None and state["state"] not in ("gap", "failed"):
             raise ValueError("source has no reliable remote cursor")
-    elif kind == "floor":
-        if entry["before"] is not None and entry["before"] not in arrival_order:
-            raise ValueError("floor arrival does not exist")
+    elif kind == "drop_arrivals":
+        if any(arrival not in pending for arrival in entry["arrivals"]):
+            raise ValueError("arrival to drop does not exist")
     elif kind == "mark_read":
         window = tuple(entry["window"])
-        arrivals = entry.get("arrivals")
+        arrivals = entry["arrivals"]
         ordered = [arrival for arrival, item in pending.items() if tuple(item["window"]) == window]
         if (not isinstance(arrivals, list) or not arrivals
                 or len(arrivals) != len(set(arrivals))
@@ -194,9 +287,9 @@ def _validate(entry: dict, indexes: dict[str, dict], pending: dict[str, dict],
         notice = indexes[entry["notification"]]
         if notice["kind"] != "notification":
             raise ValueError("notification ack does not name a notification")
-    elif kind == "condensed":
-        if entry["target"] not in indexes:
-            raise ValueError("condensed target does not exist")
+    elif kind == "hide_events":
+        if any(event_id not in indexes for event_id in entry["ids"]):
+            raise ValueError("visibility target does not exist")
     elif kind == "cover":
         window = tuple(entry["window"])
         source = entry["node"].partition("#")[0]
@@ -224,10 +317,6 @@ def _validate(entry: dict, indexes: dict[str, dict], pending: dict[str, dict],
             raise ValueError("invalid event id")
         if kind == "result" and entry["source"] not in indexes:
             raise ValueError("result source does not exist")
-        if kind == "output" and isinstance(entry.get("assistant"), dict):
-            if any(not isinstance(call, dict) or "function" not in call
-                   for call in entry["assistant"].get("tool_calls", ())):
-                raise ValueError("output tool calls are invalid")
         if kind == "input":
             _input_message_identity(entry, sources)
         list(_reference_candidates(entry))
@@ -255,7 +344,7 @@ def _apply(
     if entry["kind"] == "source_start":
         source = entry["source"]
         sources[source] = {"key": source, "name": entry["name"], "window": entry["window"],
-                           "queue_window": entry.get("queue_window", entry["window"]),
+                           "queue_window": entry["queue_window"],
                            "source_type": entry["source_type"], "pulled": False,
                            "state": "fetching", "anchor": entry.get("anchor"),
                            "anchor_time": entry.get("anchor_time"),
@@ -273,7 +362,7 @@ def _apply(
         state["page_counts"].append(entry["member_count"])
         state["pages"] += 1
         state["member_count"] += entry["member_count"]
-        state["mention_count"] += entry.get("mention_count", 0)
+        state["mention_count"] += entry["mention_count"]
         state["cursor"] = entry["cursor"]
         return
     if entry["kind"] == "source_progress":
@@ -287,7 +376,7 @@ def _apply(
         state["state"] = entry["state"]
         state["gap"] = entry.get("gap")
         state["error"] = entry.get("error")
-        state["stop_cursor"] = entry.get("stop_cursor", state["cursor"])
+        state["stop_cursor"] = entry["stop_cursor"]
         if state["gap"]:
             state["previous_gaps"].append(state["gap"])
         return
@@ -305,15 +394,11 @@ def _apply(
     if entry["kind"] == "activation":
         if entry["arrival"] in pending:
             pending[entry["arrival"]]["activated"] = True
-            pending[entry["arrival"]]["activation_kind"] = entry.get("activation_kind", "wake")
+            pending[entry["arrival"]]["activation_kind"] = entry["activation_kind"]
         return
-    if entry["kind"] == "floor":
-        window = tuple(entry["window"])
-        if entry["before"] is not None:
-            boundary = arrival_order[entry["before"]]
-            for arrival, item in list(pending.items()):
-                if arrival_order[arrival] <= boundary and tuple(item["window"]) == window and not item.get("fetched"):
-                    pending.pop(arrival)
+    if entry["kind"] == "drop_arrivals":
+        for arrival in entry["arrivals"]:
+            pending.pop(arrival)
         return
     if entry["kind"] == "mark_read":
         # WHY: 「标为已读」只推进持久未读水位，不是主体真正读到的一段经历，
@@ -330,14 +415,12 @@ def _apply(
     if entry["kind"] == "source_mark_read":
         # 历史信源的已读坐标只由日志重放派生；和 window mark_read 一样不伪造 input。
         state = sources[entry["source"]]
-        positions = entry.get("positions")
-        if positions is None:
-            positions = [list(position) for position in list(_source_positions(state))[:entry["count"]]]
+        positions = entry["positions"]
         state["read_positions"].update(map(tuple, positions))
         state["skip_entries"].update((tuple(position), entry) for position in positions)
-        state["read_mention_count"] += entry.get("mention_count", 0)
+        state["read_mention_count"] += entry["mention_count"]
         state["pulled"] = True
-        for arrival in entry.get("arrivals", []):
+        for arrival in entry["arrivals"]:
             marked = pending.pop(arrival)
             source_arrivals.add(arrival)
             identity = _message_identity(tuple(state["window"]), marked["event"])
@@ -349,10 +432,9 @@ def _apply(
         notice["acknowledged"] = True
         notified.update(notice["arrivals"])
         return
-    # WHY: 新代码不再产生 condensed/clear；这里只重放既有生产日志，避免升级后
-    # 旧事件突然重新出现或让事件流因未知记录无法启动。旧日志退休后即可一起删除。
-    if entry["kind"] == "condensed":
-        indexes[entry["target"]]["condensed"] = True
+    if entry["kind"] == "hide_events":
+        for event_id in entry["ids"]:
+            indexes[event_id]["hidden"] = True
         return
     if entry["kind"] == "cover":
         window = tuple(entry["window"])
@@ -361,17 +443,9 @@ def _apply(
         coverage_nodes[entry["node"]] = list(entry["members"])
         covered.setdefault(window, set()).update(entry["members"])
         return
-    if entry["kind"] == "clear":
-        for existing in windows.get(tuple(entry["window"]), ()):
-            if existing["kind"] == "result":
-                existing["hidden"] = True
-        return
     source_read = entry["kind"] == "input" and "page" in entry
-    if entry["kind"] == "output" and isinstance(entry.get("assistant"), dict):
-        assistant = entry["assistant"]
-        entry["body"] = assistant.get("content") or ""
-        entry["thought_present"] = bool(assistant.get("reasoning_content"))
-        entry["actions"] = [call["function"] for call in assistant.get("tool_calls", ())]
+    if entry["kind"] == "output":
+        _complete_output(entry)
     event_id = entry["id"]
     mentions = []
     seen_mentions = set()
@@ -388,8 +462,8 @@ def _apply(
             mentions.append(reference)
     entry["_mentions"] = mentions
     day, number = event_id.split("-", 1)
-    if entry["kind"] == "result" and indexes[entry["source"]].get("condensed"):
-        entry["condensed"] = True
+    if entry["kind"] == "result" and indexes[entry["source"]].get("hidden"):
+        entry["hidden"] = True
     counters[day] = max(counters.get(day, 0), int(number))
     recorded.append(entry)
     indexes[event_id] = entry

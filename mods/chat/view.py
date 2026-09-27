@@ -137,13 +137,11 @@ def _unread_detail_text(detail: dict, *, include_wakes: bool = True) -> str:
     target = ("g" if window[0] == "group" else "u") + str(window[1])
     sources = ""
     if include_wakes:
-        # WHY: 旧 notification 持久化过 unread 快照，且旧快照没有 ordinal；
-        # 重建它时不展示这份已过期的唤醒位置。
         sources = ", ".join(
             f"{item['kind']}"
             + (f" 作者={item['user_id']}" if item.get("user_id") is not None else "")
             + f" 时间={item['time']}"
-            + (f" 未读序号={item['ordinal']}" if item.get("ordinal") is not None else "")
+            + f" 未读序号={item['ordinal']}"
             for item in detail["wake_sources"])
     recovery = detail.get("recovery")
     extra = ((f" 补回未读={recovery['remaining']} 补回状态={recovery['state']}"
@@ -165,36 +163,10 @@ def _remember_stream(session, message: dict, event_id: str) -> None:
 
 
 def _notification_projection(entry: dict) -> dict:
-    if entry.get("version") == 2:
-        lines = "\n".join(_activation_text(item) for item in entry["activations"])
-        return {"role": "user", "content": f"[{entry['id']}] 新召唤通知：\n{lines}"}
-    return _legacy_notification_projection(entry)
-
-
-def _legacy_notification_projection(entry: dict) -> dict:
-    details = entry.get("unread", ())
-    if details:
-        shown = []
-        for detail in details:
-            candidate = "；".join([*shown, _unread_detail_text(detail, include_wakes=False)])
-            if _chat_root.count_tokens(candidate) > _chat_root.NOTICE_TOKENS - 150:
-                break
-            shown.append(_unread_detail_text(detail, include_wakes=False))
-        omitted = len(details) - len(shown)
-        listing = "；".join(shown) + (f"；还有 {omitted} 个窗口未列出，用 status() 查看"
-                                   if omitted else "")
-    else:
-        listing = "、".join(f"{window[0]}:{window[1]}" for window in entry["windows"])
-    activations = entry.get("activations", ())
-    activation_listing = ("；".join(_activation_text(item) for item in activations)
-                          if activations else "旧版通知未记录逐条唤醒")
-    content = (f"[{entry['id']}] 新召唤通知（创建时快照，未读序号可能已变化）。当时全部未读唤醒：{activation_listing}。"
-               f"未读概况：{listing}。"
-               "正文仍在未读信源；普通消息本身不激活。"
-               "可用 take(source, start, count) 按执行时未读序号选范围正式阅读，mentions(source) 正式读入未读提及，"
-               "read_messages 按 message_id 选择档案。通知已看见不等于消息已读；"
-               "未读红点不会自行反复唤醒，之后的新唤醒仍会再次带上这份完整未读集合。")
-    return {"role": "user", "content": content}
+    if "projection" in entry:
+        return entry["projection"]
+    lines = "\n".join(_activation_text(item) for item in entry["activations"])
+    return {"role": "user", "content": f"[{entry['id']}] 新召唤通知：\n{lines}"}
 
 
 def _message_cost(converted: dict) -> int:

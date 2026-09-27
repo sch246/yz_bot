@@ -44,9 +44,12 @@ _origins: dict[tuple[tuple, str], dict] = {}
 _sources: dict[str, dict] = {}
 _seen_messages: set[tuple[tuple, str, int, str | None]] = set()
 _failed = False
+_restore_error = None
+_legacy_adapter = None
 
 from .replay import (
-    _accessible, _apply, _message_identity, _reference_candidates, _validate,
+    _accessible, _apply, _complete_output, _message_identity, _reference_candidates, _validate,
+    _validate_shape, _validate_internal_shape,
 )
 
 
@@ -54,10 +57,40 @@ class PersistenceError(RuntimeError):
     """The durable stream is uncertain; no further actions may be dispatched."""
 
 
+class RestoreError(PersistenceError):
+    """A journal read could not establish a trustworthy in-memory stream."""
+
+
+class FormatRestoreError(RestoreError):
+    """A row needs an unavailable or unsuccessful format translation."""
+
+
+class _LegacyFormatError(ValueError):
+    pass
+
+
+def register_legacy_adapter(adapter) -> None:
+    """Install an optional read-only journal translator before the first restore."""
+    global _legacy_adapter
+    if _root is not None:
+        raise RuntimeError("event stream already restored")
+    if _legacy_adapter is not None:
+        raise RuntimeError("event stream adapter already registered")
+    _legacy_adapter = adapter
+
+
 def raise_if_failed() -> None:
     with _lock:
+        if _restore_error is not None:
+            raise _restore_error("event stream restore failed; refusing further actions")
         if _failed:
             raise PersistenceError("event stream write failed; refusing further actions")
+
+
+def ensure_available() -> None:
+    """Verify the full journal before a central reader starts its turn."""
+    with _lock:
+        _restore()
 
 
 def _directory() -> Path:
@@ -72,6 +105,19 @@ def source_page_root() -> Path:
 
 
 def _restore() -> None:
+    global _restore_error
+    raise_if_failed()
+    try:
+        _restore_impl()
+    except _LegacyFormatError as error:
+        _restore_error = FormatRestoreError
+        raise FormatRestoreError("event stream format could not be restored") from error
+    except Exception as error:
+        _restore_error = RestoreError
+        raise RestoreError("event stream restore failed; refusing further actions") from error
+
+
+def _restore_impl() -> None:
     global _root, _failed
     directory = _directory()
     if _root == directory:
@@ -92,31 +138,43 @@ def _restore() -> None:
     origins: dict[tuple[tuple, str], dict] = {}
     sources: dict[str, dict] = {}
     seen_messages: set[tuple[tuple, str, int, str | None]] = set()
+    incomplete: list[tuple[Path, bytes, int]] = []
     for path in sorted(directory.glob("????????.jsonl")):
         data = path.read_bytes()
         complete = data.rfind(b"\n") + 1
         for line in data[:complete].splitlines():
-            entry = json.loads(line.decode("utf-8"))
-            _validate(entry, indexes, pending, coverage_nodes, arrival_order, sources)
-            _apply(entry, restored, indexes, windows, counters, pending, covered, coverage_nodes,
-                   origins, mentioned_by, notified, arrival_order, sources, seen_messages,
-                   arrival_members, arrival_skips, source_arrivals)
+            entry, adapted = _internalize(json.loads(line.decode("utf-8")),
+                                          {"events": restored, "indexes": indexes,
+                                           "windows": windows, "pending": pending,
+                                           "arrival_order": arrival_order, "sources": sources})
+            try:
+                _validate(entry, indexes, pending, coverage_nodes, arrival_order, sources)
+                _apply(entry, restored, indexes, windows, counters, pending, covered, coverage_nodes,
+                       origins, mentioned_by, notified, arrival_order, sources, seen_messages,
+                       arrival_members, arrival_skips, source_arrivals)
+            except Exception as error:
+                if adapted:
+                    raise _LegacyFormatError("translated row is invalid") from error
+                raise
         if complete != len(data):
-            # WHY: Only a missing final newline is a crash tail. A malformed complete
-            # row is corruption, never permission to silently skip committed facts.
-            backup = path.with_name(path.name + ".incomplete-" + uuid4().hex)
-            with backup.open("xb") as stream:
-                stream.write(data[complete:])
-                stream.flush()
-                os.fsync(stream.fileno())
-            with path.open("r+b") as stream:
-                if stream.read() != data:
-                    raise RuntimeError("event stream changed during crash-tail recovery")
-                stream.truncate(complete)
-                stream.flush()
-                os.fsync(stream.fileno())
-            logging.warning("event stream recovered %d trailing bytes from %s into %s",
-                            len(data) - complete, path.name, backup.name)
+            incomplete.append((path, data, complete))
+    for path, data, complete in incomplete:
+        # WHY: Only a missing final newline is a crash tail. Validate the
+        # entire journal before touching even that tail, so a later bad row
+        # leaves the failed restore completely read-only.
+        backup = path.with_name(path.name + ".incomplete-" + uuid4().hex)
+        with backup.open("xb") as stream:
+            stream.write(data[complete:])
+            stream.flush()
+            os.fsync(stream.fileno())
+        with path.open("r+b") as stream:
+            if stream.read() != data:
+                raise RuntimeError("event stream changed during crash-tail recovery")
+            stream.truncate(complete)
+            stream.flush()
+            os.fsync(stream.fileno())
+        logging.warning("event stream recovered %d trailing bytes from %s into %s",
+                        len(data) - complete, path.name, backup.name)
     _events[:] = restored
     _by_id.clear()
     _by_id.update(indexes)
@@ -154,6 +212,21 @@ def _restore() -> None:
     _seen_messages.update(seen_messages)
     _root = directory
     _failed = False
+
+
+def _internalize(entry: dict, state: dict) -> tuple[dict, bool]:
+    try:
+        _validate_shape(entry)
+        return entry, False
+    except (KeyError, TypeError, ValueError) as error:
+        if _legacy_adapter is None:
+            raise _LegacyFormatError("unsupported event stream shape") from error
+    try:
+        translated = _legacy_adapter(entry, state)
+        _validate_internal_shape(translated)
+    except Exception as error:
+        raise _LegacyFormatError("event stream translation failed") from error
+    return translated, True
 
 
 def _event_bound(value: str | None, name: str) -> tuple[str, int] | None:
@@ -197,6 +270,7 @@ def iter_events(start: str | None = None, stop: str | None = None) -> Iterable[d
                 entry = json.loads(line.decode("utf-8"))
                 event_id = entry.get("id")
                 if event_id is not None:
+                    entry, _adapted = _internalize(entry, {})
                     position = _event_bound(event_id, "journal id")
                     if upper is not None and position >= upper:
                         return
@@ -206,12 +280,8 @@ def iter_events(start: str | None = None, stop: str | None = None) -> Iterable[d
                         started = True
                     if entry.get("kind") not in ("input", "output", "result", "notification"):
                         continue
-                    if entry["kind"] == "output" and isinstance(entry.get("assistant"), dict):
-                        assistant = entry["assistant"]
-                        entry["body"] = assistant.get("content") or ""
-                        entry["thought_present"] = bool(assistant.get("reasoning_content"))
-                        entry["actions"] = [call["function"]
-                                            for call in assistant.get("tool_calls", ())]
+                    if entry["kind"] == "output":
+                        _complete_output(entry)
                     entry["references"] = list(dict.fromkeys(_reference_candidates(entry)))
                     yield entry
                 elif started and entry.get("kind") == "cover":
@@ -223,6 +293,7 @@ def _append(entry: dict, day: str) -> None:
     # WHY: 追加、fsync 或落盘后的索引应用可能失败，磁盘上可能已有这条或残尾；继续行动会让
     # 外部副作用失去可信的来源记录。保持失败直到重启恢复检查磁盘，而非在进程内重试编号。
     raise_if_failed()
+    _validate_shape(entry)
     _validate(entry, _by_id, _pending, _coverage_nodes, _arrival_order, _sources)
     path = _root / f"{day}.jsonl"
     line = (json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
@@ -713,7 +784,8 @@ def input(window: tuple | None, event: dict, projection: dict | None, arrival: s
 def input_tools(window: tuple, content: str) -> dict:
     """Append tool state as an ordinary formal input, without an unread source."""
     return _register(window, "input", event={"type": "tools", "content": content},
-                     projection={"role": "user", "content": content})
+                     projection={"role": "user", "content": content},
+                     read_by=None, read_via=None)
 
 
 def input_archive(window: tuple, event: dict, projection: dict, origin: str,
@@ -766,21 +838,18 @@ def origin_status(window: tuple | None, origin: str) -> str | None:
 def output(window: tuple | None, assistant: dict, calls: list[dict],
            *, persist_reasoning: bool = False, model: str | None = None) -> str | None:
     reasoning = assistant.get("reasoning_content")
+    # WHY: One durable output shape also covers direct Python callers without
+    # inventing provider call ids; only model-tagged rows may be native-paired.
+    values = {"assistant": {"role": assistant.get("role", "assistant"),
+                            "content": assistant.get("content", "")}}
     if model is not None:
-        # WHY: The provider's original assistant shape is the only durable
-        # execution transcript. body/actions are reconstructed by _apply for
-        # coverage and older readers, rather than written as a second version.
-        values = {"model": model, "protocol": "openai_chat_completions",
-                  "assistant": {key: assistant[key] for key in
-                                ("role", "content", "reasoning_content") if key in assistant}}
-        if calls:
-            values["assistant"]["tool_calls"] = calls
-    else:
-        values = {"body": assistant.get("content", ""),
-                  "thought_present": bool(reasoning),
-                  "actions": [call["function"] for call in calls]}
-        if persist_reasoning and isinstance(reasoning, str) and reasoning:
-            values["thought"] = reasoning
+        values.update(model=model, protocol="openai_chat_completions")
+    if calls:
+        values["assistant"]["tool_calls"] = calls
+    if persist_reasoning and isinstance(reasoning, str) and reasoning:
+        values["assistant"]["reasoning_content"] = reasoning
+    elif model is not None and "reasoning_content" in assistant:
+        values["assistant"]["reasoning_content"] = reasoning
     recorded = _register(window, "output", **values)
     return recorded["id"] if recorded else None
 
@@ -793,9 +862,8 @@ def events(window: tuple | None, include_condensed: bool = False) -> list[dict]:
     with _lock:
         _restore()
         return [item for item in _windows.get(tuple(window or ()), ())
-                if not item.get("hidden")
-                and (include_condensed or (not item.get("condensed")
-                                           and item["id"] not in _covered.get(tuple(window or ()), ())))]
+                if (include_condensed or (not item.get("hidden")
+                                          and item["id"] not in _covered.get(tuple(window or ()), ())))]
 
 
 def covered(window: tuple | None) -> set[str]:
@@ -895,8 +963,7 @@ def cover(window: tuple, node: str, ids: Iterable[str], visible: set[str]) -> se
             if (entry is None or not _accessible(window, entry)
                     or (event_id not in visible and event_id not in _covered.get(window, ())
                         and not (window == AGENT_WINDOW and event_id in _covered.get(tuple(entry["window"]), ())))
-                    or entry.get("hidden")
-                    or entry.get("condensed") or (entry["kind"] == "input" and entry.get("projection") is None)):
+                    or entry.get("hidden") or (entry["kind"] == "input" and entry.get("projection") is None)):
                 raise ValueError(f"覆盖成员不在当前主窗口可见已读流中: {event_id}")
         _append({"kind": "cover", "window": list(window), "node": node,
                  "members": sorted(closure)}, datetime.now().strftime("%Y%m%d"))

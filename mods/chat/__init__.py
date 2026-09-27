@@ -495,6 +495,7 @@ def chat(model: str | None = None) -> None:
     window = history.window(event)
     if window is None:
         return
+    oplog.ensure_available()
     _agent._drive_agent(model, window)
 
 
@@ -502,6 +503,7 @@ def run_offline(model: str, window: tuple, *, fact: str, registry,
                 on_chunk: Callable, persist_reasoning: bool,
                 send_context, send_sink: Callable) -> None:
     """Drive the production reader with an explicit temporary replay scope."""
+    oplog.ensure_available()
     scope = _offline_scope.set({"model": model, "fact": fact,
                                 "persist_reasoning": persist_reasoning,
                                 "registry": registry, "on_chunk": on_chunk})
@@ -543,17 +545,23 @@ def record_event(event: dict, write: Callable[[], object]) -> object:
         result = write()
         if result is None:
             return result
-        message_id = (event.get("message_id") if event.get("post_type") in ("message", "message_sent")
-                      else None)
-        arrival = (oplog.pending_message(window, message_id, event.get("time"),
-                                         event.get("message_seq")) if message_id is not None else None)
-        if arrival is None and message_id is not None and oplog.message_seen(
-                window, message_id, event.get("time"), event.get("message_seq")):
-            from mods import chatlog
+        try:
+            message_id = (event.get("message_id") if event.get("post_type") in ("message", "message_sent")
+                          else None)
+            arrival = (oplog.pending_message(window, message_id, event.get("time"),
+                                             event.get("message_seq")) if message_id is not None else None)
+            if arrival is None and message_id is not None and oplog.message_seen(
+                    window, message_id, event.get("time"), event.get("message_seq")):
+                from mods import chatlog
 
-            chatlog.consume_origin(event)
-        elif arrival is None:
-            arrival = oplog.arrive(window, event)
+                chatlog.consume_origin(event)
+            elif arrival is None:
+                arrival = oplog.arrive(window, event)
+        except oplog.FormatRestoreError:
+            # WHY: The explicit maintenance routes run after chat recording.
+            # An unreadable journal disables agent mail, not .py/.reboot.
+            context.remember_arrival(event, None)
+            return result
         context.remember_arrival(event, arrival)
         return result
 
