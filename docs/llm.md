@@ -262,7 +262,7 @@ Chat.chat
 
 入站不被生成挡住：link 独立运行，消息照常在 `oplog` 登记为各窗口未读。过去每窗口各有 reader；现在全 Bot 只有一个中心 reader，另一次召唤加入通知，不并发生成。
 
-中心 reader 登记在 `context.WindowTurn` 的 `AGENT_WINDOW` 键下；各来源窗口的有序未读成员只由 `oplog` 的 arrival、input 和 `mark_read` 事实决定，`context.Mailbox` 已删除。`context.window_lock` 串行化同窗口的 chatlog/history 写入、arrival 与正式消费；路由期间的事件对象→arrival 关联由 `context.remember_arrival`／`event_arrival`／`release_arrival` 临时保存，不写进事件 dict。通知递交、未读正文与正式 input 各有日志事实，不以一个红点代替；source 页内任意已读坐标从 input/source journal 派生。相关窗口的群友可用 `^C` 取消共享请求，未读与其它窗口的通知仍留在信息流里。
+中心 reader 登记在 `context.WindowTurn` 的 `AGENT_WINDOW` 键下；各来源窗口的有序未读成员只由 `oplog` 的 arrival、input 和 `mark_read` 事实决定，`context.Mailbox` 已删除。`context.window_lock` 串行化同窗口的 chatlog/history 写入、arrival 与正式消费；图片描述网络 I/O 在锁外完成，提交前重新取锁核验未读成员；路由期间的事件对象→arrival 关联由 `context.remember_arrival`／`event_arrival`／`release_arrival` 临时保存，不写进事件 dict。通知递交、未读正文与正式 input 各有日志事实，不以一个红点代替；source 页内任意已读坐标从 input/source journal 派生。相关窗口的群友可用 `^C` 取消共享请求，未读与其它窗口的通知仍留在信息流里。
 
 - **先接纳，后阅读。** 路由在同一窗口锁内写 chatlog/history 与 arrival；Bot 的 `message_sent` 回声也入列，但不再执行命令。中心开局只递交不含正文的通知，既不偷读末段，也不把未读整段追加。
 - **未读集合与档案分开。** `take(source, start=1, count=8)` 按工具执行时当前未读的 1-based 序号选择连续范围；已读与跳过不计数，`ids`、`arrival`、`origin`、`message_id` 是高级精确入口；`mentions(source)` 选至多 500 条未读提及，`pull(source, count)` 是前缀薄别名。`mark_read(source)` 将调用时已有成员设为已读而不生成 input。`read_messages` 按窗口内 `message_id` 或 `origin` 选前后文；R 只确认安排，同一批的全部阅读在下一请求进入同一全文 input 路径，命中未读成员时一并消费。`recall_events` 仍直接同步返回 R，不进入未读集合、不分页。

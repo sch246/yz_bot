@@ -255,7 +255,7 @@ def _agent_provider(turn, session: llm.Chat):
                                      f"{window} 正式阅读部分失败："
                                      f"本次已兑现 {len(pulled)} 条，"
                                      f"尚未兑现 {len(remaining)} 条；{error}。"
-                                     "原计划停止，未兑现成员仍未读；请重新选择，"
+                                     "原计划停止，未兑现成员状态可能已变化；请重新查询再选择，"
                                      "或用 read_messages 查档案。"})
             binding = session.tool_binding
             binding.sync_registry()
