@@ -527,12 +527,16 @@ def _mail_candidate(event: dict) -> bool:
         return False
     if msgs.is_msg(event):
         return True
+    if msgs.is_recall(event):
+        return True
     return _view._is_context_poke(event, event.get("group_id") is not None)
 
 
 def record_event(event: dict, write: Callable[[], object]) -> object:
     """Write chat history and register the arrival under one window lock."""
     window = history.window(event)
+    if window is None and msgs.is_friend_recall(event) and event.get("user_id") is not None:
+        window = ("private", event["user_id"])
     if window is None or not _mail_candidate(event):
         return write()
     with context.window_lock(window):

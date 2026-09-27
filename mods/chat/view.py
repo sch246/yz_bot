@@ -110,6 +110,13 @@ def event2chat(event: dict, in_group: bool) -> dict:
     """
     if msgs.is_msg(event):
         return msg2chat(event, in_group)
+    if msgs.is_recall(event):
+        window = (("group", event["group_id"]) if in_group
+                  else ("private", event.get("target_id", event.get("user_id"))))
+        operator = event.get("operator_id", event.get("user_id"))
+        return {"role": "user", "content":
+                f"【撤回事件 {window}】操作者={operator} 作者={event.get('user_id')} "
+                f"时间={event.get('time')} 消息号={event.get('message_id')}"}
     kind = "群聊事件" if in_group else "私聊事件"
     return {"role": "user", "content": f"【{kind} {history.window(event)}】{_poke_text(event)}"}
 
@@ -120,7 +127,7 @@ def _model_event(event: dict, in_group: bool) -> dict | None:
         value = msgs.body(event)
         if value.startswith("#"):
             return None
-    elif not _is_context_poke(event, in_group):
+    elif not (msgs.is_recall(event) or _is_context_poke(event, in_group)):
         return None
     return event2chat(event, in_group)
 
@@ -264,7 +271,6 @@ def _stream_rows(window: tuple | None, token_limit: int | None,
                  ) -> tuple[list[tuple[dict, dict]], int, bool]:
     """Select one visible suffix by event count and projected token cost."""
     entries = oplog.events(window)
-    recalled_by_window: dict[tuple, set[str]] = {}
     links = oplog.say_links(window)
     picked: list[tuple[dict, dict]] = []
     used = 0
@@ -308,16 +314,6 @@ def _stream_rows(window: tuple | None, token_limit: int | None,
             projection = entry.get("projection")
             if projection is None:
                 continue
-            message_id = entry["event"].get("message_id")
-            if message_id is not None and window is not None:
-                from mods import chatlog
-
-                source_window = tuple(entry.get("source_window") or window)
-                if source_window not in recalled_by_window:
-                    recalled_by_window[source_window] = chatlog.recalled_ids(*source_window)
-                recalled = recalled_by_window[source_window]
-                if chatlog.recall_key(message_id) in recalled:
-                    continue
             converted = _numbered(projection, entry["id"])
             converted = _echo_relation(converted, entry, links)
         elif entry["kind"] == "output":
