@@ -137,8 +137,8 @@ def _unread_detail_text(detail: dict, *, include_wakes: bool = True) -> str:
     target = ("g" if window[0] == "group" else "u") + str(window[1])
     sources = ""
     if include_wakes:
-        # WHY: notification 会持久化当时的 unread 快照；旧快照没有 ordinal，
-        # 而且重建历史通知时本就不展示这份已过期的唤醒位置。
+        # WHY: 旧 notification 持久化过 unread 快照，且旧快照没有 ordinal；
+        # 重建它时不展示这份已过期的唤醒位置。
         sources = ", ".join(
             f"{item['kind']}"
             + (f" 作者={item['user_id']}" if item.get("user_id") is not None else "")
@@ -165,6 +165,13 @@ def _remember_stream(session, message: dict, event_id: str) -> None:
 
 
 def _notification_projection(entry: dict) -> dict:
+    if entry.get("version") == 2:
+        lines = "\n".join(_activation_text(item) for item in entry["activations"])
+        return {"role": "user", "content": f"[{entry['id']}] 新召唤通知：\n{lines}"}
+    return _legacy_notification_projection(entry)
+
+
+def _legacy_notification_projection(entry: dict) -> dict:
     details = entry.get("unread", ())
     if details:
         shown = []

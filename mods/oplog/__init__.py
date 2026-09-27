@@ -549,34 +549,28 @@ def acknowledge_notification(event_id: str) -> None:
 
 
 def deliver_notifications(agent_window: tuple) -> dict | None:
-    """Offer the current unread-activation snapshot as a numbered notice."""
+    """Offer only newly activated arrivals, retrying any unacknowledged notice."""
     with _lock:
         _restore()
         for entry in _windows.get(agent_window, ()):
             if entry["kind"] == "notification" and not entry.get("acknowledged"):
                 return entry
-        activated = []
         newly_activated = []
-        latest: dict[tuple, str] = {}
         for entry in _pending.values():
-            latest[tuple(entry["window"])] = entry["arrival"]
-            if entry.get("activated"):
-                activated.append(entry)
-                if entry["arrival"] not in _notified:
-                    newly_activated.append(entry)
+            if entry.get("activated") and entry["arrival"] not in _notified:
+                newly_activated.append(entry)
         if not newly_activated:
             return None
-        windows = list(dict.fromkeys(tuple(entry["window"]) for entry in activated))
+        windows = list(dict.fromkeys(tuple(entry["window"]) for entry in newly_activated))
         return _register(agent_window, "notification",
+                         version=2,
                          arrivals=[entry["arrival"] for entry in newly_activated],
-                         through={str(window): latest[window] for window in windows},
                          windows=[list(window) for window in windows],
                          activations=[{"window": list(entry["window"]),
                                        "kind": entry.get("activation_kind", "wake"),
                                        "user_id": entry["event"].get("user_id"),
                                        "time": entry["event"].get("time")}
-                                      for entry in activated],
-                         unread=pending_details())
+                                      for entry in newly_activated])
 
 
 def latest_pending_arrival(window: tuple) -> str | None:
