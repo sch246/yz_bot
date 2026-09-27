@@ -716,6 +716,12 @@ def input(window: tuple | None, event: dict, projection: dict | None, arrival: s
                          read_by=read_by, read_via=read_via)
 
 
+def input_tools(window: tuple, content: str) -> dict:
+    """Append tool state as an ordinary formal input, without an unread source."""
+    return _register(window, "input", event={"type": "tools", "content": content},
+                     projection={"role": "user", "content": content})
+
+
 def input_archive(window: tuple, event: dict, projection: dict, origin: str,
                   source_window: tuple, *, arrival: str | None = None,
                   source: str | None = None, page: int | None = None,

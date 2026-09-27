@@ -213,13 +213,11 @@ def init_chat(
     prompts["base"] = _view._base_prompt()
     state = {"role": "system", "content": "你是唯一的中心 agent；窗口只是来源与明确发送目标。"}
     offline = _offline_scope.get()
-    tool_context = tool_modules.create_context_message(registry=offline["registry"] if offline else None)
     window = AGENT_WINDOW
     session.set_messages([
         *get_prompt(),
         *prompts["base"],
         *([{"role": "system", "content": offline["fact"]}] if offline else []),
-        tool_context,
         state,
         *(messages or []),
     ])
@@ -233,11 +231,13 @@ def init_chat(
     # 一次被调用的时刻，所以 bind 出来的那个对象要一直拿着，供 `_stream_results` 上报。
     binding = tool_modules.bind_session(
         session,
-        tool_context,
+        None,
         registry=offline["registry"] if offline else None,
         visible=(lambda name, module: name not in {"baidumap", "dianping"}
                  and tool_modules.bot_op_tool_visible(name, module)) if not offline else None,
         persist=_persist_modules,
+        schema_modules=_schema_modules(),
+        persist_schema=_persist_schema_modules,
     )
     return binding, window
 
@@ -254,6 +254,8 @@ def _activate_chat(
     binding, window = init_chat(session, messages)
     session.reads_window_mail = True
     _restore_agent_tools(binding)
+    binding.restore_schema()
+    session.tool_binding = binding
     session.add_hint(lambda: _agent_hint())
     session.add_hint("对外说话必须实际调用 say；回复正文只是自言自语，不会发送到聊天窗口。")
     # WHY: 工具恢复可能持久化 ttl 回收；它必须先于其余全局设置读取，避免无关的配置异常
@@ -280,10 +282,7 @@ def _restore_agent_tools(binding) -> None:
     now，空闲回收在那条路上恒为空操作。子代理只借用「静默装回、不发通告」，没有生命周期
     含义，把它也卷进来只会让接管时机的那一步多一个不相干的调用点。
 
-    WHY: 空映射时不调用，**这个条件是照搬的**，不是新加的判断。核实过它此刻
-    并不承重：刚 bind 完 `_dirty` 是 False，空输入下 `kept == requested == []`，所以
-    `restore` 既不会 `_save_active` 也不会 `_queue_reclaimed`，只是把 `_render_context`
-    幂等地重算一遍。继续保留这个条件，是为了只迁移副作用的归属，不同时改变空名单语义。
+    WHY: 空映射时不调用是保留的旧边界；没有名单就不产生恢复写入。
     """
     modules = _active_modules()
     if modules:
@@ -375,6 +374,18 @@ def set_agent_hint(text: str) -> None:
 
 # 会话主体持久激活的工具模块名，以及各自最后一次被调用的时刻。
 _ACTIVE_MODULES_KEY = "active_tools"
+_SCHEMA_MODULES_KEY = "tool_schema_modules"
+_TOLD_TOOLS_KEY = "tool_state_told"
+
+
+def _schema_modules() -> list[str]:
+    value = storage.get("", "agent").get(_SCHEMA_MODULES_KEY, [])
+    return [name for name in value if isinstance(name, str)] if isinstance(value, list) else []
+
+
+def _persist_schema_modules(names: list[str]) -> None:
+    storage.get("", "agent")[_SCHEMA_MODULES_KEY] = list(names)
+    storage.save()
 
 
 def _active_modules() -> dict[str, float]:
@@ -418,6 +429,7 @@ def _persist_modules(stamps: dict[str, float]) -> None:
         data[_ACTIVE_MODULES_KEY] = {name: float(stamp) for name, stamp in stamps.items()}
     else:
         data.pop(_ACTIVE_MODULES_KEY, None)
+    storage.save()
 
 
 def _hint_effective(default: dict, chat_hint: dict | None) -> dict:

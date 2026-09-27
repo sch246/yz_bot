@@ -256,6 +256,20 @@ def _agent_provider(turn, session: llm.Chat):
                                      f"尚未兑现 {len(remaining)} 条；{error}。"
                                      "原计划停止，未兑现成员仍未读；请重新选择，"
                                      "或用 read_messages 查档案。"})
+            binding = session.tool_binding
+            data = _chat_root.storage.get("", "agent")
+            if data.get("history_start") == getattr(turn, "history_start", None):
+                previous = data.get(_chat_root._TOLD_TOOLS_KEY)
+                current = binding.state_snapshot()
+                if previous != current:
+                    content = binding.state_text(previous if isinstance(previous, dict) else None)
+                    if content:
+                        entry = oplog.input_tools(_chat_root.AGENT_WINDOW, content)
+                        projection = _view._numbered(entry["projection"], entry["id"])
+                        produced.append(projection)
+                        _view._remember_stream(session, projection, entry["id"])
+                    data[_chat_root._TOLD_TOOLS_KEY] = current
+                    _chat_root.storage.save()
             turn._chat_usage_tokens = sum(
                 _view._message_cost(message) for message in [*session.messages, *produced]
                 if _stream_id(session, message) is not None

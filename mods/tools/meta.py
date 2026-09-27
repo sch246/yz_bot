@@ -215,7 +215,7 @@ def exec_code(expr: str, code: str, timeout: float) -> str:
 
 
 def list_tools() -> str:
-    """列出 last-good 模块、当前会话的激活状态、空闲回收时限、磁盘差异和最近失败；查可用模块名先调用它。"""
+    """列出完整当前工具状态（目录、已激活说明）、空闲回收、磁盘差异和最近失败；查可用模块名先调用它。"""
     return current_binding().list_text()
 
 

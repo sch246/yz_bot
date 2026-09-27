@@ -280,6 +280,8 @@ def _subcommand(value: str):
     data = storage.get("", "agent")
     if name == "reset_start" and not tail:
         data.pop("history_start", None)
+        data.pop(_chat_root._TOLD_TOOLS_KEY, None)
+        data.pop(_chat_root._SCHEMA_MODULES_KEY, None)
         storage.save()
         return "已安排在下一次激活时重选中心历史起点"
     if name == "help" and not tail:
