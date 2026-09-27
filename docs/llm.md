@@ -11,46 +11,50 @@
 - 戳一戳 Bot；
 - `#...` 控制命令。
 
-群聊只有群号位于 `chat_groups` 时才进入这条路径；私聊没有这层群白名单。普通 `#` 命令先由本地子命令解析，返回的 callable 直接执行而不请求模型；`#poke` 和不能解析成控制命令的普通触发才会进入聊天。`.chat` 则建立一次单句请求。
+群聊只有群号位于 `chat_groups` 时才进入这条路径；私聊没有这层群白名单。普通 `#` 命令先由本地子命令解析，返回的 callable 直接执行而不请求模型；`#poke` 和不能解析成控制命令的普通触发才会进入聊天。`.chat` 命令已删除，`.chattop` 月账命令仍保留。
 
 群内其它成员之间的戳一戳不会单独触发 LLM，但可登记为群聊未读，之后经正式阅读成为中心已读事件。因此“能被模型看见”与“立即触发模型”是两个不同边界。
 
-每次请求都会新建一个 `Chat` 对象，但共享进程级 `LLMClient`、供应商客户端和 storage。主聊天由唯一中心 reader 从全局已读信息流重建；`oplog` 是各来源窗口未读状态的唯一权威，chatlog 保存原始聊天档案。独立 `.chat` 仍是窗口内的单句请求。因此：
+中心设置命令直接使用 `#` 前缀，没有 `#agent` 层：`#model`、`#models`、`#prompt`、`#setting`、无参 `#image`、`#reasoning`、`#limit` 和 `#help` 可查看；`#use_model`、`#add_prompt`、`#use_setting`、`#set_setting`、`#del_setting`、`#reset_start`、带参数的 `#image`／`#reasoning`／`#limit` 修改全局设置，要求 op。`#add_prompt` 只接收显式列表。`#hint` 不属于这些全局聊天设置：它由 op 管理，可覆盖本窗口或全局默认，并在最初触发窗口的聊天循环停下时向 QQ 发送状态。
+
+每次中心请求都会新建一个 `Chat` 对象，但共享进程级 `LLMClient`、供应商客户端和 storage。主聊天由唯一中心 reader 从全局已读信息流重建；`oplog` 是各来源窗口未读状态的唯一权威，chatlog 保存原始聊天档案。因此：
 
 - 群聊和私聊消息在被中心 agent 实际阅读后进入同一条全局经历；
 - 来源窗口和私聊身份始终保留在输入元数据里，`say` 必须明确目标；
-- 主模型、prompt、图片档位、工具状态和预算从全局 `agent` 设置读取；旧窗口设置原样保留，独立 `.chat` 仍可读取其窗口配置；
+- 主模型、prompt、图片档位、工具状态和预算只从全局 `agent` 设置读取；旧窗口聊天设置不再读取；每窗口 `#hint` 独立保留；
 - 主模型运行时不把某个群友事件当作隐式当前窗口；窗口相关工具须显式给目标或不在中心会话中启用。
 
 ## 上下文如何组装
 
-中心 reader 首次激活时，从 `AGENT_WINDOW` 的统一已读流按 `max_events` 与 `max_token` 选最新可见后缀，将起点持久保存为全局 `agent.history_start`；空历史也保存已选择状态，最新单条超限仍至少纳入该条，起点不拆开原生 O/R。之后每次激活（含重启后）从固定起点显示全部可见经历，不再按上限自动滑窗；覆盖仍隐藏原文，起点事件即使后来被覆盖也不重选。op 用 `#agent reset_start` 安排**下一次激活**重选，当前轮不变。默认上限为 500 条／40000 token；`#limit` 或 `#agent limit` 修改同一份全局设置，但单改上限不重选已有起点。旧窗口覆盖保留原数据，只供独立 `.chat` 读取。`聊天开始／结束`是普通内容。`get_msgs()` 保留为窗口级辅助查询，不是中心开局的读取入口。
+中心 reader 首次激活时，从 `AGENT_WINDOW` 的统一已读流按 `max_events` 与 `max_token` 选最新可见后缀，将起点持久保存为全局 `agent.history_start`；空历史也保存已选择状态，最新单条超限仍至少纳入该条，起点不拆开原生 O/R。之后每次激活（含重启后）从固定起点显示全部可见经历，不再按上限自动滑窗；覆盖仍隐藏原文，起点事件即使后来被覆盖也不重选。op 用 `#reset_start` 安排**下一次激活**重选，当前轮不变。默认上限为 500 条／40000 token；`#limit` 修改全局设置，但单改上限不重选已有起点。旧窗口聊天设置保留原数据但不再读取。`聊天开始／结束`是普通内容。
 
-中心 agent 可用 `cover_events(ids, conclusion)` 将已读正式号归入本次行动的结论，节点沿用输出号和行动位置。显式调用如 `cover_events(["20260923-4", "20260923-5"], "结论")`；范围调用如 `cover_events(ids=[], conclusion="结论", anchor="20260923-4", before=2, after=3, kinds="input")`，或改用 `start`／`end`。`ids=[]` 是当前工具 schema 为保留旧位置参数而要求的范围写法。覆盖范围没有条数上限；成员可跨来源窗口，也可重复被不同节点覆盖。首次覆盖仍须在当前已读可见流中，旧号经明确 `recall_events` 且整段结果进入模型后也可点名。输出与整批返回保持强绑定，say 回声可单独覆盖，冻结的 `<sent_by>` 引用仍保留：筛选只选种子，实际闭包可越过范围、种类和来源；任一最终成员不可覆盖则整次失败，不自动补入未读成员或静默删成员。覆盖只改变默认投影，不删原文或原号；`recall_events` 可按原号反查实际冻结成员。独立 `.chat` 和子代理不能提交中心覆盖。
+中心 agent 可用 `cover_events(ids, conclusion)` 将已读正式号归入本次行动的结论，节点沿用输出号和行动位置。显式调用如 `cover_events(["20260923-4", "20260923-5"], "结论")`；范围调用如 `cover_events(ids=[], conclusion="结论", anchor="20260923-4", before=2, after=3, kinds="input")`，或改用 `start`／`end`。`ids=[]` 是当前工具 schema 为保留旧位置参数而要求的范围写法。覆盖范围没有条数上限；成员可跨来源窗口，也可重复被不同节点覆盖。首次覆盖仍须在当前已读可见流中，旧号经明确 `recall_events` 且整段结果进入模型后也可点名。输出与整批返回保持强绑定，say 回声可单独覆盖，冻结的 `<sent_by>` 引用仍保留：筛选只选种子，实际闭包可越过范围、种类和来源；任一最终成员不可覆盖则整次失败，不自动补入未读成员或静默删成员。覆盖只改变默认投影，不删原文或原号；`recall_events` 可按原号反查实际冻结成员。子代理不能提交中心覆盖。
 
-覆盖成员允许多重归属：同一正式事件可成为多个结论节点的成员。`_covered` 只是默认隐藏并集，节点各自冻结实际成员；重复引用不解除隐藏。中心 agent 可跨窗口引用旧号，但私有 `.chat` 仍只访问自身窗口。强绑定闭包和未完成行动检查不因跨窗口而放松。
+覆盖成员允许多重归属：同一正式事件可成为多个结论节点的成员。`_covered` 只是默认隐藏并集，节点各自冻结实际成员；重复引用不解除隐藏。中心 agent 可跨窗口引用旧号。一次输出与其全部结果仍需成组覆盖，以保护原生工具配对；say 回声不在这个闭包里，能单独覆盖。未完成行动检查不因跨窗口而放松。
 
-`oplog` 从已登记输入的模型可见文本、输出正文与行动参数、返回参数与正文中识别当时已存在的正式号；中心输出允许指向旧窗口号，私有记录仍受窗口限制。`event_links(ids)` 或 `event_links(anchor="20260923-4", before=2, after=2, kinds="result")` 可查看一跳文本引用、被引用者、覆盖成员／所属节点、结果来源及输出 `reads`（从各 input 的 `read_by` 派生的实际读入号，不按输出后位置猜测）。筛选只限制查询根，邻接边完整返回；它不读取正文，也不授予覆盖信用。覆盖、文本出现编号与某结论的真实依据是不同关系；搜索树可沿节点 `Y` 的覆盖成员找到返回 `R`，再沿 `R` 的文本引用找到旧记录 `E`。这里尚不实现自动退休、高度计算或语义证据核验；私有窗口的邻居可见性暂不随选择器改变。
+`oplog` 从已登记输入的模型可见文本、输出正文与行动参数、返回参数与正文中识别当时已存在的正式号；中心输出允许指向旧窗口号，旧窗口正式号保留原身份。`event_links(ids)` 或 `event_links(anchor="20260923-4", before=2, after=2, kinds="result")` 可查看一跳文本引用、被引用者、覆盖成员／所属节点、结果来源及输出 `reads`（从各 input 的 `read_by` 派生的实际读入号，不按输出后位置猜测）。筛选只限制查询根，邻接边完整返回；它不读取正文，也不授予覆盖信用。覆盖、文本出现编号与某结论的真实依据是不同关系；搜索树可沿节点 `Y` 的覆盖成员找到返回 `R`，再沿 `R` 的文本引用找到旧记录 `E`。这里尚不实现自动退休、高度计算或语义证据核验。
 
 `recall_events`、`event_links`、`cover_events` 共用正式事件选择：显式 `ids`、`anchor` 加前后数量，或同时给 `start`／`end`，三者只能选一种。范围沿 `oplog._events` 的唯一已读追加顺序含端点解析出实际 IDs，不设条数上限；`kinds` 和 `source` 随后才过滤，不重排，也不按筛选命中补足。缺选择器、混用、不完整区间、非法种类或来源都会报错。`recall_events(start="20260923-4", end="20260923-8")` 直接返回解析后的完整事件及冻结的 `resolved_ids`，含已覆盖或旧版已收缩的可读事件；它不进入未读信源、不按字符分页，也不拆成多条模型消息。`take` 消耗选中的未读成员，并给世界事件正式 input 号；反查则由当前输出 `O` 发起行动，旧内容随新的工具 result 事件 `R` 入流，`R` 的文本引用旧事件 `E`（`O → R → E`）。旧 `E` 不移动、不复制、不重新编号，也不消耗未读成员。通常总结这次探索时覆盖 recall 的 `O/R`，结论再引用旧号，形成“结论 → 回看结果 → 旧事件”；完整回看后也允许直接覆盖旧 `E`，但那是另一次明确选择。覆盖可见性信用只在整个工具结果实际进入模型后按返回的 `resolved_ids` 授予，不在工具执行时提前授予。选择器不扩展到聊天档案或未读信源。
 
 一次模型输出的全部同步工具返回完成时立即登记一个普通 result R；正常下一子请求先追加当前会话暂存的完整 R 投影，再追加通知和显式阅读，不按同批工具数量均分、二次截断或自动分页。`take`、`pull`、`mentions` 与 `read_messages` 的 R 只确认安排、不带选中消息正文；同批安排的全部阅读在下一 provider 请求前按顺序逐条全文登记为正式 input，不因 token 预算截断、分批或报错。没有下一请求，安排不消费。每条新 input 保存并投影发起输出号 `read_by` 和实际公开工具名 `read_via`；同一输出的多个读取行动共用输出号，不用 `#位置` 作读取身份。跨过已读/跳过成员时，桥附属于新 input 的持久投影；已读桥保留旧正式号与冻结的完整投影，跳过桥没有旧 input 号并显示 `skipped_by`/`skipped_via=mark_read`。连续桥超过 5 条仅展示首尾及中间折叠数。旧 input 没有 provenance 字段时留空；旧 mark_read 跳过桥没有发起输出号时显示 `skipped_by=unknown`，不伪装成未读。`recall_events` 仍同步返回完整旧经历，同一输出里的工具彼此看不到结果。若 `say(final_call=true)` 结束、请求取消或失败，不为结果强迫续轮，也不做交付确认；下次激活从固定历史起点重建，已覆盖或在起点之前的内容需要时可用 `recall_events` 主动反查。极窄取消窗口可能让模型没读到已经登记的 R。`mark_read` 保存发起输出号并跳过当前成员，不产生 input；之后仍可用 `read_messages` 再次阅读 chatlog。
 
-中心 reader 每次请求前估算实际送达的已编号事件文本成本；超过全局 `pressure_percent`（默认 75%，由 `#agent limit` 的第三项设置）时，在模型可见末尾 hint 显示“上下文占用 {已用}/{上限} token”。达到 `max_token` 时改为明确要求先用 `cover_events` 压缩已读经历、再做别的事；这只是提示，不拦截工具，也不自动裁剪历史。它不计事件条数，不是聊天结束后向 QQ 发状态的 `#hint`；这里的 token 是本地文本估算，不等于 API 实际使用量。
+中心 reader 每次请求前估算实际送达的已编号事件文本成本；超过全局 `pressure_percent`（默认 75%，由 `#limit` 的第三项设置）时，在模型可见末尾 hint 显示“上下文占用 {已用}/{上限} token”。达到 `max_token` 时改为明确要求先用 `cover_events` 压缩已读经历、再做别的事；这只是提示，不拦截工具，也不自动裁剪历史。它不计事件条数，不是聊天结束后向 QQ 发状态的 `#hint`；这里的 token 是本地文本估算，不等于 API 实际使用量。
 
 中心 agent 可调用 `edit_hint(text)` 整体替换全局待办，空字符串清空；文本以 `agent_hint` 存在全局 `agent` storage。每次模型子请求从该值重新生成末尾 hint，历史中不追加旧版文本（工具行动本身仍留痕），也不会发 QQ 消息。同一模型输出中多个工具调用的参数已一起生成，彼此看不到结果；不能在同批 `edit_hint` 中宣称前面的 `cover_events` 已成功，须等返回进入下一子请求再更新依赖结果的待办。动态未读概况和压力提示是另外两段可重算 hint；向 QQ 发结束状态的 `#hint` 命令仍按来源窗口配置。
 
 构建时会：
 
-1. 跳过以 `#` 开头的本地控制消息和无关 notice。`#` 是一条跨模块约定：LLM 失败信息（`llm.Chat.chat`）、`.py` 与 link action 的 traceback、`#` 子命令的输出都以它开头，`chat.get_msgs` 据此把它们排除，使调试输出不回流进模型——它们占 token，还会让模型看到自己的错误堆栈。过滤对所有发送者一视同仁，Bot 自己发的与用户发的 `#help` 一样不进上下文。改任何一个生产端的前缀都会让那类输出开始回流，且不会报错；
+1. 跳过以 `#` 开头的本地控制消息和无关 notice。`#` 是一条跨模块约定：LLM 失败信息（`llm.Chat.chat`）、`.py` 与 link action 的 traceback、`#` 子命令的输出都以它开头，`chat.view._model_event` 据此把它们排除，使调试输出不回流进模型——它们占 token，还会让模型看到自己的错误堆栈。过滤对所有发送者一视同仁，Bot 自己发的与用户发的 `#help` 一样不进上下文。改任何一个生产端的前缀都会让那类输出开始回流，且不会报错；
 2. 将“聊天开始”或“聊天结束”作为普通消息，不改变回看范围；
-3. 用 `msg2chat()` 将普通 OneBot 事件投影为 `role=user`，显示来源窗口、作者、名字、时间、消息 ID 和可用的档案位置；缺失时间标为未知，不猜。Bot 的 `say` 动作与随后 QQ 回声是两次经历，按唯一 `message_id` 确认关联，不伪装成同一次输出；
-4. 群聊中所有戳一戳、私聊中只有戳 Bot 的事件，会复用 chatlog 的姓名/群名片格式生成 `role=user` 的本地事件文本；
-5. 普通消息和戳一戳事件在首次选定历史起点时共同参与 `max_events`／`max_token` 选择；之后不因超限自动裁剪。
+3. 用 `msg2chat()` 将普通 OneBot 事件投影为 `role=user`，显示来源窗口、作者、名字、时间、消息 ID 和可用的档案位置；缺失时间标为未知，不猜。Bot 的 `say` 动作与随后 QQ 回声是两次经历；同目标窗口且唯一匹配已登记 say 返回的 live/source 回声，在正式读入时冻结 `<sent_by>行动号</sent_by>`，档案重读与不唯一匹配不写，以后也不回填；
+4. 群聊中所有戳一戳、私聊中只有戳 Bot 的事件，以及撤回通知，在正式阅读时投影为新的 `role=user` 事件；撤回只改变近期窗口的展示，已读 input 不会被反向删除；
+5. 普通消息、戳一戳和撤回在正式阅读后共同参与首次历史起点选择；之后不因超限自动裁剪。
 
 `init_chat()` 装配主设置选定的提示词、base、中心 agent 身份说明与从固定起点开始的全局已读流；`_activate_chat()` 从全局 `agent.active_tools` 恢复实际加载状态。工具说明在请求前进入正式 input，不放开头。`recall_events` 同步返回正文；`take`、`mentions`、`read_messages` 只在下一安全子请求边界追加正式 input，通知不含未读正文。
 
-中心主聊天的图片档位由 `#agent image <mode>` 全局设置；旧窗口 `#image` 仍可用于独立窗口会话。名称与数字别名分别为 `off/0`、`lazy/1`、`eager/2`；历史布尔值兼容为 `False → off`、`True → lazy`。`off` 会把历史消息中的图片 part 降级为 `[图片(URI)]` 文本：避免把 `image_url` 发给纯文本模型。`recognize_image` 对独立 `.chat` 或显式加载 image 模块的会话仍可用；中心 agent 当前隐藏整个 image 模块，因为生图函数仍依赖隐式当前窗口，不能说中心模型可按需调用识别工具。`lazy` 只在 LLM 聊天实际触发时处理本轮上下文中的图片；**一次对话内同一张图只解析一次**——这里的“一次对话”指 `chat.chat()` 的一次持有（多轮工具调用与插话续写都算同一轮，直到它的 `finally`），解析失败的不再逐轮重试（腾讯 `rkey` 过期后只会拿到 HTML），成功的也直接复用，对话结束后重新聊会重新检查。这项检查台账挂在线程局部，eager 预取与 `.chat` 单句各记各的。`eager` 在图片消息到达时立即启动后台下载：中心聊天模型能直接读图时只缓存原图，纯文本模型才会同时预生成文字描述。同一来源若恰好同时被 eager 和聊天请求，描述生成会等待同一个进行中任务，避免重复计费。纯文本模型的识别结果统一压成一个 `[图片(URI)识别结果：描述]` 文本 part，明确 URL 与描述属于同一张图片；视觉模型收到的实际图片 part 前会保留一段“下方图片的原始链接”文本。图片加载失败或没有可用视觉模型时也使用同一个带 URI 的单段格式。
+中心主聊天的图片档位由 op 用 `#image <mode>` 全局设置。名称与数字别名分别为 `off/0`、`lazy/1`、`eager/2`；历史布尔值兼容为 `False → off`、`True → lazy`。`off` 会把历史消息中的图片 part 降级为 `[图片(URI)]` 文本：避免把 `image_url` 发给纯文本模型。中心 agent 可按需加载 `image` 模块：`recognize_image` 不依赖窗口，生图返回临时文件 URI，由模型再用带显式目标的 `say` 发送。`lazy` 只在 LLM 聊天实际触发时处理本轮上下文中的图片；**一次对话内同一张图只解析一次**——这里的“一次对话”指 `chat.chat()` 的一次持有（多轮工具调用与插话续写都算同一轮，直到它的 `finally`），解析失败的不再逐轮重试（腾讯 `rkey` 过期后只会拿到 HTML），成功的也直接复用，对话结束后重新聊会重新检查。这项检查台账挂在线程局部，eager 预取另在线程记账。`eager` 在图片消息到达时立即启动后台下载：中心聊天模型能直接读图时只缓存原图，纯文本模型才会同时预生成文字描述。同一来源若恰好同时被 eager 和聊天请求，描述生成会等待同一个进行中任务，避免重复计费。纯文本模型的识别结果统一压成一个 `[图片(URI)识别结果：描述]` 文本 part，明确 URL 与描述属于同一张图片；视觉模型收到的实际图片 part 前会保留一段“下方图片的原始链接”文本。图片加载失败或没有可用视觉模型时也使用同一个带 URI 的单段格式。
+
+纯文本模型的描述模式在**正式阅读 input 提交时**转换并冻结描述文本或失败占位；之后重建该 input 直接使用持久投影，不随描述缓存过期、重启或源文件变化重算。阅读采用两阶段：窗口锁内选定成员，锁外完成可能访问网络的视觉 I/O，再取锁复核成员坐标并提交 input，避免视觉等待堵住同窗口入站和 `^C`。视觉模型直看图片的模式仍可能因原图缓存过期而改变再次发送的图片内容，这属于已接受的缓存例外。`attach_image` 在不支持工具结果带图的模型上只把附图保留于当前子请求，不进 oplog。
 
 自动描述使用固定 prompt，要求直接概括可见内容、转录重要文字、标明不确定项，并禁止“如果你愿意我还可以……”一类元话术。自动聊天图片处理、eager 预取、`recognize_image` 和参考图生图共用图片解析入口：`http://`、`https://` 和本机绝对 `file://` URI 都解析为 SHA-256 内容身份；网络图片按摘要缓存在 `data/tmp_files`，本地文件只计算摘要而不复制。所有入口都执行图片格式和 20 MiB 上限校验。需要把图片交给视觉模型时，再统一由 `image_uri_to_data_uri` 编码。`recognize_image` 支持自定义识别 prompt，不设置输出 token 上限，也不读写自动描述缓存，避免长文本识别被截断以及不同识别任务互相串用答案。
 
@@ -76,7 +80,7 @@
 
 `price_fn` 是保存在 JSON 中的 Python 函数源码，必须定义 `price_fn(when, prices)` 并返回三项单价字典。`when` 是带 UTC 时区的请求发起时间，可用提供的 `ZoneInfo` 转为供应商时区；`prices` 是基础单价的副本，键为 `prompt_price`、`prompt_cached_price`、`completion_price`。函数可按任意条件计算；返回值必须保留三个键且是有限非负数。配置是 Bot 的宿主机信任域，函数会直接执行。DeepSeek 的默认函数见 `mods/llm/models.py`，含 2026 年假期日期；已有的 `llm_system/config` 不会自动合并默认函数。仍在运行旧代码的实例需要暂留 `off_peak` 供旧进程计价；新代码在有 `price_fn` 时只用函数，重启后可删掉旧字段。只有旧字段而没有函数时，新代码会明确报迁移错误。未来假期依官方公告更新该函数。[DeepSeek 价目](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)、[国务院 2026 年节假日安排](https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm)。
 
-当前窗口可以用 `#model` 和 `#models` 查看当前选择及其模型列表。`#use_model <provider>/<model>` 会保存一个完整模型选择，并且只以参数中第一个 `/` 为分隔，所以模型名本身可以继续包含 `/`；不带参数的 `#use_model` 重置该选择。只有**供应商**必须已配置：没有 base URL 与 API key 就不存在可调用的对象，命令会拒绝它。**模型不必登记在配置里**：未登记的 `provider/model` 原样下传，本地按「支持视觉与函数调用、价格 0」处理（`models.UNKNOWN_MODEL_CAPABILITIES`），模型是否真的存在由对端回答。所以打错的模型名拿到的是一条供应商报错，而不是本地的拒绝。`#models` 先向对端请求它当前提供的模型列表，取不到（网络、密钥或对端不实现 `/models`）就退回本地配置并在末尾说明已回退；本地没有元数据的行只显示名字（价格为 `-`），能力标记留空；价格列读的是「输入未命中 / 输入命中 / 输出」，显示按当前时刻调用 `price_fn` 后的单价。这些取舍见[模型选择的宽松解析](working/proposals/model-selection.md)。源码内的默认配置只用于首次创建空配置，不能代表当前设备正在使用的服务。
+任何聊天窗口都可用 `#model` 和 `#models` 查看全局选择及其模型列表；`#use_model` 修改全局选择时要求 op。`#use_model <provider>/<model>` 会保存一个完整模型选择，并且只以参数中第一个 `/` 为分隔，所以模型名本身可以继续包含 `/`；不带参数的 `#use_model` 重置该选择。只有**供应商**必须已配置：没有 base URL 与 API key 就不存在可调用的对象，命令会拒绝它。**模型不必登记在配置里**：未登记的 `provider/model` 原样下传，本地按「支持视觉与函数调用、价格 0」处理（`models.UNKNOWN_MODEL_CAPABILITIES`），模型是否真的存在由对端回答。所以打错的模型名拿到的是一条供应商报错，而不是本地的拒绝。`#models` 先向对端请求它当前提供的模型列表，取不到（网络、密钥或对端不实现 `/models`）就退回本地配置并在末尾说明已回退；本地没有元数据的行只显示名字（价格为 `-`），能力标记留空；价格列读的是「输入未命中 / 输入命中 / 输出」，显示按当前时刻调用 `price_fn` 后的单价。这些取舍见[模型选择的宽松解析](working/proposals/model-selection.md)。源码内的默认配置只用于首次创建空配置，不能代表当前设备正在使用的服务。
 
 运行中人工修改 `data/storage/llm_system/config.json` 后，只要对应内存仍等于 storage baseline，storage 自身的文件 watcher/轮询会把合法 JSON 原地载入内存字典；内存同时被改过时则拒绝覆盖。管理员仍可用 `storage.load('llm_system', 'config')` 明确强制选择磁盘版本。无论自动还是显式载入，都不会自动重建已经派生出的 provider 客户端；可以随后重启完成原子切换，或者对相关 `LLMClient` 实例显式调用 `reload_clients()`。
 
@@ -102,7 +106,7 @@
 | `exec_code` | 在 `.py` 的共享 `loc` 中先 `exec(code)`、再 `eval(expr)`；`timeout` 必填（秒，`0` 表示不限），代码跑在一个可终止的子线程里，到点终止它启动的子进程并中断该线程。调用时仍检查 op，拥有与 `.py` 接近的进程和宿主机能力。 |
 | `list_tools` | 列出 last-good 模块、当前会话激活状态、空闲回收规则、最近加载失败及磁盘差异。 |
 | `reload_tools` | 按模块名从磁盘显式应用、更新或删除模块；逐项返回成功和带完整 traceback 的失败结果，失败保留旧 last-good。 |
-| `load_tools` | 将 last-good 模块激活到当前 Chat；主会话名单存全局 `agent`，独立 `.chat` 保留窗口名单；不读取磁盘。 |
+| `load_tools` | 将 last-good 模块激活到当前 Chat；中心名单存全局 `agent`，不读取磁盘。 |
 
 仓库当前提供以下按需模块；函数只在对应模块激活后出现：
 
@@ -113,6 +117,7 @@
 | `later` | `later__later_add`、`later__later_del` |
 | `user_data` | `user_data__get_user_data`、`user_data__set_user_data` |
 | `agents` | `agents__assign_tasks` |
+| `amap` | `amap__login`、`amap__search`、`amap__around` 等地点与路线查询 |
 | `host` | `host__read_file`、`host__write_file`、`host__run_command` |
 | `minecraft` | `minecraft__search_mc_mod`、`minecraft__check_mod` |
 | `weather` | `weather__search_city`、`weather__get_realtime_weather`、`weather__get_daily_forecast`、`weather__get_hourly_forecast` |
@@ -123,9 +128,11 @@
 
 历史源码中有实现、但 `add_tool` 注册被明确注释的 `read_data`、群成员、农历/小六壬、跨窗口发送、`later_list/later_set`、URL 转 CQ 和百科工具，只在 `mods/tools/disable/README.md` 留有决策记录：说明它们当时是什么、现在等价能力在哪里、以及 RAG 等只剩草稿或死名字的项为什么不复活。仓库不保存永不运行的实现；要启用就按现有模块格式在 `mods/tools/` 顶层重写。
 
-`create_image` 使用 OpenAI 原生 `gpt-image-2` 的参数与返回形状，不传 DALL·E 的 `style`、`standard` 或 `response_format=url`。图片以 `b64_json` 返回，解码后使用 `data/tmp_files` 的现有临时图片缓存和过期清理机制；Base64 本身不会进入 QQ 消息或 chatlog。
+`create_image` 使用 OpenAI 原生 `gpt-image-2` 的参数与返回形状，不传 DALL·E 的 `style`、`standard` 或 `response_format=url`。图片以 `b64_json` 返回，解码后存进 `data/tmp_files` 临时图片缓存，工具只返回 `file://` 路径，不自动发送；Base64 本身不会进入 QQ 消息或 chatlog。缓存文件闲置超过 15 天可能清理。
 
 `create_image_from_references` 的 `image_uris` 参数每行接收一个 URI，并在输入边界按完整 URI 去重。解析后复用统一的内容寻址文件缓存；`file://` 必须是本机绝对路径。所有参考图都需通过图片格式和 20 MiB 上限校验。`gpt-image-2` 会自动高保真处理参考图，请求不传 `input_fidelity`。供应商是否对参考图输入另行计费尚未实测；当前 usage 仍只按实际返回图片数以每张 0.13 元记录。
+
+退役窗口会话后，四个原本依赖隐式来源的模块改用中心可调用的边界：`image` 生图只回 `data/tmp_files` 内容缓存的 `file://` 路径，模型再以 `[CQ:image,file=...]` 通过 `say(target="g…"/"u…")` 发送，`say` 的 CQ 正文不转义；`later` 增删任务必须给明确目标窗口；`amap` 的 Key 存在 Bot 自己的用户 storage，不再按唤醒作者查；`agents__assign_tasks` 的子会话清除当前事件、不继承隐式窗口，结果只作为父工具返回。`common__poke` 也要求中心会话明确目标。Bot 非 op 时仍可经 `say` 发送已生成的本地图片，但读取任意本地 `file://` 参考图或识别图仍需 op。
 
 ## 统一模块格式与两种加载
 
@@ -135,7 +142,7 @@
 
 模块可以在顶层写 `BOT_OP_ONLY = True`，声明"只有 Bot 自身拥有 op 权限时可见、可加载"（目前只有 `op.py` 这么做）。Bot 的权限来自 `config.bot_permissions.op`，在一次进程生命周期内固定，不读取 `context.current()`，因此不会因这一轮读到谁的消息而出现或消失。三层都拦：渲染目录时过滤（`tools.bot_op_tool_visible`）、`SessionBinding.load` 拒绝（模型记得名字直接 load 也没用）、工具执行时再查一次 `op.bot_is_op()`。
 
-中心 reader 的模型与辅助调用记入 Bot 的全局月账，不随唤醒作者或 `context.current()` 改变；独立 `.chat` 仍记发起者，旧月份不迁移。`cmds__run_command` 留空 `sender` 时以 Bot 自身执行，显式代行人类 op 时 Bot 自身也必须有 op 权限；下游仍按被代行者判权。`message.recvmsg(sender_id=X)` 只在可编程环境中使用，不直接暴露为模型工具。
+中心 reader 的模型与辅助调用记入 Bot 的全局月账，不随唤醒作者或 `context.current()` 改变；旧月份不迁移。`cmds__run_command` 留空 `sender` 时以 Bot 自身执行，显式代行人类 op 时 Bot 自身也必须有 op 权限；下游仍按被代行者判权。`message.recvmsg(sender_id=X)` 只在可编程环境中使用，不直接暴露为模型工具。
 
 Python 候选作为正常模块执行，可以 import 第三方依赖、其它 `mods` 和同目录下划线 helper。每个导出函数都必须有可用的签名、参数类型标注和 docstring，并通过现有 `Tool` schema 校验；模块内任一导出失败，整个模块都不替换。加载候选不会调用导出函数，但会执行顶层 import 和其它顶层语句，所以这里与 `.py`、命令、link 和宿主机操作属于同一信任域，不是沙箱；顶层应只放 import、常量和定义。
 
@@ -182,12 +189,12 @@ hint 与追加式上下文是两层，判据是一句话：**频繁变化、且�
 
 ### 中心设置与旧窗口配置
 
-`image`（图片档位）、`reasoning`、`tools`、`max_events`、`max_token`、`pressure_percent` 共用 `mods/chat.WINDOW_SETTINGS` 的归一化规则。中心主会话读全局 `agent` storage，op 用 `#agent` 修改整组设置，也可用 `#limit` 直接修改预算；旧窗口配置仍在原群／私聊 storage，不自动迁移，独立 `.chat` 仍可按窗口读取。
+`image`（图片档位）、`reasoning`、`max_events`、`max_token`、`pressure_percent` 共用 `mods.chat.AGENT_SETTINGS` 的全局归一化规则。中心主会话只读全局 `agent` storage；op 用 `#use_model`、`#image`、`#reasoning`、`#limit` 等命令修改它。旧窗口聊天配置不自动迁移，也不再读取；`#hint` 的窗口配置是独立例外。
 
-- **缺省值写死在代码里**（`DEFAULT_MAX_EVENTS` / `DEFAULT_MAX_TOKEN` 与各归一化函数的兜底分支），不再读 `llm_system/config.json`。中心运行期覆盖只有全局 `agent` storage 一份；`#limit` 与 `#agent limit` 是同一写入的两个命令入口。
-- **事件数和 token 只选历史起点**：默认 `max_events = 500`、`max_token = 40000`。首次激活或 `#agent reset_start` 后的下一次激活用它们选起点；随后不再自动裁剪，超过 `max_token` 只提醒主动压缩。旧窗口覆盖不自动迁入全局主体。
-- **`hint` 与 `prompt` 不在表里**：它们是复合值（dict / 列表），缺省来自别的存储，各自的合并只有一行（`{**default, **window}` 与 `data.get("prompt") or settings`）。塞进单值表反而要造间接层。
-- 合并只在 `window_setting` 一处发生，没有别的间接层。
+- **缺省值写死在代码里**（`DEFAULT_MAX_EVENTS` / `DEFAULT_MAX_TOKEN` 与各归一化函数的兜底分支），不再读 `llm_system/config.json`。中心运行期覆盖只有全局 `agent` storage 一份；`#limit` 是唯一预算命令入口。
+- **事件数和 token 只选历史起点**：默认 `max_events = 500`、`max_token = 40000`。首次激活或 `#reset_start` 后的下一次激活用它们选起点；随后不再自动裁剪，超过 `max_token` 只提醒主动压缩。旧窗口覆盖不自动迁入全局主体。
+- **`hint` 与 `prompt` 不在表里**：窗口结束提示的 `#hint` 独立合并全局默认与窗口覆盖；中心提示词从全局 `agent.prompt` 选择内置设置或显式列表。它们不是单值档位，不使用 `AGENT_SETTINGS` 的归一化。
+- 已退役的窗口聊天设置仍可能留在生产 storage，但运行代码不再读取；其清理需先获维护者授权，见[第二轮调查](working/round2-legacy-and-backfill-audit.md)。
 
 **旧档案主动翻阅。** 中心 agent 用 `read_messages(window, message_id|origin, before, after)` 在指定聊天窗口选择本地档案；QQ `message_id` 命中多条时须加 `timestamp` 或用稳定 `origin` 消歧义。选择先随工具批次取得 R，正文在下一子请求作为逐条正式 input；若命中 live/source 当前未读成员，登记该 input 时一并消费。已读档案可再次阅读，新的 archive input 保留来源元数据，但不充当 live say 回声。远端旧档先用 `fetch(g/u)` 固化成有名字的信源，模型不管理 NapCat 请求页。默认上下文不再为补满预算自动倒扫 chatlog。`#hint` 不触发旧档阅读。
 
@@ -195,23 +202,23 @@ hint 与追加式上下文是两层，判据是一句话：**频繁变化、且�
 
 模型子请求的一次完整输出（思考、正文、零到多个行动）在派发工具之前取得一个全局 `YYYYMMDD-N` 号；行动以 `号#位置` 指名。QQ 输入和通知在阅读时、输出在派发工具前、同步结果在批次完成时进入同一追加式信息流；未读到达不预占正式号。来源窗口各自持有持久 pending；中心 reader 从有序成员中选择任意成员正式读取。到达与正式登记事实写入 `data/event_stream/YYYYMMDD.jsonl`，chatlog 仍是 QQ 消息正文权威。
 
-- 中心上下文从首次选定的固定起点读取可见事件，编号输入、输出、结果按阅读顺序投影；开局只给不含正文的通知，`take` 选中成员在下一请求正式读取，`pull` 只作前缀别名，`mark_read` 只把调用时已有成员设为已读。DeepSeek 主模型的完整 O/R 批次保留原生 assistant 思考、正文、工具调用与 tool 返回，重启后从同一事件流重建；旧记录、换模型、行动不完整或配对字段不符时，整批用明确的已编号文本投影。原生工具 ID 只供供应商配对，不是稳定记忆号。`.chat` 与子代理仍用各自原生配对。
+- 中心上下文从首次选定的固定起点读取可见事件，编号输入、输出、结果按阅读顺序投影；开局只给不含正文的通知，`take` 选中成员在下一请求正式读取，`pull` 只作前缀别名，`mark_read` 只把调用时已有成员设为已读。DeepSeek 主模型的完整 O/R 批次保留原生 assistant 思考、正文、工具调用与 tool 返回，重启后从同一事件流重建；旧记录、换模型、行动不完整或配对字段不符时，整批用明确的已编号文本投影。原生工具 ID 只供供应商配对，不是稳定记忆号。子代理仍用自己的原生配对。
 - 真实 live/source `message_sent` 在正式读入时，以 `message_id`、同目标窗口和唯一已登记的中心 say 返回匹配，匹配到的行动号当场冻结在 `<sent_by>`；档案重读、子代理发言及非唯一匹配留空，以后不回填。超时或缺少 `message_id` 不靠文本、时间猜。
 - 新的中心 O 在原事件中保存供应商原生 assistant 字段及模型来源，包含思考全文、自言自语正文和有序工具调用；R 仍是一个正式事件，投影时可展开成多条原生 tool 消息。完整原生块末尾派生一条 `<event_refs>` user 标签，列 O、各行动的 `O#位置` 与工具名、R；无工具输出只列 O。标签不入日志、不取号，映射归 O，cover 时随原生块一起退出。首次选择历史起点时，标签 token 也计入估算、事件数仍按 O/R 计算，原生块超限可用有界文本投影选择起点；起点冻结后不再每轮按预算降级或裁剪，更不会留下孤立 tool 或标签。未完成的行动只显示已有事实，不补造结果。`cover_events` 把 O 与其全部 R 成组移出默认上下文；say 回声可独立覆盖，原文仍可反查。清理可见性不销毁日志、不复用号码，长期遗忘和物理退休另待裁定。旧 `condensed`/`clear` 日志只为重放既有生产数据保留只读兼容，不再有写入工具或命令。
 
 - 流式结果中途截断不会登记半个输出或派发行动；输出写入日志失败则不派发。`oplog` 在写盘前校验可预见的拒绝条件；追加、fsync 或落盘后索引应用失败会进入失败态，后续写入和同批尚未执行的工具行动都停止，直到重启检查磁盘。行动开始后不会自动重放：重启恢复未读事实，而非重跑已登记的动作。
 
-统一正式号表示中心信息流的登记顺序，不表示各 QQ 窗口的消息发生顺序；极窄的取消窗口里，已登记的同步 R 可能尚未送进模型。独立 `.chat` 和子代理可先在私有请求中读到原生工具返回，不替中心消费 `oplog` 未读；旧 per-window 正式号保留原身份，中心可按原号反查。
+统一正式号表示中心信息流的登记顺序，不表示各 QQ 窗口的消息发生顺序；极窄的取消窗口里，已登记的同步 R 可能尚未送进模型。子代理可先在自身请求中读到原生工具返回，不替中心消费 `oplog` 未读；旧 per-window 正式号保留原身份，中心可按原号反查。
 
 DeepSeek 在带 `tools` 的 thinking 请求中要求最后一条 `user` 后的每条 `assistant` 携带 `reasoning_content`；`chat.view._closing_hint` 在持久 provider 产物之后检查尾部，仅在需要时为 outgoing 附加临时 `user` hint，不写入 `Chat.messages`、oplog 或持久前缀，也不为供应商编造过往思考。此规则最小报文于 2026-09-17 验证；其他供应商不依赖该字段。
 
 ### 思考内容开关
 
-主会话的思考载体模式由 `#agent reasoning` 全局设置；旧窗口 `#reasoning` 只影响独立窗口请求。`keep` 是默认值，`drop` 让中心已读输出使用不带思考的文本投影。
+主会话的思考载体模式由 op 用 `#reasoning` 全局设置。`keep` 是默认值，`drop` 让中心已读输出使用不带思考的文本投影。
 
-中心 agent 的 `keep` 将完整原生思考随 O 留到 cover 或手动重置历史起点，并在完整 O/R 时原生重建；`drop` 只将 O/R 作不带思考的已编号文本投影。两种模式都在同一 O 事件中留原文供按号反查。单句 `.chat` 和子代理的独立请求上下文仍使用原生工具配对，`drop` 在其工具循环内把思考字段换成空字符串。
+中心 agent 的 `keep` 将完整原生思考随 O 留到 cover 或手动重置历史起点，并在完整 O/R 时原生重建；`drop` 只将 O/R 作不带思考的已编号文本投影。两种模式都在同一 O 事件中留原文供按号反查。子代理的独立请求上下文仍使用原生工具配对，`drop` 在其工具循环内把思考字段换成空字符串。
 
-中心模型跨轮从事件流重建，私有 `.chat` 的跨轮上下文仍从 chatlog 重建。
+中心模型跨轮从事件流重建；chatlog 是 QQ 原始聊天档案，不再构造私有会话上下文。
 
 
 ### 窗口的结束提示（`#hint`）
@@ -220,12 +227,12 @@ DeepSeek 在带 `tools` 的 thinking 请求中要求最后一条 `user` 后的�
 
 命令面只做文本管理——写、看、开关，和 `#model`/`#prompt` 一系；「它在聊天结束时自动跑」是另一回事，两半分开看。
 
-- **谁跑、什么时候跑。** 唯一中心 reader 在 `_drive_agent` 的 `finally` 求值一次，按最初触发窗口选择窗口 `#hint` 配置；这是向 QQ 发状态的旧机制，不是全局模型待办 hint。无 reader 所有权的早退与独立 `.chat` 不触发。
+- **谁跑、什么时候跑。** 唯一中心 reader 在 `_drive_agent` 的 `finally` 求值一次，按最初触发窗口选择窗口 `#hint` 配置；这是向 QQ 发状态的旧机制，不是全局模型待办 hint。无 reader 所有权的早退不触发。
 - **配置模型。** 两份字典——全局默认 `storage.get("", "hint")` 与窗口 `getchatstorage()["hint"]`——按显式顺序合并成 `{**default, **window}`，两侧都只认同名的 `code`/`on` 两个键，没有别的间接层。发不发 = 合并结果里 `code` 非空**且** `on` 为 `True`；`on` 缺失按 `False`。窗口可以只写 `on`（单独关掉默认提示，`code` 仍继承）。`#hint set <源码>` 写入 `{"code": …, "on": True}`，`#hint set` 无参清掉窗口配置、回落默认；`#hint` 与 `#hint default` 只翻开关，保源码。没有 `del`——源码是劳动成果，toggle 不该顺手删掉它。
-- **求值。** 走 `py.eval_last(source, environment)`，与 link 共用同一份实现（原先 link 里那份私有副本已消掉）：前面各行 `exec`，末行 `eval`；末行为空、以 `#` 开头、或结果为 `None` 就不发。环境是共享动态环境 `py.loc` 的**一份副本**，另注入 `window`（本窗口的 `history.window` 键）、`usage`（最后一次中心请求的事件文本 token 估算）、`event_count`（该请求中不同正式事件号的数量）与 `context_limit`（该请求实际使用的事件数/token 上限）。后三项在中心 agent 仍活跃时冻结，避免结束后误读最初触发群的窗口设置。
+- **求值。** 走 `py.eval_last(source, environment)`，与 link 共用同一份实现（原先 link 里那份私有副本已消掉）：前面各行 `exec`，末行 `eval`；末行为空、以 `#` 开头、或结果为 `None` 就不发。环境是共享动态环境 `py.loc` 的**一份副本**，另注入 `window`（本窗口的 `history.window` 键）、`usage`（最后一次中心请求的事件文本 token 估算）、`event_count`（该请求中不同正式事件号的数量）与 `context_limit`（该请求实际使用的事件数/token 上限）。后三项在中心 agent 仍活跃时冻结，避免结束后误读不相关的窗口状态。
 - **输出带 `#` 前缀**（`"#" + cq.escape(str(result))`），因此不回流进模型上下文，也不自指。报错同样以 `#` 开头、附 traceback。
 - **异常安全是硬要求。** 求值与发送的任何异常都在这一层吞掉、只写 `hint` 日志流，**绝不抛回 `finally`**：这段代码是用户自己写的、每次聊天都自动跑，让它抛出去就等于一段烂代码能污染聊天主流程的返回路径。（只吞 `Exception`——`SystemExit`/`KeyboardInterrupt` 是进程控制，不该被用户代码吃掉。）
-- **「已用上下文」的出口是 `chat.context_usage()`**。中心 reader 记录最近一次子请求实际收到的已编号事件文本本地估算，包含当次通知或有界结果／mail 页，不把尚未正式读取的整个 pending 计入；不含 system 提示和工具 schema，也不是供应商返回的实际 token 数。
+- **「已用上下文」的出口是 `chat.context_usage()`**。中心 reader 记录最近一次子请求实际收到的已编号事件文本本地估算，包含当次通知、整批结果和正式阅读 input，不把尚未正式读取的 pending 计入；不含 system 提示和工具 schema，也不是供应商返回的实际 token 数。
 - **op 专属。** hint 是用户可写、跑在特权环境、还每次聊天自动执行的代码，权限与 `.py`/`.link` 同级，比只改提示文本的 `#prompt` 高一档。非 op 的 `#hint` **不接管**（`cond()` 里先判权，返回 `False`），只给一节流提醒——复用 `op.require_op` 的约定，提醒的节流按「同一个人的同类重试」判（`pattern=r"^#\s*hint"`），所以提醒不会把别人正常的 `#hint` 也算进去。
 - **`#help [名称]`** 照 `.help` 的两级形态：无参列所有 `#` 子命令的首行摘要（`#{pattern} — {首行}`），带名称显示那一条的完整多行说明，查不到就是 `该命令不存在！`。**不做 op 过滤**——单 `#help` 列出全部（含 op 专属的 `hint`），非 op 真去执行 `#hint` 时才被拒：`#help` 是所有人的发现入口，为它加特判不值。
 
@@ -252,7 +259,7 @@ Chat.chat
 
 工具返回值统一 `str(result)`；普通工具抛出异常时，类型和错误文本作为结果回传，完整 traceback 写应用日志；`reload_tools` 的校验失败则有意把完整 traceback 放进返回值，让模型能够修正模块源码。名字不在本轮快照里、或参数不是合法 JSON 的调用不再被丢掉，而是换成说明性结果（见上面「叫不到的名字不再吞掉调用」）。
 
-完整子响应先登记一个输出号、再派发工具；同步工具完成后登记一个整批结果 R。中心 DeepSeek 会话保留完整的原生 assistant/tool 配对，后续激活从固定历史起点重建；不完整批次与旧记录用文本投影。下一次请求再追加通知和显式 take／档案阅读 input。流式文本仍由回调逐段产出用于终端显示，不会分拆成多个输出事件；普通工具失败不会回滚已经发生的行动，`PersistenceError` 则立即停批而非变成工具结果。单句 `.chat` 不读取中心未读，继续通过原生配对获取同步返回。
+完整子响应先登记一个输出号、再派发工具；同步工具完成后登记一个整批结果 R。中心 DeepSeek 会话保留完整的原生 assistant/tool 配对，后续激活从固定历史起点重建；不完整批次与旧记录用文本投影。下一次请求再追加通知和显式 take／档案阅读 input。流式文本仍由回调逐段产出用于终端显示，不会分拆成多个输出事件；普通工具失败不会回滚已经发生的行动，`PersistenceError` 则立即停批而非变成工具结果。
 
 若供应商返回 `reasoning_content`，流式路径会完整拼接该字段、非流式路径直接读取；中心 O 原样保存到事件文件，未覆盖且位于固定历史起点之后时可带回下一次 DeepSeek 请求。QQ 回复和 chatlog 不存这份思考。旧 O 只有存在标记，不能由系统补造思考。
 
@@ -260,7 +267,7 @@ Chat.chat
 
 ### 插话与 `^C` 打断
 
-入站不被生成挡住：link 独立运行，消息照常在 `oplog` 登记为各窗口未读。过去每窗口各有 reader；现在全 Bot 只有一个中心 reader，另一次召唤加入通知，不并发生成。
+入站不被生成挡住：link 独立运行，消息照常在 `oplog` 登记为各窗口未读。全 Bot 只有一个中心 reader，另一次召唤加入通知，不并发生成。
 
 中心 reader 登记在 `context.WindowTurn` 的 `AGENT_WINDOW` 键下；各来源窗口的有序未读成员只由 `oplog` 的 arrival、input 和 `mark_read` 事实决定，`context.Mailbox` 已删除。`context.window_lock` 串行化同窗口的 chatlog/history 写入、arrival 与正式消费；图片描述网络 I/O 在锁外完成，提交前重新取锁核验未读成员；路由期间的事件对象→arrival 关联由 `context.remember_arrival`／`event_arrival`／`release_arrival` 临时保存，不写进事件 dict。通知递交、未读正文与正式 input 各有日志事实，不以一个红点代替；source 页内任意已读坐标从 input/source journal 派生。相关窗口的群友可用 `^C` 取消共享请求，未读与其它窗口的通知仍留在信息流里。
 
@@ -280,9 +287,9 @@ Chat.chat
 
 子会话和顶层聊天一样获得四个基础工具与模块目录提示，并预先激活父模型明确列出的 last-good 模块；它不自动继承父会话其它活动模块、聊天历史、base 提示或窗口提示词。子会话的模型使用父模型传入的 `provider/model` 字符串，不再另有固定 provider。模块列表可以包含 `agents`，但代码没有强制递归深度、并发上限或全局预算。
 
-函数捕获原始消息，并在每个工作线程运行子 `Chat` 前安装为当前 context，结束时清除；依赖当前窗口的工具因此沿用父任务的聊天事件。子会话仍不拥有父会话的提示词和历史消息。
+子会话清除当前消息 context，不继承隐式 QQ 窗口；需要发消息或建任务的工具必须接收显式目标。它仍不拥有父会话的提示词和历史消息。
 
-每次顶层 `_activate_chat()` 增加一次调用计数并恢复对应会话主体的持久工具名单；中心名单在全局 `agent`，私有 `.chat` 在窗口。子会话不经过顶层激活，响应 usage 仍会累加费用。中心主模型与辅助费用记到 Bot，独立 `.chat` 记发起者。当前费用只在供应商返回 usage 时按输入未命中／缓存命中／输出三段入账；供应商不返回 usage 时尚无发送 token 兜底。单价来自模型元数据，峰谷取请求发起时刻；缓存命中价单独计，两边都不报命中数时保守按未命中算。`.chattop` 按自然月记账，中心费用以 Bot QQ 号显示；“调用次数”并不等于所有底层 HTTP 子请求数。
+每次顶层 `_activate_chat()` 增加一次调用计数并从全局 `agent` 恢复中心主体的持久工具名单。子会话不经过顶层激活，响应 usage 仍会累加费用；中心主模型与辅助调用都记到 Bot。当前费用只在供应商返回 usage 时按输入未命中／缓存命中／输出三段入账；供应商不返回 usage 时尚无发送 token 兜底。单价来自模型元数据，峰谷取请求发起时刻；缓存命中价单独计，两边都不报命中数时保守按未命中算。`.chattop` 按自然月记账，中心费用以 Bot QQ 号显示；“调用次数”并不等于所有底层 HTTP 子请求数。
 
 ## 当前信任边界与维护取舍
 
@@ -295,12 +302,12 @@ Chat.chat
 - `reload_tools` 可以在进程内执行并应用 `mods/tools` 中的受信任 Python；候选顶层代码在校验期间就会执行；`load_tools` 可以把任意 last-good 模块交给当前模型；
 - `set_user_data` 可读取模型生成的 Python 字面量并修改任意用户 storage；
 - `get_user_data` 可把任意用户数据发送给模型供应商；
-- 延时任务会在未来执行并回到当前窗口；模型工具创建和修改时按 Bot 自身权限判定，未来执行不重新换身份；人类直接使用 `.later` 仍按消息作者判定；
+- `later__later_add`／`later__later_del` 要求明确 `g`／`u` 目标；未来任务归属该目标窗口，任意代码按 Bot 自身权限判定，触发时不重新换身份；人类直接使用 `.later` 仍按消息作者判定；
 - `assign_tasks` 可以增加并发、费用和工具调用深度；
-- `poke` 会立即对当前会话产生外部可见的戳一戳动作；
+- `common__poke` 要求明确目标窗口，会立即产生外部可见的戳一戳动作；
 - `recognize_image` 可以下载模型指定的网络图片，或读取模型指定的本机 `file://` 绝对路径，再把图片及识别要求发送给视觉供应商，产生额外网络访问、宿主机文件读取和模型费用；
-- `create_image` 会产生按张计费的外部 API 调用，并立即向当前 QQ 会话发送生成结果；
-- `create_image_from_references` 还会下载模型指定的网络图片或读取本机 `file://` 绝对路径，并作为 multipart 文件上传给生图供应商；
+- `create_image` 会产生按张计费的外部 API 调用，返回可能过期的临时本地文件路径；
+- `create_image_from_references` 还会下载模型指定的网络图片或读取本机 `file://` 绝对路径，并作为 multipart 文件上传给生图供应商；它同样只返回临时路径，发送须另用 `say` 明确目标；
 - 天气和 MC 搜索会向外部站点发请求。
 
 账户相关配置不进入源码或 storage。`main.py` 启动时加载仓库根的 `.env`：生图调用复用 `BYTECAT_BASE_URL` 并读取独立的 `BYTECAT_IMAGE_API_KEY`；天气调用分别读取 `QWEATHER_API_HOST`、`QWEATHER_KEY_ID`、`QWEATHER_PROJECT_ID` 和可选的 `QWEATHER_PRIVATE_KEY_FILE`。可从 [`.env.example`](../.env.example) 复制空白模板；缺少必需值时，调用会显式失败，不会回退到硬编码账户。
