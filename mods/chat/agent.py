@@ -176,7 +176,7 @@ def _run_agent(model: str | None, turn) -> bool:
         _view._remember_stream(session, projection, entry["id"])
     if not messages and not turn.requested_reads:
         return True
-    _chat_root._activate_chat(session, _view._close_with_user(messages))
+    _chat_root._activate_chat(session, messages)
     for entry, projection in rows:
         if entry["kind"] == "result":
             for result in entry["returns"]:
@@ -196,6 +196,7 @@ def _run_agent(model: str | None, turn) -> bool:
     session.add_hint(_reader._pending_hint)
     session.add_hint(lambda: _pressure_hint(turn._chat_usage_tokens, _chat_root.limit()[1],
                                             _chat_root.agent_setting("pressure_percent")))
+    session.add_hint(lambda: _view._closing_hint(session.messages))
     session.should_stop = lambda: turn.cancelled
     session.chat(recall_func=_chat_root.get_handler(session), description_cache=_chat_root.description_cache)
     return session.output_recorded
@@ -257,6 +258,7 @@ def _agent_provider(turn, session: llm.Chat):
                                      "原计划停止，未兑现成员仍未读；请重新选择，"
                                      "或用 read_messages 查档案。"})
             binding = session.tool_binding
+            binding.sync_registry()
             data = _chat_root.storage.get("", "agent")
             if data.get("history_start") == getattr(turn, "history_start", None):
                 previous = data.get(_chat_root._TOLD_TOOLS_KEY)

@@ -481,8 +481,8 @@ def _result_projection(entry: dict, links: dict[str, tuple[str, str]]) -> dict:
 _CLOSING_NOTE = "<system-reminder>\n会话已自动接续。\n</system-reminder>"
 
 
-def _close_with_user(messages: list) -> list:
-    """Make sure the assembled context ends with a user message.
+def _closing_hint(messages: list) -> str:
+    """Keep a temporary user tail only when durable context ends with assistant.
 
     WHY: DeepSeek 在请求带 `tools` 时要求**最后一条 user 之后的每条 assistant** 都带
     `reasoning_content`，缺一条就 400（"The reasoning_content in the thinking mode must
@@ -499,13 +499,10 @@ def _close_with_user(messages: list) -> list:
     只有"没有新消息的那一轮"（重启后接着聊，`reboot.resume_chat`）会以 assistant
     收尾，那正是 2026-09-17 两次 400 的现场。
 
-    WHY: 追加的是一句极短的**声明**，不是假装有人说了一句话。形状抄 `tools._announce` 的系统
-    追加：`role="user"` 加 `<system-reminder>` 框架——那条路径实跑过很多轮，说明"系统追加的
-    user 消息"这个形状本身是被接受的。它只活在发出去的那一份里，不进 chatlog、不发 QQ。
+    WHY: 续接属于末尾 hint，不进 `Chat.messages` 或 oplog。请求前正式的工具状态
+    input 等全部追加后再判断，避免临时续接插在两次请求之间成为不可重建的前缀。
 
     WHY: 空 content 的 assistant 也算数。原生 O 可以只有思考与行动、没有正文，
     它照样是 assistant，照样要算进尾段。
     """
-    if messages and messages[-1].get("role") == "user":
-        return messages
-    return [*messages, {"role": "user", "content": _CLOSING_NOTE}]
+    return _CLOSING_NOTE if messages and messages[-1].get("role") != "user" else ""

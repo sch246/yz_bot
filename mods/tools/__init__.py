@@ -539,6 +539,7 @@ class SessionBinding:
         self.schema_modules = list(dict.fromkeys(schema_modules)) if schema_modules is not None else None
         self.persist_schema = persist_schema
         self.active: dict[str, ToolModule] = {}
+        self._loaded: dict[str, ToolModule] = {}
         # 每个激活模块最后一次被调用的时刻，见 touch。先活在内存里，落盘由 _save_active 做。
         self._touched: dict[str, float] = {}
         # WHY: schema 名 -> 拥有它的模块名。它和 `session.functions` 是同一份事实的两面，
@@ -774,6 +775,7 @@ class SessionBinding:
         WHY: `touched_at` 只有 `restore` 会传，而且必须传——它带的是磁盘上那次使用的
         时刻，拿“现在”顶替的话，每轮开局都会把一切刷成刚用过，空闲回收永远不触发。
         """
+        original = module
         module = self._bind_module(module)
         previous = self.active.get(module.name)
         previous_tools = dict(previous.tools) if previous is not None else {}
@@ -798,6 +800,7 @@ class SessionBinding:
         for name in module.tools:
             self._owner[name] = module.name
         self.active[module.name] = module
+        self._loaded[module.name] = original
         # 装上了就不再是"这一轮装不回来"的那种；两边同时挂着一个名字会让 _save_active
         # 有两个时刻可选。
         self._deferred.pop(module.name, None)
@@ -856,6 +859,7 @@ class SessionBinding:
             for tool_name, old_tool in previous.tools.items():
                 functions[tool_name] = self._unloaded_tool(old_tool, name)
         del self.active[name]
+        self._loaded.pop(name, None)
         # 名字都没了，使用时刻留着只会让 _touched 无限长；下次 load 会重新盖上“现在”。
         self._touched.pop(name, None)
 
@@ -904,6 +908,27 @@ class SessionBinding:
         self.session.functions.update(functions)
         self._owner = owners
 
+    def sync_registry(self) -> None:
+        """Make this request's callables match shared last-good before announcing."""
+        if self.schema_modules is None:
+            return
+        changed = False
+        with self._lock, self.registry.lock:
+            catalog = self._catalog()
+            for name in tuple(self.active):
+                current = catalog.get(name)
+                if current is None:
+                    if self.registry.get(name) is not None and name != _BASE_MODULE_NAME:
+                        self._deferred[name] = self._touched[name]
+                    self._deactivate(name)
+                    changed = True
+                elif current is not self._loaded[name]:
+                    self._activate(current, touched_at=self._touched[name])
+                    changed = True
+            self.restore_schema()
+            if changed:
+                self._save_active()
+
     @staticmethod
     def _unloaded_tool(original: Tool, module_name: str) -> Tool:
         name = original.description["function"]["name"]
@@ -917,9 +942,9 @@ class SessionBinding:
         schemas = {}
         for name in [_BASE_MODULE_NAME, *(self.schema_modules or [
                 name for name in self.active if name != _BASE_MODULE_NAME])]:
-            module = catalog.get(name)
-            if module is not None:
-                definitions = [tool.description for tool in module.tools.values()]
+            definitions = [tool.description for tool_name, tool in self.session.functions.items()
+                           if self._owner.get(tool_name) == name]
+            if definitions and (name in catalog or name in self.active):
                 schemas[name] = hashlib.sha256(json.dumps(definitions, ensure_ascii=False,
                                             sort_keys=True).encode()).hexdigest()
         return {

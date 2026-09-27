@@ -82,13 +82,13 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 ## 统一 LLM 工具模块
 
-`mods/tools/` 是工具和可按需载入说明的唯一目录，`mods.tools.ToolRegistry` 持有进程级 last-good 模块表。顶层 `foo.py` 和 `foo.md` 具有同一种模块语义：第一行是开局可见的模块描述，余下文本是激活后加入当前聊天 system 提示的内容；Markdown 模块没有函数，Python 模块通过 `__all__` 导出一组普通函数。Python 文件可以正常 import 第三方依赖、其它 `mods` 和同目录 `_helper.py`，导出函数仍由现有 `Tool` 校验，模型侧名称通常为 `foo__function`。
+`mods/tools/` 是工具和可按需载入说明的唯一目录，`mods.tools.ToolRegistry` 持有进程级 last-good 模块表。顶层 `foo.py` 和 `foo.md` 具有同一种模块语义：第一行是目录描述，余下文本在激活后进入中心 agent 的正式工具状态 input；子代理仍在开头显示一次。Markdown 模块没有函数，Python 模块通过 `__all__` 导出一组普通函数。Python 文件可以正常 import 第三方依赖、其它 `mods` 和同目录 `_helper.py`，导出函数仍由现有 `Tool` 校验，模型侧名称通常为 `foo__function`。
 
-首次使用 registry 时，每个顶层模块独立尝试进入 last-good；单模块失败只记录 traceback。之后修改磁盘不会自动改变运行版本：`list_tools` 查看差异，`reload_tools` 才逐模块读取、执行、校验并原子替换 last-good，失败保留旧版；`load_tools` 不读磁盘，只把 last-good 模块的说明和函数激活到当前 `Chat`。因此进程级“已应用源码”和会话主体“已激活能力”是两层状态，没有 watcher、变化 hint 或兼容旁路。中心 agent 的激活名单在全局 agent storage 的 `active_tools` 中，独立 `.chat` 仍在窗口 chat storage 中；每次 `_activate_chat` 装回，`load_tools`／`reload_tools` 改一次写一次，所以跨轮、跨重启都在。名单里还带着每个模块最后一次被调用的时刻（`chat._stream_results` 上报给 `binding.touch`）：超过 1 小时没被调用过的不再装回，并给模型一条收回通告。不这么剪的话，每次 `load_tools` 都会永久占着基线消息。
+首次使用 registry 时，每个顶层模块独立尝试进入 last-good；单模块失败只记录 traceback。之后修改磁盘不会自动改变运行版本：`list_tools` 查看差异，`reload_tools` 才逐模块读取、执行、校验并原子替换 last-good，失败保留旧版；`load_tools` 不读磁盘，只激活 last-good 模块。中心 agent 的实际激活名单及最后使用时刻在全局 `agent.active_tools`，超过 1 小时未使用的模块下轮不再装回；函数定义模块顺序另存在 `agent.tool_schema_modules`，卸载不删除定义，调用只返回重装提示。请求边界先同步共享 registry 与本会话函数，再把完整或差异状态写入正式 input，之后更新 `agent.tool_state_told`；磁盘漂移仍只作末尾 hint。没有工具状态 system 基线，也没有旧内存通告。
 
 `meta.py` 是唯一默认激活的必需模块，保存工具维护说明并导出 `exec_code`、`list_tools`、`reload_tools`、`load_tools` 四个无前缀恢复入口。`__init__.py` 只持有 registry、last-good 和 per-Chat binding 机制；它不再伪装成工具格式。`meta` 调用通过一次调用范围内的 `ContextVar` 取得当前 binding，多 Chat 和 `assign_tasks` 工作线程不会共享错误会话；磁盘删除 `meta.py` 的 reload 会失败并保留旧 last-good。
 
-可用模块的第一行描述从一开始就在同一条 system 提示中；中心 agent 持久激活的模块从全局 `agent.active_tools` 装回，私有 `.chat` 保留自己的窗口激活状态。同一轮内的 `load_tools` 更新当前 Chat 的内容和函数。每个 LLM 子请求冻结同一份 schema/callable 快照，所以加载或重载只从下一子请求起生效。
+中心 agent 的可用模块描述从首次工具状态 input 开始可见；持久激活模块从全局 `agent.active_tools` 装回。`load_tools` 更新当前 Chat 的实际模块和函数，`reload_tools` 更新 last-good；每个 LLM 子请求冻结同一份 schema/callable 快照，所以加载或重载只从下一子请求起生效。
 
 提示词没有新增编辑管理器；`.py` 共享环境继续暴露可变 `prompts` 对象，模型需要时可自己编写工具编辑它。
 
