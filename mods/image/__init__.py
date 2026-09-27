@@ -37,7 +37,7 @@ _stream = log.stream("image")
 # 一次对话（`chat.chat()` 的一次持有：多轮 + 插话续写，直到 finally）内的图片检查台账。
 # WHY: 同一张图在一次对话里只该被解析/下载一次——失败的不要每轮重试（腾讯 rkey 过期后
 # 只会拿到 HTML），成功的也不必每轮重新查一遍。挂在线程局部：对话在哪个线程跑就在哪个
-# 线程记账，别的线程（eager 预取、.chat 单句）各记各的，互不干扰。
+# 线程记账，别的线程（例如 eager 预取）各记各的，互不干扰。
 _local = threading.local()
 
 
@@ -328,6 +328,13 @@ def _store_content_image(content: bytes, mime: str, digest: str, target_dir: str
             raise
     path, resolved_mime = _validate_image_file(destination, max_bytes)
     return path, resolved_mime, digest
+
+
+def cache_image_bytes(content: bytes, target_dir: str = TEMP_PATH, max_bytes: int = MAX_LOCAL_IMAGE_BYTES) -> tuple[str, str, str]:
+    """Validate generated image bytes and store them in the expiring content cache."""
+    mime, digest = _validate_image_bytes(content, max_bytes)
+    maybe_prune_image_cache(target_dir)
+    return _store_content_image(content, mime, digest, target_dir, max_bytes)
 
 
 def _download_image_to_cache(uri: str, target_dir: str, max_bytes: int) -> tuple[str, str, str]:

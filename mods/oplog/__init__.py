@@ -549,34 +549,28 @@ def acknowledge_notification(event_id: str) -> None:
 
 
 def deliver_notifications(agent_window: tuple) -> dict | None:
-    """Offer the current unread-activation snapshot as a numbered notice."""
+    """Offer only newly activated arrivals, retrying any unacknowledged notice."""
     with _lock:
         _restore()
         for entry in _windows.get(agent_window, ()):
             if entry["kind"] == "notification" and not entry.get("acknowledged"):
                 return entry
-        activated = []
         newly_activated = []
-        latest: dict[tuple, str] = {}
         for entry in _pending.values():
-            latest[tuple(entry["window"])] = entry["arrival"]
-            if entry.get("activated"):
-                activated.append(entry)
-                if entry["arrival"] not in _notified:
-                    newly_activated.append(entry)
+            if entry.get("activated") and entry["arrival"] not in _notified:
+                newly_activated.append(entry)
         if not newly_activated:
             return None
-        windows = list(dict.fromkeys(tuple(entry["window"]) for entry in activated))
+        windows = list(dict.fromkeys(tuple(entry["window"]) for entry in newly_activated))
         return _register(agent_window, "notification",
+                         version=2,
                          arrivals=[entry["arrival"] for entry in newly_activated],
-                         through={str(window): latest[window] for window in windows},
                          windows=[list(window) for window in windows],
                          activations=[{"window": list(entry["window"]),
                                        "kind": entry.get("activation_kind", "wake"),
                                        "user_id": entry["event"].get("user_id"),
                                        "time": entry["event"].get("time")}
-                                      for entry in activated],
-                         unread=pending_details())
+                                      for entry in newly_activated])
 
 
 def latest_pending_arrival(window: tuple) -> str | None:
@@ -714,6 +708,12 @@ def input(window: tuple | None, event: dict, projection: dict | None, arrival: s
                          origin=origin, source=pending.get("source"),
                          source_window=list(source_window) if source_window is not None else original,
                          read_by=read_by, read_via=read_via)
+
+
+def input_tools(window: tuple, content: str) -> dict:
+    """Append tool state as an ordinary formal input, without an unread source."""
+    return _register(window, "input", event={"type": "tools", "content": content},
+                     projection={"role": "user", "content": content})
 
 
 def input_archive(window: tuple, event: dict, projection: dict, origin: str,
@@ -870,8 +870,6 @@ def cover(window: tuple, node: str, ids: Iterable[str], visible: set[str]) -> se
             entry = _by_id.get(event_id)
             if entry is None or not _accessible(window, entry):
                 raise ValueError(f"不是本窗口已读事件: {event_id}")
-        links = say_links(window)
-        linked_echoes = {echo for echo, _reference in links.values()}
         while True:
             expanded = set(closure)
             for event_id in closure:
@@ -880,32 +878,16 @@ def cover(window: tuple, node: str, ids: Iterable[str], visible: set[str]) -> se
                     expanded.add(entry["source"])
                 elif entry["kind"] == "output":
                     expanded.update(result["id"] for result in by_source.get(event_id, ()))
-            for echo, reference in links.values():
-                group = {echo, reference.split("#")[0]}
-                group.update(result["id"] for result in by_source.get(reference.split("#")[0], ()))
-                if group & expanded:
-                    expanded.update(group)
             if expanded == closure:
                 break
             closure = expanded
         for event_id in closure:
             entry = _by_id[event_id]
-            if (entry["kind"] == "input" and not entry.get("archive") and not entry.get("source")
-                    and entry["event"].get("post_type") == "message_sent"
-                    and event_id not in linked_echoes):
-                raise ValueError("自发回声尚无唯一已读 say 返回，不能孤立覆盖")
             if entry["kind"] == "output":
                 positions = [item["position"] for result in by_source.get(event_id, ())
                              for item in result["returns"]]
                 if sorted(positions) != list(range(len(entry["actions"]))):
                     raise ValueError(f"输出 {event_id} 还有未读或未返回的行动，不能拆批覆盖")
-            if entry["kind"] == "result":
-                for item in entry["returns"]:
-                    if item["name"] != "say" or not str(item["content"]).lstrip("-").isdecimal():
-                        continue
-                    linked = links.get(str(item["content"]))
-                    if linked is None or linked[1] != _call({**entry, **item}):
-                        raise ValueError("say 返回尚无唯一已读回声，不能孤立覆盖")
         if source in closure:
             raise ValueError("覆盖不能包含本次输出")
         for event_id in closure:
@@ -921,26 +903,25 @@ def cover(window: tuple, node: str, ids: Iterable[str], visible: set[str]) -> se
         return closure
 
 
-def _call(entry: dict) -> str:
-    return f"{entry['source']}#{entry['position'] + 1}"
+def sent_by(message_id: int | str, target_window: tuple) -> str | None:
+    """Find one already-recorded central say return for this exact destination."""
+    from mods.chat.reader import parse_target
 
-
-def say_links(window: tuple | None) -> dict[str, tuple[str, str]]:
     with _lock:
         _restore()
-        recorded = ([entry for entry in _events if not entry.get("hidden")]
-                    if window == AGENT_WINDOW else events(window, True))
-    echoes: dict[str, list[str]] = {}
-    returns: dict[str, list[str]] = {}
-    for entry in recorded:
-        if (entry["kind"] == "input" and not entry.get("archive") and not entry.get("source")
-                and entry["event"].get("post_type") == "message_sent"):
-            message_id = entry["event"].get("message_id")
-            if message_id is not None:
-                echoes.setdefault(str(message_id), []).append(entry["id"])
-        if entry["kind"] == "result":
+        matches = []
+        for entry in _windows.get(AGENT_WINDOW, ()):
+            if entry["kind"] != "result":
+                continue
             for item in entry["returns"]:
-                if item.get("name") == "say" and str(item["content"]).lstrip("-").isdecimal():
-                    returns.setdefault(str(item["content"]), []).append(_call({**entry, **item}))
-    return {key: (ids[0], returns[key][0]) for key, ids in echoes.items()
-            if len(ids) == len(returns.get(key, ())) == 1}
+                if item.get("name") != "say" or str(item.get("content")) != str(message_id):
+                    continue
+                try:
+                    arguments = json.loads(item["arguments"])
+                    parsed = parse_target(arguments["target"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if parsed != target_window:
+                    continue
+                matches.append(f"{entry['source']}#{item['position'] + 1}")
+        return matches[0] if len(matches) == 1 else None

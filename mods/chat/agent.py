@@ -42,7 +42,7 @@ def _stream_results(window, binding):
                 session.messages.append(tag)
                 _view._remember_stream(session, tag, source)
             else:
-                projection = _view._result_projection(recorded, oplog.say_links(window))
+                projection = _view._result_projection(recorded)
                 session.pending_results.append((recorded, projection))
     return record
 
@@ -176,7 +176,7 @@ def _run_agent(model: str | None, turn) -> bool:
         _view._remember_stream(session, projection, entry["id"])
     if not messages and not turn.requested_reads:
         return True
-    _chat_root._activate_chat(session, _view._close_with_user(messages), read_mail=True)
+    _chat_root._activate_chat(session, messages)
     for entry, projection in rows:
         if entry["kind"] == "result":
             for result in entry["returns"]:
@@ -195,7 +195,8 @@ def _run_agent(model: str | None, turn) -> bool:
     session.add_context_provider(_agent_provider(turn, session))
     session.add_hint(_reader._pending_hint)
     session.add_hint(lambda: _pressure_hint(turn._chat_usage_tokens, _chat_root.limit()[1],
-                                            _chat_root.window_setting("pressure_percent")))
+                                            _chat_root.agent_setting("pressure_percent")))
+    session.add_hint(lambda: _view._closing_hint(session.messages))
     session.should_stop = lambda: turn.cancelled
     session.chat(recall_func=_chat_root.get_handler(session), description_cache=_chat_root.description_cache)
     return session.output_recorded
@@ -254,8 +255,23 @@ def _agent_provider(turn, session: llm.Chat):
                                      f"{window} 正式阅读部分失败："
                                      f"本次已兑现 {len(pulled)} 条，"
                                      f"尚未兑现 {len(remaining)} 条；{error}。"
-                                     "原计划停止，未兑现成员仍未读；请重新选择，"
+                                     "原计划停止，未兑现成员状态可能已变化；请重新查询再选择，"
                                      "或用 read_messages 查档案。"})
+            binding = session.tool_binding
+            binding.sync_registry()
+            data = _chat_root.storage.get("", "agent")
+            if data.get("history_start") == getattr(turn, "history_start", None):
+                previous = data.get(_chat_root._TOLD_TOOLS_KEY)
+                current = binding.state_snapshot()
+                if previous != current:
+                    content = binding.state_text(previous if isinstance(previous, dict) else None)
+                    if content:
+                        entry = oplog.input_tools(_chat_root.AGENT_WINDOW, content)
+                        projection = _view._numbered(entry["projection"], entry["id"])
+                        produced.append(projection)
+                        _view._remember_stream(session, projection, entry["id"])
+                    data[_chat_root._TOLD_TOOLS_KEY] = current
+                    _chat_root.storage.save()
             turn._chat_usage_tokens = sum(
                 _view._message_cost(message) for message in [*session.messages, *produced]
                 if _stream_id(session, message) is not None
@@ -344,7 +360,7 @@ def event_links(window, ids: list[str] | None = None, anchor: str = "", before: 
 def cover_stream(session, window, ids: list[str], conclusion: str, anchor: str = "", before: int = 0,
                  after: int = 0, start: str = "", end: str = "", kinds: str = "",
                  source: str = "") -> str:
-    """将本次主窗口可见或此前已覆盖的事件归入这次行动的结论；成员不再自动载入，但仍可按原编号反查。关联的整批输出、返回和已确认 say 回声必须一同覆盖。
+    """将本次主窗口可见或此前已覆盖的事件归入这次行动的结论；成员不再自动载入，但仍可按原编号反查。关联的整批输出和返回必须一同覆盖。
 
     @param
     ids: 显式正式号列表；与 anchor 或 start/end 二选一，范围调用请传 []

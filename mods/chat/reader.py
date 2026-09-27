@@ -124,8 +124,7 @@ def _drain_legacy_results() -> list[tuple[dict, dict]]:
             continue
         recorded = oplog.result(_chat_root.AGENT_WINDOW, values["source"],
                                 values["returns"], entry["arrival"])
-        rows.append((recorded, _view._result_projection(
-            recorded, oplog.say_links(_chat_root.AGENT_WINDOW))))
+        rows.append((recorded, _view._result_projection(recorded)))
     return rows
 
 
@@ -215,25 +214,39 @@ def _take_source_events(window: tuple, source: dict, session: llm.Chat | None,
     for page_number, offset in positions:
         with context.window_lock(window):
             if oplog.source_position_read(source["key"], page_number, offset):
-                continue
+                return output, f"信源成员已被读取或跳过：{source['key']}:{page_number}:{offset}"
             members = pages.setdefault(page_number, _source_pages.read_page(
                 oplog.source_page_root(), source["key"], page_number))
             member = members[offset]
             origin = member["origin"]
-            event = chatlog.read_origin(*window, origin)
-            if event is None:
-                return output, f"补回档案位置已丢失：{origin}"
-            event["_history_source"] = "napcat_backfill"
-            event["_history_seq"] = member.get("message_seq")
             arrival = oplog.pending_message(window, member["message_id"], member["time"],
                                             member.get("message_seq"))
+        event = chatlog.read_origin(*window, origin)
+        if event is None:
+            return output, f"补回档案位置已丢失：{origin}"
+        event["_history_source"] = "napcat_backfill"
+        event["_history_seq"] = member.get("message_seq")
+
+        def commit(converted: dict | None) -> dict:
+            with context.window_lock(window):
+                if oplog.source_position_read(source["key"], page_number, offset):
+                    raise ValueError(f"信源成员已被读取或跳过：{source['key']}:{page_number}:{offset}")
+                current_arrival = oplog.pending_message(
+                    window, member["message_id"], member["time"], member.get("message_seq"))
+                if arrival is not None and current_arrival != arrival:
+                    raise ValueError(f"信源成员对应的实时到达已被读取或跳过：{arrival}")
+                return oplog.input_source(
+                    _chat_root.AGENT_WINDOW, event, converted, source["key"],
+                    page_number, offset, origin, window, arrival=current_arrival,
+                    mentioned=member.get("mentioned", False),
+                    read_by=read_by, read_via=read_via)
+
+        try:
             projected = _formal_input(
                 session, window, event, read_by, read_via, bridge,
-                lambda converted: oplog.input_source(
-                    _chat_root.AGENT_WINDOW, event, converted, source["key"],
-                    page_number, offset, origin, window, arrival=arrival,
-                    mentioned=member.get("mentioned", False),
-                    read_by=read_by, read_via=read_via), echo=True)
+                commit, echo=True)
+        except ValueError as error:
+            return output, str(error)
         if projected is not None:
             output.append(projected)
     return output, None
@@ -471,19 +484,32 @@ def _formal_input(session: llm.Chat | None, window: tuple, event: dict,
                   read_by: str | None, read_via: str | None, bridge: dict | None,
                   commit: Callable[[dict | None], dict], *, echo: bool,
                   skip_unprojectable: bool = False) -> dict | None:
+    # WHY: 图片描述可能等待外部视觉模型；它必须在窗口锁外完成，避免同窗口入站和 ^C
+    # 被网络请求挡住。调用者先锁内选定成员，再由 commit 锁内复核原坐标并追加 input。
     converted = _view._read_projection(_view._model_event(event, window[0] == "group"),
                                        read_by, read_via)
     if converted is None and skip_unprojectable:
         return None
+    if (converted is not None and echo and event.get("post_type") == "message_sent"
+            and event.get("message_id") is not None):
+        reference = oplog.sent_by(event["message_id"], window)
+        if reference is not None:
+            content = converted["content"]
+            metadata = content[0]
+            converted = {**converted, "content": [
+                {**metadata, "text": metadata["text"].replace(
+                    "</metadata>", f"  <sent_by>{reference}</sent_by>\n</metadata>", 1)},
+                *content[1:]]}
     if converted is not None and bridge:
         converted = _with_bridge(converted, bridge)
+    if (converted is not None and session is not None and session.do_process_image
+            and not session.chat_client.get_model_capabilities(session.model).vision):
+        converted = session.chat_client._describe_images(
+            [converted], _chat_root.description_cache)[0]
     recorded = commit(converted)
     if converted is None:
         return None
     projection = _view._numbered(converted, recorded["id"])
-    if echo:
-        projection = _view._echo_relation(projection, recorded,
-                                          oplog.say_links(_chat_root.AGENT_WINDOW))
     if session is not None:
         _view._remember_stream(session, projection, recorded["id"])
     return projection
@@ -864,11 +890,7 @@ def _take_members(session: llm.Chat, request: dict) -> tuple[list[dict], str | N
             source = oplog.resolve_source(member["source"])
             if source is None or oplog.source_position_read(
                     member["source"], member["page"], member["offset"]):
-                selected.pop(0)
-                if selected:
-                    bridge_plan = _source_bridge_plan(request["source"],
-                                                      request.get("last_key", ""), selected)
-                continue
+                return output, f"信源成员已被读取或跳过：{member['key']}"
             projected, error = _take_source_events(
                 window, source, session, [(member["page"], member["offset"])],
                 read_by=request.get("read_by"),
@@ -884,28 +906,53 @@ def _take_members(session: llm.Chat, request: dict) -> tuple[list[dict], str | N
         with context.window_lock(window):
             entry = next((item for item in oplog.unread(window)
                           if item["arrival"] == arrival), None)
-            if entry is not None:
-                located = {**entry["event"], "_log_origin": entry.get("origin"), "_live": True}
+        if entry is None:
+            return output, f"实时成员已被读取或跳过：{arrival}"
+        located = {**entry["event"], "_log_origin": entry.get("origin"), "_live": True}
+
+        def commit(converted: dict | None) -> dict:
+            with context.window_lock(window):
+                current = next((item for item in oplog.unread(window)
+                                if item["arrival"] == arrival), None)
+                if current is None:
+                    raise ValueError(f"实时成员已被读取或跳过：{arrival}")
                 # WHY: I is durable before hiding this exact arrival. A provider failure
                 # after request assembly can leave it read but unprocessed; exactly-once
                 # delivery is not promised. The oplog validates this exact arrival.
-                projection = _formal_input(
-                    session, window, located, request.get("read_by"), request.get("read_via"), bridge,
-                    lambda converted: oplog.input(
-                        _chat_root.AGENT_WINDOW, entry["event"], converted, arrival,
-                        source_window=window, read_by=request.get("read_by"),
-                        read_via=request.get("read_via")), echo=True)
-        if entry is None:
-            selected.pop(0)
-            if selected:
-                bridge_plan = _source_bridge_plan(request["source"],
-                                                  request.get("last_key", ""), selected)
-            continue
+                return oplog.input(
+                    _chat_root.AGENT_WINDOW, current["event"], converted, arrival,
+                    source_window=window, read_by=request.get("read_by"),
+                    read_via=request.get("read_via"))
+
+        try:
+            projection = _formal_input(
+                session, window, located, request.get("read_by"), request.get("read_via"), bridge,
+                commit, echo=True)
+        except ValueError as error:
+            return output, str(error)
         if projection is not None:
             output.append(projection)
         request["last_key"] = member["key"]
         selected.pop(0)
     return output, None
+
+
+def _archive_targets(window: tuple, record: dict, origin: str) -> tuple[str | None, dict]:
+    arrival = next((item["arrival"] for item in oplog.unread(window)
+                    if item.get("origin") == origin), None)
+    if arrival is None and record.get("message_id") is not None and type(record.get("time")) is int:
+        arrival = oplog.pending_message(window, record["message_id"], record["time"],
+                                        record.get("message_seq"))
+    source_member = next((item for source in oplog.sources()
+                          if tuple(source["window"]) == window and source["state"] != "fetching"
+                          for page, offset, member in _source_unread_members(source)
+                          if member["origin"] == origin
+                          for item in [(source["key"], page, offset,
+                                        bool(member.get("mentioned")))]), None)
+    values = ({"source": source_member[0], "page": source_member[1],
+               "offset": source_member[2], "mentioned": source_member[3]}
+              if source_member is not None else {})
+    return arrival, values
 
 
 def _take_archive(session: llm.Chat, request: dict, window: tuple) -> tuple[list[dict], str | None]:
@@ -918,30 +965,25 @@ def _take_archive(session: llm.Chat, request: dict, window: tuple) -> tuple[list
             return output, "档案记录缺少稳定 origin"
         event = {**record, "_history_source": "archive", "_live": False}
         with context.window_lock(window):
-            arrival = next((item["arrival"] for item in oplog.unread(window)
-                            if item.get("origin") == origin), None)
-            if arrival is None and record.get("message_id") is not None and type(record.get("time")) is int:
-                arrival = oplog.pending_message(window, record["message_id"], record["time"],
-                                                record.get("message_seq"))
-            source_member = next((item for source in oplog.sources()
-                                  if tuple(source["window"]) == window and source["state"] != "fetching"
-                                  for page, offset, member in _source_unread_members(source)
-                                  if member["origin"] == origin
-                                  for item in [(source["key"], page, offset,
-                                                bool(member.get("mentioned")))]), None)
-            values = ({"source": source_member[0], "page": source_member[1],
-                       "offset": source_member[2], "mentioned": source_member[3]}
-                      if source_member is not None else {})
+            arrival, values = _archive_targets(window, record, origin)
 
-            def commit(converted: dict | None) -> dict:
+        def commit(converted: dict | None) -> dict:
+            with context.window_lock(window):
+                current_arrival, current_values = _archive_targets(window, record, origin)
+                if (arrival is not None and current_arrival != arrival
+                        or values and current_values != values):
+                    raise ValueError(f"档案命中的未读成员已被读取或跳过：{origin}")
                 return oplog.input_archive(_chat_root.AGENT_WINDOW, record, converted, origin,
-                                           window, arrival=arrival,
+                                           window, arrival=current_arrival,
                                            read_by=request.get("read_by"),
-                                           read_via=request.get("read_via"), **values)
+                                           read_via=request.get("read_via"), **current_values)
 
+        try:
             projection = _formal_input(session, window, event, request.get("read_by"),
                                        request.get("read_via"), None, commit, echo=False,
                                        skip_unprojectable=True)
+        except ValueError as error:
+            return output, str(error)
         if projection is not None:
             output.append(projection)
         records.pop(0)

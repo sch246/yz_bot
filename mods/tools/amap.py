@@ -14,6 +14,7 @@
 控制台 `https://console.amap.com/dev/key/app` → 创建应用 → 添加 Key → **服务平台选
 「Web 服务」** → 拿到一串 32 位 Key。创建时若同时给了"安全密钥"，把它一并交给 `login`
 的 `secret`，工具会按高德规则算 `sig`；只给 Key 也行（没有安全密钥的 Key 不需要签名）。
+Key 属于 Bot 自己，所有中心会话共享，不从唤醒者的个人存储读取。
 
 ## 使用边界（高德开放平台服务协议，2025-12-03 版）
 
@@ -35,7 +36,7 @@ import time
 import urllib.parse
 import urllib.request
 
-from mods import context, identity
+from mods import identity
 
 KEY_STORAGE = "amap_key"
 SECRET_STORAGE = "amap_secret"
@@ -51,13 +52,12 @@ NEED_KEY = (
 _last_call = 0.0
 
 
-def _uid() -> int:
-    current = context.current() or {}
-    return int(current.get("user_id") or 0)
+def _bucket() -> dict:
+    return identity.getstorage(identity.bot_id())
 
 
 def _creds() -> tuple[str, str]:
-    bucket = identity.getstorage(_uid())
+    bucket = _bucket()
     return str(bucket.get(KEY_STORAGE) or ""), str(bucket.get(SECRET_STORAGE) or "")
 
 
@@ -161,7 +161,7 @@ def _poi_lines(pois: list, start: int = 1) -> list[str]:
 
 
 def login(key: str, secret: str = "") -> str:
-    """保存高德 Key（并先真查一次验证），供之后所有查询使用。
+    """保存 Bot 自己的高德 Key（并先真查一次验证），供之后所有查询使用。
 
     @param
     key: 32 位高德 Key，服务端类型（控制台创建时服务平台选「Web 服务」）
@@ -173,14 +173,14 @@ def login(key: str, secret: str = "") -> str:
                   key=key.strip(), secret=secret.strip())
     if probe.get("_error"):
         return f"Key 验证失败：{probe['_error']}"
-    bucket = identity.getstorage(_uid())
+    bucket = _bucket()
     bucket[KEY_STORAGE] = key.strip()
     if secret.strip():
         bucket[SECRET_STORAGE] = secret.strip()
     else:
         bucket.pop(SECRET_STORAGE, None)
     found = len(probe.get("pois") or [])
-    return f"成功：Key 有效（验证查询返回 {found} 条）。已保存到你的名下。"
+    return f"成功：Key 有效（验证查询返回 {found} 条）。已保存为 Bot 的 Key。"
 
 
 def search(keyword: str, city: str = "", limit: int = 10) -> str:
@@ -332,8 +332,8 @@ def status() -> str:
 
 
 def forget() -> str:
-    """删掉保存的高德 Key。"""
-    bucket = identity.getstorage(_uid())
+    """删掉 Bot 保存的高德 Key。"""
+    bucket = _bucket()
     had = bool(bucket.pop(KEY_STORAGE, None))
     bucket.pop(SECRET_STORAGE, None)
     return "已删除保存的高德 Key。" if had else "本来就没有保存过高德 Key。"

@@ -1,4 +1,4 @@
-"""QQ-window chat context, settings, tools, and the ``.chat`` command."""
+"""Global agent context, settings, and QQ-window hints."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ import traceback
 from typing import Callable
 
 from mods import _source_pages, context, cq, history, identity, image, llm, log, message, msgs, op, oplog, py, storage, text, thread, tools as tool_modules
-from mods.command import command
 from mods.capture import capture
 from mods.llm import pricing
 
@@ -24,15 +23,9 @@ IMAGE_MODES = ("off", "lazy", "eager")
 IMAGE_MODE_ALIASES = {"0": "off", "1": "lazy", "2": "eager"}
 
 # WHY: 中心 keep 保留原生思考直到 cover；drop 以无思考的
-# 文本投影省 token。独立 .chat 的 keep/drop 仍只影响本轮工具循环。
+# 文本投影省 token。
 REASONING_MODES = ("keep", "drop")
 REASONING_ALIASES = {"on": "keep", "off": "drop", "1": "keep", "0": "drop"}
-
-# WHY: append=工具变动追加进上下文(默认，进历史、可回放、不打断前缀缓存)，
-# ui=整个工具状态作为一整块 hint 挂在末尾(只有一个权威副本，且明确位于所有修改之后，
-# 代价是每次子请求都是未命中缓存的新 token)。两者的取舍见 tools._state_hint。
-TOOLS_MODES = ("append", "ui")
-TOOLS_MODE_ALIASES = {"0": "append", "1": "ui", "hint": "ui"}
 
 settings: list = []
 prompts: dict = {}
@@ -41,8 +34,7 @@ description_cache: dict = {}
 llm_config: dict = {}
 # WHY: 两个上限的默认值写死在这里，不再读 llm_system/config.json；运行期由全局
 # agent storage 覆盖。两个值只在首次激活或显式重置时决定起点；此后不自动遗忘。
-# 500 条避免极短事件挤占首次视野，40000 token 是自主压缩的信号。独立 `.chat`
-# 沿用同一缺省及原有窗口裁剪，旧窗口覆盖仍原样保留。
+# 500 条避免极短事件挤占首次视野，40000 token 是自主压缩的信号。
 DEFAULT_MAX_EVENTS = 500
 DEFAULT_MAX_TOKEN = 40000
 AGENT_WINDOW = oplog.AGENT_WINDOW
@@ -59,18 +51,6 @@ _hint_stream = log.stream("hint")
 _offline_scope: ContextVar[dict | None] = ContextVar("chat_offline_scope", default=None)
 
 
-def getchatstorage(event: dict | None = None) -> dict:
-    if context.agent_mode():
-        return storage.get("", "agent")
-    event = context.current() if event is None else event
-    if event is None:
-        raise RuntimeError("当前没有聊天窗口")
-    if event.get("group_id") is not None:
-        return storage.get("groups", str(event["group_id"]))
-    # 私聊窗口是对端（`target_id`）；`user_id` 是作者，只在窗口缺失时兜底。
-    return storage.get("users", str(event.get("target_id") or event.get("user_id")))
-
-
 def normalize_image_mode(value) -> str:
     if value is True:
         return "lazy"
@@ -80,53 +60,27 @@ def normalize_image_mode(value) -> str:
     return normalized if normalized in IMAGE_MODES else "off"
 
 
-def window_setting(name: str, data: dict | None = None):
-    """本窗口生效的窗口级配置：窗口里写过的合法值优先，否则回到默认值。
-
-    WHY: 只有这一处合并，没有别的间接层。窗口层住在 `getchatstorage()` 的平铺键里
-    （与 `#image`/`#tools` 一系），缺省写死在 WINDOW_SETTINGS；合法值判断交给归一化
-    函数，所以读取端永远拿得到能用的值，旧存储里的遗留值也不会让聊天崩掉。
-    """
-    key, _default, normalize = WINDOW_SETTINGS[name]
-    return normalize((getchatstorage() if data is None else data).get(key))
+def agent_setting(name: str, data: dict | None = None):
+    key, normalize = AGENT_SETTINGS[name]
+    return normalize((storage.get("", "agent") if data is None else data).get(key))
 
 
-def limit(event: dict | None = None) -> tuple[int, int]:
-    """本窗口生效的 `(可见事件数上限, 上下文 token 上限)`。
-
-    两个值都从 WINDOW_SETTINGS 取，窗口没写就用默认。没有窗口（没有 group_id 也
-    没有 user_id）时直接给默认值——`#hint` 的默认代码要拿它显示，不该因此抛出去。
-    """
-    if context.agent_mode():
-        data = getchatstorage()
-        return (WINDOW_SETTINGS["max_events"][2](data.get("max_events")),
-                WINDOW_SETTINGS["max_token"][2](data.get("max_token")))
-    event = context.current() if event is None else event
-    if event is None or history.window(event) is None:
-        return DEFAULT_MAX_EVENTS, DEFAULT_MAX_TOKEN
-    data = getchatstorage(event)
-    value = data.get("max_events", data.get("max_msg"))
-    return WINDOW_SETTINGS["max_events"][2](value), window_setting("max_token", data)
+def limit() -> tuple[int, int]:
+    return agent_setting("max_events"), agent_setting("max_token")
 
 
 def get_image_mode(data: dict | None = None) -> str:
-    return window_setting("image", data)
+    return agent_setting("image", data)
 
 
-# WHY: 下面两组照 image 那一套写：normalize 负责把存坏的值拉回默认，读取端永远拿得到
-# 合法值，所以旧存储里的遗留值不会让聊天崩掉。别改成直接读原值。
+# WHY: 归一化负责把存坏的值拉回默认，读取端永远拿得到合法值。
 def normalize_reasoning_mode(value) -> str:
     normalized = REASONING_ALIASES.get(str(value).lower(), str(value).lower())
     return normalized if normalized in REASONING_MODES else "keep"
 
 
 def get_reasoning_mode(data: dict | None = None) -> str:
-    return window_setting("reasoning", data)
-
-
-def normalize_tools_mode(value) -> str:
-    normalized = TOOLS_MODE_ALIASES.get(str(value).lower(), str(value).lower())
-    return normalized if normalized in TOOLS_MODES else "append"
+    return agent_setting("reasoning", data)
 
 
 def _bounded_int(minimum: int, fallback: int, maximum: int | None = None):
@@ -142,26 +96,18 @@ def _bounded_int(minimum: int, fallback: int, maximum: int | None = None):
     return normalize
 
 
-# 单值聊天配置：命令名 -> (storage 键, 默认值, 归一化)。
-# WHY: 窗口会话走 window_setting 合并，中心 agent 把自己的全局字典交给同一归一化函数；
-# 表只统一合法值和默认值，不混合两种 storage。`hint`/`prompt` 是复合值（dict / 列表），
-# 缺省来自别的存储，各自的合并也只有一行，塞进来反而要造间接层。
-WINDOW_SETTINGS = {
-    "image": ("image", "off", normalize_image_mode),
-    "reasoning": ("reasoning", "keep", normalize_reasoning_mode),
-    "tools": ("tools", "append", normalize_tools_mode),
-    "max_events": ("max_events", DEFAULT_MAX_EVENTS, _bounded_int(1, DEFAULT_MAX_EVENTS)),
-    "max_token": ("max_token", DEFAULT_MAX_TOKEN, _bounded_int(1, DEFAULT_MAX_TOKEN)),
-    "pressure_percent": ("pressure_percent", _PRESSURE_PERCENT, _bounded_int(1, _PRESSURE_PERCENT, 100)),
+# 单值全局 agent 配置：storage 键与归一化。
+AGENT_SETTINGS = {
+    "image": ("image", normalize_image_mode),
+    "reasoning": ("reasoning", normalize_reasoning_mode),
+    "max_events": ("max_events", _bounded_int(1, DEFAULT_MAX_EVENTS)),
+    "max_token": ("max_token", _bounded_int(1, DEFAULT_MAX_TOKEN)),
+    "pressure_percent": ("pressure_percent", _bounded_int(1, _PRESSURE_PERCENT, 100)),
 }
 
 
-def get_tools_mode(data: dict | None = None) -> str:
-    return window_setting("tools", data)
-
-
 def get_prompt() -> list:
-    selected = getchatstorage().get("prompt")
+    selected = storage.get("", "agent").get("prompt")
     if not selected:
         return settings
     if isinstance(selected, str):
@@ -170,7 +116,7 @@ def get_prompt() -> list:
 
 
 def get_model(data: dict | None = None) -> str:
-    data = getchatstorage() if data is None else data
+    data = storage.get("", "agent") if data is None else data
     selection = data.get("model", llm_config.get("default_model", llm.DEFAULT_MODEL))
     try:
         llm.resolve_model(llm_config, selection)
@@ -204,11 +150,11 @@ def bounded_excerpt(value: str, max_tokens: int) -> str:
 def context_usage(turn=None) -> int:
     """Estimate the last request's actual stream view when a reader owns it."""
     if turn is None:
-        turn = context.get_turn(history.window(context.current() or {}))
+        turn = context.get_turn(AGENT_WINDOW)
     captured = getattr(turn, "_chat_usage_tokens", None)
     if captured is not None:
         return captured
-    return _view.get_msgs(return_token=True)[1]
+    return 0
 
 
 def usage_name(when: datetime | None = None) -> str:
@@ -222,20 +168,8 @@ def usage_name(when: datetime | None = None) -> str:
 
 
 def _usage_entry() -> list | None:
-    """The current LLM actor's ``[calls, cost]`` for the month.
-
-    WHY: 中心 reader 的行动属于 Bot，不能记给刚好唤醒它的群友；独立 `.chat`
-    仍是人类发起的单句请求，保留原作者账目。Bot 的 QQ 号作为中心账本键，
-    旧月份的人类账目不迁移或重写。
-
-    WHY: 私聊的顶层 `user_id` 是窗口对端，不一定是发起者；私有会话仍用
-    `history.author` 判归属。没有可确定作者时不写入 "None" 键，否则 `.chattop`
-    无法读回这笔费用。
-    """
-    if getattr(context, "agent_mode", lambda: False)():
-        user_id = identity.bot_id()
-    else:
-        user_id = history.author(context.current() or {})
+    """The Bot's ``[calls, cost]`` for the month."""
+    user_id = identity.bot_id()
     if user_id is None:
         return None
     usage = storage.get("usage", usage_name())
@@ -277,25 +211,17 @@ def init_chat(
 ) -> tuple[tool_modules.SessionBinding, tuple | None]:
     """Assemble one Chat and return its tool binding and window."""
     prompts["base"] = _view._base_prompt()
-    group = context.current().get("group_id") if context.current() else None
-    state = ({"role": "system", "content": "你是唯一的中心 agent；窗口只是来源与明确发送目标。"}
-             if context.agent_mode() else
-             ({"role": "system", "content": f"当前所在群聊:{identity.getgroupname(group)}({group})"}
-              if group is not None else {"role": "system", "content": f"当前在私聊:{identity.getname()}({context.current().get('user_id')})"}))
-    ui_mode = get_tools_mode() == "ui"
+    state = {"role": "system", "content": "你是唯一的中心 agent；窗口只是来源与明确发送目标。"}
     offline = _offline_scope.get()
-    tool_context = tool_modules.create_context_message(
-        ui_mode=ui_mode, registry=offline["registry"] if offline else None)
-    window = AGENT_WINDOW if context.agent_mode() else history.window(context.current() or {})
+    window = AGENT_WINDOW
     session.set_messages([
         *get_prompt(),
         *prompts["base"],
         *([{"role": "system", "content": offline["fact"]}] if offline else []),
-        tool_context,
         state,
         *(messages or []),
     ])
-    # WHY: 激活态属于会话主体：主 reader 存全局 agent，独立 .chat 存窗口。每轮
+    # WHY: 激活态属于全局会话主体。每轮
     # 都新建一个 `llm.Chat`，激活只在内存里活着的话，下一轮模型就拿着上一轮
     # 装载过的名字去调用，而快照里没有——那个调用被丢掉、整轮直接结束，模型连自救的机会
     # 都没有（2026-09-17 `browser__open_page`）。读写在 `_active_modules`／
@@ -303,18 +229,15 @@ def init_chat(
     # WHY: 装回不是无限的：超过时限没用过的模块会在 `restore` 里被收掉，并给模型一条
     # 通告——"只进不出"会让每次 `load_tools` 都永久占着基线消息。判据用的是每个模块最后
     # 一次被调用的时刻，所以 bind 出来的那个对象要一直拿着，供 `_stream_results` 上报。
-    # WHY: image's generation functions still infer an implicit current window;
-    # the central agent has no such destination. Keep the whole module hidden
-    # here without changing what independent .chat can explicitly load.
     binding = tool_modules.bind_session(
         session,
-        tool_context,
+        None,
         registry=offline["registry"] if offline else None,
-        ui_mode=ui_mode,
-        visible=(lambda name, module: name not in {
-            "agents", "amap", "baidumap", "dianping", "image", "later"
-        } and tool_modules.bot_op_tool_visible(name, module)) if context.agent_mode() and not offline else None,
-        persist=_persist_modules(window) if window is not None else None,
+        visible=(lambda name, module: name not in {"baidumap", "dianping"}
+                 and tool_modules.bot_op_tool_visible(name, module)) if not offline else None,
+        persist=_persist_modules,
+        schema_modules=_schema_modules(),
+        persist_schema=_persist_schema_modules,
     )
     return binding, window
 
@@ -322,35 +245,32 @@ def init_chat(
 def _activate_chat(
     session: llm.Chat,
     messages: list | None = None,
-    *,
-    read_mail: bool = False,
 ) -> tool_modules.SessionBinding:
     """Run the two lifecycle effects owned by one top-level activation."""
-    # WHY: 调用计数与窗口工具恢复描述的是「Bot 被激活一次」，不是「有人调用了上下文装配
-    # 函数」。把两者放在同一个入口后，mail 续读、`.chat` 与重启接续都明确经过它，单纯
+    # WHY: 调用计数与全局工具恢复描述的是「Bot 被激活一次」，不是「有人调用了上下文装配
+    # 函数」。把两者放在同一个入口后，mail 续读与重启接续都明确经过它，单纯
     # 构造 Chat 则不产生生命周期副作用。顺序仍与迁移前一致：先计数，再装配，再恢复工具。
     inc_call_count()
     binding, window = init_chat(session, messages)
-    session.reads_window_mail = read_mail
-    _restore_window_tools(binding, window)
-    if window is not None:
-        session.add_hint(lambda: _agent_hint(window))
+    session.reads_window_mail = True
+    _restore_agent_tools(binding)
+    binding.restore_schema()
+    session.tool_binding = binding
+    session.add_hint(lambda: _agent_hint())
     session.add_hint("对外说话必须实际调用 say；回复正文只是自言自语，不会发送到聊天窗口。")
-    # WHY: 工具恢复可能持久化 ttl 回收；它必须先于其余窗口设置读取，避免无关的配置异常
+    # WHY: 工具恢复可能持久化 ttl 回收；它必须先于其余全局设置读取，避免无关的配置异常
     # 改变这一轮是否完成回收。
     session.do_process_image = get_image_mode() != "off"
     session.keep_reasoning = get_reasoning_mode() == "keep"
-    # WHY: `.chat` 和子代理始终使用原生配对；中心 reader 对能够原样
-    # 恢复的 DeepSeek 输出也保留原生配对，其余记录使用正式事件文本。
-    session.preserve_native = read_mail and session.keep_reasoning
-    session.on_output = (lambda assistant, calls: _record_output(window, assistant, calls, session)
-                         if read_mail else oplog.output(window, assistant, calls))
+    # WHY: 中心 reader 对能够原样恢复的 DeepSeek 输出保留原生配对，其余记录使用正式事件文本。
+    session.preserve_native = session.keep_reasoning
+    session.on_output = lambda assistant, calls: _record_output(window, assistant, calls, session)
     session.on_results = _agent._stream_results(window, binding)
     return binding
 
 
-def _restore_window_tools(binding, window: tuple | None) -> None:
-    """把本窗口已激活的工具模块装回本次激活；空闲回收挂在同一个动作上。
+def _restore_agent_tools(binding) -> None:
+    """把全局 agent 已激活的工具模块装回本次激活；空闲回收挂在同一个动作上。
 
     WHY: 这一步**不**再交给 `bind_session` 的 `initial_modules` 参数顺带做，虽然那样少一
     行。装回是一个**生命周期动作**，不是装配的一部分：它发生在「顶层激活」这个时刻，而
@@ -362,12 +282,9 @@ def _restore_window_tools(binding, window: tuple | None) -> None:
     now，空闲回收在那条路上恒为空操作。子代理只借用「静默装回、不发通告」，没有生命周期
     含义，把它也卷进来只会让接管时机的那一步多一个不相干的调用点。
 
-    WHY: 空映射时不调用，**这个条件是照搬的**，不是新加的判断。核实过它此刻
-    并不承重：刚 bind 完 `_dirty` 是 False，空输入下 `kept == requested == []`，所以
-    `restore` 既不会 `_save_active` 也不会 `_queue_reclaimed`，只是把 `_render_context`
-    幂等地重算一遍。继续保留这个条件，是为了只迁移副作用的归属，不同时改变空名单语义。
+    WHY: 空映射时不调用是保留的旧边界；没有名单就不产生恢复写入。
     """
-    modules = _active_modules(window) if window is not None else {}
+    modules = _active_modules()
     if modules:
         binding.restore(modules)
 
@@ -424,12 +341,11 @@ def _record_output(window, assistant: dict, calls: list[dict], session=None) -> 
 
 
 def _window_storage(window: tuple) -> dict:
-    """取本窗口自己的 chat storage，键就是 `history.window(...)`（`#hint` 和工具激活共用）。
+    """只为 `#hint` 取本窗口 storage，键就是 `history.window(...)`。
 
     WHY: 不经过 `context.current()`——hint 在 `chat` 的 `finally` 里跑，那个窗口就是调用方
     手上的实参；由实参决定"哪个窗口"，触发点就不依赖线程局部的当前事件，也不跟捕获、派发
-    的细节绑在一起。工具激活走同一个理由：`_activate_chat` 手上的 window 就是它的窗口。
-    命名空间与 getchatstorage 同一套。
+    的细节绑在一起。
     """
     if window == AGENT_WINDOW:
         return storage.get("", "agent")
@@ -440,15 +356,15 @@ def _window_storage(window: tuple) -> dict:
 _AGENT_HINT_KEY = "agent_hint"
 
 
-def _agent_hint(window: tuple) -> str:
-    value = _window_storage(window).get(_AGENT_HINT_KEY)
+def _agent_hint() -> str:
+    value = storage.get("", "agent").get(_AGENT_HINT_KEY)
     if not isinstance(value, str) or not value.strip():
         return ""
     return f"待办（你用 edit_hint 保存，可整体替换或清空）：\n{value}"
 
 
-def set_agent_hint(window: tuple, text: str) -> None:
-    data = _window_storage(window)
+def set_agent_hint(text: str) -> None:
+    data = storage.get("", "agent")
     if text.strip():
         data[_AGENT_HINT_KEY] = text.strip()
     else:
@@ -456,19 +372,30 @@ def set_agent_hint(window: tuple, text: str) -> None:
     storage.save()
 
 
-# 会话主体持久激活的工具模块名，以及各自最后一次被调用的时刻。别和 WINDOW_SETTINGS 里的
-# "tools"（工具状态呈现方式）混用，两者住在同一个 storage 字典里。
+# 会话主体持久激活的工具模块名，以及各自最后一次被调用的时刻。
 _ACTIVE_MODULES_KEY = "active_tools"
+_SCHEMA_MODULES_KEY = "tool_schema_modules"
+_TOLD_TOOLS_KEY = "tool_state_told"
 
 
-def _active_modules(window: tuple) -> dict[str, float]:
+def _schema_modules() -> list[str]:
+    value = storage.get("", "agent").get(_SCHEMA_MODULES_KEY, [])
+    return [name for name in value if isinstance(name, str)] if isinstance(value, list) else []
+
+
+def _persist_schema_modules(names: list[str]) -> None:
+    storage.get("", "agent")[_SCHEMA_MODULES_KEY] = list(names)
+    storage.save()
+
+
+def _active_modules() -> dict[str, float]:
     """本会话主体上次装着哪些工具模块、各自最后一次被调用是什么时候。
 
     WHY: 值是使用时刻，`tools.SessionBinding.restore` 靠它决定哪些模块已经空闲太久、
     该在这一轮收掉。旧格式（只存名字的列表）一律当成"就是刚才用过"——那是这份格式之前
     留下的，给它一个完整时限比让它立刻消失更不容易误伤。
     """
-    value = _window_storage(window).get(_ACTIVE_MODULES_KEY)
+    value = storage.get("", "agent").get(_ACTIVE_MODULES_KEY)
     if isinstance(value, dict):
         return {
             name: float(stamp)
@@ -480,10 +407,10 @@ def _active_modules(window: tuple) -> dict[str, float]:
     return {}
 
 
-def _persist_modules(window: tuple):
+def _persist_modules(stamps: dict[str, float]) -> None:
     """给 `SessionBinding` 的回调：把会话主体的激活集合写回 storage。
 
-    WHY: 主 reader 的激活是**全局主体**状态，私有 .chat 才按窗口存；都不是单轮状态。
+    WHY: 主 reader 的激活是**全局主体**状态，不是单轮状态。
     每轮都新建一个 `llm.Chat`，
     激活如果只活在内存里，模型下一轮会照上一轮装载过的名字去调用（操作历史轨道把那几次
     `load_tools` 原样重建进了上下文），而那一轮的快照里没有这个名字——`llm` 解析时
@@ -497,13 +424,12 @@ def _persist_modules(window: tuple):
     WHY: 值是使用时刻而不是只有名字，见 `_active_modules`；空闲回收在 `tools` 那层判，
     这里只负责如实来回搬。
     """
-    def save(stamps: dict[str, float]) -> None:
-        data = _window_storage(window)
-        if stamps:
-            data[_ACTIVE_MODULES_KEY] = {name: float(stamp) for name, stamp in stamps.items()}
-        else:
-            data.pop(_ACTIVE_MODULES_KEY, None)
-    return save
+    data = storage.get("", "agent")
+    if stamps:
+        data[_ACTIVE_MODULES_KEY] = {name: float(stamp) for name, stamp in stamps.items()}
+    else:
+        data.pop(_ACTIVE_MODULES_KEY, None)
+    storage.save()
 
 
 def _hint_effective(default: dict, chat_hint: dict | None) -> dict:
@@ -532,7 +458,7 @@ def _run_hint(window: tuple, turn=None) -> None:
             return
         result = _hint_evaluate(code, window, turn)
         if result is not None:
-            # `#` 前缀让结束提示不回流进 LLM 上下文，见 get_msgs 的说明。
+            # `#` 前缀让结束提示不回流进 LLM 上下文，见 _model_event。
             message.sendmsg("#" + cq.escape(str(result)))
     except Exception:
         _report_hint_failure()
@@ -558,7 +484,7 @@ def _report_hint_failure() -> None:
     """照 link._report_error 的惯例，把 traceback 用 `#` 前缀发出去。"""
     _hint_stream.exception("hint 执行失败")
     try:
-        # `#` 前缀让 traceback 不回流进 LLM 上下文，见 get_msgs 的说明。
+        # `#` 前缀让 traceback 不回流进 LLM 上下文，见 _model_event。
         message.sendmsg("#" + "".join(traceback.format_exc().splitlines(True)[3:]).strip())
     except Exception:
         _hint_stream.exception("hint 的错误报告也发不出去")
@@ -601,12 +527,16 @@ def _mail_candidate(event: dict) -> bool:
         return False
     if msgs.is_msg(event):
         return True
+    if msgs.is_recall(event):
+        return True
     return _view._is_context_poke(event, event.get("group_id") is not None)
 
 
 def record_event(event: dict, write: Callable[[], object]) -> object:
     """Write chat history and register the arrival under one window lock."""
     window = history.window(event)
+    if window is None and msgs.is_friend_recall(event) and event.get("user_id") is not None:
+        window = ("private", event["user_id"])
     if window is None or not _mail_candidate(event):
         return write()
     with context.window_lock(window):
@@ -672,10 +602,9 @@ def _subcommand_call(event: dict) -> Callable | None:
     subcommand = value[1:].strip().partition(" ")[0]
     if subcommand not in _subcommands._SUBCOMMAND_NAMES:
         return None
-    if subcommand in ("hint", "agent", "limit") and not op.require_op(
-            event, pattern=r"^#\s*(hint|agent|limit)"):
-        # WHY: hint 是用户可写的特权代码；agent 与 limit 修改全局主体设置。三者都不能让
-        # 普通群友就地改写。require_op 已经按节流约定给过提醒，这里只要不接管消息。
+    if _subcommands.requires_op(value[1:]) and not op.require_op(
+            event, pattern=r"^#\s*(hint|use_model|add_prompt|use_setting|set_setting|del_setting|image|reasoning|limit|reset_start)"):
+        # WHY: 全局设置不可由普通群友改写；只读子命令保持公开。
         return None
     return lambda value=value: _subcommands._subcommand(value[1:])
 
@@ -694,7 +623,7 @@ def cond() -> Callable | bool:
 
 def call(data: Callable | bool):
     if callable(data):
-        # `#` 前缀让子命令的输出不回流进 LLM 上下文，见 get_msgs 的说明。
+        # `#` 前缀让子命令的输出不回流进 LLM 上下文，见 _model_event。
         return "#" + cq.escape(str(data()))
     return chat()
 
@@ -781,26 +710,6 @@ def eager_cache_images(event: dict) -> None:
             _eager_cache_images(event.copy(), model)
 
 
-@command
-@thread.to_thread
-def run(body: str, model: str | None = None):
-    """向当前窗口配置的模型发送一次单句请求。
-
-    格式：.chat <内容>
-    使用当前窗口的模型、提示词和图片模式；连续聊天与 # 设置由聊天捕获入口管理。
-    """
-    if not body.strip():
-        return run.__doc__
-    session = llm.Chat(model=model or get_model(), chat_client=llm.get_client())
-    _activate_chat(session, [{"role": "user", "content": body.lstrip()}])
-    # WHY: 单句请求里的工具轮同样会反复经过图片处理，所以也按一次对话记台账。
-    image_ledger = image.begin_conversation()
-    try:
-        session.chat(recall_func=get_handler(session), description_cache=description_cache)
-    finally:
-        image.end_conversation(image_ledger)
-
-
 def on_load(ctx) -> None:
     global settings, prompts, chat_groups, description_cache, llm_config
     from mods import is_available
@@ -872,5 +781,5 @@ def on_load(ctx) -> None:
 
     threading.Thread(target=resume_pending, name="chat-agent-resume", daemon=True).start()
 from . import view as _view, reader as _reader, agent as _agent, subcommands as _subcommands
-from .view import has_at, msg_split, msg2chat, event2chat, get_msgs, build_context
+from .view import has_at, msg_split, msg2chat, event2chat
 from .reader import parse_target, unread_details, prepare_recovery_sources, fetch_remote_source, unread_members, mark_window_read, mark_source_read

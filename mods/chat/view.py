@@ -4,7 +4,7 @@ import json
 import re
 import time
 
-from mods import context, cq, history, identity, message, msgs, oplog, storage
+from mods import cq, history, identity, msgs, oplog, storage
 
 import mods.chat as _chat_root
 
@@ -104,12 +104,19 @@ def _is_context_poke(event: dict, in_group: bool) -> bool:
 def event2chat(event: dict, in_group: bool) -> dict:
     """Convert one history event into the single shape the model sees.
 
-    WHY: 插话与 get_msgs 必须走同一条转换。中途插进来的消息如果换个形状(比如只塞纯
+    WHY: 插话与正式阅读必须走同一条转换。中途插进来的消息如果换个形状(比如只塞纯
     文本)，模型就会看到同一个人在同一轮里忽然换了说话格式，而且图片、回复引用这些都会
     丢。这里是唯一的转换点。
     """
     if msgs.is_msg(event):
         return msg2chat(event, in_group)
+    if msgs.is_recall(event):
+        window = (("group", event["group_id"]) if in_group
+                  else ("private", event.get("target_id", event.get("user_id"))))
+        operator = event.get("operator_id", event.get("user_id"))
+        return {"role": "user", "content":
+                f"【撤回事件 {window}】操作者={operator} 作者={event.get('user_id')} "
+                f"时间={event.get('time')} 消息号={event.get('message_id')}"}
     kind = "群聊事件" if in_group else "私聊事件"
     return {"role": "user", "content": f"【{kind} {history.window(event)}】{_poke_text(event)}"}
 
@@ -120,7 +127,7 @@ def _model_event(event: dict, in_group: bool) -> dict | None:
         value = msgs.body(event)
         if value.startswith("#"):
             return None
-    elif not _is_context_poke(event, in_group):
+    elif not (msgs.is_recall(event) or _is_context_poke(event, in_group)):
         return None
     return event2chat(event, in_group)
 
@@ -130,8 +137,8 @@ def _unread_detail_text(detail: dict, *, include_wakes: bool = True) -> str:
     target = ("g" if window[0] == "group" else "u") + str(window[1])
     sources = ""
     if include_wakes:
-        # WHY: notification 会持久化当时的 unread 快照；旧快照没有 ordinal，
-        # 而且重建历史通知时本就不展示这份已过期的唤醒位置。
+        # WHY: 旧 notification 持久化过 unread 快照，且旧快照没有 ordinal；
+        # 重建它时不展示这份已过期的唤醒位置。
         sources = ", ".join(
             f"{item['kind']}"
             + (f" 作者={item['user_id']}" if item.get("user_id") is not None else "")
@@ -158,6 +165,13 @@ def _remember_stream(session, message: dict, event_id: str) -> None:
 
 
 def _notification_projection(entry: dict) -> dict:
+    if entry.get("version") == 2:
+        lines = "\n".join(_activation_text(item) for item in entry["activations"])
+        return {"role": "user", "content": f"[{entry['id']}] 新召唤通知：\n{lines}"}
+    return _legacy_notification_projection(entry)
+
+
+def _legacy_notification_projection(entry: dict) -> dict:
     details = entry.get("unread", ())
     if details:
         shown = []
@@ -264,8 +278,6 @@ def _stream_rows(window: tuple | None, token_limit: int | None,
                  ) -> tuple[list[tuple[dict, dict]], int, bool]:
     """Select one visible suffix by event count and projected token cost."""
     entries = oplog.events(window)
-    recalled_by_window: dict[tuple, set[str]] = {}
-    links = oplog.say_links(window)
     picked: list[tuple[dict, dict]] = []
     used = 0
     picked_events = 0
@@ -290,7 +302,7 @@ def _stream_rows(window: tuple | None, token_limit: int | None,
                 # enter together; no provider sees an orphaned tool message.
                 native = [(entries[index - 1], _output_projection(entries[index - 1],
                                                                   show_thought=show_thought)),
-                          (entry, _result_projection(entry, links))]
+                          (entry, _result_projection(entry))]
                 amount = sum(_message_cost(message) for _source, message in native)
             if (picked or not keep_latest) and ((event_limit is not None and picked_events + 2 > event_limit)
                     or (token_limit is not None and used + amount > token_limit)):
@@ -308,18 +320,7 @@ def _stream_rows(window: tuple | None, token_limit: int | None,
             projection = entry.get("projection")
             if projection is None:
                 continue
-            message_id = entry["event"].get("message_id")
-            if message_id is not None and window is not None:
-                from mods import chatlog
-
-                source_window = tuple(entry.get("source_window") or window)
-                if source_window not in recalled_by_window:
-                    recalled_by_window[source_window] = chatlog.recalled_ids(*source_window)
-                recalled = recalled_by_window[source_window]
-                if chatlog.recall_key(message_id) in recalled:
-                    continue
             converted = _numbered(projection, entry["id"])
-            converted = _echo_relation(converted, entry, links)
         elif entry["kind"] == "output":
             if not entry["actions"] and not entry["body"]:
                 if not native_model or _native_assistant(entry, native_model) is None:
@@ -343,7 +344,7 @@ def _stream_rows(window: tuple | None, token_limit: int | None,
         elif entry["kind"] == "notification":
             converted = _notification_projection(entry)
         else:
-            converted = _result_projection(entry, links)
+            converted = _result_projection(entry)
         amount = _message_cost(converted)
         if (picked or not keep_latest) and token_limit is not None and used + amount > token_limit:
             blocked = True
@@ -395,22 +396,6 @@ def agent_rows(max_tokens: int, max_events: int, *, model: str | None,
             if order(entry["id"]) >= boundary]
 
 
-def get_msgs(token_limit: int | None = None, return_token: bool = False):
-    current = context.current() or {}
-    max_events, max_tokens = _chat_root.limit(current)
-    selected_limit = max_tokens if token_limit is None else token_limit
-    rows, used, _blocked = _stream_rows(history.window(current), selected_limit, max_events)
-    output = [converted for _entry, converted in rows]
-    return (output, used) if return_token else output
-
-
-def _chat_msgs() -> list[dict]:
-    current = context.current() or {}
-    max_events, max_tokens = _chat_root.limit(current)
-    rows, _used, _blocked = _stream_rows(history.window(current), max_tokens, max_events)
-    return [converted for entry, converted in rows if entry["kind"] == "input"]
-
-
 def _base_prompt() -> list[dict]:
     return [{"role": "system", "content": f"""## 注意事项
 - 你的昵称: {identity.bot_name()}
@@ -419,19 +404,10 @@ def _base_prompt() -> list[dict]:
 - 聊天中可能不会有明显的问题，扮演好角色即可
 - 如无特殊要求，请用中文回复
 - **说话要调 `say`**。直接写在回复正文里的内容不会发出去，只会留在你自己的输出轨迹里
-- 眼前历史是唯一全局已读信息流从固定起点至今的可见部分，不是全部记录；达到上下文上限要先用 cover_events 压缩，不会自动滑窗。通知不等于读取；通知是创建时快照，尾部 hint 给当前未读提及的时间和未读序号（所有未读都计数，已读/跳过不计数）。take(source, start, count) 在工具执行时按当前未读序号选范围；已读/跳过桥会随新 input 展示，原已读正式号不变。正式输入的 read_by 是发起工具的输出号，read_via 是公开工具名；mark_read 只跳过并留下 skipped_by，不伪造 input。mentions 正式消费至多 500 条未读提及。红点本身不会反复启动你，后来有新唤醒时才再叫一次并重列完整集合。read_messages 从聊天档案选消息并在下一请求正式阅读
+- 眼前历史是唯一全局已读信息流从固定起点至今的可见部分，不是全部记录；达到上下文上限要先用 cover_events 压缩，不会自动滑窗。通知不等于读取；新版通知只列上次确认后新来的唤醒，尾部 hint 给当前未读提及的时间和未读序号（所有未读都计数，已读/跳过不计数）。take(source, start, count) 在工具执行时按当前未读序号选范围；已读/跳过桥会随新 input 展示，原已读正式号不变。正式输入的 read_by 是发起工具的输出号，read_via 是公开工具名；mark_read 只跳过并留下 skipped_by，不伪造 input。mentions 正式消费至多 500 条未读提及。红点本身不会反复启动你，后来有新唤醒时才再叫一次并只列新唤醒。read_messages 从聊天档案选消息并在下一请求正式阅读
 - 想积累经验就实际写入以后会用的载体：可复用做法写 Markdown Skill 并按需加载，全局待办用 `edit_hint` 保存；只在回复里说“记住了”不会保存它
 - 对外发送必须在 say 里明确写目标 g群号 或 u私聊对端号；没有默认接收窗口
 - `say` 返回这条消息的 message_id；它默认 `final_call=true`，说完这一轮就结束，要接着干活就传 `final_call=false`"""}]
-
-
-def _build_context_snapshot(token_limit: int | None = None) -> list:
-    """Project the selected visible stream without consuming unread mail."""
-    current = context.current() or {}
-    max_events, max_tokens = _chat_root.limit(current)
-    selected_limit = max_tokens if token_limit is None else token_limit
-    rows, _used, _blocked = _stream_rows(history.window(current), selected_limit, max_events)
-    return _close_with_user([converted for _entry, converted in rows])
 
 
 def _numbered(converted: dict, event_id: str) -> dict:
@@ -464,20 +440,6 @@ def _read_projection(converted: dict | None, read_by: str | None,
     return _provenance_projection(converted, read_by, read_via)
 
 
-def _echo_relation(converted: dict, entry: dict, links: dict[str, tuple[str, str]]) -> dict:
-    event = entry["event"]
-    if event.get("post_type") != "message_sent" or event.get("message_id") is None:
-        return converted
-    linked = links.get(str(event["message_id"]))
-    if linked is None or linked[0] != entry["id"]:
-        return converted
-    relation = f"（已确认由 {linked[1]} say 发出）"
-    content = converted["content"]
-    if isinstance(content, list):
-        return {**converted, "content": [content[0], {"type": "text", "text": relation}, *content[1:]]}
-    return {**converted, "content": content + relation}
-
-
 def _output_projection(entry: dict, *, show_thought: bool = True) -> dict:
     actions = "\n".join(f"{entry['id']}#{position + 1} {action['name']}({action['arguments']})"
                         for position, action in enumerate(entry["actions"]))
@@ -489,30 +451,20 @@ def _output_projection(entry: dict, *, show_thought: bool = True) -> dict:
     return {"role": "user", "content": f"[{entry['id']}] 自己的输出：{body}{thought_text}\n{actions}"}
 
 
-def _result_projection(entry: dict, links: dict[str, tuple[str, str]]) -> dict:
+def _result_projection(entry: dict) -> dict:
     lines = []
     for result in entry["returns"]:
         reference = f"{entry['source']}#{result['position'] + 1}"
-        relation = ""
-        if result["name"] == "say" and str(result["content"]).lstrip("-").isdecimal():
-            linked = links.get(str(result["content"]))
-            if linked and linked[1] == reference:
-                relation = f" (已确认回声 {linked[0]})"
-        lines.append(f"{reference} {result['name']} -> {result['content']}{relation}")
+        lines.append(f"{reference} {result['name']} -> {result['content']}")
     content = f"[{entry['id']}] 行动返回：\n" + "\n".join(lines)
     return {"role": "user", "content": content}
-
-
-def build_context(token_limit: int | None = None) -> list:
-    """Build the current window context without consuming its mailbox."""
-    return _build_context_snapshot(token_limit)
 
 
 _CLOSING_NOTE = "<system-reminder>\n会话已自动接续。\n</system-reminder>"
 
 
-def _close_with_user(messages: list) -> list:
-    """Make sure the assembled context ends with a user message.
+def _closing_hint(messages: list) -> str:
+    """Keep a temporary user tail only when durable context ends with assistant.
 
     WHY: DeepSeek 在请求带 `tools` 时要求**最后一条 user 之后的每条 assistant** 都带
     `reasoning_content`，缺一条就 400（"The reasoning_content in the thinking mode must
@@ -525,17 +477,14 @@ def _close_with_user(messages: list) -> list:
     DeepSeek 专有的，别的供应商并不要求（草籽 2026-09-17），替它们发明一个字段是拿一个供应
     商的规矩去改所有人的请求。
 
-    WHY: 平时不会走到这里——正常聊天最后一条总是触发它的那条 user 消息，`.chat` 单句自带
-    一条。只有"没有新消息的那一轮"（重启后接着聊，`reboot.resume_chat`）会以 assistant
+    WHY: 平时不会走到这里——正常聊天最后一条总是触发它的那条 user 消息。
+    只有"没有新消息的那一轮"（重启后接着聊，`reboot.resume_chat`）会以 assistant
     收尾，那正是 2026-09-17 两次 400 的现场。
 
-    WHY: 追加的是一句极短的**声明**，不是假装有人说了一句话。形状抄 `tools._announce` 的系统
-    追加：`role="user"` 加 `<system-reminder>` 框架——那条路径实跑过很多轮，说明"系统追加的
-    user 消息"这个形状本身是被接受的。它只活在发出去的那一份里，不进 chatlog、不发 QQ。
+    WHY: 续接属于末尾 hint，不进 `Chat.messages` 或 oplog。请求前正式的工具状态
+    input 等全部追加后再判断，避免临时续接插在两次请求之间成为不可重建的前缀。
 
     WHY: 空 content 的 assistant 也算数。原生 O 可以只有思考与行动、没有正文，
     它照样是 assistant，照样要算进尾段。
     """
-    if messages and messages[-1].get("role") == "user":
-        return messages
-    return [*messages, {"role": "user", "content": _CLOSING_NOTE}]
+    return _CLOSING_NOTE if messages and messages[-1].get("role") != "user" else ""

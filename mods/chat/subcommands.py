@@ -4,11 +4,10 @@ import ast
 from datetime import datetime, timezone
 import re
 
-from mods import cq, llm, storage, text
+from mods import context, cq, history, llm, storage, text
 from mods.llm import pricing
 
 import mods.chat as _chat_root
-from . import view as _view
 
 
 _SUBCOMMAND_HELP = (
@@ -17,24 +16,23 @@ _SUBCOMMAND_HELP = (
     ("model <selection>", "查看指定模型信息"),
     ("models", "列出当前供应商的模型（优先在线列表）"),
     ("use_model [selection]", "设置或重置当前模型"),
-    ("agent [model|use_model|limit|reset_start|use_setting|ops]", "查看或设置中心 agent 的全局模型、预算、设定与操作记录（管理员）；reset_start 在下一次激活时重选历史起点"),
     ("prompt", "查看当前提示词"),
-    ("add_prompt [count|list]", "追加聊天或给定提示词"),
+    ("add_prompt <list>", "将显式给定的消息列表追加到全局提示词（管理员）"),
     ("setting [name]", "列出或查看设定"),
     ("use_setting [name]", "应用或重置设定"),
     ("set_setting <name> [list]", "保存当前或给定设定"),
     ("del_setting <name>", "删除设定"),
     ("image [off|lazy|eager]", "查看或设置图片读取档位"),
     ("reasoning [keep|drop]", "查看或设置中心已读输出是否原生带回思考内容"),
-    ("tools [append|ui]", "查看或设置工具状态的呈现方式"),
+    ("reset_start", "安排下一次激活重选中心历史起点（管理员）"),
     ("limit [<事件数> <token> [提醒百分比]|reset]", """查看或设置中心 agent 的全局可见事件数、上下文 token 上限与提醒阈值（管理员）。
 
 格式：#limit | #limit <事件数> <token> [提醒百分比] | #limit reset
-两个上限只在首次激活或 #agent reset_start 后决定历史起点；之后不自动裁剪。提醒百分比决定模型末尾何时显示上下文 token 用量（已用/上限），达到 token 上限时要求先压缩。默认值分别为 500、40000、75%。
+两个上限只在首次激活或 #reset_start 后决定历史起点；之后不自动裁剪。提醒百分比决定模型末尾何时显示上下文 token 用量（已用/上限），达到 token 上限时要求先压缩。默认值分别为 500、40000、75%。
 #limit                  显示全局两个上限和提醒百分比，并标出值来自全局覆盖还是默认
 #limit <事件数> <token> [提醒百分比] 写入全局上限；省略百分比则保留原设置
 #limit reset            清掉全局上限与提醒百分比，回落到默认
-它是 #agent limit 的简写；未读 mail 不受历史限额丢弃。旧窗口覆盖仍只供独立 .chat 兼容。"""),
+未读 mail 不受历史限额丢弃。"""),
     ("hint [get|set|default]", """查看、编写或开关本窗口的结束提示（管理员）。
 
 格式：#hint | #hint get | #hint set <代码> | #hint set | #hint default [get|set <代码>]
@@ -50,6 +48,13 @@ _SUBCOMMAND_HELP = (
 #hint default set <代码>  写入全局默认的代码并打开开关"""),
 )
 _SUBCOMMAND_NAMES = {pattern.partition(" ")[0] for pattern, _description in _SUBCOMMAND_HELP}
+
+
+def requires_op(value: str) -> bool:
+    name, _, tail = value.strip().partition(" ")
+    return (name == "hint" or name in {"use_model", "add_prompt", "use_setting", "set_setting",
+                                       "del_setting", "reset_start"}
+            or name in {"image", "reasoning", "limit"} and bool(tail.strip()))
 
 
 def _subcommand_help(name: str = "") -> str:
@@ -181,7 +186,11 @@ def _hint_subcommand(raw: str) -> str:
     WHY: 改完立刻 `storage.save()`，不等后台扫描——hint 是用户手写的配置，紧接着一次重启
     就该还在（cave、link 也是这么落盘的）。
     """
-    data = _chat_root.getchatstorage()
+    event = context.current() or {}
+    window = history.window(event)
+    if window is None:
+        return "当前没有聊天窗口"
+    data = _chat_root._window_storage(window)
     default = storage.get("", "hint")
     chat_hint = data.get("hint")
     verb, source = _hint_request(raw)
@@ -225,7 +234,7 @@ def _limit_report() -> str:
     data = storage.get("", "agent")
     lines = []
     for name in ("max_events", "max_token", "pressure_percent"):
-        key, _default, normalize = _chat_root.WINDOW_SETTINGS[name]
+        key, normalize = _chat_root.AGENT_SETTINGS[name]
         origin = "全局" if key in data else "默认"
         value = normalize(data.get(key))
         lines.append(f"{name}: {value}（{origin}）")
@@ -241,8 +250,7 @@ def _limit_set(tail: str) -> str:
     data = storage.get("", "agent")
     if tail.strip() == "reset":
         for name in ("max_events", "max_token", "pressure_percent"):
-            data.pop(_chat_root.WINDOW_SETTINGS[name][0], None)
-        data.pop("max_msg", None)
+            data.pop(_chat_root.AGENT_SETTINGS[name][0], None)
         storage.save()
         return "已重置中心 agent 上限，回落到默认"
     parts = tail.split()
@@ -258,62 +266,9 @@ def _limit_set(tail: str) -> str:
             return "limit 参数错误，可用 #help limit 查看"
         written.append((name, number))
     for name, number in written:
-        data[_chat_root.WINDOW_SETTINGS[name][0]] = number
+        data[_chat_root.AGENT_SETTINGS[name][0]] = number
     storage.save()
     return "\n".join(f"{name}: {number}" for name, number in written)
-
-
-def _agent_subcommand(tail: str) -> str:
-    """Handle the op-gated detailed entry for the main agent's global settings."""
-    data = storage.get("", "agent")
-    parts = tail.split()
-    if not parts:
-        events, tokens = (_chat_root.WINDOW_SETTINGS["max_events"][2](data.get("max_events")),
-                          _chat_root.WINDOW_SETTINGS["max_token"][2](data.get("max_token")))
-        pressure = _chat_root.WINDOW_SETTINGS["pressure_percent"][2](data.get("pressure_percent"))
-        return (f"model: {_chat_root.get_model(data)}\nlimit: {events} {tokens} {pressure}%\n"
-                f"image: {_chat_root.get_image_mode(data)}\nreasoning: {_chat_root.get_reasoning_mode(data)}\n"
-                f"tools: {_chat_root.get_tools_mode(data)}\nprompt: {data.get('prompt', '(默认)')}")
-    verb, *arguments = parts
-    if verb == "reset_start" and not arguments:
-        data.pop("history_start", None)
-        storage.save()
-        return "已安排在下一次激活时重选中心历史起点"
-    if verb == "use_model" and len(arguments) <= 1:
-        if arguments:
-            try:
-                llm.resolve_model(_chat_root.llm_config, arguments[0])
-            except ValueError as error:
-                return str(error)
-            data["model"] = arguments[0]
-        else:
-            data.pop("model", None)
-    elif (verb == "limit" and len(arguments) in (2, 3)
-          and all(value.isdecimal() and int(value) > 0 for value in arguments)
-          and (len(arguments) == 2 or int(arguments[2]) <= 100)):
-        data["max_events"], data["max_token"] = map(int, arguments[:2])
-        if len(arguments) == 3:
-            data["pressure_percent"] = int(arguments[2])
-    elif verb == "use_setting" and len(arguments) <= 1:
-        if arguments and arguments[0] not in _chat_root.prompts:
-            return "未找到设定"
-        if arguments:
-            data["prompt"] = arguments[0]
-        else:
-            data.pop("prompt", None)
-    elif verb in ("image", "reasoning", "tools") and len(arguments) == 1:
-        modes = {"image": _chat_root.IMAGE_MODES, "reasoning": _chat_root.REASONING_MODES, "tools": _chat_root.TOOLS_MODES}
-        aliases = {"image": _chat_root.IMAGE_MODE_ALIASES, "reasoning": _chat_root.REASONING_ALIASES,
-                   "tools": _chat_root.TOOLS_MODE_ALIASES}
-        raw = arguments[0].lower()
-        choice = aliases[verb].get(raw, raw)
-        if choice not in modes[verb]:
-            return "设置值不受支持"
-        data[verb] = choice
-    else:
-        return "用法：#agent [use_model [selection]|limit <events> <tokens> [提醒百分比]|reset_start|use_setting [name]|image/reasoning/tools <mode>|ops [clear]]"
-    storage.save()
-    return _agent_subcommand("")
 
 
 def _subcommand(value: str):
@@ -322,9 +277,13 @@ def _subcommand(value: str):
     value = value.strip()
     name, _, tail = value.partition(" ")
     tail = tail.strip()
-    data = _chat_root.getchatstorage()
-    if name == "agent":
-        return _agent_subcommand(tail)
+    data = storage.get("", "agent")
+    if name == "reset_start" and not tail:
+        data.pop("history_start", None)
+        data.pop(_chat_root._TOLD_TOOLS_KEY, None)
+        data.pop(_chat_root._SCHEMA_MODULES_KEY, None)
+        storage.save()
+        return "已安排在下一次激活时重选中心历史起点"
     if name == "help" and not tail:
         return _subcommand_help()
     if name == "help" and tail:
@@ -354,9 +313,11 @@ def _subcommand(value: str):
         except ValueError as error:
             return str(error)
         data["model"] = selection
+        storage.save()
         return f"模型设置为 {selection}"
     if name == "use_model" and not tail:
         data.pop("model", None)
+        storage.save()
         return "已重置模型"
     if name == "image" and not tail:
         return f"image: {_chat_root.get_image_mode(data)}"
@@ -368,6 +329,7 @@ def _subcommand(value: str):
         if mode not in _chat_root.IMAGE_MODES:
             return "图片读取档位必须是 off/0、lazy/1 或 eager/2"
         data["image"] = mode
+        storage.save()
         return f"image: {mode}"
     if name == "reasoning" and not tail:
         return f"reasoning: {_chat_root.get_reasoning_mode(data)}"
@@ -379,18 +341,8 @@ def _subcommand(value: str):
         if mode not in _chat_root.REASONING_MODES:
             return "reasoning 必须是 keep/on 或 drop/off"
         data["reasoning"] = mode
+        storage.save()
         return f"reasoning: {mode}"
-    if name == "tools" and not tail:
-        return f"tools: {_chat_root.get_tools_mode(data)}"
-    if name == "tools" and tail:
-        mode, remaining = _first_argument(tail)
-        if remaining.strip():
-            return "tools 参数过多"
-        mode = _chat_root.TOOLS_MODE_ALIASES.get(mode.lower(), mode.lower())
-        if mode not in _chat_root.TOOLS_MODES:
-            return "tools 必须是 append 或 ui"
-        data["tools"] = mode
-        return f"tools: {mode}"
     if name == "prompt" and not tail:
         selected = data.get("prompt")
         if selected is None:
@@ -400,21 +352,12 @@ def _subcommand(value: str):
         return str(selected)
     if name == "add_prompt":
         try:
-            if not tail:
-                addition = _view._chat_msgs()[-1:]
-                result = "上一句聊天已追加到提示词"
-            elif re.fullmatch(r"-?\d+", tail):
-                count = int(tail)
-                messages = _view._chat_msgs()
-                addition = messages[-count:] if count else messages
-                result = "当前聊天已追加到提示词(注意重复)"
-            else:
-                addition = _list_argument(tail)
-                result = "提示词已追加"
+            addition = _list_argument(tail)
         except (SyntaxError, ValueError) as error:
             return f"add_prompt 参数错误: {error}"
         data["prompt"] = [*_chat_root.get_prompt(), *addition]
-        return result
+        storage.save()
+        return "提示词已追加"
     if name == "setting":
         if not tail:
             return "\n".join(_chat_root.prompts)
@@ -425,17 +368,20 @@ def _subcommand(value: str):
     if name == "use_setting":
         if not tail:
             data.pop("prompt", None)
+            storage.save()
             return "已重置提示词"
         setting_name, remaining = _first_argument(tail)
         if remaining.strip() or setting_name not in _chat_root.prompts:
             return "未找到设定，你可能需要先创建设定"
         data["prompt"] = setting_name
+        storage.save()
         return "设定已应用"
     if name == "del_setting" and tail:
         setting_name, remaining = _first_argument(tail)
         if remaining.strip() or setting_name not in _chat_root.prompts:
             return "未找到设定"
         del _chat_root.prompts[setting_name]
+        storage.save()
         return "设定已删除"
     if name == "set_setting" and tail:
         setting_name, remaining = _first_argument(tail)
@@ -451,6 +397,7 @@ def _subcommand(value: str):
         else:
             return "当前没有可保存的自定义提示词"
         _chat_root.prompts[setting_name] = prompt
+        storage.save()
         return "设定已保存"
     if name == "limit" and not tail:
         return _limit_report()

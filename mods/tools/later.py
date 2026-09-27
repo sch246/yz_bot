@@ -1,10 +1,10 @@
-"""安排延时任务：到点在当前聊天里发一条消息或执行一段代码。
+"""安排延时任务：到点在明确指定的聊天里发一条消息或执行一段代码。
 
-任务属于创建它的那个聊天（群或私聊），到点后结果发回同一个聊天，重启也不会丢。
+任务属于指定的目标群或私聊，到点后结果发回那里，重启也不会丢。目标写成 `g<群号>` 或 `u<私聊对端号>`。
 
 到点时执行的是一段 Python：先执行 `code`，再对 `expr` 求值，求值结果不是 None 就作为消息发出去。所以**普通提醒的 `expr` 必须写成带引号的 Python 字符串**，例如 `'该喝水了'`；写成 `该喝水了` 会被当成变量名并在到点时报错。
 
-- 纯提醒：`later_add("10m", "", "'十分钟到了，记得喝水'")`
+- 纯提醒：`later_add("g群号", "10m", "", "'十分钟到了，记得喝水'")`
 - 需要到点才计算的内容：把逻辑放 `code`，最后用 `expr` 给出要发的字符串。
 
 `code` 非空时属于任意 Python 执行，只有 Bot 自身拥有 op 权限才允许，否则直接返回"字符串以外的任务需要管理员权限"。普通提醒把 `code` 传空字符串即可。
@@ -22,28 +22,45 @@
 """
 
 
-def later_add(time: str, code: str, expr: str) -> str:
-    """添加一个延时任务，到点在当前聊天发送 expr 的求值结果；成功返回"序号: 执行时间 表达式"。
+def _target_message(target: str) -> dict:
+    from mods import chat
+
+    window = chat.parse_target(target)
+    return {"group_id": window[1]} if window[0] == "group" else {"target_id": window[1]}
+
+
+def later_add(target: str, time: str, code: str, expr: str) -> str:
+    """添加一个延时任务，到点在明确目标发送 expr 的求值结果；成功返回"序号: 执行时间 表达式"。
 
     @param
+    target: g<群号> 或 u<私聊对端号>
     time: 执行时间；相对时间如 30s、10m、2h、1d、1M（M 是月、m 是分钟），绝对时间如 21:30、09-15 21:30、2026-09-15 21:30:00
     code: 到点时在 expr 之前执行的 Python 代码，不需要就传空字符串；非空代码只有管理员可用
     expr: 到点求值并发送的 Python 表达式；普通提醒必须是带引号的字符串，例如 '该喝水了'
     """
     from mods import later
 
-    return later.run(f" add {time} {code}\n{expr}", bot_action=True)
+    try:
+        msg = _target_message(target)
+    except ValueError as error:
+        return str(error)
+    return later.run(f" add {time} {code}\n{expr}", bot_action=True, msg=msg)
 
 
-def later_del(seqs: str) -> str:
-    """按序号删除本聊天的延时任务，返回被删掉的任务；序号不存在时返回删除失败。
+def later_del(target: str, seqs: str) -> str:
+    """按序号删除明确目标聊天的延时任务，返回被删掉的任务；序号不存在时返回删除失败。
 
     @param
+    target: g<群号> 或 u<私聊对端号>
     seqs: 一个序号如 3，逗号分隔的多个序号如 3,5,8，或 * 删除当前聊天的全部任务
     """
     from mods import later
 
-    return later.run(f" del {seqs}", bot_action=True)
+    try:
+        msg = _target_message(target)
+    except ValueError as error:
+        return str(error)
+    return later.run(f" del {seqs}", bot_action=True, msg=msg)
 
 
 __all__ = ["later_add", "later_del"]

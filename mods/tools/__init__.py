@@ -7,10 +7,8 @@
 #    显示用于索引，激活后展开全部，展开后还能按需继续索引子文件夹内容。
 #    _split_description、_render_context、_source_paths 合起来已经是这个形状。
 # 2. 让模型能随时改自己的工具，并主动察觉到工具可更新；更新后立即可用，失败则拿到错误栈。
-#    "更新后立即可用/拿到错误栈"由 reload_tools + registry._failures 覆盖，结果以追加
-#    的方式进上下文，见 _announce。"主动察觉磁盘变了"由 _drift_hint 覆盖：它是末尾 hint，
-#    每次子请求重算、不进历史。两者别混——_announce 是显式 reload/load 的结果，_drift_hint
-#    是磁盘状态的探测，而且只报告不加载。
+#    "更新后立即可用/拿到错误栈"由 reload_tools + registry._failures 覆盖；中心请求边界
+#    对账后把变化写入经历流。"主动察觉磁盘变了"由末尾 _drift_hint 覆盖，只报告不加载。
 # 3. meta.py 是这套东西的使用说明书，给模型看的。
 #
 # 因此判断这里的代码时，标准不是"它已经在这儿而且能跑"，而是 docs/design-principles.md
@@ -22,7 +20,9 @@ from collections.abc import Callable, Iterable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
+import hashlib
 import inspect
+import json
 import logging
 from pathlib import Path
 import sys
@@ -450,8 +450,6 @@ def _framed(body: str) -> str:
     return f"<system-reminder>\n{escaped}\n{_REMINDER_CLOSE}"
 
 
-# WHY: 这是**基线**，只在 bind 时渲染一次，之后永不改写。工具变动走 _announce 追加到
-# 上下文末尾，见那边的说明。
 def _render_context(
     catalog: Mapping[str, ToolModule],
     active: Mapping[str, ToolModule],
@@ -467,16 +465,6 @@ def _render_context(
         if content:
             result += f"\n\n## 已激活模块 {name}\n{content}"
     return result
-
-
-# WHY: UI 模式下这条 system 消息**不放**工具状态，只放一个指路条。整套 UI 模式的
-# 卖点就是"工具只有一个权威副本，而且它明确位于所有修改之后"；这里再留一份目录，
-# 上下文里就又有两个说法了，等于白切。
-_UI_POINTER = (
-    "## 可用工具模块\n"
-    "工具状态不在这里。当前的模块目录、已激活模块正文和磁盘变化统一放在上下文**末尾**的"
-    "工具状态块里，那里是唯一权威，并且位于你所有修改之后。"
-)
 
 
 def bot_op_tool_visible(name: str, module: ToolModule) -> bool:
@@ -512,13 +500,10 @@ def _visible_catalog(
 def create_context_message(
     *,
     registry: ToolRegistry | None = None,
-    ui_mode: bool = False,
     visible: Callable[[str, ToolModule], bool] | None = None,
 ) -> dict[str, str]:
     """Create the baseline module catalog; later changes are appended, not rewritten."""
     selected = default_registry if registry is None else registry
-    if ui_mode:
-        return {"role": "system", "content": _UI_POINTER}
     return {"role": "system", "content": _render_context(_visible_catalog(selected, visible), {})}
 
 
@@ -528,15 +513,17 @@ class SessionBinding:
     def __init__(
         self,
         session,
-        context_message: dict,
+        context_message: dict | None,
         *,
         registry: ToolRegistry,
-        ui_mode: bool = False,
         visible: Callable[[str, ToolModule], bool] | None = None,
         persist: Callable[[Mapping[str, float]], None] | None = None,
         ttl: float | None = _IDLE_RECLAIM_SECONDS,
+        schema_modules: Iterable[str] | None = None,
+        persist_schema: Callable[[list[str]], None] | None = None,
     ) -> None:
-        if not isinstance(context_message, dict) or context_message.get("role") != "system":
+        if (schema_modules is None and
+                (not isinstance(context_message, dict) or context_message.get("role") != "system")):
             raise TypeError("context_message must be an existing system message dict")
         if not isinstance(getattr(session, "functions", None), dict):
             raise TypeError("session.functions must be a dict")
@@ -549,7 +536,10 @@ class SessionBinding:
         self.persist = persist
         # 空闲多久就把模块收回去（秒）；None 或 <=0 表示不收，见 restore。
         self.ttl = ttl
+        self.schema_modules = list(dict.fromkeys(schema_modules)) if schema_modules is not None else None
+        self.persist_schema = persist_schema
         self.active: dict[str, ToolModule] = {}
+        self._loaded: dict[str, ToolModule] = {}
         # 每个激活模块最后一次被调用的时刻，见 touch。先活在内存里，落盘由 _save_active 做。
         self._touched: dict[str, float] = {}
         # WHY: schema 名 -> 拥有它的模块名。它和 `session.functions` 是同一份事实的两面，
@@ -567,35 +557,19 @@ class SessionBinding:
         if meta is None:
             failure = self.registry.failures.get(_BASE_MODULE_NAME)
             raise RuntimeError("required tool module meta is unavailable" + (f"\n{failure}" if failure else ""))
-        self._announcements: list[str] = []
-        self.ui_mode = bool(ui_mode)
         self._activate(meta)
         add_hint = getattr(session, "add_hint", None)
-        if self.ui_mode:
-            # UI 模式：整块状态挂末尾，前面那条 system 只留指路条。
-            self.context_message["content"] = _UI_POINTER
-            if callable(add_hint):
-                add_hint(self._state_hint)
-            return
-        # 追加模式：基线在 bind 时写一次，之后这条消息不再变，变动走 _announce 追加。
-        self.context_message["content"] = _render_context(self._catalog(), self.active)
-        register = getattr(session, "add_context_provider", None)
-        if callable(register):
-            register(self._take_announcements)
+        if self.schema_modules is None:
+            self.context_message["content"] = _render_context(self._catalog(), self.active)
+            self._child_told = self.state_snapshot()
+            session.add_context_provider(self._child_provider)
         if callable(add_hint):
             add_hint(self._drift_hint)
 
     def restore(self, entries: Mapping[str, float] | Iterable[str]) -> list[str]:
         """Re-activate a window's persisted modules at bind time, without announcing.
 
-        WHY: 激活是**窗口级**状态。每次变化都由 `_save_active` 交给调用方持久化（连续聊天
-        写本窗口 storage），所以每个新 `Chat` 开局都要把这些模块装回来，装回本身就是这一
-        层存在的理由，见 `chat._persist_modules`。
-
-        WHY: 装回**本身**不发 `_announce`。此刻还没有任何模型请求，对模型来说什么都没
-        "发生"，把已激活模块的正文直接渲染进基线那条目录消息就够了；而 `_announce` 比的是
-        前后全量，开局时"前"只有 meta，于是每轮都会把这次装回的模块报成"已激活"并各附一份
-        正文副本。`load` 仍然只用于"模型刚要求激活"，那里的通告才是它要的反馈。
+        WHY: 激活态由调用方持久化；装回本身不写经历，由中心请求边界统一对账。
 
         WHY: 分两种。**源码没了**的名字就地丢掉并回写，它指向的东西已经不存在。而
         `visible` 挡下的（Bot 没有模块所需权限）仍保留在 `_deferred`，storage 里的记录连同
@@ -603,12 +577,11 @@ class SessionBinding:
         超过 `ttl` 照样被下面的空闲回收收走。
 
         WHY: 超过 `self.ttl` 没有被装入或调用过的也丢掉，这是"只进不出"的解药——不丢的话每次
-        `load_tools` 都会永久留在这个窗口里，每轮都往基线消息里渲染一份正文。判据放在
+        `load_tools` 都会永久保持激活。判据放在
         **开局**：轮中间把工具抽走会让模型手上的快照和它下一句要调的名字对不上，而开局
-        收掉的模块，从这一轮的目录消息起就不在了。旧格式（只存名字的列表）由调用方补上
+        收掉的模块在下一请求边界作为差异告知。旧格式（只存名字的列表）由调用方补上
         "就是刚才用过"，见 `chat._active_modules`。
 
-        WHY: 被丢掉的要发一条通告，装回的不发，见 `_queue_reclaimed`。
         """
         now = time.time()
         if isinstance(entries, Mapping):
@@ -622,12 +595,10 @@ class SessionBinding:
         with self._lock:
             requested = [name for name in stamps if name and name != _BASE_MODULE_NAME]
             kept: list[str] = []
-            reclaimed: list[tuple[str, str]] = []
             for name in requested:
                 module = self.registry.get(name)
                 stamp = stamps[name]
                 if module is None:
-                    reclaimed.append((name, "已不存在"))
                     continue
                 # WHY: 空闲回收排在可见性前面。反过来的话，一个一直不可见的模块永远走不到
                 # 这一步，`_deferred` 就会把它在 storage 里留成永久居民——而 ttl 正是那份
@@ -636,43 +607,34 @@ class SessionBinding:
                 # 技能和只给说明的 `.py` 不参与回收，出口交给一个 `unload_tools`——撤掉了。
                 # 撤的理由是那扇门的成本不在 token 而在**注意力**：它没有触发时机，于是每轮
                 # 都要分神判一次"这个还留着吗"，天天付；而它买到的只是躲开一次收回，罕见且
-                # 便宜。收回本身是有界的：通告是追加的不会消失，目录里那一行每轮都在，重新
-                # `load_tools` 就是一次往返。
+                # 便宜。收回后可用 `load_tools` 再装入。
                 # WHY: 代价是这里**唯一**一处"明知可能还要用也照收"——一个 `.md` 技能在第二
                 # 个小时仍被每轮阅读，也会在开局被收掉，因为阅读留不下痕迹。这不是没想到的
                 # 副作用，是知情的取舍：函数模块误收会被下一次调用当场打回来，内容模块误收
-                # 没有任何动作会撞上它，靠的是会话开头那份目录：模块的名字加首行描述
-                # 在那里是**无条件**列着的，收不收都在，所以钩子不是"重装之后才有"，而是本来
-                # 就在（这也是通告不必再抄一遍描述的原因，见 `_queue_reclaimed`）。哪天发现模型反复漏掉
-                # 某个技能里写着的约束，回来看这一条。
+                # 没有任何动作会撞上它，只能靠目录与状态变化提示重新装入。
                 if (
                     self.ttl is not None
                     and self.ttl > 0
                     and now - stamp > self.ttl
                 ):
                     _log.debug("reclaiming idle tool module from window: %s", name)
-                    reclaimed.append((name, "空闲收回"))
                     continue
                 if not self.visible(name, module):
                     self._deferred[name] = stamp
-                    reclaimed.append((name, "Bot 未获权限"))
                     continue
                 self._activate(module, touched_at=stamp)
                 kept.append(name)
-            if not self.ui_mode:
-                # UI 模式的工具状态整块挂在末尾，每次子请求重算，这里不用碰。
+            if self.schema_modules is None:
                 self.context_message["content"] = _render_context(self._catalog(), self.active)
+                self._child_told = self.state_snapshot()
             if kept != requested or self._dirty:
                 self._save_active()
-            if reclaimed:
-                self._queue_reclaimed(reclaimed)
             return kept
 
     def load(self, names: str | Iterable[str]) -> dict[str, dict]:
         """Activate only in-memory last-good modules in this session."""
         results: dict[str, dict] = {}
         with self._lock:
-            before = self._capture()
             for requested_name in _requested_names(names):
                 try:
                     name = _validate_module_name(requested_name)
@@ -690,7 +652,6 @@ class SessionBinding:
                     results[_result_name(requested_name)] = _failure(
                         "failed to activate tool module %r", requested_name
                     )
-            self._announce(before)
             self._save_active()
         return results
 
@@ -704,11 +665,15 @@ class SessionBinding:
         """
         results: dict[str, dict] = {}
         with self._lock, self.registry.lock:
-            before = self._capture()
             for requested_name in _requested_names(names):
                 try:
                     name = _validate_module_name(requested_name)
                     candidate = self.registry.prepare(name)
+                    if candidate is not None and self.schema_modules is not None and name in self.schema_modules:
+                        conflicts = [tool_name for tool_name in candidate.tools
+                                     if tool_name in self._owner and self._owner[tool_name] != name]
+                        if conflicts:
+                            raise KeyError("session tool names already exist: " + ", ".join(conflicts))
                     if name in self.active:
                         if candidate is None:
                             self._deactivate(name)
@@ -720,7 +685,8 @@ class SessionBinding:
                     failure = _failure("failed to reload tool module %r", requested_name)
                     self.registry.record_failure(result_name, failure["error"])
                     results[result_name] = failure
-            self._announce(before)
+            if self.schema_modules is not None:
+                self.restore_schema()
             self._save_active()
         return results
 
@@ -735,7 +701,7 @@ class SessionBinding:
         可以重算、而且只有当前值有意义"的状态：文件改回去，提醒就该消失，而不是在上下文
         里留着一条"曾经改过"。
 
-        WHY: 它只报告，不加载。发现变化与决定应用是两步，理由见 _announce 的 WHY——磁盘
+        WHY: 它只报告，不加载。发现变化与决定应用是两步——磁盘
         上的模块随时可能正被写到一半。所以这里也不承载模块正文，只给名字。
 
         WHY: 每次都真读磁盘，没有节流。一次 scan 是十来个小文件的 read_bytes，相对一次
@@ -757,54 +723,8 @@ class SessionBinding:
         return _framed(
             "工具模块的磁盘源与已加载版本不一致，尚未应用：\n"
             + "\n".join(f"- {part}" for part in parts)
-            + "\n需要时用 reload_tools 显式应用；不应用则当前生效的仍是上面目录里的版本。"
+            + "\n需要时用 reload_tools 显式应用；不应用则当前生效的仍是目录中的版本。"
         )
-
-    def _state_hint(self) -> str:
-        """Render the whole tool state as one end-of-context block (UI mode).
-
-        WHY: UI 模式的全部意义是注意力：工具只剩**一个**权威副本，而且它明确位于所有
-        修改之后。就地改写头部做不到这一点（会丢掉"改过"这件事，还打断前缀缓存），
-        追加式也做不到——上下文里同时留着某模块的旧正文和新正文，模型可能以为修改之前
-        的工具就长那样。整块挂末尾则没有歧义：末尾这一份就是现在的样子。
-
-        WHY: 代价是这一整块每次子请求都是未命中缓存的新 token，工具循环越长付得越多。
-        所以它是**可切换**的而不是替换掉追加模式，默认仍走追加。开关见
-        chat.get_tools_mode，按窗口存。
-
-        WHY: 它连磁盘变化一起报，所以 UI 模式下不再单独挂 _drift_hint——那会是同一件事
-        的第二个说法。仍然只报告不加载，理由和 _announce 那条完全相同。
-        """
-        try:
-            changes = self.registry.scan()
-        except Exception:
-            _log.exception("failed to scan tool sources for the state hint")
-            changes = {}
-        modules = self._catalog()
-        lines = ["当前工具状态（本块位于你所有修改之后，是唯一权威）：", "", "## 可用工具模块"]
-        if modules:
-            lines.extend(
-                f"- {name}: {module.description}" + ("（已激活）" if name in self.active else "")
-                for name, module in modules.items()
-            )
-        else:
-            lines.append("- (无)")
-        for name in sorted(self.active):
-            content = self.active[name].content
-            if content:
-                lines.append(f"\n## 已激活模块 {name}\n{content}")
-        drift = [
-            f"- {label} {', '.join(changes[kind])}"
-            for kind, label in (("added", "新增"), ("modified", "修改"), ("deleted", "删除"))
-            if changes.get(kind)
-        ]
-        if drift:
-            lines.append("\n## 磁盘源与已加载版本不一致（尚未应用）")
-            lines.extend(drift)
-            lines.append("需要时用 reload_tools 显式应用。")
-        for name, error in sorted(self.registry.failures.items()):
-            lines.append(f"\n## 加载失败 {name}\n{error}")
-        return _framed("\n".join(lines))
 
     def list_text(self) -> str:
         """Describe last-good, active, failed, and changed modules."""
@@ -842,6 +762,7 @@ class SessionBinding:
         if failures:
             lines.append("加载失败:")
             lines.extend(f"- {name}:\n{error}" for name, error in failures.items())
+        lines.append("完整当前工具状态:\n" + self.state_text())
         return "\n".join(lines)
 
     def _catalog(self) -> dict[str, ToolModule]:
@@ -854,6 +775,7 @@ class SessionBinding:
         WHY: `touched_at` 只有 `restore` 会传，而且必须传——它带的是磁盘上那次使用的
         时刻，拿“现在”顶替的话，每轮开局都会把一切刷成刚用过，空闲回收永远不触发。
         """
+        original = module
         module = self._bind_module(module)
         previous = self.active.get(module.name)
         previous_tools = dict(previous.tools) if previous is not None else {}
@@ -865,22 +787,29 @@ class SessionBinding:
             name
             for name in module.tools
             if name in functions and name not in previous_tools
+            and (self.schema_modules is None or self._owner.get(name) != module.name)
         ]
         if conflicts:
             raise KeyError("session tool names already exist: " + ", ".join(conflicts))
 
         for name in previous_tools:
-            functions.pop(name)
-            self._owner.pop(name, None)
+            if name not in module.tools:
+                functions.pop(name)
+                self._owner.pop(name, None)
         functions.update(module.tools)
         for name in module.tools:
             self._owner[name] = module.name
         self.active[module.name] = module
+        self._loaded[module.name] = original
         # 装上了就不再是"这一轮装不回来"的那种；两边同时挂着一个名字会让 _save_active
         # 有两个时刻可选。
         self._deferred.pop(module.name, None)
         self._touched[module.name] = time.time() if touched_at is None else touched_at
         self._dirty = True
+        if self.schema_modules is not None and module.name != _BASE_MODULE_NAME and module.name not in self.schema_modules:
+            self.schema_modules.append(module.name)
+            if self.persist_schema is not None:
+                self.persist_schema(self.schema_modules)
 
     def _bind_module(self, module: ToolModule) -> ToolModule:
         """把模块的每个工具包一层"当前 binding"上下文，再装进会话。
@@ -922,10 +851,15 @@ class SessionBinding:
         for tool_name, old_tool in previous.tools.items():
             if functions.get(tool_name) is not old_tool:
                 raise KeyError(f"active tool ownership changed: {tool_name}")
-        for tool_name in previous.tools:
-            functions.pop(tool_name)
-            self._owner.pop(tool_name, None)
+        if self.schema_modules is None:
+            for tool_name in previous.tools:
+                functions.pop(tool_name)
+                self._owner.pop(tool_name, None)
+        else:
+            for tool_name, old_tool in previous.tools.items():
+                functions[tool_name] = self._unloaded_tool(old_tool, name)
         del self.active[name]
+        self._loaded.pop(name, None)
         # 名字都没了，使用时刻留着只会让 _touched 无限长；下次 load 会重新盖上“现在”。
         self._touched.pop(name, None)
 
@@ -939,44 +873,122 @@ class SessionBinding:
         `meta` 不记，反正它每轮都在，记了只会在 `_touched` 里多一个谁也不看的条目。
         """
         owner = self._owner.get(tool_name)
-        if owner is None or owner == _BASE_MODULE_NAME:
+        if owner is None or owner == _BASE_MODULE_NAME or owner not in self.active:
             return
         with self._lock:
             self._touched[owner] = time.time()
             self._dirty = True
+            self._save_active()
 
-    def _queue_reclaimed(self, reclaimed: list[tuple[str, str]]) -> None:
-        """Queue one appended notice about modules this window lost with nobody talking.
-
-        WHY: 收回必须让模型知道，理由和 `_announce` 那条一字不差：操作历史轨道里留着上一
-        轮那几次 `load_tools`，模型据此以为模块还在；它照着那个印象调名，而这一轮的快照里
-        没有这个名字，`llm` 解析时 `mapping[name]` 抛 KeyError，整个调用被丢掉，那一轮连
-        一条 tool 结果都没有就结束了（2026-09-17 `browser__open_page` 那次）。收回发生在
-        模型没说话的时候，所以这条通告是它**唯一**的信息来源：基线目录消息里少了一行，而
-        模型不会把那行和"我上一轮明明装载过"对上。
-
-        WHY: 不走 `_announce`。开局时"前"只有 meta，全量比较会把这次装回的模块全报成
-        "已激活"并各附一份正文副本，每轮都来一遍。这里只报丢掉的那几个。
-
-        WHY: 一条记录只有名字和原因，不带描述、也不带"要回来该怎么做"。三处各管一件事：
-        会话开头那份目录管**是什么**——它是无条件的，每个模块的名字加首行一直列在那儿，
-        与激活与否无关（见 `_render_context`），被收掉的模块照样占着它那一行；`meta` 的
-        正文管**怎么装载**，三种原因的含义也写在那里；通告只管**状态变了、为什么变**。
-        通告再抄一遍描述或操作步骤，就是同一个事实有了第二个写入权威——而重复的指引会被
-        当成义务照做，2026-09-18 的"用完就卸"就是这么让模型真去调了一次 unload。
-
-        WHY: UI 模式不发，和 `_announce` 同一条理由。整块状态挂在末尾、每次子请求重算，
-        本来就是最新的，再追加一条"变了什么"就又是两个副本并存。
-        """
-        if self.ui_mode:
+    def restore_schema(self) -> None:
+        """Restore the stable module order and guarded definitions from current code."""
+        if self.schema_modules is None:
             return
-        grouped: dict[str, list[str]] = {}
-        for name, reason in reclaimed:
-            grouped.setdefault(reason, []).append(name)
-        lines = ["工具模块已变化（本条由系统追加，不是用户发言）："]
-        for reason, names in grouped.items():
-            lines.extend(f"- 已停用（{reason}）：{name}" for name in sorted(names))
-        self._announcements.append(_framed("\n".join(lines)))
+        catalog = self._catalog()
+        kept = [name for name in self.schema_modules
+                if name != _BASE_MODULE_NAME and name in catalog]
+        for name in self.active:
+            if name != _BASE_MODULE_NAME and name not in kept:
+                kept.append(name)
+        if kept != self.schema_modules:
+            self.schema_modules = kept
+            if self.persist_schema is not None:
+                self.persist_schema(kept)
+        functions = dict(self.active[_BASE_MODULE_NAME].tools)
+        owners = {name: _BASE_MODULE_NAME for name in functions}
+        for name in kept:
+            module = self.active.get(name) or self._bind_module(catalog[name])
+            for tool_name, tool in module.tools.items():
+                if tool_name in functions:
+                    raise KeyError(f"session tool names already exist: {tool_name}")
+                functions[tool_name] = (tool if name in self.active else
+                                        self._unloaded_tool(tool, name))
+                owners[tool_name] = name
+        self.session.functions.clear()
+        self.session.functions.update(functions)
+        self._owner = owners
+
+    def sync_registry(self) -> None:
+        """Make this request's callables match shared last-good before announcing."""
+        if self.schema_modules is None:
+            return
+        changed = False
+        with self._lock, self.registry.lock:
+            catalog = self._catalog()
+            for name in tuple(self.active):
+                current = catalog.get(name)
+                if current is None:
+                    if self.registry.get(name) is not None and name != _BASE_MODULE_NAME:
+                        self._deferred[name] = self._touched[name]
+                    self._deactivate(name)
+                    changed = True
+                elif current is not self._loaded[name]:
+                    self._activate(current, touched_at=self._touched[name])
+                    changed = True
+            self.restore_schema()
+            if changed:
+                self._save_active()
+
+    @staticmethod
+    def _unloaded_tool(original: Tool, module_name: str) -> Tool:
+        name = original.description["function"]["name"]
+        guarded = Tool(lambda **kwargs: f"{module_name} 已卸载；请先调用 load_tools。", name)
+        guarded.description = original.description
+        return guarded
+
+    def state_snapshot(self) -> dict:
+        """Compact durable description of what was told, never a saved schema copy."""
+        catalog = self._catalog()
+        schemas = {}
+        for name in [_BASE_MODULE_NAME, *(self.schema_modules or [
+                name for name in self.active if name != _BASE_MODULE_NAME])]:
+            definitions = [tool.description for tool_name, tool in self.session.functions.items()
+                           if self._owner.get(tool_name) == name]
+            if definitions and (name in catalog or name in self.active):
+                schemas[name] = hashlib.sha256(json.dumps(definitions, ensure_ascii=False,
+                                            sort_keys=True).encode()).hexdigest()
+        return {
+            "catalog": {name: module.description for name, module in catalog.items()},
+            "active": {name: hashlib.sha256(module.content.encode()).hexdigest()
+                       for name, module in self.active.items()},
+            "schemas": schemas,
+        }
+
+    def state_text(self, previous: dict | None = None) -> str:
+        """Render a full state or only changes since the last durable announcement."""
+        current = self.state_snapshot()
+        if previous is None:
+            return _framed(_render_context(self._catalog(), self.active))
+        lines = ["工具模块状态变化（本条由系统追加，不是用户发言）："]
+        labels = {"catalog": "目录", "active": "已激活模块", "schemas": "函数定义"}
+        for section, label in labels.items():
+            before = previous.get(section, {})
+            after = current[section]
+            if not isinstance(before, dict):
+                before = {}
+            for name in sorted(set(before) | set(after)):
+                if before.get(name) == after.get(name):
+                    continue
+                if name not in after:
+                    suffix = "已卸载；不要再调用它的函数，需要时先 load_tools" if section == "active" else "已移除"
+                    lines.append(f"- {label} {name}：{suffix}")
+                elif name not in before:
+                    lines.append(f"- {label} {name}：新增")
+                else:
+                    lines.append(f"- {label} {name}：已更新")
+                if section == "catalog" and name in after:
+                    lines.append(f"  {after[name]}")
+                if section == "active" and name in after and self.active[name].content:
+                    lines.append(f"\n## 已激活模块 {name}\n{self.active[name].content}")
+        return _framed("\n".join(lines)) if len(lines) > 1 else ""
+
+    def _child_provider(self) -> list[dict]:
+        current = self.state_snapshot()
+        if current == self._child_told:
+            return []
+        content = self.state_text(self._child_told)
+        self._child_told = current
+        return [{"role": "user", "content": content}] if content else []
 
     def _save_active(self) -> None:
         """Hand this window's activation set, with use stamps, to the storage owner.
@@ -986,10 +998,7 @@ class SessionBinding:
         一个必需模块失败"的失败面。值是该模块最后一次被调用的时刻，空闲回收要用，见
         `touch` 与 `restore`。
 
-        WHY: 使用时刻在 `touch` 里只更新内存，不落盘——一次工具调用配一次 storage 写没有
-        必要。落盘的机会是装载/重载之后，以及下一轮开局 `restore`（那里 `_dirty` 为真就
-        写一次）。代价是进程正好在这中间重启会丢最后一轮的时刻，最坏让某个模块早一轮被
-        收回，可以接受。
+        WHY: `touch` 每次调用后持久写回；否则一次调用结束后重启会丢失续期时刻。
 
         WHY: 写回的是 `active` **加上** `_deferred`。后者这一轮没装、因此不在 `active` 里，
         但它仍然属于这个窗口；只写 `active` 就等于让一轮普通聊天把管理员的激活记录删掉。见
@@ -1009,103 +1018,25 @@ class SessionBinding:
         })
         self._dirty = False
 
-    def _capture(self) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
-        """Snapshot everything the model can currently see about tool modules."""
-        return (
-            {name: module.content for name, module in self.active.items()},
-            {name: module.description for name, module in self._catalog().items()},
-            dict(self.registry.failures),
-        )
-
-    def _announce(self, before: tuple[dict[str, str], dict[str, str], dict[str, str]]) -> None:
-        """Queue one appended notice describing what changed, if anything did.
-
-        WHY: 这里只往队列里放，不直接改 session.messages。工具是在 assistant(tool_calls)
-        与 tool result 之间执行的，此刻插一条 user 消息会拆散这一对，供应商会拒。队列由
-        llm.Chat 的 context provider 在下一次子请求前取走，那时 tool result 已经补齐。
-
-        WHY: 这是**显式 load/reload 的结果报告**，不是磁盘变化探测器。调用链只有一条：
-        模型调 meta 的 reload_tools/load_tools → SessionBinding.reload/load → 这里。
-        没有 watcher，改文件本身仍然不生效——这一条不要"顺手补上"：磁盘上的模块随时
-        可能正被写到一半（模型自己也在写），自动加载等于把半个文件当成新版本，而
-        registry 的 last-good 只在校验通过后才替换，正是为了让这种时刻不影响正在跑的
-        会话。想让模型知道磁盘变了，用 list_tools 报告差异，或者末尾的 _drift_hint
-        （UI 模式下是 _state_hint），都不是在这里加扫描。
-
-        WHY: 通告是**累积**的，靠顺序而不是替换生效——上下文里会同时留着某模块的旧正文
-        和后来追加的新正文，后者在后面。这是追加式的必然代价，deepseek-harness 的
-        baseline+refresh 也是如此。换成回头改写旧消息就等于放弃前缀缓存，而那正是这套
-        东西存在的理由。同一轮内的多次变动各自成条、按发生顺序交付，不互相覆盖。
-        """
-        if self.ui_mode:
-            # UI 模式不产生通告：状态整块挂在末尾，每次子请求重新渲染，本来就是最新的。
-            # 再追加一条"变了什么"就又回到了两个副本并存。
-            return
-        before_active, before_catalog, before_failures = before
-        after_active, after_catalog, after_failures = self._capture()
-
-        def joined(label: str, names) -> str | None:
-            listed = sorted(names)
-            return f"- {label}：{', '.join(listed)}" if listed else None
-
-        new_failures = {
-            name: error
-            for name, error in after_failures.items()
-            if before_failures.get(name) != error
-        }
-        lines = [
-            joined("目录新增", set(after_catalog) - set(before_catalog)),
-            joined("目录移除", set(before_catalog) - set(after_catalog)),
-            joined("目录描述更新", {
-                name for name in set(after_catalog) & set(before_catalog)
-                if after_catalog[name] != before_catalog[name]
-            }),
-            joined("已激活", set(after_active) - set(before_active)),
-            joined("已停用", set(before_active) - set(after_active)),
-            joined("已激活模块内容更新", {
-                name for name in set(after_active) & set(before_active)
-                if after_active[name] != before_active[name]
-            }),
-            joined("加载失败", new_failures),
-        ]
-        body = [line for line in lines if line]
-        if not body:
-            return
-
-        sections = ["工具模块已变化（本条由系统追加，不是用户发言）：", *body]
-        for name in sorted(after_active):
-            content = after_active[name]
-            if content and before_active.get(name) != content:
-                sections.append(f"\n## 已激活模块 {name}\n{content}")
-        for name, error in sorted(new_failures.items()):
-            sections.append(f"\n## 加载失败 {name}\n{error}")
-        self._announcements.append(_framed("\n".join(sections)))
-
-    def _take_announcements(self) -> list[dict]:
-        """Hand queued notices to llm.Chat as appended user messages."""
-        with self._lock:
-            queued, self._announcements = self._announcements, []
-        return [{"role": "user", "content": text} for text in queued]
-
-
 default_registry = ToolRegistry()
 
 
 def bind_session(
     session,
-    context_message: dict,
+    context_message: dict | None,
     initial_modules: Mapping[str, float] | Iterable[str] = (),
     *,
     registry: ToolRegistry | None = None,
-    ui_mode: bool = False,
     visible: Callable[[str, ToolModule], bool] | None = None,
     persist: Callable[[Mapping[str, float]], None] | None = None,
     ttl: float | None = _IDLE_RECLAIM_SECONDS,
+    schema_modules: Iterable[str] | None = None,
+    persist_schema: Callable[[list[str]], None] | None = None,
 ) -> SessionBinding:
     """Bind base tools, the window's persisted activation, and explicit modules.
 
     `initial_modules` 走 `restore`：静默装回，装不回来的、以及超过 `ttl` 没被调用过的都
-    丢掉，都不发"已激活"通告（被丢掉的会收到一条收回通告）。旧格式的纯名字可迭代对象也
+    丢掉；中心会话的变化由请求边界对账，子会话只在开头显示状态。旧格式的纯名字可迭代对象也
     收，一律当成"就是刚才用过"。`persist` 给了的话，此后每次激活集合变化都会回调一次，
     收到的是 `{模块名: 最后使用时刻}`。
     """
@@ -1113,10 +1044,11 @@ def bind_session(
         session,
         context_message,
         registry=default_registry if registry is None else registry,
-        ui_mode=ui_mode,
         visible=visible,
         persist=persist,
         ttl=ttl,
+        schema_modules=schema_modules,
+        persist_schema=persist_schema,
     )
     if initial_modules:
         binding.restore(initial_modules)
