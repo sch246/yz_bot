@@ -347,7 +347,7 @@ def later_add(text: str, msg: dict[str, Any], *, allow_unsafe: bool | None = Non
 
 
 @command
-def run(text: str, *, bot_action: bool = False) -> str:
+def run(text: str, *, bot_action: bool = False, msg: dict[str, Any] | None = None) -> str:
     """设置发送回当前群或私聊的一次性定时消息。
 
     示例：.later 10m '十分钟后提醒我'；.later 21:30 '晚上提醒我'。add 可以省略。
@@ -355,7 +355,7 @@ def run(text: str, *, bot_action: bool = False) -> str:
     无参数列出任务；.later del <序号[,序号...]|*> 删除；.later set <序号> <时间> <表达式> 修改。
     提醒文字必须用半角单引号或双引号包住；只有管理员可以使用字符串以外的 Python 表达式。
     """
-    msg = _current()
+    msg = _current() if msg is None else msg
     allow_unsafe = op.bot_is_op() if bot_action else op.is_op(msg)
     if not text.strip():
         tasks = get_later_list(msg)

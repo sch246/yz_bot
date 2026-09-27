@@ -9,7 +9,7 @@
 - 它**看不到**当前聊天记录、当前提示词和你已经掌握的上下文，只能看到 `prompt` 和自己那一行；
 - 它**不能**向用户提问，也不会等待回复；
 - 它默认只有 `meta` 模块的工具，需要别的能力要用 `tools` 参数逐行列出模块名（先 `list_tools` 确认名字），子任务里那些函数同样带 `模块名__` 前缀；
-- 它**和你处在同一个 QQ 聊天里**：一旦给它 `image`、`later`、`common` 这类会发消息、发图、建任务的模块，效果会直接落在当前聊天里，而不是只返回给你。只在确实需要时授权。
+- 它没有隐式 QQ 窗口：会发消息或建任务的工具须显式指定目标。只在确实需要时授权。
 
 返回值是 `repr` 后的列表，每项是 `(原任务行, 子模型的回答文本)`，顺序与 `tasks` 相同。某个子任务失败时该项回答是 `ERROR: <原因>`，其余任务照常返回；这时按需重试那一条，或如实说明这条没完成。
 
@@ -21,7 +21,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import threading
 
-from mods import context, history, llm, log, oplog, tools as tool_modules
+from mods import context, llm, log, oplog, tools as tool_modules
 
 
 _stream = log.stream("agent")
@@ -33,30 +33,23 @@ def assign_tasks(prompt: str, tasks: str, tools: str, model: str = "deepseek/dee
     @param
     prompt: 每个子任务共享的完整说明；子模型看不到当前对话，背景和输出格式都要写在这里
     tasks: 每行一个子任务；该行会接在 prompt 后面发给子模型
-    tools: 每行一个要在子任务中激活的工具模块名，不需要额外工具就传空字符串；子任务与当前聊天共享上下文，慎给会发消息的模块
+    tools: 每行一个要在子任务中激活的工具模块名，不需要额外工具就传空字符串；慎给会发消息的模块
     model: provider/model 形式的模型名，例如 deepseek/deepseek-flash；需要子任务调用工具时要选支持函数调用的模型
     max_workers: 最大并发数，1 到 5，超过按 5 处理
     """
     task_list = [value.strip() for value in tasks.splitlines() if value.strip()]
     requested = list(dict.fromkeys(value.strip() for value in tools.splitlines() if value.strip()))
     workers = max(1, min(int(max_workers), 5))
-    origin = context.current()
 
     def execute(task_value: str) -> tuple[str, str]:
-        context.set_current(origin)
+        context.clear_current()
         worker_id = threading.get_ident()
         _stream.info(f"线程 {worker_id}: 开始处理 LLM 子任务")
         try:
             session = llm.Chat(model=model, chat_client=llm.get_client())
             tool_context = tool_modules.create_context_message()
             session.set_messages([tool_context, f"{prompt}\n{task_value}"])
-            binding = tool_modules.bind_session(session, tool_context, requested)
-            window = history.window(origin or {})
-            if window is not None:
-                from mods import chat
-
-                session.on_output = lambda assistant, calls: oplog.output(window, assistant, calls)
-                session.on_results = chat.agent._stream_results(window, binding)
+            tool_modules.bind_session(session, tool_context, requested)
             pieces = []
 
             def collect(chunk: llm.LLMResponse) -> None:

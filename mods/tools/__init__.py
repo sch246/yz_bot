@@ -469,16 +469,6 @@ def _render_context(
     return result
 
 
-# WHY: UI 模式下这条 system 消息**不放**工具状态，只放一个指路条。整套 UI 模式的
-# 卖点就是"工具只有一个权威副本，而且它明确位于所有修改之后"；这里再留一份目录，
-# 上下文里就又有两个说法了，等于白切。
-_UI_POINTER = (
-    "## 可用工具模块\n"
-    "工具状态不在这里。当前的模块目录、已激活模块正文和磁盘变化统一放在上下文**末尾**的"
-    "工具状态块里，那里是唯一权威，并且位于你所有修改之后。"
-)
-
-
 def bot_op_tool_visible(name: str, module: ToolModule) -> bool:
     """Whether Bot's fixed permission allows one module to be shown and loaded."""
     if not getattr(module, "bot_op_only", False):
@@ -512,13 +502,10 @@ def _visible_catalog(
 def create_context_message(
     *,
     registry: ToolRegistry | None = None,
-    ui_mode: bool = False,
     visible: Callable[[str, ToolModule], bool] | None = None,
 ) -> dict[str, str]:
     """Create the baseline module catalog; later changes are appended, not rewritten."""
     selected = default_registry if registry is None else registry
-    if ui_mode:
-        return {"role": "system", "content": _UI_POINTER}
     return {"role": "system", "content": _render_context(_visible_catalog(selected, visible), {})}
 
 
@@ -531,7 +518,6 @@ class SessionBinding:
         context_message: dict,
         *,
         registry: ToolRegistry,
-        ui_mode: bool = False,
         visible: Callable[[str, ToolModule], bool] | None = None,
         persist: Callable[[Mapping[str, float]], None] | None = None,
         ttl: float | None = _IDLE_RECLAIM_SECONDS,
@@ -568,15 +554,8 @@ class SessionBinding:
             failure = self.registry.failures.get(_BASE_MODULE_NAME)
             raise RuntimeError("required tool module meta is unavailable" + (f"\n{failure}" if failure else ""))
         self._announcements: list[str] = []
-        self.ui_mode = bool(ui_mode)
         self._activate(meta)
         add_hint = getattr(session, "add_hint", None)
-        if self.ui_mode:
-            # UI 模式：整块状态挂末尾，前面那条 system 只留指路条。
-            self.context_message["content"] = _UI_POINTER
-            if callable(add_hint):
-                add_hint(self._state_hint)
-            return
         # 追加模式：基线在 bind 时写一次，之后这条消息不再变，变动走 _announce 追加。
         self.context_message["content"] = _render_context(self._catalog(), self.active)
         register = getattr(session, "add_context_provider", None)
@@ -659,9 +638,7 @@ class SessionBinding:
                     continue
                 self._activate(module, touched_at=stamp)
                 kept.append(name)
-            if not self.ui_mode:
-                # UI 模式的工具状态整块挂在末尾，每次子请求重算，这里不用碰。
-                self.context_message["content"] = _render_context(self._catalog(), self.active)
+            self.context_message["content"] = _render_context(self._catalog(), self.active)
             if kept != requested or self._dirty:
                 self._save_active()
             if reclaimed:
@@ -757,54 +734,8 @@ class SessionBinding:
         return _framed(
             "工具模块的磁盘源与已加载版本不一致，尚未应用：\n"
             + "\n".join(f"- {part}" for part in parts)
-            + "\n需要时用 reload_tools 显式应用；不应用则当前生效的仍是上面目录里的版本。"
+            + "\n需要时用 reload_tools 显式应用；不应用则当前生效的仍是目录中的版本。"
         )
-
-    def _state_hint(self) -> str:
-        """Render the whole tool state as one end-of-context block (UI mode).
-
-        WHY: UI 模式的全部意义是注意力：工具只剩**一个**权威副本，而且它明确位于所有
-        修改之后。就地改写头部做不到这一点（会丢掉"改过"这件事，还打断前缀缓存），
-        追加式也做不到——上下文里同时留着某模块的旧正文和新正文，模型可能以为修改之前
-        的工具就长那样。整块挂末尾则没有歧义：末尾这一份就是现在的样子。
-
-        WHY: 代价是这一整块每次子请求都是未命中缓存的新 token，工具循环越长付得越多。
-        所以它是**可切换**的而不是替换掉追加模式，默认仍走追加。开关见
-        chat.get_tools_mode，按窗口存。
-
-        WHY: 它连磁盘变化一起报，所以 UI 模式下不再单独挂 _drift_hint——那会是同一件事
-        的第二个说法。仍然只报告不加载，理由和 _announce 那条完全相同。
-        """
-        try:
-            changes = self.registry.scan()
-        except Exception:
-            _log.exception("failed to scan tool sources for the state hint")
-            changes = {}
-        modules = self._catalog()
-        lines = ["当前工具状态（本块位于你所有修改之后，是唯一权威）：", "", "## 可用工具模块"]
-        if modules:
-            lines.extend(
-                f"- {name}: {module.description}" + ("（已激活）" if name in self.active else "")
-                for name, module in modules.items()
-            )
-        else:
-            lines.append("- (无)")
-        for name in sorted(self.active):
-            content = self.active[name].content
-            if content:
-                lines.append(f"\n## 已激活模块 {name}\n{content}")
-        drift = [
-            f"- {label} {', '.join(changes[kind])}"
-            for kind, label in (("added", "新增"), ("modified", "修改"), ("deleted", "删除"))
-            if changes.get(kind)
-        ]
-        if drift:
-            lines.append("\n## 磁盘源与已加载版本不一致（尚未应用）")
-            lines.extend(drift)
-            lines.append("需要时用 reload_tools 显式应用。")
-        for name, error in sorted(self.registry.failures.items()):
-            lines.append(f"\n## 加载失败 {name}\n{error}")
-        return _framed("\n".join(lines))
 
     def list_text(self) -> str:
         """Describe last-good, active, failed, and changed modules."""
@@ -965,11 +896,7 @@ class SessionBinding:
         通告再抄一遍描述或操作步骤，就是同一个事实有了第二个写入权威——而重复的指引会被
         当成义务照做，2026-09-18 的"用完就卸"就是这么让模型真去调了一次 unload。
 
-        WHY: UI 模式不发，和 `_announce` 同一条理由。整块状态挂在末尾、每次子请求重算，
-        本来就是最新的，再追加一条"变了什么"就又是两个副本并存。
         """
-        if self.ui_mode:
-            return
         grouped: dict[str, list[str]] = {}
         for name, reason in reclaimed:
             grouped.setdefault(reason, []).append(name)
@@ -1030,17 +957,13 @@ class SessionBinding:
         可能正被写到一半（模型自己也在写），自动加载等于把半个文件当成新版本，而
         registry 的 last-good 只在校验通过后才替换，正是为了让这种时刻不影响正在跑的
         会话。想让模型知道磁盘变了，用 list_tools 报告差异，或者末尾的 _drift_hint
-        （UI 模式下是 _state_hint），都不是在这里加扫描。
+        都不是在这里加扫描。
 
         WHY: 通告是**累积**的，靠顺序而不是替换生效——上下文里会同时留着某模块的旧正文
         和后来追加的新正文，后者在后面。这是追加式的必然代价，deepseek-harness 的
         baseline+refresh 也是如此。换成回头改写旧消息就等于放弃前缀缓存，而那正是这套
         东西存在的理由。同一轮内的多次变动各自成条、按发生顺序交付，不互相覆盖。
         """
-        if self.ui_mode:
-            # UI 模式不产生通告：状态整块挂在末尾，每次子请求重新渲染，本来就是最新的。
-            # 再追加一条"变了什么"就又回到了两个副本并存。
-            return
         before_active, before_catalog, before_failures = before
         after_active, after_catalog, after_failures = self._capture()
 
@@ -1097,7 +1020,6 @@ def bind_session(
     initial_modules: Mapping[str, float] | Iterable[str] = (),
     *,
     registry: ToolRegistry | None = None,
-    ui_mode: bool = False,
     visible: Callable[[str, ToolModule], bool] | None = None,
     persist: Callable[[Mapping[str, float]], None] | None = None,
     ttl: float | None = _IDLE_RECLAIM_SECONDS,
@@ -1113,7 +1035,6 @@ def bind_session(
         session,
         context_message,
         registry=default_registry if registry is None else registry,
-        ui_mode=ui_mode,
         visible=visible,
         persist=persist,
         ttl=ttl,

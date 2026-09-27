@@ -4,7 +4,7 @@ import json
 import re
 import time
 
-from mods import context, cq, history, identity, message, msgs, oplog, storage
+from mods import cq, history, identity, msgs, oplog, storage
 
 import mods.chat as _chat_root
 
@@ -104,7 +104,7 @@ def _is_context_poke(event: dict, in_group: bool) -> bool:
 def event2chat(event: dict, in_group: bool) -> dict:
     """Convert one history event into the single shape the model sees.
 
-    WHY: 插话与 get_msgs 必须走同一条转换。中途插进来的消息如果换个形状(比如只塞纯
+    WHY: 插话与正式阅读必须走同一条转换。中途插进来的消息如果换个形状(比如只塞纯
     文本)，模型就会看到同一个人在同一轮里忽然换了说话格式，而且图片、回复引用这些都会
     丢。这里是唯一的转换点。
     """
@@ -395,22 +395,6 @@ def agent_rows(max_tokens: int, max_events: int, *, model: str | None,
             if order(entry["id"]) >= boundary]
 
 
-def get_msgs(token_limit: int | None = None, return_token: bool = False):
-    current = context.current() or {}
-    max_events, max_tokens = _chat_root.limit(current)
-    selected_limit = max_tokens if token_limit is None else token_limit
-    rows, used, _blocked = _stream_rows(history.window(current), selected_limit, max_events)
-    output = [converted for _entry, converted in rows]
-    return (output, used) if return_token else output
-
-
-def _chat_msgs() -> list[dict]:
-    current = context.current() or {}
-    max_events, max_tokens = _chat_root.limit(current)
-    rows, _used, _blocked = _stream_rows(history.window(current), max_tokens, max_events)
-    return [converted for entry, converted in rows if entry["kind"] == "input"]
-
-
 def _base_prompt() -> list[dict]:
     return [{"role": "system", "content": f"""## 注意事项
 - 你的昵称: {identity.bot_name()}
@@ -423,15 +407,6 @@ def _base_prompt() -> list[dict]:
 - 想积累经验就实际写入以后会用的载体：可复用做法写 Markdown Skill 并按需加载，全局待办用 `edit_hint` 保存；只在回复里说“记住了”不会保存它
 - 对外发送必须在 say 里明确写目标 g群号 或 u私聊对端号；没有默认接收窗口
 - `say` 返回这条消息的 message_id；它默认 `final_call=true`，说完这一轮就结束，要接着干活就传 `final_call=false`"""}]
-
-
-def _build_context_snapshot(token_limit: int | None = None) -> list:
-    """Project the selected visible stream without consuming unread mail."""
-    current = context.current() or {}
-    max_events, max_tokens = _chat_root.limit(current)
-    selected_limit = max_tokens if token_limit is None else token_limit
-    rows, _used, _blocked = _stream_rows(history.window(current), selected_limit, max_events)
-    return _close_with_user([converted for _entry, converted in rows])
 
 
 def _numbered(converted: dict, event_id: str) -> dict:
@@ -503,11 +478,6 @@ def _result_projection(entry: dict, links: dict[str, tuple[str, str]]) -> dict:
     return {"role": "user", "content": content}
 
 
-def build_context(token_limit: int | None = None) -> list:
-    """Build the current window context without consuming its mailbox."""
-    return _build_context_snapshot(token_limit)
-
-
 _CLOSING_NOTE = "<system-reminder>\n会话已自动接续。\n</system-reminder>"
 
 
@@ -525,8 +495,8 @@ def _close_with_user(messages: list) -> list:
     DeepSeek 专有的，别的供应商并不要求（草籽 2026-09-17），替它们发明一个字段是拿一个供应
     商的规矩去改所有人的请求。
 
-    WHY: 平时不会走到这里——正常聊天最后一条总是触发它的那条 user 消息，`.chat` 单句自带
-    一条。只有"没有新消息的那一轮"（重启后接着聊，`reboot.resume_chat`）会以 assistant
+    WHY: 平时不会走到这里——正常聊天最后一条总是触发它的那条 user 消息。
+    只有"没有新消息的那一轮"（重启后接着聊，`reboot.resume_chat`）会以 assistant
     收尾，那正是 2026-09-17 两次 400 的现场。
 
     WHY: 追加的是一句极短的**声明**，不是假装有人说了一句话。形状抄 `tools._announce` 的系统

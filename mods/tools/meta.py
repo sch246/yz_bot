@@ -32,7 +32,7 @@
 
 1. 磁盘源码：刚编辑的文件，还不一定生效。
 2. 进程级 last-good：最后一次成功初始化或 `reload_tools` 的完整模块版本。
-3. 中心 agent 的持久激活态：经 `load_tools` 加入的模块内容和函数。它属于唯一主体而不是最近读到的窗口；下一轮自动从全局名单装回，跨重启保留。私有 `.chat` 仍有自己的窗口激活态。
+3. 中心 agent 的持久激活态：经 `load_tools` 加入的模块内容和函数。它属于唯一主体而不是最近读到的窗口；下一轮自动从全局名单装回，跨重启保留。
 
 `reload_tools` 从磁盘应用源码；`load_tools` 只激活 last-good，不能混用。没有自动 watcher，也不要等待修改自行生效。
 
@@ -117,7 +117,7 @@ Skill 也是可编辑的长期笔记：把可重复使用的经验、做法、�
 
 结论写在 `conclusion` 参数里就够了，工具不会把它再返回一遍：这次调用本身留在上下文里，参数里的结论就是它的记录。
 
-已读消息和输出也能总结：中心会话调用 `cover_events(["20260923-4", "20260923-5"], "结论")`，参数用的是上文方括号里的正式事件号，不是 QQ `message_id` 或行动位置。也可用 `cover_events(ids=[], conclusion="结论", anchor="20260923-4", before=2, after=3, kinds="input,result")`，或用 `start`／`end` 指定含端点的区间。覆盖范围没有条数上限；先从唯一已读顺序取原始种子，再筛选种类和来源，不按命中数补足。输出、整批返回、已确认的 `say`／回声是强绑定闭包，实际覆盖成员可能越过范围和筛选条件。闭包里有任一成员不可覆盖，整次失败，不丢掉那个成员后继续。覆盖使成员从本轮和后续自动上下文中消失；原号可用 `recall_events` 反查而不解除覆盖，反查总结会显示实际冻结的所有成员，不只是你传入的号。中心会话可跨窗口点名已读或反查过的旧号；未读成员不会被补进覆盖。摘要与聊天消息、输出、返回一样属于已读历史；上限只决定首次历史起点，之后须主动压缩；私有 `.chat` 和子代理不能替中心会话写覆盖。
+已读消息和输出也能总结：中心会话调用 `cover_events(["20260923-4", "20260923-5"], "结论")`，参数用的是上文方括号里的正式事件号，不是 QQ `message_id` 或行动位置。也可用 `cover_events(ids=[], conclusion="结论", anchor="20260923-4", before=2, after=3, kinds="input,result")`，或用 `start`／`end` 指定含端点的区间。覆盖范围没有条数上限；先从唯一已读顺序取原始种子，再筛选种类和来源，不按命中数补足。输出、整批返回、已确认的 `say`／回声是强绑定闭包，实际覆盖成员可能越过范围和筛选条件。闭包里有任一成员不可覆盖，整次失败，不丢掉那个成员后继续。覆盖使成员从本轮和后续自动上下文中消失；原号可用 `recall_events` 反查而不解除覆盖，反查总结会显示实际冻结的所有成员，不只是你传入的号。中心会话可跨窗口点名已读或反查过的旧号；未读成员不会被补进覆盖。摘要与聊天消息、输出、返回一样属于已读历史；上限只决定首次历史起点，之后须主动压缩；子代理不能替中心会话写覆盖。
 
 眼前历史从首次选定的起点持续追加，不是完整记录。新消息先留在有名字的有序未读信源；通知是创建时快照，尾部 hint 显示当前未读提及的时间和未读序号。`status(source)` 看数量与缺口，`take(source, start=1, count=8)` 在工具执行时按当前未读成员序号选连续范围，已读/跳过不计数；`ids`、`arrival`、`origin`、`message_id` 是高级精确入口。`mentions(source)` 正式消费至多 500 条未读提及，不是只看通知；`pull(source, count)` 是前缀别名。正式 input 保留自己的号，并记录发起输出 `read_by` 和实际工具 `read_via`；来源顺序中跨过的已读/跳过桥附在本次新 input 内，已读桥保留旧正式号，跳过桥显示 `skipped_by` 而没有旧 input 号。`mark_read(source)` 把调用时已有的成员跳过，不伪造 input；`fetch(source)` 从 NapCat 向旧端补取。通知已看见不等于消息已读；红点本身不会反复启动你，只有后来出现新唤醒时才再次叫你。窗口名是 `g<群号>` 或 `u<私聊对端号>`，主动 fetch 的旧档有自己的信源 key。启动补回先于该窗口新实时消息进入原信源；未收束前不能正式阅读或标为已读。已经读过的旧档信源不会倒插内容，后续 fetch 另开信源。远端历史不保证无缺口。用 `exec_code` 可调用 `ctx["chat"].unread_members(source)` 取得脱离内部权威的 `list[dict]`，用普通 Python 筛选后把其中 `key` 列表交给 `take(ids=...)`；修改快照不会修改未读事实。
 
@@ -229,7 +229,7 @@ def reload_tools(names: list[str]) -> str:
 
 
 def load_tools(names: list[str]) -> str:
-    """激活 last-good 模块到当前 Chat；中心会话的名单全局持久，私有会话按窗口保存，不读取磁盘。
+    """激活 last-good 模块到当前 Chat；中心会话的名单全局持久，不读取磁盘。
 
     @param
     names: 模块名列表，不带 .py/.md 后缀，也不带 模块名__ 前缀；名字来自 list_tools
@@ -306,7 +306,7 @@ def cover_events(ids: list[str], conclusion: str, anchor: str = "", before: int 
     window = _tool_window()
     session = current_binding().session
     if window is None or not session.reads_window_mail or not session.active_action:
-        return "仅主窗口正在读取 mail 的会话能覆盖信息流；私有 .chat 和子代理不可覆盖"
+        return "仅中心 reader 能覆盖信息流；子代理不可覆盖"
     return chat.agent.cover_stream(session, window, ids, conclusion, anchor, before,
                                    after, start, end, kinds, source)
 
@@ -332,7 +332,7 @@ def say(text: str, final_call: bool = True, target: str = "") -> str:
     @param
     text: 要说的话。CQ 码原样写，at、reply、图片都照常生效
     final_call: 这次发言是不是本轮最后一个动作。默认 true；要接着干活就显式传 false
-    target: 中心会话必填 g<群号> 或 u<私聊对端号>；私有 .chat 可留空用当前窗口
+    target: g<群号> 或 u<私聊对端号>；中心会话必填
 
     WHY: 它**等**发送结果，不是投递完就返回。这不是谨慎，是终止语义逼出来的：一轮的结束
     由 `final_call` 声明，而"失败时照常再跑一轮"要求这里能分辨成败——成败只有 SendFuture
@@ -541,12 +541,11 @@ def edit_hint(text: str) -> str:
     @param
     text: 更新后的完整待办文本；请保留仍未完成的事项，空字符串表示清空
     """
-    from mods import chat, context, history
+    from mods import chat
 
-    window = _tool_window()
-    if window is None:
-        return "当前不在聊天窗口里，无法编辑待办 hint"
-    chat.set_agent_hint(window, text)
+    if _tool_window() != chat.AGENT_WINDOW:
+        return "只有中心 reader 可以编辑待办 hint"
+    chat.set_agent_hint(text)
     return "已更新待办 hint；下次模型请求会看到新内容" if text.strip() else "已清空待办 hint"
 
 
