@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-import sqlite3
-import tempfile
 
 from mods import _napcat_history, _source_pages, chatlog, context, oplog
 
@@ -14,11 +12,10 @@ logger = logging.getLogger(__name__)
 PAGE_SIZE = 100
 
 
-def _prior_boot_members(source: dict, root: Path) -> tuple[tempfile.TemporaryDirectory | None,
-                                                            sqlite3.Connection | None]:
-    """Index earlier boot FIFOs from their committed pages, not a second authority."""
+def _prior_boot_members(source: dict, root: Path) -> set[str] | None:
+    """Collect earlier boot FIFO origins from their committed pages."""
     if source["source_type"] != "napcat_boot":
-        return None, None
+        return None
     earlier = []
     for candidate in oplog.sources():
         if candidate["key"] == source["key"]:
@@ -28,26 +25,13 @@ def _prior_boot_members(source: dict, root: Path) -> tuple[tempfile.TemporaryDir
                 raise RuntimeError("较早的同窗口补回信源尚未收束")
             earlier.append(candidate)
     if not earlier:
-        return None, None
-    temporary = tempfile.TemporaryDirectory(prefix="yz-boot-members-")
-    database = None
-    try:
-        database = sqlite3.connect(Path(temporary.name) / "members.sqlite3")
-        database.execute("PRAGMA cache_size=-2048")
-        database.execute("CREATE TABLE members (origin TEXT PRIMARY KEY)")
-        with database:
-            for candidate in earlier:
-                for page_number in range(candidate["pages"]):
-                    database.executemany(
-                        "INSERT OR IGNORE INTO members VALUES (?)",
-                        ((member["origin"],) for member in
-                         _source_pages.read_page(root, candidate["key"], page_number)))
-        return temporary, database
-    except BaseException:
-        if database is not None:
-            database.close()
-        temporary.cleanup()
-        raise
+        return None
+    return {
+        member["origin"]
+        for candidate in earlier
+        for page_number in range(candidate["pages"])
+        for member in _source_pages.read_page(root, candidate["key"], page_number)
+    }
 
 
 def recover_source(source: dict, call_api, *, manual: bool = False) -> dict:
@@ -59,7 +43,7 @@ def recover_source(source: dict, call_api, *, manual: bool = False) -> dict:
     if state is None or state["state"] != "fetching":
         raise ValueError("source is not awaiting recovery")
 
-    temporary, prior_members = _prior_boot_members(state, root)
+    prior_members = _prior_boot_members(state, root)
     try:
         if state["pages"]:
             _source_pages.delete_pending(root, key, state["pages"] - 1)
@@ -89,8 +73,7 @@ def recover_source(source: dict, call_api, *, manual: bool = False) -> dict:
                     boundary = state["pending_boundary"]
                     if pending is not None and boundary is not None and oplog.arrival_before_or_at(pending, boundary):
                         continue
-                    if prior_members is not None and prior_members.execute(
-                            "SELECT 1 FROM members WHERE origin=?", (origin,)).fetchone():
+                    if prior_members is not None and origin in prior_members:
                         continue
                     member = {"origin": origin, "message_id": row["message_id"],
                               "message_seq": int(row["message_seq"]), "time": int(row["time"]),
@@ -128,8 +111,3 @@ def recover_source(source: dict, call_api, *, manual: bool = False) -> dict:
     except Exception:
         logger.exception("NapCat source recovery stopped before a durable page commit")
         raise
-    finally:
-        if prior_members is not None:
-            prior_members.close()
-        if temporary is not None:
-            temporary.cleanup()
