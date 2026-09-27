@@ -905,6 +905,8 @@ def cover(window: tuple, node: str, ids: Iterable[str], visible: set[str]) -> se
 
 def sent_by(message_id: int | str, target_window: tuple) -> str | None:
     """Find one already-recorded central say return for this exact destination."""
+    from mods.chat.reader import parse_target
+
     with _lock:
         _restore()
         matches = []
@@ -916,11 +918,7 @@ def sent_by(message_id: int | str, target_window: tuple) -> str | None:
                     continue
                 try:
                     arguments = json.loads(item["arguments"])
-                    target = arguments["target"]
-                    matched = re.fullmatch(r"([gu])([1-9][0-9]*)", target)
-                    if matched is None:
-                        continue
-                    parsed = (("group" if matched[1] == "g" else "private"), int(matched[2]))
+                    parsed = parse_target(arguments["target"])
                 except (KeyError, TypeError, ValueError):
                     continue
                 if parsed != target_window:
