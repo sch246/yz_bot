@@ -486,6 +486,10 @@ def _formal_input(session: llm.Chat | None, window: tuple, event: dict,
                 *content[1:]]}
     if converted is not None and bridge:
         converted = _with_bridge(converted, bridge)
+    if (converted is not None and session is not None and session.do_process_image
+            and not session.chat_client.get_model_capabilities(session.model).vision):
+        converted = session.chat_client._describe_images(
+            [converted], _chat_root.description_cache)[0]
     recorded = commit(converted)
     if converted is None:
         return None
