@@ -1,6 +1,31 @@
 # 第二轮：旧兼容与离线补回调查
 
-> **只读调查，未实施迁移，未验收真实停机空窗。** 本文对应[第二轮计划第 7 节](proposals/agent-simplify-round2.md#7-旧兼容分支和离线补回先检查后决定)。现行用户语义以[交互模型](../interaction-model.md)为准；本文的三选一是建议，不是已获授权的生产数据操作。调查只读版本控制内的代码和文档，未查看设备上的 link、`data/pyload.py`、`#hint`、oplog、chatlog 或 NapCat 响应。
+> **只读调查，未实施迁移，未验收真实停机空窗。** 本文对应[第二轮计划第 7 节](proposals/agent-simplify-round2.md#7-旧兼容分支和离线补回先检查后决定)。现行用户语义以[交互模型](../interaction-model.md)为准；本文的三选一是建议，不是已获授权的生产数据操作。第一版只读版本控制内的代码和文档；2026-09-27 经维护者授权补做了脱敏的生产数据只读复核，仍未查询 NapCat 或改写任何运行时状态。
+
+## 2026-09-27 生产数据只读复核
+
+维护者随后授权检查现有数据，但没有授权转换或删除。本次只固定每个文件当时已有的完整前缀，统计格式和字段；没有导出正文、身份、窗口号、密钥或私有端点，也没有修改生产文件。运行中的 Bot 进程启动于 2026-09-26，早于第二轮代码部署；扫描期间事件流仍从 8244 行增长到 8246 行。因此下面是活数据的只读快照，任何“当前为零”的旧形状都必须在停机后的最终冻结中复核，不能据此在线删兼容。
+
+### 实际存在的旧形状
+
+- `data/event_stream` 有 4 个 journal、8246 条完整记录；当前重放器逐行校验全部通过，无完整行 JSON 错误和残尾。旧形状包括：124 条 `condensed`、379 条 `body/actions` output、33 条旧 notification、94 条 `projection=None` input、21 条无 `read_by` 的 `mark_read`、15 条没有 `positions/read_by` 的旧 `source_mark_read`。1752 条 input 中只有 4 条带新 `read_by/read_via`。
+- 596 条历史 arrival 带 `_stream_results`，但按完整日志重放后待消费数为 0；这只能说明桥已经排空当时的遗留，不能阻止尚未重启的旧进程再次追加。
+- 925 条 `source_start` 全都有 `queue_window` 和 `pending_boundary`；15 条 `source_mark_read` 全都有 `mention_count`。`floor`、`clear`、`start` 均为 0。由此可在停机终检后收紧这些字段或删除零数据分支，但 `condensed`、旧 source 坐标恢复和旧 output 兼容仍然承重。
+- 33 条 notification 全部已确认：22 条没有 `activations`，11 条有 `activations` 但没有 `version=2`；尚无新版 v2 通知。不能拿当前未读状态回填旧快照。
+- 当前持久 input 尚无工具状态事件，也没有冻结的 `<sent_by>`。旧记录缺少足够的明确目标事实，不能事后猜写 say／回声关系。
+- 旧 `data/storage/oplog` 还有 5 个文件、482 条 `opN` 记录，其中 168 条已收缩；当前源码已无读取者。3 个文件的编号存在历史空洞，不能按剩余条数重建 cid。它们是可归档或删除的退休轨道，不是可并入统一事件流的数据。
+- 旧窗口聊天设置只出现在 4 个群 storage 和 1 个私聊 storage；其中 2 个文件同时保留仍有效的 `hint`。可删除键仅限 `model/image/reasoning/tools/max_events/max_msg/max_token/pressure_percent/prompt/active_tools`，不能整文件删除，也不能把多窗口值自动并入全局 agent。
+- 全局 `agent` 当前没有 `active_tools`；所有仍存在的窗口 `active_tools` 已是时间戳字典，不存在待转换的名字列表。动态兼容符号扫描在 `pyload`、群／用户设置与 hint 中未找到 `chat.cond`／`chat.call` 消费者；命中只来自退休的旧 oplog 正文，不能据此反向修改历史。
+- 普通 chatlog 仍以 v0 为绝对主体：8408 个 v0 日档、122 个 v1 日档和 7 个切换日档。v0 原始 CQ 与显示文字已经不可区分，继续只读适配，不做伪升级。
+- 175 个 backfill sidecar 共 1545 行，全部是完整合法 JSON；182 个 source page 与 journal 一一对应，成员数一致，无孤页、缺页、pending 或临时页。88 个派生 SQLite 索引全部通过 `integrity_check`，字段也已经是当前 schema；无需删除重建。
+
+### 据此采用的三类处理
+
+1. **保留兼容层：** v0 chatlog、`condensed`、旧 notification、未知 read provenance、旧 `source_mark_read` 坐标恢复、旧 output、`projection=None` 和旧窗口正式号都由当前 replay／projection 适配；不改写原日志，也不补造因果关系。
+2. **格式升级：** 新代码只写当前 notification、工具状态、read provenance、source 与 output 形状；生产重启后用真实新样本确认。现有派生索引已经是当前 schema，不做无意义重建。`_stream_results` 只让兼容桥排空，不把旧 arrival 重写成另一套历史。
+3. **删除候选：** 旧窗口聊天键和退休的 `data/storage/oplog` 需要停机、备份与维护者明确授权后处理；`floor/clear`、`source_start.queue_window` fallback、全局 `active_tools` 列表兼容、旧 reboot payload 与 `_stream_results` 桥，都要在新代码部署、成功重启并再次冻结计数后才能删。删除代码兼容不需要改历史，但不能在旧进程仍写入时提前宣布完成。
+
+这次没有执行任何不可逆操作。若获准清理，先停止 Bot 并备份相关 storage 与 event stream；旧窗口设置按精确键删除，退休 oplog 按整目录归档后再从运行路径移除。事件流、source pages、chatlog 原文、正式号和引用不进入清理范围。
 
 ## 旧兼容分支清单
 
