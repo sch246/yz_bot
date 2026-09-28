@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import mmap
 import os
 from pathlib import Path
 import re
@@ -1286,6 +1287,50 @@ def read_range(
     return records
 
 
+_HEAD_ID = re.compile(rb" \| ([^\n]*)")
+_UNICODE_DIGIT_LEADS = tuple(bytes((lead,)) for lead in sorted({
+    chr(codepoint).encode("utf-8")[0] for codepoint in range(128, 0x110000)
+    if chr(codepoint).isdecimal()
+}))
+
+
+def _ordinary_may_have_id(path: Path, key: str) -> bool:
+    """Only skip a day when neither ASCII digits nor a Unicode decimal ID can match.
+
+    A possible day still goes through the existing exact merged SQLite view.
+    """
+    if not path.is_file() or path.stat().st_size == 0:
+        return False
+    raw_key = key.encode("utf-8")
+    numeric = key.lstrip("-").isdigit()
+    digits = key.lstrip("-").encode("utf-8") if numeric else raw_key
+    with path.open("rb") as file, mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as content:
+        if content.find(digits) < 0 and (not numeric or not any(
+                content.find(lead) >= 0 for lead in _UNICODE_DIGIT_LEADS)):
+            return False
+        for match in _HEAD_ID.finditer(content):
+            start = content.rfind(b"\n", 0, match.start()) + 1
+            if content[start:start + 4] == b"    ":
+                continue
+            raw_id = match[1]
+            if digits not in raw_id and (not numeric or raw_id.isascii()):
+                continue
+            if recall_key(raw_id.decode("utf-8")) == key:
+                return True
+    return False
+
+
+def _sidecar_may_have_id(path: Path, key: str, root: str | os.PathLike | None) -> bool:
+    if not path.is_file():
+        return False
+    found = False
+    with _backfill_archive._lock:
+        for _, _, message in _backfill_archive._iter_sidecar(
+                path, rootfile if root is None else root):
+            found |= recall_key(message["message_id"]) == key
+    return found
+
+
 def read_around(
     kind: str,
     target: int | str,
@@ -1321,7 +1366,6 @@ def read_around(
     bot_names, names_complete = _bot_identities()
     days = _archive_days(directory)
     with _window_lock(directory), closing(_reader_index(directory)) as database:
-        indexed = [(day, _index_day(database, kind, target, day, root)) for day in days]
         anchor_day = anchor_position = anchor_row = None
         if origin is not None:
             anchor_day, anchor_position, anchor_row = _locate_origin(
@@ -1334,7 +1378,14 @@ def read_around(
         else:
             key = recall_key(message_id)
             candidates = []
-            for day, day_key in indexed:
+            for day in days:
+                ordinary, sidecar = _day_paths(kind, target, day, root)
+                possible = _ordinary_may_have_id(ordinary, key)
+                if not possible and kind != "bot":
+                    possible = _sidecar_may_have_id(sidecar, key, root)
+                if not possible:
+                    continue
+                day_key = _index_day(database, kind, target, day, root)
                 query = ("SELECT source, line, offset, end, position, stamp FROM reader_rows "
                          "WHERE day=? AND visible=1 AND message_id=?")
                 params: tuple[Any, ...] = (day_key, key)
@@ -1360,7 +1411,8 @@ def read_around(
                     count: int) -> list[tuple[tuple[int, int, int], tuple]]:
             if count <= 0:
                 return []
-            day, day_key = indexed[day_index]
+            day = days[day_index]
+            day_key = _index_day(database, kind, target, day, root)
             rows = database.execute(
                 "SELECT source, line, offset, end, position FROM reader_rows "
                 f"WHERE day=? AND visible=1 {clause} ORDER BY position {order} LIMIT ?",
