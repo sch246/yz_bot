@@ -1,6 +1,6 @@
 # 记忆基础问题综述：按开放问题组织
 
-> 状态：外部研究综述（初稿 2026-10-06；预测编码专题与推论校准 2026-10-08）。它按[基础问题讨论](memory-foundations-discussion.md)留下的开放问题组织已有工作，不是运行合同，不批准实现，也不替维护者决定记忆系统的目标。
+> 状态：外部研究综述（初稿 2026-10-06；预测编码专题、全文补读与推论校准 2026-10-08）。它按[基础问题讨论](memory-foundations-discussion.md)留下的开放问题组织已有工作，不是运行合同，不批准实现，也不替维护者决定记忆系统的目标。
 
 ## 为什么写、怎样读
 
@@ -17,7 +17,7 @@
 
 **证据强度标记**：**强**＝多项独立实验或有明确前提的数学证明；**中**＝特定任务上的实验结果；**弱**＝理论主张、类比或尚有争议。标记只修饰紧邻的主张：定理对某种网络成立，不提高“脑采用它”或“柚子应采用它”的证据等级。
 
-**核对方式与边界。** 2026-10-06 初稿只核对了搜索结果、元数据与摘要，当时未取得 arXiv 与 YouTube 原文。2026-10-08 补读预测编码论文的相关正文、方法、定理和更正，并复核 VICReg、集成分歧、层级高斯滤波器与主动推断的关键段落，以及 PSR 的有限状态定理和反事实影响方法的对象；不声称逐页精读所有论文。文末[预测编码题单](#预测编码题单与版本核对)逐项记录读取层级，未取得的全文仍明确保留。向柚子的迁移一律是推论。视频仅取得官方标题与描述，未观看、未取得可用字幕。
+**核对方式与边界。** 2026-10-06 初稿只核对了搜索结果、元数据与摘要。2026-10-08 先选读关键节，随后按维护者“读一遍看看认知有没有变化”的要求，分工通读预测编码题单 20 项各自取得版本的主文、图注及可取得的所附方法／证明；主代理复核改变判断的关键出处。文末[题单](#预测编码题单与版本核对)记录具体版本、页数与缺口：作者稿／预印本没有一律与正式版逐字比较，未取得的补充仍保留，不声称完成形式证明审计或实验复现。VICReg、集成分歧、层级高斯滤波器、主动推断、PSR 与反事实影响方法仍是此前的关键段落核对，未扩大为全文阅读。向柚子的迁移一律是推论。视频仅取得官方标题与描述，未观看、未取得可用字幕。
 
 ## 问题一：编码器的训练目标与防坍缩
 
@@ -204,7 +204,17 @@ Empowerment 与信息瓶颈都需要估计互信息，在高维、样本少的�
 
 ## 问题八：局部误差怎样成为记忆的更新
 
-**对应讨论文档**：第四节的长跨度信用、第八节的局部学习、十二节第 10–13 条。本次题单最能补强的是“可训练层怎样更新”，而不是为整个记忆愿景提供一个现成算法。
+**对应讨论文档**：第四节的长跨度信用、第八节的局部学习、十二节第 10–13 条。全文补读修正了此前把题单主要定位为“可训练层怎样更新”的判断：**固定参数下怎样协调当前状态、从局部线索恢复其余变量，也是一条独立的贡献。** 它仍未给出整个记忆愿景的现成算法。
+
+### 推断本身就是一种记忆能力
+
+[IJCAI 综述 §4–7](https://www.ijcai.org/proceedings/2022/0774.pdf)讨论同一关系网络通过固定不同已知节点，完成识别、生成、去噪、联想恢复及条件控制；[理论与实验综述 §3](https://arxiv.org/html/2107.12979v3)还区分空间、跨模态与时间预测。这里“预测”不只指预测下一事件。反向查询可能欠定，需迭代、先验或正则；演示里的 ImageNet 联想恢复存了 100 张图片，不能外推为完整情景记忆。
+
+[Keller & Mrsic-Flogel 作者稿 PDF 页 4–5](https://discovery.ucl.ac.uk/id/eprint/10064516/3/Keller_Mrsic-Flogel.pdf)明确区分表征与误差单元：输入和预测吻合时，误差响应下降，边与三角形的表征仍然活跃。低误差可以是成功理解或恢复记忆的结果，不能推出内容应退出切片或行动。作者认为重要优势是脱离底层输入也能更新内部表征、模拟环境；抵消上行信号仍需要下行预测，总计算并不自动更少。竞争表征仍可被抑制，不能反过来写成“PC 从不抑制表征”。
+
+[Marino §4.1.1、§5.2](https://arxiv.org/abs/2011.07464v2)给出降低推断成本的另一接缝：学习从输入直接提出状态，或从当前状态与误差提出下一次修正，即摊销／迭代摊销推断。它把“学会怎样推断”纳入可学习对象，允许快速提议与迭代纠错结合；不证明冻结 LLM 的文本操作已具有同样导数，也不等于本讨论的二阶学习结果预测。
+
+[2025 年综述 v3 §3–4、§7](https://arxiv.org/html/2308.07870v3)进一步汇集 BayesPCN 的快速逐样本写入、潜变量关联记忆、时序适应与 CogNGen 的跨 episode 记忆及内部记忆操作策略。这些是该综述对各项研究的转述，原论文未另行全文核验；其中 BNP 式结构生长是前瞻方向。它们扩展了可研究的能力集合，不要求照搬认知架构、选择性遗忘或改变原始档案永不删除的原则。
 
 ### 局部规则成立在哪里
 
@@ -217,7 +227,9 @@ E(z, θ) = ½ Σ_l r_lᵀ Π_l r_l
 
 观测钳制某些节点，其余活动通过迭代减小 `E`；参数更新也沿同一能量的局部导数进行。“误差 × 活动”的 Hebbian 形状适用于相应参数线性连接，一般可微图还需要局部 Jacobian。[Bogacz 的教程](https://www.tnu.ethz.ch/fileadmin/user_upload/teaching/cpcourse/2020/Literature/Bogacz_2017.pdf)给出高斯模型下的推导，[任意计算图论文 §2](https://arxiv.org/abs/2006.04182)说明推广的条件。这里的“局部”是计算依赖局部；误差信息仍经过多步网络传播，不是只观察一个片段就自动知道它对整个未来的贡献。
 
-至少三件事不能合称“读即写”：推断改变本次活动 `z`，学习改变跨次参数 `θ`，档案追加保存本次经历。前一件事可以发生而后两件事不发生；同一能量也没有要求每次检索永久更新。文本片段由冻结 LLM 改写，不因此获得 `E`、梯度或可用的局部信用信号。
+“读即写”作为统一过程的说法可以保留，但至少三种变化须区分：推断改变本次活动 `z`，学习改变跨次参数 `θ`，档案追加保存本次经历。前一件事可以发生而后两件事不发生；同一能量没有要求每次检索永久更新。文本片段由冻结 LLM 改写，不因此获得 `E`、梯度或可用的局部信用信号。
+
+**误差不是一个通用惊奇分数。** [Rosenbaum 修订稿 pp.19–24、Figs.8–9](https://arxiv.org/abs/2106.13082v6)指出，fixed prediction 的内部误差对应任务损失对活动的敏感度，正确且可预测的物体也可出现较大信号；少量图像演示不是普遍神经结论。观测残差、任务梯度、学习收益与行动价值须分别定义。任意图论文的 CNN 共享权重还需汇总不同位置的更新，展开 RNN 仍需保留序列；局部传播没有自动解决在线长跨度信用。
 
 ### 近似、精确与调度的区别
 
@@ -230,23 +242,27 @@ E(z, θ) = ½ Σ_l r_lᵀ Π_l r_l
 
 表中来源与算法定位见文末[题单](#预测编码题单与版本核对)。Rosenbaum 的[2025 正式更正](https://doi.org/10.1371/journal.pone.0320944)修订了误差更新、算法与证明公式，应与原文一起读。
 
-**收敛也有不同含义。** [Millidge 等（ICLR 2023）Theorem 3.6](https://arxiv.org/pdf/2207.12316)要求足够小的学习率、每批初态满足损失／残差梯度关系，并假定推断收敛；证明的单调性论证采用连续时间／无穷小步长，得到 BP loss 的临界点结论，不是全局最优或任意有限步保证。“放宽生物约束”的论文则主要报告指定分类任务仍可训练，三项约束同时放宽时 ReLU 会不稳定；它不是放宽后仍精确 BP 的证明。
+Z-IL 的形式定理也不能直接转给其自主门控实现：Song 等（2020）§4 的有限历史检测器 Fa-Z-IL 失去形式等价保证，较长历史只在所报实验中保持等价。图分解也不是任意中性的：[Reverse Differentiation 正文 §3](https://ojs.aaai.org/index.php/AAAI/article/download/20788/20547)说明同一函数的不同分解可改变 IL 动力学；BP 的函数等价不保证 PC 的状态推断等价。
 
-**效率没有普适赢家。** [iPC 论文 §3.1、Table 3 与附录 C](https://proceedings.iclr.cc/paper_files/paper/2024/file/554414e570a85eb3118e988c5d77986f-Paper-Conference.pdf)支持它相对标准 PC 的稳定性和效率改善；部分效率比较采用不可并行矩阵乘次数并依赖并行假设。轻量语言模型实验中，iPC 在 masked 任务的 perplexity 优于 BP，在 conditional 任务则更差，后者 10 次运行只有 7 次收敛。“局部更新”不等于在个人电脑上更便宜。
+**收敛也有不同含义。** [Millidge 等（ICLR 2023）的预印本 v2 Theorem 3.6](https://arxiv.org/pdf/2207.12316v2)在小学习率、初态梯度关系及推断收敛等假设下提出 BP loss 的临界点结论；单调性论证采用连续时间／无穷小步长。全文补读发现 A.7.3 p28 把梯度内积取等号等同于两梯度相反，这个中间等价仍需补论证：`u=(-1,0), v=(1,-1)` 满足 `-uᵀv=‖u‖²`，却有 `u+v≠0`。这指出所读版本证明的一处缺口，不构成对完整定理或常用前向初态轨迹的反驳；正式版本未比对，不能当作本次已独立证明的收敛保证。“放宽生物约束”的论文主要报告指定分类任务仍可训练，组合放宽时 ReLU 有不稳定例外，并非放宽后仍精确 BP。
+
+**效率没有普适赢家。** [iPC 论文 §3.1、Table 3 与附录 C](https://proceedings.iclr.cc/paper_files/paper/2024/file/554414e570a85eb3118e988c5d77986f-Paper-Conference.pdf)包含矩阵乘次数、并行假设和 CPU 单次更新实测；附录 C.4 的优势随宽度／深度变化，不是端到端训练普遍加速。轻量语言模型中，iPC 在 masked 任务的 perplexity 优于 BP，在 conditional 任务更差，后者 10 次运行只有 7 次达到作者的性能阈值。表里的“收敛”指指定性能阈值，平均值剔除了未达阈值的运行，不是数学收敛。“局部更新”不等于在个人电脑上更便宜。
 
 ### 神经证据与记忆迁移
 
 [Rao & Ballard（1999）](https://doi.org/10.1038/4580)主要是计算模型重现部分视觉现象；[Keller & Mrsic-Flogel（2018）](https://doi.org/10.1016/j.neuron.2018.10.003)明确列出还需辨别的内部表征与电路实验。观察到失配响应，不能唯一证明误差就在该处计算。Friston 的 2018 文章是 News & Views；数学等价、模拟解释、局部神经证据与整个脑的实现应分开。
 
-[理论与实验综述 §4.5、§5](https://arxiv.org/html/2107.12979v3)仍把复杂动作规划、工作记忆和海马相关长期记忆列为不足。PC 联想记忆中的典型任务是从受损提示恢复存储样本，这不等于在多年聊天中恢复时间、来源、纠错与承诺。Song 等（2024）的前瞻配置支持研究“先协调目标兼容活动再巩固参数”，但没有填上这项迁移缺口。
+[理论与实验综述 §4.5、§5](https://arxiv.org/html/2107.12979v3)把复杂规划与长期记忆列为所呈现模型的不足；不能把该范围扩大成一切 PC 都不能容纳记忆，后来的综述已纳入更多记忆模型。联想恢复仍不等于多年聊天中的时间、来源、纠错与承诺。
+
+[Song 等（2024）Fig.5 与正文 PDF p8](https://doi.org/10.1038/s41593-023-01514-1)提供一个更具体的“读后怎样写”：反馈可唤起未呈现的潜在情境，更新归到推断出的情境连接，而非仅更新当前输入激活的路径。这是指定网络对既有行为数据的解释，不是一般因果信用定理。前瞻配置还让原本正确的输出通过补偿性权重变化保持稳定；第一隐层下一次自发活动沿推断变化方向的结论有特定证明，更深层主要依赖数值结果。原则强调先形成目标兼容活动，但论文的 CIFAR 实验采用每个推断步更新权重，不能把全部实验称为严格两阶段。
 
 ### 对柚子的候选实验
 
 尚未运行；合成例子只校准仪器，不把少数任务定义为通用 agent 的目标，也不替换[实践反馈主线](memory-replay-evaluation.md#实践反馈循环)。
 
 1. **先问表示是否有用。** 冻结编码器和目标，用过去预测留出的后续表示，与无记忆、打乱／错配记忆、廉价直接检索作等预算比较；目标在当时不可见。若真实记忆无增益，先检查预测对象、寻址和表示，不先换优化器。
-2. **再问 PC 是否增加能力。** 同一可训练小层、数据与损失，对比 BP 和指定 PC 变体，计入全部推断步、墙钟成本、旧材料表现和表示漂移。冻结主 LLM 不妨碍给小层使用 BP；PC 必须用独有收益证明额外推断成本。
-3. **最后问预测增益是否进入行为。** 让后续切片实际消费前一步产生的选择或结构，与不消费分支比较取证、纠错、任务接续和成本。预测改善但这些不改善，说明预测目标尚未足以代理记忆的功能，不能自动晋级。
+2. **另问条件推断是否增加能力。** 用同一关系表示，比较直接检索／一次前向提议与迭代协调，在改变已知条件、缺失或冲突线索时能否更好地恢复可核验内容；计入全部推断成本。若涉及训练，再在同一数据与目标下比较 BP 和指定 PC 变体。BP 也可训练生成式或循环模型，推断能力与训练器名称不能混为一个比较。这条问题不以先证明未来表示预测有用为前提。
+3. **问所得能力是否进入行为。** 让后续切片实际消费产生的选择或结构，与不消费分支比较取证、纠错、任务接续和成本。预测或内容恢复改善但这些不改善，说明该观察量尚未足以代理记忆的功能，不能自动晋级。
 
 ## 我们自己的数据：旧试验品的回放实验
 
@@ -267,11 +283,11 @@ E(z, θ) = ½ Σ_l r_lᵀ Π_l r_l
 3. **持续学习是重要新压力。** 需要同时检查遗忘与表示坐标漂移；原始档案支持回放，却不自动完成模式补全、结构学习或反事实评价。
 4. **盲区需要独立检验，不必预定原始重建。** 一个不完全受当前编码器控制的通道才能指出其遗漏；原文 logprob 既非唯一选择，也不自动定位新维度。
 5. **PC–BP 的条件性数学结果较强，完整神经实现与聊天迁移的证据仍弱。** 活动推断、参数学习和经历保存要分别命名；同一误差语言不保证相同计算、同一调度或同等成本。
-6. **预测好并不自动等于记忆有用。** 可预测的承诺仍需要及时进入行动；不可压缩的独特事实仍可能必要；动作会改变后续数据。偏好、独立检验与实际消费仍须保留。
+6. **低误差不等于记忆失去用途。** 表征可在误差消失后继续承载预测与行动；不可压缩的独特事实也可能必要。需检验恢复的内容是否真的改善后续活动，不能把内部误差强度直接当作统一存储、注意或回放优先级。
 
 ## 对讨论文档的影响
 
-VICReg 更正、互补学习系统与灾难性遗忘已在讨论中登记。2026-10-08 的[续思](memory-foundations-discussion.md#十三2026-10-08文献核对后的续思)进一步处理预测对象、二阶惊奇、可达性与局部信用的缺口；这些是研究推论，没有替维护者批准编码器、PC 网络或运行时改造。
+VICReg 更正、互补学习系统与灾难性遗忘已在讨论中登记。[第十三节](memory-foundations-discussion.md#十三2026-10-08文献核对后的续思)保留选读后的判断，[第十四节](memory-foundations-discussion.md#十四2026-10-08全文补读后改变了什么)记录全文补读怎样把重点移向条件推断、表征持续与学会推断。两节都是研究推论，没有批准编码器、PC 网络或运行时改造。
 
 ## 参考文献
 
@@ -329,34 +345,34 @@ VICReg 更正、互补学习系统与灾难性遗忘已在讨论中登记。2026
 
 ### 预测编码题单与版本核对
 
-按维护者给出的题单顺序列全 20 项。**正文关键节**＝取得论文原文并核读本次结论依赖的章节、方法或证明，不等于逐页通读；**摘要／元数据**＝没有据此验证正文机制。链接优先正式出处；需要阅读开放原文时同时列作者稿／预印本。
+按维护者给出的题单顺序列全 20 项。本轮“通读”指分工实际顺读所列版本的完整主文、图注与表内注明的附录／方法；不等于主代理独自读完全部材料、逐篇追读参考文献、逐图复核曲线、独立证明定理或复现实验。页数指所读 PDF 文件，不必等于正式刊页；HTML 另行说明。未取得的补充和未比对的正式版保留在表中。
 
-| # | 文献、作者与出处 | 本次读取及用途边界 |
+| # | 文献、作者与出处 | 全文补读的具体版本与边界 |
 |---|---|---|
-| 1 | Bogacz（2017），[A tutorial on the free-energy framework for modelling perception and learning](https://doi.org/10.1016/j.jmp.2015.11.003)，Journal of Mathematical Psychology 76:198–211；[开放原文](https://www.tnu.ethz.ch/fileadmin/user_upload/teaching/cpcourse/2020/Literature/Bogacz_2017.pdf) | 正文 §2–5：推断、权重及方差学习；数学教程，不是完整脑理论的实验证明 |
-| 2 | Friston（2018），[Does predictive coding have a future?](https://www.nature.com/articles/s41593-018-0200-7)，Nature Neuroscience 21:1019–1021 | 元数据、导言与作者稿开头；News & Views，全文获取失败，不能当作新实验 |
-| 3 | Huang & Rao（2011），[Predictive coding](https://doi.org/10.1002/wcs.142)，WIREs Cognitive Science 2:580–593；[作者原文](https://homes.cs.washington.edu/~rao/predcoding2011.pdf) | 正文及结论：早期视觉与高层皮层证据有差别；本题不是另一篇近年的动态预测编码论文 |
-| 4 | Keller & Mrsic-Flogel（2018），[Predictive Processing: A Canonical Cortical Computation](https://doi.org/10.1016/j.neuron.2018.10.003)，Neuron 100:424–435；[作者稿](https://discovery.ucl.ac.uk/id/eprint/10064516/3/Keller_Mrsic-Flogel.pdf) | 正文电路证据与“THE EXPERIMENTS THAT NEED TO BE DONE”：保留能区分理论的实验缺口 |
-| 5 | Lillicrap、Santoro、Marris、Akerman & Hinton（2020），[Backpropagation and the brain](https://doi.org/10.1038/s41583-020-0277-3)，Nature Reviews Neuroscience 21:335–346；[作者原文](https://www.cs.toronto.edu/~hinton/absps/backpropandbrain.pdf) | 正文 NGRAD 与结论：活动差编码教学信号是候选共同原则，脑实际算法未定 |
-| 6 | Marino（2022；预印本 2020），[Predictive Coding, Variational Autoencoders, and Biological Connections](https://doi.org/10.1162/neco_a_01458)，Neural Computation 34:1–44；[预印本](https://arxiv.org/abs/2011.07464) | 正文 §3–6：迭代潜变量推断与摊销推断的比较；提出的生物对应未获统一实证确认 |
-| 7 | Millidge、Salvatori、Song、Bogacz & Lukasiewicz（2022），[Predictive Coding: Towards a Future of Deep Learning beyond Backpropagation?](https://www.ijcai.org/proceedings/2022/774)，IJCAI Survey Track:5538–5545 | 正文 §2–4：标准 PC、BP 条件与查询灵活性；综述展望不是普适性能证明 |
-| 8 | Millidge、Seth & Buckley（2021；v3 2022），[Predictive Coding: a Theoretical and Experimental Review](https://arxiv.org/abs/2107.12979)；[v3 正文](https://arxiv.org/html/2107.12979v3) | 正文 §2.4、§4.5、§5；本次核实出处为预印本，保留复杂规划与长期记忆的不足 |
-| 9 | Millidge、Song、Salvatori、Lukasiewicz & Bogacz（ICLR 2023；预印本 2022），[A Theoretical Framework for Inference and Learning in Predictive Coding Networks](https://openreview.net/forum?id=ZCTvSF_uVM4)；[预印本正文](https://arxiv.org/pdf/2207.12316) | 预印本 Theorems 3.3、3.6 与证明：可逆条件／小步长、初态条件、推断收敛；正式 PDF 遇验证，未做两版逐字比较 |
-| 10 | Millidge、Tschantz & Buckley（2022；预印本 2020），[Predictive Coding Approximates Backprop along Arbitrary Computation Graphs](https://doi.org/10.1162/neco_a_01497)，Neural Computation 34:1329–1368；[预印本](https://arxiv.org/abs/2006.04182) | 正文 §2、算法 1：fixed prediction、前向初态与平衡条件；循环模型使用展开图，不是未经处理的任意环 |
-| 11 | Millidge、Tschantz、Seth & Buckley（2020），[Relaxing the Constraints on Predictive Coding Models](https://arxiv.org/abs/2010.01047) | 正文 §3、Discussion；本次核实出处为预印本。独立反馈、去导数、稠密误差连接的分类实验；组合松弛有不稳定例外 |
-| 12 | Rao & Ballard（1999），[Predictive coding in the visual cortex: a functional interpretation of some extra-classical receptive-field effects](https://doi.org/10.1038/4580)，Nature Neuroscience 2:79–87；[开放原文](https://ni.cmu.edu/~tai/microns_papers/rao_ballard.pdf) | 正文模型、模拟与 Discussion：解释部分感受野外效应，不排除其它回路解释 |
-| 13 | Rosenbaum（2022），[On the relationship between predictive coding and backpropagation](https://doi.org/10.1371/journal.pone.0266102)，PLOS ONE 17:e0266102；[修订预印本 v6](https://arxiv.org/abs/2106.13082v6)；[2025 正式更正](https://doi.org/10.1371/journal.pone.0320944) | 正文算法 2–4、Theorem 1、Discussion 及更正；严格 PC 与 fixed prediction 分开。不能沿用 v6 首页“更正尚未发表”的历史提示 |
-| 14 | Salvatori、Mali、Buckley、Lukasiewicz、Rao、Friston & Ororbia，题单名 *A Survey on Brain-Inspired Deep Learning via Predictive Coding*；[2023 起预印本版本链](https://arxiv.org/abs/2308.07870)，v3（2025）题名 *Brain-inspired Computational Intelligence via Predictive Coding*；正式版（2026）[A survey on neuro-mimetic deep learning via predictive coding](https://doi.org/10.1016/j.neunet.2025.108161)，Neural Networks 195:108161 | v3 正文 §3–4，正式版仅元数据／摘要；同一作品改题与更新，不是三项独立验证。深层扩展、空间成本与联想记忆任务范围仍需留意 |
-| 15 | Salvatori、Song、Xu、Lukasiewicz & Bogacz（2022），[Reverse Differentiation via Predictive Coding](https://doi.org/10.1609/aaai.v36i7.20788)，AAAI 36:8150–8158；[正式原文](https://ojs.aaai.org/index.php/AAAI/article/download/20788/20547) | 正文 identity vertices、levelled DAG、算法 2–3、Theorems 3–4：图变换同步路径后扩展精确 Z-IL |
-| 16 | Salvatori、Song、Yordanov、Millidge、Emde、Xu、Sha、Bogacz & Lukasiewicz（ICLR 2024；预印本 2022），[A Stable, Fast, and Fully Automatic Learning Algorithm for Predictive Coding Networks](https://proceedings.iclr.cc/paper_files/paper/2024/file/554414e570a85eb3118e988c5d77986f-Paper-Conference.pdf) | 正文 §3、Table 3、附录 C/D：iPC 同步更新活动与参数；相对标准 PC 有改善，相对 BP 结果混合 |
-| 17 | Song、Lukasiewicz、Xu & Bogacz（2020），[Can the Brain Do Backpropagation? — Exact Implementation of Backpropagation in Predictive Coding Networks](https://papers.neurips.cc/paper_files/paper/2020/hash/fec87a37cdeec1c6ecf8181c0aa2d3bf-Abstract.html)，NeurIPS 33；[正式原文](https://proceedings.neurips.cc/paper/2020/file/fec87a37cdeec1c6ecf8181c0aa2d3bf-Paper.pdf) | 正文 §3–4、§6，C1–C3 与 Theorems 3.1–3.2：Z-IL 精确参数更新；仍有对称反馈和非脉冲神经元等限制 |
-| 18 | Song、Millidge、Salvatori、Lukasiewicz、Xu & Bogacz（2024），[Inferring neural activity before plasticity as a foundation for learning beyond backpropagation](https://doi.org/10.1038/s41593-023-01514-1)，Nature Neuroscience 27:348–358；[机构原文](https://repositum.tuwien.at/bitstream/20.500.12708/193037/1/Song-2024-Nature%20Neuroscience-vor.pdf) | Results 与 Methods：前瞻配置、有限 relaxation 与分类／控制实验；没有开放聊天长期记忆验证 |
-| 19 | Whittington & Bogacz（2019），[Theories of Error Back-Propagation in the Brain](https://doi.org/10.1016/j.tics.2018.12.005)，Trends in Cognitive Sciences 23:235–250；[机构原文](https://www.mrcbndu.ox.ac.uk/sites/default/files/reprint_backprop_review.pdf) | 摘要、开头与生物限制相关正文；未逐节比较全部模型。局部误差、权重对称和神经元实现仍是问题 |
-| 20 | Whittington & Bogacz（2017），[An Approximation of the Error Backpropagation Algorithm in a Predictive Coding Network with Local Hebbian Synaptic Plasticity](https://doi.org/10.1162/NECO_a_00949)，Neural Computation 29:1229–1262；[开放原文](https://pmc.ncbi.nlm.nih.gov/articles/PMC5467749/) | 正文 §3.1.2、§4：弱输出影响和学习率补偿的渐近关系；输出仍可硬钳制，不能仅凭“弱钳制”三个字复述条件 |
+| 1 | Bogacz（2017），[A tutorial on the free-energy framework for modelling perception and learning](https://doi.org/10.1016/j.jmp.2015.11.003)，Journal of Mathematical Psychology 76:198–211；[开放原文](https://www.tnu.ethz.ch/fileadmin/user_upload/teaching/cpcourse/2020/Literature/Bogacz_2017.pdf) | 通读开放期刊 PDF 14 页，含附录 A/B 与习题：推断、权重及方差学习；教程不提供完整脑理论的实验证明 |
+| 2 | Friston（2018），[Does predictive coding have a future?](https://www.nature.com/articles/s41593-018-0200-7)，Nature Neuroscience 21:1019–1021 | 通读作者实验室排版稿 3 页（含 Fig.1）；[公开稿](https://www.fil.ion.ucl.ac.uk/~karl/Does%20predictive%20coding%20have%20a%20future.pdf)。[出版社更正](https://www.nature.com/articles/s41593-018-0272-4)涉及分类／supertitle，依据正式文章变更说明，未取得更正全文；排版稿出版日期仍占位 |
+| 3 | Huang & Rao（2011），[Predictive coding](https://doi.org/10.1002/wcs.142)，WIREs Cognitive Science 2:580–593；[作者原文](https://homes.cs.washington.edu/~rao/predcoding2011.pdf) | 通读作者 PDF 14 页主文及 9 幅图注；另提 Supporting Information 未取得。区分空间／时间预测、复杂图与视觉证据；本题是 2011 论文 |
+| 4 | Keller & Mrsic-Flogel（2018），[Predictive Processing: A Canonical Cortical Computation](https://doi.org/10.1016/j.neuron.2018.10.003)，Neuron 100:424–435；[作者稿](https://discovery.ucl.ac.uk/id/eprint/10064516/3/Keller_Mrsic-Flogel.pdf) | 通读 accepted manuscript 主文 PDF 页 1–20、图注页 21–22（文件共 29 页）；图像未完整核验，末尾参考文献未全部覆盖。误差静默与表征活跃须区分 |
+| 5 | Lillicrap、Santoro、Marris、Akerman & Hinton（2020），[Backpropagation and the brain](https://doi.org/10.1038/s41583-020-0277-3)，Nature Reviews Neuroscience 21:335–346；[作者原文](https://www.cs.toronto.edu/~hinton/absps/backpropandbrain.pdf) | 通读作者 PDF 12 页主文、Box 与图注；独立 Supplementary Information 未取得。NGRAD 是活动差教学信号的候选共同原则，脑实际算法未定 |
+| 6 | Marino（2022；预印本 2020），[Predictive Coding, Variational Autoencoders, and Biological Connections](https://doi.org/10.1162/neco_a_01458)，Neural Computation 34:1–44；[预印本](https://arxiv.org/abs/2011.07464) | 通读 arXiv v2（2021）43 页主文、图注、附录 A；未与正式 44 页版逐字比较。摊销／迭代摊销推断连接 PC 与 VAE；生物对应仍属提议 |
+| 7 | Millidge、Salvatori、Song、Bogacz & Lukasiewicz（2022），[Predictive Coding: Towards a Future of Deep Learning beyond Backpropagation?](https://www.ijcai.org/proceedings/2022/774)，IJCAI Survey Track:5538–5545 | 通读正式 PDF 8 页 §1–8 与图注；补入此前漏读的关联记忆、任意拓扑与控制。查询灵活性不等于普适性能或全局收敛保证 |
+| 8 | Millidge、Seth & Buckley（2021；v3 2022），[Predictive Coding: a Theoretical and Experimental Review](https://arxiv.org/abs/2107.12979)；[v3 正文](https://arxiv.org/html/2107.12979v3) | 通读 arXiv v3（2022）56 页，含附录 A–D；未重现实验。空间／跨模态／时间预测不同，长期记忆限制针对所呈现模型，不能扩大成整个框架的禁令 |
+| 9 | Millidge、Song、Salvatori、Lukasiewicz & Bogacz（ICLR 2023；预印本 2022），[A Theoretical Framework for Inference and Learning in Predictive Coding Networks](https://openreview.net/forum?id=ZCTvSF_uVM4)；[预印本正文](https://arxiv.org/pdf/2207.12316) | 通读 arXiv v2（2022）32 页，含 A.1–A.10；正式 PDF 遇验证，未比较版本。A.7.3 中间等价有待补论证，阅读不等于独立证明 Theorem 3.6 |
+| 10 | Millidge、Tschantz & Buckley（2022；预印本 2020），[Predictive Coding Approximates Backprop along Arbitrary Computation Graphs](https://doi.org/10.1162/neco_a_01497)，Neural Computation 34:1329–1368；[预印本](https://arxiv.org/abs/2006.04182) | 通读 arXiv v5 25 页，含 A–D；未与正式版逐字比较。fixed prediction 的 BP 关系有条件；CNN 参数共享及展开 RNN 仍有非局部／整段保留成本 |
+| 11 | Millidge、Tschantz、Seth & Buckley（2020），[Relaxing the Constraints on Predictive Coding Models](https://arxiv.org/abs/2010.01047) | 通读 arXiv v2 17 页，含 Appendix A；未复现。独立反馈、去导数与可学习误差连接的分类结果，不是放宽后精确 BP；组合松弛时 ReLU 不稳 |
+| 12 | Rao & Ballard（1999），[Predictive coding in the visual cortex: a functional interpretation of some extra-classical receptive-field effects](https://doi.org/10.1038/4580)，Nature Neuroscience 2:79–87；[开放原文](https://ni.cmu.edu/~tai/microns_papers/rao_ballard.pdf) | 通读公开期刊 PDF 9 页（79–87），含 Methods 与 6 幅图注；未另取得补充。估计、预测、残差分开，视觉模拟不排除其它回路解释 |
+| 13 | Rosenbaum（2022），[On the relationship between predictive coding and backpropagation](https://doi.org/10.1371/journal.pone.0266102)，PLOS ONE 17:e0266102；[修订预印本 v6](https://arxiv.org/abs/2106.13082v6)；[2025 正式更正](https://doi.org/10.1371/journal.pone.0320944) | 通读 v6 31 页（含证明、Methods、S1/S2 图注）及 2025 更正 1 页，核看更正公式；未运行代码。内部误差可为任务敏感度，不可直接当作观测惊奇 |
+| 14 | Salvatori、Mali、Buckley、Lukasiewicz、Rao、Friston & Ororbia，题单名 *A Survey on Brain-Inspired Deep Learning via Predictive Coding*；[2023 起预印本版本链](https://arxiv.org/abs/2308.07870)，v3（2025）题名 *Brain-inspired Computational Intelligence via Predictive Coding*；正式版（2026）[A survey on neuro-mimetic deep learning via predictive coding](https://doi.org/10.1016/j.neunet.2025.108161)，Neural Networks 195:108161 | 通读 v3 26 页文件的主文 §1–8、图注、表格与算法；无所附附录，§3.2 提及的 supplement 未取得。正式版仍仅元数据／摘要；记忆与时序研究属于综述转述，未另行全文核验 |
+| 15 | Salvatori、Song、Xu、Lukasiewicz & Bogacz（2022），[Reverse Differentiation via Predictive Coding](https://doi.org/10.1609/aaai.v36i7.20788)，AAAI 36:8150–8158；[正式原文](https://ojs.aaai.org/index.php/AAAI/article/download/20788/20547) | 通读正式正文 9 页及 [arXiv v4](https://arxiv.org/abs/2103.04689v4) 16 页所附证明／方法；两版未逐字比较。恒等节点同步路径；附录记号疑点未修复，不声称完成形式证明审计 |
+| 16 | Salvatori、Song、Yordanov、Millidge、Emde、Xu、Sha、Bogacz & Lukasiewicz（ICLR 2024；预印本 2022），[A Stable, Fast, and Fully Automatic Learning Algorithm for Predictive Coding Networks](https://proceedings.iclr.cc/paper_files/paper/2024/file/554414e570a85eb3118e988c5d77986f-Paper-Conference.pdf) | 通读正式 PDF 25 页，含附录 A–E；未复现。iPC 同步更新；CPU 单次更新实测与端到端效率分开，Table 3 的收敛采用性能阈值并剔除未达阈值运行 |
+| 17 | Song、Lukasiewicz、Xu & Bogacz（2020），[Can the Brain Do Backpropagation? — Exact Implementation of Backpropagation in Predictive Coding Networks](https://papers.neurips.cc/paper_files/paper/2020/hash/fec87a37cdeec1c6ecf8181c0aa2d3bf-Abstract.html)，NeurIPS 33；[正式原文](https://proceedings.neurips.cc/paper/2020/file/fec87a37cdeec1c6ecf8181c0aa2d3bf-Paper.pdf) | 通读正式正文 14 页及 [Supplemental](https://papers.neurips.cc/paper_files/paper/2020/file/fec87a37cdeec1c6ecf8181c0aa2d3bf-Supplemental.pdf) 8 页；未复现。Z-IL 条件定理与 Fa-Z-IL 有限历史检测器的经验等价分开 |
+| 18 | Song、Millidge、Salvatori、Lukasiewicz、Xu & Bogacz（2024），[Inferring neural activity before plasticity as a foundation for learning beyond backpropagation](https://doi.org/10.1038/s41593-023-01514-1)，Nature Neuroscience 27:348–358；[机构原文](https://repositum.tuwien.at/bitstream/20.500.12708/193037/1/Song-2024-Nature%20Neuroscience-vor.pdf) | 通读机构稿 21 页（含 Methods／Reporting Summary）及 [独立补充](https://media.springernature.com/full/springer-static/esm/art%3A10.1038%2Fs41593-023-01514-1/MediaObjects/41593_2023_1514_MOESM1_ESM.pdf) 37 页文字／图注；补充图像未逐图核验。潜在情境信用与补偿更新有指定证据，更深层一步保证未证明 |
+| 19 | Whittington & Bogacz（2019），[Theories of Error Back-Propagation in the Brain](https://doi.org/10.1016/j.tics.2018.12.005)，Trends in Cognitive Sciences 23:235–250；[机构原文](https://www.mrcbndu.ox.ac.uk/sites/default/files/reprint_backprop_review.pdf) | 通读机构 PDF 16 页，含 Box1–4、Table1、图注及 Outstanding Questions；关键乱码公式核看截图。自主局部学习与机制组合是候选，时间序列扩展仍有问题 |
+| 20 | Whittington & Bogacz（2017），[An Approximation of the Error Backpropagation Algorithm in a Predictive Coding Network with Local Hebbian Synaptic Plasticity](https://doi.org/10.1162/NECO_a_00949)，Neural Computation 29:1229–1262；[开放原文](https://pmc.ncbi.nlm.nih.gov/articles/PMC5467749/) | 通读 PMC 作者稿 HTML 主文 §1–4.4、表格与全部图注；未取得 PDF，不能声称读过 34 页期刊排版稿。弱输出影响／尺度补偿及双向联合模型均有前提 |
 
 视频：[Artem Kirsanov, The Brain’s Learning Algorithm Isn’t Backpropagation](https://www.youtube.com/watch?v=l-OLgbdZ3kk)。已取得 YouTube 官方元数据与描述（当前描述注明 2026-02 重整），未观看、未取得字幕，未核实原始发布日期。它提供学习入口与题单，论文结论由上面的原文支持，不引用视频中未核实的论证。
 
-若从机制入手，先读 Bogacz，再读 Whittington & Bogacz（2017）与 Rosenbaum 及更正；随后对照 Z-IL、前瞻配置与 iPC 的不同调度，最后回到两篇综述核对未解问题。PC 与 VAE 的比较帮助判断反复推断的成本能否由摊销降低，不意味着必须把柚子改成生成式架构。
+若从机制入手，Bogacz 解释活动与参数怎样围绕同一模型变化，IJCAI 综述与 Marino 解释条件查询和摊销推断；再用 Whittington & Bogacz（2017）、Rosenbaum 及更正、Z-IL、前瞻配置和 iPC 区分学习条件与调度。能力比较应包含推断，而不只包含优化器；这不决定柚子的最终结构。
 
 ### 主动推断与世界模型
 
