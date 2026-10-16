@@ -130,7 +130,7 @@
 - [x] **合并转发：让柚子看得见、也发得出去**（草籽 20:30 提；20:35-20:50 只读调查；21:15 草籽「做合并转发的」）：
   - **已落地**：新模块 `mods/forward.py`（取回 `get_forward_msg` → 落盘 `data/forward/<id>.json`，图片就地本地化 → 渲染成多行文本）+ 新工具 `mods/tools/forward.py`（`forward__read_forward` 给模型读、`forward__send_forward` 发，每行一条 `昵称: 正文`，换行写 `\n`）；`mods/cave.py` 的 `set` 改走 `forward.store`（转发取回并存档后展开成正文，取不到就留原样），`mods/message.py` 抽出 `record_sent`。
   - **实测（取）**：`7686433057126267396`（4 条）和 `7686341789559607078`（5 条、4 张图）都取回并落盘，图片写进 `data/images/`；同一个 id 第二次走内存/磁盘。两类取不到（过期 id；`7686404960608762819` 那种 retcode 0 但 `messages` 为空）都返回"取不到"，不报错。
-  - **实测（发）**：`{"type":"node","data":{"name","uin","content"}}` 发得出去（retcode 0），`content` 收字符串也收数组。**按 id 转发已有消息走不通**——`{"type":"node","data":{"id":"…"}}` 报「发送伪造合并转发消息失败：生成节点为空」（NapCat 走 packet 路径，短 id 查不到），所以不做。NapCat 侧节点深度上限 3 层，`MAX_DEPTH` 与它对齐。
+  - **实测（发）**：`{"type":"node","data":{"name","uin","content"}}` 发得出去（retcode 0），`content` 收字符串也收数组。**按 id 转发已有消息走不通**——`{"type":"node","data":{"id":"…"}}` 报「发送伪造合并转发消息失败：生成节点为空」（NapCat 走 packet 路径，短 id 查不到），所以不做。NapCat 侧节点深度上限 3 层（**发送侧**的约束）；`MAX_DEPTH` 起先与它对齐，后放宽到 5（代码为准）——取回展开这一侧不受那个上限限制，浅了内层只剩一串 id。
   - **一个新形状**：**自己发出去的**转发在 `get_msg` 里不是 `[CQ:forward,id=…]`，而是一张 `[CQ:json,…]` 卡片（`app=com.tencent.multimsg`），真 id 在 `meta.detail.resid`；这个 resid 同样能 `get_forward_msg` 取回，所以 `code_id` 两种形状都认，落盘文件名过 `quote`（resid 里带 `/`）。
   - **补的一个洞**：「发出去的消息要进 chatlog 和内存历史」原先只写在 `message._send_now` 里，于是走 `send_forward_msg` 的转发**没有痕迹**（日志没有、模型下一轮看不见自己发过）。抽出 `message.record_sent(message_id, …)`，`deliver` 成功后调它。
   - **仍未做（有意）**：① `chat.msg_split` 不自动展开转发，模型看到卡片后自己调 `read_forward`——隐藏的网络 IO 不进那个纯函数；要"自动展开"是另一个决定，等草籽。② 没有 `.forward` 命令。③ 不碰压缩那条线。

@@ -37,12 +37,22 @@ def run(_body: str) -> str:
     after = re.compile(r"我是猫(.{0,9})")
     before_results: list[str] = []
     after_results: list[str] = []
+    scanned = 0
+    # WHY: source_log_dir／phrase_allowed 用 ValueError 报的都是用户能照着改的配置问题
+    # （来源群没配、目录不存在、排除词配置无效），所以照原样回话；让它冒到事件路由去，
+    # 用户看到的会变成「处理失败: ValueError: …」，同样的话多一层壳。
     try:
         log_dir = source_log_dir()
         for root, _, files in os.walk(log_dir):
             for filename in files:
-                with open(os.path.join(root, filename), encoding="utf-8") as file:
-                    content = file.read()
+                if not filename.endswith((".log", ".txt")):
+                    continue
+                try:
+                    with open(os.path.join(root, filename), encoding="utf-8", errors="ignore") as file:
+                        content = file.read()
+                except OSError:
+                    continue
+                scanned += 1
                 before_results.extend(
                     match.strip()
                     for match in before.findall(content)
@@ -53,8 +63,13 @@ def run(_body: str) -> str:
                     for match in after.findall(content)
                     if phrase_allowed(match, 5)
                 )
-    except (OSError, ValueError) as error:
+    except ValueError as error:
         return str(error)
+
+    # WHY: 一个文件都没读到就不要动语料。无条件重写会在来源群日志缺失或改名时把
+    # data/bbxm.txt 清成空文件，而这个洞要到下次取随机语料才以「百变小猫语料为空」暴露。
+    if not scanned:
+        return f"来源群里没有可读的日志文件：{log_dir}"
 
     with open("data/bbxm.txt", "w", encoding="utf-8") as file:
         for match in sorted(set(before_results)):

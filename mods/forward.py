@@ -36,8 +36,11 @@ DIR = Path("data/forward")
 # 一次渲染最多展开多少条节点。转发可以很长，全摊开会把模型上下文挤掉；要看全部就调大
 # limit，而不是指望默认值兜住。
 MAX_NODES = 30
-# 嵌套转发的展开深度，与 NapCat 自己发送转发时的 3 层上限对齐。
-MAX_DEPTH = 3
+# 嵌套转发的展开深度：5，两处共用——`save` 按它决定往回取几层，`_lines` 按它决定渲染
+# 展开到几层。WHY: 比 NapCat 发送侧实测的 3 层上限深。那 3 层约束的是**自己发出去**的
+# 转发（实测记录在 docs/working/kouzi-memo.md），取回来再展开这一侧不受它限制；浅了
+# 内层只剩一串 [CQ:forward,id=…]，等于没展开。
+MAX_DEPTH = 5
 
 # 入站的转发是 [CQ:forward,id=…]；而**自己发出去的**那条，get_msg 里是一张
 # com.tencent.multimsg 的 json 卡片，它的 meta.detail.resid 才是同一个转发 id。
@@ -45,6 +48,25 @@ MAX_DEPTH = 3
 _card = re.compile(r"\[CQ:(?:forward|json),[^\]]*\]")
 _multimsg_app = "com.tencent.multimsg"
 _image = re.compile(r"\[CQ:image,[^\]]*\]")
+# 有些转发 CQ 尾巴上还挂着 content=…（一层被 dump 成字符串的内层段数组）：它读不出正文，
+# 却能把一整轮上下文撑满，所以只留 id。
+_forward_noise = re.compile(r"(\[CQ:forward,id=[^,\]]+)(?:,[^\]]*)?\]")
+
+
+def _clean_cq_text(text: str) -> str:
+    """把 CQ 文本里 forward 段尾巴上的 content=… 噪声收敛掉，只留 id。"""
+    if not text or "CQ:forward" not in text:
+        return text
+    return _forward_noise.sub(r"\1]", text)
+
+
+def _sanitize(record: dict) -> dict:
+    """就地收敛一份记录里所有节点的正文（老记录在磁盘上仍带着噪声）。"""
+    for node in record.get("nodes") or []:
+        if isinstance(node, dict) and isinstance(node.get("text"), str):
+            node["text"] = _clean_cq_text(node["text"])
+    return record
+
 
 # 取回来的记录按 id 留在内存里：同一轮上下文里一条转发会被转换很多次（预算计算、
 # 真正组装各一次），每次都读盘没有必要。
@@ -97,9 +119,14 @@ def fetch(forward_id: str) -> list[dict] | None:
 
 
 def _segments(value) -> str:
-    """把 OneBot 的数组消息拼回 CQ 文本；本来就是字符串就原样返回。"""
+    """把 OneBot 的数组消息拼回 CQ 文本；本来就是字符串就清掉噪声后返回。
+
+    只保留长期用得上的字段：转发段只留 id——它的 data["content"] 是一层嵌套的段数组，
+    照原样 dump 会变成一串 [object Object]，把内层正文整段吃掉；图片只留 file/url
+    （带 rkey 的 url 几天就失效）；其余段丢掉字典、列表这类深字段，免得又串出噪声。
+    """
     if isinstance(value, str):
-        return value
+        return _clean_cq_text(value)
     parts = []
     for segment in value or []:
         if not isinstance(segment, dict):
@@ -108,17 +135,35 @@ def _segments(value) -> str:
         data = segment.get("data") if isinstance(segment.get("data"), dict) else {}
         if kind == "text":
             parts.append(str(data.get("text", "")))
+        elif kind == "forward":
+            inner = str(data.get("id") or "")
+            if inner:
+                parts.append(f"[CQ:forward,id={inner}]")
+        elif kind == "image":
+            # WHY: file 和 url 都留着，而不是取其一。`cq.save_pic` 只认 data["url"] 才肯
+            # 下载本地化；只写 file（哪怕它的值就是那条 url）会让本地化悄悄跳过，记录里
+            # 剩下的只是几天后失效的 rkey 地址。
+            flat = {key: data[key] for key in ("file", "url")
+                    if isinstance(data.get(key), str) and data[key]}
+            parts.append(cq.dump({"type": kind, "data": flat}))
         elif kind:
-            parts.append(cq.dump({"type": kind, "data": dict(data)}))
-    return "".join(parts)
+            flat = {k: v for k, v in data.items()
+                    if isinstance(v, (str, int, float, bool)) and v != ""}
+            parts.append(cq.dump({"type": kind, "data": flat}))
+    # 收敛放在出口：数组消息里的转发段、以及塞在 text 段里的 CQ 串，都是同一种噪声。
+    return _clean_cq_text("".join(parts))
 
 
 def _node(value: dict) -> dict:
     """一个 OneBot 节点 → 本模块记录的节点。"""
     sender = value.get("sender") if isinstance(value.get("sender"), dict) else {}
-    text = value.get("raw_message")
-    if not isinstance(text, str):
-        text = _segments(value.get("message"))
+    # WHY: 先拼数组 message，再拿 raw_message 兜底。数组那条能逐段筛字段（转发段只留
+    # id、图片只留 file），raw_message 只能整串收下；两者都有时优先前者。
+    text = _segments(value.get("message"))
+    if not text:
+        raw = value.get("raw_message")
+        if isinstance(raw, str):
+            text = _clean_cq_text(raw)
     qq = value.get("user_id") or sender.get("user_id")
     return {
         "name": str(sender.get("nickname") or sender.get("card") or qq or "未知"),
@@ -167,6 +212,10 @@ def load(forward_id: str) -> dict | None:
     if not isinstance(record, dict) or not isinstance(record.get("nodes"), list):
         return None
     record.setdefault("id", key)
+    # WHY: 噪声的收敛点在写入口（_node）和这里，不在渲染口。老记录在磁盘上仍带着
+    # content=…，读一次就地改掉即可；每渲染一次清一遍既不划算，也让 render 变成会改
+    # 传入参数、还必须被包一层才能生效的函数。
+    _sanitize(record)
     _records[key] = record
     return record
 
@@ -179,8 +228,8 @@ def save(forward_id: str, depth: int = 0) -> dict | None:
     record = {"id": str(forward_id), "time": int(time.time()), "nodes": [_node(node) for node in nodes]}
     _write(record)
     if depth < MAX_DEPTH:
-        # 嵌套转发在节点正文里又是一串 CQ，这里顺路取回来：只在保存时联网一次，渲染时
-        # 只读内存和磁盘。
+        # 嵌套转发在节点正文里又是一串 CQ，这里顺路取回来存好。渲染走的是 `record`
+        # （内存 → 磁盘 → 现取）：当时没取到、或后来才出现的嵌套层，在展开到它时补取一次。
         for node in record["nodes"]:
             for code in _card.findall(node.get("text", "")):
                 inner = code_id(code)
@@ -225,11 +274,16 @@ def _friendly(text: str) -> str:
 def _lines(text: str, indent: str, depth: int) -> list[str]:
     """节点正文：图片写成好认的形式，嵌套转发就地展开，再逐行加缩进。"""
     value = _friendly(str(text or ""))
-    for code in _card.findall(value):
-        inner = load(code_id(code))
-        if inner is None or depth >= MAX_DEPTH:
-            continue
-        value = value.replace(code, "\n" + render(inner, depth=depth + 1) + "\n", 1)
+    # 到深度上限就不再展开，内层只留 [CQ:forward,id=…]：省掉一次注定用不上的取回。
+    if depth < MAX_DEPTH:
+        for code in _card.findall(value):
+            inner = code_id(code)
+            # 缓存里没有就顺手取回来（record = 内存 → 磁盘 → 现取），嵌套转发才能展开。
+            # 认不出 id 的卡片直接跳过：拿空 id 去问 OneBot 只换来一次必然失败的往返。
+            found = record(inner) if inner else None
+            if found is None:
+                continue
+            value = value.replace(code, "\n" + render(found, depth=depth + 1) + "\n", 1)
     return [indent + line if line.strip() else "" for line in value.split("\n")]
 
 
