@@ -16,6 +16,7 @@
 - [长期记忆离线回放实验](memory-replay-evaluation.md)（实施中；现分开验证系统是否允许运行中产生的改进被后续真实消费，以及怎样通过可逆重放形成实践反馈；固定召回指标只作诊断，所有发送与运行数据隔离）
 - [记忆估值与索引演进](memory-valuation-and-index-evolution.md)（研究提案；把 MDL、压缩进步、结构可达、实际路径和使用结果作为需要分别解释的派生观察，先离线校准，不自动晋级、淡出或删除记忆）
 - [记忆与自我演化研究地图](memory-and-self-evolution-research.md)（外部研究记录，不是运行合同；区分论文证据、本项目迁移推论和适用边界，串起长期记忆、经验 Skill、任务层学习与元层改进）
+- [QQ Bot 持久记忆实现调查](qqbot-persistent-memory-research.md)（公开源码调查；复核 SLA 收录，区分视频 QQ-agent、dsh-qqbot 与宿主机制，记录 Bili Note 的持久安装与字幕覆盖限制）
 - [记忆、预测与统一事件流：基础问题讨论](memory-foundations-discussion.md)（讨论记录，不批准实现；保留预测、编码器、二阶惊奇与可达性的工作假设；2026-10-08 第十四节记录全文补读后的变化：条件推断、表征持续、潜在情境信用与学会推断，未替维护者决定结构）
 - [记忆基础问题综述](memory-foundations-survey.md)（外部研究综述，不批准实现；按开放问题组织文献，记录 20 项预测编码题单的全文阅读版本与补充缺口；区分推断能力、条件性数学结论、神经证据和聊天记忆迁移，并提出候选证伪实验）
 - [可编程经历数据](programmable-experience-data.md)（实施计划；复用现有 `exec_code`，先以磁盘惰性迭代验证模型能否自由查询和自审，不新增 world/snapshot/记忆 manager，也不把全量历史放进内存）
