@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from datetime import datetime
+from functools import wraps
 import json
 import os
 from pathlib import Path
@@ -178,9 +179,11 @@ def isolated(root: Path, ledger: Ledger, *, failure=None, clock=None, bot=None,
             for source in skill_files:
                 (skill_root / source.name).write_bytes(source.read_bytes())
         scope.registry = replay._safe_registry(skill_root)
-        scope.send_context = scope.registry.get("meta").tools["say"].call.__globals__["_offline_send_sink"]
+        import inspect
+        scope.send_context = inspect.unwrap(scope.registry.get("meta").tools["say"].call).__globals__["_offline_send_sink"]
         for tool in scope.registry.get("meta").tools.values():
             original_call = tool.call
+            @wraps(original_call)
             def checked_tool(*args, original_call=original_call, **kwargs):
                 safe_tree()
                 result = original_call(*args, **kwargs)

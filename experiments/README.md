@@ -471,3 +471,39 @@ they do not establish comprehensive safety of every real SDK/provider response,
 service acceptance, actual billing, memory benefit or comparison-protocol
 completion. Real material, credential and paid execution still require a
 specific reviewed authorization and target-applicability evidence.
+
+The sentinels cover the doctor isolation scope. Before entering that scope,
+both CLI output modes initialize the standard-library temporary directory for
+fixture setup; its directory probe is not a model attempt.
+
+Experiment wrappers preserve the original callable signature, annotations and
+parameter documentation through session binding and rebinding. The Skill-only
+and simulated-say capability descriptions also survive Tool reconstruction.
+The pilot doctor compares every safe tool's final serialized HTTP parameters
+against a separately loaded, unwrapped production meta source. A separate fake
+peer generates status/take/load/reload arguments from those wire types and
+required fields, executes them through the SDK/parser and A0, and checks durable
+results and the next request's consumed input. Removing metadata from either
+wrapper is checked to fail this comparison. Earlier scripted or SDK pair checks
+alone did not establish this parameter contract.
+
+Pilot failures create private `exception.json` with exception types, cause or
+context links and stack frames (tracked repository source path, line, function;
+other paths become `<external>`). It excludes exception messages, notes, source
+lines and locals. The public result only labels evidence as saved or failed to
+write. The first failure remains the stop reason if cleanup also fails; evidence
+write failure never permits another action or request and does not undo settled
+usage. These diagnostics cannot recover the stack from an older run.
+Failure to write the final result also closes the ledger and attempts private
+structural evidence, then exits without retrying the result write.
+
+`result.json` now records real system wall timestamps and `perf_counter`
+durations for source verification, day opening, before/after view checks, reader
+drives, requests and the total run. Failed stages retain their partial duration.
+Request intervals are nested inside reader intervals; completed-wake intervals
+include verification, opening, checks and reader, so these views must not be
+summed. Total time runs from `run_pilot` entry through cleanup, before final
+result serialization/write; it excludes earlier CLI material loading. The
+simulated 2023 clock remains fixed for reader behavior. Synthetic timings show
+instrumentation, not faster startup on real material; no source or view proof
+has been skipped.

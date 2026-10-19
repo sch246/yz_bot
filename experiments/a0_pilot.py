@@ -7,6 +7,7 @@ from contextlib import contextmanager, redirect_stdout, ExitStack
 from datetime import date, datetime, timedelta
 import hashlib
 import io
+import inspect
 import json
 import os
 from pathlib import Path
@@ -52,6 +53,70 @@ def error_code(error):
     if isinstance(error, GeneratorExit):
         return "generator-closed"
     return "internal-error"
+
+
+def exception_structure(error):
+    """Private diagnostics without exception values, source lines or locals."""
+    sources = {str(a0.replay.REPOSITORY / name): name for name in a0.code_hashes()}
+    chain, seen, relation = [], set(), "raised"
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        frames, trace = [], error.__traceback__
+        while trace is not None:
+            code = trace.tb_frame.f_code
+            frames.append({"filename": sources.get(code.co_filename, "<external>"),
+                           "line": trace.tb_lineno, "function": code.co_name})
+            trace = trace.tb_next
+        chain.append({"relation": relation, "type": type(error).__module__ + "." + type(error).__qualname__,
+                      "frames": frames})
+        if error.__cause__ is not None:
+            error, relation = error.__cause__, "cause"
+        elif not error.__suppress_context__:
+            error, relation = error.__context__, "context"
+        else:
+            error = None
+            break
+    return {"chain": chain, "cycle_truncated": error is not None}
+
+
+def original_tool_contracts():
+    # Independent of _safe_registry and its wrappers: read the original source.
+    from mods import tools
+    source = a0.replay.REPOSITORY / "mods/tools/meta.py"
+    registry = tools.ToolRegistry(source.parent)
+    meta = registry._load_python("meta", source, source.read_bytes())
+    return {name: tool.description for name, tool in meta.tools.items() if name in a0.replay.SAFE_TOOLS}
+
+
+def check_wire_tools(body, originals):
+    actual = {tool["function"]["name"]: tool for tool in body["tools"]}
+    assert set(actual) == set(originals) and len(actual) == len(body["tools"])
+    for name, original in originals.items():
+        assert actual[name]["function"]["parameters"] == original["function"]["parameters"], name
+    for name, capability in (("load_tools", a0.replay.SKILL_CAPABILITY),
+                             ("reload_tools", a0.replay.SKILL_CAPABILITY), ("say", a0.replay.SAY_CAPABILITY)):
+        assert actual[name]["function"]["description"].startswith(capability), name
+    return actual
+
+
+def schema_arguments(tool, *, skill):
+    """The fictional peer fills the advertised types, including required fields."""
+    schema = tool["function"]["parameters"]
+    selected = set(schema["required"]) | ({"source"} if tool["function"]["name"] == "status" else set())
+    if tool["function"]["name"] == "take":
+        selected |= {"count", "start"}
+    def sample(name, field):
+        kind = field["type"]
+        if kind == "array":
+            return [sample(name, field["items"])]
+        if kind == "string":
+            assert name in {"source", "names"}, name
+            return skill if name == "names" else "g1"
+        if kind == "integer":
+            assert name in {"count", "start"}, name
+            return 10 if name == "count" else 1
+        raise AssertionError("unsupported synthetic schema field")
+    return {name: sample(name, schema["properties"][name]) for name in sorted(selected)}
 
 
 @contextmanager
@@ -272,6 +337,8 @@ class PilotClient(sdk.ClosedSDKClient):
         self.response_identity = None
         self.response_observations = []
         self.request_stop = None
+        self.request_timings = []
+        self.expected_tools = original_tool_contracts() if scenario == "schema-contract" else None
         self.config = {"default_model": MODEL, "providers": {"deepseek": {"models": {
             WIRE_MODEL: {"function_calling": True, "vision": False, "tool_images": False}}}}}
         self.strict_tools = True
@@ -433,6 +500,7 @@ class PilotClient(sdk.ClosedSDKClient):
             self.ledger.settle(active["row"], usage, outcome)
 
     def generate_response(self, *args, **kwargs):
+        started_at, started = time.time(), time.perf_counter()
         try:
             return (yield from super().generate_response(*args, **kwargs))
         except PilotStop as error:
@@ -441,6 +509,9 @@ class PilotClient(sdk.ClosedSDKClient):
             if not self.ledger.poisoned and self.ledger.state["closed"] in {"", "PilotStop"}:
                 self.ledger.stop(error.code)
             raise
+        finally:
+            self.request_timings.append({"started_at": started_at, "finished_at": time.time(),
+                                         "elapsed_seconds": time.perf_counter() - started})
 
 
 class PilotStream(sdk.ObservedStream):
@@ -466,6 +537,23 @@ class PilotStream(sdk.ObservedStream):
 
 class PilotFixtureSSE(sdk.SyntheticSSE):
     def __iter__(self):
+        if self.owner.scenario == "schema-contract":
+            body = self.owner.exchanges[-1]["body"]
+            tools = check_wire_tools(body, self.owner.expected_tools)
+            skill = next(iter(read_json(self.owner.root / "manifest.json")["skills"]))[:-3]
+            if self.number % 2:
+                actions = [(name, schema_arguments(tools[name], skill=skill))
+                           for name in ("status", "take", "load_tools", "reload_tools")]
+            else:
+                actions = [("say", {"text": "fictional schema complete", "target": "g1", "final_call": True})]
+            calls = [{"index": index, "id": f"schema-{self.number}-{index}", "type": "function",
+                      "function": {"name": name, "arguments": json.dumps(arguments)}}
+                     for index, (name, arguments) in enumerate(actions)]
+            delta = {"role": "assistant", "reasoning_content": "fictional schema reasoning", "tool_calls": calls}
+            yield b"data: " + canonical(sdk.chunk(delta)) + b"\n\n"
+            yield b"data: " + canonical(sdk.chunk({}, finish="tool_calls", usage=sdk.usage_for("normal"))) + b"\n\n"
+            yield b"data: [DONE]\n\n"
+            return
         for block in super().__iter__():
             if self.owner.scenario == "legacy" and self.number == 2 and b'"tool_calls"' in block:
                 value = json.loads(block.removeprefix(b"data: ").strip())
@@ -608,6 +696,7 @@ def pilot_scope(*args, **kwargs):
 
 def run_pilot(package, identity, contract, output, pilot, *, scenario="normal", credential=None):
     from mods import chat, context, oplog, storage
+    started_at, started = time.time(), time.perf_counter()
     validate_contract(contract, contract["mode"], code_state())
     if output.exists() or output.is_symlink():
         raise ValueError("existing pilot root refused; no resume/fork or budget reset")
@@ -615,7 +704,47 @@ def run_pilot(package, identity, contract, output, pilot, *, scenario="normal", 
     policy = CapacityPolicy(contract)
     ledger = Ledger(output, pilot, "initializing", limits=LIMITS, prices=PRICES, policy=policy)
     client, scope, reason = None, None, "complete"
-    started, wake_reports = time.time(), []
+    wake_reports, stages, failures = [], [], []
+    phase, exception_evidence = "setup", "not-needed"
+    has_failure = False
+
+    @contextmanager
+    def timed(name, day=None):
+        nonlocal phase
+        phase = name
+        row = {"phase": name, "day": day, "started_at": time.time(),
+               "start_elapsed_seconds": time.perf_counter() - started, "completed": False}
+        try:
+            yield
+            row["completed"] = True
+        finally:
+            row.update(finished_at=time.time(), end_elapsed_seconds=time.perf_counter() - started)
+            row["elapsed_seconds"] = row["end_elapsed_seconds"] - row["start_elapsed_seconds"]
+            stages.append(row)
+
+    def failed(error, failure_phase):
+        nonlocal reason, exception_evidence, has_failure
+        if not has_failure:
+            has_failure = True
+            reason = ledger.state["closed"] or error_code(error)
+            if ledger.poisoned and not isinstance(error, PilotStop):
+                reason = "persistence-unknown"
+            if (reason == "missing-usage" and ledger.state["requests"]
+                    and ledger.state["requests"][-1].get("outcome") not in {None, "stop"}):
+                reason = ledger.state["requests"][-1]["outcome"]
+        # Close before diagnostic I/O: evidence failure cannot grant another action.
+        try:
+            if not ledger.poisoned and not ledger.state["closed"]:
+                ledger.stop(reason)
+        except BaseException:
+            pass
+        try:
+            failures.append({"phase": failure_phase, **exception_structure(error)})
+            durable(output / "exception.json", {"schema": "a0-private-exception-v1", "failures": failures})
+            exception_evidence = "saved"
+        except BaseException:
+            exception_evidence = "write-failed"
+
     with a0.replay._locked(output):
         try:
             client = PilotClient(output, ledger, contract, scenario=scenario, credential=credential)
@@ -651,44 +780,51 @@ def run_pilot(package, identity, contract, output, pilot, *, scenario="normal", 
                 durable(output / "frozen-input.json", {"records": package["records"]})
                 preserve_source_manifest(package, output)
                 for opening in schedule():
-                    verify_prepared(package)
+                    wake_started = time.perf_counter()
+                    with timed("verify_prepared", opening["day"]):
+                        verify_prepared(package)
                     ledger.wake()
-                    open_day(scope, package, identity, opening)
-                    check_view(scope, package, opening)
-                    wake_started = time.time()
-                    chat.run_offline(MODEL, (identity["kind"], identity["target"]), fact=FACT, registry=scope.registry,
-                                     on_chunk=lambda value: None, persist_reasoning=False,
-                                     send_context=scope.send_context, send_sink=scope.say)
-                    if context.current() is not None or oplog.has_unnotified():
-                        raise RuntimeError("reader did not finish the current wake")
-                    check_view(scope, package, opening)
-                    wake_reports.append({"day": opening["day"], "elapsed_seconds": time.time() - wake_started,
+                    with timed("open_day", opening["day"]):
+                        open_day(scope, package, identity, opening)
+                    with timed("check_view_before", opening["day"]):
+                        check_view(scope, package, opening)
+                    with timed("reader", opening["day"]):
+                        chat.run_offline(MODEL, (identity["kind"], identity["target"]), fact=FACT, registry=scope.registry,
+                                         on_chunk=lambda value: None, persist_reasoning=False,
+                                         send_context=scope.send_context, send_sink=scope.say)
+                        if context.current() is not None or oplog.has_unnotified():
+                            raise RuntimeError("reader did not finish the current wake")
+                    with timed("check_view_after", opening["day"]):
+                        check_view(scope, package, opening)
+                    wake_reports.append({"day": opening["day"], "elapsed_seconds": time.perf_counter() - wake_started,
                                          "cumulative_attempts": client.attempts, "opened": len(scope.opened)})
+                phase = "save_and_verify"
                 storage.save()
                 a0.replay._assert_storage_saved(storage)
                 a0.replay._assert_settled(a0.replay._journal_rows(output))
         except BaseException as error:
-            reason = ledger.state["closed"] or error_code(error)
-            if ledger.poisoned and not isinstance(error, PilotStop):
-                reason = "persistence-unknown"
-            if (reason == "missing-usage" and ledger.state["requests"]
-                    and ledger.state["requests"][-1].get("outcome") not in {None, "stop"}):
-                reason = ledger.state["requests"][-1]["outcome"]
-            try:
-                if not ledger.poisoned and not ledger.state["closed"]:
-                    ledger.stop(reason)
-            except OSError:
-                pass
+            failed(error, phase)
         finally:
             if client is not None:
-                client.close()
+                try:
+                    client.close()
+                except BaseException as error:
+                    failed(error, "client_close")
             if scope is not None:
-                durable(output / "source-mapping.json", scope.mapping)
+                try:
+                    durable(output / "source-mapping.json", scope.mapping)
+                except BaseException as error:
+                    failed(error, "source_mapping")
             rows = ledger.state["requests"]
-            # A readable checksum after replace does not prove directory fsync
-            # succeeded. Never report a release from persistence-unknown bytes.
+            try:
+                journal = a0.replay._journal_rows(output)
+            except BaseException as error:
+                failed(error, "journal_report")
+                journal = None
+            # Reporting failures can themselves poison ledger closure. Decide
+            # this only after every failure callback above has finished.
             report_rows = None if ledger.poisoned else rows
-            journal = a0.replay._journal_rows(output)
+            elapsed = time.perf_counter() - started
             result = {"status": "complete" if reason == "complete" else "stopped", "stop_reason": reason,
                       "mode": contract["mode"], "manifest_sha256": ledger.state["manifest"],
                       "attempts": client.attempts if client else 0, "settlements": client.settlements if client else 0,
@@ -697,10 +833,16 @@ def run_pilot(package, identity, contract, output, pilot, *, scenario="normal", 
                       "opened_records": len(scope.opened) if scope else 0,
                       "unopened_records": len(package["records"]) - (len(scope.opened) if scope else 0),
                       "remaining_unread": getattr(scope, "remaining_unread", None),
-                      "formal_inputs": sum(row["kind"] == "input" for row in journal),
-                      "journal_rows": len(journal),
+                      "formal_inputs": sum(row["kind"] == "input" for row in journal) if journal is not None else None,
+                      "journal_rows": len(journal) if journal is not None else None,
                       "echoes": len(scope.echoes) if scope else 0, "echo_sent": False,
-                      "actions": len(scope.actions) if scope else 0, "elapsed_seconds": time.time() - started,
+                      "actions": len(scope.actions) if scope else 0, "elapsed_seconds": elapsed,
+                      "exception_evidence": exception_evidence,
+                      "timing": {"duration_clock": "system perf_counter; timestamps system wall time",
+                                 "started_at": started_at, "finished_at": time.time(), "total_seconds": elapsed,
+                                 "total_scope": "run_pilot entry through cleanup, before final result serialization/write",
+                                 "stages": stages, "requests": client.request_timings if client else [],
+                                 "nesting": "requests are inside reader; completed_wakes include verify/open/check/reader; do not sum these views"},
                       "first_request_elapsed_seconds": (rows[0]["settled_at"] - rows[0]["requested_at"]
                                                          if rows and "settled_at" in rows[0] else None),
                       "charged_or_reserved_micro_cny": sum(row.get("charged", row["reserved"]) for row in report_rows) if report_rows is not None else None,
@@ -710,7 +852,11 @@ def run_pilot(package, identity, contract, output, pilot, *, scenario="normal", 
                       "ledger_closed": ledger.state["closed"],
                       "cancellations": client.cancellations if client else [],
                       "production_calls": scope.counters if scope else {}, "view_checks": scope.probes if scope else []}
-            durable(output / "result.json", result)
+            try:
+                durable(output / "result.json", result)
+            except BaseException as error:
+                failed(error, "result_write")
+                raise
     return result
 
 
@@ -968,6 +1114,188 @@ def doctor(root):
             assert all(row["reserved"] == 2129920 and row["requested_at"] > 1700000000 for row in result["requests"])
             assert result["view_checks"][-1]["clock"] < 1700000000
             passed("actual-A0-three-daily-wakes-False-keep-native-rebuild-final-SDK-body", attempts=9, settlements=9)
+            originals = original_tool_contracts()
+            from mods import tools
+            from types import SimpleNamespace
+            binding_root = root / "binding-contract"
+            binding_root.mkdir()
+            binding_ledger = Ledger(binding_root, "fictional-binding", "synthetic")
+            with a0.isolated(binding_root, binding_ledger) as bound_scope:
+                session = SimpleNamespace(functions={})
+                binding = tools.SessionBinding(session, None, registry=bound_scope.registry,
+                                               schema_modules=[], visible=lambda name, module: True)
+                def bound_body():
+                    return {"tools": [tool.description for tool in session.functions.values()]}
+                check_wire_tools(bound_body(), originals)
+                assert binding.load(["meta"])["meta"]["action"] == "replaced"
+                check_wire_tools(bound_body(), originals)
+                for name, tool in session.functions.items():
+                    assert tool.call.__annotations__ == inspect.unwrap(tool.call).__annotations__, name
+                for name in ("load_tools", "reload_tools"):
+                    for denied in (["meta"], ["../synthetic"], "synthetic", ["not-present"]):
+                        rejects(name + "-still-refuses-nonisolated-Skills", lambda: session.functions[name].call(denied))
+                for layer, name in (("checked_tool", "status"), ("only_skills", "load_tools")):
+                    wrapped = bound_scope.registry.get("meta").tools[name].call
+                    if layer == "only_skills":
+                        wrapped = wrapped.__wrapped__
+                    original_wrapped = wrapped.__wrapped__
+                    del wrapped.__wrapped__
+                    try:
+                        binding.load(["meta"])
+                        try:
+                            check_wire_tools(bound_body(), originals)
+                        except AssertionError:
+                            passed("wire-contract-detects-missing-" + layer + "-metadata")
+                        else:
+                            raise AssertionError("old wrapper defect escaped wire validation")
+                    finally:
+                        wrapped.__wrapped__ = original_wrapped
+                        binding.load(["meta"])
+                check_wire_tools(bound_body(), originals)
+            passed("all-safe-tools-original-parameters-annotations-capabilities-survive-binding-and-rebinding")
+
+            schema_root = root / "schema-success"
+            original_registry = a0.replay._safe_registry
+            captured = []
+            def capture_registry(skill_root):
+                registry = original_registry(skill_root)
+                captured.append((registry, registry.modules))
+                return registry
+            with patch.object(a0.replay, "_safe_registry", capture_registry):
+                schema_result = run_pilot(package, identity, contract, schema_root, "fictional-schema-success", scenario="schema-contract")
+            runs.append(schema_result)
+            assert schema_result["status"] == "complete" and schema_result["attempts"] == schema_result["settlements"] == 6
+            assert schema_result["actions"] == 15
+            schema_rows = a0.replay._journal_rows(schema_root)
+            a0.replay._assert_settled(schema_rows)
+            for number in range(1, 7):
+                body = read_json(schema_root / f"request-{number:04d}.json")["body"]
+                check_wire_tools(body, originals)
+                if number % 2 == 0:
+                    for index in range(4):
+                        assert sum(message.get("tool_call_id") == f"schema-{number - 1}-{index}"
+                                   for message in body["messages"]) == 1
+                    assert f"fictional pilot day {number // 2}" in canonical(body).decode()
+            read_ids = {row["event"]["message_id"] for row in schema_rows
+                        if row["kind"] == "input" and row.get("read_via") == "take"}
+            assert set(range(101, 107)) <= read_ids and {-1, -2} <= read_ids
+            skill_file = next(iter(read_json(schema_root / "manifest.json")["skills"]))
+            skill = skill_file[:-3]
+            registry, initial_modules = captured[0]
+            assert registry.get(skill) is not initial_modules[skill]
+            assert registry.get(skill).source == (schema_root / "skills" / skill_file).read_bytes()
+            assert skill in read_json(schema_root / "data/storage/agent.json")["active_tools"]
+            passed("final-HTTP-schema-generated-status-take-load-reload-SDK-execution-durable-results-and-next-A0-input", attempts=6)
+
+            def broken_registry(skill_root):
+                registry = original_registry(skill_root)
+                original = registry.get("meta").tools["status"].call
+                from functools import wraps
+                namespace = {}
+                exec(compile("def fail():\n    try:\n        raise ValueError('FICTIONAL_EXCEPTION_SECRET')\n    except ValueError as cause:\n        error = RuntimeError('FICTIONAL_EXCEPTION_SECRET')\n        error.add_note('FICTIONAL_EXCEPTION_SECRET')\n        raise error from cause\n", "FICTIONAL_EXCEPTION_SECRET", "exec"), namespace)
+                @wraps(original)
+                def broken(*args, **kwargs):
+                    return namespace["fail"]()
+                registry.get("meta").tools["status"].call = broken
+                return registry
+
+            for fault in ("tool", "evidence", "cleanup"):
+                evidence_failure = fault == "evidence"
+                failed_root = root / ("tool-error-" + fault)
+                original_durable = durable
+                def evidence_write(path, value):
+                    if evidence_failure and path.name == "exception.json":
+                        raise OSError("FICTIONAL_EXCEPTION_SECRET")
+                    return original_durable(path, value)
+                original_close = PilotClient.close
+                def close_failure(client):
+                    original_close(client)
+                    raise OSError("FICTIONAL_EXCEPTION_SECRET")
+                with ExitStack() as fault_stack:
+                    fault_stack.enter_context(patch.object(a0.replay, "_safe_registry", broken_registry))
+                    fault_stack.enter_context(patch(__name__ + ".durable", side_effect=evidence_write))
+                    if fault == "cleanup":
+                        fault_stack.enter_context(patch.object(PilotClient, "close", close_failure))
+                    failed_result = run_pilot(package, identity, contract, failed_root,
+                                              "fictional-tool-error", scenario="schema-contract")
+                runs.append(failed_result)
+                assert failed_result["attempts"] == failed_result["settlements"] == failed_result["durable_settlements"] == 1
+                assert failed_result["actions"] == 0 and failed_result["completed_wakes"] == []
+                assert failed_result["ledger_closed"] == failed_result["stop_reason"] == "internal-error"
+                assert failed_result["requests"][0]["usage"] == [100, 40, 20]
+                assert failed_result["requests"][0]["charged"] == 282
+                assert failed_result["exception_evidence"] == ("write-failed" if evidence_failure else "saved")
+                failed_rows = a0.replay._journal_rows(failed_root)
+                assert len([row for row in failed_rows if row["kind"] == "output"]) == 1
+                assert not any(row["kind"] == "result" for row in failed_rows)
+                assert len(list(failed_root.glob("request-*.json"))) == 1
+                if not evidence_failure:
+                    evidence = read_json(failed_root / "exception.json")
+                    assert [failure["phase"] for failure in evidence["failures"]] == (["reader", "client_close"] if fault == "cleanup" else ["reader"])
+                    chain = evidence["failures"][0]["chain"]
+                    assert [item["type"] for item in chain] == ["builtins.RuntimeError", "builtins.ValueError"]
+                    assert any(frame["filename"] == "<external>" for item in chain for frame in item["frames"])
+                    assert all(set(item) == {"relation", "type", "frames"} for item in chain)
+                    assert all(set(frame) == {"filename", "line", "function"} for item in chain for frame in item["frames"])
+                assert all(b"FICTIONAL_EXCEPTION_SECRET" not in path.read_bytes() for path in failed_root.rglob("*") if path.is_file())
+                passed("post-settlement-first-tool-error-stops-with-" + fault + "-exception-evidence", attempts=1, settlements=1, actions=0)
+            assert "FICTIONAL_EXCEPTION_SECRET" not in output.getvalue()
+            cycle = RuntimeError("FICTIONAL_EXCEPTION_SECRET")
+            cause = ValueError("FICTIONAL_EXCEPTION_SECRET")
+            cycle.__cause__, cause.__cause__ = cause, cycle
+            structure = exception_structure(cycle)
+            assert structure["cycle_truncated"] and len(structure["chain"]) == 2
+            assert "FICTIONAL_EXCEPTION_SECRET" not in canonical(structure).decode()
+            passed("private-exception-cause-cycle-terminates-without-values")
+            for timed_result in (result, schema_result, *runs[-3:]):
+                timing = timed_result["timing"]
+                assert timing["total_seconds"] == timed_result["elapsed_seconds"] >= 0
+                assert timing["started_at"] > 1700000000 and timing["finished_at"] >= timing["started_at"]
+                for stage in timing["stages"]:
+                    assert 0 <= stage["start_elapsed_seconds"] <= stage["end_elapsed_seconds"] <= timing["total_seconds"]
+                    assert stage["elapsed_seconds"] >= 0 and stage["finished_at"] >= stage["started_at"]
+                assert all(row["elapsed_seconds"] >= 0 for row in timing["requests"])
+                assert {stage["phase"] for stage in timing["stages"]} >= {"open_day", "check_view_before", "reader"}
+                if timed_result["status"] == "stopped":
+                    assert timing["stages"][-1]["phase"] == "reader" and not timing["stages"][-1]["completed"]
+            passed("real-wall-clock-open-check-reader-request-total-success-and-failure-nested-timings")
+            journal_root = root / "journal-report-stop-fsync"
+            original_journal, original_stop = a0.replay._journal_rows, Ledger.stop
+            journal_calls = 0
+            def journal_failure(path):
+                nonlocal journal_calls
+                journal_calls += 1
+                if journal_calls == 2:
+                    raise OSError("fictional journal report failure")
+                return original_journal(path)
+            def stop_failure(ledger, reason):
+                with patch("a0_ledger.os.fsync", side_effect=OSError("fictional stop fsync failure")):
+                    return original_stop(ledger, reason)
+            with patch.object(a0.replay, "_journal_rows", journal_failure), patch.object(Ledger, "stop", stop_failure):
+                journal_result = run_pilot(package, identity, contract, journal_root,
+                                           "fictional-journal-report", scenario="schema-contract")
+            runs.append(journal_result)
+            assert journal_result["persistence_unknown"] and journal_result["status"] == "stopped"
+            assert journal_result["attempts"] == journal_result["settlements"] == 6
+            assert all(journal_result[key] is None for key in ("requests", "durable_settlements", "charged_or_reserved_micro_cny", "journal_rows"))
+            assert read_json(journal_root / "exception.json")["failures"][0]["phase"] == "journal_report"
+            passed("journal-report-failure-and-stop-fsync-never-report-stale-durable-credit", attempts=6)
+            result_root = root / "result-write-failure"
+            original_durable = durable
+            def result_write_failure(path, value):
+                if path.name == "result.json":
+                    raise OSError("fictional result write failure")
+                return original_durable(path, value)
+            with patch(__name__ + ".durable", side_effect=result_write_failure):
+                rejects("final-result-write-failure-closes-and-saves-structure-without-rewriting-result",
+                        lambda: run_pilot(package, identity, contract, result_root,
+                                          "fictional-result-write", scenario="schema-contract"))
+            result_state = read_json(result_root / "ledger.json")["state"]
+            assert result_state["closed"] == "internal-error" and len(result_state["requests"]) == 6
+            assert all(row["status"] == "settled" and row["usage"] == [100, 40, 20] for row in result_state["requests"])
+            assert not (result_root / "result.json").exists()
+            assert read_json(result_root / "exception.json")["failures"][0]["phase"] == "result_write"
+            runs.append({"attempts": 6, "settlements": 6})
             mapping = read_json(run_root / "source-mapping.json")
             assert len(mapping) == 6
             for item in mapping:
@@ -1299,13 +1627,17 @@ def main(argv=None):
             result = preview(args)
         else:
             selected = getattr(args, "output", None)
+            # WHY: explicit --output must share default CLI's stdlib tempdir
+            # setup. Otherwise tiktoken's first gettempdir probes outside the
+            # fixture during the audit, and count_tokens swallows that refusal.
+            temporary_root = a0.external_root(tempfile.gettempdir())
             if selected:
                 root = safe_path(selected)
                 if root.exists():
                     raise ValueError("doctor requires a fresh root")
                 root.mkdir(mode=0o700)
             else:
-                root = Path(tempfile.mkdtemp(prefix="bot-a0-pilot-", dir=a0.external_root(tempfile.gettempdir())))
+                root = Path(tempfile.mkdtemp(prefix="bot-a0-pilot-", dir=temporary_root))
             with a0.replay._locked(root):
                 result = doctor(root)
             result = {**result, "output": str(root)}

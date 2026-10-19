@@ -6,8 +6,10 @@ import argparse
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import date, timedelta
+from functools import wraps
 import fcntl
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -346,6 +348,8 @@ SAFE_TOOLS = frozenset({
     "event_links", "cover_events", "say", "status", "mentions", "read_messages", "take", "pull",
     "edit_hint",
 })
+SKILL_CAPABILITY = "只对隔离运行目录中已有的 Markdown Skill 执行该操作；不能访问 Python 模块。"
+SAY_CAPABILITY = "记录离线发言意图并产生模拟回声；绝不发送 QQ 消息。"
 
 
 def _safe_registry(skill_root: Path):
@@ -361,6 +365,7 @@ def _safe_registry(skill_root: Path):
     for action in ("load_tools", "reload_tools"):
         original = selected[action].call
 
+        @wraps(original)
         def only_skills(names, *, original=original):
             if not isinstance(names, list) or any(
                 not isinstance(name, str) or not name.isidentifier()
@@ -371,10 +376,19 @@ def _safe_registry(skill_root: Path):
             return original(names)
 
         selected[action].call = only_skills
-        selected[action].description["function"]["description"] = (
-            "只对隔离运行目录中已有的 Markdown Skill 执行该操作；不能访问 Python 模块。")
-    selected["say"].description["function"]["description"] = (
-        "记录离线发言意图并产生模拟回声；绝不发送 QQ 消息。")
+        # WHY: SessionBinding reconstructs Tool from .call, so a description-only
+        # edit disappears at bind time. Keep the capability in the callable doc.
+        only_skills.__doc__ = SKILL_CAPABILITY + "\n\n" + original.__doc__
+        selected[action].description = tools.Tool(only_skills, action).description
+    original_say = selected["say"].call
+
+    @wraps(original_say)
+    def offline_say(*args, **kwargs):
+        return original_say(*args, **kwargs)
+
+    offline_say.__doc__ = SAY_CAPABILITY + "\n\n" + original_say.__doc__
+    selected["say"].call = offline_say
+    selected["say"].description = tools.Tool(offline_say, "say").description
     registry._modules["meta"] = replace(
         meta,
         description="离线历史读取、记忆覆盖、Skill 加载、待办与模拟发言",
@@ -665,7 +679,7 @@ def _run_locked(prepared: Path, output: Path, kind: str, target: int, bot_id: in
         connect.call_api = forbidden
         extra = STRATEGIES[strategy]
         replay_prompt = OFFLINE_FACT + (("\n" + extra) if extra else "")
-        send_context = registry.get("meta").tools["say"].call.__globals__["_offline_send_sink"]
+        send_context = inspect.unwrap(registry.get("meta").tools["say"].call).__globals__["_offline_send_sink"]
         if not resume:
             last_arrival = None
             for event in ordered:
