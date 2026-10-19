@@ -274,12 +274,14 @@ the active turn is cancelled, known/missing usage is settled, and no action is
 dispatched. Bindings and current-event state are restored on exit.
 
 **This contract calibration uses `persist_reasoning=True`.** T01 still uses
-`False`; this experiment setting is recorded in the manifest and does not
-freeze a real A0 comparison baseline. It identifies a history-projection choice
-that must be settled before comparison with the
+`False`; this argument is recorded in the manifest. In the current central A0
+path, model-tagged native outputs retain reasoning even with `False` when the
+reasoning mode is `keep`. The argument alone therefore does not identify a
+history-projection strategy. Freeze the actual reasoning mode, model/protocol,
+native pairing and wire projection before a real comparison with the
 [official thinking contract](https://api-docs.deepseek.com/guides/thinking_mode/).
-It does not change the future loop's decision to discard reasoning across
-wakes.
+This experiment does not freeze that real baseline or change the future loop's
+decision to discard reasoning across wakes.
 
 The ledger remains `synthetic=True`. The offline
 [peak-price snapshot](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)
