@@ -159,3 +159,66 @@ The new directory must not exist and must be outside the repository. `fork`
 copies and verifies all files, writes a checkpoint-hash lineage record, and
 does not share writable event-stream or storage files with its source. Resume
 each branch separately with the same prepared snapshot and identity.
+
+## Synthetic A0 calibration
+
+[`a0_calibration.py`](a0_calibration.py) is a separate, no-model entry for the
+minimum synthetic A0 scope described below. It accepts
+only its checked-in fictional fixtures and scripted responses. It never reads
+an input archive, production configuration, credentials or existing model
+outputs, and never constructs a provider SDK client. Its `run` is entirely
+synthetic; the paid `memory_replay.py run` above is a different command.
+
+```sh
+uv run --frozen python experiments/a0_calibration.py doctor
+uv run --frozen python experiments/a0_calibration.py run --output /tmp/new-a0-run
+uv run --frozen python experiments/a0_calibration.py resume --output /tmp/new-a0-run
+```
+
+`doctor` is the default. It writes a detailed `doctor.json` with individual
+assertions and observed refusals under a new external temporary root; `--output`
+can select a fresh external root. `run` performs only the successful scripted
+scenario. Three fixed external wakes share one isolation scope and the real A0
+reader, base prompt, tool loop, oplog and storage. Each prefix is physically
+appended to the branch archive; future dates/windows/names are not created.
+Candidate `say` writes a verified branch chatlog echo without activation. Stable
+origins remain readable after echoes and subsequent prefix appends. Every read
+checks the private tree for symbolic links. The virtual clock is fixed at each
+prefix in `Asia/Shanghai`; the process timezone, current event, history and all
+swapped bindings are restored in `finally`. No production hint is evaluated.
+
+[`a0_ledger.py`](a0_ledger.py) keeps one pilot/request ledger, with a durable
+reservation before each fake transport attempt and settlement before any tool
+is dispatched. Defaults are 3 wakes, 12 attempts, 4096 output tokens per request,
+49152 cumulative output allowance and 5 CNY. The **synthetic** input context
+limit is explicitly frozen at 262144 tokens, using full canonical UTF-8 request
+bytes plus 1024 as the scripted interface's input upper bound. Input and output
+limits are independent in this invented interface; this does not establish a
+real model's tokenizer or context/output relationship. Complete requests are
+saved under `requests/` for recomputation. Cached input is charged once; cost is
+rounded upward to integer micro-CNY. These invented prices only calibrate the
+accounting algorithm and are not provider quotes.
+
+The manifest freezes fixture/schedule, code, base prompt/schema fingerprints,
+model label, timezone, prices and limits. The root lock, ledger checksum and
+complete-checkpoint file hashes reject concurrent writers, drift and corruption.
+`resume` only verifies an already completed checkpoint and reports cumulative
+attempts; it makes zero new attempts. Partial, stopped, unknown in-flight and
+persistence-unknown states cannot continue or fork. This explicit refusal is
+not a claim that partial runtime restoration is implemented. A directory-fsync
+failure can leave the new ledger bytes in place: the persistence-unknown marker
+still prohibits reopening. If persistence itself fails, stop evidence is best
+effort and durability remains unknown.
+
+The doctor covers legal past through range/around/origin/unread and actual
+reader/tool requests, cross-wake state and binding restoration, output/input/
+allowance/fee boundaries, missing/extra prices, cache, missing usage and
+usage overreport, corrupt/drifting/locked roots, pre-tool transport/length/
+cancellation/ledger-fsync failures, and cancellation or oplog fsync failure
+**after the first tool completes** in a two-tool batch. It also checks swallowed
+chatlog-write failures and corrupt echo readback stop before arrival or later
+actions. The twelfth fake failure causes no retry or final request. Failed or
+missing-usage requests retain their full reservation; overreport records the
+actual charge and closes the pilot. This proves only the new scripted adapter's
+attempt count, not production SDK retry settings, real cost, provider support,
+memory benefit, A1–A3 or the full comparison protocol.
