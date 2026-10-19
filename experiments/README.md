@@ -222,3 +222,72 @@ missing-usage requests retain their full reservation; overreport records the
 actual charge and closes the pilot. This proves only the new scripted adapter's
 attempt count, not production SDK retry settings, real cost, provider support,
 memory benefit, A1–A3 or the full comparison protocol.
+
+## Synthetic A0 with the real SDK
+
+[`a0_sdk_calibration.py`](a0_sdk_calibration.py) calibrates the installed OpenAI
+Python SDK and the production `LLMClient` generator/parsers against a closed
+`httpx.MockTransport`. Its only command runs built-in fictional fixtures:
+
+```sh
+uv run --frozen python experiments/a0_sdk_calibration.py doctor
+uv run --frozen python experiments/a0_sdk_calibration.py doctor --output /tmp/new-a0-sdk-run
+```
+
+The constructor fixes a fictional key, organization, project, webhook secret and
+`.invalid` base URL. It supplies the mock transport, `trust_env=False` and
+`max_retries=0`; there is no client, transport, credential, configuration, model
+or real-input option. SDK operations see a controlled empty environment rather
+than ambient key/proxy settings. The doctor blocks sockets and QQ calls, and
+blocks writes outside its fresh synthetic root (apart from SDK platform probes
+of `/dev/null`). Existing roots are refused before rewriting their manifest or
+ledger. This entry has no resume/fork operation; T01's completed-checkpoint
+verification remains separate, and partial restoration is unsupported.
+
+The HTTP send hook captures the SDK's final serialized body, including all
+history, schema, `max_tokens=4096` and streaming usage options. It durably
+reserves the request before the mock is entered and checks the exact bytes and
+pilot/request ID there. Provider selection `deepseek/deepseek-flash` and wire
+model `deepseek-flash` are recorded separately. The fictional peer exercises the
+[official Chat Completions contract](https://api-docs.deepseek.com/api/create-chat-completion/)
+with thinking enabled, high reasoning effort, automatic tools and no beta
+strict/Search/Fetch/image features. Installed SDK/httpx versions, code hashes,
+limits and protocol sources are frozen in each manifest.
+
+An observer retains raw SDK usage before passing chunks to the original parser.
+The last SSE chunk has both nonempty `choices` and usage. Length errors,
+disconnects, cancellation and parser-generator close preserve usage already
+received; missing or invalid usage consumes the full reservation. Conflicting
+valid snapshots retain their raw evidence and the largest observed charge.
+Cache aliases agree or fail closed, and reasoning tokens remain part of the
+inclusive output count. Parser outputs are buffered until settlement succeeds,
+so usage overreport or ledger-fsync failure cannot dispatch tools. Connection,
+429 and 500 fixtures each enter the mock once; the thirteenth attempt is refused
+before transport. These retry claims apply only to this closed adapter.
+
+The doctor also drives actual A0 `take` and dry `say` tools over two external
+wakes. After two consecutive tool rounds it checks the third final HTTP body
+for both assistant reasoning strings and matched tool results; the second wake
+checks retained earlier native rounds as well. A no-tool assistant reasoning
+round is retained through rebuild. Actual A0 cancellation fixtures assert that
+the active turn is cancelled, known/missing usage is settled, and no action is
+dispatched. Bindings and current-event state are restored on exit.
+
+**This contract calibration uses `persist_reasoning=True`.** T01 still uses
+`False`; this experiment setting is recorded in the manifest and does not
+freeze a real A0 comparison baseline. It identifies a history-projection choice
+that must be settled before comparison with the
+[official thinking contract](https://api-docs.deepseek.com/guides/thinking_mode/).
+It does not change the future loop's decision to discard reasoning across
+wakes.
+
+The ledger remains `synthetic=True`. The offline
+[peak-price snapshot](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)
+uses CNY per million input/cache/output tokens of 2/0.04/8. At 180000 input and
+4096 output for each of 12 requests, the candidate ceiling is 4.713216 CNY;
+T01's 262144 input ceiling would instead give 6.684672 CNY. Here the reserved
+input bound is canonical HTTP-envelope UTF-8 bytes plus 1024, a fake-interface
+policy rather than a real tokenizer proof. A separate fixture rejects an input
+that fits its input reservation but exceeds the joint context after adding
+4096 output. No result establishes real input bounds, paid readiness, provider
+availability, memory benefit or completion of the comparison protocol.
