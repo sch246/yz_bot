@@ -357,25 +357,81 @@ file and the private output after a stop. There is no resume, fork, segment
 reset or automatic rerun. A deliberately changed authorization/claim constitutes
 a new pilot; the application cannot prevent an operator from issuing new grants.
 
-The minimum supported input is the schema-1 package produced by
-`memory_replay.py prepare`: exactly `manifest.json` and ordinary group daily
-files under `archive/2023-03/{14,15,16}.log`, with matching day/aggregate hashes
-and event counts. Records must be LF terminated, have explicit sender IDs and
-unique positive integer message IDs across the selected range. Private records,
-notices, unparsed lines, absent IDs, ambiguous identity, duplicate IDs, sidecars,
-extra files/dates and symlinks are refused rather than skipped. Group text without
-a format marker is conservatively parsed as v0 stored display text; it is not
-claimed to recover original OneBot bytes. Parse statistics record format,
-missing/guessed fields and exclusions (zero for an accepted package).
+For material preparation without a model, use the separate `preview` command:
+
+```sh
+uv run --frozen python experiments/a0_pilot.py preview \
+  --prepared /private/authorized-prepared \
+  --identity /private/authorized-identity.json \
+  --output /private/new-material-preview --authorize-materials
+```
+
+Authorization and all three arguments are checked before path resolution or
+material reads. Preview loads and verifies the selected package, checks complete
+record byte coverage and counts the existing A0 filter's visible records. It
+constructs no SDK/client, prompt, runtime, tool or model request, and needs no
+credential or paid confirmation. Stdout contains only format labels and counts;
+the fresh mode-0700 output holds `preview.json`, the original byte-for-byte
+`source-manifest.json`, and a private `source-map.json` containing full original
+records. These artifacts are private material, not files to commit. An existing
+preview root is refused.
+
+Supported input remains the schema-1 package produced by `memory_replay.py
+prepare`: exactly `manifest.json` and ordinary group daily files under
+`archive/2023-03/{14,15,16}.log`, with matching day/aggregate hashes and event
+counts. Accepted source `prompt_mode` values are
+`production-default-plus-offline-history-fact`,
+`production-default-plus-offline-review-task-v2`, and
+`production-default-plus-offline-review-task-v3`. That label records the package's
+history; the source manifest is never rewritten, and its old task is never
+injected into A0. A run separately freezes its actual base prompt, capability
+fact and reasoning projection.
+
+Ordinary messages retain explicit sender IDs and signed integer message IDs,
+including repeated IDs, or retain a missing-ID marker without inventing a
+number. Recognized archive recall/poke and timestamped opaque notices are also
+retained. Message IDs are auxiliary query keys: duplicate ID/time records can
+be hidden by the existing range index, and ID-only queries can be ambiguous;
+each complete original record remains readable through its stable origin.
+Statistics distinguish extra repeated-ID instances, repeated-ID groups, and
+ID-plus-time groups/conflicts. Recall reference numbers are excluded from these
+message-identity counts. No source record is deduplicated or renumbered.
+
+Records must end in LF. Byte offsets and origin line numbers count original LF
+bytes; input is never normalized with `read_text` or `splitlines`. The current
+pure parser preserves interior CR/CRLF in bodies and strips trailing whitespace
+under the chatlog protocol. A CRLF message header makes its numeric ID a string
+ending in CR under that parser; this representation is retained unchanged and
+counted separately. Use origin to locate it rather than stripping its field to
+an integer. Other noninteger message IDs, unparsed or untimed records,
+ambiguous/missing senders, private records, sidecars, extra files/dates, unknown
+source modes and symlinks are refused. Group bodies remain conservatively
+marked v0 stored display projections, without claiming original OneBot bytes.
+
+The current A0 filter is reused unchanged: ordinary messages and group pokes
+can enter the model, while `#` controls and opaque notices are filtered. Parsed
+archive recalls contain only their text, time, window and reference number;
+they lack the native notice/author/operator fields required by the current
+model filter, so they too are filtered. Their original records remain available
+to bottom-level `chatlog.read_origin`/range reads; even the model's
+`read_messages(origin)` applies the same filter and does not expose a raw-text
+escape hatch. No native recall fields or realtime trigger are reconstructed.
+Pokes use their parsed IDs and the frozen current name mapping when rendered;
+this is not a promise to reproduce their historical notice text word for word.
 
 Parsing and all three day-end clocks use `Asia/Shanghai`: March 15, 16 and 17 at
 00:00. A day opens complete records in timestamp/file order, then activates one
 external wake. The clock stays fixed during the real A0 drive. Original frozen
-record byte ranges, full parsed records and normalized visible chatlog origins
+record byte ranges, full parsed records and branch chatlog origins
 are stored separately in the private source map. Range/around/origin/unread reads,
 names and directories see only opened material and candidate echoes. Echoes are
-`sent=false` branch records, never new wakes; old origins remain valid after
-later appends. The same isolated history/oplog/storage survives all drives and
+`sent=false` branch records, never new wakes. Their IDs decrease below every
+message/reference ID in the selected package, avoiding both historical and
+future collisions. Old origins remain valid after later appends. Source bytes
+are appended unchanged to the branch archive, including CRLF and incomplete
+notice fields. All mixed branch-day records are conservatively parsed as v0,
+including candidate echoes whose known generated bytes are also saved. The
+same isolated history/oplog/storage survives all drives and
 bindings/timezone are restored on exit. Checked-in Markdown Skills and their
 source hashes replace T01's fictional Skill; host/code/network tools and real
 sending remain unavailable to the model.

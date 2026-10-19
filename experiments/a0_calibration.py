@@ -81,13 +81,15 @@ def code_hashes():
 
 @contextmanager
 def isolated(root: Path, ledger: Ledger, *, failure=None, clock=None, bot=None,
-             skill_files=None, client=None, model=MODEL, allow_network=False):
+             skill_files=None, client=None, model=MODEL, allow_network=False,
+             reserved_message_ids=()):
     from mods import chat, chatlog, connect, context, identity, llm, message, oplog, storage, tools, history
     from mods.chat import view
     replay._require_fresh_process()
     root = external_root(root)
     clock = Clock() if clock is None else clock
     bot = {"id": 9, "name": "Synthetic Bot"} if bot is None else bot
+    echo_number = min((0, *(int(value) for value in reserved_message_ids)))
     old_cwd = Path.cwd()
     old_tz = os.environ.get("TZ")
     os.environ["TZ"] = "Asia/Shanghai"
@@ -207,10 +209,12 @@ def isolated(root: Path, ledger: Ledger, *, failure=None, clock=None, bot=None,
         bind(llm, "client", scope.client)
 
         def say(body, destination):
+            nonlocal echo_number
             ledger.guard()
             if destination not in {tuple(item["window"]) for item in scope.opened}:
                 raise RuntimeError("say destination has not opened")
-            number = -len(scope.echoes) - 1
+            echo_number -= 1
+            number = echo_number
             event = event_for({"id": number, "stamp": clock.now, "window": destination, "name": bot["name"]}, body=body, sender=bot["id"])
             event["post_type"] = "message_sent"
             if failure == "echo-write-none":

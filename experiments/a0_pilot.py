@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from contextlib import contextmanager, redirect_stdout, ExitStack
 from datetime import date, datetime, timedelta
 import hashlib
@@ -32,6 +33,9 @@ DATES = ["2023-03-14", "2023-03-15", "2023-03-16"]
 PROJECTION = {"reasoning_mode": "keep", "keep_reasoning": True, "preserve_native": True,
               "persist_reasoning": False, "model": MODEL, "protocol": "deepseek-chat-completions"}
 FACT = "离线模拟：只可见已经开放的历史；say仅记录候选意图和分支模拟回声，不影响历史、不发送真实消息。"
+SOURCE_MODES = frozenset({"production-default-plus-offline-history-fact",
+                          "production-default-plus-offline-review-task-v2", a0.replay.PROMPT_MODE})
+ARCHIVE_POLICY = "unchanged source bytes and parser fields; v0 display projection; current A0 filter; no realtime notice reconstruction"
 
 
 class PilotStop(RuntimeError):
@@ -120,14 +124,18 @@ def load_prepared(path, identity):
     required = {"schema", "model", "prompt_mode", "archive_kind", "input_sha256", "dates", "events", "status"}
     if (set(manifest) != required or manifest["schema"] != 1 or manifest["model"] != MODEL
             or manifest["archive_kind"] != "group" or manifest["status"] != "prepared-only"
-            or manifest["prompt_mode"] != a0.replay.PROMPT_MODE
+            or not isinstance(manifest["prompt_mode"], str) or manifest["prompt_mode"] not in SOURCE_MODES
+            or type(manifest["events"]) is not int or manifest["events"] < 0
+            or not isinstance(manifest["dates"], list) or any(not isinstance(entry, dict) for entry in manifest["dates"])
             or [entry.get("date") for entry in manifest["dates"]] != DATES):
         raise ValueError("unsupported prepared schema/model/format/date range")
     records, hashes, overall = [], {}, hashlib.sha256()
-    stats = {"records": 0, "v0": 0, "v1": 0, "missing": {}, "guessed": {}, "excluded": 0}
+    stats = {"records": 0, "v0": 0, "v1": 0, "missing": {}, "guessed": {}, "excluded": 0,
+             "message": 0, "recall": 0, "poke": 0, "opaque": 0, "crlf": 0,
+             "negative_ids": 0, "duplicate_id_instances": 0, "missing_ids": 0, "CRLF_header_string_ids": 0}
     with shanghai():
         for entry in manifest["dates"]:
-            if set(entry) != {"date", "sha256", "events"}:
+            if set(entry) != {"date", "sha256", "events"} or type(entry["events"]) is not int or entry["events"] < 0:
                 raise ValueError("unsupported prepared day declaration")
             day = date.fromisoformat(entry["date"])
             relative = f"archive/{day:%Y-%m}/{day:%d}.log"
@@ -138,12 +146,14 @@ def load_prepared(path, identity):
             hashes[relative] = sha
             overall.update(day.isoformat().encode() + b"\0" + bytes.fromhex(sha))
             text = raw.decode("utf-8", errors="strict")
-            if "\r" in text or (text and not text.endswith("\n")):
-                raise ValueError("minimal ordinary format requires LF terminated records")
+            if text and not text.endswith("\n"):
+                raise ValueError("ordinary records must end in LF; source bytes are never normalized")
+            stats["crlf"] += raw.count(b"\r\n")
             parsed = chatlog.parse_log(text, kind="group", target=identity["target"], day=(day.year, day.month, day.day),
                                        bot_id=identity["bot"]["id"], bot_names=identity["bot_names"], names_complete=True,
                                        origin_path=f"group/{identity['target']}/{day:%Y-%m}/{day:%d}.log")
-            lines = raw.splitlines(keepends=True)
+            # Origins count LF, not Unicode/bare-CR splitlines boundaries.
+            lines = [part + b"\n" for part in raw.split(b"\n")[:-1]]
             offsets = [0]
             for line in lines:
                 offsets.append(offsets[-1] + len(line))
@@ -153,24 +163,47 @@ def load_prepared(path, identity):
                 for category in ("missing", "guessed"):
                     for field in record.get("_" + category, []):
                         stats[category][field] = stats[category].get(field, 0) + 1
-                if (record.get("_kind") or record.get("_missing") or record.get("_guessed")
-                        or type(record.get("message_id")) is not int or type(record.get("user_id")) is not int):
-                    raise ValueError("unsupported notice/unparsed/absent-ID/ambiguous ordinary record; no records skipped")
+                category = record.get("_kind")
+                if category not in {None, "recall", "poke", "notice"} or type(record.get("time")) is not int:
+                    raise ValueError("unsupported record kind/time; no records skipped or native fields invented")
+                if category is None:
+                    number = record.get("message_id")
+                    crlf_id = isinstance(number, str) and re.fullmatch(r"-?\d+\r", number) is not None
+                    if (set(record.get("_missing", [])) - {"message_id"} or record.get("_guessed")
+                            or type(record.get("user_id")) is not int
+                            or (number is not None and type(number) is not int and not crlf_id)):
+                        raise ValueError("unsupported ordinary sender or message ID representation")
+                    stats["message"] += 1
+                    stats["missing_ids"] += "message_id" not in record
+                    stats["negative_ids"] += number is not None and str(number).startswith("-")
+                    stats["CRLF_header_string_ids"] += crlf_id
+                else:
+                    stats["opaque" if category == "notice" else category] += 1
                 first = int(record["_log_origin"].rpartition(":")[2]) - 1
                 last = int(parsed[index + 1]["_log_origin"].rpartition(":")[2]) - 1 if index + 1 < len(parsed) else len(lines)
                 part = raw[offsets[first]:offsets[last]]
                 if not part or part.startswith(b"    "):
                     raise ValueError("ordinary record boundary mismatch")
-                stats[record["_version"]] += 1
+                if "_version" in record:
+                    stats[record["_version"]] += 1
                 stats["records"] += 1
                 records.append({"day": day.isoformat(), "position": index, "record": record,
                                 "source": {"file": relative, "line": first + 1, "byte_start": offsets[first],
                                            "byte_end": offsets[last], "sha256": hashlib.sha256(part).hexdigest(), "raw_utf8": part.decode()}})
     if overall.hexdigest() != manifest["input_sha256"] or len(records) != manifest["events"]:
         raise ValueError("prepared aggregate mismatch")
-    ids = [item["record"]["message_id"] for item in records]
-    if any(number <= 0 for number in ids) or len(set(ids)) != len(ids):
-        raise ValueError("duplicate/conflicting message IDs or negative candidate namespace collision")
+    ids = [item["record"]["message_id"] for item in records
+           if not item["record"].get("_kind") and "message_id" in item["record"]]
+    stats["duplicate_id_instances"] = len(ids) - len(set(ids))
+    stats["duplicate_id_groups"] = sum(count > 1 for count in Counter(ids).values())
+    groups = {}
+    for item in records:
+        record = item["record"]
+        if not record.get("_kind") and "message_id" in record:
+            groups.setdefault((record["message_id"], record["time"]), []).append(record)
+    stats["duplicate_message_time_groups"] = sum(len(group) > 1 for group in groups.values())
+    stats["conflicting_message_time_groups"] = sum(len({digest(semantic(record)) for record in group}) > 1
+                                                    for group in groups.values())
     records.sort(key=lambda item: (item["day"], item["record"]["time"], item["position"]))
     return {"root": root, "manifest": manifest, "records": records, "hashes": hashes,
             "manifest_sha256": a0.replay._hash(root / "manifest.json"), "statistics": stats}
@@ -184,6 +217,22 @@ def verify_prepared(package):
         safe_path(path)
         if a0.replay._hash(path) != sha:
             raise PilotStop("prepared-material-drift")
+
+
+def preserve_source_manifest(package, output):
+    raw = safe_path(package["root"] / "manifest.json").read_bytes()
+    if hashlib.sha256(raw).hexdigest() != package["manifest_sha256"]:
+        raise PilotStop("prepared-manifest-drift")
+    descriptor = os.open(output / "source-manifest.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+    descriptor = os.open(output, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def schedule():
@@ -418,6 +467,18 @@ class PilotStream(sdk.ObservedStream):
 class PilotFixtureSSE(sdk.SyntheticSSE):
     def __iter__(self):
         for block in super().__iter__():
+            if self.owner.scenario == "legacy" and self.number == 2 and b'"tool_calls"' in block:
+                value = json.loads(block.removeprefix(b"data: ").strip())
+                calls = value["choices"][0]["delta"].get("tool_calls", [])
+                if calls and calls[0].get("id"):
+                    from mods import chatlog
+                    missing = next(record for record in chatlog.read_range("group", 1)
+                                   if "message" in record and "message_id" not in record)
+                    for index, origin in enumerate((missing["_log_origin"], "group/1/2023-03/14.log:1"), 1):
+                        calls.append({"index": index, "id": f"fictional-archive-{index}", "type": "function",
+                                      "function": {"name": "read_messages", "arguments": json.dumps({
+                                          "window": "g1", "origin": origin, "before": 0, "after": 0})}})
+                    block = b"data: " + canonical(value) + b"\n\n"
             if self.owner.scenario in {"model-drift", "fingerprint-drift"} and b'"usage"' in block:
                 value = json.loads(block.removeprefix(b"data: ").strip())
                 value["model" if self.owner.scenario == "model-drift" else "system_fingerprint"] = "fictional-drift"
@@ -432,11 +493,12 @@ class PilotFixtureSSE(sdk.SyntheticSSE):
 
 def semantic(record):
     return {key: record.get(key) for key in ("post_type", "message_type", "time", "message_id", "message",
-                                            "user_id", "group_id", "target_id", "sender")}
+                                            "user_id", "group_id", "target_id", "sender", "text", "notice_type",
+                                            "sub_type", "_kind", "_version", "_derived", "_missing", "_guessed")}
 
 
 def open_day(scope, package, identity, opening):
-    from mods import chatlog, oplog, identity as bot_identity
+    from mods import chatlog, oplog
     scope.clock.now = opening["clock"]
     window = (identity["kind"], identity["target"])
     arrivals = []
@@ -444,30 +506,31 @@ def open_day(scope, package, identity, opening):
         if item["day"] != opening["day"]:
             continue
         record = item["record"]
-        sender = record["sender"]
-        scope.names[record["user_id"]] = sender["nickname"]
-        scope.titles[(window[1], record["user_id"])] = sender.get("title", "")
-        event = {key: value for key, value in record.items() if not key.startswith("_")}
-        event["raw_message"] = event["message"]
-        # Current Bot display names must not overwrite the historical sender.
-        with patch.object(bot_identity, "get_group_user_info", return_value=(sender.get("title", ""), sender["nickname"])):
-            chatlog.write(event)
-        origin = chatlog.consume_origin(event)
-        scope.opened.append({"id": event["message_id"], "stamp": event["time"], "window": window,
-                             "name": sender["nickname"], "body": event["message"], "origin": origin})
-        a0.verify_written(scope, window, event, origin)
+        sender = record.get("sender", {})
+        if sender:
+            scope.names[record["user_id"]] = sender["nickname"]
+            scope.titles[(window[1], record["user_id"])] = sender.get("title", "")
+        # This is archive import, not a fabricated online event. Reusing the
+        # native notice writer would need author/operator fields absent here.
+        path = chatlog.get_path(str(chatlog.window_path(*window)), record["time"])
+        raw = item["source"]["raw_utf8"].encode()
+        offset = Path(path).stat().st_size if Path(path).exists() else 0
+        written, origin = chatlog._append(path, raw.decode())
+        if written.encode() != raw:
+            scope.fail("archive append changed original bytes")
+        scope.opened.append({"id": record.get("message_id"), "stamp": record["time"], "window": window,
+                             "name": sender.get("nickname"), "origin": origin})
         visible = chatlog.read_origin(*window, origin)
         if semantic(visible) != semantic(record):
-            scope.fail("normalized visible record differs from complete parsed source")
-        path, _, line = origin.rpartition(":")
-        data = (Path("archive") / path).read_bytes().splitlines(keepends=True)
-        start = int(line) - 1
-        end = next((index for index in range(start + 1, len(data)) if not data[index].startswith(b"    ")), len(data))
-        shown = b"".join(data[start:end])
+            scope.fail("archived record differs from complete parsed source")
+        shown = Path(path).read_bytes()[offset:offset + len(raw)]
+        if shown != raw:
+            scope.fail("archive byte readback differs from original record")
         scope.mapping.append({"source": item["source"], "source_record": record, "visible_origin": origin,
                               "visible_sha256": hashlib.sha256(shown).hexdigest(), "visible_raw_utf8": shown.decode(),
-                              "visible_record": visible, "projection": "stored v0 display text normalized to v1; original bytes retained"})
-        event["_log_origin"] = origin
+                              "visible_byte_start": offset, "visible_byte_end": offset + len(raw),
+                              "visible_record": visible, "projection": ARCHIVE_POLICY})
+        event = {**visible, "_log_origin": origin}
         arrivals.append(oplog.arrive(window, event, origin=origin))
     if not arrivals:
         scope.fail("empty selected day unsupported; no implicit wake substitution")
@@ -480,35 +543,62 @@ def open_day(scope, package, identity, opening):
 
 def check_view(scope, package, opening):
     from mods import chatlog, oplog
+    from mods.chat import reader, view
+    from types import SimpleNamespace
     scope.safe_tree()
     assert scope.clock.now == opening["clock"]
     window = tuple(scope.opened[0]["window"])
-    visible_ids = {item["id"] for item in scope.opened} | {item["event"]["message_id"] for item in scope.echoes}
+    visible_origins = {item["origin"] for item in scope.opened} | {item["origin"] for item in scope.echoes}
     assert set(chatlog.known_windows()) == {window}
+    assert set(scope.names.values()) <= {item["name"] for item in scope.opened}
+    assert all(path.name[:2].isdigit() and path.stem <= scope.clock.strftime("%d")
+               for path in chatlog.window_path(*window).glob(scope.clock.strftime("%Y-%m") + "/*.log"))
     for record in chatlog.read_range(*window):
-        assert record["message_id"] in visible_ids and record["time"] <= scope.clock.now
-        for kwargs in ({"origin": record["_log_origin"]}, {"message_id": record["message_id"]}):
-            assert all(item["message_id"] in visible_ids for item in chatlog.read_around(*window, before=100, after=100, **kwargs))
+        assert record["_log_origin"] in visible_origins and record["time"] <= scope.clock.now
+        assert all(item["_log_origin"] in visible_origins for item in chatlog.read_around(
+            *window, origin=record["_log_origin"], before=100, after=100))
+        if "message_id" in record and not record.get("_kind"):
+            try:
+                around = chatlog.read_around(*window, message_id=record["message_id"], before=100, after=100)
+            except ValueError as error:
+                assert "命中多条" in str(error)
+                around = chatlog.read_around(*window, origin=record["_log_origin"], before=100, after=100)
+            assert all(item["_log_origin"] in visible_origins for item in around)
     for mapping in scope.mapping:
-        assert semantic(chatlog.read_origin(*window, mapping["visible_origin"])) == semantic(mapping["source_record"])
+        visible = chatlog.read_origin(*window, mapping["visible_origin"])
+        assert semantic(visible) == semantic(mapping["source_record"])
+        if view._model_event(visible, True) is None:
+            session = SimpleNamespace(associated_windows=set(), requested_reads=[])
+            response = reader.arrange_archive(session, "g" + str(window[1]), origin=mapping["visible_origin"], before=0, after=0)
+            assert response == "本地档案没有命中可见记录；未安排阅读" and not session.requested_reads
         source = mapping["source"]
         raw = safe_path(package["root"] / source["file"]).read_bytes()[source["byte_start"]:source["byte_end"]]
         assert raw == source["raw_utf8"].encode() and hashlib.sha256(raw).hexdigest() == source["sha256"]
+        path = Path("archive") / mapping["visible_origin"].rpartition(":")[0]
+        assert path.read_bytes()[mapping["visible_byte_start"]:mapping["visible_byte_end"]] == raw
     for item in scope.echoes:
         assert chatlog.read_origin(*window, item["origin"])["message"] == item["event"]["message"]
     assert all(entry["event"]["time"] <= scope.clock.now for entry in oplog.unread(window))
     assert all(entry["id"].split("-")[0] <= scope.clock.strftime("%Y%m%d") for entry in oplog.events(oplog.AGENT_WINDOW))
     for item in package["records"]:
         if item["day"] > opening["day"]:
-            assert not chatlog.read_around(*window, message_id=item["record"]["message_id"])
+            try:
+                future = chatlog.read_around(*window, message_id=item["record"].get("message_id", "no-archived-id"))
+            except ValueError as error:
+                assert "命中多条" in str(error)
+                future = []
+            assert all(record["time"] <= scope.clock.now for record in future)
     scope.probes.append({"day": opening["day"], "clock": scope.clock.now, "opened": len(scope.opened),
                          "paths": ["range", "around-id", "around-origin", "origin", "directory", "unread", "raw-source"], "ok": True})
 
 
 @contextmanager
 def pilot_scope(*args, **kwargs):
-    from mods import oplog
+    from mods import oplog, storage
     with a0.isolated(*args, **kwargs) as scope:
+        # Raw imported group bodies remain v0. Candidate echoes in mixed days
+        # are also conservatively read as v0; their known bytes live separately.
+        storage.get("archive", "format")["v1_since"] = 2 ** 62
         try:
             yield scope
         finally:
@@ -534,7 +624,9 @@ def run_pilot(package, identity, contract, output, pilot, *, scenario="normal", 
             skills = a0.replay._checked_in_skills()
             bot = {**identity["bot"], "names": identity["bot_names"]}
             with pilot_scope(output, ledger, clock=clock, bot=bot, skill_files=skills,
-                             client=client, model=MODEL, allow_network=contract["mode"] == "live") as scope:
+                             client=client, model=MODEL, allow_network=contract["mode"] == "live",
+                             reserved_message_ids=[item["record"]["message_id"] for item in package["records"]
+                                                   if "message_id" in item["record"]]) as scope:
                 scope.mapping, scope.wakes = [], []
                 chat.llm_config = client.config
                 storage.get("", "agent")["reasoning"] = "keep"
@@ -547,14 +639,17 @@ def run_pilot(package, identity, contract, output, pilot, *, scenario="normal", 
                           "skills": {source.name: a0.replay._hash(source) for source in skills},
                           "skill_sources": {source.name: "mods/tools/" + source.name for source in skills},
                           "identity_sha256": digest(identity), "prepared": package["manifest"], "statistics": package["statistics"],
+                          "source_prompt_mode": package["manifest"]["prompt_mode"],
+                          "actual_prompt": {"base_sha256": digest(scope.base), "fact": FACT, "projection": PROJECTION},
                           "timezone": "Asia/Shanghai", "schedule": schedule(), "sdk": openai.__version__, "httpx": httpx.__version__,
                           "credential_supply": "explicit-private-file" if contract["mode"] == "live" else "fixed-fictional-key",
                           "real_billing_clock": "system wall time; conservative peak conversion, not provider bill",
-                          "resume": "unsupported", "source_fidelity": "ordinary group records with IDs; v0 stored projection retained, never claimed raw OneBot"}
+                          "resume": "unsupported", "source_fidelity": ARCHIVE_POLICY}
                 durable(output / "manifest.json", frozen)
                 ledger.state["manifest"] = digest(frozen)
                 ledger.save()
                 durable(output / "frozen-input.json", {"records": package["records"]})
+                preserve_source_manifest(package, output)
                 for opening in schedule():
                     verify_prepared(package)
                     ledger.wake()
@@ -653,11 +748,81 @@ def synthetic_package(root):
     return prepared, root / "identity.json"
 
 
+def legacy_synthetic_package(root, source_mode="production-default-plus-offline-review-task-v2"):
+    prepared, identity_path = synthetic_package(root)
+    days = [
+        ("【title】Fable day 1(2) 12:00:00 | -1\n    legacy negative CRLF body\r\n    second body line\rinterior CR\n    trailing blanks   \n    \n"
+         "【title】Fable day 1(2) 12:00:00 | -1\n    legacy conflicting duplicate\n"
+         "【title】Fable day 1(2) 12:00:01 | 7\n    legacy recalled original\n"
+         "【title】Fable day 1(2) 12:00:02 | \n    legacy missing ID\n"
+         ": Fable day 1(2)撤回了一条消息(7) 12:00:03\n"
+         ": Fable day 1(2)戳了戳Fictional Bot(9) 12:00:04\n"
+         ": FICTIONAL_OPAQUE_MARKER(2)被设为了管理员 12:00:05\n"
+         "【title】Fable day 1(2) 12:00:06 | 8\n    #FICTIONAL_CONTROL_MARKER\n"),
+        ("【title】Fable day 2(2) 12:00:00 | 7\n    legacy day two repeated ID\n"
+         "【title】Fictional Bot(9) 12:00:00 | -2\r\n    legacy historical Bot\n"),
+        ("【title】Fable day 3(2) 12:00:00 | -100\n    legacy future negative\n"
+         "【title】Fable day 3(2) 12:00:00 | 7\n    legacy day three repeated ID\n")]
+    from mods import chatlog
+    manifest = read_json(prepared / "manifest.json")
+    manifest["prompt_mode"] = source_mode
+    aggregate = hashlib.sha256()
+    with shanghai():
+        for day, text, entry in zip(DATES, days, manifest["dates"]):
+            path = prepared / "archive" / day[:7] / (day[8:] + ".log")
+            path.write_bytes(text.encode())
+            entry["sha256"] = a0.replay._hash(path)
+            entry["events"] = len(chatlog.parse_log(text, kind="group", target=1, day=tuple(map(int, day.split("-")))))
+            aggregate.update(day.encode() + b"\0" + bytes.fromhex(entry["sha256"]))
+    manifest.update(events=sum(entry["events"] for entry in manifest["dates"]), input_sha256=aggregate.hexdigest())
+    durable(prepared / "manifest.json", manifest)
+    return prepared, identity_path
+
+
 def authorize(args):
     # This check precedes path resolution, material/credential reads and clients.
     required = ("prepared", "identity", "contract", "credential_file", "pilot_record", "pilot_id", "output")
     if (not args.authorize_materials or not args.confirm_paid or any(not getattr(args, key, None) for key in required)):
         raise ValueError("real pilot requires explicit material/credential and paid authorization plus every manifest input")
+
+
+def preview(args):
+    # A separate material-only entry: no contract/key, client, runtime or drive.
+    if not args.authorize_materials or any(not getattr(args, key, None) for key in ("prepared", "identity", "output")):
+        raise ValueError("material preview requires explicit authorization and all inputs")
+    output, prepared = safe_path(args.output), safe_path(args.prepared)
+    if output.exists() or output.is_relative_to(prepared):
+        raise ValueError("preview requires a fresh private root outside prepared")
+    identity = load_identity(args.identity)
+    package = load_prepared(prepared, identity)
+    verify_prepared(package)
+    from mods import identity as bot_identity
+    from mods.chat import view
+    visible = 0
+    # Poke rendering must not consult production names/storage in a pure check.
+    with patch.object(bot_identity, "getname", return_value="archive participant"):
+        for item in package["records"]:
+            visible += view._model_event(item["record"], True) is not None
+    for name in package["hashes"]:
+        original = safe_path(prepared / name).read_bytes()
+        members = sorted((item for item in package["records"] if item["source"]["file"] == name),
+                         key=lambda item: item["source"]["byte_start"])
+        if b"".join(item["source"]["raw_utf8"].encode() for item in members) != original:
+            raise ValueError("source byte coverage incomplete")
+    result = {"status": "verified-materials", "statistics": package["statistics"],
+              "default_model_visible": visible, "default_model_filtered": len(package["records"]) - visible,
+              "recall_default_projection": "filtered; archived text retained; realtime recall not reconstructed",
+              "source_prompt_mode": package["manifest"]["prompt_mode"],
+              "actual_prompt": "not constructed; A0 base plus offline capability fact only on an authorized run",
+              "source_bytes_verified": True, "model_calls": 0, "sdk_clients": 0, "actions": 0}
+    output.mkdir(mode=0o700)
+    with a0.replay._locked(output):
+        preserve_source_manifest(package, output)
+        durable(output / "source-map.json", {"identity_sha256": digest(identity), "manifest_sha256": package["manifest_sha256"],
+                                              "hashes": package["hashes"], "records": package["records"], "policy": ARCHIVE_POLICY})
+        verify_prepared(package)
+        durable(output / "preview.json", result)
+    return result
 
 
 def read_credential(path):
@@ -707,6 +872,10 @@ def arguments(argv=None):
     doctor_parser = commands.add_parser("doctor")
     doctor_parser.add_argument("--output")
     commands.add_parser("contract-template")
+    material = commands.add_parser("preview", help="authorized material-only load/verify; no SDK, model or actions")
+    for name in ("prepared", "identity", "output"):
+        material.add_argument("--" + name)
+    material.add_argument("--authorize-materials", action="store_true")
     live = commands.add_parser("run")
     for name in ("prepared", "identity", "contract", "credential-file", "pilot-record", "pilot-id", "output"):
         live.add_argument("--" + name)
@@ -766,7 +935,10 @@ def doctor(root):
             contract = declaration("synthetic")
             contract["code"] = code_state()
             validate_contract(contract, "synthetic", code_state())
-            assert package["statistics"] == {"records": 6, "v0": 6, "v1": 0, "missing": {}, "guessed": {}, "excluded": 0}
+            assert all(package["statistics"][key] == value for key, value in
+                       {"records": 6, "v0": 6, "v1": 0, "missing": {}, "guessed": {}, "excluded": 0,
+                        "message": 6, "recall": 0, "poke": 0, "opaque": 0, "crlf": 0,
+                        "negative_ids": 0, "duplicate_id_instances": 0, "missing_ids": 0}.items())
             assert [item["record"]["message_id"] for item in package["records"]] == list(range(101, 107))
             assert schedule()[0]["clock"] == 1678809600
             passed("prepared-LF-group-v0-complete-records-same-second-order-and-Shanghai")
@@ -809,6 +981,103 @@ def doctor(root):
                 value = item["visible_raw_utf8"].encode()
                 assert b"".join(visible[int(line)-1:]).startswith(value)
             passed("original-byte-ranges-complete-record-map-and-stable-visible-origin-after-echoes")
+            legacy, legacy_identity_path = legacy_synthetic_package(root / "legacy-input")
+            legacy_identity = load_identity(legacy_identity_path)
+            legacy_package = load_prepared(legacy, legacy_identity)
+            stats = legacy_package["statistics"]
+            assert all(stats[key] == value for key, value in
+                       {"records": 12, "message": 9, "recall": 1, "poke": 1, "opaque": 1,
+                        "negative_ids": 4, "duplicate_id_instances": 3, "duplicate_id_groups": 2,
+                        "duplicate_message_time_groups": 1, "conflicting_message_time_groups": 1,
+                        "missing_ids": 1, "crlf": 2, "CRLF_header_string_ids": 1,
+                        "missing": {"message_id": 1}, "guessed": {}, "excluded": 0}.items())
+            first = legacy_package["records"][0]["record"]
+            assert first["message"] == "legacy negative CRLF body\r\nsecond body line\rinterior CR\ntrailing blanks"
+            source_bytes = (legacy / "manifest.json").read_bytes()
+            preview_args = arguments(["preview", "--authorize-materials", "--prepared", str(legacy),
+                                      "--identity", str(legacy_identity_path), "--output", str(root / "preview")])
+            with patch(__name__ + ".PilotClient", side_effect=AssertionError("preview constructed pilot SDK")), patch.object(
+                    openai, "OpenAI", side_effect=AssertionError("preview constructed SDK")), patch.object(
+                    llm.LLMClient, "generate_response", side_effect=AssertionError("preview called model")):
+                material_report = preview(preview_args)
+            assert material_report["default_model_visible"] == 9 and material_report["default_model_filtered"] == 3
+            assert material_report["source_bytes_verified"] and material_report["sdk_clients"] == material_report["model_calls"] == 0
+            assert (root / "preview/source-manifest.json").read_bytes() == source_bytes
+            assert read_json(root / "preview/source-map.json")["records"] == legacy_package["records"]
+            passed("authorized-preview-original-manifest-complete-byte-coverage-no-SDK-model-or-actions")
+            legacy_result = run_pilot(legacy_package, legacy_identity, contract, root / "legacy-success", "fictional-legacy-success", scenario="legacy")
+            runs.append(legacy_result)
+            assert legacy_result["status"] == "complete", legacy_result
+            assert legacy_result["attempts"] == legacy_result["settlements"] == 9
+            assert legacy_result["external_wakes"] == 3 and legacy_result["opened_records"] == 12
+            legacy_mapping = read_json(root / "legacy-success/source-mapping.json")
+            assert len(legacy_mapping) == 12 and all(item["source"]["raw_utf8"] == item["visible_raw_utf8"] for item in legacy_mapping)
+            assert (root / "legacy-success/source-manifest.json").read_bytes() == source_bytes
+            assert len({item["visible_origin"] for item in legacy_mapping}) == 12
+            history_ids = {item["record"]["message_id"] for item in legacy_package["records"] if "message_id" in item["record"]}
+            rows = a0.replay._journal_rows(root / "legacy-success")
+            archive_inputs = [row for row in rows if row["kind"] == "input" and row.get("read_via") == "read_messages"]
+            assert len(archive_inputs) == 2
+            assert "message_id" not in archive_inputs[0]["event"] and archive_inputs[1]["event"]["message_id"] == -1
+            assert archive_inputs[1]["event"]["message"] == first["message"]
+            echoes = [row["event"] for row in rows if row["kind"] == "arrival" and row["event"].get("post_type") == "message_sent"
+                      and row["event"].get("message") == "fictional SDK echo"]
+            assert len(echoes) == 6 and len({event["message_id"] for event in echoes}) == 6
+            assert not history_ids.intersection(event["message_id"] for event in echoes)
+            wire = canonical(read_json(root / "legacy-success/request-0002.json")["body"]).decode()
+            assert "legacy negative CRLF body\\r\\nsecond body line\\rinterior CR\\ntrailing blanks" in wire and "legacy conflicting duplicate" in wire
+            assert "FICTIONAL_OPAQUE_MARKER" not in wire and "FICTIONAL_CONTROL_MARKER" not in wire and "撤回了一条消息" not in wire
+            assert "戳了戳" in wire and "legacy missing ID" in wire
+            for number in range(1, 10):
+                body = read_json(root / f"legacy-success/request-{number:04d}.json")["body"]
+                rendered = canonical(body).decode()
+                if number <= 3:
+                    assert "legacy day two" not in rendered and "Fable day 2" not in rendered
+                if number <= 6:
+                    assert "legacy future negative" not in rendered and "Fable day 3" not in rendered
+            frozen_legacy = read_json(root / "legacy-success/manifest.json")
+            assert frozen_legacy["source_prompt_mode"] == "production-default-plus-offline-review-task-v2"
+            assert frozen_legacy["prepared"] == legacy_package["manifest"] and frozen_legacy["actual_prompt"]["fact"] == FACT
+            assert (legacy / "manifest.json").read_bytes() == source_bytes
+            sdk.check_native_pairs(read_json(root / "legacy-success/request-0009.json")["body"], list(range(1, 9)))
+            messages = read_json(root / "legacy-success/request-0003.json")["body"]["messages"]
+            for index in (1, 2):
+                assert sum(message.get("tool_call_id") == f"fictional-archive-{index}" for message in messages) == 1
+            passed("legacy-three-drives-origin-CRLF-negative-duplicate-missing-notice-filter-no-collision-or-future-leak", attempts=9)
+            history_manifest = read_json(legacy / "manifest.json")
+            for mode in ("production-default-plus-offline-history-fact", "unsupported-source-mode"):
+                durable(legacy / "manifest.json", {**history_manifest, "prompt_mode": mode})
+                if mode in SOURCE_MODES:
+                    assert load_prepared(legacy, legacy_identity)["manifest"]["prompt_mode"] == mode
+                    passed("explicit-history-fact-source-mode-preserved")
+                else:
+                    rejects("unknown-source-mode-refused", lambda: load_prepared(legacy, legacy_identity))
+            (legacy / "manifest.json").write_bytes(source_bytes)
+            crlf_head, crlf_identity = legacy_synthetic_package(root / "CRLF-head")
+            path = crlf_head / "archive/2023-03/14.log"
+            raw_head = path.read_bytes().replace(b" | -1\n", b" | -1\r\n", 1)
+            path.write_bytes(raw_head)
+            from mods import chatlog
+            with shanghai():
+                parsed_head = chatlog.parse_log(raw_head.decode(), kind="group", target=1, day=(2023, 3, 14))
+            assert parsed_head[0]["message_id"] == "-1\r" and type(parsed_head[0]["message_id"]) is str
+            revised = read_json(crlf_head / "manifest.json")
+            revised["dates"][0]["sha256"] = a0.replay._hash(path)
+            aggregate = hashlib.sha256()
+            for entry in revised["dates"]:
+                aggregate.update(entry["date"].encode() + b"\0" + bytes.fromhex(entry["sha256"]))
+            revised["input_sha256"] = aggregate.hexdigest()
+            durable(crlf_head / "manifest.json", revised)
+            preserved_head = load_prepared(crlf_head, load_identity(crlf_identity))
+            assert preserved_head["records"][0]["record"]["message_id"] == "-1\r"
+            assert preserved_head["statistics"]["CRLF_header_string_ids"] == 2
+            passed("CRLF-head-string-ID-preserved-without-normalizing-source")
+            assert path.read_bytes() == raw_head
+            for argv in (["preview"], ["preview", "--prepared", "/fictional/never-read"],
+                         ["preview", "--authorize-materials"]):
+                with patch(__name__ + ".read_json", side_effect=AssertionError("unauthorized preview read")), patch(
+                        __name__ + ".safe_path", side_effect=AssertionError("unauthorized preview path")):
+                    rejects("preview-authorization-before-any-material-path-or-read", lambda: preview(arguments(argv)))
             rejects("existing-root-no-reset", lambda: run_pilot(package, identity, contract, run_root, "fictional-pilot-success"))
             rejects("same-pilot-record-cannot-switch-root", lambda: claim_pilot(root / "pilot-record.json", "fictional-pilot-success", root / "other"))
             with a0.replay._locked(run_root):
@@ -930,7 +1199,13 @@ def doctor(root):
                     overall.update(entry["date"].encode() + b"\0" + bytes.fromhex(entry["sha256"]))
                 revised["input_sha256"] = overall.hexdigest()
                 durable(other / "manifest.json", revised)
-                rejects(name + "-with-valid-file-hashes-refused", lambda: load_prepared(other, load_identity(other_identity)))
+                if name == "missing-sender":
+                    rejects(name + "-with-valid-file-hashes-refused", lambda: load_prepared(other, load_identity(other_identity)))
+                else:
+                    accepted = load_prepared(other, load_identity(other_identity))
+                    assert accepted["statistics"]["records"] == 6
+                    assert accepted["statistics"]["duplicate_id_instances" if name == "duplicate-id" else "negative_ids"] == 1
+                    passed(name + "-preserved-with-original-fields-and-bytes")
             broken_identity = {**identity, "bot_names": {}}
             durable(root / "bad-identity.json", broken_identity)
             rejects("missing-identity-map", lambda: load_identity(root / "bad-identity.json"))
@@ -1002,7 +1277,7 @@ def doctor(root):
               "limitations": ["only built-in synthetic prepared package and MockTransport exercised",
                               "live target applicability/failure billing/material/credential authorization unverified",
                               "capacity reservation conditional on declared provider contract; provider bill unknown",
-                              "group ordinary LF records with explicit sender and message IDs only; no notices/sidecars",
+                              "ordinary group daily records only; native recall fields not reconstructed; current A0 archive filter retained",
                               "partial resume/fork unsupported; no paid or memory-benefit evidence"]}
     durable(root / "doctor.json", result)
     return result
@@ -1020,6 +1295,8 @@ def main(argv=None):
             # Production console can contain private input; it never goes to the public report.
             with redirect_stdout(io.StringIO()):
                 result = live_run(args)
+        elif args.command == "preview":
+            result = preview(args)
         else:
             selected = getattr(args, "output", None)
             if selected:
@@ -1033,7 +1310,7 @@ def main(argv=None):
                 result = doctor(root)
             result = {**result, "output": str(root)}
         print(json.dumps(result, ensure_ascii=False))
-        return 0 if result["status"] in {"ok", "complete"} else 1
+        return 0 if result["status"] in {"ok", "complete", "verified-materials"} else 1
     except (OSError, RuntimeError, ValueError, KeyError, AssertionError):
         # Never interpolate path arguments, credential text or SDK error bodies.
         print("A0 pilot stopped; no implicit retry. Check the private output if one was created.", file=sys.stderr)
