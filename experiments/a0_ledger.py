@@ -70,13 +70,15 @@ def cost(prices: dict, prompt: int, cached: int, output: int, *, reserve=False) 
 
 class Ledger:
     def __init__(self, root: Path, pilot: str, manifest_hash: str, *, limits=None, prices=None,
-                 reopen=False):
+                 reopen=False, policy=None):
         self.root = root
+        self.policy = policy
         self.limits = dict(LIMITS if limits is None else limits)
         if (set(self.limits) != set(LIMITS) or
                 any(type(value) is not int or value <= 0 for value in self.limits.values())):
             raise ValueError("all limits including explicit context must be positive integers")
-        self.prices = price_table(PRICES if prices is None else prices)
+        self.prices = (price_table(PRICES if prices is None else prices) if policy is None
+                       else policy.validate_prices(prices))
         self.poisoned = False
         if reopen:
             if (root / "persistence-unknown.json").exists() or (root / "ledger.json.new").exists():
@@ -111,11 +113,11 @@ class Ledger:
                     or row["status"] not in ("reserved", "settled")
                     or type(row["input_bound"]) is not int or row["input_bound"] <= 0
                     or not 0 < row["allowance"] <= self.limits["output"]
-                    or row["reserved"] != cost(self.prices, row["input_bound"], 0, row["allowance"], reserve=True)):
+                    or row["reserved"] != self.cost(row["input_bound"], 0, row["allowance"], reserve=True)):
                 raise ValueError("corrupt request reservation")
             if row["status"] == "settled":
                 charged = (row["reserved"] if row["usage"] is None else
-                           cost(self.prices, *row["usage"]))
+                           self.cost(*row["usage"]))
                 if row["charged"] != charged:
                     raise ValueError("corrupt settled charge")
         if (len(state["requests"]) > self.limits["attempts"]
@@ -137,6 +139,11 @@ class Ledger:
                 pass
             raise
 
+    def cost(self, prompt, cached, output, *, reserve=False):
+        if self.policy is None:
+            return cost(self.prices, prompt, cached, output, reserve=reserve)
+        return self.policy.cost(self.prices, prompt, cached, output, reserve=reserve)
+
     def guard(self):
         if self.poisoned or self.state["closed"]:
             raise RuntimeError("pilot closed: " + (self.state["closed"] or "persistence-unknown"))
@@ -154,7 +161,7 @@ class Ledger:
         self.guard()
         if type(allowance) is not int or not 0 < allowance <= self.limits["output"]:
             raise RuntimeError("output allowance limit")
-        bound = len(canonical(request)) + 1024
+        bound = len(canonical(request)) + 1024 if self.policy is None else self.policy.input_bound(request)
         if bound > self.limits["context"]:
             raise RuntimeError("explicit input context limit")
         rows = self.state["requests"]
@@ -162,7 +169,7 @@ class Ledger:
             raise RuntimeError("actual attempt limit")
         if sum(row["allowance"] for row in rows) + allowance > self.limits["allowances"]:
             raise RuntimeError("cumulative allowance limit")
-        reserved = cost(self.prices, bound, 0, allowance, reserve=True)
+        reserved = self.cost(bound, 0, allowance, reserve=True)
         if sum(row.get("charged", row["reserved"]) for row in rows) + reserved > self.limits["micro_cny"]:
             raise RuntimeError("cumulative CNY limit")
         row = {"id": f"{self.state['pilot']}/{len(rows) + 1:04d}", "status": "reserved",
@@ -175,10 +182,11 @@ class Ledger:
     def settle(self, row: dict, usage: list[int] | None, outcome="stop"):
         if self.poisoned or row is not self.state["requests"][-1] or row["status"] != "reserved":
             raise RuntimeError("settlement identity/state mismatch")
-        charged = row["reserved"] if usage is None else cost(self.prices, *usage)
-        over = (usage is not None and (usage[0] > row["input_bound"] or usage[2] > row["allowance"])) or charged > row["reserved"]
+        charged = row["reserved"] if usage is None else self.cost(*usage)
+        over = ((usage is not None and (usage[0] > row["input_bound"] or usage[2] > row["allowance"]))
+                or charged > row["reserved"] or (self.policy is not None and self.policy.usage_exceeds(usage)))
         row.update(status="settled", usage=usage, charged=charged,
-                   usage_source="full-reserve" if usage is None else "fake-transport",
+                   usage_source="full-reserve" if usage is None else ("fake-transport" if self.policy is None else self.policy.usage_source),
                    outcome=outcome, settled_at=time.time())
         if over or outcome != "stop" or usage is None:
             self.state["closed"] = "usage-overreport" if over else ("missing-usage" if usage is None else outcome)

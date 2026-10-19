@@ -293,3 +293,125 @@ policy rather than a real tokenizer proof. A separate fixture rejects an input
 that fits its input reservation but exceeds the joint context after adding
 4096 output. No result establishes real input bounds, paid readiness, provider
 availability, memory benefit or completion of the comparison protocol.
+
+## A0 pilot with declared capacity reservations
+
+[`a0_pilot.py`](a0_pilot.py) adds a separate daily A0 pilot. Its default `doctor`
+uses only a generated fictional prepared package, fictional identities and
+`MockTransport`. T01 and T02 retain their closed defaults. The new
+[`a0_capacity.py`](a0_capacity.py) policy plugs into the existing durable ledger;
+it does not change either earlier experiment's byte reservation policy.
+
+```sh
+uv run --frozen python experiments/a0_pilot.py doctor
+uv run --frozen python experiments/a0_pilot.py doctor --output /tmp/new-a0-pilot-doctor
+uv run --frozen python experiments/a0_pilot.py contract-template > /private/pilot-contract.json
+```
+
+`contract-template` reads tracked code and prints a template; it does not query
+`/models` or read materials/credentials. Its capacity evidence initially says
+`documentation-example-not-live-model-query`, so the template is deliberately
+insufficient for `run`. It freezes the current commit, tracked diff hash and
+source hashes, including new experiment files before they are tracked. Generate
+it against the final reviewed checkout. Before any future authorized run, fill
+in the capacity/price sources, verification time and target applicability,
+response model identity, failure-billing disclosure, and
+`pilot_binding: {"id": "unique-pilot-id", "root": "/private/new-run", "record":
+"/private/permanent-pilot-claim.json"}`. Live capacity status must be
+`operator-declared-target-applicability`. This is an explicit operator declaration,
+not evidence that this program verified a real model or account. The fixed
+policy rejects different prices/capacity/model/parameters or unknown fees.
+
+The future command is parseable, but **this implementation ticket did not
+authorize or execute it**:
+
+```sh
+uv run --frozen python experiments/a0_pilot.py run \
+  --prepared /private/authorized-prepared \
+  --identity /private/authorized-identity.json \
+  --contract /private/pilot-contract.json \
+  --credential-file /private/isolated-api-key \
+  --pilot-id unique-pilot-id \
+  --pilot-record /private/permanent-pilot-claim.json \
+  --output /private/new-run \
+  --authorize-materials --confirm-paid
+```
+
+Both authorization flags and every input are required before material or
+credential reads or client construction. The identity file is strict JSON:
+`{"schema":1,"kind":"group","target":123,"bot":{"id":456,"name":"Bot"},
+"bot_names":{"Bot":456}}`. Numbers here are examples. Historical Bot aliases
+and accounts must be mapped explicitly. The credential file contains one literal
+ASCII key, is owner-only (for example mode 0600), is at most 512 bytes and cannot
+be a symlink. No environment key, production config or `.env` is read. The key,
+its hash, credential path and authentication headers are absent from manifests
+and reports. SDK operations see the same controlled environment mechanism as
+T02, including organization/project/admin/webhook fallbacks. Live transport fixes
+`https://api.deepseek.com`, disables environment proxies and redirects, and sets
+SDK retries to zero. Neither entry accepts a custom endpoint or transport.
+
+The stable claim file is created exclusively and fsynced, binding the frozen
+contract to one pilot and output root. Existing claims or roots are refused;
+changing root or claim path cannot reuse that contract's binding. Keep this
+file and the private output after a stop. There is no resume, fork, segment
+reset or automatic rerun. A deliberately changed authorization/claim constitutes
+a new pilot; the application cannot prevent an operator from issuing new grants.
+
+The minimum supported input is the schema-1 package produced by
+`memory_replay.py prepare`: exactly `manifest.json` and ordinary group daily
+files under `archive/2023-03/{14,15,16}.log`, with matching day/aggregate hashes
+and event counts. Records must be LF terminated, have explicit sender IDs and
+unique positive integer message IDs across the selected range. Private records,
+notices, unparsed lines, absent IDs, ambiguous identity, duplicate IDs, sidecars,
+extra files/dates and symlinks are refused rather than skipped. Group text without
+a format marker is conservatively parsed as v0 stored display text; it is not
+claimed to recover original OneBot bytes. Parse statistics record format,
+missing/guessed fields and exclusions (zero for an accepted package).
+
+Parsing and all three day-end clocks use `Asia/Shanghai`: March 15, 16 and 17 at
+00:00. A day opens complete records in timestamp/file order, then activates one
+external wake. The clock stays fixed during the real A0 drive. Original frozen
+record byte ranges, full parsed records and normalized visible chatlog origins
+are stored separately in the private source map. Range/around/origin/unread reads,
+names and directories see only opened material and candidate echoes. Echoes are
+`sent=false` branch records, never new wakes; old origins remain valid after
+later appends. The same isolated history/oplog/storage survives all drives and
+bindings/timezone are restored on exit. Checked-in Markdown Skills and their
+source hashes replace T01's fictional Skill; host/code/network tools and real
+sending remain unavailable to the model.
+
+The manifest records actual `reasoning_mode=keep`, `keep_reasoning=true`,
+`preserve_native=true`, `persist_reasoning=false`, model/protocol, base prompt,
+tool schemas/capability fact, initial state, Skills, SDK versions, schedule and
+contract. The doctor checks reasoning and tool-result pairs in the actual final
+wire bodies across drives. Existing reader cover/hiding rules still apply; this
+is not a promise to retain every historical round. No old whole-archive reading
+task is added.
+
+The declared provider-context-cap policy reserves the full 1048576 context
+capacity plus 4096 output at conservative peak CNY rates 2/0.04/8 per million:
+**2,129,920 micro-CNY per attempt**. It does not count JSON bytes as real tokens.
+The one pilot shares 5,000,000 micro-CNY, 12 attempts, 3 wakes and 49,152 output
+allowances. Two full reservations fit; three do not. Successful small usage
+releases the difference and can allow 12 requests. Two legal near-capacity
+settlements also reject a third reservation. Usage exceeding the joint context
+is recorded and charged before closure, even when its separate input/output
+counts fit their individual ceilings. Request/settlement timestamps use the
+real wall clock, separate from simulated 2023 time. This conservative conversion
+is not a provider bill or an absolute guarantee against supplier overreporting.
+
+The SDK's final serialized body is checked and durably reserved before each
+transport attempt. Raw usage is saved before the original production parser
+sees it. Missing, invalid or conflicting usage keeps the full reservation and
+closes the pilot; valid usage on length/disconnect/cancel is charged before
+stopping. No tools are released before normal durable settlement. Disk ledger
+integrity and frozen code/contract/manifest/Skills are checked before another
+request; a damaged ledger is preserved and poisoned rather than overwritten.
+Stop reports distinguish local limits, protocol/usage failures and persistence
+unknown states without copying SDK error bodies. The doctor exercises socket,
+QQ and external-write sentinels, active A0 cancellation, failure/no-repair paths
+and credential-error redaction. These synthetic probes prove only those paths;
+they do not establish comprehensive safety of every real SDK/provider response,
+service acceptance, actual billing, memory benefit or comparison-protocol
+completion. Real material, credential and paid execution still require a
+specific reviewed authorization and target-applicability evidence.

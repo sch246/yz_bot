@@ -80,12 +80,14 @@ def code_hashes():
 
 
 @contextmanager
-def isolated(root: Path, ledger: Ledger, *, failure=None):
+def isolated(root: Path, ledger: Ledger, *, failure=None, clock=None, bot=None,
+             skill_files=None, client=None, model=MODEL, allow_network=False):
     from mods import chat, chatlog, connect, context, identity, llm, message, oplog, storage, tools, history
     from mods.chat import view
     replay._require_fresh_process()
     root = external_root(root)
-    clock = Clock()
+    clock = Clock() if clock is None else clock
+    bot = {"id": 9, "name": "Synthetic Bot"} if bot is None else bot
     old_cwd = Path.cwd()
     old_tz = os.environ.get("TZ")
     os.environ["TZ"] = "Asia/Shanghai"
@@ -115,7 +117,7 @@ def isolated(root: Path, ledger: Ledger, *, failure=None):
         def today(cls):
             return cls.fromtimestamp(clock.now)
 
-    scope = SimpleNamespace(clock=clock, names={}, opened=[], echoes=[], probes=[], counters=counters, actions=[], midstop=False)
+    scope = SimpleNamespace(clock=clock, names={}, titles={}, opened=[], echoes=[], probes=[], counters=counters, actions=[], midstop=False)
     def safe_tree():
         if root.is_symlink() or any(path.is_symlink() for path in root.rglob("*")):
             raise RuntimeError("synthetic root contains a symlink; read refused")
@@ -141,9 +143,9 @@ def isolated(root: Path, ledger: Ledger, *, failure=None):
         bind(storage, "root_path", "data/storage")
         bind(chatlog, "rootfile", "archive")
         storage.get("archive", "format", lambda: {})["v1_since"] = 0
-        storage.get("archive", "format", lambda: {})["bot_names"] = {"Synthetic Bot": 9}
+        storage.get("archive", "format", lambda: {})["bot_names"] = bot.get("names", {bot["name"]: bot["id"]})
         for name, value in (("settings", []), ("prompts", {}), ("chat_groups", []),
-                            ("llm_config", {"default_model": MODEL}), ("description_cache", {})):
+                            ("llm_config", {"default_model": model}), ("description_cache", {})):
             bind(chat, name, value)
         for module in (chat, view, oplog, tools):
             if hasattr(module, "time"):
@@ -151,23 +153,28 @@ def isolated(root: Path, ledger: Ledger, *, failure=None):
         bind(oplog, "datetime", VirtualDateTime)
         bind(chat, "datetime", VirtualDateTime)
         bind(chat, "_run_hint", finalizer)
-        bind(identity, "qq", 9)
-        bind(identity, "name", "Synthetic Bot")
-        bind(identity, "nicknames", ["Synthetic Bot"])
-        bind(identity, "get_user_name", lambda user_id: "Synthetic Bot" if int(user_id) == 9 else scope.names.get(int(user_id), ""))
-        bind(identity, "get_group_user_info", lambda group_id, user_id: ("", "Synthetic Bot" if int(user_id) == 9 else scope.names.get(int(user_id), "未知")))
+        bind(identity, "qq", bot["id"])
+        bind(identity, "name", bot["name"])
+        bind(identity, "nicknames", [bot["name"]])
+        bind(identity, "get_user_name", lambda user_id: bot["name"] if int(user_id) == bot["id"] else scope.names.get(int(user_id), ""))
+        bind(identity, "get_group_user_info", lambda group_id, user_id: (scope.titles.get((int(group_id), int(user_id)), ""), bot["name"] if int(user_id) == bot["id"] else scope.names.get(int(user_id), "未知")))
         bind(identity, "getname", lambda user_id=None, group_id=None: scope.names.get(int(user_id), "未知") if user_id is not None else "未知")
         for name in ("send", "sendmsg", "_send_now"):
             bind(message, name, forbidden)
         bind(connect, "call_api", forbidden)
-        bind(socket, "create_connection", network)
-        bind(socket.socket, "connect", network)
+        if not allow_network:
+            bind(socket, "create_connection", network)
+            bind(socket.socket, "connect", network)
         # WHY: a caller's current event invokes production _run_hint in finally.
         # Offline drives must have no current event, even if a caller had one.
         context.clear_current()
         skill_root = root / "skills"
         skill_root.mkdir(mode=0o700)
-        (skill_root / "synthetic.md").write_text(SKILL)
+        if skill_files is None:
+            (skill_root / "synthetic.md").write_text(SKILL)
+        else:
+            for source in skill_files:
+                (skill_root / source.name).write_bytes(source.read_bytes())
         scope.registry = replay._safe_registry(skill_root)
         scope.send_context = scope.registry.get("meta").tools["say"].call.__globals__["_offline_send_sink"]
         for tool in scope.registry.get("meta").tools.values():
@@ -196,7 +203,7 @@ def isolated(root: Path, ledger: Ledger, *, failure=None):
             bind(chatlog, name, checked_read)
         scope.schema = {name: tool.description for name, tool in scope.registry.get("meta").tools.items()}
         scope.base = view._base_prompt()
-        scope.client = fake_client(ledger, scope, failure=failure)
+        scope.client = fake_client(ledger, scope, failure=failure) if client is None else client
         bind(llm, "client", scope.client)
 
         def say(body, destination):
@@ -204,7 +211,7 @@ def isolated(root: Path, ledger: Ledger, *, failure=None):
             if destination not in {tuple(item["window"]) for item in scope.opened}:
                 raise RuntimeError("say destination has not opened")
             number = -len(scope.echoes) - 1
-            event = event_for({"id": number, "stamp": clock.now, "window": destination, "name": "Synthetic Bot"}, body=body, sender=9)
+            event = event_for({"id": number, "stamp": clock.now, "window": destination, "name": bot["name"]}, body=body, sender=bot["id"])
             event["post_type"] = "message_sent"
             if failure == "echo-write-none":
                 with patch.object(chatlog, "write", return_value=None):
