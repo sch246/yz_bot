@@ -28,7 +28,7 @@ SCENARIOS = ('normal', 'zero', 'budget', 'cancel-before', 'cancel-after-read', '
              'missing', 'conflict', 'overreport', 'connection', 'length', 'reserve-fsync', 'settle-fsync',
              'request-evidence-failure', 'receipt-failure', 'read-receipt-failure', 'resolve-receipt-failure',
              'bad-input-hash', 'unknown-reference', 'future-read', 'expired-reference', 'malformed-final',
-             'situation-limit', 'reference-limit', 'read-limit', 'request-limit', 'bytes-limit', 'bad-note-hash', 'resolve-bad-hash', 'chat-result-failure', 'chat-receipt-failure')
+             'situation-limit', 'reference-limit', 'read-limit', 'request-limit', 'bytes-limit', 'bad-note-hash', 'resolve-bad-hash', 'chat-result-failure', 'chat-receipt-failure', 'terminal-failure')
 
 
 def sha(raw):
@@ -114,7 +114,7 @@ class SelectorClient(ClosedClient):
         else:
             choice = {'situation': 'Fixture inference only; exact evidence follows separately.',
                       'references': [] if scenario == 'zero' else ids + ['note-v1'], 'input_hash': context['input_hash']}
-            if scenario == 'bad-input-hash': choice['input_hash'] = '0' * 64
+            if scenario in {'bad-input-hash', 'terminal-failure'}: choice['input_hash'] = '0' * 64
             if scenario in {'unknown-reference', 'expired-reference'}:
                 choice['references'] = ['missing' if scenario == 'unknown-reference' else 'hidden-expired']
             if scenario == 'situation-limit': choice['situation'] = 'x' * (LIMITS['situation_bytes'] + 1)
@@ -148,6 +148,11 @@ def run(output, scenario='normal'):
     durable(root / 'manifest.json', manifest)
     client = SelectorClient(root, manifest, scenario)
     receipts, failure, guard_closed = [], None, None
+    terminal_failure = None
+    def actual_request_ids(wake_id):
+        sent = {v['request_id'] for v in client.trace if v['event'] == 'mock'}
+        return [v['request_id'] for v in client.exchanges if v['request_id'] in sent
+                and client.saved[v['request_id']]['attribution']['task_id'] == wake_id]
     selection, bundle, receipt = None, None, None
     try:
         for wake in wakes[:2]:
@@ -204,9 +209,7 @@ def run(output, scenario='normal'):
                     save_receipt(client, receipt_path, receipt)
             else:
                 save_receipt(client, receipt_path, receipt)
-            request_ids = [v['envelope']['request_id'] for v in client.saved.values()
-                           if v['attribution']['task_id'] == wake['id']]
-            finish_wake(root, wake['id'], 'complete', request_ids)
+            finish_wake(root, wake['id'], 'complete', actual_request_ids(wake['id']))
     except Exception as error:
         failure = {'type': type(error).__name__, 'reason': str(error)}
         close_wake(client, 'selector-session-failure')
@@ -221,6 +224,19 @@ def run(output, scenario='normal'):
             # Failure evidence uses a separate sink; the deliberately failing
             # receipt was never permission to continue the wake.
             durable(root / 'failed-selector.json', receipt)
+        try:
+            status = 'cancelled' if scenario.startswith('cancel-') else 'failed'
+            if scenario == 'terminal-failure':
+                def fail_terminal(path, value):
+                    if path.parent.name == 'commits':
+                        raise OSError('synthetic terminal commit failure')
+                    return durable(path, value)
+                with patch('stateless_loop.durable', side_effect=fail_terminal):
+                    finish_wake(root, wake['id'], status, actual_request_ids(wake['id']), reason=failure['type'])
+            else:
+                finish_wake(root, wake['id'], status, actual_request_ids(wake['id']), reason=failure['type'])
+        except (OSError, ValueError, KeyError) as terminal_error:
+            terminal_failure = {'type': type(terminal_error).__name__, 'reason': str(terminal_error)}
         before = (client.attempts, len(client.ledger.state['requests']), len(client.trace))
         client.current = {'role': 'chat', 'wake': 'blocked', 'snapshot_id': 'blocked'}
         try:
@@ -236,8 +252,13 @@ def run(output, scenario='normal'):
         costs = client.projection()
     except ValueError as error:
         costs = {'error': str(error)}
+    try:
+        recovered, recovery_failure = recover_commits(root), None
+    except (OSError, ValueError, KeyError) as recovery_error:
+        recovered, recovery_failure = None, str(recovery_error)
     result = {'schema': 'stateless-selector-result-v1', 'status': 'stopped' if failure else 'complete',
               'failure': failure, 'scenario': scenario, 'attempts': client.attempts, 'settlements': client.settlements,
+              'terminal_failure': terminal_failure, 'recovery': recovered, 'recovery_failure': recovery_failure,
               'shared_guard_closed': guard_closed, 'receipts': receipts, 'trace': client.trace,
               'ledger': client.ledger.state, 'costs': costs,
               'request_roles': [client.saved[v['request_id']]['attribution']['role_id'] for v in client.exchanges],
@@ -261,6 +282,8 @@ def doctor(root):
                 assert report['status'] == 'complete'
                 assert report['selector_chat_objects_distinct'] and report['messages_objects_distinct']
                 assert report['attempts'] == (8 if scenario == 'normal' else 6)
+                assert not report['terminal_failure'] and not report['recovery_failure']
+                assert {k: v['status'] for k, v in report['recovery']['terminals'].items()} == {'wake-alpha': 'complete', 'wake-beta': 'complete'}
                 for receipt in report['receipts']:
                     assert len(receipt['events']) > 3 and receipt['selector_request_ids']
                     assert receipt['note_resolver_calls_after_freeze'] == 0
@@ -288,8 +311,23 @@ def doctor(root):
                 if scenario in {'chat-result-failure', 'chat-receipt-failure'}:
                     assert 'chat' in report['request_roles']
                     assert all(v['status'] == 'injected' for v in report['receipts'][0]['consumption'])
+                    recovered = report['recovery']
+                    assert not report['terminal_failure'] and not report['recovery_failure']
+                    assert recovered['acknowledged'] == ['wake-alpha']
+                    terminal = recovered['terminals']['wake-alpha']
+                    sent = [v['request_id'] for v in report['trace'] if v['event'] == 'mock']
+                    assert terminal['status'] == 'failed' and terminal['request_ids'] == sent
+                    assert terminal['cutoff_head'] == recovered['records'][-1]['previous']
+                    if scenario == 'chat-result-failure':
+                        assert list(recovered['actions'].values()) == ['unknown', 'not-dispatched']
+                    assert recovered['automatic_requests'] == recovered['automatic_tools'] == 0
+                    passed(scenario + ': recovered failed terminal exact request cutoff and no replay')
                 else:
                     assert 'chat' not in report['request_roles']
+                if scenario == 'terminal-failure':
+                    assert report['terminal_failure']['reason'] == 'synthetic terminal commit failure'
+                    assert report['recovery_failure'] == 'commit persistence unknown/residual tail'
+                    passed('terminal failure preserved separately; no fabricated cutoff or replay')
                 if scenario == 'budget':
                     assert report['attempts'] == 2
                     assert all(v['status'] == 'selected-not-injected' for v in report['receipts'][0]['consumption'])
