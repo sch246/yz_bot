@@ -652,7 +652,7 @@ def doctor(root):
     return result
 
 
-JOINT_CASES = ('active', 'main-wins', 'background-wins', 'same-batch', 'cancel-background',
+JOINT_CASES = ('active', 'main-wins', 'background-wins', 'same-batch', 'confirmed-result', 'cancel-background',
                'notes-unknown', 'ledger-unknown', 'commit-unknown', 'result-unknown',
                'output-unknown', 'terminal-unknown', 'usage-background', 'budget-background')
 
@@ -785,6 +785,17 @@ def run_joint_session(output, *, case='active'):
             materials = tuple(bundle['materials'])
             main = plan('# Gate\nCOMMITTED_B: use red\r\n', same_batch=case == 'same-batch')
             background = plan('# Gate\nBACKGROUND_C: independently reconsider blue\n')
+            if case == 'confirmed-result':
+                def main(messages, round_number):
+                    if round_number == 1:
+                        ref = json.loads(messages[1]['content'])['screen']['records'][-1]['ref']
+                        return {'role': 'assistant', 'content': '', 'tool_calls': [tool('read_reference', ref, 1)]}
+                    if round_number == 2:
+                        previous_call = next(v for v in messages if v.get('tool_calls'))['tool_calls'][0]['id']
+                        args = revision('# Gate\nCOMMITTED_B: use red\r\n', messages, claim='success', sources=['tool:' + previous_call])
+                        return {'role': 'assistant', 'content': 'fixture confirmed read, not gate action', 'tool_calls': [
+                            tool('revise_note', args, 1), tool('read_note', {'key': keys[0]}, 2)]}
+                    return {'role': 'assistant', 'content': 'FIXTURE_FINISHED'}
             fired = [False]
             def interleave(output, process):
                 if fired[0]:
@@ -863,6 +874,12 @@ def run_joint_session(output, *, case='active'):
                     else:
                         blocked[role] = False
                 seen['all_roles_blocked'] = blocked
+                try:
+                    client.guard_tools()
+                except (ValueError, RuntimeError):
+                    seen['tools_blocked'] = True
+                else:
+                    seen['tools_blocked'] = False
             client.close()
         try:
             recovered, recovery_error = recover_commits(loop), None
@@ -895,7 +912,7 @@ def joint_doctor(root):
         for case in JOINT_CASES:
             report = run_joint_session(root / case, case=case)
             cases[case] = report
-            if case in {'active', 'main-wins', 'background-wins', 'same-batch'}:
+            if case in {'active', 'main-wins', 'background-wins', 'same-batch', 'confirmed-result'}:
                 assert report['status'] == 'complete', report['failure']
                 assert report['chat_objects_unique'] and report['messages_objects_unique']
                 state = report['recovery']
@@ -914,6 +931,9 @@ def joint_doctor(root):
                 assert all(ids[v['envelope']['request_id']]['request_sha256'] == digest(v['envelope']) for v in wire)
                 feedback = [v for v in wire if v['attribution']['task_id'] == 'joint-2']
                 assert any(v['attribution']['role_id'] == 'selector' for v in feedback)
+                assert b'ENVIRONMENT_3' not in canonical(feedback)
+                initial_wire = [v for v in wire if v['attribution']['task_id'] == 'joint-1']
+                assert b'ENVIRONMENT_2' not in canonical(initial_wire) and b'ENVIRONMENT_3' not in canonical(initial_wire)
                 if case in {'main-wins', 'background-wins'}:
                     assert any(v['attribution']['role_id'] == 'librarian' for v in feedback)
                     assert any(v['status'] == 'failed' for v in state['results'].values())
@@ -950,7 +970,7 @@ def joint_doctor(root):
                                    'same_wake_consumption_requests': exposed, 'requests': len(rows)})
             else:
                 assert report['failure'], case
-                assert all(report['seen']['all_roles_blocked'].values()), case
+                assert all(report['seen']['all_roles_blocked'].values()) and report['seen']['tools_blocked'], case
                 assert report['ledger']['closed'] or case == 'ledger-unknown'
                 assertions.append({'case': case, 'assertion': 'all-roles-stop-no-retry-after-cancel-unknown-budget-or-usage',
                                    'attempts': report['attempts']})

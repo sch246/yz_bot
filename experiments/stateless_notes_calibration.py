@@ -394,9 +394,22 @@ def doctor(root):
                 other.future_reference = {'source_alias': future['source_alias'], 'event_key': future['event_key']}
             try:
                 other.ledger.wake()
+                # T13 now closes the shared session immediately on failure,
+                # rather than waiting for its caller to append a terminal.
+                # Capture the legal pre-failure candidate at output persistence.
+                ready = {}
+                original_append = stateless_loop.append_commit
+                def capture(folder_arg, kind, value, **kwargs):
+                    row = original_append(folder_arg, kind, value, **kwargs)
+                    if kind == 'output':
+                        registered = writer.register_trigger(folder, wakes[0]['id'], first, allowed_keys=keys)
+                        task = writer.admit_trigger(registered['id'], folder, first, through_output=value['id'])
+                        ready['candidate'] = candidate(task, b'before failure', writer=writer)
+                    return row
                 try:
-                    outcome = drive_wake(first, wakes[0], [wakes[0]], folder, other, scenario=scenario,
-                        materials=(writer.freeze_baseline('global/main', first, allowed_keys=keys),))
+                    with patch.object(stateless_loop, 'append_commit', capture):
+                        outcome = drive_wake(first, wakes[0], [wakes[0]], folder, other, scenario=scenario,
+                            materials=(writer.freeze_baseline('global/main', first, allowed_keys=keys),))
                     status = 'cancelled' if outcome['cancelled'] else 'complete'
                 except (ValueError, RuntimeError, OSError):
                     status = 'failed'
@@ -404,7 +417,7 @@ def doctor(root):
                 assert set(journal['actions'].values()) == expected
                 registered = writer.register_trigger(folder, wakes[0]['id'], first, allowed_keys=keys)
                 task = writer.admit_trigger(registered['id'], folder, first, through_output=next(iter(journal['outputs'])))
-                ready = candidate(task, b'before failure', writer=writer)
+                ready = ready['candidate']
                 finish_wake(folder, wakes[0]['id'], status, list(other.saved))
                 assert writer.commit_candidate(ready)['status'] == 'rejected'
                 _reject(lambda: candidate(task, b'after failure', writer=writer), 'writes closed')

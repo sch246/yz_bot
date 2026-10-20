@@ -280,7 +280,11 @@ def note_source_handles(cutoff):
     The model selects coordinates it actually received, not post-output hashes.
     Generated self is an expression source, never proof of external success.
     """
-    values = {}
+    values, tool_ids = {}, {}
+    for item in cutoff['exposures'].values():
+        if item['kind'] == 'generated':
+            for index, call in enumerate(item['assistant'].get('tool_calls', []), 1):
+                tool_ids[item['output_id'] + '#' + str(index)] = call['id']
     for identity, item in cutoff['exposures'].items():
         kind = item['kind']
         handle = None
@@ -294,6 +298,8 @@ def note_source_handles(cutoff):
             handle = 'action:' + item['action']
         if handle:
             values.setdefault(handle, []).append(identity)
+            if kind == 'execution' and item['action'] in tool_ids:
+                values.setdefault('tool:' + tool_ids[item['action']], []).append(identity)
     return values
 
 
@@ -311,6 +317,9 @@ def drive_wake(snapshot, wake, wakes, root, client, *, references=(), actions=()
         if scenario == 'construct-failure':
             raise ValueError('synthetic screen construction failure')
         root = Path(root)
+        materials = tuple(deepcopy(item) for item in materials)
+        note_keys = tuple(note_keys)
+        note_aliases = deepcopy(note_aliases) if note_aliases is not None else None
         screen = build_screen(snapshot, wake)
         state = recover_commits(root)
         if wake['id'] in state['terminals']:
@@ -337,7 +346,7 @@ def drive_wake(snapshot, wake, wakes, root, client, *, references=(), actions=()
                    'selector_inference material is inference, not evidence.')
     if notes:
         instruction += (' Note revision sources use visible coordinates: record:<source_alias>:<event_key>, '
-                        'material:<source_id>:<version_id>, action:<output_id>#<position>, generated:self '
+                        'material:<source_id>:<version_id>, action:<output_id>#<position>, tool:<tool_call_id>, generated:self '
                         'or generated:<output_id>. Baselines are harness file state, not statement sources. '
                         'generated:self supports expression or intent, never external success. '
                         'Use read_note to receive exact current bytes; a revision status is not a read. '
@@ -468,8 +477,12 @@ def drive_wake(snapshot, wake, wakes, root, client, *, references=(), actions=()
         return execute(revise)
 
     functions = [read_reference] + ([read_note, revise_note] if notes else [])
-    chat = llm.Chat(model=client.config['default_model'], messages=messages,
-                    functions=functions, chat_client=client, do_process_image=False)
+    try:
+        chat = llm.Chat(model=client.config['default_model'], messages=messages,
+                        functions=functions, chat_client=client, do_process_image=False)
+    except BaseException:
+        close_session(client, 'chat-construction-failure')
+        raise
     chat.fail_fast = chat.preserve_native = True
     chat.on_output = persist_output
     chat.should_stop = should_stop

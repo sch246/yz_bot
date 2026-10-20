@@ -590,13 +590,15 @@ historical messages through that argument.
 `run_synthetic_session(..., materials_by_wake={wake_id: [...]})` and
 `drive_wake(..., materials=())` also accept explicit frozen material values with
 exactly `kind`, `source_id`, `version_id`, `snapshot_id`, `sha256` and `raw`
-(bytes). `kind` is `note` or `selector_inference`. The loop copies the values,
+(bytes). `kind` is `note`, `note_baseline` or `selector_inference`. A note baseline is
+harness file-state evidence, including absence/tombstones; it is not note content
+or a model inference. The loop copies the values,
 checks their byte hash, strict UTF-8, current snapshot and nonempty source/version
 labels, then puts exact decoded text in `selected.materials`. Selector inference
 is labelled `inference-not-evidence` in the material and in the stable instruction;
 it is not promoted to source evidence. Paths, arbitrary messages and extra fields
 are refused. The producing selector/note slice must establish directory, version,
-scope and terminal-cutoff legality; this loop does not own those stores. The
+scope and source-cutoff legality; this loop does not own those stores. The
 built-in `materials` scenario checks exact note and inference bytes in both actual
 first-request wire bodies. Every final body still passes the same common guard.
 
@@ -623,8 +625,9 @@ run; overreported usage is charged and stops it. Length, connection, cancellatio
 request-evidence and reserve/settle persistence failures release no tools.
 A different role cannot bypass the shared stop. Within a wake, the next actual
 wire retains native assistant reasoning and matching tool-call IDs/results.
-The only tool reads one complete snapshot-qualified original record. An unopened
-reference fails, records a known refusal and stops the following tool.
+The base fixture exposes a tool reading one complete snapshot-qualified original
+record. An unopened reference fails, records a known refusal and stops the
+following tool. Optional note tools and background Chats are described below.
 
 The first complete output commit contains its frozen screen, boundary, wake
 facts and acknowledgement together. It never rereads the current archive tail.
@@ -662,8 +665,106 @@ context. The normal fixture makes four mock requests and settles 480 synthetic
 tokens cumulatively. A separate two-attempt common ceiling refuses the second
 wake before its mock request.
 
-This is request-isolation, accounting and commit-boundary evidence. It has no
-real selector or librarian output, note/Skill revisions, production scheduling,
-actual provider acceptance, semantic memory result, or complete D10 acceptance.
-The selector and librarian remain separate future slices; fixed fixture choices
-do not establish their quality.
+The base two-wake fixture establishes request isolation, accounting and commit
+boundaries. The joint fixture below adds actual selector/background requests and
+note revisions. Neither establishes real model quality, production scheduling,
+provider acceptance, semantic memory benefit or complete D10 acceptance.
+
+
+## Synthetic joint note loop
+
+The same [`stateless_calibration.py`](stateless_calibration.py) entry can drive
+native note tools and optional independent background Chats through the installed
+SDK/parser and its closed MockTransport:
+
+```sh
+uv run --frozen python experiments/stateless_calibration.py joint-doctor --output /tmp/new-joint-doctor
+uv run --frozen python experiments/stateless_calibration.py joint-run --output /tmp/new-joint-session
+uv run --frozen python experiments/stateless_calibration.py joint-run --case main-wins --output /tmp/new-joint-race
+```
+
+These commands require a new external root. They accept only built-in fictional
+fixtures: no real model, credentials, archive, endpoint or paid option. The older
+`run` and `doctor` retain their two-wake reference fixture and failure checks.
+`joint-doctor` additionally exercises active note revision, both stale-write
+orders, same-batch source/parent refusal, background cancellation, usage/common
+budget refusal and note/Ledger/output/result/terminal persistence unknown.
+Failed runs retain their original evidence and exit 1.
+
+`drive_wake(..., notes=None, note_keys=(), note_aliases=None, process="main",
+after_output=None, cancelled=...)` deepens the existing loop. Passing the existing
+[`NoteWriter`](stateless_notes.py) and an explicit key allowlist enables
+`revise_note` and `read_note` alongside `read_reference`. Before generation,
+keys without a supplied frozen note receive an exact `freeze_baseline` material;
+held frozen content keeps its own parent. Alias mappings are frozen caller
+scope bindings, not model authority. The fixture manifest records their hash.
+
+`revise_note(key, body, reason, expectation, sources, claim="draft")` takes
+Markdown and provenance choices from actual model tool arguments. Public source
+coordinates are `record:<source_alias>:<event_key>`,
+`material:<source_id>:<version_id>`, `action:<output_id>#<position>`,
+`tool:<tool_call_id>` for a native result already in input, and
+`generated:self` or `generated:<output_id>`. The harness maps only coordinates in
+the generating output's admitted cutoff to T12 source identities. It does not
+ask the model to guess hashes created after that output. Baselines cannot support
+factual statements; generated expression cannot prove external success. A
+`success` claim needs a completed action result actually present in the input.
+
+The complete assistant output is committed before any tool dispatch. Each note
+revision registers/adopts that exact output cutoff and uses T12's single
+prepare/commit entry with its actual process, generator and exposed parent.
+Known source/scope/stale refusals remain typed failed results that the Chat can
+read and reconsider. A persistence failure closes the common session immediately.
+Revision status, including an ancestor/no-op version, never becomes a current
+note read. `read_note` returns exact `{"note_material": {...}}` bytes/hash/version,
+or a harness baseline for absence/tombstone. Only a later actual request carrying
+that native result establishes the new parent and content exposure. A preceding
+tool in the same batch has not yet entered the generating request.
+
+`process="background"` creates a separate Chat with new messages. An optional
+`after_output(output_id, process)` caller hook can run that independent Chat
+before the outer Chat's tools; the outer output is already durable. This is a
+small synchronous composition seam, not a scheduler or concurrency claim.
+Nested calls save/restore request attribution. Each actual Chat gets a host
+`chat_id`; outputs record its first-output flag and process with request/context
+hashes. The existing journal validates identity continuity, rejects reuse or
+wake/snapshot/process drift, and allocates unique shared output IDs. Model text,
+role names and provider call IDs do not establish Chat identity. Notes match
+native history only within the generating Chat; ambiguous legacy history without
+an identity is refused rather than assigned by equal text.
+
+All requests and tools use the original shared Ledger and guard. Cancellation,
+unknown persistence and exceptional tools close every role before another
+request/tool; closing first checks disk integrity so damaged originals are not
+overwritten by in-memory state. `finish_wake(..., client=client)` also closes that
+same domain if terminal persistence fails. Read-only recovery does not construct
+a client, replay a tool or repair an unknown result. Existing failed roots are
+not resumable checkpoints.
+
+The joint fixture has three finite wakes. A separately declared environment
+changes its fictional gate rule from blue to red, then reports no further change.
+The fake model emits the predeclared body/reason/source choices through actual
+SDK responses; these are fixture choices, not model autonomy or self-assessment.
+An optional selector chooses frozen A, a main Chat revises and explicitly reads
+B before terminal, and later same-wake HTTP bodies consume exact B while selected
+A stays unchanged. The next wake reconstructs from committed notes/actions with
+new messages and leaves the note alone. That quiet wake makes one Chat request,
+without a compulsory selector or background request. Race fixtures give both
+processes their own request/output and reject the stale producer; only a fresh
+read and output can rebase it.
+
+Each joint run freezes one synthetic limit envelope (three wakes, sixteen
+attempts, 4096 output each, 65536 cumulative allowance), shared across all roles;
+it never resets or splits a balance by role. Original synthetic price/context
+policy remains explicit and does not authorize paid use. Manifests freeze source,
+schedule, environment, limits, mapping and code hashes. Results retain full role
+request order, settlements/costs, outputs, native results, frozen A/new current
+material, failures and read-only recovery. Fixture choices, serial interleaving,
+cooperative locks and injected IO faults establish neither real semantic quality,
+threaded throughput, physical power-loss safety nor production readiness.
+
+Future simulated-action tools can reuse the local `execute` function in
+`drive_wake`, which owns guard → dispatch → operation → result. Adding such a tool
+requires ownership of that local function/registration seam in `stateless_loop.py`;
+it must use the existing output/action journal. No second action log or general
+tool scheduling framework is provided here.
