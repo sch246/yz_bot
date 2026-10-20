@@ -640,7 +640,8 @@ class NoteWriter:
         saved = json.loads(_path(loop_root, 'ledger.json').read_bytes())
         # Reuse Ledger's read-only reopen validation, including unknown IO,
         # reservations and settlement failures; never reset or write a budget.
-        manifest = json.loads(_path(loop_root, 'manifest.json').read_bytes())
+        manifest_path = _path(loop_root, 'manifest.json')
+        manifest = json.loads(manifest_path.read_bytes()) if manifest_path.exists() else {}
         schema = manifest.get('schema', '')
         if schema in {'stateless-capacity-manifest-v1', 'stateless-official-manifest-v1'}:
             import stateless_capacity_client as capacity
