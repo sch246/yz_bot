@@ -858,9 +858,11 @@ python experiments/subject_probe.py verify --root /absolute/new/external/root
 python experiments/subject_probe.py run --root /absolute/new/external/root --credential-stdin
 ```
 
-Never put a credential in command arguments, files or environment variables.
-The run command checks readiness before reading stdin; prepare/verify/recover
-never read it. Each wake and each tool rechecks frozen source/material hashes.
+Never put a credential in command arguments, environment variables, run artifacts
+or logs. An operator may temporarily supply stdin from an explicitly authorized
+private credential source; using a private key file depends on that authorization.
+The CLI accepts stdin only and never discovers credential files. The run command
+checks readiness before reading stdin; prepare/verify/recover never read it. Each wake and each tool rechecks frozen source/material hashes.
 The OfficialClient's permanent execute-once claim and common Ledger guards stay
 in force. Cancellation, missing usage, budget refusal and unknown note, action,
 external effect or result persistence close the shared session. Recovery is
