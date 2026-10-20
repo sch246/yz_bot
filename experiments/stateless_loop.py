@@ -1,6 +1,7 @@
 """Synthetic fresh-context loop and read-only action-commit recovery.
 
-No production lifecycle, archive path import, model transport, or note writer.
+No production lifecycle, archive path import or model transport. Optional note
+tools use the existing NoteWriter; this module owns no note versions or budget.
 The snapshot is private control data; only resolved visible records enter Chat.
 """
 from __future__ import annotations
@@ -241,91 +242,246 @@ def append_commit(root, kind, value, *, fault=None):
     return row
 
 
-def drive_wake(snapshot, wake, wakes, root, client, *, references=(), actions=(), materials=(), scenario='normal'):
-    """One new Chat; same-wake native pairs live only inside this invocation."""
-    if scenario == 'construct-failure':
-        raise ValueError('synthetic screen construction failure')
-    screen = build_screen(snapshot, wake)
-    state = recover_commits(root)
-    material = selected_context(snapshot, references, actions, state, materials)
-    generation = state['generation'] + 1
+def close_session(client, reason):
+    """Close the one shared Ledger, preserving damaged/unknown originals."""
+    if client.ledger.poisoned or client.ledger.state['closed']:
+        return
+    try:
+        # WHY: stop() writes. Never overwrite corrupt disk evidence with the
+        # in-memory projection while trying to report a different failure.
+        client.projection()
+        client.ledger.stop(reason)
+    except BaseException:
+        client.ledger.poisoned = True
+
+
+def note_source_handles(cutoff):
+    """Public source coordinates map only to this output's verified exposure.
+
+    The model selects coordinates it actually received, not post-output hashes.
+    Generated self is an expression source, never proof of external success.
+    """
+    values = {}
+    for identity, item in cutoff['exposures'].items():
+        kind = item['kind']
+        handle = None
+        if kind == 'record':
+            handle = 'record:' + item['ref']['source_alias'] + ':' + item['ref']['event_key']
+        elif kind == 'material':
+            handle = 'material:' + item['source_id'] + ':' + item['version_id']
+        elif kind == 'generated':
+            handle = 'generated:' + ('self' if item['output_id'] == cutoff['output_id'] else item['output_id'])
+        elif kind == 'execution' and item['visibility'] == 'actual-request':
+            handle = 'action:' + item['action']
+        if handle:
+            values.setdefault(handle, []).append(identity)
+    return values
+
+
+def drive_wake(snapshot, wake, wakes, root, client, *, references=(), actions=(), materials=(), scenario='normal',
+               notes=None, note_keys=(), note_aliases=None, process='main', after_output=None, cancelled=lambda: False):
+    """A fresh main/background Chat, optionally interleaved before terminal.
+
+    after_output is an explicit caller seam for a second independent Chat;
+    generation never holds a note lock. All outputs use the existing journal's
+    shared sequence, even when a nested Chat finishes before this Chat's tools.
+    """
+    if process not in {'main', 'background'} or (note_keys and notes is None):
+        raise ValueError('explicit process and note writer required')
+    try:
+        if scenario == 'construct-failure':
+            raise ValueError('synthetic screen construction failure')
+        root = Path(root)
+        screen = build_screen(snapshot, wake)
+        state = recover_commits(root)
+        if wake['id'] in state['terminals']:
+            raise ValueError('wake already terminal')
+        existing = [v for v in state['outputs'].values() if v['wake_id'] == wake['id']]
+        if existing and (existing[-1]['snapshot_id'] != snapshot['snapshot_id']
+                         or existing[-1]['generation'] != state['generation']):
+            raise ValueError('wake is no longer the active snapshot/generation')
+        generation = state['generation'] if existing else state['generation'] + 1
+        client.guard_tools()
+        exposed_notes = {(note_aliases or {}).get(item['source_id'], item['source_id'])
+                         for item in materials if item['kind'] == 'note'}
+        baselines = tuple(notes.freeze_baseline(key, snapshot, allowed_keys=note_keys)
+                          for key in note_keys if key not in exposed_notes) if notes else ()
+        material = selected_context(snapshot, references, actions, state, tuple(materials) + baselines)
+    except BaseException:
+        close_session(client, 'context-failure')
+        raise
     covered = [item['id'] for item in wakes if item['cursor'] <= wake['cursor']
                and item['window'] == wake['window']
                and item['event_key'] in {record['ref']['event_key'] for record in screen['records']}
                and item['id'] not in state['acknowledged']]
-    messages = [{'role': 'system', 'content': 'Fictional archive calibration. Read only snapshot-qualified references. selector_inference material is inference, not evidence.'},
+    instruction = ('Fictional archive calibration. Read only snapshot-qualified references. '
+                   'selector_inference material is inference, not evidence.')
+    if notes:
+        instruction += (' Note revision sources use visible coordinates: record:<source_alias>:<event_key>, '
+                        'material:<source_id>:<version_id>, action:<output_id>#<position>, generated:self '
+                        'or generated:<output_id>. Baselines are harness file state, not statement sources. '
+                        'generated:self supports expression or intent, never external success. '
+                        'Use read_note to receive exact current bytes; a revision status is not a read. '
+                        'A result from another tool in the same batch is not yet in your input.')
+    messages = [{'role': 'system', 'content': instruction},
                 {'role': 'user', 'content': canonical({'wake': {k: wake[k] for k in ('id', 'reason', 'window')},
                     'screen': screen, 'selected': material}).decode()}]
-    stopped = [False]
-    first = [True]
-    output_ids = []
-    tool_count = [0]
+    stopped, output_ids, tool_count = [False], [], [0]
     chat = None
+    previous_current = client.current
+    attribution = {'role': 'chat' if process == 'main' else 'librarian',
+                   'wake': wake['id'], 'snapshot_id': snapshot['snapshot_id']}
+
+    def should_stop():
+        if stopped[0] or cancelled():
+            stopped[0] = True
+            close_session(client, 'cancelled')
+        return stopped[0]
+
+    def guard():
+        if should_stop():
+            raise RuntimeError('cancelled before tool/request')
+        client.guard_tools()
+        recover_commits(root)
+        if notes and (notes.poisoned or (notes.root / 'persistence-unknown.json').exists()
+                      or any(notes.root.rglob('*.new'))):
+            raise RuntimeError('note persistence unknown; session closed')
 
     def persist_output(assistant, calls):
-        client.guard_tools()
-        output = f"{wake['id']}/output-{len(output_ids) + 1}"
+        guard()
+        current = recover_commits(root)
+        first = not any(v['wake_id'] == wake['id'] for v in current['outputs'].values())
+        output = f"{wake['id']}/output-{1 + sum(v['wake_id'] == wake['id'] for v in current['outputs'].values())}"
         value = {'id': output, 'wake_id': wake['id'], 'snapshot_id': snapshot['snapshot_id'],
                  'generation': generation, 'parent_generation': generation - 1,
                  'request_id': client.ledger.state['requests'][-1]['id'], 'context_sha256': digest(client.exchanges[-1]['body']['messages']),
-                 'screen': screen if first[0] else None, 'covered_wakes': covered if first[0] else [],
-                 'acknowledged': covered if first[0] else [],
-                 'wake_facts': [dict(item) for item in wakes if item['id'] in covered] if first[0] else [],
+                 'screen': screen if first else None, 'covered_wakes': covered if first else [],
+                 'acknowledged': covered if first else [],
+                 'wake_facts': [dict(item) for item in wakes if item['id'] in covered] if first else [],
                  'assistant': {k: deepcopy(v) for k, v in assistant.items() if k != 'reasoning_content'}}
         fault = {'output-failure': 'before', 'output-flush': 'flush', 'output-fsync': 'fsync',
-                 'output-after-rename': 'after-rename'}.get(scenario) if first[0] else None
+                 'output-after-rename': 'after-rename'}.get(scenario) if first else None
         append_commit(root, 'output', value, fault=fault)
-        client.trace.append({'event': 'output-commit', 'output': output})
+        client.trace.append({'event': 'output-commit', 'output': output, 'request_id': value['request_id'], 'process': process})
         output_ids.append(output)
-        first[0] = False
         if scenario in {'stop-before-tool', 'cancel-before-tool'}:
             stopped[0] = True
+            close_session(client, 'cancelled')
+        elif after_output:
+            after_output(output, process)
         return output
+
+    def execute(function):
+        guard()
+        action = chat.active_action
+        append_commit(root, 'dispatch', {'action': action})
+        client.trace.append({'event': 'dispatch', 'action': action, 'process': process})
+        try:
+            content, status = function(action)
+        except ValueError as error:
+            append_commit(root, 'result', {'action': action, 'status': 'failed', 'error': type(error).__name__})
+            client.trace.append({'event': 'result-commit', 'action': action, 'status': 'failed'})
+            raise
+        tool_count[0] += 1
+        client.trace.append({'event': 'tool', 'action': action, 'process': process})
+        append_commit(root, 'result', {'action': action, 'content': content, 'status': status},
+                      fault='before' if scenario == 'result-failure' else None)
+        client.trace.append({'event': 'result-commit', 'action': action, 'status': status})
+        if scenario == 'cancel-after-tool':
+            stopped[0] = True
+            close_session(client, 'cancelled')
+        return content
 
     def read_reference(snapshot_id: str, source_alias: str, event_key: str) -> str:
         """Read one complete original record from this wake's frozen snapshot."""
-        if stopped[0]:
-            raise RuntimeError('cancelled before tool')
-        client.guard_tools()
-        action = chat.active_action
-        append_commit(root, 'dispatch', {'action': action})
-        client.trace.append({'event': 'dispatch', 'action': action})
-        try:
+        def read(_):
             result = resolve_ref(snapshot, {'snapshot_id': snapshot_id, 'source_alias': source_alias, 'event_key': event_key})
-        except ValueError:
-            append_commit(root, 'result', {'action': action, 'status': 'failed', 'error': 'reference-refused'})
-            client.trace.append({'event': 'result-commit', 'action': action, 'status': 'failed'})
-            raise
-        content = canonical({'ref': {'snapshot_id': snapshot_id, 'source_alias': source_alias, 'event_key': event_key},
-                             'origin': result['visible_origin'], 'sha256': result['sha256'],
-                             'raw': result['raw'].decode()}).decode()
-        tool_count[0] += 1
-        client.trace.append({'event': 'tool', 'action': action, 'raw_sha256': hashlib.sha256(result['raw']).hexdigest()})
-        append_commit(root, 'result', {'action': action, 'content': content},
-                      fault='before' if scenario == 'result-failure' else None)
-        client.trace.append({'event': 'result-commit', 'action': action})
-        if scenario == 'cancel-after-tool':
-            stopped[0] = True
-        return content
+            return canonical({'ref': {'snapshot_id': snapshot_id, 'source_alias': source_alias, 'event_key': event_key},
+                              'origin': result['visible_origin'], 'sha256': result['sha256'],
+                              'raw': result['raw'].decode()}).decode(), 'completed'
+        return execute(read)
 
+    def read_note(key: str) -> str:
+        """Read one authorized committed note, or its explicit absent/tombstone baseline."""
+        from stateless_notes import read_committed
+        def read(_):
+            if key not in note_keys:
+                raise ValueError('note scope not authorized')
+            value = read_committed(notes.root, key, snapshot, allowed_keys=note_keys)
+            if value is None:
+                value = notes.freeze_baseline(key, snapshot, allowed_keys=note_keys)
+            wire = {k: v for k, v in value.items() if k != 'raw'} | {'text': value['raw'].decode()}
+            return canonical({'note_material': wire}).decode(), 'completed'
+        return execute(read)
+
+    def revise_note(key: str, body: str, reason: str, expectation: str, sources: list[str], claim: str = 'draft') -> str:
+        """Propose exact Markdown from this output; source coordinates must be in your actual input.
+
+        claim: draft/inference/correction/observation/quote/attempt/success/failed/unknown; success needs an input action result.
+        """
+        def revise(action):
+            registered = notes.register_trigger(root, wake['id'], snapshot, allowed_keys=note_keys)
+            task = notes.admit_trigger(registered['id'], root, snapshot, through_output=action.rsplit('#', 1)[0],
+                                       note_aliases=note_aliases)
+            mapping = note_source_handles(task['cutoff'])
+            try:
+                if type(sources) is not list or any(type(source) is not str or source not in mapping for source in sources):
+                    raise ValueError('source coordinate was not exposed to generator')
+                identities = sorted({identity for source in sources for identity in mapping[source]})
+                candidate = notes.prepare_candidate(task['id'], key, body.encode(), sources=identities,
+                    reason=reason, expectation=expectation,
+                    statements=[{'kind': claim, 'text': reason, 'sources': identities}],
+                    producer={'process': process, 'basis': 'native revise_note tool arguments', 'output_id': task['cutoff']['output_id']})
+            except ValueError as error:
+                return canonical({'note_revision': {'status': 'rejected', 'reason': str(error)}}).decode(), 'failed'
+            outcome = notes.commit_candidate(candidate)
+            client.trace.append({'event': 'note-revision', 'action': action, 'candidate_id': candidate,
+                                 'task_id': task['id'], 'process': process, 'outcome': outcome})
+            # A persistence failure is never delivered as ordinary successful
+            # text. The shared Ledger closes before another Chat/tool can run.
+            if outcome['status'] == 'failed' or notes.poisoned:
+                raise RuntimeError('note persistence unknown')
+            return canonical({'note_revision': {'candidate_id': candidate, **outcome}}).decode(), (
+                'completed' if outcome['status'] in {'committed', 'no-op'} else 'failed')
+        return execute(revise)
+
+    functions = [read_reference] + ([read_note, revise_note] if notes else [])
     chat = llm.Chat(model=client.config['default_model'], messages=messages,
-                    functions=[read_reference], chat_client=client, do_process_image=False)
-    chat.fail_fast = True
-    chat.preserve_native = True
+                    functions=functions, chat_client=client, do_process_image=False)
+    chat.fail_fast = chat.preserve_native = True
     chat.on_output = persist_output
-    chat.should_stop = lambda: stopped[0]
-    # Keep references alive for object-isolation evidence; never reuse messages.
+    chat.should_stop = should_stop
+    def next_request():
+        try:
+            guard()
+        except Exception as error:
+            raise llm.RequiredContextError(str(error)) from error
+        client.current = dict(attribution)
+        return []
+    chat.add_context_provider(next_request)
     client.chats.append(chat)
-    client.current = {'wake': wake['id'], 'snapshot_id': snapshot['snapshot_id']}
-    chat.chat(stream=False)
-    return {'wake': wake['id'], 'screen': screen, 'outputs': output_ids,
+    client.current = dict(attribution)
+    try:
+        chat.chat(stream=False)
+        guard() if not stopped[0] else None
+    except BaseException:
+        close_session(client, 'session-failure')
+        raise
+    finally:
+        client.current = previous_current
+    return {'wake': wake['id'], 'process': process, 'screen': screen, 'outputs': output_ids,
             'tools': tool_count[0], 'cancelled': stopped[0]}
 
 
-def finish_wake(root, wake_id, status, request_ids, *, reason=None):
+def finish_wake(root, wake_id, status, request_ids, *, reason=None, client=None, fault=None):
     """Commit the round cutoff separately from first-output wake confirmation."""
-    state = recover_commits(root)
-    value = {'wake_id': wake_id, 'generation': state['generation'], 'status': status,
-             'request_ids': list(request_ids), 'cutoff_head': state['head'], 'reason': reason}
-    append_commit(root, 'wake-end', value)
+    try:
+        state = recover_commits(root)
+        value = {'wake_id': wake_id, 'generation': state['generation'], 'status': status,
+                 'request_ids': list(request_ids), 'cutoff_head': state['head'], 'reason': reason}
+        append_commit(root, 'wake-end', value, fault=fault)
+    except BaseException:
+        if client is not None:
+            close_session(client, 'terminal-persistence-failure')
+        raise
     return value

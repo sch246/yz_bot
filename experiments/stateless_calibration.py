@@ -24,7 +24,7 @@ from a0_ledger import LIMITS, PRICES, Ledger, canonical, digest, durable
 from a0_sdk_calibration import no_sdk_environment, normalize_usage
 from comparison_budget import STAGES, project_costs, admit_request
 from comparison_snapshot import freeze_sources, open_snapshot, resolve_ref, _safe_root
-from stateless_loop import build_screen, drive_wake, recover_commits, finish_wake, material_values, selected_context
+from stateless_loop import build_screen, drive_wake, recover_commits, finish_wake, material_values, selected_context, close_session
 from mods import llm
 import httpx
 import openai
@@ -76,7 +76,8 @@ def code_hashes():
     repo = Path(__file__).resolve().parents[1]
     files = sorted((repo / 'mods').rglob('*.py')) + [repo / 'experiments' / name for name in (
         'stateless_loop.py', 'stateless_calibration.py', 'comparison_snapshot.py', 'comparison_budget.py',
-        'a0_ledger.py', 'a0_sdk_calibration.py', 'a0_calibration.py', 'memory_replay.py')]
+        'a0_ledger.py', 'a0_sdk_calibration.py', 'a0_calibration.py', 'memory_replay.py',
+        'stateless_notes.py', 'stateless_selector.py')]
     return {str(path.relative_to(repo)): hashlib.sha256(path.read_bytes()).hexdigest() for path in files}
 
 
@@ -106,6 +107,8 @@ class ClosedClient(llm.LLMClient):
         self.clients = {'deepseek': SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=self._create)))}
 
     def projection(self):
+        if self.ledger.poisoned or any((self.root / name).exists() for name in ('persistence-unknown.json', 'ledger.json.new')):
+            raise ValueError('Ledger persistence unknown')
         disk = json.loads((self.root / 'ledger.json').read_bytes())
         if disk != {'state': self.ledger.state, 'sha256': digest(self.ledger.state)}:
             raise ValueError('fresh Ledger disk/memory drift')
@@ -186,6 +189,19 @@ class ClosedClient(llm.LLMClient):
         if self.scenario == 'connection':
             raise httpx.ConnectError('synthetic connection failure', request=request)
         messages = json.loads(request.content)['messages']
+        message = self.fixture_message(messages)
+        usage = {'prompt_tokens': 100, 'completion_tokens': 20, 'total_tokens': 120, 'prompt_cache_hit_tokens': 40}
+        if self.scenario == 'missing':
+            usage = None
+        elif self.scenario == 'conflict':
+            usage['prompt_tokens_details'] = {'cached_tokens': 41}
+        elif self.scenario == 'overreport':
+            usage.update(completion_tokens=4097, total_tokens=4197)
+        return httpx.Response(200, json={'id': 'synthetic-completion', 'object': 'chat.completion', 'created': 1767225600,
+            'model': WIRE_MODEL, 'choices': [{'index': 0, 'finish_reason': 'length' if self.scenario == 'length' else
+                'tool_calls' if message.get('tool_calls') else 'stop', 'message': message}], 'usage': usage})
+
+    def fixture_message(self, messages):
         initial = not any(item['role'] == 'tool' for item in messages)
         if initial:
             context = json.loads(messages[1]['content'])
@@ -198,16 +214,7 @@ class ClosedClient(llm.LLMClient):
         else:
             message = {'role': 'assistant', 'content': f"COMPLETED_{self.current['wake']}",
                        'reasoning_content': f"FINAL_EPHEMERAL_{self.current['wake']}"}
-        usage = {'prompt_tokens': 100, 'completion_tokens': 20, 'total_tokens': 120, 'prompt_cache_hit_tokens': 40}
-        if self.scenario == 'missing':
-            usage = None
-        elif self.scenario == 'conflict':
-            usage['prompt_tokens_details'] = {'cached_tokens': 41}
-        elif self.scenario == 'overreport':
-            usage.update(completion_tokens=4097, total_tokens=4197)
-        return httpx.Response(200, json={'id': 'synthetic-completion', 'object': 'chat.completion', 'created': 1767225600,
-            'model': WIRE_MODEL, 'choices': [{'index': 0, 'finish_reason': 'length' if self.scenario == 'length' else
-                'tool_calls' if initial else 'stop', 'message': message}], 'usage': usage})
+        return message
 
     def generate_response(self, *args, **kwargs):
         if not self.lock.acquire(blocking=False):
@@ -324,12 +331,11 @@ def run_synthetic_session(frozen_sources, schedule, wakes, budget_fixture, outpu
                            and client.saved[event['request_id']]['attribution']['task_id'] == wake['id']]
             finish_wake(root, wake['id'], 'cancelled' if result['cancelled'] else 'complete', request_ids)
             if result['cancelled']:
-                client.ledger.stop('cancelled')
+                close_session(client, 'cancelled')
                 break
     except (Exception,) as error:
         failure = {'type': type(error).__name__, 'reason': str(error)}
-        if not client.ledger.poisoned and not client.ledger.state['closed']:
-            client.ledger.stop('session-failure')
+        close_session(client, 'session-failure')
         try:
             request_ids = [event['request_id'] for event in client.trace if event['event'] == 'mock'
                            and client.saved[event['request_id']]['attribution']['task_id'] == wake['id']]
@@ -646,11 +652,338 @@ def doctor(root):
     return result
 
 
+JOINT_CASES = ('active', 'main-wins', 'background-wins', 'same-batch', 'cancel-background',
+               'notes-unknown', 'ledger-unknown', 'commit-unknown', 'result-unknown',
+               'output-unknown', 'terminal-unknown', 'usage-background', 'budget-background')
+
+
+def joint_fixture():
+    """An independent invented environment changes before the next wake.
+
+    These transitions are fixture facts, not scores calculated from candidate
+    text or model self-assessment. Nothing here is a real external action.
+    """
+    states = [{'revision': 1, 'switch': 'blue', 'feedback': 'blue opens gate'},
+              {'revision': 2, 'switch': 'red', 'feedback': 'blue failed; red opens gate'},
+              {'revision': 3, 'switch': 'red', 'feedback': 'red remains valid; leave note alone'}]
+    raw = b''.join(f"【】FixtureEnvironment(101) 12:00:0{index} | {index + 1}\n    ENVIRONMENT_{value['revision']}: {value['feedback']}\n".encode()
+                   for index, value in enumerate(states))
+    frozen = freeze_sources([{'source_alias': 'alpha', 'target': 1001, 'days': {'2026-01-01': raw}}],
+                            bot={'id': 900, 'name': 'FixtureBot', 'names': {'FixtureBot': 900}}, synthetic=True)
+    ordered = sorted(frozen['events'], key=lambda v: v['record']['time'])
+    schedule = [{'opened_cursor': i + 1, 'virtual_time': v['record']['time'], 'event_keys': [v['event_key']]}
+                for i, v in enumerate(ordered)]
+    wakes = [{'id': 'joint-' + str(i + 1), 'reason': 'independent-fixture-feedback', 'window': 'alpha',
+              'cursor': i + 1, 'event_key': v['event_key']} for i, v in enumerate(ordered)]
+    return frozen, schedule, wakes, states
+
+
+class JointClient(ClosedClient):
+    """Fixture peer emits actual SDK tools; no free harness-generated revision."""
+    program = None
+
+    def fixture_message(self, messages):
+        if self.current['role'] == 'selector':
+            payload = json.loads(messages[1]['content'])
+            return {'role': 'assistant', 'content': canonical({'situation': 'fixture inference: revisit gate note',
+                'references': [payload['input']['catalog'][0]['entry_id']], 'input_hash': payload['input_hash']}).decode()}
+        if self.program is None:
+            raise RuntimeError('fixture program absent')
+        round_number = 1 + sum(v['role'] == 'assistant' for v in messages)
+        return self.program(messages, round_number)
+
+
+def run_joint_session(output, *, case='active'):
+    """Three finite synthetic wakes, optional selector/background, one Ledger."""
+    from stateless_notes import NoteWriter, snapshot_notes, recover_notes
+    from stateless_selector import build_selector_input, select_materials, resolve_selection, record_consumption
+    import stateless_loop
+    if case not in JOINT_CASES:
+        raise ValueError('unknown joint fixture case')
+    root = _safe_root(output)
+    root.mkdir(parents=True, mode=0o700)
+    loop = root / 'loop'
+    loop.mkdir()
+    notes = NoteWriter.create(root / 'notes')
+    frozen, schedule, wakes, environment = joint_fixture()
+    keys, alias = ('global/main',), 'joint-note-handle'
+    aliases = {alias: keys[0]}
+    limits = {**LIMITS, 'wakes': 3, 'attempts': 16, 'allowances': 65536}
+    manifest = {'schema': 'stateless-joint-v1', 'synthetic': True, 'case': case, 'code': code_hashes(),
+                'source_sha256': frozen['frozen_id'], 'schedule': schedule, 'wakes': wakes,
+                'environment': environment, 'limits': limits, 'note_aliases': aliases,
+                'note_aliases_sha256': digest(aliases), 'transport': 'closed SDK MockTransport',
+                'fixture_policy': 'body/reason/expectation/source selectors originate in scripted mock model responses',
+                'paid': False, 'optional_roles': True}
+    durable(root / 'manifest.json', manifest)
+    durable(loop / 'manifest.json', manifest)
+    started = time.perf_counter()
+    report, outcomes, seen, failure = {}, [], {}, None
+    # One frozen synthetic envelope for the entire run, never per-role budgets.
+    with patch.dict(LIMITS, limits):
+        client = JointClient(loop, manifest, 'normal')
+        client.ceiling['attempts'] = limits['attempts']
+        def requests(wake):
+            return [row['id'] for row in client.ledger.state['requests']
+                    if client.saved[row['id']]['attribution']['task_id'] == wake['id']]
+        def tool(name, arguments, position):
+            return {'id': f"fixture-{client.current['role']}-{len(client.ledger.state['requests'])}-{position}",
+                    'type': 'function', 'function': {'name': name, 'arguments': canonical(arguments).decode()}}
+        def revision(text, messages, *, claim='draft', sources=None):
+            context = json.loads(messages[1]['content'])
+            record = context['screen']['records'][-1]['ref']
+            return {'key': keys[0], 'body': text, 'reason': 'fixture response to independently supplied environment feedback',
+                    'expectation': 'explicit later request will receive this committed version',
+                    'sources': sources or ['record:' + record['source_alias'] + ':' + record['event_key'], 'generated:self'],
+                    'claim': claim}
+        def plan(text, *, retry=None, same_batch=False, quiet=False):
+            def model(messages, round_number):
+                if quiet or round_number > (2 if retry else 1):
+                    return {'role': 'assistant', 'content': 'FIXTURE_LEAVE_UNCHANGED' if quiet else 'FIXTURE_FINISHED'}
+                body = text if round_number == 1 else retry
+                calls = [tool('revise_note', revision(body, messages), 1)]
+                if same_batch and round_number == 1:
+                    # Host result of the first revision is not in this request.
+                    calls.append(tool('revise_note', revision('UNCOMMITTED_SAME_BATCH_SUCCESS\n', messages,
+                        claim='success', sources=['generated:self']), 2))
+                    calls.append(tool('revise_note', revision('UNCOMMITTED_SAME_BATCH_PARENT\n', messages), 3))
+                calls.append(tool('read_note', {'key': keys[0]}, len(calls) + 1))
+                return {'role': 'assistant', 'content': 'FIXTURE_INTENT', 'tool_calls': calls,
+                        'reasoning_content': 'JOINT_EPHEMERAL_' + client.current['role']}
+            return model
+        def drive(snapshot, wake, program, *, process='main', materials=(), hook=None, scenario='normal', actions=()):
+            old = client.program
+            client.program = program
+            try:
+                return drive_wake(snapshot, wake, wakes, loop, client, notes=notes, note_keys=keys,
+                    note_aliases=aliases, materials=materials, actions=actions, process=process,
+                    after_output=hook, scenario=scenario)
+            finally:
+                client.program = old
+        def finish(wake, *, fault=None):
+            return finish_wake(loop, wake['id'], 'complete', requests(wake), client=client, fault=fault)
+        try:
+            first = open_snapshot(frozen, schedule, 1)
+            client.ledger.wake()
+            outcomes.append(drive(first, wakes[0], plan('# Gate\nCOMMITTED_A: use blue\r\n')))
+            finish(wakes[0])
+            held_a = snapshot_notes(notes.root, first, allowed_keys=keys)[0]
+            seen['held_a_sha256'] = held_a['sha256']
+            durable(root / 'held-A.json', {k: v for k, v in held_a.items() if k != 'raw'} | {'text': held_a['raw'].decode()})
+            second = open_snapshot(frozen, schedule, 2)
+            client.ledger.wake()
+            selected_a = {**held_a, 'snapshot_id': second['snapshot_id'], 'source_id': alias}
+            entry = {'entry_id': 'held-note-A', 'kind': 'note', 'title': 'fixture gate note', 'scope': 'global',
+                     'branch_id': 'main', 'version_id': held_a['version_id'], 'source_id': alias,
+                     'committed_cursor': 1, 'expires_cursor': 3, 'sha256': held_a['sha256'],
+                     'ref': {'source_id': alias, 'version_id': held_a['version_id'], 'snapshot_id': second['snapshot_id']}}
+            resolver = lambda _: {k: v for k, v in selected_a.items() if k != 'kind'}
+            context = build_selector_input(second, wakes[1], 'fixture optional revisit', [entry], scopes=('global',))
+            receipt = {}
+            selection = select_materials(context, second, client, resolver, receipt, loop / 'selector.json')
+            bundle = resolve_selection(context, selection, second, resolver)
+            materials = tuple(bundle['materials'])
+            main = plan('# Gate\nCOMMITTED_B: use red\r\n', same_batch=case == 'same-batch')
+            background = plan('# Gate\nBACKGROUND_C: independently reconsider blue\n')
+            fired = [False]
+            def interleave(output, process):
+                if fired[0]:
+                    return
+                fired[0] = True
+                assert not recover_commits(loop)['terminals'].get(wakes[1]['id'])
+                if case in {'main-wins', 'background-wins', 'cancel-background', 'usage-background', 'budget-background'}:
+                    if case == 'usage-background':
+                        client.scenario = 'missing'
+                    if case == 'budget-background':
+                        client.ceiling['attempts'] = len(client.ledger.state['requests'])
+                    inner_process = 'main' if case == 'main-wins' else 'background'
+                    inner_plan = main if inner_process == 'main' else background
+                    outcomes.append(drive(second, wakes[1], inner_plan, process=inner_process, materials=materials,
+                        scenario='cancel-after-tool' if case == 'cancel-background' else 'normal'))
+                elif case == 'ledger-unknown':
+                    durable(loop / 'persistence-unknown.json', {'status': 'synthetic unknown'})
+                elif case == 'commit-unknown':
+                    durable(loop / 'commit-persistence-unknown.json', {'status': 'synthetic unknown'})
+            if case == 'main-wins':
+                outer = plan('# Gate\nUNCOMMITTED_STALE_BACKGROUND\n', retry='# Gate\nBACKGROUND_REBASED: red remains correct\n')
+                outcomes.append(drive(second, wakes[1], outer, process='background', materials=materials, hook=interleave))
+            else:
+                if case == 'background-wins':
+                    main = plan('# Gate\nUNCOMMITTED_STALE_MAIN\n', retry='# Gate\nCOMMITTED_B: use red\r\n')
+                scenario = {'result-unknown': 'result-failure', 'output-unknown': 'output-after-rename'}.get(case, 'normal')
+                original_commit = notes.commit_candidate
+                def injected(candidate_id, **kwargs):
+                    return original_commit(candidate_id, fault='current-after-replace')
+                with patch.object(notes, 'commit_candidate', injected) if case == 'notes-unknown' else ExitStack():
+                    outcomes.append(drive(second, wakes[1], main, materials=materials, hook=interleave,
+                                          scenario=scenario))
+            finish(wakes[1], fault='after-rename' if case == 'terminal-unknown' else None)
+            feedback_requests = [v for v in client.saved.values() if v['attribution']['task_id'] == wakes[1]['id']
+                                 and v['attribution']['role_id'] == 'chat']
+            # The first main Chat sees the optional frozen selector bundle.
+            # Nested/main-win uses the same exact bundle, never latest lookup.
+            record_consumption(receipt, bundle, feedback_requests[0])
+            durable(loop / 'selector.json', receipt)
+            held_again = held_a['raw']
+            assert held_again == held_a['raw'] and hashlib.sha256(held_again).hexdigest() == seen['held_a_sha256']
+            current_b = snapshot_notes(notes.root, second, allowed_keys=keys)[0]
+            seen['new_sha256'], seen['new_version_id'] = current_b['sha256'], current_b['version_id']
+            durable(root / 'current-after-feedback.json', {k: v for k, v in current_b.items() if k != 'raw'} | {'text': current_b['raw'].decode()})
+            third = open_snapshot(frozen, schedule, 3)
+            client.ledger.wake()
+            third_material = {**current_b, 'snapshot_id': third['snapshot_id'], 'source_id': alias}
+            before = len(client.exchanges)
+            outcomes.append(drive(third, wakes[2], plan('', quiet=True), materials=(third_material,),
+                                  actions=tuple(recover_commits(loop)['outputs'])))
+            finish(wakes[2])
+            assert len(client.exchanges) == before + 1  # No mandatory selector/background.
+            seen['quiet_requests'] = [v['request_id'] for v in client.exchanges[before:]]
+        except Exception as error:
+            failure = {'type': type(error).__name__, 'reason': str(error)}
+            close_session(client, 'joint-session-failure')
+            try:
+                state = recover_commits(loop)
+                current_wake = wakes[min(client.ledger.state['wakes'] - 1, 2)]
+                if current_wake['id'] not in state['terminals']:
+                    finish_wake(loop, current_wake['id'], 'cancelled' if case == 'cancel-background' else 'failed',
+                                requests(current_wake), reason=failure['type'], client=client)
+            except (ValueError, OSError) as terminal_error:
+                seen['terminal_failure'] = type(terminal_error).__name__ + ': ' + str(terminal_error)
+        finally:
+            if failure:
+                # Both roles are tried against the original stopped client.
+                blocked = {}
+                for role in ('chat', 'librarian', 'selector'):
+                    before = (client.attempts, len(client.ledger.state['requests']), len(client.trace))
+                    client.current = {'role': role, 'wake': 'blocked-probe', 'snapshot_id': 'blocked'}
+                    try:
+                        list(client.generate_response([{'role': 'user', 'content': 'must remain blocked'}], model=MODEL, stream=False))
+                    except (ValueError, RuntimeError):
+                        blocked[role] = before == (client.attempts, len(client.ledger.state['requests']), len(client.trace))
+                    else:
+                        blocked[role] = False
+                seen['all_roles_blocked'] = blocked
+            client.close()
+        try:
+            recovered, recovery_error = recover_commits(loop), None
+        except (ValueError, OSError) as error:
+            recovered, recovery_error = None, str(error)
+        try:
+            costs = client.projection()
+        except (ValueError, RuntimeError) as error:
+            costs = {'unavailable': str(error)}
+        report = {'schema': 'stateless-joint-result-v1', 'case': case, 'status': 'stopped' if failure else 'complete',
+                  'failure': failure, 'seen': seen, 'outcomes': outcomes, 'trace': client.trace,
+                  'ledger': deepcopy(client.ledger.state), 'attempts': client.attempts, 'settlements': client.settlements,
+                  'costs': costs, 'recovery': recovered, 'recovery_error': recovery_error,
+                  'notes_recovery': recover_notes(notes.root), 'environment': environment,
+                  'chat_object_count': len(client.chats), 'chat_objects_unique': len({id(v) for v in client.chats}) == len(client.chats),
+                  'messages_objects_unique': len({id(v.messages) for v in client.chats}) == len(client.chats),
+                  'elapsed_seconds': time.perf_counter() - started, 'peak_rss_kib': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+                  'real_HTTP': 0, 'QQ': 0,
+                  'limitations': ['scripted fixture choices, not real generation, autonomy or semantic quality',
+                                  'serial nested Chats, no threaded throughput or production scheduler',
+                                  'synthetic ordinary group only; no production state, credentials or paid execution',
+                                  'read-only recovery, cooperative note locks, fault injection not physical power-loss proof']}
+        durable(root / 'result.json', report)
+    return report
+
+
+def joint_doctor(root):
+    assertions, cases = [], {}
+    with sentinels(root) as counters, redirect_stdout(io.StringIO()) as console:
+        for case in JOINT_CASES:
+            report = run_joint_session(root / case, case=case)
+            cases[case] = report
+            if case in {'active', 'main-wins', 'background-wins', 'same-batch'}:
+                assert report['status'] == 'complete', report['failure']
+                assert report['chat_objects_unique'] and report['messages_objects_unique']
+                state = report['recovery']
+                assert len(state['terminals']) == 3 and state['generation'] == 3
+                assert len(state['outputs']) == len(set(state['outputs']))
+                trace = report['trace']
+                changes = [v for v in trace if v['event'] == 'note-revision']
+                assert any(v['outcome']['status'] == 'committed' for v in changes)
+                assert len(report['seen']['quiet_requests']) == 1
+                rows = report['ledger']['requests']
+                wire = [json.loads(p.read_bytes()) for p in sorted((root / case / 'loop').glob('request-*.json'))]
+                assert len(rows) == report['attempts'] == report['settlements'] == len(wire)
+                assert sum(v['charged'] for v in rows) == report['costs']['scopes']['research']['actual']['micro_cny']
+                assert all(v['status'] == 'settled' and v['usage'] is not None for v in rows)
+                ids = {v['id']: v for v in rows}
+                assert all(ids[v['envelope']['request_id']]['request_sha256'] == digest(v['envelope']) for v in wire)
+                feedback = [v for v in wire if v['attribution']['task_id'] == 'joint-2']
+                assert any(v['attribution']['role_id'] == 'selector' for v in feedback)
+                if case in {'main-wins', 'background-wins'}:
+                    assert any(v['attribution']['role_id'] == 'librarian' for v in feedback)
+                    assert any(v['status'] == 'failed' for v in state['results'].values())
+                    assert any('BACKGROUND_REBASED' in v['assistant'].get('tool_calls', [{}])[0].get('function', {}).get('arguments', '')
+                               or 'COMMITTED_B' in v['assistant'].get('tool_calls', [{}])[0].get('function', {}).get('arguments', '')
+                               for v in state['outputs'].values())
+                else:
+                    assert not any(v['attribution']['role_id'] == 'librarian' for v in wire)
+                if case == 'same-batch':
+                    failures = [json.loads(v['content'])['note_revision'] for v in state['results'].values()
+                                if v.get('content') and 'note_revision' in json.loads(v['content'])
+                                and v['status'] == 'failed']
+                    assert len(failures) == 2
+                    assert any('completed execution' in v['reason'] for v in failures)
+                # Exact current note must reach same-wake subsequent HTTP via a
+                # native read result. Old selected A remains exact and unchanged.
+                wanted = report['seen']['new_sha256']
+                exposed = []
+                for saved in feedback:
+                    for msg in saved['envelope']['body']['messages'][2:]:
+                        if msg['role'] == 'tool':
+                            value = json.loads(msg['content'])
+                            if set(value) == {'note_material'} and value['note_material']['sha256'] == wanted:
+                                exposed.append(saved['envelope']['request_id'])
+                assert exposed
+                last = next(v for v in wire if v['attribution']['task_id'] == 'joint-3')
+                assert len(last['envelope']['body']['messages']) == 2
+                current_materials = json.loads(last['envelope']['body']['messages'][1]['content'])['selected']['materials']
+                assert any(v['kind'] == 'note' and v['version_id'] == report['seen']['new_version_id']
+                           and v['sha256'] == wanted for v in current_materials)
+                assert 'JOINT_EPHEMERAL' not in canonical(last).decode()
+                assert len(report['seen']['quiet_requests']) == 1
+                assertions.append({'case': case, 'assertion': 'native-active-note-tools-exact-wire-held-A-fresh-next-wake-and-one-shared-budget',
+                                   'same_wake_consumption_requests': exposed, 'requests': len(rows)})
+            else:
+                assert report['failure'], case
+                assert all(report['seen']['all_roles_blocked'].values()), case
+                assert report['ledger']['closed'] or case == 'ledger-unknown'
+                assertions.append({'case': case, 'assertion': 'all-roles-stop-no-retry-after-cancel-unknown-budget-or-usage',
+                                   'attempts': report['attempts']})
+            # Recovery is a read-only diagnosis, including when it refuses.
+            before = {str(p.relative_to(root / case)): hashlib.sha256(p.read_bytes()).hexdigest()
+                      for p in (root / case).rglob('*') if p.is_file()}
+            def forbidden(*_, **__):
+                raise AssertionError('recovery constructed client/tool or wrote')
+            with patch.object(ClosedClient, '__init__', forbidden), patch.object(llm.Tool, '__init__', forbidden), \
+                 patch.object(Path, 'write_bytes', forbidden), patch.object(Path, 'write_text', forbidden):
+                try:
+                    recovered = recover_commits(root / case / 'loop')
+                    assert recovered == report['recovery']
+                except ValueError:
+                    assert report['recovery_error']
+            after = {str(p.relative_to(root / case)): hashlib.sha256(p.read_bytes()).hexdigest()
+                     for p in (root / case).rglob('*') if p.is_file()}
+            assert before == after
+        assert not any(counters.values())
+    durable(root / 'parser-console.json', {'synthetic_console': console.getvalue()})
+    result = {'schema': 'stateless-joint-doctor-v1', 'status': 'ok', 'assertions': assertions,
+              'assertion_count': len(assertions), 'cases': {k: {'status': v['status'], 'attempts': v['attempts'], 'failure': v['failure']}
+                                                        for k, v in cases.items()}, 'sentinels': counters, 'real_HTTP': 0, 'QQ': 0}
+    durable(root / 'doctor.json', result)
+    return result
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('doctor', 'run', 'recover'))
+    parser.add_argument('command', choices=('doctor', 'run', 'recover', 'joint-doctor', 'joint-run'))
     parser.add_argument('--output', required=True, help='new external output root; existing root only for read-only recover')
     parser.add_argument('--scenario', choices=SCENARIOS, default='normal')
+    parser.add_argument('--case', choices=JOINT_CASES, default='active')
     args = parser.parse_args(argv)
     try:
         if args.command == 'recover':
@@ -661,6 +994,14 @@ def main(argv=None):
             if manifest.get('schema') != 'stateless-loop-v1' or manifest.get('synthetic') is not True:
                 raise ValueError('only this synthetic action format can recover')
             result = recover_commits(root)
+        elif args.command == 'joint-doctor':
+            root = _safe_root(args.output)
+            root.mkdir(parents=True, mode=0o700)
+            result = joint_doctor(root)
+        elif args.command == 'joint-run':
+            root = _safe_root(args.output)
+            with sentinels(root), redirect_stdout(io.StringIO()):
+                result = run_joint_session(root, case=args.case)
         elif args.command == 'doctor':
             root = _safe_root(args.output)
             root.mkdir(parents=True, mode=0o700)
