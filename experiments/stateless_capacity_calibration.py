@@ -13,6 +13,8 @@ import subprocess
 import os
 import sys
 import time
+from datetime import datetime, timedelta, timezone
+import httpx
 from unittest.mock import patch
 
 sys.dont_write_bytecode = True
@@ -28,7 +30,7 @@ from stateless_selector import build_selector_input, select_materials, resolve_s
 from stateless_loop import drive_wake, finish_wake, recover_commits
 
 
-LIMITATION = ['Closed MockTransport only; no live constructor, credential reader or live runner.',
+LIMITATION = ['This doctor uses closed MockTransport only; the separate official entry is not executed live.',
               'Historical capacity/prices are declarations, not current official verification or provider acceptance.',
               'No real failure-billing, model quality, autonomous subject or production evidence.',
               'Fixture budgets are not the authorized run allocation; no formal run scale chosen.',
@@ -124,6 +126,204 @@ def save_case(root, name, client, failure=None, **extra):
     durable(root / name / 'result.json', report)
     client.close()
     return {k: report[k] for k in ('case', 'attempts', 'settlements', 'failure', 'poisoned')}
+
+
+def official_fixture(root, name, *, budgets=None, role_stages=None, mutate=None, origin='synthetic-calibration'):
+    """Invent every operator record; nothing here is an actual authorization."""
+    import stateless_official as official
+    folder = root / name
+    folder.mkdir(mode=0o700)
+    if budgets is None:
+        budgets = {'research': {'tokens': 20000000, 'micro_cny': 20000000, 'attempts': 12},
+                   'stages': {stage: {'tokens': 5000000, 'micro_cny': 5000000, 'attempts': 3}
+                              for stage in capacity.STAGES}}
+    value = official.manifest(folder, 'fictional-' + name, budgets,
+                               capacity.ROLE_STAGES if role_stages is None else role_stages, {})
+    now = datetime.now(timezone.utc)
+    data = {
+        'plan.json': {'schema': 'stateless-official-entry-v1', 'objective': 'Synthetic calibration only.', 'seed': 7,
+                      'material_sha256': digest({'synthetic': True}),
+                      'stopping': 'one-entry; caller-loop-bounded-by-frozen-Ledger; unknown-stop-no-replay',
+                      'entry': {'current': {'role': 'librarian', 'wake': 'fixture-wake', 'snapshot_id': 'fixture-snapshot'},
+                                'messages': [{'role': 'system', 'content': 'Synthetic only.'}, {'role': 'user', 'content': '{}'}]}},
+        'models-response.json': {'object': 'list', 'data': [{'id': capacity.WIRE_MODEL,
+                                 'context_window': capacity.LIMITS['context'], 'max_output_tokens': 393216}]},
+        'target-metadata.json': {'schema': 'stateless-target-metadata-v1', 'origin': origin, 'method': 'GET',
+                                 'url': capacity.ENDPOINT + '/models', 'observed_at': now.isoformat(), 'response_sha256': ''},
+        'research-allocation.json': {'schema': 'stateless-research-allocation-v1', 'origin': origin, 'revision': 'fictional-revision',
+                                    'ceiling': {'tokens': official.COMMON_TOKENS, 'micro_cny': 100000000, 'attempts': 100},
+                                    'spent': dict.fromkeys(capacity.METRICS, 0),
+                                    'reservations': [{'id': 'fictional-reservation', 'run_id': value['run_id'], 'root': str(folder),
+                                                      'binding': official.binding(value), 'budgets': deepcopy(budgets)}]},
+        'authorization.json': {'schema': 'stateless-official-authorization-v1', 'origin': origin, 'mode': 'execute-once',
+                               'binding': official.binding(value), 'records': {}, 'reservation_id': 'fictional-reservation',
+                               'approved_by': 'fictional-reviewer', 'valid_from': (now - timedelta(minutes=1)).isoformat(),
+                               'expires_at': (now + timedelta(hours=1)).isoformat(),
+                               'accept_unknown_billing': True, 'accept_current_contract': True}}
+    if mutate is not None:
+        mutate(value, data)
+    for name in ('plan.json', 'models-response.json', 'target-metadata.json', 'research-allocation.json', 'authorization.json'):
+        if name == 'target-metadata.json':
+            data[name]['response_sha256'] = value['records']['models-response.json']
+        if name == 'authorization.json':
+            data[name]['records'] = dict(value['records'])
+        durable(folder / name, data[name])
+        value['records'][name] = hashlib.sha256((folder / name).read_bytes()).hexdigest()
+    durable(folder / 'manifest.json', value)
+    return folder, value
+
+
+def official_doctor(root):
+    import stateless_official as official
+    started, results = time.perf_counter(), []
+    def passed(name, **evidence):
+        results.append({'case': name, 'status': 'pass', **evidence})
+    def closed(name, client, action, attempts):
+        try:
+            action()
+        except capacity.CapacityStop:
+            pass
+        else:
+            raise AssertionError(name)
+        assert client.attempts == attempts
+        shared_closed(client)
+        passed(name, attempts=attempts, poisoned=client.ledger.poisoned)
+        save_case(root, name, client)
+    with isolation(root) as (private, counters), redirect_stdout(io.StringIO()) as console:
+        folder, frozen = official_fixture(root, 'normal')
+        checked = official.verify(folder, _calibration=official._CALIBRATION)
+        assert checked['send_authorized'] is False and not (folder / 'ledger.json').exists()
+        client = official._calibration_client(folder, frozen)
+        assert client.attempts == 0
+        for role in frozen['role_stages']:
+            if role == 'selector':
+                client.current = {'role': role, 'wake': 'fixture-wake', 'snapshot_id': 'fixture-snapshot'}
+                consume(client.generate_response([{'role': 'system', 'content': 'Synthetic only.'},
+                    {'role': 'user', 'content': canonical({'input': {'catalog': []}, 'input_hash': digest({})}).decode()}], stream=False))
+            else:
+                consume(request(client, role))
+        assert client.attempts == client.settlements == 4
+        for row in client.ledger.state['requests']:
+            evidence = client.transport_evidence(row['id'])
+            assert evidence['mock_exposed'] and not evidence['sent'] and not evidence['transport_attempted']
+            assert evidence['arrival'] == evidence['provider_accepted'] == 'unknown'
+            assert row['usage_source'] == 'synthetic-sdk-usage'
+        passed('one-Ledger-all-roles-official-schema-internal-fake-final-transport',
+               projection=client.projection(), transport=[client.transport_evidence(v['id']) for v in client.ledger.state['requests']])
+        save_case(root, 'normal', client)
+        try:
+            official.OfficialClient(folder, frozen, temporary_api_key='sk-fictional-only')
+        except capacity.CapacityStop:
+            passed('public-constructor-refuses-synthetic-records')
+        else:
+            raise AssertionError('synthetic records upgraded to official')
+
+        passed('public-official-constructor-through-internal-calibration-context')
+
+        for scenario in ('missing', 'alias', 'conflict-alias', 'total', 'null-counter', 'joint-overreport',
+                         'output-overreport', 'connection', '429', '500', 'cancel-before', 'cancel-after', 'model-drift'):
+            name = 'official-' + scenario
+            folder, frozen = official_fixture(root, name)
+            client = official._calibration_client(folder, frozen, scenario=scenario)
+            if scenario == 'alias':
+                consume(request(client))
+                assert client.ledger.state['requests'][0]['usage'] == [100, 40, 20]
+                passed(name)
+                save_case(root, name, client)
+            else:
+                closed(name, client, lambda: consume(request(client)), 0 if scenario == 'cancel-before' else 1)
+        for record, mutation in (
+            ('metadata-example', lambda v, d: d['target-metadata.json'].update(origin='documentation-example')),
+            ('metadata-context', lambda v, d: d['models-response.json']['data'][0].update(context_window=1000000)),
+            ('metadata-output', lambda v, d: d['models-response.json']['data'][0].update(max_output_tokens=384000)),
+            ('missing-stage-allocation', lambda v, d: d['research-allocation.json']['reservations'].clear()),
+            ('other-root-allocation', lambda v, d: d['research-allocation.json']['reservations'][0].update(root='/fictional/other')),
+            ('common-overallocation', lambda v, d: d['research-allocation.json']['spent'].update(tokens=official.COMMON_TOKENS)),
+            ('authorization', lambda v, d: d['authorization.json'].update(mode='verify')),
+            ('billing-unknown', lambda v, d: d['authorization.json'].update(accept_unknown_billing=False)),
+            ('expired', lambda v, d: d['authorization.json'].update(expires_at=(datetime.now(timezone.utc)-timedelta(seconds=1)).isoformat())),
+        ):
+            folder, frozen = official_fixture(root, record, mutate=mutation)
+            try:
+                official._calibration_client(folder, frozen)
+            except capacity.CapacityStop:
+                assert not (folder / 'ledger.json').exists() and not (folder / 'execution-claim.json').exists()
+                passed(record + '-refused-before-Ledger')
+            else:
+                raise AssertionError(record)
+        for drift in ('sdk-client', 'sdk-base', 'key', 'route-after-hook', 'body-after-hook', 'hook-removal', 'duplicate-hook',
+                      'price', 'code', 'record', 'credential-input', 'credential-response', 'credential-response-escaped'):
+            name = 'official-drift-' + drift
+            folder, frozen = official_fixture(root, name)
+            client = official._calibration_client(folder, frozen)
+            with ExitStack() as stack:
+                if drift == 'sdk-client': client.sdk._client = httpx.Client(transport=httpx.MockTransport(lambda _: None), trust_env=False)
+                elif drift == 'sdk-base': client.sdk.base_url = 'https://fictional.invalid/'
+                elif drift == 'key': client.sdk.api_key = 'sk-fictional-drift'
+                elif drift in ('route-after-hook', 'body-after-hook', 'duplicate-hook'):
+                    def change(req, _drift=drift):
+                        client._before_http(req)
+                        if _drift == 'route-after-hook': req.url = req.url.copy_with(host='fictional.invalid')
+                        elif _drift == 'body-after-hook': req._content = canonical({**json.loads(req.content), 'temperature': 1})
+                        else: client._before_http(req)
+                    client.http.event_hooks['request'] = [change]
+                elif drift == 'hook-removal': client.http.event_hooks['request'] = []
+                elif drift == 'price': client.contract['prices']['input'] = '0'
+                elif drift == 'code': stack.enter_context(patch.object(capacity, 'source_hashes', return_value={'fictional': 'drift'}))
+                elif drift == 'record': (folder / 'authorization.json').write_bytes(b'{}')
+                elif drift in ('credential-response', 'credential-response-escaped'):
+                    original = client._fixture_response
+                    def reflect(body):
+                        value = original(body)
+                        value['system_fingerprint'] = client._temporary_key
+                        return value
+                    client._fixture_response = reflect
+                    if drift == 'credential-response-escaped':
+                        def escaped(req):
+                            response = client._mock(req)
+                            raw = response.content.replace(b'sk-fictional', b'\\u0073k-fictional')
+                            return httpx.Response(200, content=raw)
+                        client._transport.inner.handler = escaped
+                messages = [{'role': 'user', 'content': client._temporary_key}] if drift == 'credential-input' else None
+                if messages is not None:
+                    client.current = {'role': 'librarian', 'wake': 'fixture-wake', 'snapshot_id': 'fixture-snapshot'}
+                closed(name, client, lambda: consume(client.generate_response(messages, stream=False)) if messages else consume(request(client)),
+                       1 if drift.startswith('credential-response') else 0)
+                if drift.startswith('credential-response'):
+                    assert client.ledger.state['requests'][0]['usage'] == [100, 40, 20]
+        for damage in ('malformed', 'truncated', 'missing'):
+            for entrance in ('generation', 'tools', 'settle'):
+                name = 'official-ledger-' + damage + '-' + entrance
+                folder, frozen = official_fixture(root, name)
+                client = official._calibration_client(folder, frozen)
+                ledger = folder / 'ledger.json'
+                def corrupt():
+                    if damage == 'missing': ledger.unlink()
+                    else: ledger.write_bytes(b'not-json\n' if damage == 'malformed' else b'{"state":')
+                if entrance == 'settle':
+                    observe = client._observe_http
+                    def corrupt_after_response(response):
+                        observe(response)
+                        corrupt()
+                    client.http.event_hooks['response'] = [corrupt_after_response]
+                else:
+                    corrupt()
+                expected = None if damage == 'missing' else b'not-json\n' if damage == 'malformed' else b'{"state":'
+                closed(name, client, client.guard_tools if entrance == 'tools' else lambda: consume(request(client)),
+                       1 if entrance == 'settle' else 0)
+                assert (ledger.read_bytes() if ledger.exists() else None) == expected and client.ledger.poisoned
+        counters.update(private)
+        assert all(v == 0 for v in counters.values())
+    durable(root / 'parser-console.json', {'synthetic_console': console.getvalue()})
+    result = {'schema': 'stateless-official-doctor-v1', 'status': 'ok', 'assertion_count': len(results),
+              'assertions': results, 'sentinels': counters, 'real_HTTP': 0, 'real_model': 0,
+              'elapsed_seconds': time.perf_counter()-started, 'peak_rss_kib': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+              'limitations': ['All metadata, authorization and allocation records are invented; no API, account or real allocation verified.',
+                              'Real network/trace/provider acceptance and billing remain unverified.',
+                              'No T17 subject loop, selector live exposure integration or production change.',
+                              'External approved allocation snapshot is trusted, not a second writable balance or a cross-process transaction.']}
+    durable(root / 'doctor.json', result)
+    return result
 
 
 def doctor(root):
@@ -402,12 +602,12 @@ def doctor(root):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('doctor',))
+    parser.add_argument('command', choices=('doctor', 'official-doctor'))
     parser.add_argument('--output', required=True, help='fresh external synthetic evidence directory')
     args = parser.parse_args(argv)
     root = _safe_root(args.output)
     root.mkdir(parents=True, mode=0o700)
-    result = doctor(root)
+    result = (doctor if args.command == 'doctor' else official_doctor)(root)
     print(json.dumps({k: result[k] for k in ('status', 'assertion_count', 'elapsed_seconds', 'peak_rss_kib', 'sentinels')}))
     return 0
 

@@ -1,8 +1,9 @@
-"""Closed non-streaming capacity experiment; no live constructor or credentials.
+"""Shared non-streaming capacity accounting; this constructor stays closed.
 
 The official route/model and historical numeric snapshot are declarations only.
-Every HTTP request uses the real SDK and an internal MockTransport. Ledger is
-its only durable balance; projections never reserve or maintain another total.
+CapacityClient uses an internal MockTransport. stateless_official reuses these
+guards and settlement with a separate explicit official execution contract.
+Ledger is the only durable balance; projections never maintain another total.
 """
 from __future__ import annotations
 
@@ -43,8 +44,9 @@ def source_hashes():
     tracked = subprocess.run(['git', 'ls-files', '-z', '--', 'mods', 'experiments'], cwd=repo,
                              capture_output=True, check=True).stdout.split(b'\0')
     names = {name.decode('utf-8') for name in tracked if name.endswith(b'.py')}
-    # These two sources must be bound even before the delivery commit exists.
-    names.update({'experiments/stateless_capacity_client.py', 'experiments/stateless_capacity_calibration.py'})
+    # New delivery sources must be bound before the commit exists as well.
+    names.update({'experiments/stateless_capacity_client.py', 'experiments/stateless_capacity_calibration.py',
+                  'experiments/stateless_official.py'})
     files = [repo / name for name in sorted(names)]
     return {str(path.relative_to(repo)): hashlib.sha256(path.read_bytes()).hexdigest() for path in files}
 
@@ -70,12 +72,29 @@ def _require(ok, label):
         raise CapacityStop(label)
 
 
+def _wire_usage(raw):
+    _require(isinstance(raw, dict), 'invalid-usage')
+    # The shared normalizer treats null aliases/falsey details as absent.
+    # This contract rejects their explicit wire presence before SDK coercion.
+    for key, number in raw.items():
+        if key in ('prompt_tokens_details', 'completion_tokens_details'):
+            _require(type(number) is dict and all(type(v) is int and v >= 0
+                                                 for v in number.values()), 'invalid-usage')
+        else:
+            _require(type(number) is int and number >= 0, 'invalid-usage')
+    return normalize_usage(raw)
+
+
 def _validate_manifest(value):
     _require(set(value) == {'schema', 'synthetic', 'run_id', 'contract', 'budgets', 'role_stages', 'openai', 'httpx'}
              and value['schema'] == 'stateless-capacity-manifest-v1' and value['synthetic'] is True
              and isinstance(value['run_id'], str) and bool(value['run_id'])
              and value['contract'] == contract()
              and value['openai'] == openai.__version__ and value['httpx'] == httpx.__version__, 'manifest-drift')
+    _validate_budgets(value)
+
+
+def _validate_budgets(value):
     roles = value['role_stages']
     _require(isinstance(roles, dict) and bool(roles)
              and all(isinstance(k, str) and bool(k) and v in STAGES for k, v in roles.items()), 'role-stage-schema')
@@ -96,6 +115,14 @@ class CapacityClient(llm.LLMClient):
     def __init__(self, root, frozen_manifest, *, scenario='normal'):
         _validate_manifest(frozen_manifest)
         _require(scenario in SCENARIOS, 'unknown-scenario')
+        self._initialize(root, frozen_manifest, scenario=scenario)
+        self._open_sdk('sk-fictional-capacity-only', httpx.MockTransport(self._mock))
+
+    def _expected_contract(self):
+        return contract()
+
+    def _initialize(self, root, frozen_manifest, *, scenario):
+        """Shared setup after the owning closed/official schema was validated."""
         self.root = Path(root)
         _require(self.root.is_absolute() and not any(p.is_symlink() for p in (self.root, *self.root.parents)),
                  'unsafe-root')
@@ -120,10 +147,11 @@ class CapacityClient(llm.LLMClient):
         self.request_policy = lambda *_: {'max_tokens': LIMITS['output']}
         self.clients = {'deepseek': SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=self._create)))}
         self._clients = self.clients['deepseek']
+    def _open_sdk(self, temporary_key, transport):
         with no_sdk_environment(self.environment_reads):
-            self.http = httpx.Client(transport=httpx.MockTransport(self._mock), trust_env=False,
+            self.http = httpx.Client(transport=transport, trust_env=False,
                 follow_redirects=False, event_hooks={'request': [self._before_http], 'response': [self._observe_http]})
-            self.sdk = openai.OpenAI(api_key='sk-fictional-capacity-only', admin_api_key='unused',
+            self.sdk = openai.OpenAI(api_key=temporary_key, admin_api_key='unused',
                 organization='', project='', webhook_secret='unused', base_url=ENDPOINT,
                 max_retries=0, timeout=self.contract['timeout_seconds'], http_client=self.http)
         self._sdk = self.sdk
@@ -145,7 +173,7 @@ class CapacityClient(llm.LLMClient):
     def _integrity(self):
         _require(digest(self.manifest) == self.manifest_hash and self.contract is self.manifest['contract'], 'manifest-drift')
         _require(json.loads((self.root / 'manifest.json').read_bytes()) == self.manifest, 'manifest-drift')
-        _require(self.contract == contract(), 'code-contract-drift')
+        _require(self.contract == self._expected_contract(), 'code-contract-drift')
         _require(self.ledger.policy.contract == self.contract and self.ledger.limits == LIMITS
                  and self.ledger.prices == PRICES and self.ledger.state['manifest'] == self.manifest_hash
                  and self.ledger.state['pilot'] == self.manifest['run_id'], 'ledger-policy-drift')
@@ -293,17 +321,7 @@ class CapacityClient(llm.LLMClient):
             value = json.loads(raw)
             active['raw_usage'] = value.get('usage')
             try:
-                usage = active['raw_usage']
-                _require(isinstance(usage, dict), 'invalid-usage')
-                # The shared normalizer treats null aliases/falsey details as
-                # absent. This contract rejects their explicit wire presence.
-                for key, number in usage.items():
-                    if key in ('prompt_tokens_details', 'completion_tokens_details'):
-                        _require(type(number) is dict and all(type(v) is int and v >= 0
-                                                             for v in number.values()), 'invalid-usage')
-                    else:
-                        _require(type(number) is int and number >= 0, 'invalid-usage')
-                active['usage'] = normalize_usage(usage)
+                active['usage'] = _wire_usage(active['raw_usage'])
             except (ValueError, KeyError, TypeError, CapacityStop):
                 raise CapacityStop('missing-usage' if active['raw_usage'] is None else 'invalid-usage') from None
             identity = {'model': value.get('model'), 'system_fingerprint': value.get('system_fingerprint')}
