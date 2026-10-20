@@ -283,10 +283,28 @@ def _safe_root(value):
     if any(item.is_symlink() for item in (path, *path.parents)):
         raise ValueError("symlink output path refused")
     path = a0.external_root(path)
-    registered = subprocess.run(["git", "worktree", "list", "--porcelain", "-z"],
+    registered = subprocess.run(["git", "-c", "core.quotePath=false", "worktree", "list", "--porcelain"],
                                 cwd=a0.replay.REPOSITORY, capture_output=True, check=True).stdout
-    roots = [Path(os.fsdecode(item.removeprefix(b"worktree "))).resolve()
-             for item in registered.split(b"\0") if item.startswith(b"worktree ")]
+    # WHY: older Git lacks porcelain -z. Never guess-decode its quoted paths;
+    # a control character in a registered root must close this write boundary.
+    if not registered.endswith(b"\n") or b"\0" in registered:
+        raise ValueError("malformed Git worktree metadata")
+    roots, new_record = [], True
+    for line in registered.split(b"\n"):
+        if not line:
+            new_record = True
+        elif line.startswith(b"worktree ") and new_record:
+            raw = line.removeprefix(b"worktree ")
+            if not raw or raw.startswith(b'"') or any(byte < 32 or byte == 127 for byte in raw):
+                raise ValueError("quoted/control Git worktree path refused")
+            root = Path(os.fsdecode(raw))
+            if not root.is_absolute():
+                raise ValueError("nonabsolute Git worktree path refused")
+            roots.append(root.resolve())
+            new_record = False
+        elif (new_record or not (line.startswith((b"HEAD ", b"branch ", b"locked ", b"prunable "))
+                                 or line in (b"bare", b"detached", b"locked", b"prunable"))):
+            raise ValueError("malformed Git worktree metadata")
     if not roots or any(path.is_relative_to(root) for root in roots):
         raise ValueError("output must be outside every registered Git worktree")
     if path.exists():
