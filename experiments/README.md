@@ -541,3 +541,129 @@ hashes establish consistency, not authenticity or freshness. Every decision has
 module adds no persistent ledger, HTTP guard or concurrent budget allocator.
 These are library interfaces without a CLI. Neither seam establishes a complete
 four-arm comparator or memory benefit.
+
+## Synthetic fresh-context loop
+
+[`stateless_loop.py`](stateless_loop.py) and
+[`stateless_calibration.py`](stateless_calibration.py) implement the first new-loop
+slice over the synthetic T07 snapshot and T08 accounting interfaces. They do not
+change the production reader or adapt A0 arrival/formal-reading semantics.
+
+```sh
+uv run --frozen python experiments/stateless_calibration.py doctor --output /tmp/new-stateless-doctor
+uv run --frozen python experiments/stateless_calibration.py run --output /tmp/new-stateless-session
+uv run --frozen python experiments/stateless_calibration.py recover --output /tmp/new-stateless-session
+```
+
+`doctor` runs built-in fictional scenarios. `run` runs the two-wake fixture;
+`--scenario` selects one built-in failure scenario (see `--help`). Failed runs
+exit 1 and retain their original evidence. Both require a new output outside all
+registered Git worktrees and reject symlink ancestry and existing roots. Creating
+the directory is exclusive, so concurrent callers cannot share a run. There is
+no key, real-material, endpoint, transport, model, paid, resume or fork option.
+`recover` only reads this synthetic commit format; it sends no request and
+executes no tool. Existing failed roots are evidence, not restart checkpoints.
+
+`run_synthetic_session(frozen_sources, schedule, wakes, "synthetic-default",
+output, scenario="normal")` accepts invented in-memory T07 sources and an
+explicit availability table. The fixture has two group windows, equal-second
+records, identical display names with distinct authors, duplicate message IDs,
+a late old-time record, truncation and unopened body/name/directory markers.
+T07 currently supports ordinary group sources only: this slice does not prove
+private-chat identity behavior. Nothing is sent to QQ and no candidate echo is
+created.
+
+`build_screen(snapshot, wake, count=2)` selects recent records from the awakened
+window, orders by occurrence time and stable event key, and returns exact
+original bytes decoded as UTF-8, date, author, source reference, snapshot hash,
+truncation count and a frozen boundary. The count is a fixture setting. Its
+new/old label is approximate: late, omitted and noncontinuous references are
+not an exact seen set. `drive_wake(..., references=(), actions=())` resolves
+explicit extra references from the same snapshot; `actions` contains committed
+output IDs, which are looked up in the action log. Each selected fact separates
+`generated_assistant` from per-action execution status and committed results,
+with its wake terminal/cutoff when present. Generated plans therefore remain
+distinct from completed, failed, unknown and undispatched actions. The second
+synthetic wake explicitly consumes these sourced facts. It cannot inject arbitrary
+historical messages through that argument.
+
+`run_synthetic_session(..., materials_by_wake={wake_id: [...]})` and
+`drive_wake(..., materials=())` also accept explicit frozen material values with
+exactly `kind`, `source_id`, `version_id`, `snapshot_id`, `sha256` and `raw`
+(bytes). `kind` is `note` or `selector_inference`. The loop copies the values,
+checks their byte hash, strict UTF-8, current snapshot and nonempty source/version
+labels, then puts exact decoded text in `selected.materials`. Selector inference
+is labelled `inference-not-evidence` in the material and in the stable instruction;
+it is not promoted to source evidence. Paths, arbitrary messages and extra fields
+are refused. The producing selector/note slice must establish directory, version,
+scope and terminal-cutoff legality; this loop does not own those stores. The
+built-in `materials` scenario checks exact note and inference bytes in both actual
+first-request wire bodies. Every final body still passes the same common guard.
+
+Each invocation constructs a fresh
+`Chat` and messages list. Only explicitly selected committed facts cross wakes;
+reasoning and native tool rounds remain local to the current Chat.
+
+The closed client uses the installed OpenAI SDK and the production nonstream
+parser with `httpx.MockTransport`, fictional credentials, `trust_env=False` and
+zero SDK retries. SDK operations see an empty controlled environment instead of
+host credential or proxy values. The final serialized HTTP body and immutable
+role/task/run/branch/parent/stage/snapshot attribution are saved before transport.
+Inside the serial request boundary the sender rereads the persistent Ledger,
+rebuilds T08 costs, checks `S + I + R`, saves request evidence and invokes the
+original Ledger reserve. T08 always returns `send_authorized=False`; an allowed
+decision alone never reaches the mock. The mock verifies the durable reservation
+and exact request bytes. Both wakes share one Ledger using its default synthetic
+canonical-envelope-bytes-plus-1024 reservation policy, with no second writable
+balance. This policy is not a real tokenizer bound or price quote.
+
+Parser outputs are buffered until usage validation and durable settlement
+succeed. Missing/conflicting usage retains the full reservation and closes the
+run; overreported usage is charged and stops it. Length, connection, cancellation,
+request-evidence and reserve/settle persistence failures release no tools.
+A different role cannot bypass the shared stop. Within a wake, the next actual
+wire retains native assistant reasoning and matching tool-call IDs/results.
+The only tool reads one complete snapshot-qualified original record. An unopened
+reference fails, records a known refusal and stops the following tool.
+
+The first complete output commit contains its frozen screen, boundary, wake
+facts and acknowledgement together. It never rereads the current archive tail.
+Later activations remain pending. Output commits also bind the settled request ID
+and context hash; persisted assistant facts exclude reasoning. Each tool has a
+durable dispatch record followed by its full result before the next tool can
+start. A result-write failure leaves that action unknown and the next action
+undispatched. Cancellation checks run before each tool; completed results remain
+committed. Failure or cancellation closes the common request domain.
+
+`recover_commits(root)` rebuilds boundaries, acknowledged wakes and action states
+from hash-linked commits. The same record validator runs before writes and during
+recovery, including generation, wake/snapshot identity and screen consistency.
+`finish_wake(root, wake_id, status, request_ids, reason=None)` commits a separate
+round cutoff with complete/cancelled/failed status and request IDs; first-output
+acknowledgement does not mean the round is finished. `recover_commits` returns
+these facts in `terminals`, and the read-only CLI prints the rebuilt state. If
+unknown persistence prevents a terminal commit, `result.json` records
+`terminal_failure` and recovery refuses the log. There is no independently
+writable boundary file. Missing results mean unknown
+when dispatch was committed, or not dispatched otherwise; recovery replays
+neither state. Damaged/checksum-invalid, stale-generation, mismatched-subrequest
+and residual-tail logs are refused. Dispatch or result records after their wake
+terminal are also refused; this slice has only synchronous tools. Flush/file-fsync/directory-fsync injections
+retain originals and mark persistence unknown. These probes do not simulate a
+physical power failure or prove durability across every filesystem or device.
+
+Each run retains `manifest.json`, actual `request-*.json` wire/attribution,
+`observation-*.json` usage, the original `ledger.json`, `commits/`, and
+`result.json` with hashes, sequence trace, costs, stops and recovery state.
+`doctor.json` records scenario assertions and socket/QQ/external-write sentinels;
+`parser-console.json` contains fictional parser output. Diagnostic wire bodies
+can include same-wake reasoning; those files are never loaded as subsequent
+context. The normal fixture makes four mock requests and settles 480 synthetic
+tokens cumulatively. A separate two-attempt common ceiling refuses the second
+wake before its mock request.
+
+This is request-isolation, accounting and commit-boundary evidence. It has no
+real selector or librarian output, note/Skill revisions, production scheduling,
+actual provider acceptance, semantic memory result, or complete D10 acceptance.
+The selector and librarian remain separate future slices; fixed fixture choices
+do not establish their quality.
