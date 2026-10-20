@@ -1,7 +1,8 @@
-"""Synthetic Markdown commit/recovery calibration through T10's actual SDK wire.
+"""Closed synthetic note-prefix/commit calibration through T10's actual SDK.
 
-Supplied candidates below are fixtures, not librarian learning results. No model
-candidate generator, endpoint override, automatic retry or production entry.
+Candidate Markdown is supplied by fixtures. Main/background labels describe the
+producing process; both use the same parent, exposure and persistence checks.
+No production lifecycle, real HTTP, automatic retry or model quality claim.
 """
 from __future__ import annotations
 
@@ -21,9 +22,11 @@ from unittest.mock import patch
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from a0_ledger import canonical, durable
+from a0_ledger import LIMITS, canonical, durable
 from comparison_snapshot import _safe_root, open_snapshot
 from stateless_calibration import ClosedClient, synthetic_fixture, sentinels
+from stateless_selector_calibration import SelectorClient
+from stateless_selector import build_selector_input, select_materials, resolve_selection, record_consumption
 from stateless_loop import drive_wake, finish_wake, recover_commits
 from stateless_notes import NoteWriter, snapshot_notes, read_committed, recover_notes, _decode, _read_json, _pack
 
@@ -42,6 +45,20 @@ def _reject(call, expected=None):
     raise AssertionError('invalid operation accepted')
 
 
+def _wire(material):
+    return {k: v for k, v in material.items() if k != 'raw'} | {'text': material['raw'].decode()}
+
+
+class NotesClient(SelectorClient):
+    """One inherited SDK/guard; process attribution changes no write policy."""
+    process_role = 'chat'
+
+    def _before_http(self, request):
+        if self.current.get('role') != 'selector':
+            self.current['role'] = self.process_role
+        return super()._before_http(request)
+
+
 def doctor(root):
     started = time.perf_counter()
     assertions, faults = [], {}
@@ -50,225 +67,236 @@ def doctor(root):
     frozen, schedule, wakes = synthetic_fixture()
     first, second = [open_snapshot(frozen, schedule, cursor) for cursor in (1, 2)]
     keys = ('global/main', 'person/101', 'group/alpha')
-    with sentinels(root) as counters, redirect_stdout(io.StringIO()) as console:
+    # Larger *synthetic* run envelope, still one serial ClosedClient/Ledger guard.
+    with patch.dict(LIMITS, wakes=40, attempts=100, allowances=409600), \
+         sentinels(root) as counters, redirect_stdout(io.StringIO()) as console:
         notes = NoteWriter.create(root / 'notes')
         loop = root / 'loop'
         loop.mkdir()
-        manifest = {'synthetic': True, 'schema': 'notes-calibration-v1', 'source': frozen['frozen_id']}
+        manifest = {'synthetic': True, 'schema': 'notes-calibration-v2', 'source': frozen['frozen_id']}
         durable(loop / 'manifest.json', manifest)
-        client = ClosedClient(loop, manifest, 'normal')
-        def drive(snapshot, wake, materials=(), *, scenario='normal', terminal=True):
+        client = NotesClient(loop, manifest, 'normal')
+        client.ceiling.update(attempts=100, tokens=4000000, micro_cny=10000000)
+        number = [0]
+        def drive(snapshot, wake, materials=(), *, hook=None, terminal=True, references=(), actions=()):
+            import stateless_loop
+            original = stateless_loop.append_commit
+            def commit(folder, kind, value, **kwargs):
+                row = original(folder, kind, value, **kwargs)
+                if hook:
+                    hook(kind, value)
+                return row
             client.ledger.wake()
-            outcome = drive_wake(snapshot, wake, [wake], loop, client, materials=materials, scenario=scenario)
-            request_ids = [key for key, value in client.saved.items() if value['attribution']['task_id'] == wake['id']]
+            with patch.object(stateless_loop, 'append_commit', commit):
+                outcome = drive_wake(snapshot, wake, [wake], loop, client,
+                                     materials=materials, references=references, actions=actions)
+            requests = [k for k, v in client.saved.items() if v['attribution']['task_id'] == wake['id']]
             if terminal:
-                finish_wake(loop, wake['id'], 'cancelled' if outcome['cancelled'] else 'complete', request_ids)
+                finish_wake(loop, wake['id'], 'complete', requests)
             return outcome
-        try:
-            drive(first, wakes[0], terminal=False)
-            trigger = notes.register_trigger(loop, wakes[0]['id'], first, allowed_keys=keys)
-            assert notes.admit_trigger(trigger['id'], loop, first)['status'] == 'pending'
-            _reject(lambda: notes.prepare_candidate(trigger['id'], 'global/main', b'premature', sources=['x'],
-                                                    reason='fixture', expectation='must reject'), 'incomplete')
-            count = len(client.exchanges)
-            finish_wake(loop, wakes[0]['id'], 'complete', list(client.saved))
-            trigger = notes.admit_trigger(trigger['id'], loop, first)
-            assert len(client.exchanges) == count
-            assert notes.register_trigger(loop, wakes[0]['id'], first, allowed_keys=keys)['id'] == trigger['id']
-            first_trigger = deepcopy(trigger)
-            exposures = trigger['cutoff']['exposures']
-            record_sources = [key for key, value in exposures.items() if value['kind'] == 'record']
-            action_sources = [key for key, value in exposures.items() if value['kind'] == 'execution']
-            generated_sources = [key for key, value in exposures.items() if value['kind'] == 'generated']
-            assert record_sources and action_sources and generated_sources
-            passed('registration-before-terminal-does-not-authorize-processing; actual-cutoff-without-extra-request')
-            def candidate(body, *, key='global/main', operation='write', restore_version=None, writer=notes,
-                          task=trigger, sources=record_sources, **kwargs):
-                return writer.prepare_candidate(task['id'], key, body, operation=operation, sources=sources,
-                     reason='explicit synthetic correction/recovery', expectation='exact bytes next wake',
-                     restore_version=restore_version, **kwargs)
-            a = candidate(b'# A\r\nOLD_NOTE_A  \n')
-            assert candidate(b'# A\r\nOLD_NOTE_A  \n') == a
-            a_result = notes.commit_candidate(a)
-            assert a_result['status'] == 'committed'
-            assert notes.commit_candidate(a)['status'] == 'no-op'
-            with notes._locked():
-                _reject(lambda: NoteWriter(notes.root).commit_candidate(a))
-            assert not notes.poisoned
-            passed('cooperative-competing-writer-refused-without-mutation')
-            frozen_a = snapshot_notes(notes.root, second, allowed_keys=keys)
-            assert len(frozen_a) == 1
-            old_candidate = candidate(b'UNCOMMITTED_LATE_C\n')
-            b = candidate(b'# Corrected\r\nCOMMITTED_B  \n')
-            # Fault copies start with A and a ready B candidate.
-            shutil.copytree(notes.root, root / 'fault-baseline')
-            b_result = notes.commit_candidate(b)
-            assert b_result['status'] == 'committed'
-            notes.finish_trigger(trigger['id'], 'success', 'synthetic fixture candidates committed; no model generation')
-            assert notes.commit_candidate(old_candidate)['status'] == 'stale'
-            frozen_b = snapshot_notes(notes.root, second, allowed_keys=keys)
-            assert b'COMMITTED_B' in frozen_b[0]['raw'] and b'OLD_NOTE_A' in frozen_a[0]['raw']
-            assert notes.commit_candidate(b)['status'] == 'no-op'
-            pending = candidate(b'UNCOMMITTED_CANDIDATE_SECRET\n')
-            drive(second, wakes[1], frozen_b)
-            second_task = notes.register_trigger(loop, wakes[1]['id'], second, allowed_keys=keys)
-            second_task = notes.admit_trigger(second_task['id'], loop, second)
-            notes.finish_trigger(second_task['id'], 'no-op', 'fixture: no note change')
-            # The request already assembled from A keeps A even after B commits.
-            held_wake = {**wakes[1], 'id': 'held-request-alpha'}
-            held_a = tuple({**value, 'snapshot_id': second['snapshot_id']} for value in frozen_a)
-            drive(second, held_wake, held_a)
-            wire_b = json.loads((loop / 'request-0003.json').read_bytes())['envelope']['body']
-            wire_a = json.loads((loop / 'request-0005.json').read_bytes())['envelope']['body']
-            material_b = json.loads(wire_b['messages'][1]['content'])['selected']['materials']
-            material_a = json.loads(wire_a['messages'][1]['content'])['selected']['materials']
-            assert material_b[0]['text'].encode() == frozen_b[0]['raw']
-            assert material_a[0]['text'].encode() == frozen_a[0]['raw']
-            assert material_b[0]['sha256'] == _hash(frozen_b[0]['raw'])
-            assert 'UNCOMMITTED_' not in canonical(wire_b).decode()
-            passed('actual-T10-drive-wake-SDK-wire-exact-committed-B-and-held-A-excludes-candidates', requests=len(client.exchanges))
-            # Newer terminal first: delayed old task must not borrow the new parent.
-            second_sources = list(second_task['cutoff']['exposures'])
-            newer = candidate(b'NEWER_CUTOFF\n', task=second_task, sources=second_sources)
-            assert notes.commit_candidate(newer)['status'] == 'committed'
-            _reject(lambda: candidate(b'LATE_OLD_WAKE\n'), 'older wake cutoff')
-            passed('late-old-wake-cannot-rebase-on-newer-source-cutoff')
-            # Keep subsequent lifecycle checks on the latest task.
-            trigger, record_sources = second_task, second_sources
-            delete = candidate(b'', operation='delete', task=trigger, sources=record_sources)
-            assert notes.commit_candidate(delete)['status'] == 'committed'
-            assert snapshot_notes(notes.root, second, allowed_keys=keys) == ()
-            deletion_loop = root / 'independent-deletion-loop'
-            deletion_loop.mkdir()
-            deletion_manifest = {**manifest, 'scenario': 'independent tombstone consumption diagnostic'}
-            durable(deletion_loop / 'manifest.json', deletion_manifest)
-            deletion_client = ClosedClient(deletion_loop, deletion_manifest, 'normal')
+        def baselines(snapshot, writer=notes):
+            return tuple(writer.freeze_baseline(k, snapshot, allowed_keys=keys) for k in keys)
+        def admit(wake, snapshot, *, output=None, aliases=None, writer=notes):
+            registered = writer.register_trigger(loop, wake['id'], snapshot, allowed_keys=keys)
+            return writer.admit_trigger(registered['id'], loop, snapshot, through_output=output, note_aliases=aliases)
+        def candidate(task, body, *, process='main', key='global/main', writer=notes, sources=None, **kwargs):
+            return writer.prepare_candidate(task['id'], key, body,
+                sources=list(task['cutoff']['exposures']) if sources is None else sources,
+                reason='explicit synthetic revision', expectation='exact bytes after explicit read',
+                producer={'process': process, 'basis': 'fixture bytes based on frozen input',
+                          'output_id': task['cutoff']['output_id']}, **kwargs)
+        def new_task(*, writer=notes, materials=None, aliases=None, role='chat', actions=()):
+            number[0] += 1
+            wake = {**wakes[1], 'id': 'notes-round-' + str(number[0])}
+            # Explicit alpha reference supplies stable person/group provenance.
+            reference = first['frozen_sources']['events'][0]
+            ref = {'snapshot_id': second['snapshot_id'], 'source_alias': reference['source_alias'],
+                   'event_key': reference['event_key']}
+            client.process_role = role
             try:
-                deletion_client.ledger.wake()
-                deletion_wake = {**wakes[1], 'id': 'deleted-note-read'}
-                drive_wake(second, deletion_wake, [deletion_wake], deletion_loop, deletion_client,
-                           materials=snapshot_notes(notes.root, second, allowed_keys=keys))
-                finish_wake(deletion_loop, deletion_wake['id'], 'complete', list(deletion_client.saved))
-                deleted_wire = json.loads((deletion_loop / 'request-0001.json').read_bytes())['envelope']['body']
-                assert json.loads(deleted_wire['messages'][1]['content'])['selected']['materials'] == []
+                drive(second, wake, baselines(second, writer) if materials is None else materials,
+                      references=(ref,), actions=actions)
             finally:
-                deletion_client.close()
-            tombstone = (notes.root / 'current/global/main.md').read_bytes()
-            tomb, _ = _decode(tombstone)
-            assert tomb['operation'] == 'delete' and tomb['parent_version']
-            restored = candidate(b'# Corrected\r\nCOMMITTED_B  \n', operation='restore',
-                                 restore_version=b_result['version_id'], task=trigger, sources=record_sources)
-            restore_result = notes.commit_candidate(restored)
-            assert restore_result['status'] == 'committed' and restore_result['version_id'] != b_result['version_id']
-            rollback = candidate(b'# A\r\nOLD_NOTE_A  \n', operation='rollback', restore_version=a_result['version_id'],
-                                 task=trigger, sources=record_sources)
-            rollback_result = notes.commit_candidate(rollback)
-            assert rollback_result['status'] == 'committed'
-            chain, version = [], rollback_result['version_id']
+                client.process_role = 'chat'
+            return admit(wake, second, aliases=aliases, writer=writer)
+        state = {}
+        try:
+            initial = baselines(first)
+            def live(kind, value):
+                if kind != 'output':
+                    if kind == 'result':
+                        old = admit(wakes[0], first, output=state['early']['cutoff']['output_id'])
+                        assert old['id'] == state['early']['id'] and old['cutoff'] == state['early']['cutoff']
+                    return
+                task = admit(wakes[0], first, output=value['id'])
+                assert not recover_commits(loop)['terminals']
+                if 'early' not in state:
+                    state['early'] = task
+                    registered = notes.register_trigger(loop, wakes[0]['id'], first, allowed_keys=keys)
+                    assert notes.admit_trigger(registered['id'], loop, first)['status'] == 'pending'
+                    a = candidate(task, b'# A\r\nOLD_NOTE_A  \n')
+                    c = candidate(task, b'UNCOMMITTED_LATE_C\n', process='background')
+                    state.update(a=a, c=c)
+                    reverse = root / 'reverse-writers'
+                    shutil.copytree(notes.root, reverse)
+                    reversed_writer = NoteWriter(reverse)
+                    assert reversed_writer.commit_candidate(c)['status'] == 'committed'
+                    assert reversed_writer.commit_candidate(a)['status'] == 'stale'
+                    state['a_result'] = notes.commit_candidate(a)
+                    assert state['a_result']['status'] == 'committed'
+                    assert notes.commit_candidate(c)['status'] == 'stale'
+                    state['frozen_a'] = snapshot_notes(notes.root, first, allowed_keys=keys)
+                    # Explicit resolver read on the next native request. This is
+                    # calibration wiring, not T13's real revision/read tools.
+                    supplied = [False]
+                    def reread():
+                        if supplied[0]:
+                            return []
+                        supplied[0] = True
+                        return [{'role': 'user', 'content': canonical({'note_material':
+                            _wire(notes.freeze_baseline('global/main', first, allowed_keys=keys))}).decode()}]
+                    client.chats[-1].add_context_provider(reread)
+                    generated = [k for k, v in task['cutoff']['exposures'].items() if v['kind'] == 'generated']
+                    _reject(lambda: candidate(task, b'false success', sources=generated,
+                        statements=[{'kind': 'success', 'text': 'tool succeeded', 'sources': generated}]), 'completed execution')
+                    state['intent'] = candidate(task, b'intent only', sources=generated,
+                        statements=[{'kind': 'draft', 'text': 'intended action', 'sources': generated}])
+                else:
+                    state['late'] = task
+                    assert task['cutoff']['generation'] == state['early']['cutoff']['generation']
+                    assert task['cutoff']['sequence'] > state['early']['cutoff']['sequence']
+                    state['b'] = candidate(task, b'# Corrected\r\nCOMMITTED_B  \n', process='background')
+                    shutil.copytree(notes.root, root / 'fault-baseline')
+                    state['b_result'] = notes.commit_candidate(state['b'])
+                    assert state['b_result']['status'] == 'committed'
+                    state['frozen_b'] = snapshot_notes(notes.root, first, allowed_keys=keys)
+            drive(first, wakes[0], initial, hook=live, terminal=False)
+            early, late = state['early'], state['late']
+            assert notes.commit_candidate(state['c'])['status'] in {'stale', 'rejected'}
+            assert notes.commit_candidate(state['b'])['status'] == 'no-op'
+            _reject(lambda: candidate(early, b'old view new parent', parent={
+                'version_id': state['b_result']['version_id'], 'sha256': state['b_result']['sha256']}), 'differs')
+            _reject(lambda: candidate(early, b'old view', process='background'), 'older wake cutoff')
+            assert b'OLD_NOTE_A' in state['frozen_a'][0]['raw'] and b'COMMITTED_B' in state['frozen_b'][0]['raw']
+            finish_wake(loop, wakes[0]['id'], 'complete', list(client.saved))
+            assert admit(wakes[0], first, output=early['cutoff']['output_id'])['cutoff'] == early['cutoff']
+            assert not any(v.get('status') == 'completed' for v in early['cutoff']['exposures'].values())
+            assert any(v.get('visibility') == 'actual-request' for v in late['cutoff']['exposures'].values())
+            passed('nonterminal-main-background-shared-CAS-both-orders-and-same-wake-prefix-parent-refusal')
+            passed('generated-intent-not-success-host-results-not-backfilled-old-cutoff-immutable')
+            # Real selector + opaque note handle -> chat SDK wire. Parent binding
+            # resolves the frozen alias, never treats the catalog title as text.
+            material = read_committed(notes.root, 'global/main', second, allowed_keys=keys)
+            alias = 'opaque-note-handle'
+            exposed = {**material, 'source_id': alias}
+            wake = {**wakes[1], 'id': 'mixed-selector-chat'}
+            entry = {'entry_id': 'note-v1', 'kind': 'note', 'title': 'fictional committed note',
+                'scope': 'global', 'branch_id': 'main', 'version_id': material['version_id'],
+                'source_id': alias, 'committed_cursor': 1, 'expires_cursor': 3, 'sha256': material['sha256'],
+                'ref': {'source_id': alias, 'version_id': material['version_id'], 'snapshot_id': second['snapshot_id']}}
+            resolver_calls = []
+            def resolver(_):
+                resolver_calls.append(alias)
+                return {k: v for k, v in exposed.items() if k != 'kind'}
+            context = build_selector_input(second, wake, 'fictional hint', [entry], scopes=('global',))
+            receipt = {}
+            client.ledger.wake()
+            selection = select_materials(context, second, client, resolver, receipt, loop / 'selector.json')
+            bundle = resolve_selection(context, selection, second, resolver)
+            before = len(client.exchanges)
+            # drive increments the shared synthetic wake counter; no extra role budget.
+            drive(second, wake, tuple(bundle['materials']))
+            actual = client.saved[client.exchanges[before]['request_id']]
+            assert record_consumption(receipt, bundle, actual)[0]['status'] == 'injected'
+            mixed = admit(wake, second, aliases={alias: 'global/main'})
+            assert set(mixed['cutoff']['request_roles'].values()) == {'selector', 'chat'}
+            assert mixed['cutoff']['seen_notes']['global/main']['version_id'] == material['version_id']
+            _reject(lambda: admit(wake, second, aliases={alias: 'person/101'}), 'illegal exposed note')
+            _reject(lambda: admit(wake, second, aliases={alias: 'person/unauthorized'}), 'unauthorized')
+            assert b'COMMITTED_B' in canonical(actual) and b'UNCOMMITTED_' not in canonical(actual)
+            durable(root / 'mixed-consumption.json', {'receipt': receipt, 'cutoff': mixed['cutoff'],
+                                                       'resolver_calls': resolver_calls})
+            held = {**wakes[1], 'id': 'held-request-A'}
+            drive(second, held, tuple({**v, 'snapshot_id': second['snapshot_id']} for v in state['frozen_a']))
+            held_body = client.exchanges[-2]['body']
+            assert json.loads(held_body['messages'][1]['content'])['selected']['materials'][0]['text'].encode() == state['frozen_a'][0]['raw']
+            passed('mixed-chat-selector-real-SDK-opaque-alias-mapping-and-next-wake-exact-B-held-A-no-candidate-leak')
+            # Emulate the future note-read result using T10's existing tool and
+            # action journal, without introducing another chat execution loop.
+            import stateless_loop
+            original_canonical = stateless_loop.canonical
+            read_value = read_committed(notes.root, 'global/main', second, allowed_keys=keys)
+            def note_result(value):
+                if isinstance(value, dict) and set(value) == {'ref', 'origin', 'sha256', 'raw'}:
+                    return original_canonical({'note_material': _wire(read_value)})
+                return original_canonical(value)
+            with patch.object(stateless_loop, 'canonical', note_result):
+                read_task = new_task()
+            read_output = next(v['value']['id'] for v in recover_commits(loop)['records']
+                               if v['kind'] == 'output' and v['value']['wake_id'] == read_task['wake_id'])
+            # No top-level note or baseline: the background request sees the
+            # parent only inside an exact committed action's note-read result.
+            task = new_task(role='librarian', materials=(), actions=(read_output,))
+            assert task['cutoff']['seen_notes']['global/main']['version_id'] == read_value['version_id']
+            durable(root / 'background-action-note-read.json', {'task': task,
+                'source_output': read_output, 'source_material': _wire(read_value)})
+            passed('committed-actions-note-material-parent-actually-exposed-to-background-request')
+            # Every later proposal has a newly exposed exact baseline.
+            assert task['cutoff']['generator_role'] == 'librarian'
+            assert any(v.get('visibility') == 'actual-request' and v.get('status') == 'completed'
+                       for v in task['cutoff']['exposures'].values())
+            passed('independent-background-request-role-and-confirmed-action-exposure-share-same-producer-policy')
+            pending = candidate(task, b'UNCOMMITTED_CANDIDATE_SECRET\n')
+            deleted = notes.commit_candidate(candidate(task, b'', operation='delete', process='background'))
+            assert deleted['status'] == 'committed' and snapshot_notes(notes.root, second, allowed_keys=keys) == ()
+            assert notes.commit_candidate(pending)['status'] == 'stale'
+            tomb_raw = (notes.root / 'current/global/main.md').read_bytes()
+            tomb, _ = _decode(tomb_raw)
+            task = new_task()
+            restored = notes.commit_candidate(candidate(task, b'# Corrected\r\nCOMMITTED_B  \n',
+                operation='restore', restore_version=state['b_result']['version_id']))
+            assert restored['status'] == 'committed'
+            task = new_task()
+            rolled = notes.commit_candidate(candidate(task, b'# A\r\nOLD_NOTE_A  \n',
+                operation='rollback', restore_version=state['a_result']['version_id']))
+            assert rolled['status'] == 'committed'
+            chain, version = [], rolled['version_id']
             while version:
-                row, _ = _decode((notes.root / 'versions' / (version + '.md')).read_bytes())
+                meta, _ = _decode((notes.root / 'versions' / (version + '.md')).read_bytes())
                 chain.append(version)
-                version = row['parent_version']
-            assert len(chain) == 6 and b_result['version_id'] in chain and tomb['version_id'] in chain
-            passed('delete-not-injected-explicit-restore-and-rollback-add-revisions-retain-history', chain=chain)
-            # Person identity is the stable account key, independent of a display
-            # name/window. T07 itself cannot supply private archives.
-            person = candidate(b'PERSON_101\n', key='person/101', task=first_trigger,
-                               sources=[key for key, value in first_trigger['cutoff']['exposures'].items()
-                                        if value.get('author_id') == '101'])
+                version = meta['parent_version']
+            assert len(chain) == 5 and tomb['version_id'] in chain and restored['version_id'] in chain
+            passed('tombstone-not-injected-explicit-restore-rollback-add-versions-retain-history', chain=chain)
+            task = new_task()
+            person = candidate(task, b'PERSON_101\n', key='person/101')
             assert notes.commit_candidate(person)['status'] == 'committed'
-            person_material = read_committed(notes.root, 'person/101', second, allowed_keys=['person/101'])
-            assert person_material['source_id'] == 'person/101'
+            assert read_committed(notes.root, 'person/101', second, allowed_keys=['person/101'])
             _reject(lambda: read_committed(notes.root, 'person/101', second, allowed_keys=['group/beta']), 'scope')
-            _reject(lambda: candidate(b'wrong', key='person/202', task=second_task, sources=second_sources), 'scope')
-            _reject(lambda: candidate(b'wrong', key='../outside', task=second_task, sources=second_sources))
-            _reject(lambda: candidate(b'wrong', task=second_task, sources=['unopened-future']))
-            _reject(lambda: candidate(b'wrong', task=second_task, sources=second_sources, branch='foreign'))
+            _reject(lambda: candidate(task, b'wrong', key='../outside'))
+            _reject(lambda: candidate(task, b'wrong', sources=['unexposed-future']), 'future')
+            _reject(lambda: candidate(task, b'wrong', branch='foreign'), 'foreign')
             _reject(lambda: read_committed(notes.root, 'global/main', first, allowed_keys=keys), 'future')
-            second_generated = [key for key, value in second_task['cutoff']['exposures'].items() if value['kind'] == 'generated']
-            _reject(lambda: candidate(b'false-success', task=second_task, sources=second_generated,
-                                     statements=[{'kind': 'success', 'text': 'sent', 'sources': second_generated}]), 'completed execution')
-            passed('stable-person-key-explicit-scope-path-branch-future-and-generated-success-refusals')
-            # Actual outside edit, pause and a new baseline; old parent cannot
-            # prune intervening history during recovery.
-            latest_candidate = candidate(b'queued before human edit\n', task=trigger, sources=record_sources)
+            passed('scope-stable-person-path-branch-unexposed-future-refusals')
+            latest = candidate(task, b'queued before human edit\n')
             path = notes.root / 'current/global/main.md'
-            original = path.read_bytes()
-            path.write_bytes(original.partition(b'\n')[0] + b'\n# HUMAN_EDIT\r\n  exact  \n')
-            assert notes.commit_candidate(latest_candidate)['status'] == 'rejected'
-            _reject(lambda: snapshot_notes(notes.root, second, allowed_keys=['global/main']), 'paused')
+            path.write_bytes(path.read_bytes().partition(b'\n')[0] + b'\n# HUMAN_EDIT\r\n exact  \n')
+            assert notes.commit_candidate(latest)['status'] == 'rejected'
+            _reject(lambda: snapshot_notes(notes.root, second, allowed_keys=keys), 'paused')
             pause = _read_json(notes.root / 'pauses/global/main.json')
             _reject(lambda: notes.rebaseline('global/main', expected_observation=pause['observed_sha256'],
-                    parent_version=a_result['version_id'], trigger_id=trigger['id'], sources=record_sources,
-                    reason='bad history pruning', expectation='reject'), 'parent')
-            rebased = notes.rebaseline('global/main', expected_observation=pause['observed_sha256'],
-                    parent_version=rollback_result['version_id'], trigger_id=trigger['id'], sources=record_sources,
-                    reason='adopt explicit human correction', expectation='preserve human bytes')
-            assert rebased['status'] == 'committed'
+                parent_version=state['a_result']['version_id'], trigger_id=task['id'], sources=list(task['cutoff']['exposures']),
+                reason='bad pruning', expectation='reject'), 'parent')
+            assert notes.rebaseline('global/main', expected_observation=pause['observed_sha256'],
+                parent_version=rolled['version_id'], trigger_id=task['id'], sources=list(task['cutoff']['exposures']),
+                reason='explicit human correction', expectation='keep human bytes')['status'] == 'committed'
             assert b'HUMAN_EDIT' in read_committed(notes.root, 'global/main', second, allowed_keys=keys)['raw']
-            assert notes.commit_candidate(latest_candidate)['status'] == 'stale'
-            passed('observed-manual-edit-pauses-explicit-baseline-new-version-rejects-history-pruning')
-            # Removing current manually is not a fresh empty note.
-            missing_root = root / 'missing-current'
-            shutil.copytree(root / 'fault-baseline', missing_root)
-            missing_writer = NoteWriter(missing_root)
-            (missing_root / 'current/global/main.md').unlink()
-            first_task = _read_json(missing_root / 'triggers' / (list((missing_root / 'triggers').glob('*.json'))[0].stem + '.json'))
-            _reject(lambda: candidate(b'new root', writer=missing_writer, task=first_task,
-                                      sources=list(first_task['cutoff']['exposures'])), 'external edit')
-            assert list((missing_root / 'pauses').rglob('*.json'))
-            passed('external-current-deletion-cannot-create-second-root')
-            # Symlink in ordinary current namespace is rejected, never followed.
-            link_root = root / 'symlink'
-            shutil.copytree(root / 'fault-baseline', link_root)
-            target = link_root / 'current/global/main.md'
-            target.unlink()
-            target.symlink_to(root / 'notes/current/global/main.md')
-            _reject(lambda: snapshot_notes(link_root, first, allowed_keys=['global/main']), 'symlink')
-            passed('symlink-current-refused')
-            # Pending, cancelled, failure and budget refusal are tracked without
-            # constructing a librarian client or automatic retry.
+            assert notes.commit_candidate(latest)['status'] == 'stale'
             for status in ('failed', 'not-admitted', 'no-op'):
-                notes.finish_trigger(trigger['id'], status, 'synthetic ' + status)
-            task_after = _read_json(notes.root / 'triggers' / (trigger['id'] + '.json'))
-            assert [value['status'] for value in task_after['attempts']][-3:] == ['failed', 'not-admitted', 'no-op']
-            assert len(client.exchanges) == 6
-            passed('no-change-failure-budget-refusal-recorded-without-auto-requests')
+                notes.finish_trigger(task['id'], status, 'synthetic ' + status)
+            passed('manual-edit-pauses-explicit-baseline-preserves-history-and-trigger-outcomes-without-auto-request')
         finally:
             client.close()
-        # Same T10 action journal distinguishes generated/attempted/unknown/
-        # failed facts. These fixtures are reference tools, not QQ sends.
-        for scenario, expected_statuses in (
-                ('cancel-before-tool', {'not-dispatched'}),
-                ('result-failure', {'unknown', 'not-dispatched'}),
-                ('future-tool', {'failed', 'not-dispatched'})):
-            cancellation = root / (scenario + '-loop')
-            cancellation.mkdir()
-            cancel_client = ClosedClient(cancellation, {**manifest, 'scenario': scenario}, scenario)
-            if scenario == 'future-tool':
-                future = next(event for event in frozen['events'] if event['event_key'] not in first['visible_event_keys'])
-                cancel_client.future_reference = {'source_alias': future['source_alias'], 'event_key': future['event_key']}
-            try:
-                cancel_client.ledger.wake()
-                try:
-                    outcome = drive_wake(first, wakes[0], [wakes[0]], cancellation, cancel_client, scenario=scenario)
-                    terminal_status = 'cancelled' if outcome['cancelled'] else 'complete'
-                except (RuntimeError, OSError, ValueError):
-                    terminal_status = 'failed'
-                finish_wake(cancellation, wakes[0]['id'], terminal_status, list(cancel_client.saved))
-                cancel_client.ledger.stop('explicit terminal diagnostic; no automatic retry')
-                cancelled_writer = NoteWriter.create(root / (scenario + '-notes'))
-                task = cancelled_writer.register_trigger(cancellation, wakes[0]['id'], first, allowed_keys=['global/main'])
-                task = cancelled_writer.admit_trigger(task['id'], cancellation, first)
-                execution = [value for value in task['cutoff']['exposures'].values() if value['kind'] == 'execution']
-                assert {value['status'] for value in execution} == expected_statuses
-                _reject(lambda: cancelled_writer.prepare_candidate(task['id'], 'global/main', b'no retry',
-                          sources=list(task['cutoff']['exposures']), reason='partial terminal', expectation='reject'))
-                cancelled_writer.finish_trigger(task['id'], 'not-admitted', 'first slice processes only complete terminal; explicit diagnostic retained')
-                assert cancel_client.attempts == 1
-                passed('partial-terminal-facts-no-auto-retry-' + scenario, statuses=sorted(expected_statuses))
-            finally:
-                cancel_client.close()
+        # Durable note failure matrix uses the same ready B proposal and A base.
         for fault in ('previous', 'audit-before', 'audit-partial', 'audit-flush', 'audit-fsync', 'audit-replace',
                       'audit-after-replace', 'audit-dir-fsync', 'current-before', 'current-partial', 'current-flush',
                       'current-fsync', 'current-replace', 'current-after-replace', 'current-dir-fsync',
@@ -277,92 +305,126 @@ def doctor(root):
             folder = root / ('fault-' + fault)
             shutil.copytree(root / 'fault-baseline', folder)
             writer = NoteWriter(folder)
-            result = writer.commit_candidate(b, fault=fault)
+            result = writer.commit_candidate(state['b'], fault=fault)
             assert result['status'] == 'failed' and writer.poisoned
             before = {str(p.relative_to(folder)): _hash(p.read_bytes()) for p in folder.rglob('*') if p.is_file()}
             def forbidden(*_, **__):
-                raise AssertionError('read-only recovery wrote/constructed a client')
+                raise AssertionError('read-only recovery wrote/constructed client')
             with patch.object(Path, 'write_bytes', forbidden), patch.object(Path, 'write_text', forbidden), \
                  patch.object(ClosedClient, '__init__', forbidden):
                 recovered = recover_notes(folder)
             after = {str(p.relative_to(folder)): _hash(p.read_bytes()) for p in folder.rglob('*') if p.is_file()}
             assert before == after and not recovered['rejected'] and recovered['persistence_unknown']
-            current = recovered['notes']['global/main']['version_id']
-            assert current in {a_result['version_id'], b_result['version_id']}
-            _reject(lambda: writer.commit_candidate(b), 'closed')
-            _reject(lambda: NoteWriter(folder).commit_candidate(b), 'closed')
+            assert recovered['notes']['global/main']['version_id'] in {state['a_result']['version_id'], state['b_result']['version_id']}
+            _reject(lambda: writer.commit_candidate(state['b']), 'closed')
+            _reject(lambda: NoteWriter(folder).commit_candidate(state['b']), 'closed')
             faults[fault] = {'result': result, 'recovery': recovered, 'all_bytes_unchanged': True}
-        passed('22-injected-previous-audit-current-receipt-breakpoints-read-only-old-or-new-and-reopened-writer-closed')
-        tamper_root = root / 'tampered-candidates'
-        shutil.copytree(root / 'fault-baseline', tamper_root)
-        original_candidate = _read_json(tamper_root / 'candidates' / (b + '.json'))
+        passed('22-note-IO-breakpoints-old-or-new-readonly-recovery-reopened-writer-closed')
+        original_candidate = _read_json(root / 'fault-baseline/candidates' / (state['b'] + '.json'))
         for name, changes in (
                 ('restore', {'operation': 'restore', 'restore_version': 'nonexistent'}),
-                ('delete-body', {'operation': 'delete'}),
-                ('operation', {'operation': 'unrecognized'}),
-                ('generation', {'generation': 999}),
-                ('frozen-source', {'source_frozen_id': 'foreign'}),
-                ('scope', {'key': 'person/202'}),
+                ('delete-body', {'operation': 'delete'}), ('operation', {'operation': 'unrecognized'}),
+                ('generation', {'generation': 999}), ('prefix-sequence', {'cutoff_sequence': 999}),
+                ('frozen-source', {'source_frozen_id': 'foreign'}), ('scope', {'key': 'person/202'}),
                 ('future-source', {'sources': ['unexposed-future']})):
+            folder = root / ('tamper-' + name)
+            shutil.copytree(root / 'fault-baseline', folder)
             forged = {**deepcopy(original_candidate), **changes}
-            forged_id = _hash(canonical(forged))
-            (tamper_root / 'candidates' / (forged_id + '.json')).write_bytes(_pack(forged))
-            result = NoteWriter(tamper_root).commit_candidate(forged_id)
-            assert result['status'] == 'rejected', (name, result)
-        passed('recomputed-candidate-hashes-cannot-bypass-shared-commit-policy')
-        rewind_root = root / 'external-full-version-rewind'
-        shutil.copytree(root / 'fault-baseline', rewind_root)
-        rewind_writer = NoteWriter(rewind_root)
-        assert rewind_writer.commit_candidate(b)['status'] == 'committed'
-        (rewind_root / 'current/global/main.md').write_bytes(frozen_a[0]['raw'])
-        assert rewind_writer.commit_candidate(b)['status'] == 'rejected'
-        rewind_pause = _read_json(rewind_root / 'pauses/global/main.json')
-        assert rewind_pause['expected_version'] == b_result['version_id']
-        _reject(lambda: rewind_writer.rebaseline('global/main', expected_observation=rewind_pause['observed_sha256'],
-                  parent_version=a_result['version_id'], trigger_id=first_trigger['id'],
-                  sources=list(first_trigger['cutoff']['exposures']), reason='bad rewind', expectation='reject'), 'parent')
-        passed('whole-file-external-rewind-detected-by-immutable-applied-audit-without-current-fallback')
-        paused_root = root / 'cooperative-manual-edit'
-        shutil.copytree(root / 'fault-baseline', paused_root)
-        paused_writer = NoteWriter(paused_root)
-        paused_writer.pause_note('global/main', reason='human begins edit while automatic writer paused')
-        assert paused_writer.commit_candidate(b)['status'] == 'rejected'
-        paused_path = paused_root / 'current/global/main.md'
-        paused_path.write_bytes(paused_path.read_bytes().partition(b'\n')[0] + b'\nCOOPERATIVE_HUMAN_BYTES\r\n')
-        observed = paused_writer.pause_note('global/main', reason='human saved; explicitly observe new bytes')
-        assert paused_writer.rebaseline('global/main', expected_observation=observed['observed_sha256'],
-                   parent_version=a_result['version_id'], trigger_id=first_trigger['id'],
-                   sources=list(first_trigger['cutoff']['exposures']), reason='explicit human baseline',
-                   expectation='keep human body')['status'] == 'committed'
-        assert paused_writer.commit_candidate(b)['status'] == 'stale'
-        passed('explicit-pre-edit-pause-and-post-edit-observation-new-baseline')
-        # Deliberate non-cooperating editor at the final check/replace gap.
-        race_root = root / 'toctou-counterexample'
-        shutil.copytree(root / 'fault-baseline', race_root)
-        race_writer = NoteWriter(race_root)
-        import stateless_notes
-        original_replace = stateless_notes.os.replace
-        def racing_replace(source, target):
-            if str(target).endswith('current/global/main.md'):
-                Path(target).write_bytes(b'NONCOOPERATING_EDITOR_WRITE')
-            return original_replace(source, target)
-        with patch.object(stateless_notes.os, 'replace', racing_replace):
-            race_result = race_writer.commit_candidate(b)
-        assert race_result['status'] == 'committed'
-        assert b'NONCOOPERATING_EDITOR_WRITE' not in (race_root / 'current/global/main.md').read_bytes()
-        passed('TOCTOU-counterexample-confirms-noncooperative-editor-outside-guarantee')
-        assert all(value == 0 for value in counters.values())
+            identity = _hash(canonical(forged))
+            (folder / 'candidates' / (identity + '.json')).write_bytes(_pack(forged))
+            assert NoteWriter(folder).commit_candidate(identity)['status'] == 'rejected', name
+        passed('recomputed-candidate-hashes-cannot-bypass-source-scope-prefix-operation-policy')
+        for mode in ('missing', 'rewind', 'symlink', 'cooperative', 'race'):
+            folder = root / ('external-' + mode)
+            shutil.copytree(root / 'fault-baseline', folder)
+            writer = NoteWriter(folder)
+            path = folder / 'current/global/main.md'
+            if mode == 'missing':
+                path.unlink()
+                assert writer.commit_candidate(state['b'])['status'] == 'rejected'
+            elif mode == 'rewind':
+                assert writer.commit_candidate(state['b'])['status'] == 'committed'
+                path.write_bytes(state['frozen_a'][0]['raw'])
+                assert writer.commit_candidate(state['b'])['status'] == 'rejected'
+            elif mode == 'symlink':
+                path.unlink()
+                path.symlink_to(notes.root / 'current/global/main.md')
+                _reject(lambda: snapshot_notes(folder, first, allowed_keys=keys), 'symlink')
+            elif mode == 'cooperative':
+                writer.pause_note('global/main', reason='explicit pre-edit pause')
+                assert writer.commit_candidate(state['b'])['status'] == 'rejected'
+            else:
+                import stateless_notes
+                replace = stateless_notes.os.replace
+                def race(source, target):
+                    if str(target).endswith('current/global/main.md'):
+                        Path(target).write_bytes(b'NONCOOPERATING_EDITOR_WRITE')
+                    return replace(source, target)
+                with patch.object(stateless_notes.os, 'replace', race):
+                    assert writer.commit_candidate(state['b'])['status'] == 'committed'
+                assert b'NONCOOPERATING_EDITOR_WRITE' not in path.read_bytes()
+            passed('external-' + mode + ('-outside-cooperative-guarantee' if mode == 'race' else '-refused'))
+        # Source-domain failures cannot be hidden by an older valid cutoff.
+        for marker in ('persistence-unknown.json', 'ledger.json.new', 'commit-persistence-unknown.json'):
+            path = loop / marker
+            path.write_bytes(b'fictional fault')
+            try:
+                result = NoteWriter(root / 'fault-baseline').commit_candidate(state['b'])
+                assert result['status'] == 'rejected', (marker, result)
+            finally:
+                path.unlink()
+        ledger_path = loop / 'ledger.json'
+        ledger_raw = ledger_path.read_bytes()
+        ledger_path.unlink()
+        try:
+            assert NoteWriter(root / 'fault-baseline').commit_candidate(state['b'])['status'] == 'rejected'
+        finally:
+            ledger_path.write_bytes(ledger_raw)
+        passed('source-Ledger-and-commit-persistence-unknown-or-missing-close-writing')
+        # Cancel/failure facts remain exact in the T10 journal; no retry request.
+        for scenario, expected in (('cancel-before-tool', {'not-dispatched'}),
+                                   ('result-failure', {'unknown', 'not-dispatched'}),
+                                   ('future-tool', {'failed', 'not-dispatched'})):
+            folder = root / (scenario + '-loop')
+            folder.mkdir()
+            other = ClosedClient(folder, manifest, scenario)
+            writer = NoteWriter.create(root / (scenario + '-notes'))
+            if scenario == 'future-tool':
+                future = next(e for e in frozen['events'] if e['event_key'] not in first['visible_event_keys'])
+                other.future_reference = {'source_alias': future['source_alias'], 'event_key': future['event_key']}
+            try:
+                other.ledger.wake()
+                try:
+                    outcome = drive_wake(first, wakes[0], [wakes[0]], folder, other, scenario=scenario,
+                        materials=(writer.freeze_baseline('global/main', first, allowed_keys=keys),))
+                    status = 'cancelled' if outcome['cancelled'] else 'complete'
+                except (ValueError, RuntimeError, OSError):
+                    status = 'failed'
+                journal = recover_commits(folder)
+                assert set(journal['actions'].values()) == expected
+                registered = writer.register_trigger(folder, wakes[0]['id'], first, allowed_keys=keys)
+                task = writer.admit_trigger(registered['id'], folder, first, through_output=next(iter(journal['outputs'])))
+                ready = candidate(task, b'before failure', writer=writer)
+                finish_wake(folder, wakes[0]['id'], status, list(other.saved))
+                assert writer.commit_candidate(ready)['status'] == 'rejected'
+                _reject(lambda: candidate(task, b'after failure', writer=writer), 'writes closed')
+                assert other.attempts == 1
+                passed('cancel-failed-unknown-facts-preserved-and-old-candidates-closed-' + scenario, statuses=sorted(expected))
+            finally:
+                other.close()
+        assert all(v == 0 for v in counters.values())
     durable(root / 'parser-console.json', {'synthetic_console': console.getvalue()})
-    result = {'schema': 'stateless-notes-doctor-v1', 'status': 'ok', 'assertions': assertions, 'faults': faults,
-              'sentinels': counters, 'real_HTTP': 0, 'QQ': 0, 'elapsed_seconds': time.perf_counter() - started,
-              'peak_rss_kib': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
-              'source_hashes': {name: _hash((Path(__file__).parent / name).read_bytes())
-                                for name in ('stateless_notes.py', 'stateless_notes_calibration.py', 'stateless_loop.py', 'stateless_calibration.py')},
-              'limitations': ['fixture candidates; no real librarian generation or semantic learning evidence',
-                              'T07 ordinary-group archive only; stable personal key and explicit scope, no private-source ingestion proof',
-                              'per-file cooperative lock; noncooperative editor TOCTOU explicitly reproduced',
-                              'fault injection, not physical power-loss/all-filesystem durability proof',
-                              'no atomic multi-file snapshot; no automatic retry, scheduler or production editor integration']}
+    result = {'schema': 'stateless-notes-doctor-v2', 'status': 'ok', 'assertions': assertions, 'faults': faults,
+        'sentinels': counters, 'real_HTTP': 0, 'QQ': 0, 'elapsed_seconds': time.perf_counter() - started,
+        'peak_rss_kib': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        'source_hashes': {name: _hash((Path(__file__).parent / name).read_bytes()) for name in (
+            'stateless_notes.py', 'stateless_notes_calibration.py', 'stateless_loop.py', 'stateless_calibration.py',
+            'stateless_selector.py', 'stateless_selector_calibration.py')},
+        'limitations': ['fixture candidate bytes; no real generation, semantic learning or subjectivity proof',
+            'T12 explicit reread uses existing Chat context provider; real note tools and orchestration belong to T13',
+            'ordinary-group synthetic archive, no private-ingestion proof',
+            'cooperative lock; noncooperative editor TOCTOU reproduced',
+            'fault injection, not physical power-loss/all-filesystem proof; no atomic multi-file snapshot']}
     durable(root / 'doctor.json', result)
     return result
 
@@ -380,7 +442,7 @@ def main(argv=None):
             root.mkdir(parents=True, mode=0o700)
             result = doctor(root)
         print(json.dumps({'status': result.get('status'), 'assertions': len(result.get('assertions', [])),
-                          'result': result if args.command == 'recover' else None}))
+                         'result': result if args.command == 'recover' else None}))
         return 0
     except (ValueError, RuntimeError, OSError, AssertionError, KeyError) as error:
         print(f'notes calibration: {type(error).__name__}: {error}', file=sys.stderr)
