@@ -768,3 +768,131 @@ Future simulated-action tools can reuse the local `execute` function in
 requires ownership of that local function/registration seam in `stateless_loop.py`;
 it must use the existing output/action journal. No second action log or general
 tool scheduling framework is provided here.
+
+## Finite subject workspace
+
+[`subject_probe.py`](subject_probe.py) composes the existing native Chat driver,
+NoteWriter and OfficialClient around a small fictional workspace. It offers two
+objects, two text cards and three places. Actual move/write tools change
+`world.json`; an independently specified clock can tilt a tray and slide its
+objects to the table. No interest, preferred arrangement, plan, score or correct
+reaction is supplied. The bootstrap, rules, seed, visible scope, source bytes and
+budget are frozen before execution. These are disclosed design priors, not
+claims about an unconditioned subject.
+
+The application ceiling is 2,000,000 cumulative tokens, 5 CNY at the frozen
+conservative prices, twelve actual HTTP requests, three wakes and 4096 output
+tokens per request. Only the `chat` role in the `question` stage is enabled.
+Stage and run ceilings overlap on the same original Ledger; they are not extra
+balances. No selector or background call is mandatory. The unused stage fields
+have minimal positive declarations because the existing capacity schema requires
+all four stages; those roles are not enabled.
+
+A bootstrap wake is followed by at most one separately labelled harness clock
+opportunity. `request_revisit(delay_ticks, reason)` creates a further opportunity
+only through an actual native request, dispatch, world persistence and confirmed
+result. Delays are one to three simulated ticks; zero declines every remaining
+opportunity. A quiet model requests no revisit and can therefore finish with two
+wakes; explicit decline can finish with one. Three is a ceiling. A due request
+can remain undelivered when that ceiling or the shared budget is reached.
+The next-request shared reserve is checked before clock advancement, and the
+existing HTTP hook repeats admission before reservation/send. These are finite
+simulated ticks, not a production scheduler.
+
+The four optional `drive_wake(..., simulation=workspace)` tools are
+`observe_workspace()`, `move_object(object_id, destination)`,
+`write_card(card_id, text)` and `request_revisit(delay_ticks, reason)`. They all
+reuse the existing guard → output/dispatch → operation → result path. The world
+reads its current state, frozen rules and actual dispatched arguments only;
+it does not inspect a note, candidate, diagnostic expected answer or model
+self-assessment to decide an effect. A fresh observation returns current state
+and the last clock effect, never future state or pending opportunities.
+
+Each later wake creates a fresh host-identified Chat from committed notes and
+committed action facts. Only wakes actually delivered so far are passed to the
+existing acknowledgement logic. The static bootstrap snapshot/cursor can be
+reused without treating later note generations as unchanged. `revise_note` and
+`read_note` retain their existing source/parent contracts, including
+`tool:<call_id>` only after its native result appears in an actual request.
+Rejected candidate arguments may remain visible as historical generated action
+facts; they never become selected note material. Exact wire bodies establish
+exposure. File existence or exposure alone does not establish use or benefit.
+
+Preparation and inspection are offline and take no credential:
+
+```sh
+python experiments/subject_probe.py prepare --root /absolute/new/external/root
+python experiments/subject_probe.py verify --root /absolute/new/external/root
+python experiments/subject_probe.py recover --root /absolute/new/external/root
+```
+
+`prepare` freezes `bootstrap.txt`, `world-rules.json`, `subject.json`, `plan.json`
+and `official-template.json`. It creates no Ledger, allocation, authorization or
+client and reports `prepared-not-ready`. The default command is `verify`;
+missing operator records report `not-ready`. `plan.json` binds the exact raw
+`subject.json` bytes. Its entry is a bootstrap declaration; the subject driver,
+not the official single-entry CLI, constructs the actual native requests.
+
+For an explicitly approved real segment, an operator must independently provide
+the four records required by [`stateless_official.py`](stateless_official.py):
+`models-response.json`, `target-metadata.json`, `research-allocation.json` and
+`authorization.json`. The existing official verifier is the schema authority.
+Metadata must record an actual applicable `/models` observation with origin
+`operator-observed-official`, exact response hash, target identity and capacity.
+The common 100M-token allocation must contain one matching fresh reservation for
+the prepared root/run/binding and full overlapping budgets. Authorization must
+bind the template's `official.binding`, all four other record hashes (including
+`plan.json`), that reservation ID, the explicit current contract and unknown
+billing acceptance, with a valid interval of at most 24 hours. Preparation does
+not invent any of those observations, reservations or approvals.
+
+After those records have been supplied, `seal` only hashes them into the final
+manifest and verifies them. It does not grant approval or repair invalid input.
+A failed seal retains its manifest for inspection; do not reuse it as a fresh
+execution root. Explicit execution takes one temporary credential line on stdin
+through an operator-controlled channel:
+
+```sh
+python experiments/subject_probe.py seal --root /absolute/new/external/root
+python experiments/subject_probe.py verify --root /absolute/new/external/root
+python experiments/subject_probe.py run --root /absolute/new/external/root --credential-stdin
+```
+
+Never put a credential in command arguments, files or environment variables.
+The run command checks readiness before reading stdin; prepare/verify/recover
+never read it. Each wake and each tool rechecks frozen source/material hashes.
+The OfficialClient's permanent execute-once claim and common Ledger guards stay
+in force. Cancellation, missing usage, budget refusal and unknown note, action,
+external effect or result persistence close the shared session. Recovery is
+read-only: no client, replay, retry or repair. An external effect can be known in
+`world.json` while its action result is unknown; it must not be dispatched again.
+A delivery recorded before the first output remains delivered-but-unacknowledged,
+not proof that a model received it. World checksums and source binding detect
+ordinary drift; they are not authentication against a trusted host rewriting
+both evidence and hashes.
+
+The offline composition calibration uses only the fixed internal OfficialClient
+MockTransport path, real installed SDK/parser, fictional operator records and a
+fictional credential. Public verification still refuses those records. It never
+sends a model request or spends real money:
+
+```sh
+python experiments/subject_probe_calibration.py doctor --case active --output /tmp/new-subject-active
+python experiments/subject_probe_calibration.py doctor --case quiet --output /tmp/new-subject-quiet
+python experiments/subject_probe_calibration.py doctor --case revisit-unknown --output /tmp/new-subject-fault
+```
+
+Run cases separately when applying a per-command timeout. `doctor` without
+`--case` runs every case and can take longer. Active fixtures emit scripted tool
+arguments through actual fake SDK responses: move/write, inspect the real native
+result, revise/read a note, request a revisit, then observe an independent clock
+effect and revise. This proves wiring and refusal behavior, not autonomous
+interests, semantic quality or a real model's decision. Cases also cover silence,
+explicit rest, same-batch premature success refusal, cancellation, request and
+wake-boundary budgets, missing usage, input drift and effect/result/note unknown.
+Every request retains its original Ledger row, exact wire, attribution, usage,
+transport evidence (`sent=False`) and action provenance. `result.json` separates
+formation, selection, injection, use judgment and external results; it supplies
+no success ranking. Independent external evidence readers can recompute the
+world from the rules and actual tool arguments without importing the fixture or
+subject implementation.

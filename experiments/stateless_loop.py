@@ -304,7 +304,7 @@ def note_source_handles(cutoff):
 
 
 def drive_wake(snapshot, wake, wakes, root, client, *, references=(), actions=(), materials=(), scenario='normal',
-               notes=None, note_keys=(), note_aliases=None, process='main', after_output=None, cancelled=lambda: False):
+               notes=None, note_keys=(), note_aliases=None, process='main', after_output=None, cancelled=lambda: False, simulation=None):
     """A fresh main/background Chat, optionally interleaved before terminal.
 
     after_output is an explicit caller seam for a second independent Chat;
@@ -372,6 +372,8 @@ def drive_wake(snapshot, wake, wakes, root, client, *, references=(), actions=()
         if should_stop():
             raise RuntimeError('cancelled before tool/request')
         client.guard_tools()
+        if simulation is not None:
+            simulation.guard()
         recover_commits(root)
         if notes and (notes.poisoned or (notes.root / 'persistence-unknown.json').exists()
                       or any(notes.root.rglob('*.new'))):
@@ -476,7 +478,31 @@ def drive_wake(snapshot, wake, wakes, root, client, *, references=(), actions=()
                 'completed' if outcome['status'] in {'committed', 'no-op'} else 'failed')
         return execute(revise)
 
+    def observe_workspace() -> str:
+        """Inspect the current synthetic objects/cards/clock; no future state is visible."""
+        return execute(lambda action: simulation.act(action, 'observe_workspace', {}))
+
+    def move_object(object_id: str, destination: str) -> str:
+        """Move a synthetic object to table, left or right. No external device is controlled."""
+        return execute(lambda action: simulation.act(action, 'move_object', {
+            'object_id': object_id, 'destination': destination}))
+
+    def write_card(card_id: str, text: str) -> str:
+        """Write exact text on synthetic card one or two; this is an external object, not note memory."""
+        return execute(lambda action: simulation.act(action, 'write_card', {'card_id': card_id, 'text': text}))
+
+    def request_revisit(delay_ticks: int, reason: str) -> str:
+        """Request a simulated revisit in 1..3 ticks. Zero declines all further wake opportunities.
+
+        It is optional: silence/final output requests no revisit. The harness has
+        at most one separately labelled clock opportunity unless declined here.
+        """
+        return execute(lambda action: simulation.act(action, 'request_revisit', {
+            'delay_ticks': delay_ticks, 'reason': reason}))
+
     functions = [read_reference] + ([read_note, revise_note] if notes else [])
+    if simulation is not None:
+        functions += [observe_workspace, move_object, write_card, request_revisit]
     try:
         chat = llm.Chat(model=client.config['default_model'], messages=messages,
                         functions=functions, chat_client=client, do_process_image=False)
