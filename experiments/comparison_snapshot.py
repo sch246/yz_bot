@@ -29,6 +29,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import time
 from types import MappingProxyType, SimpleNamespace
@@ -282,6 +283,12 @@ def _safe_root(value):
     if any(item.is_symlink() for item in (path, *path.parents)):
         raise ValueError("symlink output path refused")
     path = a0.external_root(path)
+    registered = subprocess.run(["git", "worktree", "list", "--porcelain", "-z"],
+                                cwd=a0.replay.REPOSITORY, capture_output=True, check=True).stdout
+    roots = [Path(os.fsdecode(item.removeprefix(b"worktree "))).resolve()
+             for item in registered.split(b"\0") if item.startswith(b"worktree ")]
+    if not roots or any(path.is_relative_to(root) for root in roots):
+        raise ValueError("output must be outside every registered Git worktree")
     if path.exists():
         raise ValueError("fresh external root required; no resume or branch reuse")
     return path
