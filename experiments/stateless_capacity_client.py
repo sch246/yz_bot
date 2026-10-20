@@ -149,16 +149,30 @@ class CapacityClient(llm.LLMClient):
         _require(self.ledger.policy.contract == self.contract and self.ledger.limits == LIMITS
                  and self.ledger.prices == PRICES and self.ledger.state['manifest'] == self.manifest_hash
                  and self.ledger.state['pilot'] == self.manifest['run_id'], 'ledger-policy-drift')
-        disk = json.loads((self.root / 'ledger.json').read_bytes())
-        if disk != {'state': self.ledger.state, 'sha256': digest(self.ledger.state)}:
-            self._poison('ledger-integrity-unknown')
-            raise CapacityStop('ledger-integrity-unknown')
-        self.ledger.validate()
+        self._ledger_snapshot()
         _require(digest(self.config) == self._config_hash and self.clients.get('deepseek') is self._clients
                  and self._clients.chat.completions.create == self._create and self.sdk is self._sdk
                  and self.sdk.max_retries == 0 and self.sdk.timeout == self.contract['timeout_seconds']
                  and not self.http.follow_redirects
                  and self.strict_tools is True, 'sdk-config-drift')
+
+    def _ledger_snapshot(self):
+        # WHY: a read/parse failure is an unknown authority, not permission to
+        # repair it by writing the in-memory balance while stopping a caller.
+        try:
+            disk = json.loads((self.root / 'ledger.json').read_bytes())
+            _require(disk == {'state': self.ledger.state, 'sha256': digest(self.ledger.state)},
+                     'ledger-integrity-unknown')
+            self.ledger.validate()
+        except (OSError, ValueError, TypeError, KeyError, IndexError, CapacityStop):
+            self._poison('ledger-integrity-unknown')
+            raise CapacityStop('ledger-integrity-unknown') from None
+        return disk
+
+    def _stop(self, reason):
+        if not self.ledger.poisoned and not self.ledger.state['closed']:
+            self._ledger_snapshot()
+            self.ledger.stop(reason)
 
     def projection(self):
         """Read S and I from unchanged original Ledger rows and exact evidence."""
@@ -263,7 +277,7 @@ class CapacityClient(llm.LLMClient):
                 self.active['error'] = label
             if not self.ledger.poisoned and not self.ledger.state['closed']:
                 try:
-                    self.ledger.stop(label)
+                    self._stop(label)
                 except BaseException:
                     pass
             raise
@@ -338,6 +352,7 @@ class CapacityClient(llm.LLMClient):
         row = self.active['row']
         if row is None or row['status'] != 'reserved' or self.ledger.poisoned:
             return
+        self._ledger_snapshot()
         if self.ledger.state['closed'] and outcome == 'stop':
             outcome = 'shared-closed'
         self._write(f"observation-{len(self.ledger.state['requests']):04d}.json", {
@@ -424,7 +439,7 @@ class CapacityClient(llm.LLMClient):
             # The owning generation notices the shared stop before release.
             if not self.ledger.poisoned:
                 try:
-                    self.ledger.stop('concurrent-generation')
+                    self._stop('concurrent-generation')
                 except BaseException:
                     pass
             raise CapacityStop('concurrent-generation')
@@ -454,7 +469,7 @@ class CapacityClient(llm.LLMClient):
             self._finish_request(outcome)
             if error is not None or self.ledger.poisoned or self.ledger.state['closed']:
                 if not self.ledger.poisoned and not self.ledger.state['closed']:
-                    self.ledger.stop(outcome)
+                    self._stop(outcome)
                 raise CapacityStop('persistence-unknown' if self.ledger.poisoned else
                                    self.ledger.state['closed'] or outcome) from None
             self._integrity()
@@ -467,12 +482,12 @@ class CapacityClient(llm.LLMClient):
             return completed
         except GeneratorExit:
             if not self.ledger.poisoned and not self.ledger.state['closed']:
-                self.ledger.stop('cancelled')
+                self._stop('cancelled')
             raise
         except BaseException as failure:
             if not self.ledger.poisoned and not self.ledger.state['closed']:
                 try:
-                    self.ledger.stop('local-failure')
+                    self._stop('local-failure')
                 except BaseException:
                     pass
             raise CapacityStop(str(failure) if isinstance(failure, CapacityStop) else 'local-failure') from None
@@ -486,7 +501,7 @@ class CapacityClient(llm.LLMClient):
             self.projection()
         except BaseException:
             if not self.ledger.poisoned and not self.ledger.state['closed']:
-                self.ledger.stop('tool-guard-failure')
+                self._stop('tool-guard-failure')
             raise CapacityStop('shared-closed') from None
 
     def close(self):
