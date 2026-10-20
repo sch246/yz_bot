@@ -1,0 +1,416 @@
+"""Synthetic SDK+MockTransport capacity doctor; never a live execution CLI."""
+from __future__ import annotations
+
+import argparse
+from contextlib import ExitStack, redirect_stdout, contextmanager
+from copy import deepcopy
+import hashlib
+import io
+import json
+from pathlib import Path
+import resource
+import subprocess
+import os
+import sys
+import time
+from unittest.mock import patch
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import a0_ledger
+import stateless_capacity_client as capacity
+from a0_ledger import canonical, digest, durable
+from comparison_snapshot import _safe_root, open_snapshot
+from stateless_calibration import synthetic_fixture, sentinels
+from stateless_selector_calibration import fixture_catalog
+from stateless_selector import build_selector_input, select_materials, resolve_selection, record_consumption
+from stateless_loop import drive_wake, finish_wake, recover_commits
+
+
+LIMITATION = ['Closed MockTransport only; no live constructor, credential reader or live runner.',
+              'Historical capacity/prices are declarations, not current official verification or provider acceptance.',
+              'No real failure-billing, model quality, autonomous subject or production evidence.',
+              'Fixture budgets are not the authorized run allocation; no formal run scale chosen.',
+              'Future live selector needs a real sent event; current mock exposure is closed-only.',
+              'Fault injection is not a physical crash/power-loss proof.']
+
+
+@contextmanager
+def isolation(root):
+    """Add production-read and model-attempt counters to the existing sentinels."""
+    repo = Path(__file__).resolve().parents[1]
+    common = subprocess.run(['git', 'rev-parse', '--git-common-dir'], cwd=repo,
+                            capture_output=True, check=True, text=True).stdout.strip()
+    common = Path(common)
+    if not common.is_absolute():
+        common = repo / common
+    repositories = {repo.resolve(), common.resolve().parent}
+    counts, active = {'production_read': 0, 'real_model': 0}, [True]
+    def audit(event, args):
+        if not active[0] or event not in ('open', 'os.listdir', 'os.scandir'):
+            return
+        value = args[0]
+        if not isinstance(value, (str, bytes, os.PathLike)):
+            return
+        path = Path(os.fsdecode(value)).absolute().resolve()
+        for repository in repositories:
+            if path.is_relative_to(repository):
+                relative = path.relative_to(repository)
+                first = relative.parts[0] if relative.parts else ''
+                if (first in {'data', 'chatlog', 'log', 'config.json', '.venv', 'outputs', 'woutputs'}
+                        or first.startswith(('.env', 'app.log'))):
+                    counts['production_read'] += 1
+                    raise RuntimeError('blocked production state access')
+    sys.addaudithook(audit)
+    try:
+        with sentinels(root) as base:
+            yield counts, base
+    finally:
+        active[0] = False
+
+
+def fixture_budgets():
+    ceiling = {'tokens': 5000000, 'micro_cny': 5000000, 'attempts': 12}
+    return {'research': dict(ceiling), 'stages': {stage: dict(ceiling) for stage in capacity.STAGES}}
+
+
+def new_client(root, name, *, scenario='normal', budgets=None, role_stages=None):
+    folder = root / name
+    folder.mkdir(mode=0o700)
+    frozen = capacity.manifest('fictional-' + name, fixture_budgets() if budgets is None else budgets,
+                               role_stages=role_stages)
+    durable(folder / 'manifest.json', frozen)
+    return capacity.CapacityClient(folder, frozen, scenario=scenario)
+
+
+def request(client, role='librarian', *, wake='fixture-wake', snapshot='fixture-snapshot'):
+    client.current = {'role': role, 'wake': wake, 'snapshot_id': snapshot}
+    return client.generate_response([{'role': 'system', 'content': 'Synthetic only.'},
+                                    {'role': 'user', 'content': '{}'}], stream=False)
+
+
+def consume(generator):
+    values = []
+    while True:
+        try:
+            values.append(next(generator))
+        except StopIteration as done:
+            return values, done.value
+
+
+def shared_closed(client):
+    before = client.attempts
+    for role in client.manifest['role_stages']:
+        try:
+            consume(request(client, role))
+        except capacity.CapacityStop:
+            pass
+        else:
+            raise AssertionError('role escaped shared closure')
+    try:
+        client.guard_tools()
+    except capacity.CapacityStop:
+        pass
+    else:
+        raise AssertionError('tool escaped shared closure')
+    assert client.attempts == before
+
+
+def save_case(root, name, client, failure=None, **extra):
+    report = {'case': name, 'attempts': client.attempts, 'settlements': client.settlements,
+              'failure': failure, 'poisoned': client.ledger.poisoned,
+              'ledger': deepcopy(client.ledger.state), 'trace': deepcopy(client.trace), **extra}
+    durable(root / name / 'result.json', report)
+    client.close()
+    return {k: report[k] for k in ('case', 'attempts', 'settlements', 'failure', 'poisoned')}
+
+
+def doctor(root):
+    started = time.perf_counter()
+    cases, assertions = [], []
+    def passed(name, **evidence):
+        assertions.append({'assertion': name, 'status': 'pass', **evidence})
+    def rejected(name, client, action, expected_attempts, *, poison=False):
+        try:
+            action()
+        except capacity.CapacityStop as failure:
+            label = str(failure)
+        else:
+            raise AssertionError('accepted ' + name)
+        assert client.attempts == expected_attempts, (name, client.attempts, expected_attempts)
+        assert client.ledger.poisoned if poison else client.ledger.state['closed']
+        shared_closed(client)
+        passed(name, failure=label, attempts=client.attempts, poisoned=client.ledger.poisoned)
+        cases.append(save_case(root, name, client, label))
+
+    with isolation(root) as (private_counters, counters), redirect_stdout(io.StringIO()) as console:
+        client = new_client(root, 'normal')
+        frozen, schedule, wakes = synthetic_fixture()
+        wake = wakes[0]
+        snapshot = open_snapshot(frozen, schedule, wake['cursor'])
+        client.ledger.wake()
+        state = recover_commits(client.root)
+        catalog, resolver, _, _ = fixture_catalog(snapshot, state)
+        context = build_selector_input(snapshot, wake, 'Synthetic hint.', catalog,
+                                       scopes=('global', 'group:alpha', 'group:beta'), committed_state=state)
+        receipt = {}
+        selection = select_materials(context, snapshot, client, resolver, receipt,
+                                     client.root / 'selector.json', committed_state=state)
+        bundle = resolve_selection(context, selection, snapshot, resolver, committed_state=state)
+        before = len(client.exchanges)
+        result = drive_wake(snapshot, wake, wakes, client.root, client,
+                            references=bundle['references'], actions=bundle['actions'], materials=bundle['materials'])
+        record = client.saved[client.exchanges[before]['request_id']]['value']
+        consumed = record_consumption(receipt, bundle, record)
+        assert all(v['status'] == 'injected' for v in consumed)
+        finish_wake(client.root, wake['id'], 'complete', [v['request_id'] for v in client.exchanges])
+        consume(request(client, 'librarian', wake=wake['id'], snapshot=snapshot['snapshot_id']))
+        consume(request(client, 'background', wake=wake['id'], snapshot=snapshot['snapshot_id']))
+        projection = client.projection()
+        assert client.attempts == client.settlements == 6
+        assert projection['scopes']['research']['S'] == {'tokens': 720, 'micro_cny': 1692, 'attempts': 6}
+        assert {v['value']['attribution']['role_id'] for v in client.saved.values()} == set(capacity.ROLE_STAGES)
+        assert receipt['catalog_exposure']['status'] == 'exposed'
+        for row in client.ledger.state['requests']:
+            assert row['input_bound'] == capacity.LIMITS['context'] and row['reserved'] == 2129920
+        for index, event in enumerate(client.trace):
+            if event['event'] == 'mock':
+                assert [v['event'] for v in client.trace[:index] if v.get('request_id') == event['request_id']] == [
+                    'admit', 'request-evidence', 'reserve']
+            if event['event'] == 'output-commit':
+                assert client.trace[index - 1]['event'] == 'settle'
+        for envelope in client.exchanges:
+            body = envelope['body']
+            assert body['stream'] is False and 'stream_options' not in body
+            assert envelope['url'] == capacity.ENDPOINT + '/chat/completions'
+            assert hashlib.sha256(envelope['serialized_body'].encode()).hexdigest() == envelope['body_sha256']
+        passed('actual-SDK-parser-selector-chat-background-one-capacity-Ledger', projection=projection,
+               exact_materials=consumed, outputs=result['outputs'])
+        cases.append(save_case(root, 'normal', client, projection=projection, receipt=receipt))
+
+        for scenario in capacity.SCENARIOS:
+            if scenario == 'normal':
+                continue
+            client = new_client(root, scenario, scenario=scenario)
+            if scenario == 'alias':
+                consume(request(client))
+                assert client.ledger.state['requests'][0]['usage'] == [100, 40, 20]
+                passed('strict-cache-alias-accepted')
+                cases.append(save_case(root, scenario, client))
+                continue
+            action = lambda: consume(request(client))
+            if scenario == 'fingerprint-drift':
+                consume(request(client))
+            rejected(scenario, client, action, 0 if scenario == 'cancel-before' else
+                     2 if scenario == 'fingerprint-drift' else 1)
+            row = client.ledger.state['requests'][-1] if client.ledger.state['requests'] else None
+            if scenario in ('missing', 'invalid', 'conflict-alias', 'total', 'unknown-usage', 'null-counter',
+                            'null-cache', 'null-details', 'false-details', 'list-details', 'null-nested-cache',
+                            'connection', '429', '500'):
+                assert row['usage'] is None and row['charged'] == row['reserved']
+            if scenario in ('cancel-after', 'model-drift', 'fingerprint-drift', 'length'):
+                assert row['usage'] == [100, 40, 20] and row['charged'] == 282
+            if scenario == 'joint-overreport':
+                assert row['usage'][0] <= row['input_bound'] and row['usage'][2] <= row['allowance']
+                assert client.ledger.state['closed'] == 'usage-overreport'
+
+        # S + I + R limits, including equality and a second-role attempt.
+        R = {'tokens': capacity.LIMITS['context'] + capacity.LIMITS['output'],
+             'micro_cny': 2129920, 'attempts': 1}
+        for scope in ('research', 'stages'):
+            for metric in capacity.METRICS:
+                name = scope + '-' + metric
+                budgets = fixture_budgets()
+                ceiling = budgets['research'] if scope == 'research' else budgets['stages']['formation']
+                ceiling[metric] = R[metric]
+                client = new_client(root, name, budgets=budgets)
+                consume(request(client))  # Exactly the full reserve fits.
+                rejected(name, client, lambda: consume(request(client)), 1)
+                formula = client.trace[-1]['decision']['formulas'][
+                    'research' if scope == 'research' else 'stages/formation'][metric]
+                assert formula['S'] > 0 and formula['I'] == 0 and formula['R'] == R[metric] and not formula['ok']
+                passed(name + '-S-plus-I-plus-R', formula=formula)
+        budgets = fixture_budgets()
+        budgets['research']['tokens'] = R['tokens'] + 119
+        client = new_client(root, 'shared-cross-role-token', budgets=budgets)
+        consume(request(client))
+        rejected('shared-cross-role-token', client, lambda: consume(request(client, 'selector')), 1)
+        budgets = fixture_budgets()
+        budgets['research']['micro_cny'] = R['micro_cny'] - 1
+        client = new_client(root, 'reserve-CNY-before-first-byte', budgets=budgets)
+        rejected('reserve-CNY-before-first-byte', client, lambda: consume(request(client)), 0)
+
+        client = new_client(root, 'inflight-projection')
+        original_mock = client._mock
+        inflight = []
+        def inspect_inflight(http_request):
+            decision = client.admission(client.active['attribution'])
+            formula = decision['formulas']['research']['tokens']
+            assert formula['S'] == 0 and formula['I'] == formula['R'] == R['tokens']
+            assert not decision['allowed'] and 'shared-inflight' in decision['reasons']
+            inflight.append(decision)
+            return original_mock(http_request)
+        # The transport itself is still the constructor's closed MockTransport.
+        client.http._transport.handler = inspect_inflight
+        consume(request(client))
+        passed('same-Ledger-inflight-I-plus-next-capacity-R-blocks-admission', decision=inflight[0])
+        cases.append(save_case(root, 'inflight-projection', client))
+
+        client = new_client(root, 'manifest-role-stage', role_stages={'background-other': 'verification'})
+        consume(request(client, 'background-other'))
+        projected = client.projection()
+        assert projected['scopes']['stages/verification']['S']['tokens'] == 120
+        assert projected['scopes']['stages/formation']['S']['tokens'] == 0
+        client.current['stage'] = 'formation'
+        rejected('manifest-role-stage', client, lambda: consume(client.generate_response([
+            {'role': 'system', 'content': 'Synthetic.'}, {'role': 'user', 'content': '{}'}], stream=False)), 1)
+        passed('manifest-custom-role-stage-and-no-current-stage-override')
+
+        # Real persistence failures at each responsibility boundary.
+        for failure in ('request', 'response', 'observation', 'reserve', 'settle'):
+            name = 'persistence-' + failure
+            client = new_client(root, name)
+            if failure in ('reserve', 'settle'):
+                original = getattr(client.ledger, failure)
+                def fail_ledger(*args, _original=original, **kwargs):
+                    with patch.object(a0_ledger.os, 'fsync', side_effect=OSError('fictional fsync failure')):
+                        return _original(*args, **kwargs)
+                with patch.object(client.ledger, failure, fail_ledger):
+                    rejected(name, client, lambda: consume(request(client)), 0 if failure == 'reserve' else 1, poison=True)
+            else:
+                original = capacity.durable
+                def fail_evidence(path, value, _target=failure):
+                    if path.name.startswith(_target + '-'):
+                        raise OSError('fictional evidence failure')
+                    return original(path, value)
+                with patch.object(capacity, 'durable', fail_evidence):
+                    rejected(name, client, lambda: consume(request(client)), 0 if failure == 'request' else 1, poison=True)
+            assert (client.root / 'persistence-unknown.json').exists()
+            try:
+                a0_ledger.Ledger(client.root, client.ledger.state['pilot'], client.manifest_hash,
+                    limits=capacity.LIMITS, prices=capacity.PRICES, policy=capacity.CapacityPolicy(client.contract), reopen=True)
+            except ValueError:
+                passed(name + '-reopen-refused')
+            else:
+                raise AssertionError('unknown persistence resumed')
+
+        client = new_client(root, 'direct-sdk-outside-generation')
+        def direct_sdk():
+            try:
+                with capacity.no_sdk_environment(client.environment_reads):
+                    client.sdk.chat.completions.create(model=capacity.WIRE_MODEL,
+                        messages=[{'role': 'user', 'content': 'Synthetic.'}], stream=False)
+            except Exception:
+                raise capacity.CapacityStop('direct-sdk-refused') from None
+        rejected('direct-sdk-outside-generation', client, direct_sdk, 0)
+
+        # Final HTTP hooks see drift after SDK serialization.
+        for drift in ('route', 'method', 'model', 'body', 'role', 'wake', 'snapshot', 'duplicate-hook'):
+            name = 'drift-' + drift
+            client = new_client(root, name)
+            original = client._before_http
+            def mutate(request, _drift=drift):
+                if _drift == 'route': request.url = request.url.copy_with(host='fictional.invalid')
+                elif _drift == 'method': request.method = 'GET'
+                elif _drift in ('model', 'body'):
+                    body = json.loads(request.content)
+                    body['model' if _drift == 'model' else 'max_tokens'] = 'drift' if _drift == 'model' else 1
+                    request._content = canonical(body)
+                elif _drift in ('role', 'wake', 'snapshot'):
+                    client.current[{'role': 'role', 'wake': 'wake', 'snapshot': 'snapshot_id'}[_drift]] = 'drift'
+                original(request)
+                if _drift == 'duplicate-hook': original(request)
+            client.http.event_hooks['request'] = [mutate]
+            rejected(name, client, lambda: consume(request(client)), 0)
+        for drift in ('manifest', 'code', 'sdk', 'config', 'ledger', 'attribution'):
+            name = 'drift-' + drift
+            client = new_client(root, name)
+            with ExitStack() as stack:
+                if drift == 'manifest':
+                    value = deepcopy(client.manifest)
+                    value['run_id'] = 'drift'
+                    durable(client.root / 'manifest.json', value)
+                elif drift == 'code':
+                    stack.enter_context(patch.object(capacity, 'source_hashes', return_value={'drift': '0'}))
+                elif drift == 'sdk':
+                    client.clients['deepseek'].chat.completions.create = lambda **_: None
+                elif drift == 'config': client.config['default_model'] = 'drift'
+                elif drift == 'ledger':
+                    durable(client.root / 'ledger.json', {'state': {}, 'sha256': 'drift'})
+                else:
+                    consume(request(client))
+                    row = client.ledger.state['requests'][0]
+                    saved = client.saved[row['id']]
+                    value = deepcopy(saved['value'])
+                    value['attribution']['role_id'] = 'selector'
+                    durable(client.root / saved['file'], value)
+                rejected(name, client, lambda: consume(request(client)), 1 if drift == 'attribution' else 0,
+                         poison=drift == 'ledger')
+
+        client = new_client(root, 'concurrent')
+        first = request(client)
+        next(first)  # Settled, but parser output generator still owns flight.
+        rejected('concurrent', client, lambda: consume(request(client)), 1)
+        try:
+            next(first)
+        except capacity.CapacityStop:
+            passed('concurrent-closure-blocks-paused-buffer-release')
+        else:
+            raise AssertionError('paused generator released after shared closure')
+        first.close()
+        passed('concurrent-generation-never-constructs-second-SDK-request')
+        client = new_client(root, 'generator-cancel')
+        first = request(client)
+        next(first)
+        first.close()
+        shared_closed(client)
+        assert client.ledger.state['requests'][0]['status'] == 'settled'
+        cases.append(save_case(root, 'generator-cancel', client, 'cancelled'))
+        passed('generator-close-after-usage-keeps-settlement-and-closes-tools')
+        client = new_client(root, 'completed-attribution-drift')
+        first = request(client)
+        next(first)
+        next(first)
+        client.current['wake'] = 'drift-after-last-yield'
+        rejected('completed-attribution-drift', client, lambda: next(first), 1)
+        client = new_client(root, 'parser-console-after-durable-settle')
+        console_calls = []
+        original_message = capacity.llm.console.message
+        def inspect_console(*args, **kwargs):
+            disk = json.loads((client.root / 'ledger.json').read_bytes())['state']
+            assert disk['requests'][-1]['status'] == 'settled'
+            assert (client.root / 'observation-0001.json').exists()
+            console_calls.append(disk['requests'][-1]['id'])
+            return original_message(*args, **kwargs)
+        with patch.object(capacity.llm.console, 'message', inspect_console):
+            consume(request(client))
+        assert console_calls == [client.ledger.state['requests'][0]['id']]
+        passed('production-parser-console-follows-durable-settle', request_ids=console_calls)
+        cases.append(save_case(root, 'parser-console-after-durable-settle', client))
+        counters.update(private_counters)
+        assert all(value == 0 for value in counters.values()), counters
+        passed('socket-QQ-external-write-zero', **counters)
+    durable(root / 'parser-console.json', {'synthetic_console': console.getvalue()})
+    result = {'schema': 'stateless-capacity-doctor-v1', 'status': 'ok', 'cases': cases,
+              'assertions': assertions, 'assertion_count': len(assertions), 'sentinels': counters,
+              'real_model': 0, 'real_HTTP': 0, 'QQ': 0, 'elapsed_seconds': time.perf_counter() - started,
+              'peak_rss_kib': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss, 'limitations': LIMITATION}
+    durable(root / 'doctor.json', result)
+    return result
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('command', choices=('doctor',))
+    parser.add_argument('--output', required=True, help='fresh external synthetic evidence directory')
+    args = parser.parse_args(argv)
+    root = _safe_root(args.output)
+    root.mkdir(parents=True, mode=0o700)
+    result = doctor(root)
+    print(json.dumps({k: result[k] for k in ('status', 'assertion_count', 'elapsed_seconds', 'peak_rss_kib', 'sentinels')}))
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
