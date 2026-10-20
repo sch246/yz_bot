@@ -640,8 +640,37 @@ class NoteWriter:
         saved = json.loads(_path(loop_root, 'ledger.json').read_bytes())
         # Reuse Ledger's read-only reopen validation, including unknown IO,
         # reservations and settlement failures; never reset or write a budget.
-        ledger = Ledger(loop_root, saved['state']['pilot'], saved['state']['manifest'],
-                        limits=saved['state']['limits'], prices=saved['state']['prices'], reopen=True)
+        manifest = json.loads(_path(loop_root, 'manifest.json').read_bytes())
+        schema = manifest.get('schema', '')
+        if schema in {'stateless-capacity-manifest-v1', 'stateless-official-manifest-v1'}:
+            import stateless_capacity_client as capacity
+            if schema == 'stateless-capacity-manifest-v1':
+                capacity._validate_manifest(manifest)
+            else:
+                import stateless_official as official
+                if (set(manifest) != {'schema', 'root', 'run_id', 'contract', 'budgets',
+                                     'role_stages', 'openai', 'httpx', 'records'}
+                        or manifest['root'] != str(loop_root)
+                        or not isinstance(manifest['run_id'], str) or not manifest['run_id']
+                        or manifest['contract'] != official.contract()
+                        or manifest['openai'] != official.openai.__version__
+                        or manifest['httpx'] != official.httpx.__version__):
+                    raise ValueError('unsupported official source contract')
+                capacity._validate_budgets(manifest)
+            # WHY: historical source validation uses the actual writer policy,
+            # not an execution authorization or a guess from a price field.
+            # Origin/time-sensitive official.verify would reject valid closed
+            # calibration evidence and would conflate read proof with a grant.
+            contract = manifest['contract']
+            ledger = Ledger(loop_root, manifest['run_id'], digest(manifest),
+                            limits=contract['limits'], prices=contract['prices'], reopen=True,
+                            policy=capacity.CapacityPolicy(contract))
+        else:
+            if schema not in {'', 'stateless-loop-v1', 'stateless-selector-calibration-v1',
+                              'stateless-joint-v1', 'notes-calibration-v2'}:
+                raise ValueError('unsupported source manifest schema')
+            ledger = Ledger(loop_root, saved['state']['pilot'], saved['state']['manifest'],
+                            limits=saved['state']['limits'], prices=saved['state']['prices'], reopen=True)
         requests = {row['id']: row for row in ledger.state['requests']}
         for filename, expected in cutoff['request_files'].items():
             path = _path(loop_root, filename)

@@ -442,9 +442,88 @@ def doctor(root):
     return result
 
 
+def policy_doctor(root):
+    """Native revisions under each supported capacity source, with read-only drift probes."""
+    import stateless_capacity_client as capacity
+    import stateless_official as official
+    from stateless_capacity_calibration import official_fixture, new_client, isolation, fixture_budgets
+    from a0_ledger import digest
+    reports = []
+    frozen, schedule, wakes = synthetic_fixture()
+    snapshot = open_snapshot(frozen, schedule, wakes[0]['cursor'])
+    original = capacity.CapacityClient._fixture_response
+    def fixture(client, body):
+        response = original(client, body)
+        if len(body['messages']) == 2:
+            response['choices'][0].update(finish_reason='tool_calls', message={
+                'role': 'assistant', 'content': 'fixture expression', 'tool_calls': [{
+                    'id': 'fixture-capacity-note', 'type': 'function', 'function': {'name': 'revise_note',
+                    'arguments': canonical({'key': 'global/main', 'body': 'fixture native expression\n',
+                        'reason': 'fixture expression', 'expectation': 'later explicit read',
+                        'sources': ['generated:self'], 'claim': 'draft'}).decode()}}]})
+        return response
+    with isolation(root) as counters, redirect_stdout(io.StringIO()), patch.object(capacity.CapacityClient, '_fixture_response', fixture):
+        for mode in ('capacity', 'official'):
+            if mode == 'official':
+                folder, manifest = official_fixture(root, mode, budgets=fixture_budgets())
+                client = official._calibration_client(folder, manifest)
+            else:
+                client = new_client(root, mode)
+                folder = client.root
+            writer = NoteWriter.create(root / (mode + '-notes'))
+            try:
+                client.ledger.wake()
+                drive_wake(snapshot, wakes[0], wakes[:1], folder, client, notes=writer, note_keys=('global/main',))
+                state = recover_commits(folder)
+                assert any(json.loads(v.get('content', '{}')).get('note_revision', {}).get('status') == 'committed'
+                           for v in state['results'].values())
+                task = writer.admit_trigger(writer.register_trigger(folder, wakes[0]['id'], snapshot,
+                    allowed_keys=('global/main',))['id'], folder, snapshot, through_output=next(reversed(state['outputs'])))
+                writer._verify_cutoff(task)
+                originals = {name: (folder / name).read_bytes() for name in ('manifest.json', 'ledger.json')}
+                rejected = []
+                for change in ('schema', 'cross-schema', 'manifest-run', 'contract', 'price', 'limits',
+                               'ledger-run', 'ledger-manifest', 'ledger-price', 'ledger-limits', 'closed', 'reserved',
+                               'persistence-unknown.json', 'ledger.json.new'):
+                    manifest = json.loads(originals['manifest.json'])
+                    ledger = json.loads(originals['ledger.json'])
+                    state = ledger['state']
+                    if change == 'schema': manifest['schema'] = 'unsupported-source-v2'
+                    elif change == 'cross-schema': manifest['schema'] = ('stateless-capacity-manifest-v1' if mode == 'official' else 'stateless-official-manifest-v1')
+                    elif change == 'manifest-run': manifest['run_id'] += '-drift'
+                    elif change == 'contract': manifest['contract']['request']['max_tokens'] += 1
+                    elif change == 'price': manifest['contract']['prices']['input'] = '0'
+                    elif change == 'limits': manifest['contract']['limits']['context'] += 1
+                    elif change == 'ledger-run': state['pilot'] += '-drift'
+                    elif change == 'ledger-manifest': state['manifest'] = '0' * 64
+                    elif change == 'ledger-price': state['prices']['input'] = '0'
+                    elif change == 'ledger-limits': state['limits']['context'] += 1
+                    elif change == 'closed': state['closed'] = 'fixture stopped'
+                    elif change == 'reserved': state['requests'][-1]['status'] = 'reserved'
+                    else: (folder / change).write_bytes(b'fixture unknown')
+                    ledger['sha256'] = digest(state)
+                    (folder / 'manifest.json').write_bytes(canonical(manifest))
+                    (folder / 'ledger.json').write_bytes(canonical(ledger))
+                    before = {name: (folder / name).read_bytes() for name in originals}
+                    _reject(lambda: writer._verify_cutoff(task))
+                    assert before == {name: (folder / name).read_bytes() for name in originals}
+                    for name, raw in originals.items(): (folder / name).write_bytes(raw)
+                    if change in ('persistence-unknown.json', 'ledger.json.new'): (folder / change).unlink()
+                    rejected.append(change)
+                writer._verify_cutoff(task)
+                reports.append({'mode': mode, 'native_committed': True, 'read_only_rejections': rejected,
+                                'attempts': client.attempts, 'sent': False})
+            finally:
+                client.close()
+        assert all(value == 0 for values in counters for value in values.values())
+    result = {'status': 'ok', 'cases': reports, 'sentinels': counters}
+    durable(root / 'policy-doctor.json', result)
+    return result
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('doctor', 'recover'))
+    parser.add_argument('command', choices=('doctor', 'policy-doctor', 'recover'))
     parser.add_argument('--output', required=True)
     args = parser.parse_args(argv)
     try:
@@ -453,7 +532,7 @@ def main(argv=None):
         else:
             root = _safe_root(args.output)
             root.mkdir(parents=True, mode=0o700)
-            result = doctor(root)
+            result = policy_doctor(root) if args.command == 'policy-doctor' else doctor(root)
         print(json.dumps({'status': result.get('status'), 'assertions': len(result.get('assertions', [])),
                          'result': result if args.command == 'recover' else None}))
         return 0
