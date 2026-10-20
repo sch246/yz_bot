@@ -341,8 +341,13 @@ class NoteWriter:
             self._save('triggers/' + identity + '.json', value)
         return deepcopy(value)
 
-    def admit_trigger(self, trigger_id, loop_root, snapshot):
-        """Bind actual exposed HTTP values and T10 terminal; no second wake-end."""
+    def admit_trigger(self, trigger_id, loop_root, snapshot, *, note_aliases=None):
+        """Bind T10 terminal and exact chat exposure, with frozen note aliases.
+
+        Selector requests remain in the terminal request/hash/role cutoff, but
+        their catalog/screen is not supported as a candidate body source here.
+        A catalog title is not evidence that its note's full text was exposed.
+        """
         from a0_ledger import digest
         from comparison_snapshot import resolve_ref
         from stateless_loop import recover_commits
@@ -352,12 +357,19 @@ class NoteWriter:
             task = _read_json(_path(self.root, relative))
             if task['snapshot_id'] != snapshot['snapshot_id']:
                 raise ValueError('trigger snapshot mismatch')
+            if note_aliases is not None and type(note_aliases) is not dict:
+                raise ValueError('ordinary frozen note alias mapping required')
+            aliases = dict(note_aliases or {})
+            for alias, key in aliases.items():
+                if (not isinstance(alias, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,96}', alias)
+                        or _key(key) not in task['allowed_keys']):
+                    raise ValueError('invalid note alias or unauthorized target scope')
             terminal = state['terminals'].get(task['wake_id'])
             if terminal is None:
                 return {'status': 'pending', 'reason': 'no terminal; no processing permission'}
             exposures = []
             outputs = {key: value for key, value in state['outputs'].items() if value['wake_id'] == task['wake_id']}
-            evidence = {}
+            evidence, roles = {}, {}
             for path in sorted(Path(loop_root).glob('request-*.json')):
                 if path.is_symlink():
                     raise ValueError('symlink request evidence')
@@ -369,14 +381,22 @@ class NoteWriter:
                             or _hash(envelope['serialized_body'].encode()) != envelope['body_sha256']
                             or json.loads(envelope['serialized_body']) != envelope['body']):
                         raise ValueError('request cutoff/evidence drift')
+                    role = saved['attribution']['role_id']
+                    if role not in {'chat', 'selector'}:
+                        raise ValueError('unsupported role in chat terminal cutoff')
+                    if envelope['request_id'] in evidence:
+                        raise ValueError('duplicate terminal request evidence')
                     evidence[envelope['request_id']] = envelope
+                    roles[envelope['request_id']] = role
             if set(evidence) != set(terminal['request_ids']):
                 raise ValueError('missing actual request evidence')
             for output in outputs.values():
-                if (output['request_id'] not in evidence
+                if (output['request_id'] not in evidence or roles[output['request_id']] != 'chat'
                         or output['context_sha256'] != digest(evidence[output['request_id']]['body']['messages'])):
                     raise ValueError('output does not match actual wire evidence')
             for request_id, envelope in evidence.items():
+                if roles[request_id] == 'selector':
+                    continue
                 context = json.loads(envelope['body']['messages'][1]['content'])
                 if context['screen']['snapshot_id'] != task['snapshot_id']:
                     raise ValueError('wire snapshot mismatch')
@@ -389,21 +409,26 @@ class NoteWriter:
                                       'sha256': resolved['sha256'], 'author_id': str(resolved['record'].get('user_id')),
                                       'window': resolved['source_alias']})
                 for item in context['selected']['materials']:
-                    if _hash(item['text'].encode()) != item['sha256']:
+                    if (item['snapshot_id'] != task['snapshot_id']
+                            or _hash(item['text'].encode()) != item['sha256']):
                         raise ValueError('wire material bytes drift')
                     if item['kind'] == 'note':
-                        note_key = _key(item['source_id'])
+                        note_key = _key(aliases.get(item['source_id'], item['source_id']))
                         archived = _path(self.root, 'versions/' + _id(item['version_id']) + '.md').read_bytes()
                         note_metadata, _ = _decode(archived)
                         if (note_key not in task['allowed_keys'] or note_metadata['key'] != note_key
+                                or note_metadata['version_id'] != item['version_id']
                                 or note_metadata['branch'] != task['branch']
                                 or note_metadata['source_frozen_id'] != task['source_frozen_id']
                                 or note_metadata['cursor'] > task['cursor']
                                 or note_metadata['operation'] == 'delete' or archived != item['text'].encode()
                                 or item['version_id'] not in {row['version_id'] for row in _receipts(self.root, note_key)}):
                             raise ValueError('illegal exposed note scope/version/cutoff')
-                    exposures.append({'kind': 'material', 'material_kind': item['kind'], 'request_id': request_id,
-                                      **{key: item[key] for key in ('source_id', 'version_id', 'sha256')}})
+                    exposure = {'kind': 'material', 'material_kind': item['kind'], 'request_id': request_id,
+                                **{key: item[key] for key in ('source_id', 'version_id', 'sha256')}}
+                    if item['kind'] == 'note':
+                        exposure['note_key'] = note_key
+                    exposures.append(exposure)
             for output_id, output in outputs.items():
                 exposures.append({'kind': 'generated', 'output_id': output_id, 'assistant': output['assistant']})
                 for action, status in state['actions'].items():
@@ -421,7 +446,9 @@ class NoteWriter:
                                                   'window': resolved['source_alias']})
             exposures = {digest(item): item for item in exposures}
             cutoff = {'terminal': terminal, 'terminal_sha256': digest(terminal), 'exposures': exposures,
-                      'request_hashes': {key: value['body_sha256'] for key, value in evidence.items()}}
+                      'request_hashes': {key: value['body_sha256'] for key, value in evidence.items()},
+                      'request_roles': roles, 'note_aliases': aliases, 'note_aliases_sha256': digest(aliases),
+                      'selector_body_sources': 'unsupported; request role/hash only'}
             if task['cutoff'] is not None and task['cutoff'] != cutoff:
                 raise ValueError('terminal cutoff changed')
             task['cutoff'] = cutoff
