@@ -507,3 +507,37 @@ result serialization/write; it excludes earlier CLI material loading. The
 simulated 2023 clock remains fixed for reader behavior. Synthetic timings show
 instrumentation, not faster startup on real material; no source or view proof
 has been skipped.
+
+## Synthetic comparison seams
+
+[`comparison_snapshot.py`](comparison_snapshot.py) provides `freeze_sources`,
+`open_snapshot`, `resolve_ref` and `bind_a0_view` for invented, in-memory group
+day bytes. It freezes source coordinates and identity, opens records by an
+explicit availability sequence, and binds the existing A0 archive readers to a
+fresh directory outside every registered worktree. References require the
+snapshot and source alias; ambiguous message IDs are refused. Native range
+deduplication remains unchanged, while exact origins retain every record.
+Declared v0/v1 bytes, multiline messages, CRLF message quirks and supported
+notices retain the original parser's semantics; unsupported formats fail.
+Quoted or control-character paths in Git worktree metadata are refused.
+
+The snapshot object includes unopened control data and must stay outside model
+input. Only the bound archive and names form the legal view. The serial scope
+checks source, directory and identity drift and restores bindings on exit. It
+supports archive reading, without a model drive, arrivals, echoes, resume or
+note/Skill writes.
+
+[`comparison_budget.py`](comparison_budget.py) provides `project_costs` and
+`admit_request` over complete synthetic `Ledger` slices, request attribution,
+explicit checkpoint ancestry and fixture limits. It counts each actual attempt
+once for research spend, includes ancestors in each path, preserves unknown
+usage reservations, and checks shared and configured scope limits with
+`S + I + R`. Frozen attribution fingerprints detect relabelled old requests.
+Only the default synthetic Ledger price and input-bound policy is supported.
+
+The caller must supply a trusted frozen policy and freshly captured slices;
+hashes establish consistency, not authenticity or freshness. Every decision has
+`send_authorized=False`. The original Ledger owns durable reserve/settle; this
+module adds no persistent ledger, HTTP guard or concurrent budget allocator.
+These are library interfaces without a CLI. Neither seam establishes a complete
+four-arm comparator or memory benefit.
