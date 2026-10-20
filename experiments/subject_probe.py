@@ -33,7 +33,9 @@ At clock advancement one tray (left/right) may tilt; objects there slide to the
 table. The fixed mechanism/seed are design priors, not a reward or your judgment.
 Use actual observations/results to distinguish effects from intentions.
 There are at most three wakes and twelve shared HTTP requests, each at most4096
-output tokens. Every native follow-up costs a request; all roles share the budget.
+output tokens. Shared application caps are 2,000,000 cumulative tokens and5 CNY
+at conservative frozen prices, not a provider bill; unknown usage stops the run.
+Every native follow-up costs a request; all roles share the budget.
 After bootstrap the harness offers at most one labelled clock opportunity. A
 further revisit happens only if you actually call request_revisit. Delay zero
 explicitly declines every remaining opportunity. Finishing or silence alone
