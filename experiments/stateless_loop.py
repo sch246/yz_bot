@@ -11,6 +11,7 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import uuid
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -111,7 +112,7 @@ def _recover_rows(envelopes):
     previous, generation = None, 0
     current_wake, current_snapshot, cursor = None, None, 0
     boundaries, acknowledged, outputs, dispatched, results, records = {}, [], {}, set(), {}, []
-    terminals = {}
+    terminals, chat_bindings, request_ids = {}, {}, set()
     for number, envelope in enumerate(envelopes, 1):
         row = envelope['record']
         if (set(envelope) != {'record', 'sha256'} or envelope['sha256'] != digest(row)
@@ -125,6 +126,24 @@ def _recover_rows(envelopes):
                 raise ValueError('output after terminal wake')
             if value['id'] in outputs:
                 raise ValueError('duplicate output')
+            if value['request_id'] in request_ids:
+                raise ValueError('duplicate generating request')
+            request_ids.add(value['request_id'])
+            host_fields = {'chat_id', 'chat_first', 'process'}
+            if host_fields & set(value):
+                if (not host_fields <= set(value) or type(value['chat_first']) is not bool
+                        or not isinstance(value['chat_id'], str) or len(value['chat_id']) != 32
+                        or any(c not in '0123456789abcdef' for c in value['chat_id'])
+                        or value['process'] not in {'main', 'background'}):
+                    raise ValueError('invalid host Chat identity')
+                binding = (value['wake_id'], value['snapshot_id'], value['generation'], value['process'])
+                previous_binding = chat_bindings.get(value['chat_id'])
+                if previous_binding is None:
+                    if not value['chat_first']:
+                        raise ValueError('Chat continuation without first output')
+                    chat_bindings[value['chat_id']] = binding
+                elif value['chat_first'] or previous_binding != binding:
+                    raise ValueError('Chat identity reused or wake/snapshot/process drift')
             if value['screen'] is not None:
                 screen = value['screen']
                 if (value['parent_generation'] != generation or value['generation'] != generation + 1
@@ -328,6 +347,8 @@ def drive_wake(snapshot, wake, wakes, root, client, *, references=(), actions=()
                     'screen': screen, 'selected': material}).decode()}]
     stopped, output_ids, tool_count = [False], [], [0]
     chat = None
+    # Host-created once per actual Chat, independent of model text and role.
+    chat_id = uuid.uuid4().hex
     previous_current = client.current
     attribution = {'role': 'chat' if process == 'main' else 'librarian',
                    'wake': wake['id'], 'snapshot_id': snapshot['snapshot_id']}
@@ -353,6 +374,7 @@ def drive_wake(snapshot, wake, wakes, root, client, *, references=(), actions=()
         first = not any(v['wake_id'] == wake['id'] for v in current['outputs'].values())
         output = f"{wake['id']}/output-{1 + sum(v['wake_id'] == wake['id'] for v in current['outputs'].values())}"
         value = {'id': output, 'wake_id': wake['id'], 'snapshot_id': snapshot['snapshot_id'],
+                 'chat_id': chat_id, 'chat_first': not output_ids, 'process': process,
                  'generation': generation, 'parent_generation': generation - 1,
                  'request_id': client.ledger.state['requests'][-1]['id'], 'context_sha256': digest(client.exchanges[-1]['body']['messages']),
                  'screen': screen if first else None, 'covered_wakes': covered if first else [],

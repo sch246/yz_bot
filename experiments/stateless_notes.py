@@ -545,11 +545,21 @@ class NoteWriter:
                             material(content['note_material'], source_snapshot_id=generated['snapshot_id'])
             # Verify native result pairs against the existing T10 action journal.
             calls = {}
+            generator_chat = output.get('chat_id')
             prior_outputs = iter((identity, v) for identity, v in prefix['outputs'].items()
-                                 if v['wake_id'] == original['wake_id'] and identity != through_output)
+                                 if v['wake_id'] == original['wake_id'] and identity != through_output
+                                 and v.get('chat_id') == generator_chat)
             for message in messages[2:]:
                 if message['role'] == 'assistant':
                     expected = {k: v for k, v in message.items() if k != 'reasoning_content'}
+                    if generator_chat is None:
+                        # WHY: old single-Chat evidence remains readable, but
+                        # equal outputs cannot establish which Chat produced a
+                        # native pair. Never guess from role or matching bytes.
+                        remaining = list(prior_outputs)
+                        if sum(v['assistant'] == expected for _, v in remaining) > 1:
+                            raise ValueError('ambiguous legacy native Chat identity')
+                        prior_outputs = iter(remaining)
                     identity, generated = next(((identity, v) for identity, v in prior_outputs
                                                 if v['assistant'] == expected), (None, None))
                     if generated is None:
@@ -590,7 +600,7 @@ class NoteWriter:
             cutoff = {'mode': mode, 'terminal': terminal if mode == 'terminal' else None,
                       'generation': output['generation'], 'sequence': sequence, 'head': prefix['head'],
                       'lineage': digest(state['records'][0]), 'output_id': through_output,
-                      'generator_role': roles[output['request_id']],
+                      'generator_role': roles[output['request_id']], 'generator_chat_id': generator_chat,
                       'exposures': {digest(item): item for item in exposures}, 'seen_notes': seen_notes,
                       'request_hashes': {k: v['body_sha256'] for k, v in evidence.items()},
                       'request_roles': roles, 'request_files': files, 'note_aliases': aliases,
