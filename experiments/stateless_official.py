@@ -77,6 +77,8 @@ def _time(value):
 def _contains_credential(value, credential):
     if isinstance(value, str):
         return credential in value
+    if type(value) in (int, float):
+        return credential in str(value)
     if isinstance(value, dict):
         return any(_contains_credential(k, credential) or _contains_credential(v, credential) for k, v in value.items())
     if isinstance(value, (list, tuple)):
@@ -331,6 +333,11 @@ class OfficialClient(capacity.CapacityClient):
             try:
                 raw = decoded.get('usage') if isinstance(decoded, dict) else None
                 usage = capacity._wire_usage(raw)
+                # WHY: a numeric credential can also be a valid usage counter.
+                # Preserve the full reserve rather than persist that secret.
+                capacity._require(not _contains_credential(raw, self.sdk.api_key)
+                                  and self.sdk.api_key not in canonical(raw).decode()
+                                  and self.sdk.api_key not in canonical(usage).decode(), 'credential-in-usage')
                 self.active['raw_usage'], self.active['usage'] = raw, usage
             except (ValueError, KeyError, TypeError, capacity.CapacityStop):
                 pass
