@@ -50,8 +50,10 @@ def material_values(snapshot, materials):
     """Validate frozen values; source/version legality belongs to their producer."""
     values = []
     fields = {'kind', 'source_id', 'version_id', 'snapshot_id', 'sha256', 'raw'}
+    # WHY: absent or tombstoned notes still need an exposed parent baseline,
+    # without presenting file-state metadata as remembered content or inference.
     for material in materials:
-        if (set(material) != fields or material['kind'] not in {'note', 'selector_inference'}
+        if (set(material) != fields or material['kind'] not in {'note', 'note_baseline', 'selector_inference'}
                 or any(not isinstance(material[key], str) or not material[key].strip()
                        for key in ('source_id', 'version_id', 'snapshot_id', 'sha256'))
                 or material['snapshot_id'] != snapshot['snapshot_id']
@@ -60,7 +62,9 @@ def material_values(snapshot, materials):
             raise ValueError('invalid frozen material bytes/hash/snapshot/source/version')
         values.append({key: material[key] for key in fields - {'raw'}} | {
             'text': material['raw'].decode('utf-8', errors='strict'),
-            'interpretation': ('inference-not-evidence' if material['kind'] == 'selector_inference' else 'versioned-note')})
+            'interpretation': {'note': 'versioned-note',
+                               'note_baseline': 'harness-file-state-baseline-not-note-content',
+                               'selector_inference': 'inference-not-evidence'}[material['kind']]})
     return values
 
 
