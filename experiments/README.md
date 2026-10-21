@@ -898,3 +898,44 @@ formation, selection, injection, use judgment and external results; it supplies
 no success ranking. Independent external evidence readers can recompute the
 world from the rules and actual tool arguments without importing the fixture or
 subject implementation.
+
+Non-streaming response diagnostics retain each actual wire choice's `index` and
+`finish_reason`, response byte count and SHA-256 in `response-NNNN.json`. When
+usage is missing or invalid, the same summary remains in the request-bound
+`observation-NNNN.json`; unknown usage still consumes the full reservation and
+closes the session. The official reflection guard runs before these additions.
+No response body, headers or credential is added to diagnostic evidence.
+
+`diagnostic-NNNN.json` records the original non-`CapacityStop` exception's type,
+fixed stage and traceback frames (file basename, function, line), without
+exception messages, source lines, chained exceptions or locals. Known usage is
+durably settled before the production parser runs. Parser failure closes the
+shared session before diagnostic persistence; a diagnostic write failure also
+closes it through the existing persistence-unknown guard. Buffered model output
+and tool dispatch cannot escape those guards. Official credentials are checked
+again against derived summary values and structural diagnostic names/numbers.
+
+Diagnostics include a client-initialization memory baseline and samples around
+response observation, SDK completion and parser entry/exit. On Linux these are
+`/proc/self/status` VmRSS and VmHWM plus `getrusage(SELF).ru_maxrss`, all in KiB.
+VmHWM describes the current address space; Linux ru_maxrss can retain a high
+water mark from before `exec`, so it alone does not establish growth in the
+current Python run. On macOS only ru_maxrss is collected (bytes converted to
+KiB). Unavailable fields are JSON null with an `unavailable` source. These cheap
+process measurements neither attribute allocations to a request nor change
+admission. No heap tracing or persistent monitor runs.
+
+The bounded offline diagnostics use the fixed internal official MockTransport,
+actual SDK/parser and fictional credentials/records, with `sent=False`:
+
+```sh
+python experiments/stateless_capacity_calibration.py parser-doctor --case length --output /tmp/new-parser-length
+python experiments/stateless_capacity_calibration.py parser-doctor --case tool_calls --output /tmp/new-parser-tools
+python experiments/stateless_capacity_calibration.py parser-doctor --case diagnostic-write --output /tmp/new-parser-fault
+```
+
+Use `--case` for one bounded probe; omitting it runs all parser probes. Cases
+cover normal stop/tools, original parser exceptions, missing usage, cancellation,
+evidence faults, reflection in finish reasons/indices/exception types/memory
+numbers, missing measurements and the closed synthetic client. They do not
+establish the missing finish reason of an earlier run or explain its memory peak.

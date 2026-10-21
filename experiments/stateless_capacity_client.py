@@ -85,6 +85,43 @@ def _wire_usage(raw):
     return normalize_usage(raw)
 
 
+def memory_sample():
+    """Small process observations, never an admission decision or heap trace."""
+    value = {'rss_kib': None, 'hwm_rss_kib': None, 'ru_maxrss_kib': None,
+             'proc_source': 'unavailable', 'ru_source': 'unavailable'}
+    if sys.platform.startswith('linux'):
+        try:
+            with open('/proc/self/status', encoding='ascii') as stream:
+                for line in stream:
+                    if line.startswith(('VmRSS:', 'VmHWM:')):
+                        fields = line.split()
+                        if len(fields) == 3 and fields[2] == 'kB':
+                            value['rss_kib' if fields[0] == 'VmRSS:' else 'hwm_rss_kib'] = int(fields[1])
+                            value['proc_source'] = 'proc-self-status-current-mm'
+        except (OSError, ValueError, UnicodeError):
+            pass
+    if sys.platform.startswith('linux') or sys.platform == 'darwin':
+        try:
+            import resource
+            peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            value.update(ru_maxrss_kib=int(peak) if sys.platform != 'darwin' else (int(peak) + 1023) // 1024,
+                         ru_source='getrusage-may-include-pre-exec-high-water')
+        except (ImportError, OSError, ValueError):
+            pass
+    return value
+
+
+def exception_structure(error, stage):
+    """Do not format the exception, source lines, chained messages or locals."""
+    frames, cursor = [], error.__traceback__
+    while cursor is not None:
+        code = cursor.tb_frame.f_code
+        frames.append({'file': Path(code.co_filename).name, 'function': code.co_name, 'line': cursor.tb_lineno})
+        cursor = cursor.tb_next
+    return {'stage': stage, 'type': {'module': type(error).__module__, 'name': type(error).__name__},
+            'frames': frames}
+
+
 def _validate_manifest(value):
     _require(set(value) == {'schema', 'synthetic', 'run_id', 'contract', 'budgets', 'role_stages', 'openai', 'httpx'}
              and value['schema'] == 'stateless-capacity-manifest-v1' and value['synthetic'] is True
@@ -137,6 +174,7 @@ class CapacityClient(llm.LLMClient):
                              limits=LIMITS, prices=PRICES, policy=CapacityPolicy(self.contract))
         self.trace, self.chats, self.exchanges, self.saved = [], [], [], {}
         self.current, self.active, self.response_identity = None, None, None
+        self.memory_baseline = memory_sample()
         self.lock = threading.Lock()
         self.attempts = self.settlements = 0
         self.environment_reads = []
@@ -169,6 +207,25 @@ class CapacityClient(llm.LLMClient):
         except BaseException:
             self._poison('evidence-persistence-unknown')
             raise CapacityStop('evidence-persistence-unknown') from None
+
+    def _sample_memory(self, stage):
+        self.active['memory'].append({'stage': stage, **memory_sample()})
+
+    def _validate_diagnostic(self, value):
+        """The official subclass also rejects credentials in structural names."""
+
+    def _record_diagnostic(self, outcome):
+        active = self.active
+        if active['row'] is None or not active['diagnostic_allowed'] or self.ledger.poisoned:
+            return
+        value = {'request_id': active['row']['id'], 'stage': 'response-parse', 'outcome': outcome,
+                 'exception': active['exception'], 'memory_baseline': self.memory_baseline, 'memory': active['memory']}
+        try:
+            self._validate_diagnostic(value)
+        except CapacityStop:
+            self._stop('credential-in-diagnostic')
+            raise
+        self._write(f"diagnostic-{len(self.ledger.state['requests']):04d}.json", value)
 
     def _integrity(self):
         _require(digest(self.manifest) == self.manifest_hash and self.contract is self.manifest['contract'], 'manifest-drift')
@@ -315,10 +372,20 @@ class CapacityClient(llm.LLMClient):
         try:
             _require(active is not None and active['row'] is not None and not active['observed'], 'response-hook-drift')
             active['observed'] = True
+            # The official credential-reflection guard has already accepted the
+            # response before entering this common observer.
+            active['diagnostic_allowed'] = True
+            self._sample_memory('response-observer-enter')
             raw = response.read()
             if response.status_code != 200:
                 raise CapacityStop('http-failure')
             value = json.loads(raw)
+            choices = value.get('choices')
+            active['response_summary'] = {
+                'response_bytes': len(raw), 'response_sha256': hashlib.sha256(raw).hexdigest(),
+                'choices': [{'index': item.get('index') if type(item.get('index')) is int else None,
+                             'finish_reason': item.get('finish_reason') if isinstance(item.get('finish_reason'), str) else None}
+                            for item in choices if isinstance(item, dict)] if isinstance(choices, list) else None}
             active['raw_usage'] = value.get('usage')
             try:
                 active['usage'] = _wire_usage(active['raw_usage'])
@@ -333,11 +400,23 @@ class CapacityClient(llm.LLMClient):
                 self.response_identity = deepcopy(identity)
             _require(identity == self.response_identity, 'response-identity-drift')
             _require(self._attribution() == active['attribution'], 'attribution-drift')
-            self._write(f"response-{len(self.ledger.state['requests']):04d}.json", {
+            evidence = {
                 'request_id': active['row']['id'], 'identity': identity, 'raw_usage': active['raw_usage'],
-                'response_sha256': hashlib.sha256(raw).hexdigest()})
+                **active['response_summary']}
+            self._validate_diagnostic(evidence)
+            self._write(f"response-{len(self.ledger.state['requests']):04d}.json", evidence)
+            self._sample_memory('response-observer-exit')
             self.trace.append({'event': 'response-observation', 'request_id': active['row']['id']})
         except BaseException as error:
+            # Invalid/missing usage still gets an observation and full reserve.
+            # Check derived summary values before that fallback can persist it.
+            if active is not None and active['response_summary'] is not None:
+                try:
+                    self._validate_diagnostic(active['response_summary'])
+                except CapacityStop:
+                    active['response_summary'], active['diagnostic_allowed'] = None, False
+                    active['error'] = 'credential-in-diagnostic'
+                    raise
             active['error'] = str(error) if isinstance(error, CapacityStop) else 'response-observation-failed'
             raise
 
@@ -358,12 +437,16 @@ class CapacityClient(llm.LLMClient):
             if self.scenario == 'cancel-after':
                 raise CapacityStop('cancelled')
         except BaseException as failure:
+            if not isinstance(failure, CapacityStop):
+                self.active['exception'] = exception_structure(failure, 'sdk-create')
             error = self.active['error'] or (str(failure) if isinstance(failure, CapacityStop) else 'transport-failure')
+        self._sample_memory('sdk-create-exit')
         # WHY: the production parser prints as well as yields. Settle before
         # returning the SDK object so even its console output follows durability.
         self._finish_request(error or 'stop')
         if error:
             raise CapacityStop(error) from None
+        self._sample_memory('parser-enter')
         return value
 
     def _finish_request(self, outcome):
@@ -375,7 +458,8 @@ class CapacityClient(llm.LLMClient):
             outcome = 'shared-closed'
         self._write(f"observation-{len(self.ledger.state['requests']):04d}.json", {
             'request_id': row['id'], 'raw_usage': self.active['raw_usage'], 'usage': self.active['usage'],
-            'identity': self.active['identity'], 'outcome': outcome})
+            'identity': self.active['identity'], 'outcome': outcome,
+            **({'response_summary': self.active['response_summary']} if self.active['response_summary'] is not None else {})})
         self.settlements += 1
         try:
             self.ledger.settle(row, self.active['usage'], outcome)
@@ -463,7 +547,9 @@ class CapacityClient(llm.LLMClient):
             raise CapacityStop('concurrent-generation')
         inner, error, buffered, completed = None, None, [], None
         self.active = {'row': None, 'usage': None, 'raw_usage': None, 'identity': None, 'error': None,
-                       'hook': False, 'observed': False, 'attempted': False, 'attribution': None}
+                       'hook': False, 'observed': False, 'attempted': False, 'attribution': None,
+                       'response_summary': None, 'exception': None, 'memory': [], 'diagnostic_allowed': False}
+        phase = 'generation-guard'
         try:
             try:
                 self.ledger.guard()
@@ -471,7 +557,10 @@ class CapacityClient(llm.LLMClient):
                 self.active['attribution'] = self._attribution()
                 if self.scenario == 'cancel-before':
                     raise CapacityStop('cancelled')
+                self._sample_memory('generation-enter')
+                phase = 'request-preparation'
                 inner = super().generate_response(*args, **kwargs)
+                phase = 'response-parse'
                 while True:
                     try:
                         buffered.append(next(inner))
@@ -480,16 +569,21 @@ class CapacityClient(llm.LLMClient):
                         break
             except BaseException as failure:
                 error = failure
+                if not isinstance(failure, CapacityStop) and phase == 'response-parse':
+                    self.active['exception'] = exception_structure(failure, phase)
             finally:
                 if inner is not None:
                     inner.close()
             outcome = (str(error) if isinstance(error, CapacityStop) else 'parser-failure') if error else 'stop'
             self._finish_request(outcome)
+            self._sample_memory('parser-failed' if error else 'parser-exit')
             if error is not None or self.ledger.poisoned or self.ledger.state['closed']:
                 if not self.ledger.poisoned and not self.ledger.state['closed']:
                     self._stop(outcome)
+                self._record_diagnostic(outcome)
                 raise CapacityStop('persistence-unknown' if self.ledger.poisoned else
                                    self.ledger.state['closed'] or outcome) from None
+            self._record_diagnostic(outcome)
             self._integrity()
             for value in buffered:
                 self.ledger.guard()

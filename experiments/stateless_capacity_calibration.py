@@ -600,14 +600,176 @@ def doctor(root):
     return result
 
 
+PARSER_CASES = ('length', 'stop', 'tool_calls', 'parser-error', 'missing', 'cancel-after',
+                'diagnostic-write', 'response-write', 'reflected-finish', 'reflected-index',
+                'reflected-type', 'reflected-memory', 'reflected-summary', 'memory-unavailable', 'closed-client')
+
+
+def parser_doctor(root, selected=None):
+    """Small selectable actual SDK/parser probes; no console body accumulation."""
+    import stateless_official as official
+    started, assertions = time.perf_counter(), []
+    names = PARSER_CASES if selected is None else (selected,)
+    with isolation(root) as (private, counters), open(os.devnull, 'w') as sink, redirect_stdout(sink):
+        for name in names:
+            if name == 'closed-client':
+                client = new_client(root, name)
+            else:
+                folder, frozen = official_fixture(root, name)
+                if name in ('reflected-index', 'reflected-memory', 'reflected-summary'):
+                    key, scenario = '87654321', 'normal'
+                    if name == 'reflected-summary':
+                        # A safe tiny body can derive a forbidden hash without
+                        # reflecting the credential anywhere in the raw JSON.
+                        peer = capacity.SimpleNamespace(active={'attribution': {'role_id': 'librarian'}}, scenario='missing')
+                        preview = capacity.CapacityClient._fixture_response(peer, {'messages': []})
+                        preview['choices'][0]['index'] = 7
+                        key, scenario = hashlib.sha256(httpx.Response(200, json=preview).content).hexdigest(), 'missing'
+                    token = official._calibration_context.set((official._CALIBRATION, scenario))
+                    try:
+                        client = official.OfficialClient(folder, frozen, temporary_api_key=key)
+                    finally:
+                        official._calibration_context.reset(token)
+                else:
+                    client = official._calibration_client(folder, frozen,
+                        scenario=name if name in ('length', 'missing', 'cancel-after') else 'normal')
+            original_response, wire, dispatched = client._fixture_response, [], []
+            def response(body):
+                value = original_response(body)
+                value['choices'][0]['index'] = 7  # Preserve wire index, never enumerate it.
+                if name in ('tool_calls', 'diagnostic-write', 'response-write') and not any(v['role'] == 'tool' for v in body['messages']):
+                    value['choices'][0].update(finish_reason='tool_calls', message={
+                        'role': 'assistant', 'content': '', 'tool_calls': [{'id': 'diagnostic-call', 'type': 'function',
+                        'function': {'name': 'observe', 'arguments': '{"value":"fixture"}'}}]})
+                if name == 'reflected-finish':
+                    value['choices'][0]['finish_reason'] = client._temporary_key
+                if name == 'reflected-index':
+                    value['choices'][0]['index'] = int(client._temporary_key)
+                # This is the exact byte serialization used by httpx.Response(json=...).
+                raw = httpx.Response(200, json=value).content
+                wire.append({'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest(),
+                             'choices': [{'index': v['index'], 'finish_reason': v['finish_reason']} for v in value['choices']]})
+                return value
+            def observe(value: str):
+                client.guard_tools()
+                disk = json.loads((client.root / 'ledger.json').read_bytes())['state']
+                assert disk['requests'][-1]['status'] == 'settled'
+                dispatched.append(value)
+                return 'fixture-observed'
+            class FixtureParserError(RuntimeError):
+                pass
+            error_type = type(client._temporary_key, (RuntimeError,), {}) if name == 'reflected-type' else FixtureParserError
+            def fail_parser(*args, **kwargs):
+                private_local = 'LOCAL-MUST-NOT-PERSIST'
+                disk = json.loads((client.root / 'ledger.json').read_bytes())['state']
+                assert disk['requests'][-1]['status'] == 'settled'
+                assert private_local
+                raise error_type('MESSAGE-MUST-NOT-PERSIST')
+            original_durable = capacity.durable
+            def fail_evidence(path, value):
+                if path.name.startswith(('diagnostic' if name == 'diagnostic-write' else 'response') + '-'):
+                    raise OSError('EVIDENCE-MESSAGE-MUST-NOT-PERSIST')
+                return original_durable(path, value)
+            failure = None
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(client, '_fixture_response', response))
+                if name in ('parser-error', 'reflected-type'):
+                    stack.enter_context(patch.object(capacity.llm.console, 'message', fail_parser))
+                if name in ('diagnostic-write', 'response-write'):
+                    stack.enter_context(patch.object(capacity, 'durable', fail_evidence))
+                if name in ('memory-unavailable', 'reflected-memory'):
+                    stack.enter_context(patch.object(capacity, 'memory_sample', return_value={
+                        'rss_kib': None, 'hwm_rss_kib': None, 'ru_maxrss_kib': 87654321 if name == 'reflected-memory' else None,
+                        'proc_source': 'unavailable', 'ru_source': 'fixture' if name == 'reflected-memory' else 'unavailable'}))
+                try:
+                    if name in ('tool_calls', 'diagnostic-write', 'response-write'):
+                        client.current = {'role': 'librarian', 'wake': 'fixture-wake', 'snapshot_id': 'fixture-snapshot'}
+                        consume(client.chat([{'role': 'system', 'content': 'Synthetic only.'},
+                            {'role': 'user', 'content': '{}'}], tools=[capacity.llm.Tool(observe)], stream=False))
+                    else:
+                        consume(request(client))
+                except capacity.CapacityStop as error:
+                    failure = str(error)
+            normal = name in ('stop', 'tool_calls', 'memory-unavailable', 'closed-client')
+            assert (failure is None) == normal, (name, failure)
+            rows = client.ledger.state['requests']
+            assert len(rows) == client.attempts == (2 if name == 'tool_calls' else 1)
+            assert dispatched == (['fixture'] if name == 'tool_calls' else [])
+            if name != 'response-write':
+                assert all(row['status'] == 'settled' for row in rows)
+                assert rows[0]['usage'] == (None if name in ('missing', 'reflected-summary') else [100, 40, 20])
+                assert rows[0]['charged'] == (rows[0]['reserved'] if name in ('missing', 'reflected-summary') else 282)
+            else:
+                assert rows[0]['status'] == 'reserved' and 'usage' not in rows[0] and 'charged' not in rows[0]
+            if not normal:
+                shared_closed(client)
+            if name.startswith('reflected-'):
+                assert not list(client.root.glob('diagnostic-*.json'))
+                if name in ('reflected-finish', 'reflected-index', 'reflected-summary'):
+                    assert not list(client.root.glob('response-*.json'))
+                if name == 'reflected-summary':
+                    assert wire[0]['sha256'] == client._temporary_key
+                    assert 'response_summary' not in json.loads((client.root / 'observation-0001.json').read_bytes())
+            elif name not in ('response-write', 'diagnostic-write'):
+                for index, expected in enumerate(wire, 1):
+                    summary = json.loads((client.root / f'response-{index:04d}.json').read_bytes()) if name != 'missing' else (
+                        json.loads((client.root / f'observation-{index:04d}.json').read_bytes())['response_summary'])
+                    assert summary['choices'] == expected['choices']
+                    assert summary['response_bytes'] == expected['bytes'] and summary['response_sha256'] == expected['sha256']
+                    diagnostic = json.loads((client.root / f'diagnostic-{index:04d}.json').read_bytes())
+                    assert diagnostic['request_id'] == rows[index - 1]['id']
+                    stages = [v['stage'] for v in diagnostic['memory']]
+                    assert 'generation-enter' in stages and 'sdk-create-exit' in stages
+                    assert ('parser-failed' if failure else 'parser-exit') in stages
+                    if name in ('length', 'parser-error'):
+                        original = diagnostic['exception']
+                        assert original['stage'] == 'response-parse'
+                        assert original['type']['name'] == ('RuntimeError' if name == 'length' else 'FixtureParserError')
+                        assert any(v['function'] == ('_non_stream_response' if name == 'length' else 'fail_parser') for v in original['frames'])
+                        assert all(set(v) == {'file', 'function', 'line'} and '/' not in v['file'] for v in original['frames'])
+                    if name == 'memory-unavailable':
+                        assert all(v['rss_kib'] is v['hwm_rss_kib'] is v['ru_maxrss_kib'] is None for v in diagnostic['memory'])
+            if name in ('response-write', 'diagnostic-write'):
+                assert client.ledger.poisoned and (client.root / 'persistence-unknown.json').exists()
+                before = (client.root / 'ledger.json').read_bytes()
+                try:
+                    a0_ledger.Ledger(client.root, frozen['run_id'], digest(frozen), limits=capacity.LIMITS,
+                        prices=capacity.PRICES, policy=capacity.CapacityPolicy(client.contract), reopen=True)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError('persistence unknown reopened')
+                assert (client.root / 'ledger.json').read_bytes() == before
+            if name != 'closed-client':
+                assert all(not client.transport_evidence(row['id'])['sent'] for row in rows)
+                key = client._temporary_key.encode()
+                assert all(key not in path.read_bytes() for path in client.root.iterdir() if path.is_file())
+            assert all(b'MESSAGE-MUST-NOT-PERSIST' not in path.read_bytes() and b'LOCAL-MUST-NOT-PERSIST' not in path.read_bytes()
+                       for path in client.root.iterdir() if path.is_file())
+            assertions.append(save_case(root, name, client, failure, tool_dispatch=dispatched))
+        counters.update(private)
+        assert all(value == 0 for value in counters.values()), counters
+    result = {'status': 'ok', 'assertions': assertions, 'assertion_count': len(assertions), 'sentinels': counters,
+              'elapsed_seconds': time.perf_counter() - started,
+              'peak_rss_kib': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+              'limitations': LIMITATION + ['VmHWM is current-mm high water; ru_maxrss may include a pre-exec peak; neither is per-request allocation.',
+                  'New synthetic finish reasons do not establish the old real segment finish reason or memory cause.']}
+    durable(root / 'parser-doctor.json', result)
+    return result
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('doctor', 'official-doctor'))
+    parser.add_argument('command', choices=('doctor', 'official-doctor', 'parser-doctor'))
+    parser.add_argument('--case', choices=PARSER_CASES, help='one bounded parser-doctor probe')
     parser.add_argument('--output', required=True, help='fresh external synthetic evidence directory')
     args = parser.parse_args(argv)
     root = _safe_root(args.output)
     root.mkdir(parents=True, mode=0o700)
-    result = (doctor if args.command == 'doctor' else official_doctor)(root)
+    if args.case and args.command != 'parser-doctor':
+        parser.error('--case is only supported by parser-doctor')
+    result = parser_doctor(root, args.case) if args.command == 'parser-doctor' else (
+        doctor if args.command == 'doctor' else official_doctor)(root)
     print(json.dumps({k: result[k] for k in ('status', 'assertion_count', 'elapsed_seconds', 'peak_rss_kib', 'sentinels')}))
     return 0
 

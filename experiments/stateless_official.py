@@ -321,6 +321,7 @@ class OfficialClient(capacity.CapacityClient):
         super()._before_http(request)
 
     def _observe_http(self, response):
+        self._sample_memory('official-response-hook-enter')
         raw_response = response.read()
         try:
             decoded = json.loads(raw_response)
@@ -343,6 +344,12 @@ class OfficialClient(capacity.CapacityClient):
                 pass
             raise capacity.CapacityStop('credential-reflected-by-peer')
         super()._observe_http(response)
+
+    def _validate_diagnostic(self, value):
+        # Type/code names can be host-generated too; never assume they are
+        # harmless merely because exception messages and locals are excluded.
+        capacity._require(not _contains_credential(value, self._temporary_key)
+                          and self._temporary_key not in canonical(value).decode(), 'credential-in-diagnostic')
 
     def _final_transport_guard(self, request):
         self._integrity()
