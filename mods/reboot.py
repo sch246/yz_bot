@@ -67,7 +67,11 @@ def resume_chat(event: dict) -> None:
             return
         context.set_current(event)
         try:
-            chat.chat()
+            central = chat.center_runtime()
+            if central is not None:
+                central.resume(event, self_restart=True)
+            else:
+                chat.chat()
         except Exception:
             _logger.exception("重启后续话失败")
         finally:

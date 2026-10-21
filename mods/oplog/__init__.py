@@ -80,6 +80,11 @@ def register_legacy_adapter(adapter) -> None:
 
 
 def raise_if_failed() -> None:
+    from mods.chat.center import active
+    central = active()
+    if central is not None:
+        central.ensure_available()
+        return
     with _lock:
         if _restore_error is not None:
             raise _restore_error("event stream restore failed; refusing further actions")
@@ -106,6 +111,9 @@ def source_page_root() -> Path:
 
 def _restore() -> None:
     global _restore_error
+    from mods.chat.center import active
+    if active() is not None:
+        raise RuntimeError("legacy event_stream is unavailable in the isolated center; use center journal")
     raise_if_failed()
     try:
         _restore_impl()
@@ -290,6 +298,9 @@ def iter_events(start: str | None = None, stop: str | None = None) -> Iterable[d
 
 def _append(entry: dict, day: str) -> None:
     global _failed
+    from mods.chat.center import active
+    if active() is not None:
+        raise PersistenceError("legacy event_stream writer is disabled in the isolated center")
     # WHY: 追加、fsync 或落盘后的索引应用可能失败，磁盘上可能已有这条或残尾；继续行动会让
     # 外部副作用失去可信的来源记录。保持失败直到重启恢复检查磁盘，而非在进程内重试编号。
     raise_if_failed()

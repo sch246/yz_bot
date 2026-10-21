@@ -51,6 +51,11 @@ _hint_stream = log.stream("hint")
 _offline_scope: ContextVar[dict | None] = ContextVar("chat_offline_scope", default=None)
 
 
+def center_runtime():
+    from .center import active
+    return active()
+
+
 def normalize_image_mode(value) -> str:
     if value is True:
         return "lazy"
@@ -213,6 +218,7 @@ def init_chat(
     prompts["base"] = _view._base_prompt()
     state = {"role": "system", "content": "你是唯一的中心 agent；窗口只是来源与明确发送目标。"}
     offline = _offline_scope.get()
+    central = center_runtime()
     window = AGENT_WINDOW
     session.set_messages([
         *get_prompt(),
@@ -232,7 +238,7 @@ def init_chat(
     binding = tool_modules.bind_session(
         session,
         None,
-        registry=offline["registry"] if offline else None,
+        registry=central.registry if central else offline["registry"] if offline else None,
         visible=(lambda name, module: name not in {"baidumap", "dianping"}
                  and tool_modules.bot_op_tool_visible(name, module)) if not offline else None,
         persist=_persist_modules,
@@ -459,7 +465,11 @@ def _run_hint(window: tuple, turn=None) -> None:
         result = _hint_evaluate(code, window, turn)
         if result is not None:
             # `#` 前缀让结束提示不回流进 LLM 上下文，见 _model_event。
-            message.sendmsg("#" + cq.escape(str(result)))
+            central = center_runtime()
+            if central is not None:
+                central.send_hint(window, "#" + cq.escape(str(result)))
+            else:
+                message.sendmsg("#" + cq.escape(str(result)))
     except Exception:
         _report_hint_failure()
 
@@ -483,6 +493,8 @@ def _hint_evaluate(code: str, window: tuple, turn=None):
 def _report_hint_failure() -> None:
     """照 link._report_error 的惯例，把 traceback 用 `#` 前缀发出去。"""
     _hint_stream.exception("hint 执行失败")
+    if center_runtime() is not None:
+        return
     try:
         # `#` 前缀让 traceback 不回流进 LLM 上下文，见 _model_event。
         message.sendmsg("#" + "".join(traceback.format_exc().splitlines(True)[3:]).strip())
@@ -495,7 +507,8 @@ def chat(model: str | None = None) -> None:
     window = history.window(event)
     if window is None:
         return
-    oplog.ensure_available()
+    if center_runtime() is None:
+        oplog.ensure_available()
     _agent._drive_agent(model, window)
 
 
@@ -536,6 +549,8 @@ def _mail_candidate(event: dict) -> bool:
 
 def record_event(event: dict, write: Callable[[], object]) -> object:
     """Write chat history and register the arrival under one window lock."""
+    if center_runtime() is not None:
+        return center_runtime().record_event(event, write)
     window = history.window(event)
     if window is None and msgs.is_friend_recall(event) and event.get("user_id") is not None:
         window = ("private", event["user_id"])
@@ -657,13 +672,17 @@ def capture_chat(event: dict) -> bool:
             return False
         if arrival is None:
             return True
-        pending = next((entry for entry in oplog.unread(window)
-                        if entry["arrival"] == arrival), None)
-        if pending is None or pending["activated"]:
-            return True
-        kind = ("mention" if msgs.is_msg(event) and _reader._addressed(event, msgs.body(event))
-                else "poke" if msgs.is_poke(event) else "wake")
-        oplog.activate(arrival, kind)
+        central = center_runtime()
+        if central is not None:
+            central.activate(arrival, "mention" if msgs.is_msg(event) else "poke")
+        else:
+            pending = next((entry for entry in oplog.unread(window)
+                            if entry["arrival"] == arrival), None)
+            if pending is None or pending["activated"]:
+                return True
+            kind = ("mention" if msgs.is_msg(event) and _reader._addressed(event, msgs.body(event))
+                    else "poke" if msgs.is_poke(event) else "wake")
+            oplog.activate(arrival, kind)
     chat()
     return True
 
@@ -738,6 +757,8 @@ def on_load(ctx) -> None:
 
         if not wait_booted(120):
             return
+        if center_runtime() is not None:
+            return
         waiting: dict[tuple, list[dict]] = {}
         for source in oplog.sources():
             if source["source_type"] == "napcat_boot" and source["state"] == "fetching":
@@ -774,6 +795,8 @@ def on_load(ctx) -> None:
         from mods import wait_booted
 
         if not wait_booted(120):
+            return
+        if center_runtime() is not None:
             return
         if not oplog.has_unnotified():
             return

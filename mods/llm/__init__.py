@@ -32,6 +32,16 @@ from .types import LLMResponse, ModelCapabilities, ToolCallResult
 LOAD_AFTER = ("image", "storage", "watchdog")
 _log = logging.getLogger(__name__)
 
+
+def _observe_request(client, selection, params):
+    # This boundary sees the SDK payload after image conversion and policy.
+    from mods.chat.center import active
+    central = active()
+    if central is not None:
+        if client is not central.client:
+            raise PersistenceError("isolated center rejects a different LLM client")
+        central.observe_request(selection, params)
+
 # WHY: 自动图片描述路径固定使用这段 prompt（_get_image_description 调 describe_image 时
 # 不传 prompt），结果按内容摘要长期缓存。改这里必须同时提升
 # image.AUTO_IMAGE_DESCRIPTION_VERSION，理由见那边的注释。
@@ -308,6 +318,9 @@ class LLMClient:
         为准。取不到时退回本地配置而不是抛给调用方——一条查看用的命令不该因为网络或密钥
         失败变成报错。失败原因进 llm 流，聊天里只说已回退，见 chat._models_report。
         """
+        from mods.chat.center import active
+        if active() is not None:
+            raise PersistenceError("online model listing is unavailable in isolated center")
         client = self.clients.get(provider)
         if client is None:
             return None
@@ -476,6 +489,9 @@ class LLMClient:
         return [_rewrite_message_images(message, replace) for message in messages]
 
     def describe_image(self, uri: str, prompt: str = "", model: str | None = None) -> str | None:
+        from mods.chat.center import active
+        if active() is not None:
+            raise PersistenceError("isolated center requires direct image payload; auxiliary vision requests are unsupported")
         selection = model or self.get_vision_model()
         if not selection:
             return None
@@ -490,13 +506,12 @@ class LLMClient:
             text += "\n\n" + image.AUTO_IMAGE_SPLIT_PROMPT
             console.notice(f"🧩 图片较长，将以 {len(slices)} 个切片请求 {selection}")
         console.notice(f"等待 {selection} 的图片识别响应…")
-        response = client.chat.completions.create(
-            model=api_model,
-            messages=[{"role": "user", "content": [
+        params = dict(model=api_model, messages=[{"role": "user", "content": [
                 {"type": "text", "text": text},
                 *({"type": "image_url", "image_url": {"url": value}} for value in slices),
-            ]}],
-        )
+            ]}])
+        _observe_request(self, selection, params)
+        response = client.chat.completions.create(**params)
         description = response.choices[0].message.content
         if description:
             console.notice(f"✅ 视觉模型调用成功：{console.format_uri(uri)}")
@@ -532,6 +547,8 @@ class LLMClient:
             params.update(options)
         if stream:
             params["stream_options"] = {"include_usage": True}
+        _observe_request(self, selection, params)
+        if stream:
             return self._stream_response(client, params, selection)
         return self._non_stream_response(client, params, selection)
 
@@ -782,6 +799,9 @@ class LLMClient:
                 try:
                     if on_action is not None:
                         on_action(f"{output_id}#{position + 1}" if output_id is not None else None)
+                    from mods.chat.center import active
+                    if active() is not None:
+                        active().observe_action(f"{output_id}#{position + 1}")
                     content = str(tool.call(**arguments))
                 except PersistenceError:
                     raise

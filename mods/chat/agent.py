@@ -102,6 +102,9 @@ def _cover_projection(messages: list[dict], members: set[str]) -> None:
 
 
 def _drive_agent(model: str | None, window: tuple) -> None:
+    central = _chat_root.center_runtime()
+    if central is not None:
+        return central.drive(model, window)
     turn, owner = context.begin_turn(_chat_root.AGENT_WINDOW)
     if not owner:
         return

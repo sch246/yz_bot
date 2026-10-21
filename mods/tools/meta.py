@@ -373,6 +373,10 @@ def say(text: str, final_call: bool = True, target: str = "") -> str:
 
     body = str(text)
     sink = _offline_send_sink.get()
+    central = chat.center_runtime()
+    if central is not None:
+        central.ensure_available()
+        sink = central.send_sink
     if chat._offline_scope.get() is not None and sink is None:
         raise RuntimeError("offline send sink is missing")
     if not body.strip():

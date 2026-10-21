@@ -37,6 +37,10 @@ def assign_tasks(prompt: str, tasks: str, tools: str, model: str = "deepseek/dee
     model: provider/model 形式的模型名，例如 deepseek/deepseek-flash；需要子任务调用工具时要选支持函数调用的模型
     max_workers: 最大并发数，1 到 5，超过按 5 处理
     """
+    from mods.chat.center import active
+    if active() is not None:
+        active().ensure_available()
+        raise llm.PersistenceError("assign_tasks is not wired to the isolated center journal; refusing dispatch")
     task_list = [value.strip() for value in tasks.splitlines() if value.strip()]
     requested = list(dict.fromkeys(value.strip() for value in tools.splitlines() if value.strip()))
     workers = max(1, min(int(max_workers), 5))
