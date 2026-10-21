@@ -527,6 +527,9 @@ class Center:
             if state["note"] == version and state.get("note_told"):
                 return []
             state["note"], state["note_told"] = version, True
+            # WHY: the injected version is a source only from this request onward.
+            if version is not None:
+                state["sources"].append(version)
             return [{"role": "user", "content": "current long term note " + _bytes(head).decode()}]
         except Exception as error:
             raise llm.RequiredContextError("center note/context failed") from error
