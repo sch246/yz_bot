@@ -161,15 +161,38 @@ def tree_hashes(root):
     return {str(p.relative_to(root)): probe._hash(p.read_bytes()) for p in root.rglob('*') if p.is_file()}
 
 
+def copy_prior_fixture(prior_root, origin):
+    """Relocate synthetic origin evidence coherently before negative mutation."""
+    shutil.copytree(prior_root, origin)
+    subject = json.loads((origin / 'subject.json').read_bytes())
+    subject['root'] = str(origin)
+    durable(origin / 'subject.json', subject)
+    durable(origin / 'plan.json', probe._entry(subject, (origin / 'subject.json').read_bytes(), probe.BOOTSTRAP))
+    manifest = json.loads((origin / 'manifest.json').read_bytes())
+    manifest['root'] = str(origin)
+    manifest['records']['plan.json'] = probe._hash((origin / 'plan.json').read_bytes())
+    durable(origin / 'manifest.json', manifest)
+    ledger = json.loads((origin / 'ledger.json').read_bytes())['state']
+    ledger['manifest'] = digest(manifest)
+    durable(origin / 'ledger.json', {'state': ledger, 'sha256': digest(ledger)})
+    assert probe.official.recover(origin)['ledger_status'] == 'closed'
+    # Prove the copy reaches the note checks; an earlier identity refusal must
+    # not be counted as a scope/source/receipt negative below.
+    probe._prior_note(origin / 'notes', 'global/main', origin.parent / 'uncreated-preflight')
+    return origin
+
+
 def transfer_refusals(root, prior_root):
     """Mutate only private copies: supplied hashes cannot replace commit evidence."""
-    checks = []
+    checks, reasons = [], {}
     original = tree_hashes(prior_root)
-    def refused(label, operation, destination):
+    def refused(label, operation, destination, *, expected=None):
         before = tree_hashes(destination) if destination.exists() else None
         with patch.object(official.OfficialClient, '__init__', side_effect=AssertionError('refusal constructed client')):
             try: operation()
-            except (ValueError, RuntimeError, OSError, KeyError, TypeError): pass
+            except (ValueError, RuntimeError, OSError, KeyError, TypeError) as error:
+                reasons[label] = str(error)
+                if expected is not None: assert str(error) == expected, (label, str(error))
             else: raise AssertionError('accepted invalid prior input: ' + label)
         assert (tree_hashes(destination) if destination.exists() else None) == before, label
         checks.append(label)
@@ -189,11 +212,7 @@ def transfer_refusals(root, prior_root):
     # path only so each negative has its own internally consistent fixture root.
     for case in ('absent', 'receipt', 'bytes', 'foreign-source', 'future-cursor', 'foreign-snapshot', 'branch', 'deleted', 'non-synthetic',
                  'paused', 'persistence-unknown', 'active-origin'):
-        origin = root / ('origin-' + case)
-        shutil.copytree(prior_root, origin)
-        subject = json.loads((origin / 'subject.json').read_bytes())
-        subject['root'] = str(origin)
-        durable(origin / 'subject.json', subject)
+        origin = copy_prior_fixture(prior_root, root / ('origin-' + case))
         current = origin / 'notes/current/global/main.md'
         if case == 'absent': current.unlink()
         elif case == 'receipt': sorted((origin / 'notes/receipts').glob('*.json'))[-1].unlink()
@@ -233,6 +252,50 @@ def transfer_refusals(root, prior_root):
             receipt_path.write_bytes(note_module._pack(row))
         target = root / ('rejected-' + case)
         refused(case, lambda: prepare(target, origin / 'notes'), target)
+    historical = copy_prior_fixture(prior_root, root / 'historical-code-origin')
+    manifest = json.loads((historical / 'manifest.json').read_bytes())
+    for name in ('subject_probe.py', 'subject_probe_calibration.py'):
+        manifest['contract']['code'].pop('experiments/' + name, None)
+    durable(historical / 'manifest.json', manifest)
+    ledger = json.loads((historical / 'ledger.json').read_bytes())['state']
+    ledger['manifest'] = digest(manifest)
+    durable(historical / 'ledger.json', {'state': ledger, 'sha256': digest(ledger)})
+    assert prepare(root / 'historical-code-subset', historical / 'notes')['status'] == 'prepared-not-ready'
+    # The donor is a real closed SDK-Mock run, not a fabricated checksum.
+    donor = root / 'other-closed-run'
+    assert run_case(donor, 'quiet')['status'] == 'complete'
+    foreign_ledger = (donor / 'ledger.json').read_bytes()
+    for when in ('before-prepare', 'after-prepare'):
+        origin = copy_prior_fixture(prior_root, root / ('ledger-origin-' + when))
+        target = root / ('foreign-ledger-' + when)
+        if when == 'after-prepare': prepare(target, origin / 'notes')
+        (origin / 'ledger.json').write_bytes(foreign_ledger)
+        assert official.recover(origin)['ledger_status'] == 'closed'
+        operation = (lambda: prepare(target, origin / 'notes')) if when == 'before-prepare' else (
+            lambda: probe.run_probe(target, temporary_api_key='sk-fictional-official-only', _calibration=official._CALIBRATION))
+        refused('foreign-ledger-' + when, operation, target, expected='prior Ledger origin identity drift')
+    origin = copy_prior_fixture(prior_root, root / 'manifest-origin')
+    manifest_path = origin / 'manifest.json'
+    saved_manifest = manifest_path.read_bytes()
+    manifest = json.loads(saved_manifest)
+    manifest['run_id'] += '-foreign'
+    durable(manifest_path, manifest)
+    target = root / 'manifest-before-prepare'
+    refused('manifest-before-prepare', lambda: prepare(target, origin / 'notes'), target,
+            expected='prior historical manifest/input binding drift')
+    manifest_path.write_bytes(saved_manifest)
+    target = root / 'manifest-after-prepare'
+    prepare(target, origin / 'notes')
+    assert 'manifest.json' in json.loads((target / 'subject.json').read_bytes())['prior_note']['origin']['files']
+    # Canonical manifest identity remains valid; only its pinned bytes change.
+    manifest_path.write_bytes(saved_manifest + b' ')
+    refused('manifest-after-prepare', lambda: probe.run_probe(target, temporary_api_key='sk-fictional-official-only',
+        _calibration=official._CALIBRATION), target, expected='prior note bytes/version/origin drift')
+    manifest_path.write_bytes(saved_manifest)
+    plan_path = origin / 'plan.json'
+    plan_path.write_bytes(plan_path.read_bytes() + b' ')
+    target = root / 'plan-record-drift'
+    refused('plan-record-drift', lambda: prepare(target, origin / 'notes'), target, expected='prior record hash drift')
     frozen = root / 'prepared'
     prepare(frozen, notes)
     original_subject = (frozen / 'subject.json').read_bytes()
@@ -268,8 +331,8 @@ def transfer_refusals(root, prior_root):
     refused('expired-new-authorization', lambda: probe.run_probe(expired, temporary_api_key='sk-fictional-official-only',
         _calibration=official._CALIBRATION), expired)
     assert tree_hashes(prior_root) == original
-    return {'case': 'prior-reject', 'status': 'pass', 'refusals': checks, 'requests': 0,
-            'prior_bytes_unchanged': True}
+    return {'case': 'prior-reject', 'status': 'pass', 'refusals': checks, 'reasons': reasons, 'requests': 0, 'setup_mock_requests': 2,
+            'historical_code_subset_accepted': True, 'prior_bytes_unchanged': True}
 
 
 def run_transfer_case(root, case, prior_root):

@@ -130,7 +130,28 @@ def _prior_note(notes_root, key, destination):
     _require(all(_hash(raw) == prior['files'][name] for name, raw in raw_inputs.items())
              and raw_inputs['bootstrap.txt'] == BOOTSTRAP.encode()
              and json.loads(raw_inputs['world-rules.json']) == rules(prior['seed']), 'prior source input drift')
+    manifest_raw = _read(origin, 'manifest.json')
+    manifest = json.loads(manifest_raw)
+    _require(set(manifest) == {'schema', 'root', 'run_id', 'contract', 'budgets', 'role_stages', 'openai', 'httpx', 'records'}
+             and manifest['schema'] == 'stateless-official-manifest-v1'
+             and manifest['root'] == str(origin) and manifest['run_id'] == prior['run_id']
+             and manifest['budgets'] == prior['budgets'] and manifest['role_stages'] == prior['role_stages']
+             and all(prior['code'].get(name) == sha for name, sha in manifest['contract']['code'].items())
+             and set(prior['code']) - set(manifest['contract']['code']) <= {
+                 'experiments/subject_probe.py', 'experiments/subject_probe_calibration.py'}
+             and set(manifest['records']) == set(official.FILES),
+             'prior historical manifest/input binding drift')
+    records = {name: _read(origin, name) for name in official.FILES}
+    _require(all(_hash(raw) == manifest['records'][name] for name, raw in records.items()), 'prior record hash drift')
+    _require(json.loads(records['plan.json']) == _entry(prior, subject_raw, BOOTSTRAP), 'prior plan/subject binding drift')
     _require(official.recover(origin)['ledger_status'] == 'closed', 'prior run must be stopped with a known closed Ledger')
+    ledger_raw = _read(origin, 'ledger.json')
+    ledger = json.loads(ledger_raw)
+    # WHY: a valid closed Ledger can belong to another run. Recovery validates
+    # its accounting, not this historical manifest/subject identity. No expired
+    # execution grant or historical executable is activated by this read.
+    _require(ledger['sha256'] == digest(ledger['state']) and ledger['state']['pilot'] == prior['run_id']
+             and ledger['state']['manifest'] == digest(manifest), 'prior Ledger origin identity drift')
     snapshot = _snapshot(raw_inputs['bootstrap.txt'].decode())
     value = read_committed(notes_root, key, snapshot, allowed_keys=(key,))
     _require(value is not None, 'prior current note absent or deleted')
@@ -143,7 +164,8 @@ def _prior_note(notes_root, key, destination):
                               'branch': metadata['branch'],
                               'files': {'subject.json': _hash(subject_raw),
                                         **{name: _hash(raw) for name, raw in raw_inputs.items()},
-                                        'ledger.json': _hash(_read(origin, 'ledger.json')),
+                                        'manifest.json': _hash(manifest_raw), 'plan.json': _hash(records['plan.json']),
+                                        'ledger.json': _hash(ledger_raw),
                                         'notes/manifest.json': _hash(_read(notes_root, 'manifest.json'))}}}
     return declaration, value
 
