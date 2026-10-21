@@ -831,8 +831,10 @@ The four optional `drive_wake(..., simulation=workspace)` tools are
 reuse the existing guard → output/dispatch → operation → result path. The world
 reads its current state, frozen rules and actual dispatched arguments only;
 it does not inspect a note, candidate, diagnostic expected answer or model
-self-assessment to decide an effect. A fresh observation returns current state
-and the last clock effect, never future state or pending opportunities.
+self-assessment to decide an effect. A fresh observation returns current state, the last clock effect, the current
+delivery (or null), and actual submitted revisit requests with pending, delivered
+or declined status. These are detached projections of existing world state;
+future world effects are not exposed.
 
 Each later wake creates a fresh host-identified Chat from committed notes and
 committed action facts. Only wakes actually delivered so far are passed to the
