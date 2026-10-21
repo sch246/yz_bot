@@ -1087,6 +1087,7 @@ def freeze_archive_day(
             if len(records) != 1 or "time" not in records[0]:
                 raise ValueError("档案片段不能唯一解析")
             record = records[0]
+            record["_source"] = source_namespace
         record["_log_origin"] = origin
         ref = {"schema": _FRAGMENT_SCHEMA, "source_namespace": source_namespace, "kind": kind,
                "target": target, "day": calendar.isoformat(), "source_format": source_format,
