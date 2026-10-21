@@ -351,6 +351,11 @@ def drive_wake(snapshot, wake, wakes, root, client, *, references=(), actions=()
                         'generated:self supports expression or intent, never external success. '
                         'Use read_note to receive exact current bytes; a revision status is not a read. '
                         'A result from another tool in the same batch is not yet in your input.')
+    elif any(item['kind'] == 'note' for item in materials):
+        instruction += (' Selected notes are read-only history, not a current observation or action result. '
+                        'They do not establish the current environment state. No read_note or revise_note tool is available. '
+                        'Use available tools for current observations or actions; observing, acting, revisiting, silence and ending '
+                        'remain your choices.')
     messages = [{'role': 'system', 'content': instruction},
                 {'role': 'user', 'content': canonical({'wake': {k: wake[k] for k in ('id', 'reason', 'window')},
                     'screen': screen, 'selected': material}).decode()}]

@@ -8,6 +8,7 @@ import io
 import json
 from pathlib import Path
 import resource
+import shutil
 import sys
 import time
 from unittest.mock import patch
@@ -21,13 +22,14 @@ import stateless_loop as loop
 from stateless_capacity_calibration import isolation, official_fixture
 from a0_ledger import canonical, digest, durable
 
+TRANSFER_CASES = ('prior-active', 'prior-quiet', 'prior-cancel', 'prior-budget', 'prior-usage', 'prior-drift', 'prior-reject')
 CASES = ('active', 'quiet', 'rest', 'same-batch', 'cancel', 'budget', 'usage',
-         'effect-before', 'effect-after', 'result-unknown', 'revisit-unknown', 'note-unknown', 'input-drift', 'wake-budget')
+         'effect-before', 'effect-after', 'result-unknown', 'revisit-unknown', 'note-unknown', 'input-drift', 'wake-budget') + TRANSFER_CASES
 
 
-def fictional_operator(root, case):
+def fictional_operator(root, case, **prepare_options):
     """Invent records, never manufacture a public ready/run authorization."""
-    prepared = probe.prepare(root, run_id='fixture-subject-' + case)
+    prepared = probe.prepare(root, run_id='fixture-subject-' + case, **prepare_options)
     assert prepared['status'] == 'prepared-not-ready' and probe.verify(root)['status'] == 'not-ready'
     template = json.loads((root / 'official-template.json').read_bytes())
     builder = root / 'fixture-record-builder'
@@ -41,7 +43,10 @@ def fictional_operator(root, case):
     folder, manifest = official_fixture(builder, 'operator', budgets=template['budgets'], role_stages=template['role_stages'], mutate=fill)
     for name in official.FILES:
         if name != 'plan.json': (root / name).write_bytes((folder / name).read_bytes())
-    durable(root / 'manifest.json', manifest)
+    # Exercise public seal too. Fixture records stay synthetic and the public
+    # verify therefore stays not-ready; only the internal SDK path accepts them.
+    assert probe.seal(root)['status'] == 'not-ready'
+    assert json.loads((root / 'manifest.json').read_bytes()) == manifest
     assert probe.verify(root, _calibration=official._CALIBRATION)['status'] == 'verified-local-records-only'
     assert probe.verify(root)['status'] == 'not-ready'
     return manifest
@@ -61,7 +66,15 @@ def fixture_response(client, body, *, case):
     number = client.attempts
     def call(name, args, pos): return tool(name, args, number, pos)
     calls, content = [], 'FIXTURE_FINISHED_OR_SILENT'
-    if case == 'quiet':
+    if case.startswith('prior-'):
+        if case == 'prior-quiet':
+            content = ''
+        elif round_number == 1:
+            calls = [call('observe_workspace', {}, 1)]
+            if wake == 'subject-1':
+                calls += [call('move_object', {'object_id': 'circle', 'destination': 'left'}, 2),
+                          call('request_revisit', {'delay_ticks': 1, 'reason': 'fixture optional new-world revisit'}, 3)]
+    elif case == 'quiet':
         content = ''
     elif case == 'rest':
         if round_number == 1: calls = [call('request_revisit', {'delay_ticks': 0, 'reason': 'fixture decline future opportunities'}, 1)]
@@ -144,11 +157,213 @@ def run_case(root, case):
     return report
 
 
+def tree_hashes(root):
+    return {str(p.relative_to(root)): probe._hash(p.read_bytes()) for p in root.rglob('*') if p.is_file()}
+
+
+def transfer_refusals(root, prior_root):
+    """Mutate only private copies: supplied hashes cannot replace commit evidence."""
+    checks = []
+    original = tree_hashes(prior_root)
+    def refused(label, operation, destination):
+        before = tree_hashes(destination) if destination.exists() else None
+        with patch.object(official.OfficialClient, '__init__', side_effect=AssertionError('refusal constructed client')):
+            try: operation()
+            except (ValueError, RuntimeError, OSError, KeyError, TypeError): pass
+            else: raise AssertionError('accepted invalid prior input: ' + label)
+        assert (tree_hashes(destination) if destination.exists() else None) == before, label
+        checks.append(label)
+    def prepare(destination, notes, key='global/main'):
+        return probe.prepare(destination, prior_notes_root=notes, prior_note_key=key, seed=8)
+    notes = prior_root / 'notes'
+    for label, options in (('root-without-key', {'prior_notes_root': notes}),
+                           ('key-without-root', {'prior_note_key': 'global/main'})):
+        target = root / label
+        refused(label, lambda: probe.prepare(target, **options), target)
+    target = root / 'scope'
+    refused('scope', lambda: prepare(target, notes, 'person/fixture'), target)
+    for label, target in (('overlap-inside', prior_root / 'uncreated-child'),
+                          ('overlap-parent', prior_root.parent), ('overlap-dotdot', prior_root / 'elsewhere/..')):
+        refused(label, lambda: prepare(target, notes), target)
+    # Copies retain frozen origin paths in their subject record; rewrite that
+    # path only so each negative has its own internally consistent fixture root.
+    for case in ('absent', 'receipt', 'bytes', 'foreign-source', 'future-cursor', 'foreign-snapshot', 'branch', 'deleted', 'non-synthetic',
+                 'paused', 'persistence-unknown', 'active-origin'):
+        origin = root / ('origin-' + case)
+        shutil.copytree(prior_root, origin)
+        subject = json.loads((origin / 'subject.json').read_bytes())
+        subject['root'] = str(origin)
+        durable(origin / 'subject.json', subject)
+        current = origin / 'notes/current/global/main.md'
+        if case == 'absent': current.unlink()
+        elif case == 'receipt': sorted((origin / 'notes/receipts').glob('*.json'))[-1].unlink()
+        elif case == 'bytes': current.write_bytes(current.read_bytes() + b'EXTERNAL_EDIT')
+        elif case == 'paused':
+            (origin / 'notes/pauses/global').mkdir()
+            durable(origin / 'notes/pauses/global/main.json', {'fixture': True})
+        elif case == 'persistence-unknown': durable(origin / 'notes/persistence-unknown.json', {'fixture': True})
+        elif case == 'non-synthetic':
+            import stateless_notes as note_module
+            manifest_path = origin / 'notes/manifest.json'
+            manifest = note_module._read_json(manifest_path)
+            manifest['synthetic'] = False
+            manifest_path.write_bytes(note_module._pack(manifest))
+        elif case == 'active-origin':
+            envelope = json.loads((origin / 'ledger.json').read_bytes())
+            envelope['state']['closed'] = ''
+            durable(origin / 'ledger.json', {'state': envelope['state'], 'sha256': digest(envelope['state'])})
+        else:
+            # Make locally coherent forged current/archive/receipt bytes to
+            # reach the original source/cursor/snapshot checks, not just SHA.
+            import stateless_notes as note_module
+            metadata, body = note_module._decode(current.read_bytes())
+            metadata.pop('version_id')
+            if case == 'foreign-source': metadata['source_frozen_id'] = 'foreign-fixture'
+            elif case == 'future-cursor': metadata['cursor'] = 2
+            elif case == 'foreign-snapshot': metadata['snapshot_id'] = 'foreign-fixture'
+            elif case == 'deleted': metadata['operation'] = 'delete'
+            else: metadata['branch'] = 'other-fixture'
+            raw = note_module._encode(metadata, body)
+            new_metadata, _ = note_module._decode(raw)
+            current.write_bytes(raw)
+            (origin / 'notes/versions' / (new_metadata['version_id'] + '.md')).write_bytes(raw)
+            receipt_path = sorted((origin / 'notes/receipts').glob('*.json'))[-1]
+            row = note_module._read_json(receipt_path)
+            row.update(version_id=new_metadata['version_id'], sha256=probe._hash(raw))
+            receipt_path.write_bytes(note_module._pack(row))
+        target = root / ('rejected-' + case)
+        refused(case, lambda: prepare(target, origin / 'notes'), target)
+    frozen = root / 'prepared'
+    prepare(frozen, notes)
+    original_subject = (frozen / 'subject.json').read_bytes()
+    for field in ('version_id', 'sha256', 'origin'):
+        subject = json.loads(original_subject)
+        if field == 'origin': subject['prior_note'][field]['run_id'] += '-drift'
+        else: subject['prior_note'][field] = '0' * 64
+        durable(frozen / 'subject.json', subject)
+        refused('frozen-' + field, lambda: probe.run_probe(frozen, temporary_api_key='sk-fictional-official-only',
+            _calibration=official._CALIBRATION), frozen)
+    (frozen / 'subject.json').write_bytes(original_subject)
+    raw = (frozen / probe.PRIOR_FILE).read_bytes()
+    (frozen / probe.PRIOR_FILE).write_bytes(raw + b'COPY_DRIFT')
+    refused('frozen-bytes', lambda: probe.verify_inputs(frozen), frozen)
+    (frozen / probe.PRIOR_FILE).write_bytes(raw)
+    # Drift the source after prepare, preserving the selected current bytes.
+    changed = prior_root / 'subject.json'
+    saved = changed.read_bytes()
+    try:
+        changed.write_bytes(saved + b' ')
+        refused('origin-after-freeze', lambda: probe.run_probe(frozen, temporary_api_key='sk-fictional-official-only',
+            _calibration=official._CALIBRATION), frozen)
+    finally:
+        changed.write_bytes(saved)
+    expired = root / 'expired-new-run'
+    fictional_operator(expired, 'expired', seed=8, prior_notes_root=notes, prior_note_key='global/main')
+    auth = json.loads((expired / 'authorization.json').read_bytes())
+    auth['expires_at'] = auth['valid_from']
+    durable(expired / 'authorization.json', auth)
+    manifest = json.loads((expired / 'manifest.json').read_bytes())
+    manifest['records']['authorization.json'] = probe._hash((expired / 'authorization.json').read_bytes())
+    durable(expired / 'manifest.json', manifest)
+    refused('expired-new-authorization', lambda: probe.run_probe(expired, temporary_api_key='sk-fictional-official-only',
+        _calibration=official._CALIBRATION), expired)
+    assert tree_hashes(prior_root) == original
+    return {'case': 'prior-reject', 'status': 'pass', 'refusals': checks, 'requests': 0,
+            'prior_bytes_unchanged': True}
+
+
+def run_transfer_case(root, case, prior_root):
+    before = tree_hashes(prior_root)
+    if case == 'prior-reject':
+        return transfer_refusals(root, prior_root)
+    fictional_operator(root, case, seed=8, prior_notes_root=prior_root / 'notes', prior_note_key='global/main')
+    original_act = probe.Workspace.act
+    cancel = [False]
+    def act(world, action, operation, arguments):
+        result = original_act(world, action, operation, arguments)
+        if case == 'prior-cancel': cancel[0] = True
+        return result
+    def response(client, body):
+        value = fixture_response(client, body, case=case)
+        if case == 'prior-budget' and client.attempts == 1:
+            value['usage'] = {'prompt_tokens': 1000000, 'completion_tokens': 20, 'total_tokens': 1000020}
+        if case == 'prior-usage': value['usage'] = None
+        if case == 'prior-drift' and client.attempts == 1:
+            current = prior_root / 'notes/current/global/main.md'
+            current.write_bytes(current.read_bytes() + b'FIXTURE_CONCURRENT_EDIT')
+        return value
+    current = prior_root / 'notes/current/global/main.md'
+    saved = current.read_bytes()
+    try:
+        with patch.object(capacity.CapacityClient, '_fixture_response', response), patch.object(probe.Workspace, 'act', act), \
+             patch.object(probe.NoteWriter, 'create', side_effect=AssertionError('prior mode created writer')):
+            report = probe.run_probe(root, temporary_api_key='sk-fictional-official-only',
+                _calibration=official._CALIBRATION, cancelled=lambda: cancel[0])
+    finally:
+        if current.read_bytes() != saved: current.write_bytes(saved)
+    assert tree_hashes(prior_root) == before
+    assert not (root / 'notes').exists()
+    assert report['ledger']['closed'] and all(not v['sent'] and not v['transport_attempted'] for v in report['transport'])
+    wire = [json.loads(p.read_bytes()) for p in sorted(root.glob('request-*.json'))]
+    assert len(wire) == len(report['ledger']['requests'])
+    for request in wire:
+        body = request['envelope']['body']
+        names = {tool['function']['name'] for tool in body['tools']}
+        assert set(probe.TOOLS) <= names and not {'read_note', 'revise_note'} & names
+        assert 'read-only history' in body['messages'][0]['content']
+        assert 'not a current observation' in body['messages'][0]['content']
+        selected = json.loads(body['messages'][1]['content'])['selected']
+        assert len(selected['materials']) == 1
+        material = selected['materials'][0]
+        assert material['text'].encode() == saved and material['sha256'] == probe._hash(saved)
+        assert material['version_id'] == probe._decode(saved)[0]['version_id']
+        assert material['snapshot_id'] == probe._decode(saved)[0]['snapshot_id']
+        assert all(item['request_id'].startswith('fixture-subject-' + case + '/') for item in selected['committed_actions'])
+    assert not json.loads(wire[0]['envelope']['body']['messages'][1]['content'])['selected']['committed_actions']
+    state = json.loads((root / 'world.json').read_bytes())['value']
+    journal = loop.recover_commits(root)
+    success = case in ('prior-active', 'prior-quiet')
+    assert report['status'] == ('complete' if success else 'stopped'), report['failure']
+    if case == 'prior-active':
+        assert [item['source'] for item in state['deliveries']] == ['bootstrap', 'harness-clock', 'model-revisit']
+        assert state['objects']['circle'] == 'left' and state['clocks'][0]['tilted'] == 'right'
+        assert all(item['status'] == 'completed' for item in journal['results'].values())
+        assert any(json.loads(message['content']).get('world_result', {}).get('objects', {}).get('circle') == 'left'
+                   for request in wire[1:] for message in request['envelope']['body']['messages'] if message['role'] == 'tool')
+    elif case == 'prior-quiet':
+        assert len(wire) == 2 and not state['effects'] and not state['revisits']
+    else:
+        assert len(wire) == 1 and len(state['deliveries']) == 1
+        assert len(state['effects']) == (1 if case == 'prior-cancel' else 3 if case == 'prior-budget' else 0)
+        if case == 'prior-usage': assert report['ledger']['requests'][0]['usage'] is None
+        previous = tree_hashes(root)
+        try: probe.run_probe(root, temporary_api_key='sk-fictional-official-only', _calibration=official._CALIBRATION)
+        except (RuntimeError, ValueError, OSError): pass
+        else: raise AssertionError('prior failed run replayed')
+        assert tree_hashes(root) == previous
+    hashes = tree_hashes(root)
+    with patch.object(official.OfficialClient, '__init__', side_effect=AssertionError('recover client')), \
+         patch.object(probe.Workspace, 'act', side_effect=AssertionError('recover effect')):
+        recovered = probe.recover(root)
+    assert tree_hashes(root) == hashes and recovered['resume'] is False
+    assert recovered['notes']['status'] == 'disabled-read-only-prior-note'
+    durable(root / 'prior-integrity.json', {'before': before, 'after': tree_hashes(prior_root), 'unchanged': True})
+    return {'case': case, 'status': 'pass', 'requests': len(wire), 'prior_bytes_unchanged': True,
+            'wakes': len(state['deliveries']), 'replay': False, 'local_notes': False}
+
+
 def doctor(root, cases=CASES):
     started, results = time.perf_counter(), []
     with isolation(root) as counters, redirect_stdout(io.StringIO()) as console:
+        prior_root = root / 'prior-run'
+        if any(case in TRANSFER_CASES for case in cases):
+            assert run_case(prior_root, 'active')['status'] == 'complete'
         for case in cases:
             folder = root / case
+            if case in TRANSFER_CASES:
+                if case == 'prior-reject': folder.mkdir(mode=0o700)
+                results.append(run_transfer_case(folder, case, prior_root))
+                continue
             report = run_case(folder, case)
             ledger = report['ledger']
             assert all(not item['sent'] and not item['transport_attempted'] for item in report['transport'])
@@ -267,6 +482,7 @@ def main(argv=None):
             result = doctor(root, CASES if args.case is None else (args.case,))
         else:
             # Single fixture run remains isolated/closed, never a live selector.
+            assert args.case not in TRANSFER_CASES, 'prior cases use doctor with a constructed stopped origin'
             with isolation(root.parent), redirect_stdout(io.StringIO()): result = run_case(root, args.case or 'active')
         print(json.dumps({'status': result['status'], 'assertions': len(result.get('assertions', []))}))
         return 0 if result['status'] in ('ok', 'complete') else 1

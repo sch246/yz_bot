@@ -20,7 +20,7 @@ from comparison_snapshot import _safe_root, freeze_sources, open_snapshot
 import stateless_official as official
 import stateless_capacity_client as capacity
 from stateless_loop import drive_wake, finish_wake, recover_commits, close_session
-from stateless_notes import NoteWriter, snapshot_notes, recover_notes
+from stateless_notes import NoteWriter, snapshot_notes, recover_notes, read_committed, _decode
 
 BOOTSTRAP = '''This is a finite synthetic workspace, not production or an assigned task.
 No interest, plan, preferred arrangement or success score is supplied. You may
@@ -45,6 +45,7 @@ is evidence of input, not proof that you used them; later choices remain open.
 '''
 TOOLS = ('observe_workspace', 'move_object', 'write_card', 'request_revisit')
 INPUT_FILES = ('bootstrap.txt', 'world-rules.json')
+PRIOR_FILE = 'prior-note.md'
 
 
 def _hash(raw):
@@ -107,14 +108,69 @@ def _entry(subject, raw_subject, bootstrap):
                                    {'role': 'user', 'content': bootstrap}]}}
 
 
-def prepare(root, *, run_id='subject-first-segment', seed=7, max_wakes=3):
+def _prior_note(notes_root, key, destination):
+    """Read the stopped origin in place; never open a writer or import its actions."""
+    notes_root = _root(notes_root)
+    origin = notes_root.parent
+    _require(notes_root.name == 'notes' and key == 'global/main', 'explicit prior global/main notes root required')
+    _require(not destination.resolve().is_relative_to(origin.resolve()) and not origin.resolve().is_relative_to(destination.resolve()),
+             'prior and new subject roots must be disjoint')
+    subject_raw = _read(origin, 'subject.json')
+    prior = json.loads(subject_raw)
+    # WHY: old source hashes describe the old executable, so current-code
+    # verification cannot reopen a historical origin. Pin its input bytes and
+    # validate the supported v1 source instead; no old authorization is reused.
+    _require(prior['schema'] == 'subject-probe-input-v1' and prior['root'] == str(origin)
+             and prior['tools'] == list(TOOLS) and prior['role_stages'] == {'chat': 'question'}
+             and type(prior['seed']) is int and 0 <= prior['seed'] <= 2147483647
+             and type(prior['max_wakes']) is int and 1 <= prior['max_wakes'] <= 3
+             and set(prior['files']) == set(INPUT_FILES), 'unsupported prior subject origin')
+    capacity._validate_budgets(prior)
+    raw_inputs = {name: _read(origin, name) for name in INPUT_FILES}
+    _require(all(_hash(raw) == prior['files'][name] for name, raw in raw_inputs.items())
+             and raw_inputs['bootstrap.txt'] == BOOTSTRAP.encode()
+             and json.loads(raw_inputs['world-rules.json']) == rules(prior['seed']), 'prior source input drift')
+    _require(official.recover(origin)['ledger_status'] == 'closed', 'prior run must be stopped with a known closed Ledger')
+    snapshot = _snapshot(raw_inputs['bootstrap.txt'].decode())
+    value = read_committed(notes_root, key, snapshot, allowed_keys=(key,))
+    _require(value is not None, 'prior current note absent or deleted')
+    metadata, _ = _decode(value['raw'])
+    _require(metadata['snapshot_id'] == snapshot['snapshot_id'] and metadata['branch'] == 'main',
+             'prior note origin snapshot/branch drift')
+    declaration = {'notes_root': str(notes_root), 'key': key, 'version_id': value['version_id'], 'sha256': value['sha256'],
+                   'origin': {'run_id': prior['run_id'], 'snapshot_id': snapshot['snapshot_id'],
+                              'source_frozen_id': snapshot['source_sha256'], 'cursor': metadata['cursor'],
+                              'branch': metadata['branch'],
+                              'files': {'subject.json': _hash(subject_raw),
+                                        **{name: _hash(raw) for name, raw in raw_inputs.items()},
+                                        'ledger.json': _hash(_read(origin, 'ledger.json')),
+                                        'notes/manifest.json': _hash(_read(notes_root, 'manifest.json'))}}}
+    return declaration, value
+
+
+def _prior_material(root, subject, snapshot):
+    declared = subject['prior_note']
+    actual, value = _prior_note(declared['notes_root'], declared['key'], root)
+    _require(actual == declared and _read(root, PRIOR_FILE) == value['raw'], 'prior note bytes/version/origin drift')
+    _require(value['snapshot_id'] == snapshot['snapshot_id']
+             and actual['origin']['source_frozen_id'] == snapshot['source_sha256']
+             and actual['origin']['cursor'] <= snapshot['opened_cursor'], 'foreign/future prior note exposure')
+    return (value,)
+
+
+def prepare(root, *, run_id='subject-first-segment', seed=7, max_wakes=3,
+            prior_notes_root=None, prior_note_key=None):
     """Create only fictional frozen inputs/templates; no operator grant or Ledger."""
     root = _root(root)
     _require(type(seed) is int and 0 <= seed <= 2147483647 and type(max_wakes) is int and 1 <= max_wakes <= 3,
              'invalid finite subject bounds')
     _require(isinstance(run_id, str) and run_id and len(run_id) <= 80 and all(c.isalnum() or c in '-_' for c in run_id), 'invalid run id')
+    _require((prior_notes_root is None) == (prior_note_key is None), 'prior notes root and key required together')
+    prior = _prior_note(prior_notes_root, prior_note_key, root) if prior_notes_root is not None else None
     root.mkdir(mode=0o700, parents=True)
     (root / 'bootstrap.txt').write_bytes(BOOTSTRAP.encode())
+    if prior:
+        (root / PRIOR_FILE).write_bytes(prior[1]['raw'])
     durable(root / 'world-rules.json', rules(seed))
     ceiling = {'tokens': 2000000, 'micro_cny': 5000000, 'attempts': 12}
     subject = {'schema': 'subject-probe-input-v1', 'root': str(root), 'run_id': run_id, 'seed': seed,
@@ -124,6 +180,11 @@ def prepare(root, *, run_id='subject-first-segment', seed=7, max_wakes=3):
                'files': {name: _hash((root / name).read_bytes()) for name in INPUT_FILES}, 'code': source_hashes(),
                'selection': 'all authorized current global/main plus committed output/action facts; no selector or background request',
                'clock': 'bootstrap; at most one harness opportunity at tick1; model-requested due ticks; max_wakes is a ceiling'}
+    if prior:
+        subject.update(schema='subject-probe-input-v2', prior_note=prior[0],
+                       selection='exact read-only prior global/main history from an earlier independent synthetic workspace; '
+                                 'this run committed output/action facts only; no writer')
+        subject['files'][PRIOR_FILE] = _hash(prior[1]['raw'])
     durable(root / 'subject.json', subject)
     durable(root / 'plan.json', _entry(subject, (root / 'subject.json').read_bytes(), BOOTSTRAP))
     template = official.manifest(root, run_id, subject['budgets'], subject['role_stages'], {})
@@ -138,13 +199,15 @@ def verify_inputs(root):
     root = _root(root)
     raw = _read(root, 'subject.json')
     subject = json.loads(raw)
+    prior = subject.get('schema') == 'subject-probe-input-v2'
     _require(set(subject) == {'schema', 'root', 'run_id', 'seed', 'max_wakes', 'tools', 'role_stages', 'budgets',
-                              'files', 'code', 'selection', 'clock'} and subject['schema'] == 'subject-probe-input-v1'
+                              'files', 'code', 'selection', 'clock'} | ({'prior_note'} if prior else set())
+             and subject['schema'] in {'subject-probe-input-v1', 'subject-probe-input-v2'}
              and subject['root'] == str(root) and subject['code'] == source_hashes()
              and subject['tools'] == list(TOOLS) and subject['role_stages'] == {'chat': 'question'}
              and type(subject['max_wakes']) is int and 1 <= subject['max_wakes'] <= 3
              and type(subject['seed']) is int and 0 <= subject['seed'] <= 2147483647
-             and set(subject['files']) == set(INPUT_FILES), 'subject input declaration drift')
+             and set(subject['files']) == set(INPUT_FILES) | ({PRIOR_FILE} if prior else set()), 'subject input declaration drift')
     capacity._validate_budgets(subject)
     ceiling = subject['budgets']['research']
     _require(ceiling == {'tokens': 2000000, 'micro_cny': 5000000, 'attempts': 12}
@@ -154,6 +217,9 @@ def verify_inputs(root):
     bootstrap = _read(root, 'bootstrap.txt').decode('utf-8')
     _require(bootstrap == BOOTSTRAP and json.loads(_read(root, 'world-rules.json')) == rules(subject['seed']),
              'subject rule/bootstrap drift')
+    if prior:
+        _require(not (root / 'notes').exists(), 'read-only prior mode cannot have a local notes store')
+        _prior_material(root, subject, _snapshot(bootstrap))
     _require(json.loads(_read(root, 'plan.json')) == _entry(subject, raw, bootstrap), 'subject plan/material binding drift')
     template = official.manifest(root, subject['run_id'], subject['budgets'], subject['role_stages'], {})
     _require(json.loads(_read(root, 'official-template.json')) == template, 'subject official template drift')
@@ -363,6 +429,8 @@ def recover(root):
             result[name] = {'status': 'readable', 'value': value}
         except (ValueError, RuntimeError, OSError, KeyError, TypeError):
             result[name] = {'status': 'unavailable-or-unknown'}
+    if result['inputs']['status'] == 'readable' and 'prior_note' in result['inputs']['value']:
+        result['notes'] = {'status': 'disabled-read-only-prior-note'}
     return result
 
 
@@ -376,7 +444,7 @@ def run_probe(root, *, temporary_api_key, _calibration=None, cancelled=lambda: F
               else official.OfficialClient(root, json.loads(_read(root, 'manifest.json')), temporary_api_key=temporary_api_key))
     outcomes, failure = [], None
     try:
-        notes = NoteWriter.create(root / 'notes')
+        notes = None if 'prior_note' in subject else NoteWriter.create(root / 'notes')
         world = Workspace(root, create=True)
         snapshot = _snapshot(_read(root, 'bootstrap.txt').decode())
         delivered = []
@@ -404,8 +472,9 @@ def run_probe(root, *, temporary_api_key, _calibration=None, cancelled=lambda: F
             delivered.append(wake)
             client.ledger.wake()
             state = recover_commits(root)
-            material = snapshot_notes(notes.root, snapshot, allowed_keys=('global/main',))
-            outcome = drive_wake(snapshot, wake, delivered, root, client, notes=notes, note_keys=('global/main',),
+            material = (snapshot_notes(notes.root, snapshot, allowed_keys=('global/main',)) if notes else
+                        _prior_material(root, subject, snapshot))
+            outcome = drive_wake(snapshot, wake, delivered, root, client, notes=notes, note_keys=('global/main',) if notes else (),
                 materials=material, actions=tuple(state['outputs']), simulation=world, cancelled=cancelled)
             outcomes.append(outcome)
             ids = [key for key, item in client.saved.items() if item['value']['attribution']['task_id'] == wake['id']]
@@ -445,11 +514,16 @@ def main(argv=None):
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--max-wakes', type=int, default=3)
     parser.add_argument('--credential-stdin', action='store_true')
+    parser.add_argument('--prior-notes-root', help='prepare only: stopped synthetic v1 subject run notes root')
+    parser.add_argument('--prior-note-key', choices=('global/main',), help='prepare only: explicit read-only historical note key')
     args = parser.parse_args(argv)
     try:
+        _require(args.command == 'prepare' or (args.prior_notes_root is None and args.prior_note_key is None),
+                 'prior note selection only during prepare')
         if args.command != 'run':
             _require(not args.credential_stdin, 'credential only in explicit run')
-            result = prepare(args.root, run_id=args.run_id, seed=args.seed, max_wakes=args.max_wakes) if args.command == 'prepare' else (
+            result = prepare(args.root, run_id=args.run_id, seed=args.seed, max_wakes=args.max_wakes,
+                             prior_notes_root=args.prior_notes_root, prior_note_key=args.prior_note_key) if args.command == 'prepare' else (
                 seal(args.root) if args.command == 'seal' else recover(args.root) if args.command == 'recover' else verify(args.root))
         else:
             _require(args.credential_stdin, 'explicit credential stdin required')
