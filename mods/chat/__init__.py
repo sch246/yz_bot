@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from contextlib import nullcontext
 from contextvars import ContextVar
 from datetime import datetime, timezone
 import json
@@ -447,7 +448,7 @@ def _hint_effective(default: dict, chat_hint: dict | None) -> dict:
     return {**default, **(chat_hint if isinstance(chat_hint, dict) else {})}
 
 
-def _run_hint(window: tuple, turn=None) -> None:
+def _run_hint(window: tuple, turn=None, *, _assembly=None) -> None:
     """求值本窗口的结束提示，并把结果发出去；触发点写在 `chat` 的 `finally`。
 
     WHY: 唯一信号是"循环停下"：`while` 里每个 `return` 和异常都经过 `finally`，而每轮
@@ -458,20 +459,30 @@ def _run_hint(window: tuple, turn=None) -> None:
     写的、每次聊天都自动跑，让它抛出去就等于一段烂代码能污染聊天主流程的返回路径。
     """
     try:
-        merged = _hint_effective(storage.get("", "hint"), _window_storage(window).get("hint"))
-        code = merged.get("code")
-        if not merged.get("on", False) or not isinstance(code, str) or not code.strip():
-            return
-        result = _hint_evaluate(code, window, turn)
-        if result is not None:
-            # `#` 前缀让结束提示不回流进 LLM 上下文，见 _model_event。
-            central = center_runtime()
-            if central is not None:
-                central.send_hint(window, "#" + cq.escape(str(result)))
-            else:
-                message.sendmsg("#" + cq.escape(str(result)))
+        if _assembly is not None:
+            from .center import _assembly_lock, require_assembly
+            central, identity = _assembly
+        # WHY: hint code can itself dispatch through py.loc.  Its evaluation
+        # and sending must share the installation lifetime, not just its result.
+        with (_assembly_lock if _assembly is not None else nullcontext()):
+            if _assembly is not None:
+                require_assembly(central, identity)
+            merged = _hint_effective(storage.get("", "hint"), _window_storage(window).get("hint"))
+            code = merged.get("code")
+            if not merged.get("on", False) or not isinstance(code, str) or not code.strip():
+                return
+            result = _hint_evaluate(code, window, turn)
+            if result is not None:
+                # `#` 前缀让结束提示不回流进 LLM 上下文，见 _model_event。
+                if _assembly is not None:
+                    require_assembly(central, identity)
+                    central.send_hint(window, "#" + cq.escape(str(result)))
+                elif (central := center_runtime()) is not None:
+                    central.send_hint(window, "#" + cq.escape(str(result)))
+                else:
+                    message.sendmsg("#" + cq.escape(str(result)))
     except Exception:
-        _report_hint_failure()
+        _report_hint_failure(_isolated=_assembly is not None)
 
 
 def _hint_evaluate(code: str, window: tuple, turn=None):
@@ -490,10 +501,10 @@ def _hint_evaluate(code: str, window: tuple, turn=None):
     return py.eval_last(code, namespace)
 
 
-def _report_hint_failure() -> None:
+def _report_hint_failure(*, _isolated=False) -> None:
     """照 link._report_error 的惯例，把 traceback 用 `#` 前缀发出去。"""
     _hint_stream.exception("hint 执行失败")
-    if center_runtime() is not None:
+    if _isolated or center_runtime() is not None:
         return
     try:
         # `#` 前缀让 traceback 不回流进 LLM 上下文，见 _model_event。
@@ -502,14 +513,12 @@ def _report_hint_failure() -> None:
         _hint_stream.exception("hint 的错误报告也发不出去")
 
 
-def chat(model: str | None = None) -> None:
+def chat(model: str | None = None, *, _assembly=None) -> None:
     event = context.current() or {}
     window = history.window(event)
     if window is None:
         return
-    if center_runtime() is None:
-        oplog.ensure_available()
-    _agent._drive_agent(model, window)
+    _agent._drive_agent(model, window, _assembly=_assembly)
 
 
 def run_offline(model: str, window: tuple, *, fact: str, registry,

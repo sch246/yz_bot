@@ -31,6 +31,12 @@ def active():
     return _active
 
 
+def require_assembly(runtime, identity):
+    """Caller holds _assembly_lock through the protected mutation/turn claim."""
+    if _active is not runtime or identity is None or runtime._assembly is not identity:
+        raise RuntimeError("center assembly was detached or replaced")
+
+
 def _bytes(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
 
@@ -46,6 +52,7 @@ def isolated(runtime):
     with _assembly_lock:
         if _active is not None or context.get_turn(("agent", 0)) is not None:
             raise RuntimeError("a center reader is already installed or running")
+        runtime._assembly = object()
         _active = runtime
     try:
         runtime.ensure_available()
@@ -60,6 +67,7 @@ def isolated(runtime):
                 # back into the legacy writer when its owner finally returns.
                 raise RuntimeError("cannot detach a running center")
             _active = None
+            runtime._assembly = None
 
 
 class Center:
@@ -83,6 +91,7 @@ class Center:
         self.registry, self.scheduler = registry, scheduler
         self.request_limit = int(request_limit)
         self.lock = threading.RLock()
+        self._assembly = None
         self.events = []
         self.failed = None
         self.path = self.root / "center.jsonl"
@@ -243,14 +252,14 @@ class Center:
         return self.append("revisit_delivery", request=delivery["request"], delivery=delivery,
                            window=list(window), reason=reason)
 
-    def wake(self, window):
+    def wake(self, window, *, assembly=None):
         from mods import chat
 
         previous = context.current()
         event = {"group_id": window[1]} if window[0] == "group" else {"target_id": window[1]}
         context.set_current(event)
         try:
-            chat.chat()
+            chat.chat(_assembly=(self, self._assembly if assembly is None else assembly))
         finally:
             context.set_current(previous)
 
@@ -366,11 +375,15 @@ class Center:
                         activations=state["activations"])
             return messages
 
-    def drive(self, model, window):
+    def drive(self, model, window, *, assembly):
         from mods import chat, image
 
         while True:
-            with self.lock:
+            with _assembly_lock, self.lock:
+                # WHY: a scheduler callback can outlive detach and even a new
+                # installation of this same object.  Bind before claiming the
+                # turn so detach cannot move it onto another authority.
+                require_assembly(self, assembly)
                 self.ensure_available()
                 turn, owner = context.begin_turn(chat.AGENT_WINDOW)
                 if owner:
@@ -424,7 +437,7 @@ class Center:
             finally:
                 context.end_turn(chat.AGENT_WINDOW, turn)
             if origin is not None:
-                chat._run_hint(window, turn)
+                chat._run_hint(window, turn, _assembly=(self, assembly))
 
     def _run(self, model, turn, state):
         from mods import chat

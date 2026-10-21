@@ -90,17 +90,22 @@ def pending(c: Any) -> list[dict]:
         ))
 
 
-def deliver_due(c: Any, now: float | None = None) -> list[dict]:
+def deliver_due(c: Any, now: float | None = None, *, assembly=None) -> list[dict]:
     """Commit due activations once, then invoke the ordinary wake path unlocked.
 
     A wake exception is an unknown outcome, never evidence that no work began.
     Results describe only activations committed by this call.  Persistence
     errors propagate immediately and prevent subsequent wake/activation work.
     """
+    from .center import _assembly_lock, require_assembly
+
     now = _timestamp(time.time() if now is None else now)
+    if assembly is None:
+        assembly = c._assembly
     results = []
     while True:
-        with c.lock:
+        with _assembly_lock, c.lock:
+            require_assembly(c, assembly)
             c.ensure_available()
             due = next((entry for entry in pending(c) if entry["due"] <= now), None)
             if due is None:
@@ -110,7 +115,7 @@ def deliver_due(c: Any, now: float | None = None) -> list[dict]:
             activation = c.activate_delivery(delivery, window, due["reason"])
             result = {"request": due["id"], "delivery": delivery, "activation": deepcopy(activation)}
         try:
-            c.wake(window)
+            c.wake(window, assembly=assembly)
         except Exception as error:
             # WHY: wake can start a worker before raising.  The committed
             # delivery consumes this request even when its outcome is unknown.
@@ -130,12 +135,17 @@ def project(c: Any, scheduler: Any) -> list[str]:
 
     The supplied scheduler is the existing BackgroundScheduler instance.  No
     job stores completion state.  Stale or concurrent callbacks are harmless
-    because ``deliver_due`` claims requests under the center lock.
+    because ``deliver_due`` checks the captured installation identity and
+    claims requests under the assembly and center locks.
     """
     if scheduler is None:
         raise ValueError("automatic revisits require a scheduler; use deliver_due manually")
+    from .center import _assembly_lock, require_assembly
+
     prefix = "center-revisit-" + sha256(c.scope_id.encode("utf-8")).hexdigest() + "-"
-    with c.lock:
+    assembly = c._assembly
+    with _assembly_lock, c.lock:
+        require_assembly(c, assembly)
         c.ensure_available()
         requests = pending(c)
         wanted = {prefix + entry["id"] for entry in requests}
@@ -149,6 +159,7 @@ def project(c: Any, scheduler: Any) -> list[str]:
         for entry in requests:
             scheduler.add_job(
                 deliver_due, "date", args=(c,),
+                kwargs={"assembly": assembly},
                 run_date=datetime.fromtimestamp(entry["due"], timezone.utc),
                 id=prefix + entry["id"], replace_existing=True,
                 misfire_grace_time=None,

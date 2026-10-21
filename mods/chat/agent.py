@@ -101,11 +101,20 @@ def _cover_projection(messages: list[dict], members: set[str]) -> None:
                    if not (_visible_stream_ids([message]) & members)]
 
 
-def _drive_agent(model: str | None, window: tuple) -> None:
-    central = _chat_root.center_runtime()
-    if central is not None:
-        return central.drive(model, window)
-    turn, owner = context.begin_turn(_chat_root.AGENT_WINDOW)
+def _drive_agent(model: str | None, window: tuple, *, _assembly=None) -> None:
+    from . import center
+
+    with center._assembly_lock:
+        if _assembly is None:
+            central = center.active()
+            if central is not None:
+                _assembly = (central, central._assembly)
+        if _assembly is None:
+            oplog.ensure_available()
+            turn, owner = context.begin_turn(_chat_root.AGENT_WINDOW)
+    if _assembly is not None:
+        central, identity = _assembly
+        return central.drive(model, window, assembly=identity)
     if not owner:
         return
     turn._chat_usage_tokens = 0
