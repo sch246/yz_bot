@@ -721,6 +721,32 @@ or a harness baseline for absence/tombstone. Only a later actual request carryin
 that native result establishes the new parent and content exposure. A preceding
 tool in the same batch has not yet entered the generating request.
 
+Current selected note/baseline materials establish the initial parent; subsequent
+native or harness reads in the generating Chat replace it in wire order.
+Historical committed action results retain their exact, verified source exposure
+without competing with that explicit parent. If no explicit parent was exposed,
+one unambiguous historical version/hash remains a permitted fallback; multiple
+different historical parents are refused. No current file is silently read to
+choose between them. Preparation freezes the exposed parent; commit compares
+its version and hash with current Markdown under the writer lock and refuses
+stale proposals. Source legality does not establish the truth of note prose.
+
+The bounded closed calibration reproduces selected B plus historical read A and
+native reread B, then commits C using both exact sources. It also checks parent
+conflicts, historical-only fallback, stale commits, forged bytes/receipts and
+scope refusal. The existing provenance case covers main/background commit
+ordering, frozen prefixes, source handles, restore/rollback and manual edits
+without running the unrelated IO fault matrix:
+
+```sh
+python experiments/stateless_notes_calibration.py parent-doctor --output /tmp/new-note-parent
+python experiments/stateless_notes_calibration.py doctor --case provenance --output /tmp/new-note-provenance
+```
+
+Both commands use fictional fixtures and the closed MockTransport, with socket,
+QQ and external-write sentinels. They establish no real generation quality or
+production behavior.
+
 `process="background"` creates a separate Chat with new messages. An optional
 `after_output(output_id, process)` caller hook can run that independent Chat
 before the outer Chat's tools; the outer output is already durable. This is a

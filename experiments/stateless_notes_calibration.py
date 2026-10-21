@@ -59,7 +59,7 @@ class NotesClient(SelectorClient):
         return super()._before_http(request)
 
 
-def doctor(root):
+def doctor(root, *, provenance_only=False):
     started = time.perf_counter()
     assertions, faults = [], {}
     def passed(name, **details):
@@ -296,6 +296,13 @@ def doctor(root):
             passed('manual-edit-pauses-explicit-baseline-preserves-history-and-trigger-outcomes-without-auto-request')
         finally:
             client.close()
+        if provenance_only:
+            assert all(value == 0 for value in counters.values())
+            durable(root / 'parser-console.json', {'synthetic_console': console.getvalue()})
+            result = {'status': 'ok', 'case': 'provenance', 'assertions': assertions,
+                      'sentinels': counters, 'real_HTTP': 0, 'QQ': 0}
+            durable(root / 'doctor.json', result)
+            return result
         # Durable note failure matrix uses the same ready B proposal and A base.
         for fault in ('previous', 'audit-before', 'audit-partial', 'audit-flush', 'audit-fsync', 'audit-replace',
                       'audit-after-replace', 'audit-dir-fsync', 'current-before', 'current-partial', 'current-flush',
@@ -442,6 +449,133 @@ def doctor(root):
     return result
 
 
+def parent_doctor(root):
+    """One closed native B/history-A/reread-B reproduction and parent guards."""
+    from stateless_loop import note_source_handles
+    frozen, schedule, wakes = synthetic_fixture()
+    snapshot = open_snapshot(frozen, schedule, 1)
+    keys = ('global/main', 'person/101')
+    assertions = []
+    class ParentClient(ClosedClient):
+        mode = 'native'
+
+        def fixture_message(self, messages):
+            wake = self.current['wake']
+            results = [m for m in messages if m['role'] == 'tool']
+            if self.mode == 'stop' or (results and (wake != 'parent-C' or len(results) > 1)):
+                return {'role': 'assistant', 'content': 'fixture done'}
+            def call(name, arguments):
+                return {'id': wake + '-' + str(len(results)) + '-' + name, 'type': 'function',
+                        'function': {'name': name, 'arguments': canonical(arguments).decode()}}
+            read = call('read_note', {'key': 'global/main'})
+            if wake == 'parent-C' and not results:
+                calls = [read]
+            else:
+                sources = ['generated:self']
+                if wake == 'parent-C':
+                    sources += ['material:global/main:' + item['version_id'] for item in versions.values()]
+                revision = call('revise_note', {'key': 'global/main', 'body': wake + '\n',
+                    'sources': sources, 'reason': 'fictional parent regression',
+                    'expectation': 'explicit current parent and exact historical sources', 'claim': 'draft'})
+                calls = [revision, read]
+            return {'role': 'assistant', 'content': '', 'tool_calls': calls}
+
+    with patch.dict(LIMITS, wakes=20, attempts=40, allowances=163840), \
+         sentinels(root) as counters, redirect_stdout(io.StringIO()) as console:
+        loop = root / 'loop'
+        loop.mkdir()
+        manifest = {'synthetic': True, 'schema': 'notes-calibration-v2', 'source': frozen['frozen_id']}
+        durable(loop / 'manifest.json', manifest)
+        notes = NoteWriter.create(root / 'notes')
+        client = ParentClient(loop, manifest, 'normal')
+        client.ceiling.update(attempts=40, tokens=4000000, micro_cny=10000000)
+        versions = {}
+        def drive(name, materials=(), actions=(), *, native=False):
+            wake = {**wakes[0], 'id': name}
+            client.mode = 'native' if native else 'stop'
+            client.ledger.wake()
+            outcome = drive_wake(snapshot, wake, [wake], loop, client, materials=materials, actions=actions,
+                **({'notes': notes, 'note_keys': keys} if native else {}))
+            requests = [k for k, v in client.saved.items() if v['attribution']['task_id'] == name]
+            finish_wake(loop, name, 'complete', requests)
+            return outcome['outputs']
+        def admit(name, output=None, *, aliases=None):
+            trigger = notes.register_trigger(loop, name, snapshot, allowed_keys=keys)
+            return notes.admit_trigger(trigger['id'], loop, snapshot, through_output=output, note_aliases=aliases)
+        def candidate(task, body):
+            return notes.prepare_candidate(task['id'], 'global/main', body,
+                sources=list(task['cutoff']['exposures']), reason='fixture CAS', expectation='exact parent',
+                producer={'process': 'main', 'basis': 'fixture', 'output_id': task['cutoff']['output_id']})
+        try:
+            outputs_a = drive('parent-A', native=True)
+            versions['A'] = read_committed(notes.root, 'global/main', snapshot, allowed_keys=keys)
+            outputs_b = drive('parent-B', (versions['A'],), native=True)
+            versions['B'] = read_committed(notes.root, 'global/main', snapshot, allowed_keys=keys)
+            # The actual generating wire contains selected B, old action/read A,
+            # then this Chat's native read B. The previous code fails admission.
+            outputs_c = drive('parent-C', (versions['B'],), (outputs_a[0],), native=True)
+            current = read_committed(notes.root, 'global/main', snapshot, allowed_keys=keys)
+            assert _decode(current['raw'])[1] == b'parent-C\n'
+            meta, _ = _decode(current['raw'])
+            assert meta['parent_version'] == versions['B']['version_id']
+            task = admit('parent-C', outputs_c[1])
+            handles = note_source_handles(task['cutoff'])
+            for item in versions.values():
+                assert handles['material:global/main:' + item['version_id']]
+            assert task['cutoff']['seen_notes']['global/main']['version_id'] == versions['B']['version_id']
+            assertions.append('selected-B-history-A-native-reread-B-commits-C-with-both-exact-sources')
+            # Explicit current B also wins without a later native reread.
+            drive('explicit-B', (versions['B'],), (outputs_a[0],))
+            assert admit('explicit-B')['cutoff']['seen_notes']['global/main']['version_id'] == versions['B']['version_id']
+            assertions.append('explicit-parent-does-not-require-redundant-reread')
+            drive('conflict', (versions['A'], versions['B']))
+            _reject(lambda: admit('conflict'), 'ambiguous exposed parent')
+            drive('history-conflict', actions=(outputs_a[0], outputs_b[0]))
+            _reject(lambda: admit('history-conflict'), 'ambiguous exposed parent')
+            assertions.append('conflicting-selected-and-history-only-parents-refused')
+            # A single historical read remains an exposed fallback. The old
+            # version cannot overwrite current C, even with a newer output.
+            drive('history-A', actions=(outputs_a[0],))
+            stale = admit('history-A')
+            assert stale['cutoff']['seen_notes']['global/main']['version_id'] == versions['A']['version_id']
+            assert notes.commit_candidate(candidate(stale, b'stale A\n'))['status'] == 'stale'
+            drive('history-C', actions=(outputs_c[1],))
+            fresh = admit('history-C')
+            pending = candidate(fresh, b'competing D\n')
+            assert notes.commit_candidate(candidate(fresh, b'D\n'))['status'] == 'committed'
+            assert notes.commit_candidate(pending)['status'] == 'stale'
+            assertions.append('single-history-current-parent-commits-and-both-stale-CAS-refusals-preserved')
+            # All old evidence is still checked even when explicit B determines
+            # the parent; never hide bad history behind the preferred parent.
+            archive = notes.root / 'versions' / (versions['A']['version_id'] + '.md')
+            raw = archive.read_bytes()
+            archive.write_bytes(raw + b'forged old bytes')
+            try:
+                _reject(lambda: admit('explicit-B'), 'checksum drift')
+            finally:
+                archive.write_bytes(raw)
+            receipt = notes.root / 'receipts/000001.json'
+            raw = receipt.read_bytes()
+            receipt.write_bytes(_pack({**_read_json(receipt), 'sha256': '0' * 64}))
+            try:
+                _reject(lambda: admit('explicit-B'), 'receipt version/hash drift')
+            finally:
+                receipt.write_bytes(raw)
+            drive('foreign-scope', ({**versions['B'], 'source_id': 'scope-handle'},))
+            _reject(lambda: admit('foreign-scope', aliases={'scope-handle': 'person/101'}), 'illegal exposed note')
+            assertions.append('old-bytes-receipt-and-foreign-scope-refused-despite-explicit-parent')
+            assert all(value == 0 for value in counters.values())
+        finally:
+            client.close()
+    durable(root / 'parser-console.json', {'synthetic_console': console.getvalue()})
+    result = {'status': 'ok', 'assertions': assertions, 'sentinels': counters,
+              'real_HTTP': 0, 'QQ': 0, 'attempts': client.attempts,
+              'source_hashes': {name: _hash((Path(__file__).parent / name).read_bytes())
+                                for name in ('stateless_notes.py', 'stateless_notes_calibration.py')}}
+    durable(root / 'parent-doctor.json', result)
+    return result
+
+
 def policy_doctor(root):
     """Native revisions under each supported capacity source, with read-only drift probes."""
     import stateless_capacity_client as capacity
@@ -523,16 +657,20 @@ def policy_doctor(root):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('doctor', 'policy-doctor', 'recover'))
+    parser.add_argument('command', choices=('doctor', 'parent-doctor', 'policy-doctor', 'recover'))
+    parser.add_argument('--case', choices=('provenance',), help='doctor: stop before the unrelated IO fault matrix')
     parser.add_argument('--output', required=True)
     args = parser.parse_args(argv)
+    if args.case and args.command != 'doctor':
+        parser.error('--case is supported only by doctor')
     try:
         if args.command == 'recover':
             result = recover_notes(args.output)
         else:
             root = _safe_root(args.output)
             root.mkdir(parents=True, mode=0o700)
-            result = policy_doctor(root) if args.command == 'policy-doctor' else doctor(root)
+            result = {'doctor': lambda root: doctor(root, provenance_only=bool(args.case)),
+                      'parent-doctor': parent_doctor, 'policy-doctor': policy_doctor}[args.command](root)
         print(json.dumps({'status': result.get('status'), 'assertions': len(result.get('assertions', [])),
                          'result': result if args.command == 'recover' else None}))
         return 0

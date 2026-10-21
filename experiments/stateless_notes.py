@@ -449,7 +449,16 @@ class NoteWriter:
             context = json.loads(messages[1]['content'])
             if context['screen']['snapshot_id'] != original['snapshot_id']:
                 raise ValueError('wire snapshot mismatch')
-            exposures, seen_notes = [], {}
+            exposures, seen_notes, historical_parents = [], {}, {}
+            def parent_read(key, parent, *, historical, reread):
+                if historical:
+                    parents = historical_parents.setdefault(key, [])
+                    if parent not in parents:
+                        parents.append(parent)
+                else:
+                    if not reread and key in seen_notes and seen_notes[key] != parent:
+                        raise ValueError('ambiguous exposed parent versions')
+                    seen_notes[key] = parent
             def record(item, *, source_snapshot_id=None):
                 reference = item['ref']
                 if source_snapshot_id is not None:
@@ -465,7 +474,7 @@ class NoteWriter:
                 exposures.append({'kind': 'record', 'request_id': output['request_id'], 'ref': item['ref'],
                                   'sha256': resolved['sha256'], 'author_id': str(resolved['record'].get('user_id')),
                                   'window': resolved['source_alias']})
-            def material(item, *, reread=False, source_snapshot_id=None):
+            def material(item, *, historical=False, reread=False, source_snapshot_id=None):
                 if item['kind'] not in {'note', 'selector_inference', 'note_baseline'}:
                     raise ValueError('unsupported exposed material kind')
                 if (item['snapshot_id'] != (source_snapshot_id or original['snapshot_id'])
@@ -484,9 +493,7 @@ class NoteWriter:
                             or baseline['cursor'] > original['cursor'] or baseline['key'] not in original['allowed_keys']):
                         raise ValueError('unverified/foreign baseline read')
                     parent = {k: baseline[k] for k in ('version_id', 'sha256')}
-                    if not reread and baseline['key'] in seen_notes and seen_notes[baseline['key']] != parent:
-                        raise ValueError('ambiguous exposed parent versions')
-                    seen_notes[baseline['key']] = parent
+                    parent_read(baseline['key'], parent, historical=historical, reread=reread)
                     return  # Mechanical read receipt is not a factual statement source.
                 if item['kind'] == 'note':
                     key = _key(aliases.get(item['source_id'], item['source_id']))
@@ -501,9 +508,7 @@ class NoteWriter:
                         raise ValueError('illegal exposed note scope/version/cutoff')
                     value['note_key'] = key
                     parent = {'version_id': meta['version_id'], 'sha256': _hash(raw)}
-                    if not reread and key in seen_notes and seen_notes[key] != parent:
-                        raise ValueError('ambiguous exposed parent versions')
-                    seen_notes[key] = parent
+                    parent_read(key, parent, historical=historical, reread=reread)
                 exposures.append(value)
             for item in context['screen']['records'] + context['selected']['references']:
                 record(item)
@@ -542,7 +547,8 @@ class NoteWriter:
                         if isinstance(content, dict) and 'ref' in content:
                             record(content, source_snapshot_id=generated['snapshot_id'])
                         if isinstance(content, dict) and set(content) == {'note_material'}:
-                            material(content['note_material'], source_snapshot_id=generated['snapshot_id'])
+                            material(content['note_material'], historical=True,
+                                     source_snapshot_id=generated['snapshot_id'])
             # Verify native result pairs against the existing T10 action journal.
             calls = {}
             generator_chat = output.get('chat_id')
@@ -592,6 +598,15 @@ class NoteWriter:
                     material(value['note_material'], reread=True)
                 else:
                     raise ValueError('unsupported same-wake wire message')
+            # WHY: a current selected B and an old action read A can coexist in
+            # the wire. Both are sources, but old A must not compete with this
+            # Chat's explicit parent. Keep the historical-only capability when
+            # every verified old read agrees; commit still checks version/hash.
+            for key, parents in historical_parents.items():
+                if key not in seen_notes:
+                    if len(parents) != 1:
+                        raise ValueError('ambiguous exposed parent versions')
+                    seen_notes[key] = parents[0]
             exposures.append({'kind': 'generated', 'output_id': through_output, 'assistant': output['assistant']})
             for action, status in prefix['actions'].items():
                 if action.rsplit('#', 1)[0] == through_output:
