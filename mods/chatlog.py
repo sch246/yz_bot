@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import errno
+import hashlib
 import json
 import logging
 import mmap
@@ -9,10 +11,13 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import threading
 import time
-from contextlib import closing
+from contextlib import closing, contextmanager
+from datetime import date, datetime, timezone as datetime_timezone
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from mods import INFRA
 from mods import _backfill_archive, cq, history, identity
@@ -578,9 +583,20 @@ def format_message(event: dict[str, Any], name: str, title: str = "") -> str:
     return f"{head} {stamp} | {event.get('message_id', '')}\n{_addtab(str(event.get('message', '')).rstrip())}\n"
 
 
-def _epoch(day: tuple[int, int, int], match: re.Match) -> int:
-    """Local time, as everywhere else here; the device is not expected to move."""
+def _epoch(day: tuple[int, int, int], match: re.Match, timezone: str | None = None) -> int:
+    """Legacy process-local time, or an explicit zone with one unambiguous instant."""
     year, month, number = day
+    if timezone is not None:
+        wall = datetime(year, month, number, int(match["hour"]), int(match["minute"]), int(match["second"]))
+        zone = ZoneInfo(timezone)
+        candidates = set()
+        for fold in (0, 1):
+            aware = wall.replace(tzinfo=zone, fold=fold)
+            if aware.astimezone(datetime_timezone.utc).astimezone(zone).replace(tzinfo=None) == wall:
+                candidates.add(int(aware.timestamp()))
+        if len(candidates) != 1:
+            raise ValueError("档案时间在声明时区中不存在或有歧义")
+        return candidates.pop()
     return int(time.mktime((year, month, number, int(match["hour"]), int(match["minute"]), int(match["second"]), 0, 0, -1)))
 
 
@@ -627,6 +643,7 @@ def _guess_private_sender(
     target: int,
     bot_names: dict[str, int],
     names_complete: bool,
+    private_lookup: bool = True,
 ) -> int | None:
     """Which of a private window's two participants wrote a v0 line, or nobody.
 
@@ -650,6 +667,8 @@ def _guess_private_sender(
         return owner
     if names_complete:
         return target
+    if not private_lookup:
+        return None
     try:
         if name == identity.get_user_name(target):
             return target
@@ -668,6 +687,8 @@ def _message_record(
     version: str,
     bot_names: dict[str, int] | None = None,
     names_complete: bool = False,
+    private_lookup: bool = True,
+    timezone: str | None = None,
 ) -> dict[str, Any]:
     derived = ["message_type", "time"]
     missing: list[str] = []
@@ -676,7 +697,7 @@ def _message_record(
     record: dict[str, Any] = {
         "_source": rootfile,
         "_version": version,
-        "time": _epoch(day, head["stamp"]),
+        "time": _epoch(day, head["stamp"], timezone),
         "message_type": kind,
         "message": body,
     }
@@ -692,7 +713,7 @@ def _message_record(
         derived.append("target_id")
     if sender_id is None:
         # v0 私聊行只有名字、没有号码，作者只能按 bot_names 猜（见 _guess_private_sender）。
-        author = _guess_private_sender(head["name"], kind, target, bot_names or {}, names_complete)
+        author = _guess_private_sender(head["name"], kind, target, bot_names or {}, names_complete, private_lookup)
         if author is None:
             missing.append("sender")
             missing.append("user_id")
@@ -784,6 +805,8 @@ def parse_log(
     bot_names: dict[str, int] | None = None,
     names_complete: bool = False,
     origin_path: str | None = None,
+    private_lookup: bool = True,
+    timezone: str | None = None,
 ) -> list[dict[str, Any]]:
     """Read one day's log back into records, marking what is fact and what is not.
 
@@ -802,6 +825,8 @@ def parse_log(
     Notices stay the prose ``write`` produced.  Reversing a localized sentence
     back into ``notice_type``/``sub_type``/``duration`` would break silently on
     the next wording change, so they are timestamped opaque text by definition.
+    ``private_lookup=False`` disables the legacy current-name lookup; an explicit
+    IANA ``timezone`` replaces the legacy process-local time conversion.
     """
     bot_ids = set((bot_names or {}).values()) | ({bot_id} if bot_id is not None else set())
     records: list[dict[str, Any]] = []
@@ -823,7 +848,7 @@ def parse_log(
                 "text": line[2:].rstrip() if line.startswith(": ") else line,
             }
             if stamp is not None:
-                record["time"] = _epoch(day, stamp)
+                record["time"] = _epoch(day, stamp, timezone)
                 record["text"] = line[2: stamp.start()].rstrip() if line.startswith(": ") else line
             if kind == "group":
                 record["group_id"] = target
@@ -858,11 +883,245 @@ def parse_log(
             _version_of(head, kind, version),
             bot_names,
             names_complete,
+            private_lookup,
+            timezone,
         )
         if origin_path is not None:
             record["_log_origin"] = f"{origin_path}:{head_line}"
         records.append(record)
     return records
+
+
+# --- strict, explicit archive fragments -------------------------------------
+
+_FRAGMENT_SCHEMA = "archive-fragment-v1"
+_FRAGMENT_FIELDS = {"schema", "source_namespace", "kind", "target", "day", "source_format",
+                    "origin", "byte_start", "byte_end", "sha256"}
+
+
+def _archive_coordinates(kind, target, day, source_format) -> tuple[int, date, Path]:
+    if kind not in ("group", "private"):
+        raise ValueError("严格档案读取只支持 group/private")
+    if (isinstance(target, bool) or not isinstance(target, (int, str))
+            or re.fullmatch(r"[1-9][0-9]*", str(target)) is None):
+        raise ValueError("档案窗口必须是规范正整数")
+    try:
+        if isinstance(day, str) and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", day):
+            calendar = date.fromisoformat(day)
+        elif (isinstance(day, tuple) and len(day) == 3
+              and all(type(part) is int for part in day)):
+            calendar = date(*day)
+        else:
+            raise ValueError("档案日期必须是 ISO 日期或 (年,月,日)")
+    except (TypeError, ValueError) as error:
+        raise ValueError("档案日期无效") from error
+    if source_format not in (V0, V1, "backfill-jsonl-v1"):
+        raise ValueError("档案格式必须明确声明为 v0/v1/backfill-jsonl-v1；不支持 mixed")
+    suffix = ".backfill.jsonl" if source_format == "backfill-jsonl-v1" else ".log"
+    relative = Path(kind) / str(target) / f"{calendar.year:04d}-{calendar.month:02d}" / f"{calendar.day:02d}{suffix}"
+    return int(target), calendar, relative
+
+
+@contextmanager
+def _open_archive_bytes(root, relative: Path):
+    """Open only regular files beneath the explicitly chosen root, without symlink races."""
+    if root is None or not isinstance(root, (str, os.PathLike)) or not os.fspath(root):
+        raise ValueError("严格档案读取需要显式 root")
+    descriptor = os.open(Path(root).resolve(), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in relative.parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        child = os.open(relative.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptor)
+        with os.fdopen(child, "rb") as file:
+            if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+                raise ValueError("档案来源不是普通文件")
+            yield file
+    except OSError as error:
+        if error.errno in (errno.ENOTDIR, errno.ELOOP):
+            raise ValueError("档案路径含非目录或 symlink") from error
+        raise
+    finally:
+        os.close(descriptor)
+
+
+def _fragment_key(ref: dict) -> str:
+    return hashlib.sha256(json.dumps({field: ref[field] for field in sorted(_FRAGMENT_FIELDS)},
+                                     ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _strict_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("sidecar JSON 含重复字段")
+        result[key] = value
+    return result
+
+
+def _strict_json_constant(_value):
+    raise ValueError("sidecar JSON 含非有限数值")
+
+
+def freeze_archive_day(
+    *, root, kind, target, day, source_format, bot_id, bot_names, names_complete,
+    timezone, source_namespace,
+) -> list[dict[str, Any]]:
+    """Freeze every original in one explicitly declared day file, using only rb.
+
+    ``day`` is ISO YYYY-MM-DD or (year, month, day); ``timezone`` is an IANA name.
+    Formats v0/v1 select DD.log, backfill-jsonl-v1 selects DD.backfill.jsonl.
+    The caller must establish one ordinary version for the whole file; unknown
+    or mixed days are unsupported. Identical group heads cannot validate that
+    declaration. No merge or deduplication occurs. ``raw`` is bytes, ``ref`` is JSON-safe, and ``record``
+    retains the existing parser's fidelity marks. Missing files return [].
+
+    Incomplete records, orphan bodies, undecodable data and ambiguous v0 private
+    names ending in (digits) fail without repair. The root and identity inputs
+    are never obtained from runtime storage. ValueError means invalid declaration,
+    source or reference; other filesystem failures retain their OSError type.
+    """
+    target, calendar, relative = _archive_coordinates(kind, target, day, source_format)
+    if root is None or not isinstance(root, (str, os.PathLike)) or not os.fspath(root):
+        raise ValueError("严格档案读取需要显式 root")
+    if not isinstance(source_namespace, str) or not source_namespace.strip() or "\0" in source_namespace:
+        raise ValueError("需要显式稳定的 source_namespace")
+    if bot_id is not None and (type(bot_id) is not int or bot_id <= 0):
+        raise ValueError("bot_id 必须是正整数或显式 None")
+    if (not isinstance(bot_names, dict) or any(not isinstance(name, str) or type(value) is not int or value <= 0
+                                              for name, value in bot_names.items())
+            or type(names_complete) is not bool):
+        raise ValueError("需要显式 bot_names 映射与 names_complete 布尔声明")
+    bot_names = dict(bot_names)
+    try:
+        if not isinstance(timezone, str) or not timezone:
+            raise ValueError("需要显式有效 IANA timezone")
+        zone = ZoneInfo(timezone)
+    except (ZoneInfoNotFoundError, ValueError) as error:
+        raise ValueError("需要显式有效 IANA timezone") from error
+    # WHY: Existing readers own index writes and crash-tail repair. This seam
+    # must preserve the bytes that a request actually saw, including duplicates.
+    with _window_lock(Path(root) / kind / str(target)), _append_lock, _backfill_archive._lock:
+        try:
+            with _open_archive_bytes(root, relative) as file:
+                size = os.fstat(file.fileno()).st_size
+                content = file.read(size)
+                if len(content) != size:
+                    raise ValueError("档案在冻结期间缩短")
+        except FileNotFoundError:
+            return []
+    if not content:
+        return []
+    if not content.endswith(b"\n"):
+        raise ValueError("档案含不完整尾部，严格读取不修复")
+    try:
+        text = content.decode("utf-8").replace("\r\n", "\n")
+    except UnicodeDecodeError as error:
+        raise ValueError("档案不是有效 UTF8") from error
+    if "\r" in text:
+        raise ValueError("档案含不明确的 CR 换行")
+    raw_lines = content.split(b"\n")[:-1]
+    lines = text.split("\n")[:-1]
+    offsets = [0]
+    for raw_line in raw_lines:
+        offsets.append(offsets[-1] + len(raw_line) + 1)
+    if source_format == "backfill-jsonl-v1":
+        starts = list(range(len(lines)))
+    else:
+        starts = [index for index, line in enumerate(lines) if line and not line.startswith("    ")]
+        if not starts or starts[0] != 0:
+            raise ValueError("档案开头含无归属正文或空行")
+    result = []
+    for start, end in zip(starts, starts[1:] + [len(lines)]):
+        raw = content[offsets[start]:offsets[end]]
+        origin = f"{relative.as_posix()}:{start + 1}"
+        if source_format == "backfill-jsonl-v1":
+            message = json.loads(raw.decode("utf-8"), object_pairs_hook=_strict_json_object,
+                                 parse_constant=_strict_json_constant)
+            _backfill_archive._validate(message)
+            _backfill_archive._validate_window(message, kind, target)
+            if ((kind == "private" and message.get("group_id") is not None)
+                    or message.get("post_type", "message") not in ("message", "message_sent")):
+                raise ValueError("sidecar 窗口或事件类型冲突")
+            try:
+                message_day = datetime.fromtimestamp(int(message["time"]), zone).date()
+            except (OverflowError, OSError) as error:
+                raise ValueError("sidecar 时间超出可解析范围") from error
+            if message_day != calendar:
+                raise ValueError("sidecar 时间与声明日期/时区不一致")
+            if ("user_id" in message
+                    and str(message["user_id"]) != str(message["sender"]["user_id"])):
+                raise ValueError("sidecar 作者字段冲突")
+            record = _backfill_archive._project(message, relative, start + 1, relative.parts, Path("."))
+            if isinstance(record.get("raw_message"), str):
+                record["message"] = record["raw_message"]
+                record["_derived"].append("message")
+            bot_ids = set(bot_names.values()) | ({bot_id} if bot_id is not None else set())
+            if "post_type" not in record and bot_ids:
+                record["post_type"] = "message_sent" if int(record["user_id"]) in bot_ids else "message"
+                record["_derived"].append("post_type")
+                record["_missing"].remove("post_type")
+        else:
+            head = lines[start]
+            if head.startswith(": "):
+                if end != start + 1 or _TIME_SUFFIX.search(head) is None:
+                    raise ValueError("通知边界或时间不完整")
+            else:
+                parsed_head = _split_head(head)
+                if parsed_head is None or end == start + 1:
+                    raise ValueError("消息头或正文边界不完整")
+                sender_id = parsed_head["sender_id"]
+                person_head = head[:parsed_head["stamp"].start()].rstrip()
+                sender_suffix = _SENDER_SUFFIX.search(person_head)
+                if kind == "group" and (sender_suffix is None
+                                        or _TITLED.fullmatch(person_head[:sender_suffix.start()]) is None):
+                    raise ValueError("群消息头缺少发送者或头衔边界")
+                if kind == "private" and ((source_format == V1 and sender_id is None)
+                                          or (source_format == V0 and sender_id is not None)):
+                    raise ValueError("私聊头与声明格式不符，或 v0 名字末尾有歧义")
+            records = parse_log("\n".join(lines[start:end]) + "\n", kind=kind, target=target,
+                                day=(calendar.year, calendar.month, calendar.day), bot_id=bot_id,
+                                version=source_format, bot_names=bot_names, names_complete=names_complete,
+                                private_lookup=False, timezone=timezone)
+            if len(records) != 1 or "time" not in records[0]:
+                raise ValueError("档案片段不能唯一解析")
+            record = records[0]
+        record["_log_origin"] = origin
+        ref = {"schema": _FRAGMENT_SCHEMA, "source_namespace": source_namespace, "kind": kind,
+               "target": target, "day": calendar.isoformat(), "source_format": source_format,
+               "origin": origin, "byte_start": offsets[start], "byte_end": offsets[end],
+               "sha256": hashlib.sha256(raw).hexdigest()}
+        ref["key"] = _fragment_key(ref)
+        result.append({"ref": ref, "raw": raw, "record": record})
+    return result
+
+
+def read_archive_bytes(ref, *, root) -> bytes:
+    """Read only the frozen range, rejecting changed/shortened bytes; appends are harmless."""
+    if not isinstance(ref, dict) or set(ref) != _FRAGMENT_FIELDS | {"key"}:
+        raise ValueError("档案引用字段无效")
+    if (ref["schema"] != _FRAGMENT_SCHEMA or not isinstance(ref["source_namespace"], str)
+            or not ref["source_namespace"].strip() or "\0" in ref["source_namespace"]
+            or type(ref["target"]) is not int or not isinstance(ref["day"], str)):
+        raise ValueError("档案引用声明无效")
+    _, _, relative = _archive_coordinates(ref["kind"], ref["target"], ref["day"], ref["source_format"])
+    origin = ref["origin"]
+    prefix, separator, line = origin.rpartition(":") if isinstance(origin, str) else ("", "", "")
+    if (not separator or prefix != relative.as_posix() or re.fullmatch(r"[1-9][0-9]*", line) is None
+            or any(type(ref[field]) is not int for field in ("byte_start", "byte_end"))
+            or not 0 <= ref["byte_start"] < ref["byte_end"]
+            or not isinstance(ref["sha256"], str) or re.fullmatch(r"[0-9a-f]{64}", ref["sha256"]) is None
+            or ref["key"] != _fragment_key(ref)):
+        raise ValueError("档案引用定位或 hash 无效")
+    with _open_archive_bytes(root, relative) as file:
+        if ref["byte_end"] > os.fstat(file.fileno()).st_size:
+            raise ValueError("冻结档案片段已缩短")
+        file.seek(ref["byte_start"])
+        raw = file.read(ref["byte_end"] - ref["byte_start"])
+    if len(raw) != ref["byte_end"] - ref["byte_start"] or hashlib.sha256(raw).hexdigest() != ref["sha256"]:
+        raise ValueError("冻结档案片段已改变或缩短")
+    return raw
 
 
 # --- range reading ----------------------------------------------------------
