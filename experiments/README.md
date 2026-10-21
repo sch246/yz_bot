@@ -967,3 +967,89 @@ cover normal stop/tools, original parser exceptions, missing usage, cancellation
 evidence faults, reflection in finish reasons/indices/exception types/memory
 numbers, missing measurements and the closed synthetic client. They do not
 establish the missing finish reason of an earlier run or explain its memory peak.
+
+## Isolated two-window host
+
+[`stateless_host.py`](stateless_host.py) adds `SyntheticHost` around the existing
+`drive_wake` and the caller's original bounded client. This is a single-process
+synthetic interface, with exactly two group windows from one `freeze_sources`
+material pool. It creates no client, Ledger, worker thread, real input importer,
+QQ route or automatic recovery. Use a fresh external root shared with that
+client and a fake endpoint; production configuration and archives are outside
+this interface.
+
+```python
+host = SyntheticHost(root, frozen_sources, client, fake_endpoint)
+epoch = host.submit(event_keys, activate=activation_event_keys)
+if epoch is not None:
+    outcome = host.run(epoch)
+```
+
+`submit` commits ordinary arrivals and explicit activations before attempting a
+claim. Ordinary arrivals alone return `None`. An activation may refer to an
+already arrived ordinary record; each activation receives a new identity.
+Concurrent callers receive at most one new epoch. `run(epoch)` accepts that
+nonreusable epoch once, so duplicate or delayed callers cannot start a second
+Chat or finalize a later owner. Normal completion checks pending and releases
+under the same boundary as arrival/claim. Pending for another window continues
+with a fresh Chat in the same healthy client and allowance; each Chat uses the
+original Ledger wake limit. Source opening uses committed arrival order and
+legal snapshots from the same frozen pool. All arrived records in the selected
+window fit this finite host's screen, including late older timestamps. Future
+bytes and uncommitted activations stay outside requests.
+
+The one `commits/` chain stores host binding, arrivals, activations, claim/run,
+frozen work, associations, cancel hits, dispositions, release and ending facts.
+`recover_commits(root)` validates and projects those facts alongside the original
+output/dispatch/result/wake-end records. `host.pending()` derives activations
+minus first-output acknowledgements and explicit dispositions. It is a detached
+read, not another writable queue. The same per-root process lock covers old
+driver reads/appends, output numbering, terminal cutoff and host transactions;
+it is released during model generation and endpoint calls. There is no
+multiprocess lock or crash/restart restoration claim. Existing journals cannot
+be reopened as a new host.
+
+`drive_wake(..., host=bound_owner)` adds only the named
+`say(text, final_call=True, target=...)` tool. `target` must explicitly equal one
+of the frozen `g<number>` targets. Assistant prose stays private self-talk.
+The fake endpoint is called as `endpoint(target, text, ending=False)` and returns
+`{"status": "confirmed", "message_id": ...}`, `{"status": "failed", ...}` or
+`{"status": "unknown", ...}`. A missing ID or timeout is unknown. Receipts retain
+the endpoint evidence separately from the tool's original arguments. Unknown
+transport is never automatically retried. Successful say sets the original
+Chat's `turn_done` only after its action result is committed; the rest of that
+batch still executes. A complete terminal after final say references its exact
+last-batch action and validates original arguments, explicit target, successful
+ID and every batch result. Missing/unknown results, wrong actions/targets and
+cancelled epochs cannot establish this completion. The old no-tool final-output
+branch remains available, and omitting `host` preserves the existing tools.
+
+`host.cancel(epoch, target=...)` records a hit only on that live epoch and,
+when a target is supplied, only through an associated window. Association comes
+from the claim origin, actual frozen screens/reads and send attempts; it is not
+successful-send statistics. Cooperative cancellation uses the original Chat
+checkpoints, closes the original session and disposes only frozen work still
+unacknowledged. Later activations remain visible as pending. Exceptions likewise
+close that client; neither path starts a replacement or reopens its Ledger.
+A fake effect followed by result persistence failure remains unknown in action
+recovery and closes the session without replay.
+
+Each owner that exits attempts one ending notification to its fixed claim origin,
+independent of its last say target. The notification reports that epoch's actual
+request IDs/settled usage, actual confirmed endpoint effects, committed say
+results/destinations and
+`request_screen_record_exposures` (record appearances in actual request screens,
+including repeated appearances across requests). These are separate quantities;
+none is the production formal-stream `event_count`. The fake endpoint's observed
+effects can be checked against committed say receipts; successful transport with
+an uncommitted result remains a visible discrepancy. Ending failures are saved
+separately when persistence permits, do not replace an original failure and
+never replay tools or model requests. If journal persistence is unknown, the
+original client stays closed and only this owner-exit fake notification may
+still be attempted once in this process. Its committed-result statistics are
+labelled unavailable; no broken commit is repaired or rewritten. A process exit
+loses that fallback attempt guard, so this is not restart-safe delivery. Optional `after_output`, `after_result`,
+`before_finish` and `after_release` callbacks are narrow deterministic experiment
+seams, not a general tool or scheduler registry. Production waiter/watchdog,
+hint expressions, closing hints, note lineage and real archive input remain
+outside this slice.

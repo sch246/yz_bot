@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
+from functools import wraps
+import threading
 import json
 from pathlib import Path
 import sys
@@ -18,6 +20,54 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from a0_ledger import canonical, digest, durable
 from comparison_snapshot import resolve_ref
 from mods import llm
+
+
+# WHY: both the old driver and host share this sequence. A host-only lock
+# leaves output numbering, terminal cutoffs and read-only recovery racy.
+_commit_locks = {}
+_commit_locks_guard = threading.Lock()
+
+
+def commit_boundary(root):
+    """Single-process boundary only; no restart or multiprocess recovery claim."""
+    key = str(Path(root).resolve())
+    with _commit_locks_guard:
+        return _commit_locks.setdefault(key, threading.RLock())
+
+
+def serialized(function):
+    @wraps(function)
+    def call(root, *args, **kwargs):
+        with commit_boundary(root):
+            return function(root, *args, **kwargs)
+    return call
+
+
+def final_call_evidence(action, owned, results, targets):
+    """Validate original last-batch arguments/results, never a done boolean."""
+    if not owned or not isinstance(action, str):
+        return False
+    last = owned[-1]
+    calls = last['assistant'].get('tool_calls', [])
+    batch = [last['id'] + '#' + str(i) for i in range(1, len(calls) + 1)]
+    if (action not in batch or not last.get('chat_id')
+            or any(key not in results or results[key].get('status') not in {'completed', 'failed'} for key in batch)):
+        return False
+    call = calls[batch.index(action)]['function']
+    try:
+        args = json.loads(call['arguments'])
+        receipt = json.loads(results[action]['content'])['say']
+        return (call['name'] == 'say' and set(args) <= {'text', 'target', 'final_call'}
+                and isinstance(args['text'], str) and args['target'] in targets
+                and args.get('final_call', True) is True
+                and results[action]['status'] == 'completed'
+                and all(receipt[key] == expected for key, expected in
+                        {'target': args['target'], 'text': args['text'], 'final_call': True, 'status': 'confirmed'}.items())
+                and type(receipt['message_id']) in (str, int) and bool(receipt['message_id'])
+                and receipt['endpoint_receipt']['status'] == 'confirmed'
+                and receipt['endpoint_receipt']['message_id'] == receipt['message_id'])
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def build_screen(snapshot, wake, *, count=2):
@@ -89,6 +139,7 @@ def selected_context(snapshot, references, actions, committed_state, materials=(
     return {'references': material, 'committed_actions': facts, 'materials': material_values(snapshot, materials)}
 
 
+@serialized
 def recover_commits(root):
     """Read and validate only. Never constructs a client or invokes any tool.
 
@@ -113,13 +164,20 @@ def _recover_rows(envelopes):
     current_wake, current_snapshot, cursor = None, None, 0
     boundaries, acknowledged, outputs, dispatched, results, records = {}, [], {}, set(), {}, []
     terminals, chat_bindings, request_ids = {}, {}, set()
+    host = None
     for number, envelope in enumerate(envelopes, 1):
         row = envelope['record']
         if (set(envelope) != {'record', 'sha256'} or envelope['sha256'] != digest(row)
                 or row['sequence'] != number or row['previous'] != previous or row['schema'] != 1):
             raise ValueError('corrupt commit/checksum/parent')
         kind, value = row['kind'], row['value']
-        if kind == 'output':
+        if kind.startswith('host-'):
+            from stateless_host import project_record
+            host = project_record(host, kind, value, acknowledged, terminals)
+        elif kind == 'output':
+            if host is not None:
+                from stateless_host import validate_output
+                validate_output(host, value)
             if 'reasoning_content' in value['assistant']:
                 raise ValueError('cross-wake thinking is not an action fact')
             if value['wake_id'] in terminals:
@@ -194,6 +252,9 @@ def _recover_rows(envelopes):
                     raise ValueError('result without unique dispatch')
                 results[action] = value
         elif kind == 'wake-end':
+            if host is not None:
+                from stateless_host import validate_terminal
+                validate_terminal(host, value)
             wake = value['wake_id']
             owned = [item for item in outputs.values() if item['wake_id'] == wake]
             if (wake in terminals or value['generation'] != generation or value['cutoff_head'] != previous
@@ -201,8 +262,12 @@ def _recover_rows(envelopes):
                     or not {item['request_id'] for item in owned} <= set(value['request_ids'])
                     or len(value['request_ids']) != len(set(value['request_ids']))):
                 raise ValueError('terminal wake/cutoff drift')
-            if value['status'] == 'complete' and (not owned or owned[-1]['assistant'].get('tool_calls')):
-                raise ValueError('complete wake lacks final output')
+            if value['status'] == 'complete':
+                if value.get('final_action') is not None:
+                    if not final_call_evidence(value['final_action'], owned, results, host['targets'].values() if host else ()):
+                        raise ValueError('complete wake lacks final-call evidence')
+                elif not owned or owned[-1]['assistant'].get('tool_calls'):
+                    raise ValueError('complete wake lacks final output')
             terminals[wake] = value
         else:
             raise ValueError('unknown commit kind')
@@ -216,11 +281,13 @@ def _recover_rows(envelopes):
                                'unknown' if action in dispatched else 'not-dispatched')
     return {'schema': 1, 'generation': generation, 'head': previous, 'records': records,
             'boundaries': boundaries, 'acknowledged': acknowledged, 'actions': actions,
-            'results': results, 'outputs': outputs, 'terminals': terminals, 'automatic_requests': 0, 'automatic_tools': 0}
+            'results': results, 'outputs': outputs, 'terminals': terminals, 'host': host, 'automatic_requests': 0, 'automatic_tools': 0}
 
 
+@serialized
 def append_commit(root, kind, value, *, fault=None):
     """One durable record; output includes screen and wake acknowledgement."""
+    root = Path(root)
     state = recover_commits(root)
     row = {'schema': 1, 'sequence': len(state['records']) + 1, 'previous': state['head'],
            'kind': kind, 'value': value}
@@ -304,7 +371,7 @@ def note_source_handles(cutoff):
 
 
 def drive_wake(snapshot, wake, wakes, root, client, *, references=(), actions=(), materials=(), scenario='normal',
-               notes=None, note_keys=(), note_aliases=None, process='main', after_output=None, cancelled=lambda: False, simulation=None):
+               notes=None, note_keys=(), note_aliases=None, process='main', after_output=None, cancelled=lambda: False, simulation=None, host=None):
     """A fresh main/background Chat, optionally interleaved before terminal.
 
     after_output is an explicit caller seam for a second independent Chat;
@@ -320,7 +387,7 @@ def drive_wake(snapshot, wake, wakes, root, client, *, references=(), actions=()
         materials = tuple(deepcopy(item) for item in materials)
         note_keys = tuple(note_keys)
         note_aliases = deepcopy(note_aliases) if note_aliases is not None else None
-        screen = build_screen(snapshot, wake)
+        screen = build_screen(snapshot, wake, count=host.screen_count if host else 2)
         state = recover_commits(root)
         if wake['id'] in state['terminals']:
             raise ValueError('wake already terminal')
@@ -356,6 +423,9 @@ def drive_wake(snapshot, wake, wakes, root, client, *, references=(), actions=()
                         'They do not establish the current environment state. No read_note or revise_note tool is available. '
                         'Use available tools for current observations or actions; observing, acting, revisiting, silence and ending '
                         'remain your choices.')
+    if host is not None:
+        instruction += (' Assistant prose is private self-talk. Only say sends text; target must explicitly name one of '
+                        + ', '.join(host.targets) + '. final_call ends normally only after a confirmed message ID.')
     messages = [{'role': 'system', 'content': instruction},
                 {'role': 'user', 'content': canonical({'wake': {k: wake[k] for k in ('id', 'reason', 'window')},
                     'screen': screen, 'selected': material}).decode()}]
@@ -384,7 +454,8 @@ def drive_wake(snapshot, wake, wakes, root, client, *, references=(), actions=()
                       or any(notes.root.rglob('*.new'))):
             raise RuntimeError('note persistence unknown; session closed')
 
-    def persist_output(assistant, calls):
+    @serialized
+    def persist_output_locked(_root, assistant, calls):
         guard()
         current = recover_commits(root)
         first = not any(v['wake_id'] == wake['id'] for v in current['outputs'].values())
@@ -397,11 +468,17 @@ def drive_wake(snapshot, wake, wakes, root, client, *, references=(), actions=()
                  'acknowledged': covered if first else [],
                  'wake_facts': [dict(item) for item in wakes if item['id'] in covered] if first else [],
                  'assistant': {k: deepcopy(v) for k, v in assistant.items() if k != 'reasoning_content'}}
+        if host is not None:
+            value['host_epoch'] = host.epoch
         fault = {'output-failure': 'before', 'output-flush': 'flush', 'output-fsync': 'fsync',
                  'output-after-rename': 'after-rename'}.get(scenario) if first else None
         append_commit(root, 'output', value, fault=fault)
         client.trace.append({'event': 'output-commit', 'output': output, 'request_id': value['request_id'], 'process': process})
         output_ids.append(output)
+        return output
+
+    def persist_output(assistant, calls):
+        output = persist_output_locked(root, assistant, calls)
         if scenario in {'stop-before-tool', 'cancel-before-tool'}:
             stopped[0] = True
             close_session(client, 'cancelled')
@@ -428,12 +505,25 @@ def drive_wake(snapshot, wake, wakes, root, client, *, references=(), actions=()
         if scenario == 'cancel-after-tool':
             stopped[0] = True
             close_session(client, 'cancelled')
+        if host is not None:
+            host.after_result(action)
+        return content
+
+    def say(text: str, final_call: bool = True, target: str = '') -> str:
+        """Send to an explicit synthetic target; only a confirmed ID may end this Chat."""
+        content = execute(lambda action: host.say(action, text, final_call, target))
+        receipt = json.loads(content)['say']
+        if receipt['status'] == 'confirmed' and final_call:
+            chat.turn_done = lambda: True
+            final_actions.append(chat.active_action)
         return content
 
     def read_reference(snapshot_id: str, source_alias: str, event_key: str) -> str:
         """Read one complete original record from this wake's frozen snapshot."""
         def read(_):
             result = resolve_ref(snapshot, {'snapshot_id': snapshot_id, 'source_alias': source_alias, 'event_key': event_key})
+            if host is not None:
+                host.associate(source_alias)
             return canonical({'ref': {'snapshot_id': snapshot_id, 'source_alias': source_alias, 'event_key': event_key},
                               'origin': result['visible_origin'], 'sha256': result['sha256'],
                               'raw': result['raw'].decode()}).decode(), 'completed'
@@ -505,7 +595,8 @@ def drive_wake(snapshot, wake, wakes, root, client, *, references=(), actions=()
         return execute(lambda action: simulation.act(action, 'request_revisit', {
             'delay_ticks': delay_ticks, 'reason': reason}))
 
-    functions = [read_reference] + ([read_note, revise_note] if notes else [])
+    final_actions = []
+    functions = [read_reference] + ([say] if host is not None else []) + ([read_note, revise_note] if notes else [])
     if simulation is not None:
         functions += [observe_workspace, move_object, write_card, request_revisit]
     try:
@@ -536,15 +627,19 @@ def drive_wake(snapshot, wake, wakes, root, client, *, references=(), actions=()
     finally:
         client.current = previous_current
     return {'wake': wake['id'], 'process': process, 'screen': screen, 'outputs': output_ids,
-            'tools': tool_count[0], 'cancelled': stopped[0]}
+            'tools': tool_count[0], 'cancelled': stopped[0],
+            'final_action': final_actions[-1] if final_actions else None}
 
 
-def finish_wake(root, wake_id, status, request_ids, *, reason=None, client=None, fault=None):
+@serialized
+def finish_wake(root, wake_id, status, request_ids, *, reason=None, client=None, fault=None, final_action=None):
     """Commit the round cutoff separately from first-output wake confirmation."""
     try:
         state = recover_commits(root)
         value = {'wake_id': wake_id, 'generation': state['generation'], 'status': status,
                  'request_ids': list(request_ids), 'cutoff_head': state['head'], 'reason': reason}
+        if final_action is not None:
+            value['final_action'] = final_action
         append_commit(root, 'wake-end', value, fault=fault)
     except BaseException:
         if client is not None:
