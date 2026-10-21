@@ -79,7 +79,8 @@ def fixture_response(client, body, *, case):
                 'reason': 'fixture reading of actual move result', 'expectation': 'later exact input can revisit it',
                 'sources': ['tool:' + previous], 'claim': 'success'}, 1),
                      call('read_note', {'key': 'global/main'}, 2),
-                     call('request_revisit', {'delay_ticks': 2, 'reason': 'fixture optional revisit'}, 3)]
+                     call('request_revisit', {'delay_ticks': 1 if case == 'active' else 2,
+                                             'reason': 'fixture optional revisit'}, 3)]
     else:
         if round_number == 1:
             calls = [call('observe_workspace', {}, 1)]
@@ -173,6 +174,28 @@ def doctor(root, cases=CASES):
                     assert [v['source'] for v in state['deliveries']] == ['bootstrap', 'harness-clock', 'model-revisit']
                     requested = state['deliveries'][2]['request_action']
                     assert journal['results'][requested]['status'] == 'completed' and requested in state['revisits']
+                    if case == 'active':
+                        assert [v['tick'] for v in state['deliveries']] == [0, 1, 1]
+                    observations = []
+                    for action, receipt in state['effects'].items():
+                        if receipt['operation'] != 'observe_workspace': continue
+                        observed = json.loads(receipt['content'])['world_result']
+                        wake_id = action.split('/')[0]
+                        delivery = next(v for v in state['deliveries'] if v['wake_id'] == wake_id)
+                        assert observed['delivery'] == delivery
+                        expected = [] if wake_id == 'subject-1' else [
+                            {'action': requested, **state['revisits'][requested],
+                             'status': 'pending' if wake_id == 'subject-2' else 'delivered'}]
+                        assert observed['revisits'] == expected
+                        assert set(observed) == {'tick', 'objects', 'cards', 'last_clock', 'delivery', 'revisits', 'permission'}
+                        identity, position = action.rsplit('#', 1)
+                        call_id = journal['outputs'][identity]['assistant']['tool_calls'][int(position) - 1]['id']
+                        assert any(message.get('role') == 'tool' and message.get('tool_call_id') == call_id
+                                   and message['content'] == receipt['content']
+                                   for request in wire if request['attribution']['task_id'] == wake_id
+                                   for message in request['envelope']['body']['messages'])
+                        observations.append(observed)
+                    assert len(observations) == 3
                     assert state['objects']['circle'] == 'table'
                     assert state['cards']['one'] == 'FIXTURE_EXTERNAL_CARD'
                     assert state['clocks'][0]['moved'] == [{'object_id': 'circle', 'from': 'left', 'to': 'table'},

@@ -258,6 +258,11 @@ class Workspace:
     def observe(self, state):
         return {'tick': state['tick'], 'objects': deepcopy(state['objects']), 'cards': deepcopy(state['cards']),
                 'last_clock': deepcopy(state['clocks'][-1]) if state['clocks'] else None,
+                # WHY: a harness opportunity can share a tick with a requested
+                # revisit; clock effects alone do not identify which was delivered.
+                'delivery': deepcopy(state['deliveries'][-1]) if state['deliveries'] else None,
+                'revisits': [{'action': action, 'due_tick': item['due_tick'], 'reason': item['reason'],
+                             'status': item['status']} for action, item in state['revisits'].items()],
                 'permission': 'synthetic world only; no score or assigned task'}
 
     def act(self, action, operation, arguments):
