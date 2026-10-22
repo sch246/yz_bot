@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import ast
-from contextvars import ContextVar
 from datetime import datetime, timezone
-import json
+from pathlib import Path
 import re
 import threading
 import time
@@ -22,8 +21,8 @@ LOAD_AFTER = ("chatlog", "history", "identity", "image", "llm", "oplog", "storag
 IMAGE_MODES = ("off", "lazy", "eager")
 IMAGE_MODE_ALIASES = {"0": "off", "1": "lazy", "2": "eager"}
 
-# WHY: 中心 keep 保留原生思考直到 cover；drop 以无思考的
-# 文本投影省 token。
+# WHY: 历史选项。2026-10-19 起思考只在一次唤醒之内保留，跨唤醒一律不保留（维护者裁定），
+# 这个设置暂时不再影响中心会话，等清理时一并决定去留。
 REASONING_MODES = ("keep", "drop")
 REASONING_ALIASES = {"on": "keep", "off": "drop", "1": "keep", "0": "drop"}
 
@@ -33,12 +32,12 @@ chat_groups: list = []
 description_cache: dict = {}
 llm_config: dict = {}
 # WHY: 两个上限的默认值写死在这里，不再读 llm_system/config.json；运行期由全局
-# agent storage 覆盖。两个值只在首次激活或显式重置时决定起点；此后不自动遗忘。
-# 500 条避免极短事件挤占首次视野，40000 token 是自主压缩的信号。
-DEFAULT_MAX_EVENTS = 500
+# agent storage 覆盖。2026-10-19 起每次请求都重新组装：max_events 是一个窗口画面
+# 默认展示的条数（参照 QQ-agent 的 80），max_token 乘提醒百分比是一次唤醒里上下文
+# 长到多少就请图书管理员放下一部分再重新组装。存储键沿用旧名，免得已有的全局设置失效。
+DEFAULT_MAX_EVENTS = 80
 DEFAULT_MAX_TOKEN = 40000
 AGENT_WINDOW = oplog.AGENT_WINDOW
-MAX_PULL_EVENTS = 500
 NOTICE_TOKENS = 500
 _PRESSURE_PERCENT = 75
 _cost_lock = threading.Lock()
@@ -48,7 +47,6 @@ _image_stream = log.stream("image")
 _self_talk = log.stream("msg")
 # hint 求值失败只记日志，所以它有自己的流，不混进聊天流量。
 _hint_stream = log.stream("hint")
-_offline_scope: ContextVar[dict | None] = ContextVar("chat_offline_scope", default=None)
 
 
 def normalize_image_mode(value) -> str:
@@ -105,6 +103,23 @@ AGENT_SETTINGS = {
     "pressure_percent": ("pressure_percent", _bounded_int(1, _PRESSURE_PERCENT, 100)),
 }
 
+_reflect_stream = log.stream("agent")
+
+
+def reflect_now() -> bool:
+    """Start the nightly pass right away on its own thread; False when the agent is busy."""
+    if context.get_turn(AGENT_WINDOW) is not None:
+        return False
+
+    def run() -> None:
+        try:
+            _agent.reflect()
+        except Exception:
+            _reflect_stream.exception("反思失败")
+
+    threading.Thread(target=run, name="chat-reflect", daemon=True).start()
+    return True
+
 
 def get_prompt() -> list:
     selected = storage.get("", "agent").get("prompt")
@@ -133,18 +148,6 @@ def count_tokens(value: str) -> int:
         return len(tiktoken.encoding_for_model("gpt-4").encode(value))
     except Exception:
         return max(1, len(value) // 3)
-
-
-def bounded_excerpt(value: str, max_tokens: int) -> str:
-    """Take the longest leading character span within a token budget."""
-    low, high = 0, len(value)
-    while low < high:
-        middle = (low + high + 1) // 2
-        if count_tokens(value[:middle]) <= max_tokens:
-            low = middle
-        else:
-            high = middle - 1
-    return value[:low]
 
 
 def context_usage(turn=None) -> int:
@@ -212,12 +215,10 @@ def init_chat(
     """Assemble one Chat and return its tool binding and window."""
     prompts["base"] = _view._base_prompt()
     state = {"role": "system", "content": "你是唯一的中心 agent；窗口只是来源与明确发送目标。"}
-    offline = _offline_scope.get()
     window = AGENT_WINDOW
     session.set_messages([
         *get_prompt(),
         *prompts["base"],
-        *([{"role": "system", "content": offline["fact"]}] if offline else []),
         state,
         *(messages or []),
     ])
@@ -228,13 +229,13 @@ def init_chat(
     # `_persist_modules`，理由写在那里。
     # WHY: 装回不是无限的：超过时限没用过的模块会在 `restore` 里被收掉，并给模型一条
     # 通告——"只进不出"会让每次 `load_tools` 都永久占着基线消息。判据用的是每个模块最后
-    # 一次被调用的时刻，所以 bind 出来的那个对象要一直拿着，供 `_stream_results` 上报。
+    # 一次被调用的时刻，所以 bind 出来的那个对象要一直拿着，供 `agent._run_agent` 的结果回调上报。
     binding = tool_modules.bind_session(
         session,
         None,
-        registry=offline["registry"] if offline else None,
-        visible=(lambda name, module: name not in {"baidumap", "dianping"}
-                 and tool_modules.bot_op_tool_visible(name, module)) if not offline else None,
+        registry=None,
+        visible=lambda name, module: (name not in {"baidumap", "dianping"}
+                                      and tool_modules.bot_op_tool_visible(name, module)),
         persist=_persist_modules,
         schema_modules=_schema_modules(),
         persist_schema=_persist_schema_modules,
@@ -262,10 +263,6 @@ def _activate_chat(
     # 改变这一轮是否完成回收。
     session.do_process_image = get_image_mode() != "off"
     session.keep_reasoning = get_reasoning_mode() == "keep"
-    # WHY: 中心 reader 对能够原样恢复的 DeepSeek 输出保留原生配对，其余记录使用正式事件文本。
-    session.preserve_native = session.keep_reasoning
-    session.on_output = lambda assistant, calls: _record_output(window, assistant, calls, session)
-    session.on_results = _agent._stream_results(window, binding)
     return binding
 
 
@@ -293,8 +290,8 @@ def get_handler(session: llm.Chat):
     """The per-chunk sink: self-talk to the terminal, cost to the ledger.
 
     WHY: 模型写在回复正文里的内容**不发进聊天**。发言仍只能调用 `say`（见
-    `tools/meta.py`）；正文是自己的输出轨迹，会随正式输出事件跨轮重建，直到被覆盖。
-    这样模型能记得刚才的计划，但不会把自言自语误当成已发送消息。
+    `tools/meta.py`）；正文是自己的输出轨迹，记进 oplog，之后以行动记录里的「（自语）」
+    出现。这样模型能记得刚才的计划，但不会把自言自语误当成已发送消息。
 
     WHY: 但它要打到终端。人得看得见模型在想什么，尤其是在它**忘了调 `say`**的时候——那
     种轮对聊天窗口是完全静默的，终端这一行是唯一的痕迹。用 msg 流而不是另开一个，是为了
@@ -305,9 +302,6 @@ def get_handler(session: llm.Chat):
     宁可静默一轮、在终端留下证据。
     """
     def handle(chunk: llm.LLMResponse) -> None:
-        offline = _offline_scope.get()
-        if offline is not None:
-            offline["on_chunk"](chunk)
         if chunk.role == "assistant" and chunk.content:
             _self_talk.info(f'[{time.strftime("%H:%M:%S")}]【自言自语】{chunk.content}')
         if chunk.total_tokens:
@@ -316,32 +310,8 @@ def get_handler(session: llm.Chat):
     return handle
 
 
-def _record_output(window, assistant: dict, calls: list[dict], session=None) -> tuple[str, dict] | None:
-    offline = _offline_scope.get()
-    source = oplog.output(
-        window, assistant, calls,
-        persist_reasoning=bool(offline and offline.get("persist_reasoning")),
-        model=session.model if session is not None and window == AGENT_WINDOW else None,
-    )
-    if source is None:
-        return None
-    entry, missing = oplog.recall_events(window, [source])
-    if missing:
-        raise RuntimeError("刚写入的模型输出无法反查")
-    native = (_view._native_assistant(entry[0], session.model)
-              if session is not None and window == AGENT_WINDOW and session.preserve_native else None)
-    if native is not None:
-        session.native_sources.add(source)
-        _view._remember_stream(session, assistant, source)
-        return source
-    projection = _view._output_projection(entry[0], show_thought=session.keep_reasoning if session else True)
-    if session is not None:
-        _view._remember_stream(session, projection, source)
-    return source, projection
-
-
 def _window_storage(window: tuple) -> dict:
-    """只为 `#hint` 取本窗口 storage，键就是 `history.window(...)`。
+    """只为把旧 `#hint` 配置搬进文件取本窗口 storage，键就是 `history.window(...)`。
 
     WHY: 不经过 `context.current()`——hint 在 `chat` 的 `finally` 里跑，那个窗口就是调用方
     手上的实参；由实参决定"哪个窗口"，触发点就不依赖线程局部的当前事件，也不跟捕获、派发
@@ -357,25 +327,25 @@ _AGENT_HINT_KEY = "agent_hint"
 
 
 def _agent_hint() -> str:
-    value = storage.get("", "agent").get(_AGENT_HINT_KEY)
-    if not isinstance(value, str) or not value.strip():
-        return ""
-    return f"待办（你用 edit_hint 保存，可整体替换或清空）：\n{value}"
+    """The todo note, shown at the end of every sub-request so edits show up at once.
 
-
-def set_agent_hint(text: str) -> None:
+    WHY: 待办以前存在 storage 的 `agent_hint` 键里，2026-10-22 维护者让它退化成普通文件
+    （笔记 `todo`）。第一次读到旧键时搬过去并删掉旧键，之后只认文件。
+    """
     data = storage.get("", "agent")
-    if text.strip():
-        data[_AGENT_HINT_KEY] = text.strip()
-    else:
-        data.pop(_AGENT_HINT_KEY, None)
-    storage.save()
+    legacy = data.get(_AGENT_HINT_KEY)
+    if isinstance(legacy, str) and legacy.strip() and not _notes.read("todo").strip():
+        _notes.write("todo", legacy)
+    if _AGENT_HINT_KEY in data:
+        del data[_AGENT_HINT_KEY]
+        storage.save()
+    value = _notes.read("todo").strip()
+    return f"待办（笔记 todo，用 write_note 改）：\n{value}" if value else ""
 
 
 # 会话主体持久激活的工具模块名，以及各自最后一次被调用的时刻。
 _ACTIVE_MODULES_KEY = "active_tools"
 _SCHEMA_MODULES_KEY = "tool_schema_modules"
-_TOLD_TOOLS_KEY = "tool_state_told"
 
 
 def _schema_modules() -> list[str]:
@@ -441,6 +411,62 @@ def _hint_effective(default: dict, chat_hint: dict | None) -> dict:
     return {**default, **(chat_hint if isinstance(chat_hint, dict) else {})}
 
 
+_HINT_ROOT = Path("data") / "hint"
+
+
+def _hint_path(window: tuple | None) -> Path:
+    if window is None:
+        return _HINT_ROOT / "default.py"
+    return _HINT_ROOT / f"{'g' if window[0] == 'group' else 'u'}{window[1]}.py"
+
+
+def hint_config(window: tuple | None) -> dict:
+    """One `#hint` file as the `{code?, on?}` dict the merge rule expects.
+
+    WHY: 2026-10-22 维护者让 `#hint` 退化成普通文件：`data/hint/default.py` 是全局默认，
+    `data/hint/g<群号>.py`／`u<QQ号>.py` 是窗口覆盖。首行 `# on` 或 `# off` 是开关，其余
+    是代码；只写开关、不写代码的窗口文件照旧继承默认的代码。以前存在 storage 的配置在
+    第一次读到时搬进文件并删掉旧键。
+    """
+    path = _hint_path(window)
+    home = storage.get("", "hint") if window is None else _window_storage(window)
+    legacy = home if window is None else home.get("hint")
+    if isinstance(legacy, dict) and legacy:
+        if not path.is_file():
+            save_hint(window, legacy)
+        if window is None:
+            home.clear()
+        else:
+            del home["hint"]
+        storage.save()
+    if not path.is_file():
+        return {}
+    head, _, rest = path.read_text(encoding="utf-8").partition("\n")
+    config: dict = {}
+    if head.strip() in ("# on", "# off"):
+        config["on"] = head.strip() == "# on"
+        code = rest
+    else:
+        code = head + ("\n" + rest if rest else "")
+    if code.strip():
+        config["code"] = code.strip("\n")
+    return config
+
+
+def save_hint(window: tuple | None, config: dict) -> None:
+    path = _hint_path(window)
+    lines = []
+    if "on" in config:
+        lines.append("# on" if config["on"] else "# off")
+    if isinstance(config.get("code"), str) and config["code"].strip():
+        lines.append(config["code"].strip("\n"))
+    if not lines:
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def _run_hint(window: tuple, turn=None) -> None:
     """求值本窗口的结束提示，并把结果发出去；触发点写在 `chat` 的 `finally`。
 
@@ -452,13 +478,13 @@ def _run_hint(window: tuple, turn=None) -> None:
     写的、每次聊天都自动跑，让它抛出去就等于一段烂代码能污染聊天主流程的返回路径。
     """
     try:
-        merged = _hint_effective(storage.get("", "hint"), _window_storage(window).get("hint"))
+        merged = _hint_effective(hint_config(None), hint_config(window))
         code = merged.get("code")
         if not merged.get("on", False) or not isinstance(code, str) or not code.strip():
             return
         result = _hint_evaluate(code, window, turn)
         if result is not None:
-            # `#` 前缀让结束提示不回流进 LLM 上下文，见 _model_event。
+            # `#` 前缀让结束提示不回流进 LLM 上下文，见 chat.screen.records。
             message.sendmsg("#" + cq.escape(str(result)))
     except Exception:
         _report_hint_failure()
@@ -484,7 +510,7 @@ def _report_hint_failure() -> None:
     """照 link._report_error 的惯例，把 traceback 用 `#` 前缀发出去。"""
     _hint_stream.exception("hint 执行失败")
     try:
-        # `#` 前缀让 traceback 不回流进 LLM 上下文，见 _model_event。
+        # `#` 前缀让 traceback 不回流进 LLM 上下文，见 chat.screen.records。
         message.sendmsg("#" + "".join(traceback.format_exc().splitlines(True)[3:]).strip())
     except Exception:
         _hint_stream.exception("hint 的错误报告也发不出去")
@@ -497,24 +523,6 @@ def chat(model: str | None = None) -> None:
         return
     oplog.ensure_available()
     _agent._drive_agent(model, window)
-
-
-def run_offline(model: str, window: tuple, *, fact: str, registry,
-                on_chunk: Callable, persist_reasoning: bool,
-                send_context, send_sink: Callable) -> None:
-    """Drive the production reader with an explicit temporary replay scope."""
-    oplog.ensure_available()
-    scope = _offline_scope.set({"model": model, "fact": fact,
-                                "persist_reasoning": persist_reasoning,
-                                "registry": registry, "on_chunk": on_chunk})
-    try:
-        sink = send_context.set(send_sink)
-        try:
-            _agent._drive_agent(model, window)
-        finally:
-            send_context.reset(sink)
-    finally:
-        _offline_scope.reset(scope)
 
 
 def _in_chat_scope(event: dict) -> bool:
@@ -611,7 +619,7 @@ def _subcommand_call(event: dict) -> Callable | None:
     if subcommand not in _subcommands._SUBCOMMAND_NAMES:
         return None
     if _subcommands.requires_op(value[1:]) and not op.require_op(
-            event, pattern=r"^#\s*(hint|use_model|add_prompt|use_setting|set_setting|del_setting|image|reasoning|limit|reset_start)"):
+            event, pattern=r"^#\s*(hint|use_model|add_prompt|use_setting|set_setting|del_setting|image|reasoning|limit|reflect|awaker)"):
         # WHY: 全局设置不可由普通群友改写；只读子命令保持公开。
         return None
     return lambda value=value: _subcommands._subcommand(value[1:])
@@ -631,7 +639,7 @@ def cond() -> Callable | bool:
 
 def call(data: Callable | bool):
     if callable(data):
-        # `#` 前缀让子命令的输出不回流进 LLM 上下文，见 _model_event。
+        # `#` 前缀让子命令的输出不回流进 LLM 上下文，见 chat.screen.records。
         return "#" + cq.escape(str(data()))
     return chat()
 
@@ -775,19 +783,20 @@ def on_load(ctx) -> None:
 
         if not wait_booted(120):
             return
-        if not oplog.has_unnotified():
-            return
-        window = next(iter(oplog.unacknowledged_windows()), None)
-        if window is None:
-            window = next((window for window, _count, active in oplog.pending_summary()
-                           if active and window[0] in ("group", "private")), None)
-        if window is not None:
-            try:
-                _agent._drive_agent(None, window)
-            except Exception:
-                traceback.print_exc()
+        try:
+            _agent.pick_up_pending()
+        except Exception:
+            traceback.print_exc()
 
     threading.Thread(target=resume_pending, name="chat-agent-resume", daemon=True).start()
-from . import view as _view, reader as _reader, agent as _agent, subcommands as _subcommands
-from .view import has_at, msg_split, msg2chat, event2chat
-from .reader import parse_target, unread_details, prepare_recovery_sources, fetch_remote_source, unread_members, mark_window_read, mark_source_read
+
+    def start_awaker() -> None:
+        from mods import wait_booted
+
+        if wait_booted(120):
+            _awaker.schedule()
+
+    threading.Thread(target=start_awaker, name="chat-awaker-start", daemon=True).start()
+from . import view as _view, reader as _reader, agent as _agent, roles as _roles, subcommands as _subcommands, notes as _notes, awaker as _awaker
+from .view import has_at, msg_split
+from .reader import parse_target, prepare_recovery_sources, mark_window_read

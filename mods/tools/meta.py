@@ -1,6 +1,6 @@
 '''指导模型增删查改统一工具与 Skill 模块，并说明 last-good、显式应用和当前会话激活原理。
 
-同一模型输出的多个工具调用按顺序执行，却看不到彼此结果；整批完成后立即成为一个正式 result R，正常下一子请求完整读取，不按工具拆分或自动分页。若 `say(final_call=true)` 结束、请求取消或失败，不会只为结果强迫续轮；下次激活从固定历史起点重建 R，需要全文可用 `recall_events`。`take` 是未读消息正式阅读的主名，`pull` 仅为前缀别名；`mentions` 是提及筛选别名。`read_messages` 选中的档案消息也在下一请求作为正式 input 阅读；`recall_events` 仍同步返回旧经历，不消费未读。
+同一模型输出的多个工具调用按顺序执行，却看不到彼此结果；整批完成后结果在下一子请求可见。若 `say(final_call=true)` 结束、请求取消或失败，不会只为结果强迫续轮。每次唤醒眼前只有做法笔记、短期记忆、待办、最近一篇日记、今天做过的事、叫醒你的窗口和相关人的笔记；别的要自己召回：按窗口翻聊天记录用 `read_log`，按线索找用 `search_log`，自己过去的行动用 `read_actions`，笔记用 `read_note`。笔记是普通文件，`write_note` 随时改；今天的事告一段落时用 `tidy` 请图书管理员整理。
 
 ## 直接执行 Python
 
@@ -95,7 +95,7 @@ Python 模块可以正常 import 第三方依赖、其它 `mods`，也可以 `fr
 
 Markdown 不需要 front matter、额外 summary 字段或同步机制，也不导出函数。目录不递归扫描；Skill 可在正文中引用子目录资源。写完同样先 `reload_tools(["foo"])`，需要在当前任务使用时再 `load_tools(["foo"])`。
 
-Skill 也是可编辑的长期笔记：把可重复使用的经验、做法、失败教训按主题写进去，首行说明何时值得加载；下次可从模块目录发现，再按需 `load_tools` 把正文带进上下文。要自己落盘时，先 `load_tools(["host"])`，用 `host__read_file`／`host__write_file` 精确编辑源文件，再 `reload_tools` 应用。不要为了记一件事就改始终加载的基础 prompt，也不要把整段聊天照搬进 Skill。Skill 文件可被中心 agent 发现；私人聊天原话仍保留原来源窗口，中心 agent 可按旧正式号反查。Skill 只写可复用的做法，临时待办不要塞进 Skill，用 `edit_hint`。
+Skill 也是可编辑的长期笔记：把可重复使用的经验、做法、失败教训按主题写进去，首行说明何时值得加载；下次可从模块目录发现，再按需 `load_tools` 把正文带进上下文。要自己落盘时，先 `load_tools(["host"])`，用 `host__read_file`／`host__write_file` 精确编辑源文件，再 `reload_tools` 应用。不要为了记一件事就改始终加载的基础 prompt，也不要把整段聊天照搬进 Skill。Skill 文件可被中心 agent 发现；私人聊天原话仍保留原来源窗口，中心 agent 可按旧正式号反查。Skill 只写可复用的做法，临时待办不要塞进 Skill，写进 `todo` 笔记。
 
 ## 修改
 
@@ -109,38 +109,29 @@ Skill 也是可编辑的长期笔记：把可重复使用的经验、做法、�
 
 先确认精确模块名和源文件，再删除对应的单个 `mods/tools/foo.py` 或 `.md`，不要宽泛递归删除。随后调用 `reload_tools(["foo"])`；registry 发现源文件缺失后才删除 last-good，并从当前 Chat 移除模块内容和函数，当前会话的激活记录一并清除。只删文件但不 reload 时旧 last-good 仍有效。`meta.py` 是恢复入口，不能删除。删除 helper 前先检查并 reload 所有受影响模块。
 
-## 统一经历与覆盖反查
+## 经历与笔记
 
-每次模型输出（思考、正文、多个行动）只有一个 `YYYYMMDD-N` 号；该输出内部行动用 `YYYYMMDD-N#位置` 指名。新的中心输出保存完整原生思考，旧输出可能只有“曾有思考”标记。消息和工具结果也在被读到时进入同一信息流。结果可能在下一次模型请求才读到，未读不占正式号。
+每次模型输出（正文、多个行动）记进 oplog，有一个 `YYYYMMDD-N` 行动号；工具结果随它记下。每次唤醒不重放旧的对话，眼前只有做法笔记（global）、短期记忆（recent）、最近一篇日记、上次整理以来做过的事、叫醒你的窗口和相关的人或群的笔记，末尾是待办（todo）；没出现的东西没有丢，召回是你自己的事。
 
-这些记录跨轮按读到的先后重建。中心会话统一用 `cover_events` 总结输入、输出和结果，不再维护另一套按原生工具调用位置收缩的历史。
+- 聊天记录就是 `chatlog/` 的原文，`read_log(window, count, before)` 读任意窗口，格式与画面相同；`before` 写 `YYYY-MM-DD HH:MM:SS` 往前翻页。
+- 记得一点线索（名字、话题、某个词）就用 `search_log(keyword, window, days)` 找出原文和时间，再用 `read_log` 读前后文。
+- 自己做过的事用 `read_actions(ids)` 按行动号读，或不给号读最近几条，`keyword` 按词筛。
+- 笔记都是 `data/notes/` 下的普通文件，你随时能读能写：global 是你的做法，recent 是短期记忆，todo 是待办，awaker 是你的闹钟规则，person:<QQ号>、group:<群号> 记认识与经历，diary:<日期> 是夜里写的日记（月、年各有汇总）。`read_note(scope)` 读，`write_note(scope, text)` 整份替换，改前自动备份。认识了新的人、答应了什么、被纠正了什么，想记就当场记。
+- 放下是图书管理员的事：你调用 `tidy`、一次唤醒里上下文太长、或者今天的行动列表太长时，他把上次整理以来你看过做过的东西收成结论和出处写进笔记，之后这些行动不再出现在你眼前；每天夜里他写日记、整理笔记。
+- 想定时醒来（比如每 10 分钟看一眼，或者某个时刻提醒谁），就改 awaker 笔记，每行一条：`every 10m 理由`、`daily 23:30 理由`、`at 2026-10-23 08:00 理由`；`daily 04:00 reflect` 是每晚的整理与反思，删掉它就不再反思。到点的闹钟会把理由交给你，`at` 规则响过后记得删掉。
+- 记忆系统本身怎么运作、每次唤醒组装了什么、图书管理员改了什么、你能怎么改它，见 `memory_system`；每晚反思会自动加载它。
+- 更长时间跨度的自查可加载 `self_inspection` Skill，用 `exec_code` 读磁盘记录。
 
-结论写在 `conclusion` 参数里就够了，工具不会把它再返回一遍：这次调用本身留在上下文里，参数里的结论就是它的记录。
+## 待办
 
-已读消息和输出也能总结：中心会话调用 `cover_events(["20260923-4", "20260923-5"], "结论")`，参数用的是上文方括号里的正式事件号，不是 QQ `message_id` 或行动位置。也可用 `cover_events(ids=[], conclusion="结论", anchor="20260923-4", before=2, after=3, kinds="input,result")`，或用 `start`／`end` 指定含端点的区间。覆盖范围没有条数上限；先从唯一已读顺序取原始种子，再筛选种类和来源，不按命中数补足。输出与整批返回是强绑定闭包；say 的回声可单独覆盖，回声里的 `<sent_by>` 仍可引用行动号。闭包里有任一成员不可覆盖，整次失败，不丢掉那个成员后继续。覆盖使成员从本轮和后续自动上下文中消失；原号可用 `recall_events` 反查而不解除覆盖，反查总结会显示实际冻结的所有成员，不只是你传入的号。中心会话可跨窗口点名已读或反查过的旧号；未读成员不会被补进覆盖。摘要与聊天消息、输出、返回一样属于已读历史；上限只决定首次历史起点，之后须主动压缩；子代理不能替中心会话写覆盖。
-
-眼前历史从首次选定的起点持续追加，不是完整记录。新消息先留在有名字的有序未读信源；新版通知只列上次确认后新来的唤醒，尾部 hint 显示当前未读提及的时间和未读序号。`status(source)` 看数量与缺口，`take(source, start=1, count=8)` 在工具执行时按当前未读成员序号选连续范围，已读/跳过不计数；`ids`、`arrival`、`origin`、`message_id` 是高级精确入口。`mentions(source)` 正式消费至多 500 条未读提及，不是只看通知；`pull(source, count)` 是前缀别名。正式 input 保留自己的号，并记录发起输出 `read_by` 和实际工具 `read_via`；来源顺序中跨过的已读/跳过桥附在本次新 input 内，已读桥保留旧正式号，跳过桥显示 `skipped_by` 而没有旧 input 号。`mark_read(source)` 把调用时已有的成员跳过，不伪造 input；`fetch(source)` 从 NapCat 向旧端补取。通知已看见不等于消息已读；红点本身不会反复启动你，只有后来出现新唤醒时才再次叫你。窗口名是 `g<群号>` 或 `u<私聊对端号>`，主动 fetch 的旧档有自己的信源 key。启动补回先于该窗口新实时消息进入原信源；未收束前不能正式阅读或标为已读。已经读过的旧档信源不会倒插内容，后续 fetch 另开信源。远端历史不保证无缺口。用 `exec_code` 可调用 `ctx["chat"].unread_members(source)` 取得脱离内部权威的 `list[dict]`，用普通 Python 筛选后把其中 `key` 列表交给 `take(ids=...)`；修改快照不会修改未读事实。
-
-聊天档案不属于未读信源。`read_messages(window, message_id, before, after)` 可在指定窗口中按 QQ `message_id` 选前后文；若号码歧义，加 `timestamp` 或改用 `origin`。它的同步 R 只确认安排，正文在下一子请求作为逐条正式 input 出现；命中当前 live/source 未读成员也一并消费。已读档案可再次阅读，产生新的 archive input，但不冒充 live 回声，不写 `<sent_by>`。已读 input 也可用 `recall_events` 反查。总结只改变默认显示，不删除原文。
-
-总结要方便反查：在结论里留下关键来源的正式号，别只写一段没有出处的大块故事。后续总结可以再次引用前一层总结；同一来源也可被多个不同主题的总结引用，不必强行归到唯一父节点。已被覆盖的正式号也可再次点名，与新的可见成员组成另一份总结；这不解除原覆盖。`event_links` 可查输入、输出和工具返回中明确出现的正式号，以及各节点实际覆盖的成员；“出现过编号”、“被覆盖”和“确实支撑某个结论”是三回事，核对原话仍须 `recall_events`。
-
-普通输入、完整输出及整批工具返回都可用 `recall_events(["20260923-4"])` 按正式号反查；也可用 `recall_events(start="20260923-4", end="20260923-8", source="g123")` 直接读取短范围。它一次同步返回完整选择，取得一个新的 result 号，不进入未读信源、不做字符分页，也不把正文里的旧事件移动、复制或重新编号。范围返回列出实际冻结的 `resolved_ids`。若总结这次探索，通常覆盖这次 recall 的输出和结果，并在结论中引用旧号；结果真正进入上下文后，直接覆盖其中旧号也是允许的另一次明确选择。
-
-`recall_events` 和 `event_links` 都能用 `anchor` 加前后数量，或用 `start`／`end` 指定有界区间；`kinds` 和 `source` 只在选定范围内筛选，不改变经历顺序。`event_links` 的输出 `reads` 是该输出实际导致正式读入的 input 号，不靠位置推断；回声 `<sent_by>` 的文本引用也可由 `event_links` 找到。其它一跳关系不读取正文、不授予覆盖信用。不要把这些选择器用于未读信源或原生操作号。
-
-中心会话从固定起点载入一条全局经历；旧窗口正式号仍能按原号跨窗口反查，不复制或改号。更早的结果没被删除，仍能按引用取回。
-
-## 全局待办
-
-`edit_hint(text)` 整体替换中心 agent 的全局待办；传空字符串清空。它持久保存，下一次模型子请求会在末尾 hint 看到最新内容；hint 自身不逐版追加，但 `edit_hint` 行动仍照常留在信息流里。同一模型输出中的多个工具调用彼此看不到结果：即使 `cover_events` 排在 `edit_hint` 前，后者的文本也不能先写“覆盖已成功”。先等工具返回进入下一子请求，再记录依赖成败的待办。改动不会发送 QQ 消息；要对人说话仍须调用 `say`。这里的模型可见 hint 与聊天结束后向 QQ 发状态消息的 `#hint` 命令不是一回事。只放尚待处理的事，做完及时更新；可复用经验放 Skill，聊天证据放可反查的信息流。
+待办就是 `todo` 笔记：`write_note("todo", 全文)` 整体替换，传空串清空。每次模型子请求的末尾都会显示最新内容。同一模型输出中的多个工具调用彼此看不到结果：先等工具返回进入下一子请求，再记录依赖成败的待办。改动不会发送 QQ 消息；要对人说话仍须调用 `say`。它与聊天结束后向 QQ 发状态消息的 `#hint` 命令不是一回事。只放尚待处理的事，做完及时更新；可复用经验放 Skill。
 
 ## 说话
 
 `say(text, target, final_call)` 是你**唯一**的发言方式——直接写在回复正文里的内容不会发出去，那是你的自言自语；它会作为自己的输出轨迹保留，但聊天参与者收不到。中心会话每次发言必须写明 `target="g<群号>"` 或 `target="u<私聊对端号>"`，不能凭最近读到谁来猜接收窗口。
 
-- 返回值就是这条消息的 `message_id`。它可用于与聊天记录里的回声核对；要覆盖这句话，用回声读入后的信息流正式号，不用此 `message_id` 当 `cover_events` 的参数。
-- `final_call` 默认 **true**：说完这句，当前工具循环结束；同一批里其它工具的结果这次看不到。只有新召唤会让中心 reader 接着运行；显式安排的 take 若尚未遇到下一次模型请求就自然作废，信源仍未读。若要在当前循环接着干活，显式传 `final_call=false`。
+- 返回值就是这条消息的 `message_id`，可用于与聊天记录里的回声核对。
+- `final_call` 默认 **true**：说完这句，当前工具循环结束；同一批里其它工具的结果这次看不到。只有新召唤会让中心 agent 接着运行。若要在当前循环接着干活，显式传 `final_call=false`。
 - 发送**失败**或**未确认**时，不管 `final_call` 传了什么，都会照常再跑一轮，让你看到发生了什么。"未确认"的意思是请求被收下了但没给回号码，消息很可能已经发出去——别直接重发，先看下一轮的聊天记录。
 - 一次 `say` 发一条消息。要发几条就调几次，最后一条传默认的 `final_call=true`。
 
@@ -151,15 +142,10 @@ Skill 也是可编辑的长期笔记：把可重复使用的经验、做法、�
 
 from __future__ import annotations
 
-from contextvars import ContextVar
 import io
 from typing import Mapping
 
 from mods.tools import current_binding
-
-
-_offline_send_sink: ContextVar[object | None] = ContextVar("meta_offline_send_sink", default=None)
-_DEFAULT_PULL_COUNT = 8
 
 
 def _tool_window():
@@ -237,78 +223,54 @@ def load_tools(names: list[str]) -> str:
     return _format_results(current_binding().load(names))
 
 
-
-
-def recall_events(ids: list[str] | None = None, anchor: str = "",
-                  before: int = 0, after: int = 0, start: str = "", end: str = "",
-                  kinds: str = "", source: str = "") -> str:
-    """按正式号或一段已读经历直接返回输入、完整输出和结果；中心会话可跨窗口查旧号。整次调用只有一个 result，正文中的旧事件不重新编号。
+def read_log(window: str, count: int = 30, before: str = "") -> str:
+    """读一个聊天窗口的聊天记录原文，格式与眼前的画面相同，从最新往前取；before 用来往前翻页。
 
     @param
-    ids: 显式正式号列表；与 anchor 或 start/end 二选一，范围调用可省略
-    anchor: 中心正式号；可用 before/after 取邻近已读事件
-    before: anchor 之前的原始事件数，不按筛选命中补足
-    after: anchor 之后的原始事件数，不按筛选命中补足
-    start: 含端点的区间起点；须同时给 end
-    end: 含端点的区间终点；须同时给 start
-    kinds: 可选逗号分隔 input、output、result、notification；只筛选种子
-    source: 可选 g<群号> 或 u<私聊对端号> 来源窗口；只筛选种子
-    """
-    window = _tool_window()
-    if window is None:
-        return "当前不在聊天窗口里"
-    from mods import chat
-
-    return chat.agent.recall_events(window, ids, anchor, before, after, start, end, kinds, source)
-
-
-def event_links(ids: list[str] | None = None, anchor: str = "", before: int = 0,
-                after: int = 0, start: str = "", end: str = "", kinds: str = "",
-                source: str = "") -> str:
-    """按正式号查看一跳关系；输出的 reads 是实际读入的 input 号，非位置推断。
-
-    @param
-    ids: 显式正式号列表；与 anchor 或 start/end 二选一，范围调用可省略
-    anchor: 中心正式号；可用 before/after 取邻近已读事件
-    before: anchor 之前的原始事件数
-    after: anchor 之后的原始事件数
-    start: 含端点的区间起点；须同时给 end
-    end: 含端点的区间终点；须同时给 start
-    kinds: 可选逗号分隔 input、output、result、notification；只筛选查询根
-    source: 可选 g<群号> 或 u<私聊对端号> 来源窗口；只筛选查询根
-    """
-    window = _tool_window()
-    if window is None:
-        return "当前不在聊天窗口里"
-    from mods import chat
-
-    return chat.agent.event_links(window, ids, anchor, before, after, start, end, kinds, source)
-
-
-def cover_events(ids: list[str], conclusion: str, anchor: str = "", before: int = 0,
-                 after: int = 0, start: str = "", end: str = "", kinds: str = "",
-                 source: str = "") -> str:
-    """将本次主窗口可见或此前已覆盖的事件归入这次行动的结论；成员不再自动载入，但仍可按原编号反查。关联的整批输出和返回必须一同覆盖，say 回声可单独覆盖。
-
-    @param
-    ids: 显式正式号列表；与 anchor 或 start/end 二选一，范围调用请传 []
-    conclusion: 你从这些事件得出的结论，写出供后续子请求保留的摘要
-    anchor: 中心正式号；可用 before/after 取邻近已读事件
-    before: anchor 之前的原始事件数
-    after: anchor 之后的原始事件数
-    start: 含端点的区间起点；须同时给 end
-    end: 含端点的区间终点；须同时给 start
-    kinds: 可选逗号分隔 input、output、result、notification；只筛选种子
-    source: 可选 g<群号> 或 u<私聊对端号> 来源窗口；只筛选种子
+    window: g<群号> 或 u<私聊对端号>
+    count: 取多少条记录，1 到 200
+    before: 只取这个时刻之前的记录，写 YYYY-MM-DD HH:MM:SS（画面里的日期加时间）或 Unix 秒；留空表示到最新
     """
     from mods import chat
 
-    window = _tool_window()
-    session = current_binding().session
-    if window is None or not session.reads_window_mail or not session.active_action:
-        return "仅中心 reader 能覆盖信息流；子代理不可覆盖"
-    return chat.agent.cover_stream(session, window, ids, conclusion, anchor, before,
-                                   after, start, end, kinds, source)
+    return chat.roles.read_log(window, count, before)
+
+
+def search_log(keyword: str, window: str = "", days: int = 7) -> str:
+    """按线索在聊天记录里找：名字、QQ号、话题里的词都行，返回含这个词的记录原文，最新的在前。找到时间点后可以用 read_log 的 before 读前后文。
+
+    @param
+    keyword: 要找的词（不区分大小写，按原文子串匹配）
+    window: 只找这个窗口（g<群号> 或 u<私聊对端号>）；留空找所有窗口
+    days: 往前找多少天，1 到 90
+    """
+    from mods import chat
+
+    return chat.roles.search_log(keyword, window, days)
+
+
+def read_actions(ids: list[str] | None = None, count: int = 10, keyword: str = "") -> str:
+    """读自己过去的行动记录原文：说过的话、调用过的工具及其结果。
+
+    @param
+    ids: 行动号列表，如 20261019-12；留空则取最近 count 条
+    count: 不给 ids 时取最近多少条，1 到 50
+    keyword: 只取原文里含这个词的行动（不区分大小写）
+    """
+    from mods import chat
+
+    return chat.roles.read_actions(ids, count, keyword)
+
+
+def read_note(scope: str) -> str:
+    """读一份图书管理员整理的笔记全文。
+
+    @param
+    scope: global（做法）、recent（短期记忆）、person:<QQ号> 或 group:<群号>
+    """
+    from mods import chat
+
+    return chat.roles.read_note(scope)
 
 
 def attach_image(uri: str, note: str = "") -> str:
@@ -372,20 +334,13 @@ def say(text: str, final_call: bool = True, target: str = "") -> str:
     from mods.tools import current_binding
 
     body = str(text)
-    sink = _offline_send_sink.get()
-    if chat._offline_scope.get() is not None and sink is None:
-        raise RuntimeError("offline send sink is missing")
     if not body.strip():
-        if sink is not None:
-            raise ValueError("offline say text is empty")
         return "text 为空，什么都没发。要说话就给出正文"
     destination = {}
     if context.agent_mode():
         try:
             window = chat.parse_target(target)
         except ValueError as error:
-            if sink is not None:
-                raise
             return str(error)
         destination = {"group_id" if window[0] == "group" else "user_id": window[1]}
         current_binding().session.associated_windows.add(window)
@@ -393,23 +348,16 @@ def say(text: str, final_call: bool = True, target: str = "") -> str:
         try:
             window = chat.parse_target(target)
         except ValueError as error:
-            if sink is not None:
-                raise
             return str(error)
         destination = {"group_id" if window[0] == "group" else "user_id": window[1]}
     unconfirmed = (
         "先在下一轮的聊天记录里看它在不在，再决定要不要重发——不要直接重发。"
     )
     try:
-        message_id = (sink(body, window) if sink is not None
-                      else message.sendmsg(body, **destination).result(timeout=_SAY_TIMEOUT))
+        message_id = message.sendmsg(body, **destination).result(timeout=_SAY_TIMEOUT)
     except TimeoutError:
-        if sink is not None:
-            raise
         return f"未确认：等了 {_SAY_TIMEOUT:.0f} 秒还没有结果，这句话可能正在发、也可能已经发出去。" + unconfirmed
     except Exception as error:
-        if sink is not None:
-            raise
         return f"发送失败（{type(error).__name__}）：{error}。这句话没有发出去。"
     if message_id is None:
         return "未确认：对端收下了请求，却没有回一个 message_id，所以这句话可能已经发出去了。" + unconfirmed
@@ -418,135 +366,37 @@ def say(text: str, final_call: bool = True, target: str = "") -> str:
     return str(message_id)
 
 
-def _take(source: str, count: int, start: int, ids: list[str] | None,
-          arrival: str, origin: str, message_id: str,
-          mentions_only: bool, via: str) -> str:
-    from mods import chat, context
-
-    session = current_binding().session
-    if not context.agent_mode() or not session.reads_window_mail:
-        return "只有中心 reader 可以正式阅读信源"
-    return chat.reader.arrange_take(session, source, count, start, ids, arrival,
-                                    origin, message_id, mentions_only, via)
-
-
-
-
-def take(source: str, count: int = _DEFAULT_PULL_COUNT, ids: list[str] | None = None,
-         arrival: str = "", origin: str = "", message_id: str = "",
-         mentions_only: bool = False, start: int = 1) -> str:
-    """按执行时当前未读序号选择连续范围，并在下一请求正式阅读；精确选择是高级入口。
+def write_note(scope: str, text: str) -> str:
+    """用新全文替换一份笔记（普通 Markdown 文件，改前自动备份）；空串删除整份笔记。
 
     @param
-    source: g<群号>、u<私聊对端号> 或独立信源 key
-    count: 从 start 起读多少个当前未读成员，1 到 500
-    start: 当前未读信源中从 1 起的位置；已读和跳过项不计数
-    ids: 高级入口：稳定成员 key 列表，可由 chat.unread_members 快照取得
-    arrival: 高级入口：实时消息的精确 arrival
-    origin: 高级入口：精确档案位置
-    message_id: 高级入口：QQ 消息号；歧义时改用 ids 或 origin
-    mentions_only: 只正式读取当前未读提及；mentions 是此选项的薄入口
+    scope: global、recent、todo、awaker、person:<QQ号>、group:<群号> 或 diary:<日期>
+    text: 这份笔记更新后的完整内容；改之前先 read_note 看现有内容，别把别人写的覆盖掉
     """
-    return _take(source, count, start, ids, arrival, origin, message_id,
-                 mentions_only, "take")
+    from mods.chat import awaker, journal, notes
+
+    previous = notes.write(scope, text)
+    if previous.strip() != text.strip():
+        journal.append(f"她改笔记 {scope}", journal.diff(previous, text))
+    if scope == "awaker":
+        found, skipped = awaker.parse(text if text.strip() else awaker.DEFAULT)
+        lines = [f"已写入 awaker，{len(found)} 条规则生效"] + [f"不认识：{line}" for line in skipped]
+        return "\n".join(lines)
+    return f"已写入 {scope}" if text.strip() else f"已删除 {scope}"
 
 
-
-
-def status(source: str = "") -> str:
-    """查看未读通知栏；可查看全部活跃信源，也可精确查看一个窗口或历史信源，不读取正文。
-
-    @param
-    source: 留空查看全部活跃信源；或填 g<群号>、u<私聊对端号>、fetch 返回的信源 key
-    """
-    from mods import chat, context
-
-    if not context.agent_mode() or not current_binding().session.reads_window_mail:
-        return "只有中心 reader 可以查看信源状态"
-    return chat.reader.source_status(source)
-
-
-def fetch(source: str) -> str:
-    """从 NapCat 向前补一个信源；未读缺口可续接，已读信源会从旧端另开信源。
+def tidy(note: str = "") -> str:
+    """请图书管理员现在整理：把上次整理以来你看过做过的东西收进笔记，这一轮结束后你的上下文重新组装。一件事告一段落、或刚读了一大堆材料只需要记住结论时用。
 
     @param
-    source: g<群号>、u<私聊对端号>，或已有历史信源 key
-    """
-    from mods import chat, context
-
-    if not context.agent_mode() or not current_binding().session.reads_window_mail:
-        return "只有中心 reader 可以拉取信源"
-    return chat.reader.fetch_source(current_binding().session, source)
-
-
-def mentions(source: str) -> str:
-    """正式读取当前未读 @／提及，最多 500 条；其它未读成员仍留在信源。
-
-    @param
-    source: g<群号>、u<私聊对端号>，或 fetch 返回的独立信源 key
+    note: 想让他特别注意的地方，比如"结论是端口没问题，细节不用记"；可以留空
     """
     from mods import chat
 
-    return _take(source, chat.MAX_PULL_EVENTS, 1, None, "", "", "", True, "mentions")
-
-
-def read_messages(window: str, message_id: str = "", origin: str = "", timestamp: int = 0,
-                  before: int = 4, after: int = 4) -> str:
-    """从本地档案选消息，在下一次模型请求前作为正式 input 阅读；已读档案可再次阅读。
-
-    @param
-    window: g<群号> 或 u<私聊对端号>
-    message_id: QQ 消息号；与 origin 二选一
-    origin: 稳定档案位置；与 message_id 二选一
-    timestamp: message_id 命中多条时用来消歧义的 Unix 整数秒；0 表示不指定
-    before: 锚点之前返回多少条档案记录，非负整数
-    after: 锚点之后返回多少条档案记录，非负整数
-    """
-    from mods import chat, context
-
-    if not context.agent_mode() or not current_binding().session.reads_window_mail:
-        return "只有中心 reader 可以查阅聊天档案"
-    return chat.reader.arrange_archive(current_binding().session, window, message_id,
-                                        origin, timestamp, before, after)
-
-
-def mark_read(source: str) -> str:
-    """将一个信源在调用时已存在的全部未读设为已读。这些内容不取得经历号，但仍可用 read_messages 再读档案。
-
-    @param
-    source: g<群号>、u<私聊对端号>，或 fetch 返回的独立信源 key
-    """
-    import json
-
-    from mods import chat, context
-
-    if not context.agent_mode() or not current_binding().session.reads_window_mail:
-        return "只有中心 reader 可以设为已读"
-    return chat.reader.mark_source(current_binding().session, source)
-
-
-def pull(source: str, count: int = _DEFAULT_PULL_COUNT) -> str:
-    """take(source, count) 的前缀薄别名；新调用请优先使用 take。
-
-    @param
-    source: g<群号>、u<私聊对端号>，或 fetch 返回的信源 key
-    count: 希望读取的事件数，1 到 500；选中的消息在下一请求全文读入
-    """
-    return _take(source, count, 1, None, "", "", "", False, "pull")
-
-
-def edit_hint(text: str) -> str:
-    """整体替换中心 agent 的全局待办 hint；传空字符串清空，不会向 QQ 发送消息。同批工具互不可见结果，别在同批宣称 cover_events 已成功。
-
-    @param
-    text: 更新后的完整待办文本；请保留仍未完成的事项，空字符串表示清空
-    """
-    from mods import chat
-
-    if _tool_window() != chat.AGENT_WINDOW:
-        return "只有中心 reader 可以编辑待办 hint"
-    chat.set_agent_hint(text)
-    return "已更新待办 hint；下次模型请求会看到新内容" if text.strip() else "已清空待办 hint"
+    if not chat.agent.request_tidy(note.strip()):
+        return "现在没有进行中的唤醒，不需要整理"
+    current_binding().session.turn_done = lambda: True
+    return "图书管理员会在这一轮结束后整理，之后你的上下文会重新组装"
 
 
 def _format_results(results: Mapping) -> str:
@@ -576,21 +426,16 @@ def _format_results(results: Mapping) -> str:
 
 
 __all__ = [
-    "cover_events",
     "say",
-    "status",
-    "take",
-    "mentions",
-    "fetch",
-    "pull",
-    "mark_read",
-    "read_messages",
-    "edit_hint",
+    "read_log",
+    "search_log",
+    "read_actions",
+    "read_note",
+    "write_note",
+    "tidy",
     "exec_code",
     "list_tools",
     "reload_tools",
     "load_tools",
-    "recall_events",
-    "event_links",
     "attach_image",
 ]

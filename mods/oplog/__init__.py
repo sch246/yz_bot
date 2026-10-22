@@ -48,7 +48,7 @@ _restore_error = None
 _legacy_adapter = None
 
 from .replay import (
-    _accessible, _apply, _complete_output, _message_identity, _reference_candidates, _validate,
+    _apply, _complete_output, _message_identity, _reference_candidates, _validate,
     _validate_shape, _validate_internal_shape, FormatShapeError,
 )
 
@@ -343,50 +343,6 @@ def source_position_read(source: str, page: int, offset: int) -> bool:
         return (page, offset) in _sources[source]["read_positions"]
 
 
-def source_member_provenance(source: str, page: int, offset: int) -> dict | None:
-    """Return the first input or skip fact for a page position."""
-    with _lock:
-        _restore()
-        state = _sources[source]
-        position = (page, offset)
-        recorded = state["read_entries"].get(position)
-        if recorded is not None:
-            return {"kind": "read", "input": recorded}
-        skipped = state["skip_entries"].get(position)
-        return {"kind": "skipped", "by": skipped.get("read_by")} if skipped else None
-
-
-def arrival_members(window: tuple) -> list[dict]:
-    """Replay-derived lightweight source order, excluding page-linked live duplicates."""
-    with _lock:
-        _restore()
-        return [member.copy() for arrival, member in _arrival_members.items()
-                if tuple(member["window"]) == window and arrival not in _source_arrivals]
-
-
-def arrival_member_provenance(arrival: str) -> dict | None:
-    with _lock:
-        _restore()
-        recorded = _by_arrival.get(arrival)
-        if recorded is not None and recorded["kind"] == "input":
-            return {"kind": "read", "input": recorded}
-        skipped = _arrival_skips.get(arrival)
-        return {"kind": "skipped", "by": skipped.get("read_by")} if skipped else None
-
-
-def arrival_event(arrival: str) -> dict | None:
-    """Load a rare origin-less skipped arrival from its journal, not a body cache."""
-    with _lock:
-        _restore()
-        for path in sorted(_root.glob("????????.jsonl")):
-            with path.open(encoding="utf-8") as stream:
-                for line in stream:
-                    entry = json.loads(line)
-                    if entry["kind"] == "arrival" and entry["arrival"] == arrival:
-                        return entry["event"]
-    return None
-
-
 def arrive(window: tuple, event: dict, *, activated: bool = False, origin: str | None = None) -> str:
     from mods import chatlog
 
@@ -458,12 +414,6 @@ def message_seen(window: tuple, message_id: int | str, event_time: int,
                                           "message_seq": event_seq}) in _seen_messages
 
 
-def arrival_origin(arrival: str) -> str | None:
-    with _lock:
-        _restore()
-        return _pending.get(arrival, {}).get("origin")
-
-
 def start_source(name: str, window: tuple, source_type: str, *, anchor: str | None = None,
                  anchor_time: int | None = None,
                  queue_window: tuple | str | None = None,
@@ -488,15 +438,6 @@ def start_source(name: str, window: tuple, source_type: str, *, anchor: str | No
         return _source_snapshot(_sources[source])
 
 
-def source_progress(source: str, *, cursor: str | None = None, gap: str | None = None) -> dict:
-    with _lock:
-        _restore()
-        _append({"kind": "source_progress", "source": source,
-                 "cursor": _sources[source]["cursor"], "gap": gap},
-                datetime.now().strftime("%Y%m%d"))
-        return _source_snapshot(_sources[source])
-
-
 def publish_source_page(source: str, page_number: int, cursor: str | None,
                         member_count: int, mention_count: int = 0) -> dict:
     """Commit metadata only after the bounded page body is durable."""
@@ -516,17 +457,6 @@ def finish_source(source: str, *, gap: str | None = None, error: str | None = No
         _append({"kind": "source_finish", "source": source, "state": state,
                  "gap": gap, "error": error, "stop_cursor": stop_cursor},
                 datetime.now().strftime("%Y%m%d"))
-        return _source_snapshot(_sources[source])
-
-
-def reopen_source(source: str, *, fetch_anchor: str | None = None) -> dict:
-    """Extend a sealed source only before any member is read or marked read."""
-    with _lock:
-        _restore()
-        state = _sources[source]
-        cursor = state["stop_cursor"] or state["cursor"]
-        _append({"kind": "source_reopen", "source": source, "cursor": cursor,
-                 "fetch_anchor": fetch_anchor}, datetime.now().strftime("%Y%m%d"))
         return _source_snapshot(_sources[source])
 
 
@@ -605,12 +535,6 @@ def unacknowledged_windows() -> list[tuple]:
                                   for window in entry["windows"]))
 
 
-def notification_acknowledged(event_id: str) -> bool:
-    with _lock:
-        _restore()
-        return bool(_by_id[event_id].get("acknowledged"))
-
-
 def acknowledge_notification(event_id: str) -> None:
     with _lock:
         _restore()
@@ -671,86 +595,6 @@ def read(arrival: str) -> dict | None:
         return _by_arrival.get(arrival)
 
 
-def recall_events(window: tuple | None, ids: Iterable[str]) -> tuple[list[dict], list[str]]:
-    with _lock:
-        _restore()
-        found: list[dict] = []
-        missing: list[str] = []
-        for event_id in dict.fromkeys(str(value) for value in ids):
-            entry = _by_id.get(event_id)
-            if entry is None or not _accessible(window, entry):
-                missing.append(event_id)
-            elif entry["kind"] == "input" and entry.get("projection") is None:
-                missing.append(event_id)
-            else:
-                recalled = entry.copy()
-                recalled["mentions"] = recalled.pop("_mentions", [])
-                if entry["kind"] == "output":
-                    members = {f"{event_id}#{position + 1}": list(_coverage_nodes[f"{event_id}#{position + 1}"])
-                               for position in range(len(entry["actions"]))
-                               if f"{event_id}#{position + 1}" in _coverage_nodes}
-                    if members:
-                        recalled["coverage"] = members
-                found.append(recalled)
-        return found, missing
-
-
-def select_events(window: tuple | None, *, ids: Iterable[str] | None = None,
-                  anchor: str = "", before: int = 0, after: int = 0,
-                  start: str = "", end: str = "", kinds: Iterable[str] = (),
-                  source_window: tuple | None = None) -> tuple[list[dict], list[str]]:
-    """Resolve one seed selector, then filter its members without extending the seed."""
-    if any(type(value) is not int or value < 0 for value in (before, after)):
-        raise ValueError("before 和 after 必须是非负整数")
-    if ids is not None and isinstance(ids, (str, bytes)):
-        raise ValueError("ids 必须是正式事件号列表")
-    requested = list(dict.fromkeys(str(value) for value in (ids or ())))
-    has_range = bool(start or end)
-    if sum((bool(requested), bool(anchor), has_range)) != 1 or (has_range and (not start or not end)):
-        raise ValueError("请只指定非空 ids、anchor，或同时指定 start 和 end")
-    if not anchor and (before or after):
-        raise ValueError("before 和 after 只能与 anchor 一起使用")
-    allowed_kinds = {"input", "output", "result", "notification"}
-    selected_kinds = set(kinds)
-    if selected_kinds - allowed_kinds:
-        raise ValueError("kinds 只能包含 input、output、result、notification")
-    if source_window is not None and (not isinstance(source_window, tuple)
-                                      or len(source_window) != 2
-                                      or source_window[0] not in ("group", "private")
-                                      or type(source_window[1]) is not int or source_window[1] <= 0):
-        raise ValueError("source 必须是 g<群号> 或 u<私聊对端号>")
-    with _lock:
-        _restore()
-        missing = []
-        if requested:
-            selected = []
-            for event_id in requested:
-                entry = _by_id.get(event_id)
-                if (entry is None or not _accessible(window, entry)
-                        or (entry["kind"] == "input" and entry.get("projection") is None)):
-                    missing.append(event_id)
-                else:
-                    selected.append(entry)
-        else:
-            timeline = [entry for entry in _events if _accessible(window, entry)
-                        and not (entry["kind"] == "input" and entry.get("projection") is None)]
-            positions = {entry["id"]: index for index, entry in enumerate(timeline)}
-            for event_id in (anchor, start, end):
-                if event_id and event_id not in positions:
-                    raise ValueError(f"找不到可访问的已读事件: {event_id}")
-            if anchor:
-                index = positions[anchor]
-                selected = timeline[max(0, index - before):index + after + 1]
-            else:
-                first, last = positions[start], positions[end]
-                if first > last:
-                    raise ValueError("start 必须早于或等于 end")
-                selected = timeline[first:last + 1]
-        return ([entry for entry in selected if (not selected_kinds or entry["kind"] in selected_kinds)
-                 and (source_window is None
-                      or tuple(entry.get("source_window") or entry["window"]) == source_window)], missing)
-
-
 def _register(window: tuple | None, kind: str, **values: Any) -> dict | None:
     if window is None:
         return None
@@ -779,60 +623,6 @@ def input(window: tuple | None, event: dict, projection: dict | None, arrival: s
                          origin=origin, source=pending.get("source"),
                          source_window=list(source_window) if source_window is not None else original,
                          read_by=read_by, read_via=read_via)
-
-
-def input_tools(window: tuple, content: str) -> dict:
-    """Append tool state as an ordinary formal input, without an unread source."""
-    return _register(window, "input", event={"type": "tools", "content": content},
-                     projection={"role": "user", "content": content},
-                     read_by=None, read_via=None)
-
-
-def input_archive(window: tuple, event: dict, projection: dict, origin: str,
-                  source_window: tuple, *, arrival: str | None = None,
-                  source: str | None = None, page: int | None = None,
-                  offset: int | None = None, mentioned: bool = False,
-                  read_by: str | None = None, read_via: str | None = None) -> dict:
-    """Record an archive reread and consume any matching unread member."""
-    values = {"event": event, "projection": projection, "origin": origin,
-              "source_window": list(source_window), "archive": True,
-              "read_by": read_by, "read_via": read_via}
-    if arrival is not None:
-        values["arrival"] = arrival
-    if source is not None:
-        values.update(source=source, page=page, offset=offset, mentioned=mentioned)
-    return _register(window, "input", **values)
-
-
-def input_source(window: tuple, event: dict, projection: dict | None, source: str,
-                 page: int, offset: int, origin: str | None, source_window: tuple,
-                 arrival: str | None = None, mentioned: bool = False,
-                 read_by: str | None = None, read_via: str | None = None) -> dict:
-    """Index one sealed page member; replay derives the unread holes."""
-    with _lock:
-        _restore()
-        if window is None:
-            raise ValueError("source input needs a read window")
-        values = {"event": event, "projection": projection, "source": source,
-                  "page": page, "offset": offset, "origin": origin,
-                  "source_window": list(source_window), "mentioned": mentioned,
-                  "read_by": read_by, "read_via": read_via}
-        if arrival is not None:
-            values["arrival"] = arrival
-        return _register(window, "input", **values)
-
-
-def origin_status(window: tuple | None, origin: str) -> str | None:
-    """Return the indexed id or a pending marker for one exact chatlog record."""
-    with _lock:
-        _restore()
-        key = (tuple(window or ()), origin)
-        if key in _origins:
-            return _origins[key]["id"]
-        if any(tuple(item["window"]) == key[0] and item.get("origin") == origin
-               for item in _pending.values()):
-            return "pending"
-        return None
 
 
 def output(window: tuple | None, assistant: dict, calls: list[dict],
@@ -865,132 +655,3 @@ def events(window: tuple | None, include_condensed: bool = False) -> list[dict]:
                 if not item.get("hidden")
                 and (include_condensed or (not item.get("collapsed")
                                            and item["id"] not in _covered.get(tuple(window or ()), ())))]
-
-
-def covered(window: tuple | None) -> set[str]:
-    with _lock:
-        _restore()
-        return set(_covered.get(tuple(window or ()), ()))
-
-
-def coverage_members(window: tuple | None, node: str) -> list[str] | None:
-    with _lock:
-        _restore()
-        source = _by_id.get(node.partition("#")[0])
-        if source is None or not _accessible(window, source):
-            return None
-        members = _coverage_nodes.get(node)
-        return list(members) if members is not None else None
-
-
-def reference_links(window: tuple | None, ids: Iterable[str]) -> dict[str, dict]:
-    """Resolve text mentions separately from coverage and tool-result source links."""
-    with _lock:
-        _restore()
-        selected = {}
-        requested = list(dict.fromkeys(str(value) for value in ids))
-        outputs = {event_id for event_id in requested
-                   if event_id in _by_id and _by_id[event_id]["kind"] == "output"}
-        reads: dict[str, list[str]] = {event_id: [] for event_id in outputs}
-        for item in _events:
-            if item["kind"] == "input" and item.get("read_by") in reads:
-                reads[item["read_by"]].append(item["id"])
-        for event_id in requested:
-            entry = _by_id.get(event_id)
-            if (entry is None or not _accessible(window, entry)
-                    or (entry["kind"] == "input" and entry.get("projection") is None)):
-                continue
-            covered_by = [node for node, members in _coverage_nodes.items() if event_id in members]
-            selected[event_id] = {
-                "mentions": list(entry.get("_mentions", ())),
-                "mentioned_by": list(_mentioned_by.get(event_id, ())),
-                "covers": {node: list(members) for node, members in _coverage_nodes.items()
-                           if node.partition("#")[0] == event_id},
-                "covered_by": covered_by,
-                "source": entry.get("source") if entry["kind"] == "result" else None,
-                "reads": reads.get(event_id, []),
-            }
-        return selected
-
-
-def cover(window: tuple, node: str, ids: Iterable[str], visible: set[str]) -> set[str]:
-    """Commit one validated coverage fact; all projections derive from its journal."""
-    with _lock:
-        _restore()
-        source, separator, position = node.partition("#")
-        output = _by_id.get(source)
-        if (not separator or not position.isdecimal() or output is None
-                or output["kind"] != "output" or output["window"] != list(window)
-                or not 1 <= int(position) <= len(output["actions"])
-                or output["actions"][int(position) - 1]["name"] != "cover_events"):
-            raise ValueError("覆盖节点必须是本窗口本次 cover_events 行动")
-        if node in _coverage_nodes:
-            raise ValueError("这次总结行动已经提交过覆盖")
-        requested = {str(event_id) for event_id in ids}
-        if not requested or source in requested:
-            raise ValueError("须指定非自身的已读事件")
-        all_entries = _events if window == AGENT_WINDOW else _windows.get(window, ())
-        by_source: dict[str, list[dict]] = {}
-        for entry in all_entries:
-            if entry["kind"] == "result":
-                by_source.setdefault(entry["source"], []).append(entry)
-        closure = set(requested)
-        for event_id in requested:
-            entry = _by_id.get(event_id)
-            if entry is None or not _accessible(window, entry):
-                raise ValueError(f"不是本窗口已读事件: {event_id}")
-        while True:
-            expanded = set(closure)
-            for event_id in closure:
-                entry = _by_id[event_id]
-                if entry["kind"] == "result":
-                    expanded.add(entry["source"])
-                elif entry["kind"] == "output":
-                    expanded.update(result["id"] for result in by_source.get(event_id, ()))
-            if expanded == closure:
-                break
-            closure = expanded
-        for event_id in closure:
-            entry = _by_id[event_id]
-            if entry["kind"] == "output":
-                positions = [item["position"] for result in by_source.get(event_id, ())
-                             for item in result["returns"]]
-                if sorted(positions) != list(range(len(entry["actions"]))):
-                    raise ValueError(f"输出 {event_id} 还有未读或未返回的行动，不能拆批覆盖")
-        if source in closure:
-            raise ValueError("覆盖不能包含本次输出")
-        for event_id in closure:
-            entry = _by_id.get(event_id)
-            if (entry is None or not _accessible(window, entry)
-                    or (event_id not in visible and event_id not in _covered.get(window, ())
-                        and not (window == AGENT_WINDOW and event_id in _covered.get(tuple(entry["window"]), ())))
-                    or entry.get("hidden") or entry.get("collapsed")
-                    or (entry["kind"] == "input" and entry.get("projection") is None)):
-                raise ValueError(f"覆盖成员不在当前主窗口可见已读流中: {event_id}")
-        _append({"kind": "cover", "window": list(window), "node": node,
-                 "members": sorted(closure)}, datetime.now().strftime("%Y%m%d"))
-        return closure
-
-
-def sent_by(message_id: int | str, target_window: tuple) -> str | None:
-    """Find one already-recorded central say return for this exact destination."""
-    from mods.chat.reader import parse_target
-
-    with _lock:
-        _restore()
-        matches = []
-        for entry in _windows.get(AGENT_WINDOW, ()):
-            if entry["kind"] != "result":
-                continue
-            for item in entry["returns"]:
-                if item.get("name") != "say" or str(item.get("content")) != str(message_id):
-                    continue
-                try:
-                    arguments = json.loads(item["arguments"])
-                    parsed = parse_target(arguments["target"])
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if parsed != target_window:
-                    continue
-                matches.append(f"{entry['source']}#{item['position'] + 1}")
-        return matches[0] if len(matches) == 1 else None

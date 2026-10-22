@@ -7,7 +7,7 @@ oldest to newest.  A reader reverses page order without collecting the source.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable
 import json
 import os
 from pathlib import Path
@@ -217,13 +217,3 @@ def read_page_info(root: str | os.PathLike, source_uuid: str | UUID,
 def read_page(root: str | os.PathLike, source_uuid: str | UUID, page_number: int) -> list[dict]:
     """Read one bounded page of archive references."""
     return read_page_info(root, source_uuid, page_number)[1]
-
-
-def iter_oldest(
-    root: str | os.PathLike, source_uuid: str | UUID, page_count: int,
-) -> Iterator[dict]:
-    """Yield oldest to newest, keeping at most one page of members in memory."""
-    if isinstance(page_count, bool) or not isinstance(page_count, int) or page_count < 0:
-        raise ValueError("page_count must be a nonnegative integer")
-    for page_number in range(page_count - 1, -1, -1):
-        yield from read_page(root, source_uuid, page_number)

@@ -37,8 +37,8 @@ def is_op(user_or_msg: int | dict[str, Any]) -> bool:
 
     WHY: 传事件时读的是 ``history.author``，不是顶层 ``user_id``。私聊窗口的 ``user_id``
     是**窗口对端**，Bot 自己发的话也带着对端的 id，于是"这是谁"在那个字段上问不出来；
-    ``sender.user_id`` 才是两种窗口下都指向作者的字段（与 ``history.same_author``、
-    ``chat.msg2chat`` 同一条约定）。传整数时它就是那个人自己的 id，没有这层区分。
+    ``sender.user_id`` 才是两种窗口下都指向作者的字段（与 ``history.same_author``
+    同一条约定）。传整数时它就是那个人自己的 id，没有这层区分。
 
     Bot 作者是唯一的特例：它不借 ``ops`` 名单，而读 ``config.bot_permissions.op``。
     这样自有行动的权限不会随当前消息作者改变，显式代行的作者仍照常查 ``ops``。

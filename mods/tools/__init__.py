@@ -868,8 +868,8 @@ class SessionBinding:
 
         WHY: 空闲回收的判据是"用过没有"，而"用过"只有调用那一刻知道。不在这里等调用——
         工具是 `llm` 那层直接 `tool.call(**arguments)` 执行的，它不认识 binding，所以由
-        调用方在工具结果回来时把名字递进来（`chat._stream_results`，每个工具结果都经过
-        它）。名字是模型面向的那个（`<模块名>__<函数名>`），归属查 `_owner`，不从名字反解；
+        调用方在工具结果回来时把名字递进来（`chat.agent._run_session` 的结果回调，每个
+        工具结果都经过它）。名字是模型面向的那个（`<模块名>__<函数名>`），归属查 `_owner`，不从名字反解；
         `meta` 不记，反正它每轮都在，记了只会在 `_touched` 里多一个谁也不看的条目。
         """
         owner = self._owner.get(tool_name)

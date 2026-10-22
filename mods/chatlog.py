@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import mmap
 import os
 from pathlib import Path
 import re
@@ -28,9 +27,6 @@ _window_locks: dict[Path, threading.RLock] = {}
 _boot_anchors: dict[tuple[str, int], str | None] | None = None
 _line_positions: dict[str, tuple[int, int]] = {}
 _live_origins: dict[int, tuple[dict, str]] = {}
-_recall_lock = threading.Lock()
-_recalls: dict[tuple[str, int], set[str]] = {}
-_live_recalls: dict[tuple[str, int], set[str]] = {}
 
 
 def _window_lock(directory: Path) -> threading.RLock:
@@ -392,12 +388,6 @@ def _notice(msg: dict[str, Any]) -> str | None:
             group_id=group_id,
             user_id=None if group_id is not None else user_id,
         )
-        key = ("group", group_id) if group_id is not None else ("private", user_id)
-        if key[1] is not None:
-            with _recall_lock:
-                _live_recalls.setdefault(key, set()).add(recall_key(msg["message_id"]))
-                if key in _recalls:
-                    _recalls[key].add(recall_key(msg["message_id"]))
 
     name = identity.get_user_name(user_id) if user_id is not None else "[unknown]"
     title = ""
@@ -1287,157 +1277,6 @@ def read_range(
     return records
 
 
-_HEAD_ID = re.compile(rb" \| ([^\n]*)")
-_UNICODE_DIGIT_LEADS = tuple(bytes((lead,)) for lead in sorted({
-    chr(codepoint).encode("utf-8")[0] for codepoint in range(128, 0x110000)
-    if chr(codepoint).isdecimal()
-}))
-
-
-def _ordinary_may_have_id(path: Path, key: str) -> bool:
-    """Only skip a day when neither ASCII digits nor a Unicode decimal ID can match.
-
-    A possible day still goes through the existing exact merged SQLite view.
-    """
-    if not path.is_file() or path.stat().st_size == 0:
-        return False
-    raw_key = key.encode("utf-8")
-    numeric = key.lstrip("-").isdigit()
-    digits = key.lstrip("-").encode("utf-8") if numeric else raw_key
-    with path.open("rb") as file, mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as content:
-        if content.find(digits) < 0 and (not numeric or not any(
-                content.find(lead) >= 0 for lead in _UNICODE_DIGIT_LEADS)):
-            return False
-        for match in _HEAD_ID.finditer(content):
-            start = content.rfind(b"\n", 0, match.start()) + 1
-            if content[start:start + 4] == b"    ":
-                continue
-            raw_id = match[1]
-            if digits not in raw_id and (not numeric or raw_id.isascii()):
-                continue
-            if recall_key(raw_id.decode("utf-8")) == key:
-                return True
-    return False
-
-
-def _sidecar_may_have_id(path: Path, key: str, root: str | os.PathLike | None) -> bool:
-    if not path.is_file():
-        return False
-    found = False
-    with _backfill_archive._lock:
-        for _, _, message in _backfill_archive._iter_sidecar(
-                path, rootfile if root is None else root):
-            found |= recall_key(message["message_id"]) == key
-    return found
-
-
-def read_around(
-    kind: str,
-    target: int | str,
-    *,
-    message_id: int | str | None = None,
-    origin: str | None = None,
-    timestamp: int | None = None,
-    before: int = 0,
-    after: int = 0,
-    bot_id: int | None = None,
-    root: str | os.PathLike | None = None,
-) -> list[dict[str, Any]]:
-    """Read one window around an exact archived message, oldest first.
-
-    ``message_id`` is only a lookup key, not assumed globally unique.  An
-    ambiguous match must be narrowed with ``timestamp`` or the returned stable
-    ``origin``.  Reading the archive never consumes a mailbox or assigns input
-    event ids.
-    """
-    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
-           for value in (before, after)):
-        raise ValueError("before 和 after 必须是非负整数")
-    if timestamp is not None and (isinstance(timestamp, bool) or not isinstance(timestamp, int)):
-        raise ValueError("timestamp 必须是整数秒")
-    if (message_id is None) == (origin is None):
-        raise ValueError("请只指定 message_id 或 origin")
-    directory = window_path(kind, target, root)
-    if not directory.is_dir():
-        return []
-    if bot_id is None:
-        bot_id = _bot_id()
-    switch = _switch_moment()
-    bot_names, names_complete = _bot_identities()
-    days = _archive_days(directory)
-    with _window_lock(directory), closing(_reader_index(directory)) as database:
-        anchor_day = anchor_position = anchor_row = None
-        if origin is not None:
-            anchor_day, anchor_position, anchor_row = _locate_origin(
-                kind, target, origin, root, database)
-            if timestamp is not None:
-                record = _read_indexed_record(kind, target, anchor_day, anchor_row, bot_id,
-                                              switch, bot_names, names_complete, root)
-                if record.get("time") != timestamp:
-                    return []
-        else:
-            key = recall_key(message_id)
-            candidates = []
-            for day in days:
-                ordinary, sidecar = _day_paths(kind, target, day, root)
-                possible = _ordinary_may_have_id(ordinary, key)
-                if not possible and kind != "bot":
-                    possible = _sidecar_may_have_id(sidecar, key, root)
-                if not possible:
-                    continue
-                day_key = _index_day(database, kind, target, day, root)
-                query = ("SELECT source, line, offset, end, position, stamp FROM reader_rows "
-                         "WHERE day=? AND visible=1 AND message_id=?")
-                params: tuple[Any, ...] = (day_key, key)
-                if timestamp is not None:
-                    query += " AND stamp=?"
-                    params += (timestamp,)
-                candidates.extend((day, row) for row in database.execute(query, params))
-            if not candidates:
-                return []
-            if len(candidates) != 1:
-                choices = []
-                for day, row in candidates:
-                    record = _read_indexed_record(kind, target, day, row[:4], bot_id,
-                                                  switch, bot_names, names_complete, root)
-                    choices.append(f"origin={record.get('_log_origin')} time={record.get('time')}")
-                raise ValueError("message_id 在该窗口命中多条记录，请加 timestamp 或改用 origin："
-                                 + "；".join(choices))
-            anchor_day, row = candidates[0]
-            anchor_position, anchor_row = row[4], row[:4]
-        day_index = days.index(anchor_day)
-
-        def rows_on(day_index: int, clause: str, params: tuple[Any, ...], order: str,
-                    count: int) -> list[tuple[tuple[int, int, int], tuple]]:
-            if count <= 0:
-                return []
-            day = days[day_index]
-            day_key = _index_day(database, kind, target, day, root)
-            rows = database.execute(
-                "SELECT source, line, offset, end, position FROM reader_rows "
-                f"WHERE day=? AND visible=1 {clause} ORDER BY position {order} LIMIT ?",
-                (day_key, *params, count),
-            )
-            return [(day, row) for row in rows]
-
-        older = rows_on(day_index, "AND position<?", (anchor_position,), "DESC", before)
-        for index in range(day_index + 1, len(days)):
-            if len(older) >= before:
-                break
-            older.extend(rows_on(index, "", (), "DESC", before - len(older)))
-        newer = rows_on(day_index, "AND position>?", (anchor_position,), "ASC", after)
-        for index in range(day_index - 1, -1, -1):
-            if len(newer) >= after:
-                break
-            newer.extend(rows_on(index, "", (), "ASC", after - len(newer)))
-        selected = [*reversed(older), (anchor_day, (*anchor_row, anchor_position)), *newer]
-        return [
-            _read_indexed_record(kind, target, day, row[:4], bot_id, switch,
-                                 bot_names, names_complete, root)
-            for day, row in selected
-        ]
-
-
 def known_windows() -> list[tuple[str, int]]:
     """Only windows already represented in the local archive are boot candidates."""
     windows = []
@@ -1502,39 +1341,6 @@ def freeze_boot_anchors() -> dict[tuple[str, int], str | None]:
         return dict(_boot_anchors)
 
 
-def recalled_ids(kind: str, target: int | str) -> set[str]:
-    """Index recall notices from the chatlog authority, then follow live writes."""
-    key = kind, int(target)
-    with _recall_lock:
-        if key in _recalls:
-            return set(_recalls[key])
-    found: set[str] = set()
-    for path in sorted(window_path(*key).rglob("*.log")):
-        day = day_of(path)
-        if day is None:
-            continue
-        try:
-            content = path.read_text(encoding="utf-8")
-        except OSError:
-            logger.exception("读取 chatlog 撤回记录失败")
-            raise
-        for line in content.splitlines():
-            if not line.startswith(": "):
-                continue
-            stamp = _TIME_SUFFIX.search(line)
-            shown = line[2:stamp.start()].rstrip() if stamp else line[2:].rstrip()
-            recall = _RECALL.search(shown)
-            if recall is not None:
-                found.add(recall_key(recall["message_id"]))
-    with _recall_lock:
-        found.update(_live_recalls.get(key, ()))
-        if key in _recalls:
-            _recalls[key].update(found)
-        else:
-            _recalls[key] = found
-        return set(_recalls[key])
-
-
 # --- rebuilding recent history at boot --------------------------------------
 #
 # This replaces ``data/cache_msgs``, which was a second write authority for the
@@ -1542,8 +1348,8 @@ def recalled_ids(kind: str, target: int | str) -> set[str]:
 # than rebuilding the whole tree.
 #
 # What goes back in is **v1 message records and pokes**.  A v0 body is a display
-# projection and a v0 private record has no sender at all, so ``chat.msg2chat``
-# would read the Bot's own past lines as the peer's -- hence the floor at the
+# projection and a v0 private record has no sender at all, so a reader of
+# ``history`` would take the Bot's own past lines for the peer's -- hence the floor at the
 # switch moment, which also bounds the walk: it stops at the first day file
 # entirely older than the switch instead of walking the archive.  A poke has no
 # such gap, because its only consumer re-renders it through ``format_poke``.
