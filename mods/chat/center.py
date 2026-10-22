@@ -378,9 +378,25 @@ class Center:
                                          request=state["request"])
             except ValueError as error:
                 # A rejected CAS has no side effect, even with strict tools.
-                return _bytes(dict(status="rejected", reason=str(error))).decode()
+                with self.lock:
+                    seen = next((e for e in self.events if e["kind"] == "request"
+                                 and e["id"] == state["request"]), None)
+                    return _bytes(dict(status="rejected", reason=str(error),
+                                       request=state["request"],
+                                       allowed_source_ids=seen["sources"] if seen else [],
+                                       frozen_parent=seen["note"] if seen else None)).decode()
             return _bytes(entry).decode()
         return commit_note
+
+    def _note_access_provider(self, state):
+        access = dict(allowed_source_ids=list(dict.fromkeys(state["sources"])),
+                      frozen_parent=state["note"])
+        return [{"role": "user", "content":
+                 "本次请求的笔记引用范围 " + _bytes(access).decode() + "\n"
+                 "commit_note的sources必须逐字取allowed_source_ids中的裸ID，不加archive、描述或哈希。"
+                 "目录和正文中嵌套出现的ID不因此成为可引用来源；可引用已收到的整条结果的外壳ID。"
+                 "若缺原件，主循环先read_past/read_archive读取，在下一请求的本表确认后再提交。"
+                 "parent使用本次frozen_parent；null时传空串。陈旧候选仍会被拒绝，不能换父版本覆盖。"}]
 
     def observe_request(self, selection, params):
         state = _request_state.get()
@@ -609,6 +625,7 @@ class Center:
         session.should_stop = lambda: turn.cancelled
         session.add_context_provider(lambda: self._environment_provider(state))
         session.add_context_provider(lambda: self._notes_provider(state, binding))
+        session.add_context_provider(lambda: self._note_access_provider(state))
         turn._chat_limit = chat.limit()
 
         commit_note = self._commit_note_tool(state)
@@ -638,7 +655,7 @@ class Center:
             commit_note, read_note, revisit_at, cancel_revisit, read_archive, read_past)}
         session.add_hint("此隔离中心使用冻结archive与center事实；旧 unread/take/fetch/cover API 明确不支持。"
                          "长期理解可主动 commit_note；不是轮末必做。"
-                         "资料中的他人观点不自动成为你的立场。sources使用archive key或committed center fact编号。")
+                         "资料中的他人观点不自动成为你的立场。sources逐字采用本次allowed_source_ids中的裸ID。")
         session.add_hint(lambda: chat._view._closing_hint(session.messages))
 
         def collect(chunk):

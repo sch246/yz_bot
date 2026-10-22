@@ -45,6 +45,7 @@ def _run(c, state, session, job):
     session.fail_fast = True
     session.on_output = lambda assistant, calls: c._output(state, assistant, calls)
     session.on_results = lambda output, results, native: c._results(state, None, output, results)
+    session.add_context_provider(lambda: c._note_access_provider(state))
     # The final allowed response still commits its complete tool batch. A role
     # never starts another request merely to announce that it has finished.
     session.turn_done = lambda: state["request_count"] >= c.role_request_limit
