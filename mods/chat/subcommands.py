@@ -24,15 +24,13 @@ _SUBCOMMAND_HELP = (
     ("del_setting <name>", "删除设定"),
     ("image [off|lazy|eager]", "查看或设置图片读取档位"),
     ("reasoning [keep|drop]", "查看或设置中心已读输出是否原生带回思考内容"),
-    ("reset_start", "安排下一次激活重选中心历史起点（管理员）"),
-    ("limit [<事件数> <token> [提醒百分比]|reset]", """查看或设置中心 agent 的全局可见事件数、上下文 token 上限与提醒阈值（管理员）。
+    ("limit [<画面条数> <token> [重选百分比]|reset]", """查看或设置中心 agent 的窗口画面条数、单次唤醒上下文上限与重选阈值（管理员）。
 
-格式：#limit | #limit <事件数> <token> [提醒百分比] | #limit reset
-两个上限只在首次激活或 #reset_start 后决定历史起点；之后不自动裁剪。提醒百分比决定模型末尾何时显示上下文 token 用量（已用/上限），达到 token 上限时要求先压缩。默认值分别为 500、40000、75%。
-#limit                  显示全局两个上限和提醒百分比，并标出值来自全局覆盖还是默认
-#limit <事件数> <token> [提醒百分比] 写入全局上限；省略百分比则保留原设置
-#limit reset            清掉全局上限与提醒百分比，回落到默认
-未读 mail 不受历史限额丢弃。"""),
+格式：#limit | #limit <画面条数> <token> [重选百分比] | #limit reset
+每次唤醒都重新组装上下文：画面条数是一个窗口默认展示多少条聊天记录；一次唤醒里上下文长到 token×重选百分比 时，按当时情况重新选材再继续。默认值分别为 80、40000、75%。
+#limit                  显示三个值，并标出来自全局覆盖还是默认
+#limit <画面条数> <token> [重选百分比] 写入全局设置；省略百分比则保留原设置
+#limit reset            清掉全局设置，回落到默认"""),
     ("hint [get|set|default]", """查看、编写或开关本窗口的结束提示（管理员）。
 
 格式：#hint | #hint get | #hint set <代码> | #hint set | #hint default [get|set <代码>]
@@ -53,7 +51,7 @@ _SUBCOMMAND_NAMES = {pattern.partition(" ")[0] for pattern, _description in _SUB
 def requires_op(value: str) -> bool:
     name, _, tail = value.strip().partition(" ")
     return (name == "hint" or name in {"use_model", "add_prompt", "use_setting", "set_setting",
-                                       "del_setting", "reset_start"}
+                                       "del_setting"}
             or name in {"image", "reasoning", "limit"} and bool(tail.strip()))
 
 
@@ -242,9 +240,9 @@ def _limit_report() -> str:
 
 
 def _limit_set(tail: str) -> str:
-    """`#limit <事件数> <token> [提醒百分比]` 写全局设置；`reset` 回落默认。
+    """`#limit <画面条数> <token> [重选百分比]` 写全局设置；`reset` 回落默认。
 
-    WHY: 两个历史上限仍一起写，避免只改其中一个造成难解释的半份配置。提醒百分比
+    WHY: 画面条数与 token 上限仍一起写，避免只改其中一个造成难解释的半份配置。重选百分比
     可选，不写就保留原设置；老的两参数命令因此不会意外重置它。
     """
     data = storage.get("", "agent")
@@ -278,12 +276,6 @@ def _subcommand(value: str):
     name, _, tail = value.partition(" ")
     tail = tail.strip()
     data = storage.get("", "agent")
-    if name == "reset_start" and not tail:
-        data.pop("history_start", None)
-        data.pop(_chat_root._TOLD_TOOLS_KEY, None)
-        data.pop(_chat_root._SCHEMA_MODULES_KEY, None)
-        storage.save()
-        return "已安排在下一次激活时重选中心历史起点"
     if name == "help" and not tail:
         return _subcommand_help()
     if name == "help" and tail:

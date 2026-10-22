@@ -22,8 +22,8 @@ LOAD_AFTER = ("chatlog", "history", "identity", "image", "llm", "oplog", "storag
 IMAGE_MODES = ("off", "lazy", "eager")
 IMAGE_MODE_ALIASES = {"0": "off", "1": "lazy", "2": "eager"}
 
-# WHY: 中心 keep 保留原生思考直到 cover；drop 以无思考的
-# 文本投影省 token。
+# WHY: 历史选项。2026-10-19 起思考只在一次唤醒之内保留，跨唤醒一律不保留（维护者裁定），
+# 这个设置暂时不再影响中心会话，等清理时一并决定去留。
 REASONING_MODES = ("keep", "drop")
 REASONING_ALIASES = {"on": "keep", "off": "drop", "1": "keep", "0": "drop"}
 
@@ -33,9 +33,10 @@ chat_groups: list = []
 description_cache: dict = {}
 llm_config: dict = {}
 # WHY: 两个上限的默认值写死在这里，不再读 llm_system/config.json；运行期由全局
-# agent storage 覆盖。两个值只在首次激活或显式重置时决定起点；此后不自动遗忘。
-# 500 条避免极短事件挤占首次视野，40000 token 是自主压缩的信号。
-DEFAULT_MAX_EVENTS = 500
+# agent storage 覆盖。2026-10-19 起每次请求都重新组装：max_events 是一个窗口画面
+# 默认展示的条数（参照 QQ-agent 的 80），max_token 乘提醒百分比是一次唤醒里上下文
+# 长到多少就重新选材。存储键沿用旧名，免得已有的全局设置失效。
+DEFAULT_MAX_EVENTS = 80
 DEFAULT_MAX_TOKEN = 40000
 AGENT_WINDOW = oplog.AGENT_WINDOW
 MAX_PULL_EVENTS = 500
@@ -228,7 +229,7 @@ def init_chat(
     # `_persist_modules`，理由写在那里。
     # WHY: 装回不是无限的：超过时限没用过的模块会在 `restore` 里被收掉，并给模型一条
     # 通告——"只进不出"会让每次 `load_tools` 都永久占着基线消息。判据用的是每个模块最后
-    # 一次被调用的时刻，所以 bind 出来的那个对象要一直拿着，供 `_stream_results` 上报。
+    # 一次被调用的时刻，所以 bind 出来的那个对象要一直拿着，供 `agent._run_agent` 的结果回调上报。
     binding = tool_modules.bind_session(
         session,
         None,
@@ -262,10 +263,6 @@ def _activate_chat(
     # 改变这一轮是否完成回收。
     session.do_process_image = get_image_mode() != "off"
     session.keep_reasoning = get_reasoning_mode() == "keep"
-    # WHY: 中心 reader 对能够原样恢复的 DeepSeek 输出保留原生配对，其余记录使用正式事件文本。
-    session.preserve_native = session.keep_reasoning
-    session.on_output = lambda assistant, calls: _record_output(window, assistant, calls, session)
-    session.on_results = _agent._stream_results(window, binding)
     return binding
 
 
@@ -293,8 +290,8 @@ def get_handler(session: llm.Chat):
     """The per-chunk sink: self-talk to the terminal, cost to the ledger.
 
     WHY: 模型写在回复正文里的内容**不发进聊天**。发言仍只能调用 `say`（见
-    `tools/meta.py`）；正文是自己的输出轨迹，会随正式输出事件跨轮重建，直到被覆盖。
-    这样模型能记得刚才的计划，但不会把自言自语误当成已发送消息。
+    `tools/meta.py`）；正文是自己的输出轨迹，记进 oplog，之后以行动记录里的「（自语）」
+    出现。这样模型能记得刚才的计划，但不会把自言自语误当成已发送消息。
 
     WHY: 但它要打到终端。人得看得见模型在想什么，尤其是在它**忘了调 `say`**的时候——那
     种轮对聊天窗口是完全静默的，终端这一行是唯一的痕迹。用 msg 流而不是另开一个，是为了
@@ -314,30 +311,6 @@ def get_handler(session: llm.Chat):
             inc_call_cost(session.model, chunk.prompt_tokens, chunk.completion_tokens, chunk.cached_tokens, chunk.requested_at)
 
     return handle
-
-
-def _record_output(window, assistant: dict, calls: list[dict], session=None) -> tuple[str, dict] | None:
-    offline = _offline_scope.get()
-    source = oplog.output(
-        window, assistant, calls,
-        persist_reasoning=bool(offline and offline.get("persist_reasoning")),
-        model=session.model if session is not None and window == AGENT_WINDOW else None,
-    )
-    if source is None:
-        return None
-    entry, missing = oplog.recall_events(window, [source])
-    if missing:
-        raise RuntimeError("刚写入的模型输出无法反查")
-    native = (_view._native_assistant(entry[0], session.model)
-              if session is not None and window == AGENT_WINDOW and session.preserve_native else None)
-    if native is not None:
-        session.native_sources.add(source)
-        _view._remember_stream(session, assistant, source)
-        return source
-    projection = _view._output_projection(entry[0], show_thought=session.keep_reasoning if session else True)
-    if session is not None:
-        _view._remember_stream(session, projection, source)
-    return source, projection
 
 
 def _window_storage(window: tuple) -> dict:
@@ -611,7 +584,7 @@ def _subcommand_call(event: dict) -> Callable | None:
     if subcommand not in _subcommands._SUBCOMMAND_NAMES:
         return None
     if _subcommands.requires_op(value[1:]) and not op.require_op(
-            event, pattern=r"^#\s*(hint|use_model|add_prompt|use_setting|set_setting|del_setting|image|reasoning|limit|reset_start)"):
+            event, pattern=r"^#\s*(hint|use_model|add_prompt|use_setting|set_setting|del_setting|image|reasoning|limit)"):
         # WHY: 全局设置不可由普通群友改写；只读子命令保持公开。
         return None
     return lambda value=value: _subcommands._subcommand(value[1:])
@@ -788,6 +761,6 @@ def on_load(ctx) -> None:
                 traceback.print_exc()
 
     threading.Thread(target=resume_pending, name="chat-agent-resume", daemon=True).start()
-from . import view as _view, reader as _reader, agent as _agent, subcommands as _subcommands
+from . import view as _view, reader as _reader, agent as _agent, roles as _roles, subcommands as _subcommands
 from .view import has_at, msg_split, msg2chat, event2chat
 from .reader import parse_target, unread_details, prepare_recovery_sources, fetch_remote_source, unread_members, mark_window_read, mark_source_read

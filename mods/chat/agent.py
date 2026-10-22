@@ -1,104 +1,138 @@
+"""The central agent loop: every request is assembled afresh from durable state.
+
+WHY: 2026-10-19 the maintainer replaced "replay the agent's own transcript from
+a fixed start" with a per-activation rebuild (see
+docs/working/proposals/stateless-agent-loop.md).  The oplog still records every
+output and result; it is no longer shown back wholesale.  What the model sees is
+chosen by the selector each time, so unrelated old detail drops out simply by
+not being chosen again, and comes back when something makes it relevant.
+"""
+
 from __future__ import annotations
 
 import json
-import re
+import time
 
-from mods import context, image, llm, message, oplog
+from mods import context, image, llm, oplog, storage
 
 import mods.chat as _chat_root
-from . import view as _view, reader as _reader
+from . import actions as _actions, notes as _notes, reader as _reader, roles as _roles, screen as _screen, view as _view
 
-def _stream_results(window, binding):
-    def record(source: str, results: list[llm.ToolCallResult],
-               native_results: list[dict]) -> None:
-        for result in results:
-            binding.touch(result.name)
-        if window is None:
-            return
-        session = binding.session
-        if not results:
-            if window == _chat_root.AGENT_WINDOW and session.reads_window_mail and source in session.native_sources:
-                found, missing = oplog.recall_events(window, [source])
-                if missing:
-                    raise RuntimeError("刚写入的模型输出无法反查")
-                tag = _view._event_refs(found[0])
-                session.messages.append(tag)
-                _view._remember_stream(session, tag, source)
-            return
-        returns = [{"position": position, "name": result.name,
-                    "arguments": result.arguments, "content": result.content,
-                    "tool_call_id": result.tool_call_id}
-                   for position, result in enumerate(results)]
-        recorded = oplog.result(window, source, returns, "")
-        if window == _chat_root.AGENT_WINDOW and binding.session.reads_window_mail:
-            if source in session.native_sources and len(native_results) == len(results):
-                for message, result in zip(native_results, returns):
-                    _view._remember_stream(session, message, recorded["id"])
-                    _credit_recall(session, result, message)
-                found, missing = oplog.recall_events(window, [source])
-                if missing:
-                    raise RuntimeError("刚写入的模型输出无法反查")
-                tag = _view._event_refs(found[0], recorded)
-                session.messages.append(tag)
-                _view._remember_stream(session, tag, source)
-            else:
-                projection = _view._result_projection(recorded)
-                session.pending_results.append((recorded, projection))
-    return record
+_SEEN_KEY = "seen"
+# Within one activation, results older than these stay readable by id only.
+_CURRENT_FULL = 12
+_CURRENT_CHARS = 1500
+# A window never seen before shows this much even when the selector asked only for new lines.
+_FIRST_LOOK = 20
+_LEAD_IN = 3
 
 
+def _text_tokens(messages: list[dict]) -> int:
+    def strip(value):
+        if isinstance(value, list):
+            return [strip(part) for part in value]
+        if isinstance(value, dict):
+            if value.get("type") == "image_url":
+                return "[image]"
+            return {key: strip(part) for key, part in value.items()}
+        return value
 
-def _trusted_stream_ids(session: llm.Chat) -> set[str]:
-    _prune_stream_ids(session)
-    return {event_id for message in session.messages
-            if (event_id := _stream_id(session, message)) is not None}
-
-
-def _stream_id(session: llm.Chat, message: dict) -> str | None:
-    remembered = session.stream_ids.get(id(message))
-    return remembered[1] if remembered is not None and remembered[0] is message else None
-
-
-def _prune_stream_ids(session: llm.Chat) -> None:
-    live = {id(message) for message in session.messages}
-    # WHY: on_output 在 assistant 加入 messages 前登记其映射；同批工具中的
-    # cover_events 需要看见当前 O，因此暂留 active_action 所属输出。
-    active_source = str(getattr(session, "active_action", "") or "").partition("#")[0]
-    session.stream_ids = {key: pair for key, pair in session.stream_ids.items()
-                          if key in live or active_source and pair[1] == active_source}
+    return _chat_root.count_tokens(json.dumps(strip(messages), ensure_ascii=False))
 
 
-def _cover_agent_projection(session: llm.Chat, members: set[str]) -> None:
-    session.messages[:] = [message for message in session.messages
-                          if _stream_id(session, message) not in members]
-    _prune_stream_ids(session)
+def _seen() -> dict:
+    data = storage.get("", "agent")
+    value = data.get(_SEEN_KEY)
+    if not isinstance(value, dict):
+        value = data[_SEEN_KEY] = {}
+    return value
 
 
-def _visible_stream_ids(messages: list[dict]) -> set[str]:
-    visible = set()
-    for message in messages:
-        if message.get("role") != "user":
+def _woken(notice: dict | None, turn) -> tuple[list[tuple], list[str]]:
+    windows: list[tuple] = []
+    lines: list[str] = []
+    if notice is not None:
+        for item in notice.get("activations", []):
+            window = tuple(item["window"])
+            windows.append(window)
+            stamp = _screen.clock(item["time"]) if isinstance(item.get("time"), (int, float)) else "?"
+            lines.append(f"{_screen.label(window)} {item.get('kind')} 作者={item.get('user_id')} 时间={stamp}")
+        for window in notice.get("windows", []):
+            windows.append(tuple(window))
+    windows.extend(window for window in turn.associated_windows if window[0] in ("group", "private"))
+    return list(dict.fromkeys(windows)), lines
+
+
+def _current_actions(turn) -> list[str]:
+    found = _actions.pairs(ids=turn.action_ids) if turn.action_ids else []
+    older, recent = found[:-_CURRENT_FULL], found[-_CURRENT_FULL:]
+    lines = [_actions.title(output) for output, _result in older]
+    lines.extend(_actions.render(output, result, chars=_CURRENT_CHARS) for output, result in recent)
+    return lines
+
+
+def _assemble(plan: dict, turn) -> tuple[list[dict], dict[str, str], dict[tuple, int | None]]:
+    """Build the request body from the selector's plan; nothing else is replayed."""
+    seen = _seen()
+    messages: list[dict] = []
+    note_parts = [text for scope in dict.fromkeys(plan["notes"]) if (text := _notes.render(scope))]
+    if note_parts:
+        messages.append({"role": "user", "content": "以下是你的笔记（图书管理员整理，可能不完整）：\n\n"
+                         + "\n\n".join(note_parts)})
+    situation = []
+    if plan.get("situation"):
+        situation.append("情景说明（前置选材给出）：" + plan["situation"])
+    if plan.get("actions"):
+        situation.append("相关的过去行动：\n" + "\n".join(
+            _actions.render(output, result) for output, result in _actions.pairs(ids=plan["actions"])))
+    current = _current_actions(turn)
+    if current:
+        situation.append("本次唤醒中你已经做过的行动（较早的只列标题，可用 read_actions 读全文）：\n"
+                         + "\n".join(current))
+    if situation:
+        messages.append({"role": "user", "content": "\n\n".join(situation)})
+    screens: dict[str, str] = {}
+    newest: dict[tuple, int | None] = {}
+    for window, count in plan["windows"]:
+        mark = seen.get(_screen.label(window))
+        items = _screen.records(window, max(count, 1) + 200)
+        fresh = [item for item in items if mark is not None and item["time"] is not None and item["time"] > mark]
+        # WHY: 新消息全部展示，选材给的条数只决定还附多少旧消息；至少带上新消息之前的
+        # 几条接上话头。看到时间只精确到秒，同一秒里后到的那条也靠这几条不丢。
+        older = [item for item in items if item not in fresh][-max(count, _LEAD_IN):]
+        shown = older + fresh if mark is not None else items[-(count or _FIRST_LOOK):]
+        if not shown:
             continue
-        content = message.get("content")
-        first = content[0].get("text", "") if isinstance(content, list) and content and isinstance(content[0], dict) else content
-        match = re.match(r"^\[(\d{8}-[1-9]\d*)\] ", first) if isinstance(first, str) else None
-        if match:
-            visible.add(match[1])
-    return visible
+        text = _screen.render(window, shown, mark)
+        screens[_screen.label(window)] = text
+        newest[window] = _screen.latest_time(shown)
+        messages.append({"role": "user", "content": _view.msg_split(text)})
+    return messages, screens, newest
 
 
-def _pressure_hint(used_tokens: int, max_tokens: int, threshold: int) -> str:
-    if used_tokens >= max_tokens:
-        return (f"上下文占用 {used_tokens}/{max_tokens} token；"
-                "请先用 cover_events 压缩已读经历，再做别的事。")
-    if used_tokens * 100 <= max_tokens * threshold:
-        return ""
-    return f"上下文占用 {used_tokens}/{max_tokens} token"
+def _unread_hint(on_screen: set[tuple]) -> str:
+    rows = []
+    for detail in oplog.pending_details():
+        window = tuple(detail["window"])
+        if window[0] not in ("group", "private") or window in on_screen:
+            continue
+        rows.append(f"{_screen.label(window)} {detail['unread']} 条"
+                    + (f"（@你 {detail['mentions']}）" if detail["mentions"] else ""))
+    return ("其它窗口还有没看过的消息：" + "；".join(rows[:10])
+            + "。要看就用 read_log 读原文。") if rows else ""
 
 
-def _cover_projection(messages: list[dict], members: set[str]) -> None:
-    messages[:] = [message for message in messages
-                   if not (_visible_stream_ids([message]) & members)]
+def _mark_seen(newest: dict[tuple, int | None]) -> None:
+    seen = _seen()
+    for window, stamp in newest.items():
+        if stamp is not None:
+            seen[_screen.label(window)] = max(stamp, seen.get(_screen.label(window), 0))
+        try:
+            _reader.mark_window_read(window)
+        except ValueError:
+            # 离线补回仍在进行：未读前端没有固定，下次再标。
+            pass
+    storage.save()
 
 
 def _drive_agent(model: str | None, window: tuple) -> None:
@@ -108,6 +142,9 @@ def _drive_agent(model: str | None, window: tuple) -> None:
     turn._chat_usage_tokens = 0
     turn.requested_reads = []
     turn.associated_windows = {window}
+    turn.action_ids = []
+    turn.screens = {}
+    turn.reselect = False
     # WHY: 一次对话 = 这次持有的全过程（多轮 + 插话续写，直到 finally），图片检查台账就
     # 活在这段里：同一张图不重复下载/解析，对话结束即清掉，下次再聊重新检查一遍。
     image_ledger = image.begin_conversation()
@@ -122,274 +159,117 @@ def _drive_agent(model: str | None, window: tuple) -> None:
             finally:
                 context.set_agent_mode(False)
                 context.set_current(origin)
-            turn.requested_reads.clear()
             if turn.cancelled:
                 return
+            if turn.reselect:
+                # 同一次唤醒里上下文涨过阈值：不等新消息，按当前情况重新选材再继续。
+                turn.reselect = False
+                continue
             turn.associated_windows.intersection_update(
                 {window for window, _count, active in oplog.pending_summary() if active})
-            if not context.finish_turn(_chat_root.AGENT_WINDOW, turn,
-                                       oplog.has_unnotified):
+            if not context.finish_turn(_chat_root.AGENT_WINDOW, turn, oplog.has_unnotified):
                 return
     finally:
         image.end_conversation(image_ledger)
         context.end_turn(_chat_root.AGENT_WINDOW, turn)
+        if not turn.cancelled and (turn.screens or turn.action_ids) and _chat_root._offline_scope.get() is None:
+            _roles.enqueue({
+                "time": time.time(),
+                "screens": list(turn.screens.values()),
+                "actions": [_actions.render(output, result) for output, result in _actions.pairs(ids=turn.action_ids)],
+                "scopes": _roles.involved_scopes(
+                    [_reader.parse_target(label) for label in turn.screens], list(turn.screens.values())),
+            })
         # WHY: 循环停下的唯一信号就在这里，见 _run_hint。
         if origin is not None:
             _chat_root._run_hint(window, turn)
 
 
 def _run_agent(model: str | None, turn) -> bool:
-    offline = _chat_root._offline_scope.get()
-    if offline is not None and model != offline["model"]:
-        raise RuntimeError("offline replay model changed")
+    if _chat_root._offline_scope.get() is not None:
+        raise RuntimeError("离线回放尚未按无状态主循环重写")
     session = llm.Chat(model=model or _chat_root.get_model(), chat_client=llm.get_client())
-    if offline is not None:
-        session.fail_fast = True
-    session.stream_ids = {}
-    session.recalled_ids = set()
-    session.pending_results = []
-    session.native_sources = set()
     session.requested_reads = turn.requested_reads
     session.associated_windows = turn.associated_windows
-    session.notification_ids = []
     max_events, max_tokens = _chat_root.limit()
     turn._chat_limit = (max_events, max_tokens)
-    show_thought = _chat_root.get_reasoning_mode() == "keep"
-    # WHY: 上限只在首次激活或手动重置时固定历史起点；之后不滑窗。即使起点
-    # 对应事件后来被 cover，仍沿用原位置，模型须自己压缩而不能靠自动遗忘。
-    rows = _view.agent_rows(max_tokens, max_events,
-                            model=session.model if show_thought else None,
-                            show_thought=show_thought, turn=turn)
-    rows.extend(_reader._drain_legacy_results())
     notice = oplog.deliver_notifications(_chat_root.AGENT_WINDOW)
-    if notice is not None:
-        session.notification_ids.append(notice["id"])
-        turn.associated_windows.update(map(tuple, notice["windows"]))
-        # WHY: notice 是这一请求末尾交付的当前通知；失败重投时它也可能沿用较早的正式号。
-        # 不能按事件号重排每条投影，那会拆开原生 assistant/tool 块：event_refs 与
-        # assistant 共用 O 的编号，会被排到 R 对应的 tool 消息前面，供应商随即以配对
-        # 不完整拒绝请求。保留已构造历史的块顺序，再把本次通知放到末尾。
-        rows.append((notice, _view._notification_projection(notice)))
-    messages = []
-    for entry, projection in rows:
-        messages.append(projection)
-        _view._remember_stream(session, projection, entry["id"])
-    if not messages and not turn.requested_reads:
+    woken, activation_lines = _woken(notice, turn)
+    # 续做时没有新唤醒，默认沿用刚才看着的窗口；选材仍可以换掉它们。
+    focus = woken or [_reader.parse_target(label) for label in turn.screens]
+    if notice is None and not focus and not turn.action_ids:
         return True
-    _chat_root._activate_chat(session, messages)
-    for entry, projection in rows:
-        if entry["kind"] == "result":
-            for result in entry["returns"]:
-                _credit_recall(session, result, projection)
+    current = _current_actions(turn)
+    plan = _roles.select(focus, activation_lines, current, max_events)
+    messages, screens, newest = _assemble(plan, turn)
+    if not messages and notice is None:
+        return True
+    if notice is not None:
+        messages.append({"role": "user", "content": "这次唤醒你的是：\n" + "\n".join(activation_lines)})
+    binding = _chat_root._activate_chat(session, messages)
+    # WHY: 已加载模块的正文（Skill）以前只在加载那一刻进经历、靠重放留在眼前；现在每次
+    # 重建都给出完整工具状态，放在系统提示之后，跨唤醒不变的部分仍能命中前缀缓存。
+    binding.sync_registry()
+    told = [binding.state_snapshot()]
+    state = binding.state_text(None)
+    if state:
+        position = next((index for index, message in enumerate(session.messages)
+                         if message.get("role") != "system"), len(session.messages))
+        session.messages.insert(position, {"role": "user", "content": state})
+
+    def tool_changes() -> list[dict]:
+        binding.sync_registry()
+        current = binding.state_snapshot()
+        if current == told[0]:
+            return []
+        text = binding.state_text(told[0])
+        told[0] = current
+        return [{"role": "user", "content": text}] if text else []
+    # WHY: 一次唤醒之内原生 assistant/tool 配对原样留在 messages（含思考，DeepSeek 带工具时要求
+    # 回传）；唤醒结束即丢弃，下次只从 oplog 渲染行动记录，不重放原生消息。
+    session.preserve_native = True
+    session.keep_reasoning = True
     session.output_recorded = False
+    initial = _text_tokens(session.messages)
 
     def record_output(assistant, calls):
-        recorded = _chat_root._record_output(_chat_root.AGENT_WINDOW, assistant, calls, session)
-        for event_id in session.notification_ids:
-            oplog.acknowledge_notification(event_id)
-        session.notification_ids.clear()
+        source = oplog.output(_chat_root.AGENT_WINDOW, assistant, calls)
+        turn.action_ids.append(source)
+        if not session.output_recorded:
+            if notice is not None:
+                oplog.acknowledge_notification(notice["id"])
+            _mark_seen(newest)
+            turn.screens.update(screens)
         session.output_recorded = True
-        return recorded
+        return source
+
+    def record_results(source, results, _native):
+        for result in results:
+            binding.touch(result.name)
+        if results:
+            oplog.result(_chat_root.AGENT_WINDOW, source, [
+                {"position": position, "name": result.name, "arguments": result.arguments,
+                 "content": result.content, "tool_call_id": result.tool_call_id}
+                for position, result in enumerate(results)], "")
+
+    def over_budget() -> bool:
+        # WHY: 不是"到 N 轮就截断"（见 llm.chat 的 WHY）：截下来的行动已经写进 oplog，
+        # 重新组装时最近的行动原文仍在，较早的留标题、可按号读回；前提没有被砍掉，只是收起了。
+        # 只算这次唤醒里长出来的部分：开局材料本身就大时，重选也不会变小，不能因此空转。
+        used = _text_tokens(session.messages)
+        turn._chat_usage_tokens = used
+        threshold = max_tokens * _chat_root.agent_setting("pressure_percent") // 100
+        if used > threshold and used - initial > threshold // 3:
+            turn.reselect = True
+            return True
+        return False
 
     session.on_output = record_output
-    session.add_context_provider(_agent_provider(turn, session))
-    session.add_hint(_reader._pending_hint)
-    session.add_hint(lambda: _pressure_hint(turn._chat_usage_tokens, _chat_root.limit()[1],
-                                            _chat_root.agent_setting("pressure_percent")))
-    session.add_hint(lambda: _view._closing_hint(session.messages))
+    session.on_results = record_results
+    session.turn_done = over_budget
+    session.add_context_provider(tool_changes)
+    session.add_hint(lambda: _unread_hint(set(newest)))
+    session.add_hint(lambda: f"现在是 {_screen.clock()}。")
     session.should_stop = lambda: turn.cancelled
     session.chat(recall_func=_chat_root.get_handler(session), description_cache=_chat_root.description_cache)
     return session.output_recorded
-
-
-def _credit_recall(session: llm.Chat, result: dict, projection: dict) -> None:
-    if result["name"] != "recall_events" or result["content"] not in projection["content"]:
-        return
-    try:
-        payload = json.loads(result["content"])
-        ids = payload.get("resolved_ids")
-        if not isinstance(ids, list):
-            return
-        found, _missing = oplog.recall_events(_chat_root.AGENT_WINDOW, map(str, ids))
-        session.recalled_ids.update(item["id"] for item in found)
-    except (AttributeError, KeyError, TypeError, ValueError):
-        return
-
-
-def _agent_provider(turn, session: llm.Chat):
-    def provide() -> list[dict]:
-        try:
-            # WHY: This is only a live projection of already durable R events. A
-            # cancelled session drops it; later activations use ordinary history.
-            pending = session.pending_results
-            produced = [projection for _entry, projection in pending]
-            for entry, projection in pending:
-                _view._remember_stream(session, projection, entry["id"])
-                for result in entry["returns"]:
-                    _credit_recall(session, result, projection)
-            session.pending_results = []
-            notice = oplog.deliver_notifications(_chat_root.AGENT_WINDOW)
-            new_notice = notice is not None and notice["id"] not in session.notification_ids
-            if new_notice:
-                session.notification_ids.append(notice["id"])
-                turn.associated_windows.update(map(tuple, notice["windows"]))
-                projection = _view._notification_projection(notice)
-                produced.append(projection)
-                _view._remember_stream(session, projection, notice["id"])
-            # WHY: 同一请求边界先交付完整 R 与新通知，再按安排顺序兑现本批全部读取。
-            while turn.requested_reads:
-                request = turn.requested_reads.pop(0)
-                window = tuple(request["window"])
-                turn.associated_windows.add(window)
-                if "records" in request:
-                    pulled, error = _reader._take_archive(session, request, window)
-                else:
-                    pulled, error = _reader._take_members(session, request)
-                produced.extend(pulled)
-                if error:
-                    if _chat_root._offline_scope.get() is not None:
-                        raise llm.RequiredContextError(f"离线回放读取失败：{error}")
-                    remaining = request.get("members") or request.get("records") or []
-                    produced.append({"role": "user", "content":
-                                     f"读取请求 read_by={request.get('read_by') or 'unknown'} "
-                                     f"{window} 正式阅读部分失败："
-                                     f"本次已兑现 {len(pulled)} 条，"
-                                     f"尚未兑现 {len(remaining)} 条；{error}。"
-                                     "原计划停止，未兑现成员状态可能已变化；请重新查询再选择，"
-                                     "或用 read_messages 查档案。"})
-            binding = session.tool_binding
-            binding.sync_registry()
-            data = _chat_root.storage.get("", "agent")
-            if data.get("history_start") == getattr(turn, "history_start", None):
-                previous = data.get(_chat_root._TOLD_TOOLS_KEY)
-                current = binding.state_snapshot()
-                if previous != current:
-                    content = binding.state_text(previous if isinstance(previous, dict) else None)
-                    if content:
-                        entry = oplog.input_tools(_chat_root.AGENT_WINDOW, content)
-                        projection = _view._numbered(entry["projection"], entry["id"])
-                        produced.append(projection)
-                        _view._remember_stream(session, projection, entry["id"])
-                    data[_chat_root._TOLD_TOOLS_KEY] = current
-                    _chat_root.storage.save()
-            turn._chat_usage_tokens = sum(
-                _view._message_cost(message) for message in [*session.messages, *produced]
-                if _stream_id(session, message) is not None
-            )
-            turn._chat_event_count = len({
-                event_id for message in [*session.messages, *produced]
-                if (event_id := _stream_id(session, message)) is not None
-            })
-            return produced
-        except Exception as error:
-            raise llm.RequiredContextError("读取中心信息流失败，已停止后续行动") from error
-    return provide
-
-def select_events(window, *, ids=None, anchor: str = "", before: int = 0, after: int = 0,
-                   start: str = "", end: str = "", kinds: str = "", source: str = ""):
-    if not isinstance(kinds, str):
-        raise ValueError("kinds 只能包含 input、output、result、notification")
-    if not isinstance(source, str):
-        raise ValueError("source 必须是 g<群号> 或 u<私聊对端号>")
-    selected_kinds = [kind.strip() for kind in kinds.split(",")] if kinds else []
-    if any(not kind for kind in selected_kinds):
-        raise ValueError("kinds 只能包含 input、output、result、notification")
-    source_window = _reader.parse_target(source) if source else None
-    return oplog.select_events(window, ids=ids, anchor=anchor, before=before, after=after,
-                               start=start, end=end, kinds=selected_kinds,
-                               source_window=source_window)
-
-
-def recall_events(window, ids: list[str] | None = None, anchor: str = "",
-                  before: int = 0, after: int = 0, start: str = "", end: str = "",
-                  kinds: str = "", source: str = "") -> str:
-    """按正式号或一段已读经历直接返回输入、完整输出和结果；中心会话可跨窗口查旧号。整次调用只有一个 result，正文中的旧事件不重新编号。
-
-    @param
-    ids: 显式正式号列表；与 anchor 或 start/end 二选一，范围调用可省略
-    anchor: 中心正式号；可用 before/after 取邻近已读事件
-    before: anchor 之前的原始事件数，不按筛选命中补足
-    after: anchor 之后的原始事件数，不按筛选命中补足
-    start: 含端点的区间起点；须同时给 end
-    end: 含端点的区间终点；须同时给 start
-    kinds: 可选逗号分隔 input、output、result、notification；只筛选种子
-    source: 可选 g<群号> 或 u<私聊对端号> 来源窗口；只筛选种子
-    """
-    try:
-        selected, missing = select_events(window, ids=ids, anchor=anchor, before=before,
-                                           after=after, start=start, end=end,
-                                           kinds=kinds, source=source)
-    except ValueError as error:
-        return f"未反查：{error}"
-    resolved_ids = [entry["id"] for entry in selected]
-    found, unavailable = oplog.recall_events(window, resolved_ids)
-    missing = list(dict.fromkeys([*missing, *unavailable]))
-    if not found and not missing:
-        return "范围内没有符合筛选条件的已读事件"
-    return json.dumps({"resolved_ids": resolved_ids, "events": found, "missing": missing},
-                      ensure_ascii=False)
-
-
-def event_links(window, ids: list[str] | None = None, anchor: str = "", before: int = 0,
-                after: int = 0, start: str = "", end: str = "", kinds: str = "",
-                source: str = "") -> str:
-    """按正式号查看一跳关系；输出的 reads 是实际读入的 input 号，非位置推断。
-
-    @param
-    ids: 显式正式号列表；与 anchor 或 start/end 二选一，范围调用可省略
-    anchor: 中心正式号；可用 before/after 取邻近已读事件
-    before: anchor 之前的原始事件数
-    after: anchor 之后的原始事件数
-    start: 含端点的区间起点；须同时给 end
-    end: 含端点的区间终点；须同时给 start
-    kinds: 可选逗号分隔 input、output、result、notification；只筛选查询根
-    source: 可选 g<群号> 或 u<私聊对端号> 来源窗口；只筛选查询根
-    """
-    try:
-        selected, missing = select_events(window, ids=ids, anchor=anchor, before=before,
-                                           after=after, start=start, end=end,
-                                           kinds=kinds, source=source)
-    except ValueError as error:
-        return f"未查询关系：{error}"
-    found = oplog.reference_links(window, [entry["id"] for entry in selected])
-    if missing:
-        found["找不到"] = missing
-    return json.dumps(found, ensure_ascii=False)
-
-
-def cover_stream(session, window, ids: list[str], conclusion: str, anchor: str = "", before: int = 0,
-                 after: int = 0, start: str = "", end: str = "", kinds: str = "",
-                 source: str = "") -> str:
-    """将本次主窗口可见或此前已覆盖的事件归入这次行动的结论；成员不再自动载入，但仍可按原编号反查。关联的整批输出和返回必须一同覆盖。
-
-    @param
-    ids: 显式正式号列表；与 anchor 或 start/end 二选一，范围调用请传 []
-    conclusion: 你从这些事件得出的结论，写出供后续子请求保留的摘要
-    anchor: 中心正式号；可用 before/after 取邻近已读事件
-    before: anchor 之前的原始事件数
-    after: anchor 之后的原始事件数
-    start: 含端点的区间起点；须同时给 end
-    end: 含端点的区间终点；须同时给 start
-    kinds: 可选逗号分隔 input、output、result、notification；只筛选种子
-    source: 可选 g<群号> 或 u<私聊对端号> 来源窗口；只筛选种子
-    """
-    if not conclusion.strip():
-        return "请给出非空结论"
-    try:
-        selected, missing = select_events(window, ids=ids, anchor=anchor, before=before,
-                                           after=after, start=start, end=end,
-                                           kinds=kinds, source=source)
-        if missing:
-            raise ValueError("不是本窗口已读事件: " + ", ".join(missing))
-        visible = (_trusted_stream_ids(session) | getattr(session, "recalled_ids", set())
-                   if window == _chat_root.AGENT_WINDOW
-                   else _visible_stream_ids(session.messages))
-        members = oplog.cover(window, session.active_action,
-                              [entry["id"] for entry in selected], visible)
-    except ValueError as error:
-        return f"未覆盖：{error}"
-    if window == _chat_root.AGENT_WINDOW:
-        _cover_agent_projection(session, members)
-    else:
-        _cover_projection(session.messages, members)
-    return f"已覆盖 {len(members)} 条已读事件；原编号仍可用 recall_events 反查"
