@@ -24,11 +24,11 @@ _SUBCOMMAND_HELP = (
     ("del_setting <name>", "删除设定"),
     ("image [off|lazy|eager]", "查看或设置图片读取档位"),
     ("reasoning [keep|drop]", "查看或设置中心已读输出是否原生带回思考内容"),
-    ("reset_start", "安排下一次激活重选中心历史起点（管理员）"),
+    ("reset_start", "旧循环的历史起点重置；统一日志模式每醒重新选材，无需重置"),
     ("limit [<事件数> <token> [提醒百分比]|reset]", """查看或设置中心 agent 的全局可见事件数、上下文 token 上限与提醒阈值（管理员）。
 
 格式：#limit | #limit <事件数> <token> [提醒百分比] | #limit reset
-两个上限只在首次激活或 #reset_start 后决定历史起点；之后不自动裁剪。提醒百分比决定模型末尾何时显示上下文 token 用量（已用/上限），达到 token 上限时要求先压缩。默认值分别为 500、40000、75%。
+统一日志模式中，事件数限制当前候选材料的近期范围，token限制每次实际模型请求的文本估算；旧原件和笔记历史保留。旧循环中两个上限只在首次激活或 #reset_start 后决定历史起点。默认值分别为 500、40000、75%。
 #limit                  显示全局两个上限和提醒百分比，并标出值来自全局覆盖还是默认
 #limit <事件数> <token> [提醒百分比] 写入全局上限；省略百分比则保留原设置
 #limit reset            清掉全局上限与提醒百分比，回落到默认
@@ -38,7 +38,7 @@ _SUBCOMMAND_HELP = (
 格式：#hint | #hint get | #hint set <代码> | #hint set | #hint default [get|set <代码>]
 本窗口的配置在 chat storage 的 hint 键，全局默认在 storage 的 "" 命名空间；生效的是两者按 {**默认, **窗口} 合并之后 code 非空、on 为真的那份。
 聊天循环停下时求值一次，非 None 的结果作为一条消息发出（自带 # 前缀，不进模型上下文）。
-求值环境是共享动态环境，另外注入 window（触发窗口）与 usage（中心 reader 最近一次子请求实际收到的已编号事件文本 token 估算；不含系统提示与工具 schema）。
+求值环境是共享动态环境，另外注入 window（触发窗口）与 usage（统一日志模式为当前Chat消息的文本token估算，不含另挂schema或临时hint；旧循环为已编号事件估算）。
 #hint              切换本窗口的开关（只写本窗口）
 #hint get          显示合并后生效的代码与开关，并标出代码来自哪里
 #hint set <代码>   写入本窗口的代码并打开开关；set 之后第一个换行起即为源码
@@ -279,6 +279,8 @@ def _subcommand(value: str):
     tail = tail.strip()
     data = storage.get("", "agent")
     if name == "reset_start" and not tail:
+        if _chat_root.center_runtime() is not None:
+            return "统一日志模式每醒重新选材，无固定历史起点；笔记和原始经历均保留。用 #limit 调整当前候选与请求上限"
         data.pop("history_start", None)
         data.pop(_chat_root._TOLD_TOOLS_KEY, None)
         data.pop(_chat_root._SCHEMA_MODULES_KEY, None)

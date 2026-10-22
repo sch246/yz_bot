@@ -128,6 +128,7 @@ def enqueue(c, main):
         messages = [{"role": "system", "content":
             "你整理这一轮实际已见的材料与已提交输出/结果。可不修改笔记；有必要时commit_note，"
             "保留来源，分清外部事实、自身理解与未确认动作。不能把旧候选换父版本覆盖新笔记。"
+            "可用inspect_runtime核对冻结截止内轨迹；目录不是全文。重要决定可简记理由，实际结果优先。"
             "完成后直接结束，不安排动作或唤醒。"}]
         by_id = {e["id"]: e for e in c.events}
         for key in sources:
@@ -165,7 +166,7 @@ def _work(c):
                 """重读本任务冻结的笔记；不把旧候选换成新的父版本。"""
                 return _bytes(head).decode()
 
-            session.set_tools([c._commit_note_tool(state), read_note])
+            session.set_tools([c._commit_note_tool(state), read_note, c._inspect_runtime_tool(state)])
             _run(c, state, session, job)
         except BaseException as error:
             # Catch at the worker boundary so join observes termination and no

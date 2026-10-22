@@ -1,6 +1,6 @@
 # 运行架构
 
-本文描述 2026-07-29 完成入口切换后的当前实现。用户可见语义以[交互模型](interaction-model.md)为准，部署和测试边界见[运行文档](runtime.md)。迁移时的取舍和旧源码去向保留在[架构切换记录](working/proposals/code-organization.md)，不再作为待实现目标。
+本文描述当前源码；2026-10-22已将新Center接入正常启动，运行中实例需完整重启才切换。用户可见语义以[交互模型](interaction-model.md)为准，部署和测试边界见[运行文档](runtime.md)。迁移时的取舍和旧源码去向保留在[架构切换记录](working/proposals/code-organization.md)，不再作为待实现目标。
 
 ## 唯一入口
 
@@ -88,7 +88,7 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 `meta.py` 是唯一默认激活的必需模块，保存工具维护说明并导出 `exec_code`、`list_tools`、`reload_tools`、`load_tools` 四个无前缀恢复入口。`__init__.py` 只持有 registry、last-good 和 per-Chat binding 机制；它不再伪装成工具格式。`meta` 调用通过一次调用范围内的 `ContextVar` 取得当前 binding，多 Chat 和 `assign_tasks` 工作线程不会共享错误会话；磁盘删除 `meta.py` 的 reload 会失败并保留旧 last-good。
 
-中心 agent 的可用模块描述从首次工具状态 input 开始可见；持久激活模块从全局 `agent.active_tools` 装回。`load_tools` 更新当前 Chat 的实际模块和函数，`reload_tools` 更新 last-good；每个 LLM 子请求冻结同一份 schema/callable 快照，所以加载或重载只从下一子请求起生效。
+中心 agent 的可用模块描述由当前Chat的工具状态提供；持久激活模块从全局 `agent.active_tools` 装回。`load_tools` 更新当前 Chat 的实际模块和函数，`reload_tools` 更新 last-good；每个 LLM 子请求冻结同一份 schema/callable 快照，所以加载或重载只从下一子请求起生效。
 
 提示词没有新增编辑管理器；`.py` 共享环境继续暴露可变 `prompts` 对象，模型需要时可自己编写工具编辑它。
 
@@ -118,15 +118,17 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 ## LLM、图片与可观察输出
 
-`mods.llm/` 持有模型配置、client、流式响应与每请求工具快照；`mods.chat/` 按 `__init__.py`（公开入口、全局设置与窗口 `#hint`）、`view.py`（事件投影与固定历史起点）、`reader.py`（未读选择、正式阅读、补回信源）、`agent.py`（中心激活与结果交付）、`subcommands.py`（`#` 设置命令）划分职责，对外仍是一个公开 Module；`mods.oplog/` 的 `__init__.py` 持有唯一追加日志和索引，`replay.py` 统一写前与启动重放校验；`mods.tools` 持有统一 registry、当前 Chat 绑定以及按职责分类的真实工具实现，天气模块只投影现有 `mods.weather`；`mods.image/` 持有图片身份、缓存和视觉输入；`mods.forward` 持有合并转发的取回、落盘与渲染——转发的 id 和节点里的图片 url 都会过期，所以取回来的节点落在 `data/forward/<id>.json`，`.cave` 存转发时走的就是它，发送方向则由 `send_forward_msg` 的节点数组承担。`mods.websearch` 持有互联网检索，把 DeepSeek 的服务端 `web_search` 包成一个普通函数——密钥与聊天共用，搜回来的外部正文只当数据交回，不当指令。`mods.browser` 持有自管的常驻 Chromium 与裸 CDP 会话：打开页面、读渲染后的正文、在页面里跑 JS、截图交给视觉链路，每个聊天窗口一个标签页；进程由 `watchdog.detached()` 起，不随工具调用被 `^C` 带走；顶层导航只校验 http/https 地址语法，不解析或限制本机、内网、公网等目标，也不拦截页面的后续请求；启动就绪后清掉 Chrome 按 profile 恢复出来的遗留标签页，让每次启动都从一页空白开始。图片与子任务工具只惰性调用 `mods.chat` 的既有 usage/cost 入口，不复制计费状态。`llm`、`tools`、`chat`、`oplog` 和 `image` 采用文件夹 Module，是因为各自内部实现共同拥有明确状态；具体能力仍优先由普通函数表达。
+`mods.llm/` 持有模型配置、client、流式响应与每请求工具快照；`mods.tools` 持有 last-good registry 和普通函数能力。`mods.chat.on_load` 调用 `live.start`，正常启动直接装配 `Center`：`center.py` 持有单一追加日志、激活、请求、结果及笔记版本；`cognition.py` 运行前置选材与轮后整理；`reflection.py` 安排每天北京时间04:00自检；`auxiliary.py` 为图片描述和委派请求绑定独立角色。`subcommands.py` 管理全局设置。旧 `reader.py`／`agent.py`／`view.py` 仍供旧离线接口及共用小函数使用，不负责正式 pending 和启动补回。
 
-来源窗口的未读到达、正式 input 和 `mark_read` 由 `oplog` 的 append-only 日志唯一决定，不再有 `context.Mailbox` 内存镜像。`context` 只保留每窗口锁与一次路由期间的事件对象→arrival 关联：路由在锁内先写 chatlog/history 再登记 arrival；正式阅读在锁内选定成员、锁外转换图片、再取锁复核并提交。这保证窗口内顺序，不表示不同文件有跨文件崩溃原子性，也不往原始事件 dict 塞派生键。唯一中心 reader 用 `AGENT_WINDOW` 持有全局执行线。激活只产生可确认的通知，不读取正文；新版通知仅列上次确认后新来的唤醒及其时间与作者，旧通知按原快照重建，不显示 QQ `message_id`，不能拿“通知曾递交”冒充“消息已读”。`status` 查状态，`fetch` 补旧档，`take(start, count)` 在执行时只按当前未读成员的 1-based 序号选范围；精确成员 key/arrival/origin/message_id 是高级入口。`mentions` 选至多 500 条未读提及，`pull` 是前缀别名但 `read_via` 记录 `pull`。所有安排的阅读按同批次顺序在下一 provider 请求前全文逐条登记正式 input，不按 token 预算截断或拆到后续请求；没有下一请求则不消费。每个正式 input 在写入时保留发起输出号 `read_by` 和工具名 `read_via`；`event_links` 的 output `reads` 从这些 input 事实派生，不从位置猜。`mark_read` 将调用时已有成员跳过，保存发起输出号供 `skipped_by` 投影，不分配 input 号。来源桥随新 input 的持久 projection 归属该 input：此前正式读取的成员沿用首次冻结的完整投影和原号，跳过成员从原 arrival 或不可变 source 页的档案位置恢复；连续桥超过 5 条只投影首尾与折叠数量。窗口来源顺序由轻量 arrival 索引和页顺序派生，已读/跳过状态只从 append-only input/mark_read 日志派生，source 页格式不变。档案查询 `read_messages` 按指定窗口的 `message_id` 或稳定 `origin` 选前后文，下一请求通过同一消息阅读路径形成新的 archive input；若命中未读 live/source 坐标则一并消费。已读档案可再次阅读，但不冒充实际接收的 say 回声；只有同目标窗口、唯一已登记 say 返回的 live/source 回声才在正式 input 中冻结 `<sent_by>`。Python `chat.unread_members(source, limit=...)` 返回脱离权威的普通列表供筛选；大信源应显式限制物化数量。
+入站先由 chatlog 写原件，再登记 Center 到达；唯一中心 reader 使用 `AGENT_WINDOW`。每醒冻结近期候选与当前笔记，前置可补选冻结原件；主循环的原生 assistant/tool 配对在本次会话保留。所有角色共用现有模型客户端和费用入口，模型生成串行，委派／视觉有自己的请求归属；后台整理与主循环通过已见来源和父版本CAS共享笔记入口。近期画面、目录、原件与实际已见来源相互区分，不把目录中的编号当作已读。
 
-首次中心激活按 `max_events`／`max_token` 选一个历史起点并持久保存；之后从该起点重建全部可见经历，不每轮裁掉旧内容。`#reset_start` 在下次激活重选。覆盖仍隐藏默认投影；超过 `pressure_percent` 提示占用，达到 `max_token` 要求模型先压缩但不阻断行动。输出在派发工具前持久登记；同一模型输出的全部同步工具返回完成时立即登记一个普通正式 R。当前会话暂存其完整投影，下一子请求先追加这些 R，再处理通知和显式阅读；同步 R 不按工具或预算分页。`final_call`、取消、失败或重启后不确认交付、不单独唤醒；R 已在 `oplog`，下次激活从固定历史起点重建，需要全文可 `recall_events`。旧运行版本可能留下 `_stream_results` arrival，兼容桥在下一次激活只将它登记或复用为普通 R 后消费；待部署后确认生产里没有残留再删除，不作为新结果的常规路径。模型输出确认这次“叫醒”已经递交；只有正式 input 或跳过才使 pending 成员退出。红点本身不反复调度模型；后来有新的尚未递交唤醒时才再次启动，并在通知中仅列新唤醒。旧版首读 floor 仅重放历史日志，新代码不再写入。
+新事实追加到 `data/agent-memory/center.jsonl`，每条带链式哈希及UTC记录时间；原始聊天仍在chatlog。`inspect_runtime` 以有界目录定位实际请求、输出、usage、派发、结果及笔记，显式单条全文才扩大本次可引用来源。`read_messages` 同步返回指定窗口的本地原件。未知派发／落盘失败会关闭模型与后续派发入口，不能通过自动重试伪造成功；普通已知供应商失败留下失败结果，可在后续新激活继续。
 
-`oplog` 对可预见的非法记录在写盘前用与重放相同的校验拒绝，不改变日志或内存；追加、fsync 或落盘后索引应用失败会进入持久化失败态，后续写入和同批尚未派发的工具行动均停止，直到重启检查日志。`mods.chat.run_offline()` 给离线回放传入显式模型、registry、发送替身和临时 `ContextVar` 范围；实验在独立目录和未启动 Bot 的新进程中临时绑定全局依赖，结束时恢复。它不调用真实 QQ 发送入口；这不是在运行中的生产 Bot 内切换状态的入口。
+`live` 在完整boot后才恢复持久重访、安排04:00自检和处理新journal的待处理激活；退出先停止新owner、取消并等待当前轮、清理本安装定时job和后台整理，再移除客户端绑定。不同安装的回调不能跨安装写入。自检使用普通环境事件和同一主体，默认quiet；夜间无活动窗口不调用模型，停机不补跑。
 
-中心 agent 的 `cover_events` 在 `oplog` 追加覆盖事实，节点沿用输出号及行动位置；成员可跨来源窗口、允许多重引用，只能来自可见已读或明确反查的旧号，仅输出／整批结果强绑定；say 回声可独立覆盖，其冻结的 `<sent_by>` 仍引用行动号。覆盖只隐藏默认投影，不删除原文或正式号。`recall_events` 沿已读追加顺序按显式 ID、中心半径或双端点选择，不设条数上限；之后才按种类和来源筛选，并把完整选择作为一个同步 R 直接返回。它不进入未读信源，也不做字符分页。全局 `max_events` 与 `max_token` 只在首次激活或手动重置后共同选唯一已读流的固定历史起点；默认分别为 500 条和 40000 token，`#limit` 写入全局设置。`聊天开始`／`聊天结束`是普通内容。旧窗口聊天设置不再读取，也不并入全局设置；窗口 `#hint` 独立保留。旧 chatlog 由档案查询主动翻阅；更早的 NapCat 历史先经 `fetch` 固化为有名字的信源。启动恢复与主动 fetch 内部仍以 NapCat 请求批次抓取，并用不可变持久页保存引用；已读坐标从 input 与标为已读日志派生。页号和上游游标不暴露给模型。`recall_events` 返回在同步工具批次完成时随整批成为一个 R；本地 `_log_origin` 与远端 `message_seq` 只是存储与抓取定位，不是第二套记忆号。sidecar 身份索引、合并阅读索引与启动时的旧信源成员表都只是可重建投影；JSONL、日档与 oplog 仍是各自事实的唯一权威。普通日档没有 `message_seq`，因此不凭 `message_id + 秒级时间` 自动吞并 sidecar；跨来源歧义宁可保留重复记录，也不隐藏可能不同的事实。`#` 控制消息不投影。主模型与辅助调用费用统一记入 Bot 账；退休尚未接通。
+旧 `data/event_stream`、chatlog与窗口配置保留，不自动转换、清理或重放。正常启动不再执行旧NapCat补回；当前中心支持普通v1日档，旧格式迁移和全量journal恢复的资源增长仍有缺口。离线入口 `mods.chat.run_offline()` 必须在隔离目录、新进程中使用，不能作为运行中切换权威的办法。具体行为见[交互模型](interaction-model.md)，本次验证与已知限制见[交付记录](working/agent-memory/live-center-delivery-20261022.md)。
+
+`mods.image/` 继续持有图片身份、缓存和视觉输入；`mods.forward` 持有合并转发的取回、落盘与渲染。`mods.websearch` 与 `mods.browser` 仍通过现有工具暴露检索和自管Chromium，未引入新的能力域或沙箱。图片及子任务复用正式usage/cost，不建立另一份账本。
 
 终端打印是实际运维界面的一部分：收发消息、流式 LLM 内容、工具调用、图片捕获/缓存、link/capture 命中、模块失败和生命周期进度都应保留可观察输出。这些产出者各自选一条**流名**（`mods.log.stream(...)`，即 `yz.*` logger），终端订阅其中一组；流是「属于哪个子系统」这条轴，与 logger 级别表达的「是不是故障」互不替代。每条流有自己的 `log/<流>.log`；`app.log` 只记严重程度；chatlog 保存产品聊天历史，三者不是同一用途。落盘的记录由一个 filter 自动补上交互归属，调用点不传参。终端行为、订阅集与 `.log` 见[运行时](runtime.md)。
 

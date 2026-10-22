@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator
+from contextlib import nullcontext
 import json
 import logging
 import os
@@ -35,12 +36,27 @@ _log = logging.getLogger(__name__)
 
 def _observe_request(client, selection, params):
     # This boundary sees the SDK payload after image conversion and policy.
-    from mods.chat.center import active
-    central = active()
-    if central is not None:
-        if client is not central.client:
-            raise PersistenceError("isolated center rejects a different LLM client")
-        central.observe_request(selection, params)
+    from mods.chat.center import _assembly_lock, _request_state, active, require_assembly
+    with _assembly_lock:
+        state = _request_state.get()
+        if state is not None:
+            require_assembly(state["center"], state["assembly"])
+        central = active()
+        if central is not None:
+            if client is not central.client:
+                raise PersistenceError("isolated center rejects a different LLM client")
+            central.observe_request(selection, params)
+
+
+def _observe_action(reference):
+    from mods.chat.center import _assembly_lock, _request_state, active, require_assembly
+    with _assembly_lock:
+        state = _request_state.get()
+        if state is not None:
+            require_assembly(state["center"], state["assembly"])
+        central = active()
+        if central is not None:
+            central.observe_action(reference)
 
 # WHY: 自动图片描述路径固定使用这段 prompt（_get_image_description 调 describe_image 时
 # 不传 prompt），结果按内容摘要长期缓存。改这里必须同时提升
@@ -489,12 +505,12 @@ class LLMClient:
         return [_rewrite_message_images(message, replace) for message in messages]
 
     def describe_image(self, uri: str, prompt: str = "", model: str | None = None) -> str | None:
-        from mods.chat.center import active
-        if active() is not None:
-            raise PersistenceError("isolated center requires direct image payload; auxiliary vision requests are unsupported")
+        from mods.chat import auxiliary
+
         selection = model or self.get_vision_model()
         if not selection:
             return None
+        captured = auxiliary.capture(self)
         provider, api_model, _ = resolve_model(self.config, selection)
         client = self.clients.get(provider)
         if client is None:
@@ -510,9 +526,37 @@ class LLMClient:
                 {"type": "text", "text": text},
                 *({"type": "image_url", "image_url": {"url": value}} for value in slices),
             ]}])
-        _observe_request(self, selection, params)
-        response = client.chat.completions.create(**params)
-        description = response.choices[0].message.content
+        if self.request_policy is not None:
+            options = self.request_policy(selection, params)
+            if set(options) - {"max_tokens"}:
+                raise ValueError("request policy may only set max_tokens")
+            params.update(options)
+        # WHY: lazy vision runs inside the guarded main generation on the same
+        # thread; the Center's reentrant model lock also serializes eager vision.
+        with auxiliary.bind(captured, "vision") as state:
+            with captured[0]._model_lock if captured is not None else nullcontext():
+                _observe_request(self, selection, params)
+                requested_at = datetime.now(timezone.utc)
+                response = client.chat.completions.create(**params)
+                if captured is not None and response.usage:
+                    from mods import chat
+                    value = response.usage
+                    chunk = LLMResponse("", "assistant", value.prompt_tokens, value.completion_tokens,
+                                        value.total_tokens, cached_tokens=usage_cached_tokens(value),
+                                        requested_at=requested_at)
+                    auxiliary.usage(captured, state, chunk)
+                    chat.inc_call_cost(selection, chunk.prompt_tokens, chunk.completion_tokens,
+                                       chunk.cached_tokens, requested_at)
+                choice = response.choices[0]
+                if getattr(choice, "finish_reason", None) != "stop" or choice.message.tool_calls:
+                    raise RuntimeError("vision response did not finish with a plain description")
+                description = choice.message.content
+                if captured is not None:
+                    assistant = dict(role=choice.message.role or "assistant", content=description)
+                    reasoning = getattr(choice.message, "reasoning_content", None)
+                    if reasoning is not None:
+                        assistant["reasoning_content"] = reasoning
+                    auxiliary.output(captured, state, assistant, [])
         if description:
             console.notice(f"✅ 视觉模型调用成功：{console.format_uri(uri)}")
             console.notice(f"    {description}")
@@ -799,9 +843,7 @@ class LLMClient:
                 try:
                     if on_action is not None:
                         on_action(f"{output_id}#{position + 1}" if output_id is not None else None)
-                    from mods.chat.center import active
-                    if active() is not None:
-                        active().observe_action(f"{output_id}#{position + 1}")
+                    _observe_action(f"{output_id}#{position + 1}")
                     content = str(tool.call(**arguments))
                 except PersistenceError:
                     raise

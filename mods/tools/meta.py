@@ -1,6 +1,8 @@
 '''指导模型增删查改统一工具与 Skill 模块，并说明 last-good、显式应用和当前会话激活原理。
 
-同一模型输出的多个工具调用按顺序执行，却看不到彼此结果；整批完成后立即成为一个正式 result R，正常下一子请求完整读取，不按工具拆分或自动分页。若 `say(final_call=true)` 结束、请求取消或失败，不会只为结果强迫续轮；下次激活从固定历史起点重建 R，需要全文可用 `recall_events`。`take` 是未读消息正式阅读的主名，`pull` 仅为前缀别名；`mentions` 是提及筛选别名。`read_messages` 选中的档案消息也在下一请求作为正式 input 阅读；`recall_events` 仍同步返回旧经历，不消费未读。
+同一模型输出的工具调用按顺序执行，彼此看不到结果；整批返回后，下一请求才能依据成败继续。正文是自言自语，对外必须调用 say 并指定目标。
+
+统一日志模式每醒重新装配近期画面、选材与长期笔记。read_archive/read_past读取本次目录原件，read_messages按窗口查旧聊天；inspect_runtime先列运行轨迹，再单条读请求、结果、用量和笔记版本。读到全文后，在下一请求的allowed_source_ids确认来源再commit_note；旧版本可作为来源，以当前parent提交恢复，历史保留。旧take/fetch/cover等未读工具不用于这个模式。
 
 ## 直接执行 Python
 
@@ -103,33 +105,19 @@ Skill 也是可编辑的长期笔记：把可重复使用的经验、做法、�
 
 下划线 helper 不是独立模块，它的变化不会单独出现在 `list_tools` 中。修改 helper 后要显式 reload 所有 import 它的模块。
 
-`reload_tools` 换得动的只有 `mods/tools/` 下的那一个文件（外加它的下划线 helper）。它 `import` 的 `mods.*`——包括这套机制自己的 `mods/tools/__init__.py`——是进程启动时的那份，改了要重启才生效，典型症状是“说明书和工具清单里有、调用时 AttributeError”。这条边界的完整说明在仓库的 `docs/runtime.md`（“热更换得动什么”一节），需要重启时用 op 工具集的 `send_command` 注入 `.reboot`；重启后先检查未读通知与信源状态，不要假设旧调用会重放。
+`reload_tools` 换得动的只有 `mods/tools/` 下的那一个文件（外加它的下划线 helper）。它 `import` 的 `mods.*`——包括这套机制自己的 `mods/tools/__init__.py`——是进程启动时的那份，改了要重启才生效，典型症状是“说明书和工具清单里有、调用时 AttributeError”。这条边界的完整说明在仓库的 `docs/runtime.md`（“热更换得动什么”一节），需要重启时用 op 工具集的 `send_command` 注入 `.reboot`；重启后先检查当前笔记和运行轨迹，不要假设旧调用会重放。
 
 ## 删除
 
 先确认精确模块名和源文件，再删除对应的单个 `mods/tools/foo.py` 或 `.md`，不要宽泛递归删除。随后调用 `reload_tools(["foo"])`；registry 发现源文件缺失后才删除 last-good，并从当前 Chat 移除模块内容和函数，当前会话的激活记录一并清除。只删文件但不 reload 时旧 last-good 仍有效。`meta.py` 是恢复入口，不能删除。删除 helper 前先检查并 reload 所有受影响模块。
 
-## 统一经历与覆盖反查
+## 经历与自检
 
-每次模型输出（思考、正文、多个行动）只有一个 `YYYYMMDD-N` 号；该输出内部行动用 `YYYYMMDD-N#位置` 指名。新的中心输出保存完整原生思考，旧输出可能只有“曾有思考”标记。消息和工具结果也在被读到时进入同一信息流。结果可能在下一次模型请求才读到，未读不占正式号。
+统一日志的C编号标识实际请求、输出、工具结果、环境事件和笔记版本；行动用输出号#位置。编号出现过不代表其原件已读，也不证明正文判断正确。inspect_runtime全文读取后可核对实际记录；read_messages同步返回旧聊天，引用整条results外壳，不把其中嵌套编号当作新来源。
 
-这些记录跨轮按读到的先后重建。中心会话统一用 `cover_events` 总结输入、输出和结果，不再维护另一套按原生工具调用位置收缩的历史。
+检查记忆时，可以比对选材、实际请求、原始回执和笔记差异。重要选择简记理由；发现问题可用已有文件/Python/工具能力在隔离目录实验，保留改动和结果，再判断是否采用。允许不修改。exec_code仍与宿主共享状态；隔离需实际使用临时目录、独立进程或worktree，不能靠一句“dry run”。
 
-结论写在 `conclusion` 参数里就够了，工具不会把它再返回一遍：这次调用本身留在上下文里，参数里的结论就是它的记录。
-
-已读消息和输出也能总结：中心会话调用 `cover_events(["20260923-4", "20260923-5"], "结论")`，参数用的是上文方括号里的正式事件号，不是 QQ `message_id` 或行动位置。也可用 `cover_events(ids=[], conclusion="结论", anchor="20260923-4", before=2, after=3, kinds="input,result")`，或用 `start`／`end` 指定含端点的区间。覆盖范围没有条数上限；先从唯一已读顺序取原始种子，再筛选种类和来源，不按命中数补足。输出与整批返回是强绑定闭包；say 的回声可单独覆盖，回声里的 `<sent_by>` 仍可引用行动号。闭包里有任一成员不可覆盖，整次失败，不丢掉那个成员后继续。覆盖使成员从本轮和后续自动上下文中消失；原号可用 `recall_events` 反查而不解除覆盖，反查总结会显示实际冻结的所有成员，不只是你传入的号。中心会话可跨窗口点名已读或反查过的旧号；未读成员不会被补进覆盖。摘要与聊天消息、输出、返回一样属于已读历史；上限只决定首次历史起点，之后须主动压缩；子代理不能替中心会话写覆盖。
-
-眼前历史从首次选定的起点持续追加，不是完整记录。新消息先留在有名字的有序未读信源；新版通知只列上次确认后新来的唤醒，尾部 hint 显示当前未读提及的时间和未读序号。`status(source)` 看数量与缺口，`take(source, start=1, count=8)` 在工具执行时按当前未读成员序号选连续范围，已读/跳过不计数；`ids`、`arrival`、`origin`、`message_id` 是高级精确入口。`mentions(source)` 正式消费至多 500 条未读提及，不是只看通知；`pull(source, count)` 是前缀别名。正式 input 保留自己的号，并记录发起输出 `read_by` 和实际工具 `read_via`；来源顺序中跨过的已读/跳过桥附在本次新 input 内，已读桥保留旧正式号，跳过桥显示 `skipped_by` 而没有旧 input 号。`mark_read(source)` 把调用时已有的成员跳过，不伪造 input；`fetch(source)` 从 NapCat 向旧端补取。通知已看见不等于消息已读；红点本身不会反复启动你，只有后来出现新唤醒时才再次叫你。窗口名是 `g<群号>` 或 `u<私聊对端号>`，主动 fetch 的旧档有自己的信源 key。启动补回先于该窗口新实时消息进入原信源；未收束前不能正式阅读或标为已读。已经读过的旧档信源不会倒插内容，后续 fetch 另开信源。远端历史不保证无缺口。用 `exec_code` 可调用 `ctx["chat"].unread_members(source)` 取得脱离内部权威的 `list[dict]`，用普通 Python 筛选后把其中 `key` 列表交给 `take(ids=...)`；修改快照不会修改未读事实。
-
-聊天档案不属于未读信源。`read_messages(window, message_id, before, after)` 可在指定窗口中按 QQ `message_id` 选前后文；若号码歧义，加 `timestamp` 或改用 `origin`。它的同步 R 只确认安排，正文在下一子请求作为逐条正式 input 出现；命中当前 live/source 未读成员也一并消费。已读档案可再次阅读，产生新的 archive input，但不冒充 live 回声，不写 `<sent_by>`。已读 input 也可用 `recall_events` 反查。总结只改变默认显示，不删除原文。
-
-总结要方便反查：在结论里留下关键来源的正式号，别只写一段没有出处的大块故事。后续总结可以再次引用前一层总结；同一来源也可被多个不同主题的总结引用，不必强行归到唯一父节点。已被覆盖的正式号也可再次点名，与新的可见成员组成另一份总结；这不解除原覆盖。`event_links` 可查输入、输出和工具返回中明确出现的正式号，以及各节点实际覆盖的成员；“出现过编号”、“被覆盖”和“确实支撑某个结论”是三回事，核对原话仍须 `recall_events`。
-
-普通输入、完整输出及整批工具返回都可用 `recall_events(["20260923-4"])` 按正式号反查；也可用 `recall_events(start="20260923-4", end="20260923-8", source="g123")` 直接读取短范围。它一次同步返回完整选择，取得一个新的 result 号，不进入未读信源、不做字符分页，也不把正文里的旧事件移动、复制或重新编号。范围返回列出实际冻结的 `resolved_ids`。若总结这次探索，通常覆盖这次 recall 的输出和结果，并在结论中引用旧号；结果真正进入上下文后，直接覆盖其中旧号也是允许的另一次明确选择。
-
-`recall_events` 和 `event_links` 都能用 `anchor` 加前后数量，或用 `start`／`end` 指定有界区间；`kinds` 和 `source` 只在选定范围内筛选，不改变经历顺序。`event_links` 的输出 `reads` 是该输出实际导致正式读入的 input 号，不靠位置推断；回声 `<sent_by>` 的文本引用也可由 `event_links` 找到。其它一跳关系不读取正文、不授予覆盖信用。不要把这些选择器用于未读信源或原生操作号。
-
-中心会话从固定起点载入一条全局经历；旧窗口正式号仍能按原号跨窗口反查，不复制或改号。更早的结果没被删除，仍能按引用取回。
+旧YYYYMMDD-N经历仍留在oplog，可以通过exec_code调用ctx["oplog"].iter_events(start,stop)定向反查；它们不自动变成当前统一日志的C编号。当前来源使用这次实际工具结果的外壳。
 
 ## 全局待办
 
@@ -496,7 +484,7 @@ def mentions(source: str) -> str:
 
 def read_messages(window: str, message_id: str = "", origin: str = "", timestamp: int = 0,
                   before: int = 4, after: int = 4) -> str:
-    """从本地档案选消息，在下一次模型请求前作为正式 input 阅读；已读档案可再次阅读。
+    """按窗口与精确消息定位读取聊天前后文；统一日志模式同步返回，来源是这次工具结果。
 
     @param
     window: g<群号> 或 u<私聊对端号>
@@ -510,6 +498,23 @@ def read_messages(window: str, message_id: str = "", origin: str = "", timestamp
 
     if not context.agent_mode() or not current_binding().session.reads_window_mail:
         return "只有中心 reader 可以查阅聊天档案"
+    central = chat.center_runtime()
+    if central is not None:
+        import json
+        from mods import chatlog
+
+        central.ensure_available()
+        if any(type(value) is not int or not 0 <= value <= 50 for value in (before, after)):
+            return "before/after须为0到50的整数；更长范围分次读取"
+        try:
+            kind, target = chat.parse_target(window)
+            records = chatlog.read_around(kind, target, message_id=message_id or None,
+                                         origin=origin or None, timestamp=timestamp or None,
+                                         before=before, after=after, root=central.archive_root)
+            return json.dumps({"window": window, "records": records,
+                               "source": "本次results外壳；嵌套origin不自动成为已见来源"}, ensure_ascii=False)
+        except ValueError as error:
+            return f"未读取：{error}"
     return chat.reader.arrange_archive(current_binding().session, window, message_id,
                                         origin, timestamp, before, after)
 

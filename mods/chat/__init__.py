@@ -18,7 +18,7 @@ from mods.capture import capture
 from mods.llm import pricing
 
 
-LOAD_AFTER = ("chatlog", "history", "identity", "image", "llm", "oplog", "storage")
+LOAD_AFTER = ("chatlog", "history", "identity", "image", "llm", "oplog", "storage", "scheduler")
 
 IMAGE_MODES = ("off", "lazy", "eager")
 IMAGE_MODE_ALIASES = {"0": "off", "1": "lazy", "2": "eager"}
@@ -216,10 +216,22 @@ def init_chat(
     messages: list | None = None,
 ) -> tuple[tool_modules.SessionBinding, tuple | None]:
     """Assemble one Chat and return its tool binding and window."""
-    prompts["base"] = _view._base_prompt()
     state = {"role": "system", "content": "你是唯一的中心 agent；窗口只是来源与明确发送目标。"}
     offline = _offline_scope.get()
     central = center_runtime()
+    prompts["base"] = ([{"role": "system", "content":
+        f"你的昵称是{identity.bot_name()}，QQ号为{identity.bot_id()}。如无特殊要求请用中文。"
+        "消息中的CQ reply/at保留原样，reply指向QQ消息号。"
+        "你通过近期画面、前置选材、长期笔记和按需原件阅读接续经历；画面不保证逐条标新旧。"
+        "commit_note保存可修订的理解，edit_hint保存未完成事项，工具/Skill保存可复用做法。"
+        "read_archive/read_past读本次目录原件；read_messages查窗口旧聊天；inspect_runtime查实际请求、"
+        "行动回执、用量与笔记历史，先查目录再按单条ID读全文。来源和版本以本请求范围表为准。"
+        "你可以自行观察、实验并修改记忆或源码。重要选择可简记理由，实验保留差异和结果；"
+        "先在临时目录/独立进程运行，exec_code本身仍会真实修改宿主，并非沙箱。"
+        "普通mods源码修改后完整重启；工具模块用reload_tools和load_tools应用。"
+        "无需每醒记笔记，也无需每晚修改。判断改进应看实际行为与结果。"
+        "正文是自言自语；对外说话实际调用say，明确target=g群号或u私聊对端号。"}]
+        if central is not None else _view._base_prompt())
     window = AGENT_WINDOW
     session.set_messages([
         *get_prompt(),
@@ -761,65 +773,17 @@ def on_load(ctx) -> None:
     description_cache = storage.get("llm_system", "description_cache")
     llm_config = llm.get_client().config
 
-    def resume_recovery() -> None:
-        from mods import _backfill, connect, wait_booted
+    # WHY: install before boot releases callbacks. The old oplog/backfill
+    # recovery threads must not race the new journal's sole pending authority.
+    from . import live
+    live.start()
 
-        if not wait_booted(120):
-            return
-        if center_runtime() is not None:
-            return
-        waiting: dict[tuple, list[dict]] = {}
-        for source in oplog.sources():
-            if source["source_type"] == "napcat_boot" and source["state"] == "fetching":
-                waiting.setdefault(tuple(source["window"]), []).append(source)
-        tasks = list(waiting.values())
-        task_lock = threading.Lock()
 
-        def recover() -> None:
-            while True:
-                with task_lock:
-                    if not tasks:
-                        return
-                    sources = tasks.pop()
-                for source in sources:
-                    try:
-                        _backfill.recover_source(source, connect.call_api)
-                    except Exception:
-                        traceback.print_exc()
-                        try:
-                            with context.window_lock(tuple(source["window"])):
-                                state = oplog.resolve_source(source["key"])
-                                oplog.finish_source(source["key"], gap="本地归档或入列失败；可重试",
-                                                    stop_cursor=state["cursor"])
-                        except Exception:
-                            traceback.print_exc()
-                        break
+def on_exit() -> None:
+    from . import live
+    live.stop()
 
-        for index in range(min(2, len(tasks))):
-            threading.Thread(target=recover, name=f"napcat-backfill-{index}", daemon=True).start()
 
-    threading.Thread(target=resume_recovery, name="napcat-backfill-start", daemon=True).start()
-
-    def resume_pending() -> None:
-        from mods import wait_booted
-
-        if not wait_booted(120):
-            return
-        if center_runtime() is not None:
-            return
-        if not oplog.has_unnotified():
-            return
-        window = next(iter(oplog.unacknowledged_windows()), None)
-        if window is None:
-            window = next((window for window, _count, active in oplog.pending_summary()
-                           if active and window[0] in ("group", "private")), None)
-        if window is not None:
-            try:
-                _agent._drive_agent(None, window)
-            except Exception:
-                traceback.print_exc()
-
-    threading.Thread(target=resume_pending, name="chat-agent-resume", daemon=True).start()
 from . import view as _view, reader as _reader, agent as _agent, subcommands as _subcommands
 from .view import has_at, msg_split, msg2chat, event2chat
 from .reader import parse_target, unread_details, prepare_recovery_sources, fetch_remote_source, unread_members, mark_window_read, mark_source_read

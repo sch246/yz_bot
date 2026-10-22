@@ -37,36 +37,41 @@ def assign_tasks(prompt: str, tasks: str, tools: str, model: str = "deepseek/dee
     model: provider/model 形式的模型名，例如 deepseek/deepseek-flash；需要子任务调用工具时要选支持函数调用的模型
     max_workers: 最大并发数，1 到 5，超过按 5 处理
     """
-    from mods.chat.center import active
-    if active() is not None:
-        active().ensure_available()
-        raise llm.PersistenceError("assign_tasks is not wired to the isolated center journal; refusing dispatch")
+    from mods.chat import auxiliary
+
     task_list = [value.strip() for value in tasks.splitlines() if value.strip()]
     requested = list(dict.fromkeys(value.strip() for value in tools.splitlines() if value.strip()))
     workers = max(1, min(int(max_workers), 5))
+    if not task_list:
+        return repr([])
+    chat_client = llm.get_client()
+    captured = auxiliary.capture(chat_client)
 
     def execute(task_value: str) -> tuple[str, str]:
         context.clear_current()
         worker_id = threading.get_ident()
         _stream.info(f"线程 {worker_id}: 开始处理 LLM 子任务")
         try:
-            session = llm.Chat(model=model, chat_client=llm.get_client())
-            tool_context = tool_modules.create_context_message()
+            session = llm.Chat(model=model, chat_client=chat_client)
+            registry = captured[0].registry if captured is not None else None
+            tool_context = tool_modules.create_context_message(registry=registry)
             session.set_messages([tool_context, f"{prompt}\n{task_value}"])
-            tool_modules.bind_session(session, tool_context, requested)
+            binding = tool_modules.bind_session(session, tool_context, requested, registry=registry)
             pieces = []
 
             def collect(chunk: llm.LLMResponse) -> None:
                 if chunk.role == "assistant" and chunk.content:
                     pieces.append(str(chunk.content))
                 if chunk.total_tokens:
+                    auxiliary.usage(captured, state, chunk)
                     # chat remains the sole owner of model pricing and usage state.
                     from mods import chat
 
                     chat.inc_call_cost(model, chunk.prompt_tokens, chunk.completion_tokens, chunk.cached_tokens,
                                        chunk.requested_at)
 
-            session.chat(recall_func=collect)
+            with auxiliary.bind(captured, "delegate", session=session, binding=binding) as state:
+                session.chat(recall_func=collect)
             _stream.info(f"线程 {worker_id}: LLM 子任务完成")
             return task_value, "".join(pieces).strip()
         except oplog.PersistenceError:

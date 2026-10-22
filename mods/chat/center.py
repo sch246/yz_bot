@@ -1,15 +1,11 @@
-"""Explicit isolated assembly of the production reader's next journal format.
-
-No live configuration selects this path.  A caller must supply a temporary root,
-an archive identity, a client and a send sink, before routing any events.
-"""
+"""One installed journal reader, shared by live startup and isolated callers."""
 
 from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
-from datetime import datetime
+from datetime import UTC, datetime
 import hashlib
 import json
 import os
@@ -43,6 +39,24 @@ def _bytes(value):
 
 def _hash(value):
     return hashlib.sha256(_bytes(value)).hexdigest()
+
+
+def _text_tokens(value):
+    from mods import chat
+
+    def text_parts(item):
+        if isinstance(item, list):
+            return [text_parts(part) for part in item]
+        if isinstance(item, dict):
+            if item.get("type") == "image_url" and isinstance(item.get("image_url"), dict):
+                # WHY: a 256px PNG already exceeds 40000 when its Base64 is
+                # tokenized as prose. Image tokens depend on the provider; this
+                # guard estimates text only, while the journal keeps the image.
+                return {**item, "image_url": {**item["image_url"], "url": "[image]"}}
+            return {key: text_parts(part) for key, part in item.items()}
+        return item
+
+    return chat.count_tokens(_bytes(text_parts(value)).decode())
 
 
 @contextmanager
@@ -81,7 +95,7 @@ class Center:
     def __init__(self, *, root, archive_root, source_namespace, source_format,
                  bot_id, bot_names, names_complete, timezone, client, send_sink,
                  request_limit, registry=None, scheduler=None, selector_model=None,
-                 librarian_model=None, recent_count=8, role_request_limit=4):
+                 librarian_model=None, recent_count=8, role_request_limit=4, wake_request_limit=None):
         self.root = Path(root).resolve()
         self.archive_root = Path(archive_root).resolve()
         self.scope_id = source_namespace
@@ -89,24 +103,31 @@ class Center:
             raise ValueError("source namespace is required")
         if source_format != "v1":
             raise ValueError("routed isolated center requires ordinary v1; old/sidecar imports need a reviewed migration")
-        if not callable(send_sink) or request_limit < 1:
-            raise ValueError("an explicit sink and finite request allowance are required")
+        if not callable(send_sink) or (request_limit is not None and (
+                isinstance(request_limit, bool) or not isinstance(request_limit, int) or request_limit < 1)):
+            raise ValueError("an explicit sink and positive request allowance or None are required")
         self.archive_options = dict(source_namespace=source_namespace, source_format=source_format,
                                     bot_id=bot_id, bot_names=deepcopy(bot_names),
                                     names_complete=names_complete, timezone=timezone)
         self.timezone = ZoneInfo(timezone)
         self.client, self.send_sink = client, send_sink
         self.registry, self.scheduler = registry, scheduler
-        self.request_limit = int(request_limit)
+        self.request_limit = request_limit
         for number in (recent_count, role_request_limit):
             if isinstance(number, bool) or not isinstance(number, int) or number < 1:
-                raise ValueError("recent_count and role_request_limit must be positive counts")
+                raise ValueError("recent_count and request limits must be positive counts")
+        if wake_request_limit is not None and (isinstance(wake_request_limit, bool)
+                or not isinstance(wake_request_limit, int) or wake_request_limit < 1):
+            raise ValueError("wake request limit must be a positive count or None")
         for selection in (selector_model, librarian_model):
             if selection is not None and (not isinstance(selection, str) or not selection.strip()):
                 raise ValueError("auxiliary model must be an explicit model selection or None")
         self.selector_model, self.librarian_model = selector_model, librarian_model
         self.recent_count, self.role_request_limit = recent_count, role_request_limit
-        self._model_lock = threading.Lock()
+        self.wake_request_limit = wake_request_limit
+        # WHY: lazy vision may generate inside this same thread's main request;
+        # other roles still wait for the entire outer stream to finish.
+        self._model_lock = threading.RLock()
         self._jobs, self._worker, self._closing = [], None, False
         self.lock = threading.RLock()
         self._jobs_changed = threading.Condition(self.lock)
@@ -183,7 +204,7 @@ class Center:
             self.ensure_available()
             entry = dict(schema="center-v1", scope=self.scope_id, id=f"C{len(self.events)+1}",
                          previous=self.events[-1]["sha256"] if self.events else None,
-                         kind=kind, **deepcopy(values))
+                         kind=kind, recorded_at=datetime.now(UTC).isoformat(), **deepcopy(values))
             entry["sha256"] = _hash(entry)
             try:
                 created = not self.path.exists()
@@ -312,14 +333,12 @@ class Center:
         return self.append("revisit_delivery", request=delivery["request"], delivery=delivery,
                            window=list(window), reason=reason)
 
-    def wake(self, window, *, assembly=None):
-        from mods import chat
-
+    def wake(self, window, *, assembly=None, quiet=False):
         previous = context.current()
         event = {"group_id": window[1]} if window[0] == "group" else {"target_id": window[1]}
         context.set_current(event)
         try:
-            chat.chat(_assembly=(self, self._assembly if assembly is None else assembly))
+            self.drive(None, window, assembly=self._assembly if assembly is None else assembly, quiet=quiet)
         finally:
             context.set_current(previous)
 
@@ -395,22 +414,24 @@ class Center:
                  "本次请求的笔记引用范围 " + _bytes(access).decode() + "\n"
                  "commit_note的sources必须逐字取allowed_source_ids中的裸ID，不加archive、描述或哈希。"
                  "目录和正文中嵌套出现的ID不因此成为可引用来源；可引用已收到的整条结果的外壳ID。"
-                 "若缺原件，主循环先read_past/read_archive读取，在下一请求的本表确认后再提交。"
+                 "若缺原件，先read_past/read_archive或inspect_runtime(full=true,ids=[单条ID])读取，"
+                 "在下一请求的本表确认后再提交。历史笔记可读旧note后以当前parent提交旧text，形成新版本恢复。"
                  "parent使用本次frozen_parent；null时传空串。陈旧候选仍会被拒绝，不能换父版本覆盖。"}]
 
     def observe_request(self, selection, params):
         state = _request_state.get()
-        with self.lock:
+        with _assembly_lock, self.lock:
             self.ensure_available()
             if state is None or state["center"] is not self:
                 raise llm.PersistenceError("isolated center rejects unbound model requests")
-            if sum(e["kind"] == "request" for e in self.events) >= self.request_limit:
+            require_assembly(self, state.get("assembly"))
+            if self.request_limit is not None and sum(e["kind"] == "request" for e in self.events) >= self.request_limit:
                 raise llm.PersistenceError("isolated request allowance exhausted")
-            if state["role"] != "main" and state.get("request_count", 0) >= self.role_request_limit:
+            if state["role"] in {"selector", "librarian"} and state.get("request_count", 0) >= self.role_request_limit:
                 raise llm.RequiredContextError("auxiliary role request allowance exhausted")
             from mods import chat
-            if chat.count_tokens(_bytes(params).decode()) > chat.limit()[1]:
-                raise llm.RequiredContextError("isolated SDK payload exceeds the configured context allowance")
+            if _text_tokens(params) > chat.limit()[1]:
+                raise llm.RequiredContextError("SDK text estimate exceeds the configured context allowance")
             cutoffs = [key for key in [state["cutoff"], *state["sources"]]
                        if isinstance(key, str) and key.startswith("C") and key[1:].isdigit()]
             if cutoffs:
@@ -426,27 +447,32 @@ class Center:
         if action is None:
             return
         state = _request_state.get()
-        self.ensure_available()
-        if state is None or state["center"] is not self:
-            raise llm.PersistenceError("isolated center rejects unbound actions")
-        self.append("dispatch", owner=state["owner"], role=state["role"],
-                    output=action.partition("#")[0], action=action)
+        with _assembly_lock, self.lock:
+            self.ensure_available()
+            if state is None or state["center"] is not self:
+                raise llm.PersistenceError("isolated center rejects unbound actions")
+            require_assembly(self, state.get("assembly"))
+            self.append("dispatch", owner=state["owner"], role=state["role"],
+                        output=action.partition("#")[0], action=action)
 
     def _freeze(self, state):
         from mods import chatlog, chat
 
         with self.lock:
             self.ensure_available()
-            frozen = deepcopy(self.events)
+            frozen = list(self.events)
             state["event_start"] = len(frozen)
-            if sum(e["kind"] == "arrival" and e["eligible"] for e in frozen) > chat.limit()[0]:
-                raise llm.RequiredContextError("isolated archive view exceeds the configured event allowance")
+            maximum = chat.limit()[0]
+            arrivals = [e for e in frozen if e["kind"] == "arrival" and e["eligible"]][-maximum:]
+            facts = [e for e in frozen if e["kind"] in {
+                "output", "results", "environment", "revisit_delivery", "resume"}][-maximum:]
+            candidates = sorted([*arrivals, *facts], key=lambda e: int(e["id"][1:]))
             state["cutoff"] = frozen[-1]["id"] if frozen else None
             activations = self.pending()
             state["activations"] = [e["id"] for e in activations]
             state["sources"], state["materials"], state["catalog"] = [], {}, []
             days, references, recent = {}, [], []
-            for entry in frozen:
+            for entry in candidates:
                 if entry["kind"] == "arrival" and entry["eligible"]:
                     window = entry["window"]
                     day_key = (*window, entry["day"])
@@ -456,7 +482,7 @@ class Center:
                             **self.archive_options)}
                     item = days[day_key].get(entry["origin"])
                     if item is None or item["ref"]["sha256"] != entry["raw_sha256"]:
-                        raise ValueError("archive no longer matches its registered arrival")
+                        raise llm.PersistenceError("archive no longer matches its registered arrival")
                     ref = item["ref"]
                     references.append(dict(arrival=entry["id"], ref=ref))
                     key = ref["key"]
@@ -466,7 +492,7 @@ class Center:
                     recent.append(key)
                 elif entry["kind"] in {"output", "results", "environment", "revisit_delivery", "resume"}:
                     key = entry["id"]
-                    state["materials"][key] = dict(kind="fact", fact=entry)
+                    state["materials"][key] = dict(kind="fact", fact=deepcopy(entry))
                     state["catalog"].append({k: v for k, v in dict(
                         key=key, kind=entry["kind"], role=entry.get("role"),
                         text_start=(_bytes(entry.get("assistant", entry.get("returns", entry.get("payload", {})))).decode()[:120]
@@ -525,6 +551,100 @@ class Center:
 
         return read_archive, read_past
 
+    def _inspect_runtime_tool(self, state):
+        def inspect_runtime(ids: list[str] | None = None, start: str = "", end: str = "",
+                            kind: str = "", owner: str = "", request: str = "", role: str = "",
+                            after: str = "", limit: int = 20, full: bool = False) -> str:
+            """查询本请求cutoff内的运行轨迹JSON；默认仅元数据目录，不视为读到原文。
+
+            Args:
+                ids: 精确C编号，可与其他条件交集。
+                start: 包含的起始C编号。
+                end: 包含的结束C编号。
+                kind: 精确记录类型，如request/usage/note/role_start/dispatch/results。
+                owner: 所属主醒owner；usage、note与行动沿request/output追溯。
+                request: 请求C编号，包含该请求及关联output/usage/note/dispatch/results。
+                role: main/selector/librarian等精确角色。
+                after: 分页游标，上页next_after；不包含此编号。
+                limit: 目录条数1至100，默认20；正文不自动展开。
+                full: true时ids必须只有一个ID，返回完整原条并登记引用来源。可读旧note，恢复时用commit_note新提交。
+            """
+            def number(key):
+                if not isinstance(key, str) or not key.startswith("C") or not key[1:].isdigit() or int(key[1:]) < 1:
+                    raise ValueError("expected a positive C journal ID")
+                return int(key[1:])
+
+            if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+                raise ValueError("limit must be between 1 and 100")
+            if not isinstance(full, bool):
+                raise ValueError("full must be boolean")
+            if ids is not None and (not isinstance(ids, list) or not 1 <= len(ids) <= 100):
+                raise ValueError("ids must contain 1 to 100 journal IDs")
+            chosen = {number(key) for key in ids} if ids is not None else None
+            if full and (ids is None or len(ids) != 1):
+                raise ValueError("full requires exactly one explicit ID")
+            lower, upper, cursor = number(start) if start else 1, number(end) if end else None, number(after) if after else 0
+            if upper is not None and lower > upper:
+                raise ValueError("start must not follow end")
+            if request:
+                number(request)
+            for value in (kind, owner, request, role):
+                if not isinstance(value, str):
+                    raise ValueError("filters must be text")
+            with self.lock:
+                self.ensure_available()
+                seen = next((e for e in self.events if e["id"] == state.get("request") and e["kind"] == "request"), None)
+                if seen is None:
+                    raise ValueError("runtime inspection requires an actually exposed request")
+                cutoff = seen["cutoff"]
+                # WHY: tools in this output must share its request's boundary;
+                # concurrent roles and the inspection's own dispatch are later facts.
+                frozen = self.events[:number(cutoff)] if cutoff is not None else []
+                by_id = {e["id"]: e for e in frozen}
+                records, more = [], False
+                for entry in frozen:
+                    position = number(entry["id"])
+                    if position < lower or position <= cursor or (upper is not None and position > upper):
+                        continue
+                    if chosen is not None and position not in chosen:
+                        continue
+                    linked = by_id.get(entry.get("output"), {})
+                    request_id = entry.get("request", linked.get("request"))
+                    if entry["kind"] == "request":
+                        request_id = entry["id"]
+                    elif entry["kind"] == "note":
+                        request_id = entry["note"]["request"]
+                    origin = by_id.get(request_id, {})
+                    entry_owner = entry.get("owner", linked.get("owner", origin.get("owner")))
+                    entry_role = entry.get("role", linked.get("role", origin.get("role")))
+                    if ((kind and entry["kind"] != kind) or (owner and entry_owner != owner)
+                            or (request and request_id != request) or (role and entry_role != role)):
+                        continue
+                    if len(records) == limit:
+                        more = True
+                        break
+                    if full:
+                        records.append(deepcopy(entry))
+                    else:
+                        summary = {key: entry[key] for key in (
+                            "id", "kind", "recorded_at", "sha256", "parent", "version", "cutoff",
+                            "output", "action", "dispatch", "job", "outcome", "status",
+                            "prompt_tokens", "completion_tokens", "cached_tokens") if key in entry}
+                        summary.update({key: value for key, value in dict(
+                            request=request_id, owner=entry_owner, role=entry_role).items() if value is not None})
+                        for field in ("sources", "activations", "calls", "returns", "references", "catalog"):
+                            if field in entry:
+                                summary[field + "_count"] = len(entry[field])
+                        if entry["kind"] == "note":
+                            summary["sources_count"] = len(entry["note"]["sources"])
+                        records.append(summary)
+                exposed = [records[0]["id"]] if full and records else []
+                state["sources"].extend(exposed)
+                return _bytes(dict(cutoff=cutoff, mode="full" if full else "directory", records=records,
+                                   exposed_source_ids=exposed,
+                                   next_after=records[-1]["id"] if more else None)).decode()
+        return inspect_runtime
+
     def _environment_provider(self, state):
         with self.lock:
             self.ensure_available()
@@ -538,7 +658,7 @@ class Center:
             # this provider exposes progress, not an acknowledgement claim.
             return [self._material_message(state, e["id"]) for e in entries]
 
-    def drive(self, model, window, *, assembly):
+    def drive(self, model, window, *, assembly, quiet=False):
         from mods import chat, image
 
         while True:
@@ -565,14 +685,16 @@ class Center:
         image_started = False
         origin = context.current()
         outcome = "complete"
+        state = None
         try:
-            self.append("owner_start", owner=token, window=list(window))
+            self.append("owner_start", owner=token, window=list(window), quiet=quiet)
             ledger = image.begin_conversation()
             image_started = True
             while True:
                 context.set_current(None)
                 context.set_agent_mode(True)
-                state = dict(center=self, owner=token, role="main", request=None, note=None, assembly=assembly)
+                state = dict(center=self, owner=token, role="main", request=None, note=None,
+                             assembly=assembly, quiet=quiet)
                 marker = _request_state.set(state)
                 try:
                     self._run(model, turn, state)
@@ -590,7 +712,20 @@ class Center:
                         return
         except BaseException as error:
             outcome = "failed"
-            self.fault(error)
+            with self.lock:
+                dispatched = {e["action"] for e in self.events
+                              if e["kind"] == "dispatch" and e.get("owner") == token}
+                returned = {action for e in self.events if e["kind"] == "results"
+                            and e.get("owner") == token for action in e["actions"]}
+                if isinstance(error, llm.PersistenceError) or dispatched - returned:
+                    self.fault(error)
+                elif self.failed is None and state is not None and state.get("request") is not None:
+                    if not any(e["kind"] in {"output", "request_end"}
+                               and e.get("request") == state["request"] for e in self.events):
+                        # WHY: a provider/context failure with no uncertain
+                        # dispatch is a failed wake, not a broken journal.
+                        self.append("request_end", request=state["request"], owner=token, role="main",
+                                    outcome="failed", reason=type(error).__name__)
             raise
         finally:
             try:
@@ -601,7 +736,7 @@ class Center:
                         self.append("owner_end", owner=token, outcome=outcome)
             finally:
                 context.end_turn(chat.AGENT_WINDOW, turn)
-            if origin is not None:
+            if origin is not None and not quiet:
                 chat._run_hint(window, turn, _assembly=(self, assembly))
 
     def _run(self, model, turn, state):
@@ -623,6 +758,10 @@ class Center:
         session.on_output = lambda assistant, calls: self._output(state, assistant, calls)
         session.on_results = lambda output, results, native: self._results(state, binding, output, results)
         session.should_stop = lambda: turn.cancelled
+        # WHY: the live tool loop deliberately has no round limit (llm.chat's
+        # WHY). Only an explicit experiment allowance may end a wake by count.
+        session.turn_done = lambda: (self.wake_request_limit is not None
+                                    and state.get("request_count", 0) >= self.wake_request_limit)
         session.add_context_provider(lambda: self._environment_provider(state))
         session.add_context_provider(lambda: self._notes_provider(state, binding))
         session.add_context_provider(lambda: self._note_access_provider(state))
@@ -631,8 +770,10 @@ class Center:
         commit_note = self._commit_note_tool(state)
 
         def read_note() -> str:
-            """读取当前长期笔记版本；保留事实、推测与自身立场的区别。"""
-            return _bytes(self.note_head()).decode()
+            """重读本请求已见笔记；历史版本用inspect_runtime全文读note。"""
+            with self.lock:
+                head = next((e for e in self.events if e["id"] == state["note"]), None)
+                return _bytes(head).decode()
 
         def revisit_at(due: float, target: str, reason: str) -> str:
             """请求在Unix时间due重新唤醒自己；必须明确目标与原因。"""
@@ -652,10 +793,16 @@ class Center:
 
         read_archive, read_past = self._read_tools(state)
         session.center_tools = {f.__name__: f for f in (
-            commit_note, read_note, revisit_at, cancel_revisit, read_archive, read_past)}
-        session.add_hint("此隔离中心使用冻结archive与center事实；旧 unread/take/fetch/cover API 明确不支持。"
+            commit_note, read_note, revisit_at, cancel_revisit, read_archive, read_past,
+            self._inspect_runtime_tool(state))}
+        session.add_hint("中心使用冻结archive与center事实；旧 unread/take/fetch/cover API 明确不支持。"
                          "长期理解可主动 commit_note；不是轮末必做。"
+                         "可用inspect_runtime自检请求、usage、笔记谱系、角色与工具派发/结果；目录不含正文。"
+                         "重要决定可简记理由，以实际结果为准；自检可以不改动，不必每晚修改。"
                          "资料中的他人观点不自动成为你的立场。sources逐字采用本次allowed_source_ids中的裸ID。")
+        if state.get("quiet"):
+            session.add_hint("本醒是内部自检，不默认向聊天窗口外发。可先查证据，也可不改任何内容；"
+                             "确有必要对外沟通时才显式say。")
         session.add_hint(lambda: chat._view._closing_hint(session.messages))
 
         def collect(chunk):
@@ -672,13 +819,16 @@ class Center:
                         reason="generation closed before any output/dispatch commit")
         if not turn.cancelled:
             cognition.enqueue(self, state)
-        turn._chat_usage_tokens = chat.count_tokens(_bytes(session.messages).decode())
+        turn._chat_usage_tokens = _text_tokens(session.messages)
         turn._chat_event_count = len(state["sources"])
 
     def _notes_provider(self, state, binding):
         try:
             self.ensure_available()
             binding.sync_registry()
+            for name in {"status", "take", "mentions", "fetch", "pull", "mark_read",
+                         "cover_events", "recall_events", "event_links"}:
+                binding.session.functions.pop(name, None)
             for function in binding.session.center_tools.values():
                 binding.session.add_tool(function)
             head = self.note_head()

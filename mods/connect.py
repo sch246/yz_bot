@@ -195,17 +195,9 @@ def recv_msg() -> dict | None:
 
 def on_load(ctx) -> None:
     global _server
-    from mods import chat
-
-    # WHY: The archive anchor and mail boundary must both predate live ingress;
-    # otherwise a newly received message could hide the offline gap. Chat's
-    # normal on_load is later, so only its preparation hook runs here.
-    try:
-        chat.prepare_recovery_sources()
-    except Exception:
-        # WHY: Offline recovery is optional; a broken archive must not prevent
-        # the required OneBot listener from accepting fresh messages.
-        _log.exception("offline recovery preparation failed; live ingress continues")
+    # WHY: Center now owns arrivals and pending activations. Preparing the old
+    # oplog's recovery sources here would scan history and create a second mail
+    # authority before Center is installed. Old archives stay explicitly readable.
     with _server_lock:
         if _server is not None:
             return
