@@ -2,6 +2,8 @@
 
 本目录同时保存仍未实现的提案和已经完成的架构迁移记录。当前事实只能由 `docs/architecture.md`、`docs/interaction-model.md` 与 `docs/runtime.md` 断言；完成项用于解释取舍和旧能力去向。
 
+Agent 循环替换与长期记忆研究的接续入口见[任务地图与决策票据](../agent-memory/map.md)；原裁定和研究仍保留在本目录。地图区分已接线源码、待实施计划与尚未证明的运行效果，不代替部署授权。
+
 **先找方向：**[中心化聊天软件阅读计划](chat-client-reading.md)与[NapCat 离线恢复](offline-message-backfill.md)已在主线代码接线，真实停机空窗尚未验收；[压缩与消息模型交接](condense-and-unify-handoff.md)保存此前主线与已落地部分；[统一信息流实施记录](unified-event-stream.md)区分现行接线和未完成的压缩树；[方向索引](long-term-roadmap.md)单列其它长期计划。部署进程须完整重启才使用对应版本，现行合同以正式文档和代码为准。
 
 - [新代码架构与一次性切换](code-organization.md)（已完成；调查摘要见[旧代码组织现状](../code-organization-analysis.md)）
@@ -19,7 +21,7 @@
 - [QQ Bot 持久记忆实现调查](qqbot-persistent-memory-research.md)（公开源码调查；复核 SLA 收录，区分视频 QQ-agent、dsh-qqbot 与宿主机制，记录 Bili Note 的持久安装与字幕覆盖限制）
 - [记忆、预测与统一事件流：基础问题讨论](memory-foundations-discussion.md)（讨论记录，不批准实现；保留预测、编码器、二阶惊奇与可达性的工作假设；2026-10-08 第十四节记录全文补读后的变化：条件推断、表征持续、潜在情境信用与学会推断，未替维护者决定结构）
 - [记忆基础问题综述](memory-foundations-survey.md)（外部研究综述，不批准实现；按开放问题组织文献，记录 20 项预测编码题单的全文阅读版本与补充缺口；区分推断能力、条件性数学结论、神经证据和聊天记忆迁移，并提出候选证伪实验）
-- [无状态主循环：每次唤醒重建上下文](stateless-agent-loop.md)（提案，未实现；维护者已裁定方向：参照 QQ-agent、SLA 与 retro，以“前置 agent 挑选材料 → 聊天 agent 行动 → 图书管理员改笔记”取代重放经历流，统一 chatlog 与模型可见格式、读消息直接读文件，并列出随之移除的覆盖、反查与聊天软件式阅读机制）
+- [无状态主循环：每次唤醒重建上下文](stateless-agent-loop.md)（原提案与历史裁定；部分机制已在T27接入源码，当前T28计划让前置选材决定记忆正文并支持过程重选；任务边界与淡出应由取材表现，不新增显式切换流程）
 - [可编程经历数据](programmable-experience-data.md)（实施计划；复用现有 `exec_code`，先以磁盘惰性迭代验证模型能否自由查询和自审，不新增 world/snapshot/记忆 manager，也不把全量历史放进内存）
 - [检索索引：把子代理找过的路存下来](retrieval-index.md)（未实现；缓存子代理的检索路径而不是结论，失效判据由模型自写的校验命令给出）
 - [统一信息流：读时编号与完整输出事件](unified-event-stream.md)（已提交读时编号、受限首层覆盖和反查，最新代码尚未部署；长期退休暂缓，不要求 LLF）
