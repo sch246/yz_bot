@@ -53,6 +53,7 @@ def isolated(runtime):
         if _active is not None or context.get_turn(("agent", 0)) is not None:
             raise RuntimeError("a center reader is already installed or running")
         runtime._assembly = object()
+        runtime._start_installation()
         _active = runtime
     try:
         runtime.ensure_available()
@@ -61,11 +62,17 @@ def isolated(runtime):
             revisit.project(runtime, runtime.scheduler)
         yield runtime
     finally:
-        with _assembly_lock:
+        with _assembly_lock, runtime.lock:
             if context.get_turn(("agent", 0)) is not None:
                 # Retain the assembly on misuse: an in-flight call must not fall
                 # back into the legacy writer when its owner finally returns.
                 raise RuntimeError("cannot detach a running center")
+            runtime._closing = True
+        runtime.close()
+        with _assembly_lock:
+            if context.get_turn(("agent", 0)) is not None:
+                raise RuntimeError("cannot detach a running center")
+            runtime._remove_client_guard()
             _active = None
             runtime._assembly = None
 
@@ -73,7 +80,8 @@ def isolated(runtime):
 class Center:
     def __init__(self, *, root, archive_root, source_namespace, source_format,
                  bot_id, bot_names, names_complete, timezone, client, send_sink,
-                 request_limit, registry=None, scheduler=None):
+                 request_limit, registry=None, scheduler=None, selector_model=None,
+                 librarian_model=None, recent_count=8, role_request_limit=4):
         self.root = Path(root).resolve()
         self.archive_root = Path(archive_root).resolve()
         self.scope_id = source_namespace
@@ -90,7 +98,18 @@ class Center:
         self.client, self.send_sink = client, send_sink
         self.registry, self.scheduler = registry, scheduler
         self.request_limit = int(request_limit)
+        for number in (recent_count, role_request_limit):
+            if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+                raise ValueError("recent_count and role_request_limit must be positive counts")
+        for selection in (selector_model, librarian_model):
+            if selection is not None and (not isinstance(selection, str) or not selection.strip()):
+                raise ValueError("auxiliary model must be an explicit model selection or None")
+        self.selector_model, self.librarian_model = selector_model, librarian_model
+        self.recent_count, self.role_request_limit = recent_count, role_request_limit
+        self._model_lock = threading.Lock()
+        self._jobs, self._worker, self._closing = [], None, False
         self.lock = threading.RLock()
+        self._jobs_changed = threading.Condition(self.lock)
         self._assembly = None
         self.events = []
         self.failed = None
@@ -134,7 +153,7 @@ class Center:
                 responses.add(event["request"])
             elif kind == "request":
                 requests.add(event["id"])
-            elif kind == "request_end" and event["outcome"] == "cancelled":
+            elif kind == "request_end" and event["outcome"] in {"cancelled", "failed"}:
                 responses.add(event["request"])
             elif kind == "hint_dispatch":
                 hints.add(event["id"])
@@ -243,10 +262,51 @@ class Center:
             self.append("activation", arrival=arrival, window=source["window"], activation_kind=kind)
 
     def pending(self):
-        acknowledged = {key for e in self.events if e["kind"] in {"output", "disposition"}
+        acknowledged = {key for e in self.events if (e["kind"] == "disposition" or
+                        (e["kind"] == "output" and e.get("role", "main") == "main"))
                         for key in e.get("activations", [])}
-        return [deepcopy(e) for e in self.events if e["kind"] in {"activation", "revisit_delivery", "resume"}
+        return [deepcopy(e) for e in self.events if e["kind"] in {
+                    "activation", "revisit_delivery", "resume", "environment_activation"}
                 and e["id"] not in acknowledged]
+
+    def post_event(self, source, type, payload, *, window, wake=False, assembly=None):
+        """Record a fact and optional pending activation, without starting a model.
+
+        Every callback must pass the installation identity captured at attach.
+        """
+        if not isinstance(source, str) or not source.strip() or not isinstance(type, str) or not type.strip():
+            raise ValueError("event source and type must be nonempty text")
+        if not isinstance(window, (tuple, list)) or len(window) != 2 or window[0] not in {"group", "private"}:
+            raise ValueError("event requires an explicit chat window")
+        _bytes(payload)
+        with _assembly_lock, self.lock:
+            require_assembly(self, assembly)
+            if self._closing:
+                raise RuntimeError("center is closing")
+            event = self.append("environment", source=source, type=type, payload=payload,
+                                window=list(window), time=time.time())
+            if wake:
+                self.append("environment_activation", event=event["id"], window=list(window),
+                            reason=f"{source}:{type}")
+            return event
+
+    def _start_installation(self):
+        from . import cognition
+        cognition.start(self)
+
+    def _remove_client_guard(self):
+        if self.client.generate_response is self._guarded_response:
+            self.client.generate_response = self._original_response
+
+    def join(self, timeout=None):
+        """Wait for queued auxiliary jobs; return False on timeout."""
+        from . import cognition
+        return cognition.join(self, timeout)
+
+    def close(self, timeout=None):
+        """Drain and join the auxiliary worker; restoration never replays jobs."""
+        from . import cognition
+        return cognition.close(self, timeout)
 
     def activate_delivery(self, delivery, window, reason):
         return self.append("revisit_delivery", request=delivery["request"], delivery=delivery,
@@ -302,12 +362,25 @@ class Center:
                 raise ValueError("stale note parent; read the current head")
             if parent != seen["note"]:
                 raise ValueError("candidate did not see this note parent in its actual request")
-            if not isinstance(text, str) or not isinstance(sources, list):
+            if (not isinstance(text, str) or not isinstance(sources, list)
+                    or any(not isinstance(source, str) for source in sources)):
                 raise ValueError("note text and explicit source list are required")
             if set(sources) - set(seen["sources"]):
                 raise ValueError("note source was not seen at this request cutoff")
             note = dict(text=text, sources=list(dict.fromkeys(sources)), cutoff=seen["cutoff"], request=request)
             return self.append("note", parent=parent, version=_hash(note), note=note)
+
+    def _commit_note_tool(self, state):
+        def commit_note(parent: str, text: str, sources: list[str]) -> str:
+            """按已见版本和来源保存长期理解；parent空串表示尚无笔记。"""
+            try:
+                entry = self.commit_note(parent=parent or None, text=text, sources=sources,
+                                         request=state["request"])
+            except ValueError as error:
+                # A rejected CAS has no side effect, even with strict tools.
+                return _bytes(dict(status="rejected", reason=str(error))).decode()
+            return _bytes(entry).decode()
+        return commit_note
 
     def observe_request(self, selection, params):
         state = _request_state.get()
@@ -317,13 +390,21 @@ class Center:
                 raise llm.PersistenceError("isolated center rejects unbound model requests")
             if sum(e["kind"] == "request" for e in self.events) >= self.request_limit:
                 raise llm.PersistenceError("isolated request allowance exhausted")
+            if state["role"] != "main" and state.get("request_count", 0) >= self.role_request_limit:
+                raise llm.RequiredContextError("auxiliary role request allowance exhausted")
             from mods import chat
             if chat.count_tokens(_bytes(params).decode()) > chat.limit()[1]:
                 raise llm.RequiredContextError("isolated SDK payload exceeds the configured context allowance")
+            cutoffs = [key for key in [state["cutoff"], *state["sources"]]
+                       if isinstance(key, str) and key.startswith("C") and key[1:].isdigit()]
+            if cutoffs:
+                state["cutoff"] = max(cutoffs, key=lambda key: int(key[1:]))
             entry = self.append("request", owner=state["owner"], cutoff=state["cutoff"],
-                                activations=state["activations"], sources=state["sources"],
+                                role=state["role"], activations=state["activations"],
+                                sources=list(dict.fromkeys(state["sources"])),
                                 note=state["note"], selection=selection, payload=params)
             state["request"] = entry["id"]
+            state["request_count"] = state.get("request_count", 0) + 1
 
     def observe_action(self, action):
         if action is None:
@@ -332,23 +413,23 @@ class Center:
         self.ensure_available()
         if state is None or state["center"] is not self:
             raise llm.PersistenceError("isolated center rejects unbound actions")
-        self.append("dispatch", owner=state["owner"], output=action.partition("#")[0], action=action)
+        self.append("dispatch", owner=state["owner"], role=state["role"],
+                    output=action.partition("#")[0], action=action)
 
     def _freeze(self, state):
-        from mods import chatlog
+        from mods import chatlog, chat
 
         with self.lock:
             self.ensure_available()
             frozen = deepcopy(self.events)
-            from mods import chat
+            state["event_start"] = len(frozen)
             if sum(e["kind"] == "arrival" and e["eligible"] for e in frozen) > chat.limit()[0]:
                 raise llm.RequiredContextError("isolated archive view exceeds the configured event allowance")
             state["cutoff"] = frozen[-1]["id"] if frozen else None
-            state["activations"] = [e["id"] for e in self.pending()]
-            state["sources"] = []
-            messages = []
-            days = {}
-            references = []
+            activations = self.pending()
+            state["activations"] = [e["id"] for e in activations]
+            state["sources"], state["materials"], state["catalog"] = [], {}, []
+            days, references, recent = {}, [], []
             for entry in frozen:
                 if entry["kind"] == "arrival" and entry["eligible"]:
                     window = entry["window"]
@@ -360,20 +441,86 @@ class Center:
                     item = days[day_key].get(entry["origin"])
                     if item is None or item["ref"]["sha256"] != entry["raw_sha256"]:
                         raise ValueError("archive no longer matches its registered arrival")
-                    ref, raw = item["ref"], item["raw"]
+                    ref = item["ref"]
                     references.append(dict(arrival=entry["id"], ref=ref))
                     key = ref["key"]
-                    state["sources"].append(key)
-                    messages.append({"role": "user", "content": [
-                        {"type": "text", "text": f"archive {key} {entry['window']}\n"},
-                        *chat.msg_split(raw.decode("utf-8"))]})
-                elif entry["kind"] in {"output", "results", "revisit_delivery", "resume"}:
-                    state["sources"].append(entry["id"])
-                    messages.append({"role": "user", "content": "committed center fact " + _bytes(entry).decode()})
-            messages.append({"role": "user", "content": "frozen activations " + _bytes(self.pending()).decode()})
+                    state["materials"][key] = dict(kind="archive", ref=ref)
+                    state["catalog"].append(dict(key=key, kind="archive", window=window, day=entry["day"],
+                                                     text_start=item["raw"].decode("utf-8")[:120]))
+                    recent.append(key)
+                elif entry["kind"] in {"output", "results", "environment", "revisit_delivery", "resume"}:
+                    key = entry["id"]
+                    state["materials"][key] = dict(kind="fact", fact=entry)
+                    state["catalog"].append({k: v for k, v in dict(
+                        key=key, kind=entry["kind"], role=entry.get("role"),
+                        text_start=(_bytes(entry.get("assistant", entry.get("returns", entry.get("payload", {})))).decode()[:120]
+                                    if entry.get("role", "main") == "main" else None),
+                        window=entry.get("window"), source=entry.get("source"), type=entry.get("type")).items()
+                                            if v is not None})
+                    if entry.get("role", "main") == "main":
+                        recent.append(key)
+            # WHY: auxiliary traces are inspectable by ID without becoming the
+            # main agent's default autobiographical stream.
+            state["recent"] = recent[-self.recent_count:]
+            state["environment_cursor"] = len(frozen)
+            state["activation_message"] = {"role": "user", "content": "frozen activations " + _bytes(activations).decode()}
             self.append("freeze", owner=state["owner"], cutoff=state["cutoff"], references=references,
-                        activations=state["activations"])
-            return messages
+                        activations=state["activations"], recent=state["recent"], catalog=state["catalog"])
+        messages = [self._material_message(state, key) for key in state["recent"]]
+        state["sources"].extend(state["activations"])
+        messages.append(state["activation_message"])
+        return messages
+
+    def _read_material(self, state, key, *, archive):
+        material = state["materials"].get(key)
+        if material is None or (material["kind"] == "archive") != archive:
+            raise ValueError("unknown frozen archive key" if archive else "unknown frozen past fact")
+        if archive:
+            from mods import chatlog
+            try:
+                raw = chatlog.read_archive_bytes(material["ref"], root=self.archive_root)
+            except Exception as error:
+                self.fault(error)
+                raise llm.PersistenceError("archive identity changed; refusing further dispatch") from error
+            value = dict(ref=material["ref"], raw=raw.decode("utf-8"))
+        else:
+            value = material["fact"]
+        state["sources"].append(key)
+        return value
+
+    def _material_message(self, state, key):
+        from mods import chat
+        material = state["materials"][key]
+        value = self._read_material(state, key, archive=material["kind"] == "archive")
+        if material["kind"] == "archive":
+            return {"role": "user", "content": [
+                {"type": "text", "text": f"archive {key} {[value['ref']['kind'], value['ref']['target']]}\n"},
+                *chat.msg_split(value["raw"])]}
+        return {"role": "user", "content": "committed center fact " + _bytes(value).decode()}
+
+    def _read_tools(self, state):
+        def read_archive(key: str) -> str:
+            """按目录key读取本醒冻结的archive原件；追加不会扩张引用。"""
+            return _bytes(self._read_material(state, key, archive=True)).decode()
+
+        def read_past(key: str) -> str:
+            """按目录key读取本醒冻结的原始输出、结果或环境事实；目录不等于正文。"""
+            return _bytes(self._read_material(state, key, archive=False)).decode()
+
+        return read_archive, read_past
+
+    def _environment_provider(self, state):
+        with self.lock:
+            self.ensure_available()
+            tail = deepcopy(self.events[state["environment_cursor"]:])
+            state["environment_cursor"] = len(self.events)
+            entries = [e for e in tail if e["kind"] == "environment"]
+            for entry in entries:
+                state["materials"][entry["id"]] = dict(kind="fact", fact=entry)
+                state["cutoff"] = entry["id"]
+            # Newly delivered wakes stay pending for a fresh main activation;
+            # this provider exposes progress, not an acknowledgement claim.
+            return [self._material_message(state, e["id"]) for e in entries]
 
     def drive(self, model, window, *, assembly):
         from mods import chat, image
@@ -385,6 +532,8 @@ class Center:
                 # turn so detach cannot move it onto another authority.
                 require_assembly(self, assembly)
                 self.ensure_available()
+                if self._closing:
+                    raise RuntimeError("center is closing")
                 turn, owner = context.begin_turn(chat.AGENT_WINDOW)
                 if owner:
                     turn.associated_windows = {window}
@@ -407,7 +556,7 @@ class Center:
             while True:
                 context.set_current(None)
                 context.set_agent_mode(True)
-                state = dict(center=self, owner=token, request=None, note=None)
+                state = dict(center=self, owner=token, role="main", request=None, note=None, assembly=assembly)
                 marker = _request_state.set(state)
                 try:
                     self._run(model, turn, state)
@@ -447,19 +596,22 @@ class Center:
         session.associated_windows = turn.associated_windows
         session.requested_reads = []
         messages = self._freeze(state)
+        from . import cognition
+        selected = cognition.select(self, state, messages)
+        messages.extend(self._material_message(state, key) for key in selected if key not in state["recent"])
+        messages.append({"role": "user", "content": "frozen material directory (IDs are not original contents) "
+                         + _bytes(state["catalog"]).decode()})
         binding = chat._activate_chat(session, messages)
         # The old reader callbacks are replaced before Chat is invoked.  TTL,
         # schema restore, module loading, image/reasoning and hint stay native.
         session.on_output = lambda assistant, calls: self._output(state, assistant, calls)
         session.on_results = lambda output, results, native: self._results(state, binding, output, results)
         session.should_stop = lambda: turn.cancelled
+        session.add_context_provider(lambda: self._environment_provider(state))
         session.add_context_provider(lambda: self._notes_provider(state, binding))
         turn._chat_limit = chat.limit()
 
-        def commit_note(parent: str, text: str, sources: list[str]) -> str:
-            """保存自己的长期理解。parent为空表示无旧版本；sources只能来自本次实际请求。"""
-            return _bytes(self.commit_note(parent=parent or None, text=text, sources=sources,
-                                          request=state["request"])).decode()
+        commit_note = self._commit_note_tool(state)
 
         def read_note() -> str:
             """读取当前长期笔记版本；保留事实、推测与自身立场的区别。"""
@@ -481,21 +633,9 @@ class Center:
                 revisit.project(self, self.scheduler)
             return _bytes(entry).decode()
 
-        def read_archive(key: str) -> str:
-            """按稳定archive key读取固定原件；追加不会扩张引用，原片段改变立即停止。"""
-            from mods import chatlog
-            ref = next((r["ref"] for e in reversed(self.events) if e["kind"] == "freeze"
-                        for r in e["references"] if r["ref"]["key"] == key), None)
-            if ref is None:
-                raise ValueError("unknown archive key")
-            try:
-                raw = chatlog.read_archive_bytes(ref, root=self.archive_root)
-            except Exception as error:
-                self.fault(error)
-                raise llm.PersistenceError("archive identity changed; refusing further dispatch") from error
-            return _bytes(dict(ref=ref, raw=raw.decode("utf-8"))).decode()
-
-        session.center_tools = {f.__name__: f for f in (commit_note, read_note, revisit_at, cancel_revisit, read_archive)}
+        read_archive, read_past = self._read_tools(state)
+        session.center_tools = {f.__name__: f for f in (
+            commit_note, read_note, revisit_at, cancel_revisit, read_archive, read_past)}
         session.add_hint("此隔离中心使用冻结archive与center事实；旧 unread/take/fetch/cover API 明确不支持。"
                          "长期理解可主动 commit_note；不是轮末必做。"
                          "资料中的他人观点不自动成为你的立场。sources使用archive key或committed center fact编号。")
@@ -503,7 +643,7 @@ class Center:
 
         def collect(chunk):
             if chunk.total_tokens:
-                self.append("usage", request=state["request"], prompt_tokens=chunk.prompt_tokens,
+                self.append("usage", role=state["role"], request=state["request"], prompt_tokens=chunk.prompt_tokens,
                             completion_tokens=chunk.completion_tokens, cached_tokens=chunk.cached_tokens)
             chat.get_handler(session)(chunk)
 
@@ -513,6 +653,8 @@ class Center:
                 e["kind"] == "output" and e["request"] == state["request"] for e in self.events[before:]):
             self.append("request_end", request=state["request"], outcome="cancelled",
                         reason="generation closed before any output/dispatch commit")
+        if not turn.cancelled:
+            cognition.enqueue(self, state)
         turn._chat_usage_tokens = chat.count_tokens(_bytes(session.messages).decode())
         turn._chat_event_count = len(state["sources"])
 
@@ -530,21 +672,25 @@ class Center:
             # WHY: the injected version is a source only from this request onward.
             if version is not None:
                 state["sources"].append(version)
+                if state["cutoff"] is None or int(version[1:]) > int(state["cutoff"][1:]):
+                    state["cutoff"] = version
             return [{"role": "user", "content": "current long term note " + _bytes(head).decode()}]
         except Exception as error:
             raise llm.RequiredContextError("center note/context failed") from error
 
     def _output(self, state, assistant, calls):
-        entry = self.append("output", owner=state["owner"], request=state["request"],
-                            assistant=assistant, calls=calls, activations=state["activations"])
+        entry = self.append("output", owner=state["owner"], role=state["role"], request=state["request"],
+                            assistant=assistant, calls=calls,
+                            activations=state["activations"] if state["role"] == "main" else [])
         state["sources"].append(entry["id"])
         return entry["id"]
 
     def _results(self, state, binding, output, results):
         returns = [dict(tool_call_id=r.tool_call_id, name=r.name, arguments=r.arguments, content=r.content)
                    for r in results]
-        entry = self.append("results", owner=state["owner"], output=output, returns=returns,
+        entry = self.append("results", owner=state["owner"], role=state["role"], output=output, returns=returns,
                             actions=[f"{output}#{i+1}" for i in range(len(results))])
         state["sources"].append(entry["id"])
-        for result in results:
-            binding.touch(result.name)
+        if binding is not None:
+            for result in results:
+                binding.touch(result.name)
