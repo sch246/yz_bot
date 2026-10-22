@@ -195,7 +195,7 @@ def run(root, client, model="official/deepseek-flash", *, recent_count=2,
         chatlog.rootfile = str(root / "archive")
         chatlog._boot_anchors = {}
         context._latest = {}
-        chat.settings, chat.prompts, chat.chat_groups = [], {}, []
+        chat.settings, chat.prompts, chat.chat_groups = [], {}, [WINDOW[1]]
         chat.llm_config, chat.description_cache = getattr(client, "config", {}), {}
         identity.qq, identity.name, identity.nicknames = BOT_ID, BOT_NAME, [BOT_NAME]
         identity.get_user_name = lambda user_id: BOT_NAME if int(user_id) == BOT_ID else "合成参与者"
@@ -212,20 +212,20 @@ def run(root, client, model="official/deepseek-flash", *, recent_count=2,
         with isolated(center):
             actions = Actions(center=center, step=lambda step, cancelled, report: room.step(
                 step, cancelled, report), window=WINDOW, tick_seconds=.05)
-            room = _Room(center, actions, root / "outbox", started)
-            _ACTIVE_ROOM = room
-            room.position = 0
-            room.progress = []
-            room.wake_samples = []
-            _seed(center, room)
-            _drive(center, room, actions, model, max_wakes, time_limit, started)
-            actions.close()
-            actions = None
+            try:
+                room = _Room(center, actions, root / "outbox", started)
+                _ACTIVE_ROOM = room
+                room.position = 0
+                room.progress = []
+                room.wake_samples = []
+                _seed(center, room)
+                _drive(center, room, actions, model, max_wakes, time_limit, started)
+            finally:
+                actions.close()
+                actions = None
             center.join()
             summary = _summary(center, room, root, started)
     finally:
-        if actions is not None:
-            actions.close()
         # Caller promises a fresh process; restore bindings for interactive reuse too.
         llm.client, storage.root_path, chatlog.rootfile = old["client"], old["root_path"], old["rootfile"]
         chat.settings, chat.prompts, chat.chat_groups = old["settings"], old["prompts"], old["chat_groups"]
