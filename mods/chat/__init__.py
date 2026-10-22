@@ -35,7 +35,7 @@ llm_config: dict = {}
 # WHY: 两个上限的默认值写死在这里，不再读 llm_system/config.json；运行期由全局
 # agent storage 覆盖。2026-10-19 起每次请求都重新组装：max_events 是一个窗口画面
 # 默认展示的条数（参照 QQ-agent 的 80），max_token 乘提醒百分比是一次唤醒里上下文
-# 长到多少就重新选材。存储键沿用旧名，免得已有的全局设置失效。
+# 长到多少就请图书管理员放下一部分再重新组装。存储键沿用旧名，免得已有的全局设置失效。
 DEFAULT_MAX_EVENTS = 80
 DEFAULT_MAX_TOKEN = 40000
 AGENT_WINDOW = oplog.AGENT_WINDOW

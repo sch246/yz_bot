@@ -1,4 +1,8 @@
-"""Plain Markdown notes kept by the librarian: one global, one per person, one per group.
+"""Plain Markdown notes kept by the librarian.
+
+``global`` holds how she does things (procedural memory), ``recent`` what is
+going on right now (short-term memory), and one note per person and per group
+what she knows and what happened with them.
 
 WHY: files, not storage JSON, so the maintainer can read and fix them with any
 editor while the Bot runs.  Every overwrite or deletion first copies the old
@@ -20,14 +24,14 @@ from mods import storage
 
 ROOT = Path("data") / "notes"
 _lock = threading.Lock()
-_SCOPE = re.compile(r"^(global|person:\d+|group:\d+)$")
+_SCOPE = re.compile(r"^(global|recent|person:\d+|group:\d+)$")
 
 
 def _path(scope: str) -> Path:
     if not _SCOPE.fullmatch(scope):
-        raise ValueError("scope 只能是 global、person:<QQ号> 或 group:<群号>")
-    if scope == "global":
-        return ROOT / "global.md"
+        raise ValueError("scope 只能是 global、recent、person:<QQ号> 或 group:<群号>")
+    if scope in ("global", "recent"):
+        return ROOT / f"{scope}.md"
     kind, number = scope.split(":")
     return ROOT / kind / f"{number}.md"
 
@@ -90,7 +94,7 @@ def listing(limit: int = 60) -> list[dict]:
         relative = path.relative_to(ROOT)
         if relative.parts[0] == ".history":
             continue
-        scope = "global" if relative.parts == ("global.md",) else f"{relative.parts[0]}:{path.stem}"
+        scope = path.stem if len(relative.parts) == 1 else f"{relative.parts[0]}:{path.stem}"
         if not _SCOPE.fullmatch(scope):
             continue
         text = path.read_text(encoding="utf-8").strip()

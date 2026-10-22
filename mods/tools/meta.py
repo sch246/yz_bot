@@ -1,6 +1,6 @@
 '''指导模型增删查改统一工具与 Skill 模块，并说明 last-good、显式应用和当前会话激活原理。
 
-同一模型输出的多个工具调用按顺序执行，却看不到彼此结果；整批完成后结果在下一子请求可见。若 `say(final_call=true)` 结束、请求取消或失败，不会只为结果强迫续轮。每次唤醒的材料都是重新挑选的：要看画面以外的聊天记录用 `read_log`，自己过去的行动用 `read_actions`，笔记用 `read_note`。
+同一模型输出的多个工具调用按顺序执行，却看不到彼此结果；整批完成后结果在下一子请求可见。若 `say(final_call=true)` 结束、请求取消或失败，不会只为结果强迫续轮。每次唤醒眼前只有做法笔记、短期记忆、叫醒你的窗口和相关人的笔记；别的要自己召回：按窗口翻聊天记录用 `read_log`，按线索找用 `search_log`，自己过去的行动用 `read_actions`，笔记用 `read_note`。
 
 ## 直接执行 Python
 
@@ -111,11 +111,12 @@ Skill 也是可编辑的长期笔记：把可重复使用的经验、做法、�
 
 ## 经历与笔记
 
-每次模型输出（正文、多个行动）记进 oplog，有一个 `YYYYMMDD-N` 行动号；工具结果随它记下。眼前的材料每次唤醒都由前置选材重新挑选，不重放旧的对话：没出现的东西没有丢。
+每次模型输出（正文、多个行动）记进 oplog，有一个 `YYYYMMDD-N` 行动号；工具结果随它记下。每次唤醒不重放旧的对话，眼前只有做法笔记（global）、短期记忆（recent）、叫醒你的窗口和相关的人或群的笔记；没出现的东西没有丢，召回是你自己的事。
 
-- 聊天记录就是 `chatlog/` 的原文，`read_log(window, count, before)` 读任意窗口，格式与画面相同；用 `before` 往前翻页。
-- 自己做过的事用 `read_actions(ids)` 按行动号读，或不给号读最近几条。
-- 笔记由图书管理员在每次唤醒结束后整理，分 global、person:<QQ号>、group:<群号> 三种；`read_note(scope)` 读全文。你不用自己写笔记，跨唤醒没做完的事写进 `edit_hint` 待办。
+- 聊天记录就是 `chatlog/` 的原文，`read_log(window, count, before)` 读任意窗口，格式与画面相同；`before` 写 `YYYY-MM-DD HH:MM:SS` 往前翻页。
+- 记得一点线索（名字、话题、某个词）就用 `search_log(keyword, window, days)` 找出原文和时间，再用 `read_log` 读前后文。
+- 自己做过的事用 `read_actions(ids)` 按行动号读，或不给号读最近几条，`keyword` 按词筛。
+- 笔记由图书管理员整理：global 是你的做法，recent 是你的短期记忆，person:<QQ号>、group:<群号> 记认识与经历；`read_note(scope)` 读全文。放下是图书管理员的事：唤醒结束、或者一次唤醒里上下文太长时，他把你看过做过的东西收成结论和出处写进笔记。你不用自己写笔记，跨唤醒没做完的事写进 `edit_hint` 待办。
 - 更长时间跨度的自查可加载 `self_inspection` Skill，用 `exec_code` 读磁盘记录。
 
 ## 全局待办
@@ -225,36 +226,50 @@ def load_tools(names: list[str]) -> str:
 
 
 
-def read_log(window: str, count: int = 30, before: int = 0) -> str:
+def read_log(window: str, count: int = 30, before: str = "") -> str:
     """读一个聊天窗口的聊天记录原文，格式与眼前的画面相同，从最新往前取；before 用来往前翻页。
 
     @param
     window: g<群号> 或 u<私聊对端号>
     count: 取多少条记录，1 到 200
-    before: 只取这个 Unix 秒之前的记录；0 表示到最新
+    before: 只取这个时刻之前的记录，写 YYYY-MM-DD HH:MM:SS（画面里的日期加时间）或 Unix 秒；留空表示到最新
     """
     from mods import chat
 
     return chat.roles.read_log(window, count, before)
 
 
-def read_actions(ids: list[str] | None = None, count: int = 10) -> str:
+def search_log(keyword: str, window: str = "", days: int = 7) -> str:
+    """按线索在聊天记录里找：名字、QQ号、话题里的词都行，返回含这个词的记录原文，最新的在前。找到时间点后可以用 read_log 的 before 读前后文。
+
+    @param
+    keyword: 要找的词（不区分大小写，按原文子串匹配）
+    window: 只找这个窗口（g<群号> 或 u<私聊对端号>）；留空找所有窗口
+    days: 往前找多少天，1 到 90
+    """
+    from mods import chat
+
+    return chat.roles.search_log(keyword, window, days)
+
+
+def read_actions(ids: list[str] | None = None, count: int = 10, keyword: str = "") -> str:
     """读自己过去的行动记录原文：说过的话、调用过的工具及其结果。
 
     @param
     ids: 行动号列表，如 20261019-12；留空则取最近 count 条
     count: 不给 ids 时取最近多少条，1 到 50
+    keyword: 只取原文里含这个词的行动（不区分大小写）
     """
     from mods import chat
 
-    return chat.roles.read_actions(ids, count)
+    return chat.roles.read_actions(ids, count, keyword)
 
 
 def read_note(scope: str) -> str:
     """读一份图书管理员整理的笔记全文。
 
     @param
-    scope: global、person:<QQ号> 或 group:<群号>
+    scope: global（做法）、recent（短期记忆）、person:<QQ号> 或 group:<群号>
     """
     from mods import chat
 
@@ -411,6 +426,7 @@ def _format_results(results: Mapping) -> str:
 __all__ = [
     "say",
     "read_log",
+    "search_log",
     "read_actions",
     "read_note",
     "edit_hint",

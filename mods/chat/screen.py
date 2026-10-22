@@ -37,15 +37,18 @@ def _record_time(day: tuple[int, int, int], head: str) -> int | None:
     return chatlog._epoch(day, match) if match else None
 
 
-def records(window: tuple, count: int, before: int | None = None) -> list[dict]:
+def records(window: tuple, count: int, before: int | None = None, since: float | None = None) -> list[dict]:
     """The newest *count* records of one window, oldest first.
 
     *before* is an exclusive Unix time; it pages backwards through the files.
+    *since* stops at day files that end before it.
     """
     if count <= 0:
         return []
     picked: list[dict] = []
     for day, path in _day_files(window):
+        if since is not None and chatlog._day_bounds(day)[1] < since:
+            break
         lines = path.read_text(encoding="utf-8").split("\n")
         if lines and lines[-1] == "":
             lines.pop()
