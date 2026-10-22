@@ -16,6 +16,7 @@ WHY: 2026-10-22 维护者定的极简做法：白天只有一份"今天做过的
 from __future__ import annotations
 
 import json
+import threading
 import time
 
 from mods import context, image, llm, oplog, py, storage
@@ -46,6 +47,7 @@ reason
 _LEAD_IN = 3
 _FRESH_MAX = 200
 _KNOWN_PEOPLE = 6
+_TYPING_EVERY = 5
 
 
 def _text_tokens(messages: list[dict]) -> int:
@@ -330,6 +332,32 @@ def _compose_journal(turn, cancelled: bool) -> None:
     _journal.append(head, body)
 
 
+def _keep_typing(turn, window: tuple | None, stop: threading.Event) -> None:
+    """Show "对方正在输入…" in the private chats she is working on until the wake ends.
+
+    WHY: 维护者 2026-10-22 想要循环进行时有"正在输入"。NapCat 的 set_input_status 只支持
+    私聊（C2C），QQ 群没有这个状态。没有明确的"取消"调用，所以隔几秒续一次，唤醒结束
+    就不再续。失败只记一次，不影响她干活。
+    """
+    from mods import connect
+
+    failed = False
+    while not stop.is_set():
+        try:
+            targets = {window} if window is not None and window[0] == "private" else set()
+            targets.update(_reader.parse_target(label) for label in tuple(turn.screens) if label.startswith("u"))
+            for target in targets:
+                reply = connect.call_api("set_input_status", user_id=str(target[1]), event_type=1)
+                if reply.get("retcode") not in (0, None) and not failed:
+                    failed = True
+                    _roles._stream.warning(f"设置正在输入失败：{reply.get('wording') or reply.get('retcode')}")
+        except Exception:
+            if not failed:
+                failed = True
+                _roles._stream.exception("设置正在输入失败")
+        stop.wait(_TYPING_EVERY)
+
+
 def _drive_agent(model: str | None, window: tuple | None, alarm: tuple[str, str] | None = None) -> bool:
     """Hold the agent's turn until nothing is left to do; False when someone else holds it."""
     turn, owner = context.begin_turn(_chat_root.AGENT_WINDOW)
@@ -337,6 +365,8 @@ def _drive_agent(model: str | None, window: tuple | None, alarm: tuple[str, str]
         return False
     _begin(turn, window, "闹钟" if alarm else "唤醒")
     turn.alarm = alarm
+    typing = threading.Event()
+    threading.Thread(target=_keep_typing, args=(turn, window, typing), name="chat-typing", daemon=True).start()
     # WHY: 一次对话 = 这次持有的全过程（多轮 + 插话续写，直到 finally），图片检查台账就
     # 活在这段里：同一张图不重复下载/解析，对话结束即清掉，下次再聊重新检查一遍。
     image_ledger = image.begin_conversation()
@@ -364,6 +394,7 @@ def _drive_agent(model: str | None, window: tuple | None, alarm: tuple[str, str]
             if not context.finish_turn(_chat_root.AGENT_WINDOW, turn, oplog.has_unnotified):
                 return True
     finally:
+        typing.set()
         image.end_conversation(image_ledger)
         context.end_turn(_chat_root.AGENT_WINDOW, turn)
         _write_journal(turn, turn.cancelled)
@@ -520,7 +551,8 @@ _REFLECT_PROMPT = """现在是每晚反思的时间（{now}）。没有人叫你
 1. 先评估：changes 里还没有评估结论的改动，对照它之后的日志，问题少了吗？用 assess_change 写下结论；没用的就用 edit_policy 改回去。
 2. 再找失败：从带 ⚠ 的行和被人指出忘了的地方出发，需要时用 read_log、read_actions、read_journal 看原文，弄清是没记下、记下了没想起来、还是放下太早。
 3. 一次最多改一两处：edit_policy 改给图书管理员的附加说明或你的做法（global），写明原因和预期；醒来时带什么、阈值或代码要改，写进 proposals 交给维护者。
-4. 没发现值得改的就什么都不改，直接结束。"""
+4. 系统提示最前面的 self 是你对自己的认识，只有现在能改（edit_policy("self", …)）。这一天里如果有什么让你对自己有了新的认识——不是别人一句"你应该是……"，而是你回头看仍然认同的——可以改；大多数晚上不需要动它。
+5. 没发现值得改的就什么都不改，直接结束。"""
 
 
 def _tail(text: str, lines: int) -> str:

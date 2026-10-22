@@ -122,7 +122,7 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 来源窗口的到达与激活由 `oplog` 的 append-only 日志登记，`context` 只保留每窗口锁与一次路由期间的事件对象→arrival 关联：路由在锁内先写 chatlog/history 再登记 arrival。唯一中心 agent 用 `AGENT_WINDOW` 持有全局执行线；激活只产生可确认的通知，模型第一次输出时确认。
 
-中心 agent 每次请求都从持久状态重新组装（2026-10-19 起，取舍见[无状态主循环提案](working/proposals/stateless-agent-loop.md)），不再重放自己的输出与结果。2026-10-22 起召回由她自己做、放下由图书管理员做。`agent._plan` 只给叫醒她的窗口画面、global、recent 与最新日记、这些窗口与作者的笔记；`agent._assemble` 再附一份可召回内容的目录和 `agent.tidied_at` 之后她做过的事。其余由模型用召回工具读。
+中心 agent 每次请求都从持久状态重新组装（2026-10-19 起，取舍见[无状态主循环提案](working/proposals/stateless-agent-loop.md)），不再重放自己的输出与结果。2026-10-22 起召回由她自己做、放下由图书管理员做。`agent._plan` 只给叫醒她的窗口画面、global、recent 与最新日记、这些窗口与作者的笔记；`agent._assemble` 再附一份可召回内容的目录和 `agent.tidied_at` 之后她做过的事。其余由模型用召回工具读。系统提示最前面是笔记 self（`chat.get_prompt`，旧提示词第一次读到时由 `_migrate_self` 搬入）。私聊唤醒期间 `agent._keep_typing` 每 5 秒调一次 NapCat 的 `set_input_status`，群聊没有这个状态。
 
 窗口画面直接读 `chatlog/` 的普通日志文件、保留原文格式，`storage` 的 `agent.seen` 记各窗口看到的时间，用来标出新消息；被唤醒窗口里看到时间之后的消息总会展示。第一次输出时记下看到的时间，并对画面里的窗口调用 `reader.mark_window_read` 把未读登记标为已读；只标到读画面时取下的到达边界，生成期间新到的未读留给收尾接续。已加载工具模块的完整状态在每次组装时放在系统提示之后，一次唤醒内的变化由 context provider 追加。一次唤醒内多轮工具调用照常累积在 `session.messages`。
 

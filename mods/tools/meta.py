@@ -371,11 +371,15 @@ def write_note(scope: str, text: str) -> str:
     """用新全文替换一份笔记（普通 Markdown 文件，改前自动备份）；空串删除整份笔记。
 
     @param
-    scope: global、recent、todo、awaker、person:<QQ号>、group:<群号> 或 diary:<日期>
+    scope: global、recent、todo、awaker、person:<QQ号>、group:<群号> 或 diary:<日期>（self 只能在夜间反思时用 edit_policy 改）
     text: 这份笔记更新后的完整内容；改之前先 read_note 看现有内容，别把别人写的覆盖掉
     """
     from mods.chat import awaker, journal, notes
 
+    if scope == "self":
+        # WHY: 维护者 2026-10-22 定：自我认知只在夜间反思里改，白天被人一句话说动的事
+        # 要隔一晚回头看过才变成"我是谁"，免得一次聊天里的诱导变成每次醒来都生效的人设。
+        return "self 是你对自己的认识，白天不改；想到的先记进 recent 或 todo，夜里反思时再决定要不要用 edit_policy 改"
     previous = notes.write(scope, text)
     if previous.strip() != text.strip():
         journal.append(f"她改笔记 {scope}", journal.diff(previous, text))

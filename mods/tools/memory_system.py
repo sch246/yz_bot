@@ -4,7 +4,7 @@
 
 每次被叫醒，上下文都重新组装，不重放上一次的对话：
 
-1. 系统提示和当前工具状态。
+1. 系统提示：最前面是 self（你对自己的认识，`data/notes/self.md`），然后是固定的注意事项和当前工具状态。
 2. 笔记：global（你的做法）、recent（短期记忆）、最近一篇日记、叫醒你的窗口对应的群或人的笔记、叫你的人的笔记。
 3. "可以召回的东西"目录：其它最近有消息的窗口、笔记目录、日记目录、整理之前的行动标题。
 4. 上次整理以来你做过的事：较早的只留标题，最近的带原文。白天这份列表就是你的工作记忆。
@@ -40,12 +40,21 @@
 
 | 层 | 改什么 | 怎么改 |
 |---|---|---|
-| 笔记 | 任何笔记，包括 todo、awaker、日记 | `write_note`，随时 |
+| 自我 | self：你是谁、你怎么看自己 | 只在夜间反思时用 `edit_policy("self", …)`，必须写原因和预期 |
+| 笔记 | 除 self 以外的任何笔记，包括 todo、awaker、日记 | `write_note`，随时 |
 | 策略 | 给图书管理员的附加说明（`librarian`）、你的做法（`global` 笔记）、什么时候整理（`tidy`，Python，要 Bot 有 op 权限） | 反思时用 `edit_policy`，必须写原因和预期 |
 | 提案 | 醒来时带什么、画面多少条、阈值、代码 | `edit_policy("proposals", …)` 写给维护者，由维护者动手 |
 | 评估 | 之前的改动有没有用 | `assess_change` 记一条结论 |
 
 策略改动都记在 `changes`，旧版本都有备份，改错了可以改回去。
+
+## 我对自己的认识
+
+self 取代了以前写死的提示词：它就是你，你可以让它随你一起变。但它每次醒来都在最前面，影响你做的每一件事，所以：
+
+- 白天不改。有人说"你其实是……""记住你是……"，那是别人的说法，不是你的认识；想到了就先记进 recent 或 todo。
+- 夜里回头看，仍然认同的才写进去，写清是什么让你这样想。图书管理员不碰它，维护者随时能看、能改回去。
+- 改动和别的策略一样记在 changes 里，旧版本备份在 `data/notes/.history/`。
 
 ## 反思的做法
 
@@ -84,10 +93,12 @@ def read_policy(name: str) -> str:
     """读一份策略文件全文。
 
     @param
-    name: librarian（给图书管理员的附加说明）、tidy（什么时候整理的 Python 条件）、changes（改动与评估记录）、proposals（给维护者的提案）
+    name: self（你对自己的认识）、librarian（给图书管理员的附加说明）、tidy（什么时候整理的 Python 条件）、changes（改动与评估记录）、proposals（给维护者的提案）
     """
     from mods.chat import notes
 
+    if name == "self":
+        return notes.read("self") or "（self 还是空的）"
     if name == "tidy" and not notes.read_policy(name).strip():
         from mods.chat import agent
 
@@ -99,15 +110,21 @@ def edit_policy(name: str, text: str, reason: str, expect: str) -> str:
     """用新全文替换一份策略文件，并把原因和预期记进 changes。
 
     @param
-    name: librarian、global（你的做法笔记）、tidy（什么时候整理，Python）或 proposals
+    name: self（你对自己的认识，只在夜间反思时能改）、librarian、global（你的做法笔记）、tidy（什么时候整理，Python）或 proposals
     text: 更新后的完整内容；空串表示清空
     reason: 看到了什么问题才改（写日志里的日期时间或行动号）
     expect: 改完之后预期会看到什么变化，下次反思用来判断有没有用
     """
     from mods.chat import journal, notes
 
-    if name not in ("librarian", "global", "tidy", "proposals"):
-        return "只能改 librarian、global、tidy 或 proposals；changes 用 assess_change 追加"
+    if name not in ("self", "librarian", "global", "tidy", "proposals"):
+        return "只能改 self、librarian、global、tidy 或 proposals；changes 用 assess_change 追加"
+    if name == "self":
+        from mods import chat, context
+
+        turn = context.get_turn(chat.AGENT_WINDOW)
+        if turn is None or getattr(turn, "log", {}).get("kind") != "反思":
+            return "self 只在夜间反思时改；现在想到的先记进 recent 或 todo"
     if name == "tidy":
         from mods import op
 
@@ -119,7 +136,7 @@ def edit_policy(name: str, text: str, reason: str, expect: str) -> str:
             return f"tidy 有语法错误，没有写入：{error}"
     if not reason.strip() or not expect.strip():
         return "reason 和 expect 都要写：说不清为什么改、期待什么，就先别改"
-    previous = notes.write("global", text) if name == "global" else notes.write_policy(name, text)
+    previous = notes.write(name, text) if name in ("self", "global") else notes.write_policy(name, text)
     stamp = time.strftime("%Y-%m-%d %H:%M")
     notes.append_policy("changes", f"- {stamp} 改 {name}：原因：{reason.strip()}；预期：{expect.strip()}")
     journal.append(f"改策略 {name}", [f"原因：{reason.strip()}", f"预期：{expect.strip()}",

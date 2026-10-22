@@ -1,6 +1,7 @@
 """Plain Markdown notes kept by the librarian.
 
-``global`` holds how she does things (procedural memory), ``recent`` what is
+``self`` is who she is (it replaced the old persona prompt), ``global`` how
+she does things (procedural memory), ``recent`` what is
 going on right now (short-term memory), ``todo`` what is still open, ``awaker``
 when she wakes herself, one note per person and per group what she knows and
 what happened with them, and ``diary:<day|month|year>`` the nightly diary.
@@ -28,12 +29,12 @@ from mods import storage
 
 ROOT = Path("data") / "notes"
 _lock = threading.RLock()
-_SCOPE = re.compile(r"^(global|recent|todo|awaker|person:\d+|group:\d+|diary:\d{4}(-\d{2}(-\d{2})?)?)$")
+_SCOPE = re.compile(r"^(self|global|recent|todo|awaker|person:\d+|group:\d+|diary:\d{4}(-\d{2}(-\d{2})?)?)$")
 
 
 def _path(scope: str) -> Path:
     if not _SCOPE.fullmatch(scope):
-        raise ValueError("scope 只能是 global、recent、todo、awaker、person:<QQ号>、group:<群号> 或 diary:<日期>")
+        raise ValueError("scope 只能是 self、global、recent、todo、awaker、person:<QQ号>、group:<群号> 或 diary:<日期>")
     if ":" not in scope:
         return ROOT / f"{scope}.md"
     kind, number = scope.split(":")
@@ -138,7 +139,8 @@ def listing(limit: int = 60) -> list[dict]:
         if relative.parts[0] in (".history", "diary", "policy"):
             continue
         scope = path.stem if len(relative.parts) == 1 else f"{relative.parts[0]}:{path.stem}"
-        if not _SCOPE.fullmatch(scope):
+        # self 总在系统提示最前面，不用列进"可以召回的东西"。
+        if not _SCOPE.fullmatch(scope) or scope == "self":
             continue
         text = path.read_text(encoding="utf-8").strip()
         found.append({"scope": scope, "changed": path.stat().st_mtime,

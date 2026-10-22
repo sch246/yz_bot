@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 from datetime import datetime, timezone
 import re
 
@@ -16,12 +15,11 @@ _SUBCOMMAND_HELP = (
     ("model <selection>", "查看指定模型信息"),
     ("models", "列出当前供应商的模型（优先在线列表）"),
     ("use_model [selection]", "设置或重置当前模型"),
-    ("prompt", "查看当前提示词"),
-    ("add_prompt <list>", "将显式给定的消息列表追加到全局提示词（管理员）"),
-    ("setting [name]", "列出或查看设定"),
-    ("use_setting [name]", "应用或重置设定"),
-    ("set_setting <name> [list]", "保存当前或给定设定"),
-    ("del_setting <name>", "删除设定"),
+    ("prompt [set <全文>]", """查看或改写她对自己的认识（改写要管理员）。
+
+就是笔记 self（data/notes/self.md），放在系统提示最前面，取代以前的提示词和命名设定。维护者可以直接编辑文件；她只能在夜间反思里改，要写原因和预期。
+#prompt              显示全文
+#prompt set <全文>   整份替换；set 之后第一个换行起是全文，留空表示清空"""),
     ("image [off|lazy|eager]", "查看或设置图片读取档位"),
     ("reasoning [keep|drop]", "查看或设置中心已读输出是否原生带回思考内容"),
     ("limit [<画面条数> <token> [整理百分比]|reset]", """查看或设置中心 agent 的窗口画面条数、单次唤醒上下文上限与整理阈值（管理员）。
@@ -64,9 +62,8 @@ _SUBCOMMAND_NAMES = {pattern.partition(" ")[0] for pattern, _description in _SUB
 
 def requires_op(value: str) -> bool:
     name, _, tail = value.strip().partition(" ")
-    return (name == "hint" or name in {"use_model", "add_prompt", "use_setting", "set_setting",
-                                       "del_setting"}
-            or name in {"image", "reasoning", "limit", "reflect", "awaker"} and bool(tail.strip()))
+    return (name == "hint" or name == "use_model"
+            or name in {"image", "reasoning", "limit", "reflect", "awaker", "prompt"} and bool(tail.strip()))
 
 
 def _subcommand_help(name: str = "") -> str:
@@ -131,13 +128,6 @@ def _first_argument(value: str) -> tuple[str, str]:
     if not value.strip():
         return "", ""
     return text.read_params(" " + value.strip(), read_str=True)
-
-
-def _list_argument(value: str) -> list:
-    parsed = ast.literal_eval(value)
-    if not isinstance(parsed, list):
-        raise ValueError("参数必须是 list")
-    return parsed
 
 
 def _after_tokens(line: str, count: int) -> str:
@@ -299,6 +289,22 @@ def _awaker_subcommand(raw: str) -> str:
     return _chat_root._awaker.report()
 
 
+def _prompt_subcommand(raw: str) -> str:
+    body = raw.lstrip()[len("prompt"):]
+    head, _, rest = body.partition("\n")
+    if not head.strip() and not rest.strip():
+        text = _chat_root._notes.read("self").strip()
+        return (text or "（self 还是空的）") + "\n(data/notes/self.md)"
+    if head.strip().partition(" ")[0] != "set":
+        return "prompt 参数错误，可用 #help prompt 查看"
+    text = cq.unescape((head.strip()[3:].strip() + "\n" + rest).strip())
+    from . import journal
+
+    previous = _chat_root._notes.write("self", text)
+    journal.append("维护者改 self", journal.diff(previous, text))
+    return "已改写 self" if text else "已清空 self"
+
+
 def _subcommand(value: str):
     # WHY: hint 的源码要求原样取（含缩进与换行），所以先留一份没 strip 的原文。
     raw = value
@@ -365,62 +371,8 @@ def _subcommand(value: str):
         data["reasoning"] = mode
         storage.save()
         return f"reasoning: {mode}"
-    if name == "prompt" and not tail:
-        selected = data.get("prompt")
-        if selected is None:
-            return f"{_chat_root.settings}\n(默认)"
-        if isinstance(selected, str):
-            return f"{_chat_root.prompts.get(selected, [])}\n({selected})"
-        return str(selected)
-    if name == "add_prompt":
-        try:
-            addition = _list_argument(tail)
-        except (SyntaxError, ValueError) as error:
-            return f"add_prompt 参数错误: {error}"
-        data["prompt"] = [*_chat_root.get_prompt(), *addition]
-        storage.save()
-        return "提示词已追加"
-    if name == "setting":
-        if not tail:
-            return "\n".join(_chat_root.prompts)
-        setting_name, remaining = _first_argument(tail)
-        if remaining.strip():
-            return "setting 参数过多"
-        return str(_chat_root.prompts.get(setting_name, "未找到设定，你可能需要先创建设定"))
-    if name == "use_setting":
-        if not tail:
-            data.pop("prompt", None)
-            storage.save()
-            return "已重置提示词"
-        setting_name, remaining = _first_argument(tail)
-        if remaining.strip() or setting_name not in _chat_root.prompts:
-            return "未找到设定，你可能需要先创建设定"
-        data["prompt"] = setting_name
-        storage.save()
-        return "设定已应用"
-    if name == "del_setting" and tail:
-        setting_name, remaining = _first_argument(tail)
-        if remaining.strip() or setting_name not in _chat_root.prompts:
-            return "未找到设定"
-        del _chat_root.prompts[setting_name]
-        storage.save()
-        return "设定已删除"
-    if name == "set_setting" and tail:
-        setting_name, remaining = _first_argument(tail)
-        if not setting_name:
-            return "set_setting 需要设定名"
-        if remaining.strip():
-            try:
-                prompt = _list_argument(remaining.strip())
-            except (SyntaxError, ValueError) as error:
-                return f"set_setting 参数错误: {error}"
-        elif "prompt" in data:
-            prompt = data["prompt"]
-        else:
-            return "当前没有可保存的自定义提示词"
-        _chat_root.prompts[setting_name] = prompt
-        storage.save()
-        return "设定已保存"
+    if name == "prompt":
+        return _prompt_subcommand(raw)
     if name == "limit" and not tail:
         return _limit_report()
     if name == "limit" and tail:

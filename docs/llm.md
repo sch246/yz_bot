@@ -15,7 +15,7 @@
 
 群内其它成员之间的戳一戳不会单独触发 LLM，但 chatlog 会记下它，之后出现在该群的窗口画面里。因此“能被模型看见”与“立即触发模型”是两个不同边界。
 
-中心设置命令直接使用 `#` 前缀，没有 `#agent` 层：`#model`、`#models`、`#prompt`、`#setting`、无参 `#image`、`#reasoning`、`#limit` 和 `#help` 可查看；`#use_model`、`#add_prompt`、`#use_setting`、`#set_setting`、`#del_setting`、带参数的 `#image`／`#reasoning`／`#limit`／`#reflect`／`#awaker` 修改全局设置，要求 op；无参 `#reflect`、`#awaker` 可查看。`#add_prompt` 只接收显式列表。`#hint` 不属于这些全局聊天设置：它由 op 管理，可覆盖本窗口或全局默认，并在最初触发窗口的聊天循环停下时向 QQ 发送状态。
+中心设置命令直接使用 `#` 前缀，没有 `#agent` 层：`#model`、`#models`、无参 `#prompt`、`#image`、`#reasoning`、`#limit`、`#reflect`、`#awaker` 和 `#help` 可查看；`#use_model`、带参数的 `#prompt`／`#image`／`#reasoning`／`#limit`／`#reflect`／`#awaker` 修改全局设置，要求 op。`#prompt [set <全文>]` 看或改写笔记 self；旧的 `#add_prompt`、`#setting`、`#use_setting`、`#set_setting`、`#del_setting` 已删除。`#hint` 不属于这些全局聊天设置：它由 op 管理，可覆盖本窗口或全局默认，并在最初触发窗口的聊天循环停下时向 QQ 发送状态。
 
 每次中心请求都会新建一个 `Chat` 对象，但共享进程级 `LLMClient`、供应商客户端和 storage。中心 agent 不保留跨唤醒的对话：每次被叫醒都从 chatlog、oplog 行动记录、笔记与待办重新组装上下文。chatlog 保存原始聊天档案，`oplog` 登记窗口到达、唤醒与模型的输出和结果。因此：
 
@@ -31,7 +31,7 @@
    - 画面：叫醒她的窗口各 `max_events` 条；续做时沿用刚才看着的窗口，闹钟叫醒时没有窗口。
    - 笔记：global、recent、最新一篇日记（`diary:<日期>`）、这些窗口对应的群或人，以及这次唤醒的作者（最多 6 人）。认出是谁在叫自己不算检索，所以作者的笔记直接在。
 2. **组装**（`chat.agent._assemble`），按顺序：
-   - 系统提示（所选设置、`_base_prompt`、中心身份说明）；
+   - 系统提示（笔记 self、`_base_prompt`、中心身份说明）。self 是 `data/notes/self.md`，她对自己的认识，取代了旧的提示词与命名设定：第一次读到时把当时生效的那份搬进来（系统消息拼成正文，示例对话写成“## 示例对话”一节），storage 里的旧值不删。她只能在夜间反思里用 `edit_policy("self", …)` 改，白天的 `write_note` 和图书管理员都改不了；维护者直接编辑文件或用 `#prompt set`；
    - 当前完整工具状态；
    - 笔记；
    - "可以召回的东西"目录（`chat.roles.directory`）：其它最近有消息的窗口、笔记目录、日记目录、上次整理之前的最近 12 条行动标题；
@@ -228,7 +228,7 @@ hint 与追加式上下文是两层，判据是一句话：**频繁变化、且�
 
 - **缺省值写死在代码里**（`DEFAULT_MAX_EVENTS` / `DEFAULT_MAX_TOKEN` 与各归一化函数的兜底分支），不再读 `llm_system/config.json`。中心运行期覆盖只有全局 `agent` storage 一份；`#limit` 是唯一预算命令入口。
 - **三个预算**：`max_events`（默认 80）是窗口画面的默认条数；`max_token`（默认 40000）乘 `pressure_percent`（默认 75%）是一次唤醒内触发整理的上下文大小，它的三分之一是白天列表触发整理的大小。存储键沿用旧名。旧窗口覆盖不自动迁入全局主体。`agent.librarian_model` 可选，缺省用便宜模型。每晚反思的时刻在笔记 awaker 里，`agent.reflected_at` 记上次反思的时间，`agent.tidied_at` 记上次整理的时间。
-- **`hint` 与 `prompt` 不在表里**：窗口结束提示的 `#hint` 是 `data/hint/` 下的文件，独立合并全局默认与窗口覆盖；中心提示词从全局 `agent.prompt` 选择内置设置或显式列表。它们不是单值档位，不使用 `AGENT_SETTINGS` 的归一化。
+- **`hint` 与 `prompt` 不在表里**：窗口结束提示的 `#hint` 是 `data/hint/` 下的文件，独立合并全局默认与窗口覆盖；她对自己的认识是笔记 self（`data/notes/self.md`）。它们不是单值档位，不使用 `AGENT_SETTINGS` 的归一化。
 - 已退役的窗口聊天设置仍可能留在生产 storage，但运行代码不再读取；其清理需先获维护者授权，见[第二轮调查](working/round2-legacy-and-backfill-audit.md)。
 
 **召回画面以外的内容。** 中心 agent 用 `read_log(window, count, before)` 读任意窗口的 chatlog 原文（格式与画面相同，`before` 写 `YYYY-MM-DD HH:MM:SS` 或 Unix 秒，用来往前翻），`search_log(keyword, window, days)` 按子串在一个或所有窗口最近若干天（默认 7，最多 90）的聊天记录里找，最新的 30 条在前，`read_actions(ids, count, keyword)` 读自己的行动记录，`read_note(scope)` 读笔记。旧的 `take`、`status`、`mentions`、`fetch`、`read_messages`、`mark_read`、`pull` 已移除。`#hint` 不触发阅读。

@@ -149,7 +149,7 @@ def read_note(scope: str) -> str:
     """读一份笔记全文。
 
     @param
-    scope: global、recent、person:<QQ号> 或 group:<群号>
+    scope: self、global、recent、person:<QQ号> 或 group:<群号>
     """
     return _notes.render(scope) or f"（{scope} 还没有笔记）"
 
@@ -204,7 +204,7 @@ _LIBRARIAN_PROMPT = """你是柚子的图书管理员，不和任何人说话。
 - 她作出的决定和承诺本身就是经历：写明日期与来源；以后改变也要写成"某日改为……"，不要悄悄改写成从来如此。
 - 删掉已经过时、已经解决、不再会改变她行为的条目。
 - 不确定是不是事实的，标明"她的理解"或"未确认"。
-- todo（她的待办）和 awaker（她的闹钟规则）是她自己管的，你不要改；未完成的事项只在相关笔记里留一句线索。
+- self（她对自己的认识）、todo（她的待办）和 awaker（她的闹钟规则）是她自己管的，你不要改；未完成的事项只在相关笔记里留一句线索。
 - 她自己也会随时改笔记：先读现有内容，不要把她写的东西覆盖掉。
 - 除了 recent，没有值得改的就不必写。
 
@@ -267,7 +267,7 @@ def _organize(job: dict) -> None:
         text: 这份笔记更新后的完整内容
         """
         calls[0] += 1
-        if scope in ("todo", "awaker"):
+        if scope in ("self", "todo", "awaker"):
             return f"{scope} 是她自己管的，不要改"
         previous = _notes.write(scope, text)
         if previous.strip() == text.strip():

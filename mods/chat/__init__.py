@@ -122,12 +122,38 @@ def reflect_now() -> bool:
 
 
 def get_prompt() -> list:
-    selected = storage.get("", "agent").get("prompt")
-    if not selected:
-        return settings
+    """Who she is: the ``self`` note, at the head of the system prompt."""
+    text = _notes.read("self").strip() or _migrate_self()
+    return [{"role": "system", "content": text}] if text else []
+
+
+def _migrate_self() -> str:
+    """Move the old persona prompt into ``data/notes/self.md`` once.
+
+    WHY: 维护者 2026-10-22 定：旧的提示词／命名设定是按窗口配人设时代留下的，中心化以后
+    人设就是她对自己的认识，改成普通文件 self，由她在夜间反思里迭代。只搬当时生效的那份；
+    storage 里的 `settings`、`agent.prompt` 和命名设定原样留着不删（`.py` 里仍能用 `prompts` 读到），
+    搬过一次就记下，之后维护者删掉 self.md 表示真的不要人设，不会再被搬回来。
+    """
+    data = storage.get("", "agent")
+    if data.get("self_migrated"):
+        return ""
+    selected = data.get("prompt") or settings
     if isinstance(selected, str):
         selected = prompts.get(selected)
-    return selected if isinstance(selected, list) else []
+    messages = [message for message in selected if isinstance(message, dict)] if isinstance(selected, list) else []
+    parts = [str(message.get("content", "")).strip() for message in messages if message.get("role") == "system"]
+    examples = [message for message in messages if message.get("role") != "system"]
+    if examples:
+        parts.append("## 示例对话\n" + "\n".join(
+            ("你" if message.get("role") == "assistant" else "对方") + "：" + str(message.get("content", "")).strip()
+            for message in examples))
+    text = "\n\n".join(part for part in parts if part)
+    if text:
+        _notes.write("self", text)
+    data["self_migrated"] = True
+    storage.save()
+    return text
 
 
 def get_model(data: dict | None = None) -> str:
@@ -213,12 +239,11 @@ def init_chat(
     messages: list | None = None,
 ) -> tuple[tool_modules.SessionBinding, tuple | None]:
     """Assemble one Chat and return its tool binding and window."""
-    prompts["base"] = _view._base_prompt()
     state = {"role": "system", "content": "你是唯一的中心 agent；窗口只是来源与明确发送目标。"}
     window = AGENT_WINDOW
     session.set_messages([
         *get_prompt(),
-        *prompts["base"],
+        *_view._base_prompt(),
         state,
         *(messages or []),
     ])
@@ -619,7 +644,7 @@ def _subcommand_call(event: dict) -> Callable | None:
     if subcommand not in _subcommands._SUBCOMMAND_NAMES:
         return None
     if _subcommands.requires_op(value[1:]) and not op.require_op(
-            event, pattern=r"^#\s*(hint|use_model|add_prompt|use_setting|set_setting|del_setting|image|reasoning|limit|reflect|awaker)"):
+            event, pattern=r"^#\s*(hint|use_model|prompt|image|reasoning|limit|reflect|awaker)"):
         # WHY: 全局设置不可由普通群友改写；只读子命令保持公开。
         return None
     return lambda value=value: _subcommands._subcommand(value[1:])
