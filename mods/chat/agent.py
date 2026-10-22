@@ -44,6 +44,7 @@ reason
 """
 # A window shows at least this many lines before its first unseen one.
 _LEAD_IN = 3
+_FRESH_MAX = 200
 _KNOWN_PEOPLE = 6
 
 
@@ -120,7 +121,7 @@ def _day_actions() -> list[str]:
     return lines
 
 
-def _assemble(plan: dict, turn, woken: list[tuple]) -> tuple[list[dict], dict[str, str], dict[tuple, int | None], list[str]]:
+def _assemble(plan: dict, turn, woken: list[tuple]) -> tuple[list[dict], dict[str, str], dict[tuple, tuple], list[str]]:
     """Build the request body; nothing from earlier requests is replayed."""
     seen = _seen()
     messages: list[dict] = []
@@ -138,21 +139,39 @@ def _assemble(plan: dict, turn, woken: list[tuple]) -> tuple[list[dict], dict[st
         messages.append({"role": "user", "content": "你上次整理以来做过的事（较早的只列标题，可用 read_actions 读全文；"
                          "整理过的已经收进笔记）：\n" + "\n".join(today)})
     screens: dict[str, str] = {}
-    newest: dict[tuple, int | None] = {}
+    newest: dict[tuple, tuple] = {}
     for window, count in plan["windows"]:
         mark = seen.get(_screen.label(window))
-        items = _screen.records(window, max(count, 1) + 200)
+        # WHY: 标已读只标到读画面这一刻为止的未读（2026-10-22 审查发现：生成期间同窗口
+        # 再来的 at 会在第一次输出时一起被标掉，收尾不再接续）。chatlog 写入与登记到达
+        # 在同一把窗口锁里、先写后登记，所以先取边界再读文件，边界内的都在画面能读到的文件里。
+        through = oplog.latest_pending_arrival(window)
+        items = _screen.records(window, max(count, 1) + _FRESH_MAX)
         fresh = [item for item in items if mark is not None and item["time"] is not None and item["time"] > mark]
-        # WHY: 新消息全部展示，画面条数只决定还附多少旧消息；至少带上新消息之前的
+        # WHY: 新消息（_FRESH_MAX 条以内）全部展示，画面条数只决定还附多少旧消息；至少带上新消息之前的
         # 几条接上话头。看到时间只精确到秒，同一秒里后到的那条也靠这几条不丢。
         older = [item for item in items if item not in fresh][-max(count - len(fresh), _LEAD_IN):]
         shown = older + fresh if mark is not None else items[-max(count, _LEAD_IN):]
+        skipped = 0
+        if len(fresh) > _FRESH_MAX:
+            # WHY: 维护者 2026-10-22 定：新消息太多（比如离线一晚）只展示最新的 _FRESH_MAX 条，
+            # 但要明说跳过了多少、从哪里接着翻，看到位置照样推进；不静默丢，也不撑爆上下文。
+            total = sum(1 for item in _screen.records(window, 1_000_000, since=mark)
+                        if item["time"] is not None and item["time"] > mark)
+            shown = fresh[-_FRESH_MAX:]
+            skipped = total - len(shown)
         if not shown:
             continue
         text = _screen.render(window, shown, mark)
+        if skipped:
+            text = (f"（{_screen.label(window)} 上次之后有 {skipped + len(shown)} 条新消息，这里只展示最新的 "
+                    f"{len(shown)} 条；更早的 {skipped} 条要看就用 read_log(\"{_screen.label(window)}\", "
+                    f"before=\"{_screen.clock(shown[0]['time'])}\") 往前翻）\n" + text)
         screens[_screen.label(window)] = text
-        summary.append(f"画面 {_screen.label(window)} {len(shown)} 条（新 {len(fresh) if mark is not None else len(shown)} 条）")
-        newest[window] = _screen.latest_time(shown)
+        summary.append(f"画面 {_screen.label(window)} {len(shown)} 条（新 "
+                       + (f"{skipped + len(shown)} 条，跳过较早的 {skipped} 条" if skipped
+                          else f"{len(fresh) if mark is not None else len(shown)} 条") + "）")
+        newest[window] = (_screen.latest_time(shown), through)
         messages.append({"role": "user", "content": _view.msg_split(text)})
     return messages, screens, newest, summary
 
@@ -169,13 +188,13 @@ def _unread_hint(on_screen: set[tuple]) -> str:
             + "。要看就用 read_log 读原文。") if rows else ""
 
 
-def _mark_seen(newest: dict[tuple, int | None]) -> None:
+def _mark_seen(newest: dict[tuple, tuple]) -> None:
     seen = _seen()
-    for window, stamp in newest.items():
+    for window, (stamp, through) in newest.items():
         if stamp is not None:
             seen[_screen.label(window)] = max(stamp, seen.get(_screen.label(window), 0))
         try:
-            _reader.mark_window_read(window)
+            _reader.mark_window_read(window, through=through)
         except ValueError:
             # 离线补回仍在进行：未读前端没有固定，下次再标。
             pass
