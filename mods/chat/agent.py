@@ -34,7 +34,7 @@ _TIDIED_KEY = "tidied_at"
 # （或是一段说明原因的文字）就整理；文件不存在时用下面这份默认，和它写成文件后一模一样。
 DEFAULT_TIDY = """# 什么时候请图书管理员整理。每次子请求结束（stage == "round"）和每次组装前（stage == "assemble"）
 # 各求值一次：前面的行照常执行，最后一行是一个表达式，它的值为真就整理，是字符串时就是交给图书管理员的原因。
-# 可用的名字：stage、used（当前上下文 token）、grown（这次组装以来长了多少）、limit（max_token × 整理百分比）、
+# 可用的名字：stage、used（当前上下文 token）、grown（这次组装以来长了多少）、limit（#limit 设的整理阈值）、
 # day_tokens / day_count（上次整理以来的行动列表）、since_tidy（距上次整理的秒数）、kind（唤醒／闹钟／反思）、hour。
 reason = None
 if stage == "round" and used > limit and grown > limit // 3:
@@ -205,11 +205,11 @@ def _mark_seen(newest: dict[tuple, tuple]) -> None:
 
 def _tidy_reason(turn, stage: str, used: int = 0, grown: int = 0) -> str:
     """Evaluate the tidy condition; a non-empty string means tidy now, for that reason."""
-    _max_events, max_tokens = _chat_root.limit()
+    _max_events, threshold = _chat_root.limit()
     today = _day_actions()
     namespace = dict(py.loc)
     namespace.update(stage=stage, used=used, grown=grown,
-                     limit=max_tokens * _chat_root.agent_setting("pressure_percent") // 100,
+                     limit=threshold,
                      day_tokens=_chat_root.count_tokens("\n".join(today)), day_count=len(today),
                      since_tidy=time.time() - tidied_at(), kind=turn.log["kind"],
                      hour=time.localtime().tm_hour)
@@ -418,8 +418,7 @@ def request_tidy(note: str) -> bool:
 
 
 def _run_agent(model: str | None, turn) -> bool:
-    max_events, max_tokens = _chat_root.limit()
-    turn._chat_limit = (max_events, max_tokens)
+    max_events, _threshold = _chat_root.limit()
     notice = oplog.deliver_notifications(_chat_root.AGENT_WINDOW)
     woken, activation_lines, authors = _woken(notice, turn)
     turn.authors = list(dict.fromkeys([*turn.authors, *authors]))
@@ -499,6 +498,7 @@ def _run_session(model: str | None, turn, messages: list[dict], first_output, st
     session.keep_reasoning = True
     session.output_recorded = False
     initial = _text_tokens(session.messages)
+    turn._chat_usage_tokens = initial
     turn.log["assemblies"] += 1
     turn.log["peak"] = max(turn.log["peak"], initial)
     turn.log["lines"].append(f"{assembly}：约 {initial} token；" + "；".join(summary))
@@ -632,7 +632,7 @@ def _night(turn) -> None:
 
 
 def _run_reflection(model: str | None, turn, material: str) -> None:
-    _max_events, max_tokens = _chat_root.limit()
+    _max_events, threshold = _chat_root.limit()
     notes = [text for scope in ("global", "recent") if (text := _notes.render(scope))]
     changes = _tail(_notes.read_policy("changes"), 40)
     proposals = _tail(_notes.read_policy("proposals"), 20)
@@ -643,7 +643,8 @@ def _run_reflection(model: str | None, turn, material: str) -> None:
          + "\n\n## 给维护者的提案（proposals，最近的）\n" + (proposals or "（还没有）")},
         {"role": "user", "content": _REFLECT_PROMPT.format(now=_screen.clock())},
     ]
-    _run_session(model, turn, messages, lambda: None, lambda used, _initial: used > max_tokens,
+    # 反思材料本身可能就很大：只限制它之后长出来的部分。
+    _run_session(model, turn, messages, lambda: None, lambda used, initial: used - initial > threshold,
                  assembly="组装（反思）", summary=[f"日志 {len(material)} 字", f"改动记录 {len(changes)} 字"],
                  load=("memory_system",))
 

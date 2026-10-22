@@ -81,7 +81,7 @@ generator 与 `.py input()` 共用 `mods.context` 的 continuation 登记。`^C`
    - 旧的 storage 待办第一次读到时搬进 todo 笔记。
 4. **放下是图书管理员的事**：另一个模型只在下面四种时候整理，不在每次唤醒后自动跑。
    - 她调用 `tidy`；
-   - 整理条件成立：条件是普通 Python 文件 `data/notes/policy/tidy.py`，维护者直接改，她在反思里改（要 Bot 有 op 权限）；文件不存在时默认是一次唤醒里上下文涨过 `max_token × pressure_percent`，或上次整理以来的行动列表本身太长；
+   - 整理条件成立：条件是普通 Python 文件 `data/notes/policy/tidy.py`，维护者直接改，她在反思里改（要 Bot 有 op 权限）；文件不存在时默认是一次唤醒里上下文涨过 `#limit` 的整理阈值，或上次整理以来的行动列表本身太长；
    - 夜里 `reflect` 规则到点。
 
    整理时他把上次整理以来她看过做过的东西收成结论和出处，写进笔记，之后这些行动不再出现在她眼前；原文仍在聊天记录和行动记录里。他不改 todo 和 awaker。思考内容只在一次唤醒之内保留。
@@ -112,7 +112,7 @@ generator 与 `.py input()` 共用 `mods.context` 的 continuation 登记。`^C`
 - **不由她改的**：醒来时带什么、阈值和代码。她写进 `data/notes/policy/proposals.md` 交给维护者。
 
 **设置**：主模型、提示词、工具激活与这些预算只从全局 agent 设置读取；`#model` 等命令查看全局状态，修改命令由管理员操作。
-- `#limit` 查看或修改窗口画面默认条数（默认 80）、单次唤醒的 token 上限（默认 40000）与整理百分比（默认 75%）；
+- `#limit` 查看或修改窗口画面默认条数（默认 80）与整理阈值（token，默认 30000）；
 - `#awaker` 查看或改写闹钟规则；
 - `#reflect` 查看上次反思时间，`#reflect now` 立即跑一次夜间整理与反思。
 

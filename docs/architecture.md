@@ -128,7 +128,7 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 图书管理员只在三种情况下同步运行，不在每次唤醒后自动跑：
 - 她调 `tidy`；
-- `data/notes/policy/tidy.py` 里的 Python 条件成立，默认是上下文长过 `max_token × pressure_percent` 且主要是本轮新增，或白天的列表本身超过该阈值的三分之一；
+- `data/notes/policy/tidy.py` 里的 Python 条件成立，默认是上下文长过 `#limit` 的整理阈值（`agent.tidy_token`）且主要是本轮新增，或白天的列表本身超过该阈值的三分之一；
 - 夜里 `reflect` 规则到点。
 
 前三种整理完重置 `tidied_at`，并不等新唤醒立即重新组装。笔记是 `data/notes/` 下她随时能用 `write_note` 改的普通文件，改写和删除前把旧文件复制到 `.history/`。`chat.awaker` 每分钟按笔记 awaker 的规则检查一次，到点时用 `agent.alarm` 以闹钟理由叫醒她，或者用 `agent.reflect` 先让图书管理员写日记、整理笔记、汇总月记年记，再让她加载 `memory_system` 反思。每次唤醒、闹钟、整理、笔记改动、策略改动和汇总都在 `data/journal/` 留一条可读记录。

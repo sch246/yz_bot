@@ -240,6 +240,7 @@ D7 让 [chatlog 格式](../../chatlog-format.md)里"模型看到的名字是另�
 | D16 | 自己什么时候醒 | 专门一个模块 `awaker`，她或维护者都能设，比如每 10 分钟醒一次 |
 | D17 | 整理条件与 `#hint` | 图书管理员的触发条件本身也配置化；`#hint` 也改成文件。"py 系统允许这种自由度"：条件是用 `.py` 共享环境求值的 Python |
 | D18 | 人设改成笔记 self；私聊“正在输入” | 旧提示词是按窗口配人设时代留下的，中心化后人设就是她对自己的认识：改成普通文件 `self`，放在系统提示最前面；她只在夜间反思里改（白天被人说动的事要隔一晚回头看），图书管理员不碰；命名设定那套命令删除。循环进行时在私聊显示“正在输入”（NapCat 只支持私聊） |
+| D19 | `#limit` 与 `#hint` 变量 | 消息数没用了：`#hint` 代码里只给上下文占用（`usage`、`peak`、`limit`），删掉 `event_count`、`context_limit`；`#limit` 的 token 上限 × 整理百分比合成一个整理阈值 |
 
 D10 因此只剩图书管理员一个对象。D11 背后的想法是维护者的原话："检索如果可以迭代的话，那好像不需要主会话了，她本身就是过程，只需要维持自己的短期记忆就能思考和行事了。"拆出选材原本是为了让检索过程不进主上下文；现在由图书管理员在上下文太长时替她放下，同样的目的换到了另一端。
 
@@ -300,7 +301,7 @@ S1 之后系统就能单独运行；S3、S4 的效果用 S2 的回放逐个对�
 | S1 画面与格式 | `mods/chat/screen.py`、`agent._assemble` | 直接读 chatlog 普通日志的原文记录；`agent.seen` 记看到的时间并标出新消息；跳过 `#` 开头的控制消息 |
 | S1 行动记录 | `mods/chat/actions.py` | oplog 的输出与结果渲染成和 chatlog 同形的记录；`read_actions` 按号读回 |
 | S1 去掉重放 | `agent._run_agent`、`tools/meta.py` | 不再重放经历流；移除固定起点、压力提示、`#reset_start`、工具状态差量通告，以及 `cover_events`、`recall_events`、`event_links` 与七个聊天软件式阅读工具；新增 `read_log`、`read_actions`、`read_note` |
-| 整理（D14、D17） | `agent._tidy`、`agent._tidy_reason`、`agent._day_actions`、`tools/meta.tidy` | 白天的列表是 `agent.tidied_at` 之后的全部行动。她调用 `tidy`，或 `data/notes/policy/tidy.py` 的 Python 条件成立时（默认：一次唤醒里上下文长过 `max_token × pressure_percent`，或列表本身超过它的三分之一），同步跑一次图书管理员，之后列表从当时重新开始。条件写坏时按默认判断并记 `⚠`。不再在每次唤醒结束后整理 |
+| 整理（D14、D17） | `agent._tidy`、`agent._tidy_reason`、`agent._day_actions`、`tools/meta.tidy` | 白天的列表是 `agent.tidied_at` 之后的全部行动。她调用 `tidy`，或 `data/notes/policy/tidy.py` 的 Python 条件成立时（默认：一次唤醒里上下文长过整理阈值 `agent.tidy_token`，2026-10-22 起由 `#limit <画面条数> <整理阈值>` 设，取代 `max_token × pressure_percent`；或列表本身超过它的三分之一），同步跑一次图书管理员，之后列表从当时重新开始。条件写坏时按默认判断并记 `⚠`。不再在每次唤醒结束后整理 |
 | `#hint` 文件（D17） | `chat.hint_config`、`chat.save_hint` | `data/hint/default.py` 与 `g<群号>.py`／`u<QQ号>.py`，首行 `# on`／`# off`，其余是代码；合并规则不变；旧 storage 配置第一次读到时搬进文件 |
 | self 与正在输入（D18） | `chat.get_prompt`、`chat._migrate_self`、`tools/memory_system.edit_policy`、`agent._keep_typing` | `data/notes/self.md` 在系统提示最前；旧提示词第一次读到时搬入，storage 旧值不删；`write_note("self")` 和图书管理员被拒，`edit_policy("self")` 只在反思时可用；`#prompt [set]`。私聊唤醒期间每 5 秒 `set_input_status` |
 | D11 召回 | `agent._plan`、`roles.directory`、`roles.search_log` | 醒来时只有 global、recent、叫醒她的窗口画面、这些窗口与作者的笔记，以及一份可召回内容的目录；其余由她用 `read_log`／`search_log`／`read_actions`／`read_note` 自己读。`search_log` 按子串在聊天记录里找线索，`read_actions` 可按词筛，`read_log` 的 `before` 接受画面里的日期时间。2026-10-22 上午的第一版曾有前置选材（`roles.select`），按 D11 移除 |
