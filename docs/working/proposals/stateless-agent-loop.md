@@ -238,6 +238,7 @@ D7 让 [chatlog 格式](../../chatlog-format.md)里"模型看到的名字是另�
 | D14 | 图书管理员什么时候跑 | 极简：白天只有一份"做过的事"的列表，她可以主动调用整理，也可以由条件（上下文占用）触发；不触发就留到夜里整理成日记，月、年再汇总 |
 | D15 | 笔记 | 个人笔记随时可用：笔记就是她随时能读写的普通文件，"能用普通文件的不搞复杂系统"；待办（原 storage 里的 hint）也退化成普通文件 |
 | D16 | 自己什么时候醒 | 专门一个模块 `awaker`，她或维护者都能设，比如每 10 分钟醒一次 |
+| D17 | 整理条件与 `#hint` | 图书管理员的触发条件本身也配置化；`#hint` 也改成文件。"py 系统允许这种自由度"：条件是用 `.py` 共享环境求值的 Python |
 
 D10 因此只剩图书管理员一个对象。D11 背后的想法是维护者的原话："检索如果可以迭代的话，那好像不需要主会话了，她本身就是过程，只需要维持自己的短期记忆就能思考和行事了。"拆出选材原本是为了让检索过程不进主上下文；现在由图书管理员在上下文太长时替她放下，同样的目的换到了另一端。
 
@@ -298,7 +299,8 @@ S1 之后系统就能单独运行；S3、S4 的效果用 S2 的回放逐个对�
 | S1 画面与格式 | `mods/chat/screen.py`、`agent._assemble` | 直接读 chatlog 普通日志的原文记录；`agent.seen` 记看到的时间并标出新消息；跳过 `#` 开头的控制消息 |
 | S1 行动记录 | `mods/chat/actions.py` | oplog 的输出与结果渲染成和 chatlog 同形的记录；`read_actions` 按号读回 |
 | S1 去掉重放 | `agent._run_agent`、`tools/meta.py` | 不再重放经历流；移除固定起点、压力提示、`#reset_start`、工具状态差量通告，以及 `cover_events`、`recall_events`、`event_links` 与七个聊天软件式阅读工具；新增 `read_log`、`read_actions`、`read_note` |
-| 整理（D14） | `agent._tidy`、`agent._day_actions`、`tools/meta.tidy` | 白天的列表是 `agent.tidied_at` 之后的全部行动。她调用 `tidy`、一次唤醒里上下文长过 `max_token × pressure_percent`、或列表本身超过它的三分之一时，同步跑一次图书管理员，之后列表从当时重新开始。不再在每次唤醒结束后整理 |
+| 整理（D14、D17） | `agent._tidy`、`agent._tidy_reason`、`agent._day_actions`、`tools/meta.tidy` | 白天的列表是 `agent.tidied_at` 之后的全部行动。她调用 `tidy`，或 `data/notes/policy/tidy.py` 的 Python 条件成立时（默认：一次唤醒里上下文长过 `max_token × pressure_percent`，或列表本身超过它的三分之一），同步跑一次图书管理员，之后列表从当时重新开始。条件写坏时按默认判断并记 `⚠`。不再在每次唤醒结束后整理 |
+| `#hint` 文件（D17） | `chat.hint_config`、`chat.save_hint` | `data/hint/default.py` 与 `g<群号>.py`／`u<QQ号>.py`，首行 `# on`／`# off`，其余是代码；合并规则不变；旧 storage 配置第一次读到时搬进文件 |
 | D11 召回 | `agent._plan`、`roles.directory`、`roles.search_log` | 醒来时只有 global、recent、叫醒她的窗口画面、这些窗口与作者的笔记，以及一份可召回内容的目录；其余由她用 `read_log`／`search_log`／`read_actions`／`read_note` 自己读。`search_log` 按子串在聊天记录里找线索，`read_actions` 可按词筛，`read_log` 的 `before` 接受画面里的日期时间。2026-10-22 上午的第一版曾有前置选材（`roles.select`），按 D11 移除 |
 | S3 图书管理员 | `roles.organize`、`roles.summarize` | 只在整理和夜间运行，串行；不改 todo 和 awaker。夜间写 `diary:<日期>`、整理人和群的笔记、global 和交接用的 recent；月末、年末各汇总一篇。提示词参照 retro：读一手材料、纠正优先、决定与承诺写成经历、删掉不再改变行为的条目 |
 | 笔记（D15） | `mods/chat/notes.py`、`tools/meta.write_note` | `data/notes/` 下的普通 Markdown：global、recent、todo、awaker、person、group、diary。她随时用 `write_note` 改，维护者直接编辑；改前备份到 `.history/`，内容没变不写。旧 storage 待办第一次读到时搬进 todo |
@@ -313,7 +315,7 @@ S1 之后系统就能单独运行；S3、S4 的效果用 S2 的回放逐个对�
 ### 验证
 
 - `run.py --check` 通过（129 个文件 / 85 个公开模块，新增 4 个文件）；`--smoke` 83/85，可选失败仍只有 `mcf` 与 `minecraft`，与改动前相同。
-- 仓库外的临时脚本用 smoke 的方式在临时目录启动整个应用，配假 OneBot 与假模型，按维护者的例子跑 A（长任务）→ 无关的 B → 回到 A，检查每次实际发出的请求。D14–D16 之后的版本共 36 项检查，全部通过（下面几条是 D14 之前那一版的检查，现在的版本另外覆盖了：她自己写笔记和待办、`tidy` 把她的说明交给图书管理员、唤醒结束不再整理、图书管理员改不了 todo、旧 storage 待办搬进文件、闹钟按间隔响且只响一次、过期的一次性规则不响、`reflect` 规则触发夜间整理写出日记、下一次唤醒带上日记、月记汇总、awaker 每分钟任务已登记）：
+- 仓库外的临时脚本用 smoke 的方式在临时目录启动整个应用，配假 OneBot 与假模型，按维护者的例子跑 A（长任务）→ 无关的 B → 回到 A，检查每次实际发出的请求。D14–D17 之后的版本共 42 项检查，全部通过（下面几条是 D14 之前那一版的检查，现在的版本另外覆盖了：她自己写笔记和待办、`tidy` 把她的说明交给图书管理员、唤醒结束不再整理、图书管理员改不了 todo、旧 storage 待办搬进文件、闹钟按间隔响且只响一次、过期的一次性规则不响、`reflect` 规则触发夜间整理写出日记、下一次唤醒带上日记、月记汇总、awaker 每分钟任务已登记、旧 `#hint` 配置搬进文件、`#hint set` 与开关改写文件、自定义整理条件生效、写坏的整理条件按默认判断并留下 ⚠）：
   - A：醒来就带着叫她的人的笔记；中途上下文涨过阈值时图书管理员以 release 阶段被调用，重组后的请求带着它写的 recent，之前的行动只剩标题、原始 `read_log` 结果不再出现；唤醒结束后写出群笔记；整个过程没有选材调用。
   - B：请求里没有 A 的画面和原始记录，但 recent 仍在（连续性）。
   - 回到 A：群笔记在；她用 `search_log` 按一个词找到了 A 的那条原始记录，用 `read_actions` 按词找到了自己之前说的话；"新消息"分隔线在，B 的内容不在。

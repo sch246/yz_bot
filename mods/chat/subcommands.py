@@ -48,7 +48,7 @@ at 2026-10-23 08:00 <理由>   某个时刻一次
     ("hint [get|set|default]", """查看、编写或开关本窗口的结束提示（管理员）。
 
 格式：#hint | #hint get | #hint set <代码> | #hint set | #hint default [get|set <代码>]
-本窗口的配置在 chat storage 的 hint 键，全局默认在 storage 的 "" 命名空间；生效的是两者按 {**默认, **窗口} 合并之后 code 非空、on 为真的那份。
+配置是普通文件：全局默认在 data/hint/default.py，本窗口在 data/hint/g<群号>.py 或 u<QQ号>.py；首行 # on 或 # off 是开关，其余是代码。生效的是两者按 {**默认, **窗口} 合并之后 code 非空、on 为真的那份。
 聊天循环停下时求值一次，非 None 的结果作为一条消息发出（自带 # 前缀，不进模型上下文）。
 求值环境是共享动态环境，另外注入 window（触发窗口）与 usage（中心 reader 最近一次子请求实际收到的已编号事件文本 token 估算；不含系统提示与工具 schema）。
 #hint              切换本窗口的开关（只写本窗口）
@@ -195,33 +195,27 @@ def _hint_subcommand(raw: str) -> str:
     WHY: 命令面只管文本——写、看、开关，和 `#prompt` 一系；"聊天循环停下时自动求值"是
     `_run_hint` 那一半，不混进命令语义里。因此没有 del：源码是劳动成果，不用了就
     `#hint set` 回落默认、或把开关切到关。
-    WHY: 改完立刻 `storage.save()`，不等后台扫描——hint 是用户手写的配置，紧接着一次重启
-    就该还在（cave、link 也是这么落盘的）。
+    WHY: 改完立刻写文件，不等后台扫描——hint 是用户手写的配置，紧接着一次重启就该还在。
     """
     event = context.current() or {}
     window = history.window(event)
     if window is None:
         return "当前没有聊天窗口"
-    data = _chat_root._window_storage(window)
-    default = storage.get("", "hint")
-    chat_hint = data.get("hint")
+    default = _chat_root.hint_config(None)
+    chat_hint = _chat_root.hint_config(window)
     verb, source = _hint_request(raw)
     if verb in ("get", "default", "default get") and source.strip():
         return f"hint {verb} 参数过多"
     if verb == "set":
         if source.strip():
-            data["hint"] = {"code": cq.unescape(source), "on": True}
-            storage.save()
+            _chat_root.save_hint(window, {"code": cq.unescape(source), "on": True})
             return "提示已开启"
-        data.pop("hint", None)
-        storage.save()
+        _chat_root.save_hint(window, {})
         return "已设为默认"
     if verb == "default set":
         if not source.strip():
             return "hint default set 需要代码"
-        default["code"] = cq.unescape(source)
-        default["on"] = True
-        storage.save()
+        _chat_root.save_hint(None, {"code": cq.unescape(source), "on": True})
         return "默认已开启"
     if verb == "get":
         return _hint_report(_chat_root._hint_effective(default, chat_hint), _hint_origin(chat_hint))
@@ -229,14 +223,11 @@ def _hint_subcommand(raw: str) -> str:
         return _hint_report(default, "默认")
     if verb == "default":
         default["on"] = not bool(default.get("on", False))
-        storage.save()
+        _chat_root.save_hint(None, default)
         return "默认已开启" if default["on"] else "默认已关闭"
     if verb == "":
-        if not isinstance(chat_hint, dict):
-            chat_hint = {}
-            data["hint"] = chat_hint
         chat_hint["on"] = not bool(chat_hint.get("on", False))
-        storage.save()
+        _chat_root.save_hint(window, chat_hint)
         return "提示已开启" if chat_hint["on"] else "提示已关闭"
     return "hint 参数错误，可用 #help hint 查看"
 

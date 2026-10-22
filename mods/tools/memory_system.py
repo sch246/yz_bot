@@ -18,8 +18,7 @@
 图书管理员（另一个模型）只在这几种时候来：
 
 - 你调用 `tidy`；
-- 一次唤醒里上下文涨过 `max_token × pressure_percent`；
-- 上次整理以来的行动列表太长；
+- `data/notes/policy/tidy.py` 里的条件成立：默认是一次唤醒里上下文涨过 `max_token × pressure_percent`，或上次整理以来的行动列表超过它的三分之一。这个条件是普通 Python，可以改（见下表）；
 - awaker 里 `reflect` 那条规则到点（默认凌晨 4 点）：他先把这一天写成日记 `diary:<日期>`、整理人和群的笔记、做法和交接用的 recent，月末、年末再各汇总一篇；然后才是你的反思。
 
 整理之后，之前的行动不再出现在你眼前，只留在行动记录里。他不改你的 todo 和 awaker。每次改写前旧版本备份在 `data/notes/.history/`。
@@ -42,7 +41,7 @@
 | 层 | 改什么 | 怎么改 |
 |---|---|---|
 | 笔记 | 任何笔记，包括 todo、awaker、日记 | `write_note`，随时 |
-| 策略 | 给图书管理员的附加说明（`librarian`）、你的做法（`global` 笔记） | 反思时用 `edit_policy`，必须写原因和预期 |
+| 策略 | 给图书管理员的附加说明（`librarian`）、你的做法（`global` 笔记）、什么时候整理（`tidy`，Python，要 Bot 有 op 权限） | 反思时用 `edit_policy`，必须写原因和预期 |
 | 提案 | 醒来时带什么、画面多少条、阈值、代码 | `edit_policy("proposals", …)` 写给维护者，由维护者动手 |
 | 评估 | 之前的改动有没有用 | `assess_change` 记一条结论 |
 
@@ -85,10 +84,14 @@ def read_policy(name: str) -> str:
     """读一份策略文件全文。
 
     @param
-    name: librarian（给图书管理员的附加说明）、changes（改动与评估记录）、proposals（给维护者的提案）
+    name: librarian（给图书管理员的附加说明）、tidy（什么时候整理的 Python 条件）、changes（改动与评估记录）、proposals（给维护者的提案）
     """
     from mods.chat import notes
 
+    if name == "tidy" and not notes.read_policy(name).strip():
+        from mods.chat import agent
+
+        return "（tidy 还没写，用的是默认）\n" + agent.DEFAULT_TIDY
     return notes.read_policy(name) or f"（{name} 还是空的）"
 
 
@@ -96,15 +99,24 @@ def edit_policy(name: str, text: str, reason: str, expect: str) -> str:
     """用新全文替换一份策略文件，并把原因和预期记进 changes。
 
     @param
-    name: librarian、global（你的做法笔记）或 proposals
+    name: librarian、global（你的做法笔记）、tidy（什么时候整理，Python）或 proposals
     text: 更新后的完整内容；空串表示清空
     reason: 看到了什么问题才改（写日志里的日期时间或行动号）
     expect: 改完之后预期会看到什么变化，下次反思用来判断有没有用
     """
     from mods.chat import journal, notes
 
-    if name not in ("librarian", "global", "proposals"):
-        return "只能改 librarian、global 或 proposals；changes 用 assess_change 追加"
+    if name not in ("librarian", "global", "tidy", "proposals"):
+        return "只能改 librarian、global、tidy 或 proposals；changes 用 assess_change 追加"
+    if name == "tidy":
+        from mods import op
+
+        if not op.bot_is_op():
+            return "tidy 是会执行的 Python，只有 Bot 自身拥有 op 权限时才能改；写进 proposals 交给维护者"
+        try:
+            compile(text or "None", "tidy.py", "exec")
+        except SyntaxError as error:
+            return f"tidy 有语法错误，没有写入：{error}"
     if not reason.strip() or not expect.strip():
         return "reason 和 expect 都要写：说不清为什么改、期待什么，就先别改"
     previous = notes.write("global", text) if name == "global" else notes.write_policy(name, text)

@@ -80,8 +80,7 @@ generator 与 `.py input()` 共用 `mods.context` 的 continuation 登记。`^C`
    - 旧的 storage 待办第一次读到时搬进 todo 笔记。
 4. **放下是图书管理员的事**：另一个模型只在下面四种时候整理，不在每次唤醒后自动跑。
    - 她调用 `tidy`；
-   - 一次唤醒里上下文涨过 `max_token × pressure_percent`；
-   - 上次整理以来的行动列表本身太长；
+   - 整理条件成立：条件是普通 Python 文件 `data/notes/policy/tidy.py`，维护者直接改，她在反思里改（要 Bot 有 op 权限）；文件不存在时默认是一次唤醒里上下文涨过 `max_token × pressure_percent`，或上次整理以来的行动列表本身太长；
    - 夜里 `reflect` 规则到点。
 
    整理时他把上次整理以来她看过做过的东西收成结论和出处，写进笔记，之后这些行动不再出现在她眼前；原文仍在聊天记录和行动记录里。他不改 todo 和 awaker。思考内容只在一次唤醒之内保留。
@@ -108,7 +107,7 @@ generator 与 `.py input()` 共用 `mods.context` 的 continuation 登记。`^C`
 - 笔记超长。
 
 工具模块 `memory_system` 说明上下文怎么来、她能改什么，提供读日志、改策略、记评估的工具。
-- **策略层**：给图书管理员的附加说明（`data/notes/policy/librarian.md`，每次整理时附在图书管理员提示词后面）和她的做法笔记。每次改动必须写原因和预期，记进 `data/notes/policy/changes.md`。
+- **策略层**：给图书管理员的附加说明（`data/notes/policy/librarian.md`，每次整理时附在图书管理员提示词后面）、什么时候整理（`data/notes/policy/tidy.py`）和她的做法笔记。每次改动必须写原因和预期，记进 `data/notes/policy/changes.md`。
 - **不由她改的**：醒来时带什么、阈值和代码。她写进 `data/notes/policy/proposals.md` 交给维护者。
 
 **设置**：主模型、提示词、工具激活与这些预算只从全局 agent 设置读取；`#model` 等命令查看全局状态，修改命令由管理员操作。
@@ -116,7 +115,7 @@ generator 与 `.py input()` 共用 `mods.context` 的 continuation 登记。`^C`
 - `#awaker` 查看或改写闹钟规则；
 - `#reflect` 查看上次反思时间，`#reflect now` 立即跑一次夜间整理与反思。
 
-旧窗口聊天设置不再读取；每窗口独立的 `#hint` 仍用于聊天结束时向 QQ 发送状态。`聊天开始`/`聊天结束`是普通聊天内容，不划分上下文边界。
+旧窗口聊天设置不再读取；每窗口独立的 `#hint` 仍用于聊天结束时向 QQ 发送状态，配置是 `data/hint/` 下的普通文件（`default.py` 与 `g<群号>.py`／`u<QQ号>.py`，首行 `# on`／`# off`）。`聊天开始`/`聊天结束`是普通聊天内容，不划分上下文边界。
 
 唤醒仍由 `oplog` 的到达与激活登记决定：at、名字开头、`#poke` 和指向 Bot 的戳一戳标为激活，唤醒唯一中心 agent；普通消息只登记，不单独唤醒。窗口一旦出现在画面里并且这次唤醒有了输出，就记下"看到哪里"，并把该窗口的未读登记标为已读。启动时，对已有本地档案的窗口从 NapCat 连续补回离线消息；补回内容写入按日 sidecar，当前的窗口画面只读普通日志文件，补回的消息暂不出现在画面里。
 

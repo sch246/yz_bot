@@ -49,8 +49,7 @@
 4. **行动记录**（`chat.actions`）：oplog 的输出与结果渲染成和 chatlog 同形的记录：顶格一行时间与行动号，缩进的「（自语）」正文、工具调用与结果。白天的列表取 `agent.tidied_at` 之后的全部行动，最近 12 条附原文（每项截到 1500 字），更早的只列标题。`tidied_at` 第一次读取时设为当时，旧日志里的行动不算进来。
 5. **整理的触发**（`agent._tidy`，同步跑一次图书管理员，`phase="release"`，然后从当时起重新开始列表）：
    - 她调用 `tidy(note)`：本轮结束后整理，`note` 交给图书管理员；
-   - 一次唤醒里上下文涨过 `max_token × pressure_percent / 100`，且本轮新增超过阈值的三分之一；只看本轮新增，是为了开局材料本身就大时不空转；
-   - 组装前发现列表本身超过阈值的三分之一。
+   - 整理条件成立：`data/notes/policy/tidy.py` 是一段普通 Python，用 `.py` 的共享环境副本经 `py.eval_last` 求值，每次子请求结束（`stage="round"`）和每次组装前（`stage="assemble"`）各一次，末行为真就整理，是字符串时就是原因。可用的名字有 `used`、`grown`、`limit`（`max_token × pressure_percent / 100`）、`day_tokens`、`day_count`、`since_tidy`、`kind`、`hour`。文件不存在时用 `agent.DEFAULT_TIDY`：本轮上下文超过 `limit` 且这次组装以来新增超过 `limit` 的三分之一，或组装前列表本身超过 `limit` 的三分之一；只看新增是为了开局材料本身就大时不空转。条件写坏时这次按默认判断，并记一条 `⚠`。她在反思里用 `edit_policy("tidy", …)` 改它，要 Bot 自身有 op 权限，写入前检查语法。
 
    整理失败时列表保留，记一条 `⚠`。原生 assistant/tool 配对（含思考）只在一次唤醒之内留在 `Chat.messages`。
 6. **图书管理员**（`chat.roles.organize`）：用 `agent.librarian_model`（默认 `deepseek/deepseek-flash`，配置里没有该供应商时退回主模型）。
@@ -228,7 +227,7 @@ hint 与追加式上下文是两层，判据是一句话：**频繁变化、且�
 
 - **缺省值写死在代码里**（`DEFAULT_MAX_EVENTS` / `DEFAULT_MAX_TOKEN` 与各归一化函数的兜底分支），不再读 `llm_system/config.json`。中心运行期覆盖只有全局 `agent` storage 一份；`#limit` 是唯一预算命令入口。
 - **三个预算**：`max_events`（默认 80）是窗口画面的默认条数；`max_token`（默认 40000）乘 `pressure_percent`（默认 75%）是一次唤醒内触发整理的上下文大小，它的三分之一是白天列表触发整理的大小。存储键沿用旧名。旧窗口覆盖不自动迁入全局主体。`agent.librarian_model` 可选，缺省用便宜模型。每晚反思的时刻在笔记 awaker 里，`agent.reflected_at` 记上次反思的时间，`agent.tidied_at` 记上次整理的时间。
-- **`hint` 与 `prompt` 不在表里**：窗口结束提示的 `#hint` 独立合并全局默认与窗口覆盖；中心提示词从全局 `agent.prompt` 选择内置设置或显式列表。它们不是单值档位，不使用 `AGENT_SETTINGS` 的归一化。
+- **`hint` 与 `prompt` 不在表里**：窗口结束提示的 `#hint` 是 `data/hint/` 下的文件，独立合并全局默认与窗口覆盖；中心提示词从全局 `agent.prompt` 选择内置设置或显式列表。它们不是单值档位，不使用 `AGENT_SETTINGS` 的归一化。
 - 已退役的窗口聊天设置仍可能留在生产 storage，但运行代码不再读取；其清理需先获维护者授权，见[第二轮调查](working/round2-legacy-and-backfill-audit.md)。
 
 **召回画面以外的内容。** 中心 agent 用 `read_log(window, count, before)` 读任意窗口的 chatlog 原文（格式与画面相同，`before` 写 `YYYY-MM-DD HH:MM:SS` 或 Unix 秒，用来往前翻），`search_log(keyword, window, days)` 按子串在一个或所有窗口最近若干天（默认 7，最多 90）的聊天记录里找，最新的 30 条在前，`read_actions(ids, count, keyword)` 读自己的行动记录，`read_note(scope)` 读笔记。旧的 `take`、`status`、`mentions`、`fetch`、`read_messages`、`mark_read`、`pull` 已移除。`#hint` 不触发阅读。
@@ -255,7 +254,7 @@ DeepSeek 在带 `tools` 的 thinking 请求中要求最后一条 `user` 后的�
 命令面只做文本管理——写、看、开关，和 `#model`/`#prompt` 一系；「它在聊天结束时自动跑」是另一回事，两半分开看。
 
 - **谁跑、什么时候跑。** 唯一中心 reader 在 `_drive_agent` 的 `finally` 求值一次，按最初触发窗口选择窗口 `#hint` 配置；这是向 QQ 发状态的旧机制，不是全局模型待办 hint。无 reader 所有权的早退不触发。
-- **配置模型。** 两份字典——全局默认 `storage.get("", "hint")` 与窗口 `getchatstorage()["hint"]`——按显式顺序合并成 `{**default, **window}`，两侧都只认同名的 `code`/`on` 两个键，没有别的间接层。发不发 = 合并结果里 `code` 非空**且** `on` 为 `True`；`on` 缺失按 `False`。窗口可以只写 `on`（单独关掉默认提示，`code` 仍继承）。`#hint set <源码>` 写入 `{"code": …, "on": True}`，`#hint set` 无参清掉窗口配置、回落默认；`#hint` 与 `#hint default` 只翻开关，保源码。没有 `del`——源码是劳动成果，toggle 不该顺手删掉它。
+- **配置模型。** 两份普通文件（2026-10-22 起）——全局默认 `data/hint/default.py` 与窗口 `data/hint/g<群号>.py`／`u<QQ号>.py`，首行 `# on` 或 `# off` 是开关，其余是代码；以前存在 storage 的配置在第一次读到时搬进文件并删掉旧键——读成字典后按显式顺序合并成 `{**default, **window}`，两侧都只认同名的 `code`/`on` 两个键，没有别的间接层。发不发 = 合并结果里 `code` 非空**且** `on` 为 `True`；`on` 缺失按 `False`。窗口可以只写 `on`（单独关掉默认提示，`code` 仍继承）。`#hint set <源码>` 写入 `{"code": …, "on": True}`，`#hint set` 无参清掉窗口配置、回落默认；`#hint` 与 `#hint default` 只翻开关，保源码。没有 `del`——源码是劳动成果，toggle 不该顺手删掉它。
 - **求值。** 走 `py.eval_last(source, environment)`，与 link 共用同一份实现（原先 link 里那份私有副本已消掉）：前面各行 `exec`，末行 `eval`；末行为空、以 `#` 开头、或结果为 `None` 就不发。环境是共享动态环境 `py.loc` 的**一份副本**，另注入 `window`（本窗口的 `history.window` 键）、`usage`（最后一次中心请求的事件文本 token 估算）、`event_count`（该请求中不同正式事件号的数量）与 `context_limit`（该请求实际使用的事件数/token 上限）。后三项在中心 agent 仍活跃时冻结，避免结束后误读不相关的窗口状态。
 - **输出带 `#` 前缀**（`"#" + cq.escape(str(result))`），因此不回流进模型上下文，也不自指。报错同样以 `#` 开头、附 traceback。
 - **异常安全是硬要求。** 求值与发送的任何异常都在这一层吞掉、只写 `hint` 日志流，**绝不抛回 `finally`**：这段代码是用户自己写的、每次聊天都自动跑，让它抛出去就等于一段烂代码能污染聊天主流程的返回路径。（只吞 `Exception`——`SystemExit`/`KeyboardInterrupt` 是进程控制，不该被用户代码吃掉。）

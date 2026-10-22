@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import time
 
-from mods import context, image, llm, oplog, storage
+from mods import context, image, llm, oplog, py, storage
 
 import mods.chat as _chat_root
 from . import actions as _actions, journal as _journal, notes as _notes, reader as _reader, roles as _roles, screen as _screen, view as _view
@@ -28,6 +28,20 @@ _SEEN_KEY = "seen"
 _CURRENT_FULL = 12
 _CURRENT_CHARS = 1500
 _TIDIED_KEY = "tidied_at"
+# WHY: 什么时候请图书管理员整理是可以改的策略（2026-10-22 维护者："唤醒条件本身也配置化"）。
+# 条件是 `data/notes/policy/tidy.py` 里的 Python，用 `.py` 那份共享环境求值，末行的值为真
+# （或是一段说明原因的文字）就整理；文件不存在时用下面这份默认，和它写成文件后一模一样。
+DEFAULT_TIDY = """# 什么时候请图书管理员整理。每次子请求结束（stage == "round"）和每次组装前（stage == "assemble"）
+# 各求值一次：前面的行照常执行，最后一行是一个表达式，它的值为真就整理，是字符串时就是交给图书管理员的原因。
+# 可用的名字：stage、used（当前上下文 token）、grown（这次组装以来长了多少）、limit（max_token × 整理百分比）、
+# day_tokens / day_count（上次整理以来的行动列表）、since_tidy（距上次整理的秒数）、kind（唤醒／闹钟／反思）、hour。
+reason = None
+if stage == "round" and used > limit and grown > limit // 3:
+    reason = "上下文太长"
+elif stage == "assemble" and day_tokens > limit // 3:
+    reason = "今天的行动列表太长"
+reason
+"""
 # A window shows at least this many lines before its first unseen one.
 _LEAD_IN = 3
 _KNOWN_PEOPLE = 6
@@ -166,6 +180,29 @@ def _mark_seen(newest: dict[tuple, int | None]) -> None:
             # 离线补回仍在进行：未读前端没有固定，下次再标。
             pass
     storage.save()
+
+
+def _tidy_reason(turn, stage: str, used: int = 0, grown: int = 0) -> str:
+    """Evaluate the tidy condition; a non-empty string means tidy now, for that reason."""
+    _max_events, max_tokens = _chat_root.limit()
+    today = _day_actions()
+    namespace = dict(py.loc)
+    namespace.update(stage=stage, used=used, grown=grown,
+                     limit=max_tokens * _chat_root.agent_setting("pressure_percent") // 100,
+                     day_tokens=_chat_root.count_tokens("\n".join(today)), day_count=len(today),
+                     since_tidy=time.time() - tidied_at(), kind=turn.log["kind"],
+                     hour=time.localtime().tm_hour)
+    code = _notes.read_policy("tidy").strip() or DEFAULT_TIDY
+    try:
+        result = py.eval_last(code, namespace)
+    except Exception as error:
+        # 她或维护者写坏了条件：这次按默认判断，并在日志里留一条，等反思时看到。
+        _roles._stream.exception("整理条件求值失败")
+        turn.log["warnings"].append(f"⚠ 整理条件出错，按默认判断：{type(error).__name__}: {error}")
+        result = py.eval_last(DEFAULT_TIDY, namespace) if code != DEFAULT_TIDY else None
+    if not result:
+        return ""
+    return result if isinstance(result, str) else "整理条件成立"
 
 
 def _job(turn, phase: str, note: str = "") -> dict:
@@ -340,10 +377,10 @@ def _run_agent(model: str | None, turn) -> bool:
     focus = woken or [_reader.parse_target(label) for label in turn.screens]
     if notice is None and not focus and not turn.action_ids and not turn.alarm:
         return True
-    threshold = max_tokens * _chat_root.agent_setting("pressure_percent") // 100
-    if _chat_root.count_tokens("\n".join(_day_actions())) > threshold // 3:
-        # 今天的列表本身已经太长：先收进笔记再组装，免得每次醒来都背着它。
-        _tidy(turn, "release", "今天的行动列表太长")
+    before = _tidy_reason(turn, "assemble")
+    if before:
+        # 比如今天的列表本身已经太长：先收进笔记再组装，免得每次醒来都背着它。
+        _tidy(turn, "release", before)
     reason = "醒来" if not turn.log["assemblies"] else "整理后" if turn.tidied else "续做"
     messages, screens, newest, summary = _assemble(_plan(focus, turn.authors, max_events), turn, focus)
     if not messages and notice is None:
@@ -365,11 +402,12 @@ def _run_agent(model: str | None, turn) -> bool:
         turn.screens.update(screens)
 
     def over_budget(used: int, initial: int) -> bool:
-        # WHY: 不是"到 N 轮就截断"（见 llm.chat 的 WHY）：截下来的行动已经写进 oplog，
-        # 重新组装时最近的行动原文仍在，较早的留标题、可按号读回；前提没有被砍掉，只是收起了。
-        # 只算这次唤醒里长出来的部分：开局材料本身就大时，放下也不会变小，不能因此空转。
-        if used > threshold and used - initial > threshold // 3:
-            turn.release = "上下文太长"
+        # WHY: 不是"到 N 轮就截断"（见 llm.chat 的 WHY）：整理掉的行动已经写进 oplog 和笔记，
+        # 前提没有被砍掉，只是收起了。默认条件只算这次组装以来长出来的部分：开局材料本身就大
+        # 时，整理也不会变小，不能因此空转。
+        reason = _tidy_reason(turn, "round", used, used - initial)
+        if reason:
+            turn.release = reason
             return True
         return False
 

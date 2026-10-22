@@ -118,7 +118,7 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 ## LLM、图片与可观察输出
 
-`mods.llm/` 持有模型配置、client、流式响应与每请求工具快照；`mods.chat/` 按 `__init__.py`（公开入口、全局设置与窗口 `#hint`）、`agent.py`（中心激活、每次请求的上下文组装、整理、闹钟唤醒与夜间整理反思）、`roles.py`（召回工具与图书管理员）、`awaker.py`（按笔记 awaker 的规则每分钟检查一次的闹钟）、`screen.py`（按 chatlog 原文格式渲染窗口画面）、`actions.py`（把 oplog 里的输出与结果渲染成可读行动记录）、`notes.py`（`data/notes/` 下的笔记与策略文件）、`journal.py`（`data/journal/` 下的记忆系统日志）、`view.py`（系统提示与事件投影）、`reader.py`（未读标记与补回信源）、`subcommands.py`（`#` 设置命令）划分职责，对外仍是一个公开 Module；`mods.oplog/` 的 `__init__.py` 持有唯一追加日志和索引，`replay.py` 统一写前与启动重放校验；`mods.tools` 持有统一 registry、当前 Chat 绑定以及按职责分类的真实工具实现，天气模块只投影现有 `mods.weather`；`mods.image/` 持有图片身份、缓存和视觉输入；`mods.forward` 持有合并转发的取回、落盘与渲染——转发的 id 和节点里的图片 url 都会过期，所以取回来的节点落在 `data/forward/<id>.json`，`.cave` 存转发时走的就是它，发送方向则由 `send_forward_msg` 的节点数组承担。`mods.websearch` 持有互联网检索，把 DeepSeek 的服务端 `web_search` 包成一个普通函数——密钥与聊天共用，搜回来的外部正文只当数据交回，不当指令。`mods.browser` 持有自管的常驻 Chromium 与裸 CDP 会话：打开页面、读渲染后的正文、在页面里跑 JS、截图交给视觉链路，每个聊天窗口一个标签页；进程由 `watchdog.detached()` 起，不随工具调用被 `^C` 带走；顶层导航只校验 http/https 地址语法，不解析或限制本机、内网、公网等目标，也不拦截页面的后续请求；启动就绪后清掉 Chrome 按 profile 恢复出来的遗留标签页，让每次启动都从一页空白开始。图片与子任务工具只惰性调用 `mods.chat` 的既有 usage/cost 入口，不复制计费状态。`llm`、`tools`、`chat`、`oplog` 和 `image` 采用文件夹 Module，是因为各自内部实现共同拥有明确状态；具体能力仍优先由普通函数表达。
+`mods.llm/` 持有模型配置、client、流式响应与每请求工具快照；`mods.chat/` 按 `__init__.py`（公开入口、全局设置与 `data/hint/` 下的窗口 `#hint` 文件）、`agent.py`（中心激活、每次请求的上下文组装、整理、闹钟唤醒与夜间整理反思）、`roles.py`（召回工具与图书管理员）、`awaker.py`（按笔记 awaker 的规则每分钟检查一次的闹钟）、`screen.py`（按 chatlog 原文格式渲染窗口画面）、`actions.py`（把 oplog 里的输出与结果渲染成可读行动记录）、`notes.py`（`data/notes/` 下的笔记与策略文件）、`journal.py`（`data/journal/` 下的记忆系统日志）、`view.py`（系统提示与事件投影）、`reader.py`（未读标记与补回信源）、`subcommands.py`（`#` 设置命令）划分职责，对外仍是一个公开 Module；`mods.oplog/` 的 `__init__.py` 持有唯一追加日志和索引，`replay.py` 统一写前与启动重放校验；`mods.tools` 持有统一 registry、当前 Chat 绑定以及按职责分类的真实工具实现，天气模块只投影现有 `mods.weather`；`mods.image/` 持有图片身份、缓存和视觉输入；`mods.forward` 持有合并转发的取回、落盘与渲染——转发的 id 和节点里的图片 url 都会过期，所以取回来的节点落在 `data/forward/<id>.json`，`.cave` 存转发时走的就是它，发送方向则由 `send_forward_msg` 的节点数组承担。`mods.websearch` 持有互联网检索，把 DeepSeek 的服务端 `web_search` 包成一个普通函数——密钥与聊天共用，搜回来的外部正文只当数据交回，不当指令。`mods.browser` 持有自管的常驻 Chromium 与裸 CDP 会话：打开页面、读渲染后的正文、在页面里跑 JS、截图交给视觉链路，每个聊天窗口一个标签页；进程由 `watchdog.detached()` 起，不随工具调用被 `^C` 带走；顶层导航只校验 http/https 地址语法，不解析或限制本机、内网、公网等目标，也不拦截页面的后续请求；启动就绪后清掉 Chrome 按 profile 恢复出来的遗留标签页，让每次启动都从一页空白开始。图片与子任务工具只惰性调用 `mods.chat` 的既有 usage/cost 入口，不复制计费状态。`llm`、`tools`、`chat`、`oplog` 和 `image` 采用文件夹 Module，是因为各自内部实现共同拥有明确状态；具体能力仍优先由普通函数表达。
 
 来源窗口的到达与激活由 `oplog` 的 append-only 日志登记，`context` 只保留每窗口锁与一次路由期间的事件对象→arrival 关联：路由在锁内先写 chatlog/history 再登记 arrival。唯一中心 agent 用 `AGENT_WINDOW` 持有全局执行线；激活只产生可确认的通知，模型第一次输出时确认。
 
@@ -126,10 +126,9 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 窗口画面直接读 `chatlog/` 的普通日志文件、保留原文格式，`storage` 的 `agent.seen` 记各窗口看到的时间，用来标出新消息；被唤醒窗口里看到时间之后的消息总会展示。第一次输出时记下看到的时间，并对画面里的窗口调用 `reader.mark_window_read` 把未读登记标为已读。已加载工具模块的完整状态在每次组装时放在系统提示之后，一次唤醒内的变化由 context provider 追加。一次唤醒内多轮工具调用照常累积在 `session.messages`。
 
-图书管理员只在四种情况下同步运行，不在每次唤醒后自动跑：
+图书管理员只在三种情况下同步运行，不在每次唤醒后自动跑：
 - 她调 `tidy`；
-- 上下文长过 `max_token × pressure_percent` 且主要是本轮新增；
-- 白天的列表本身超过该阈值的三分之一；
+- `data/notes/policy/tidy.py` 里的 Python 条件成立，默认是上下文长过 `max_token × pressure_percent` 且主要是本轮新增，或白天的列表本身超过该阈值的三分之一；
 - 夜里 `reflect` 规则到点。
 
 前三种整理完重置 `tidied_at`，并不等新唤醒立即重新组装。笔记是 `data/notes/` 下她随时能用 `write_note` 改的普通文件，改写和删除前把旧文件复制到 `.history/`。`chat.awaker` 每分钟按笔记 awaker 的规则检查一次，到点时用 `agent.alarm` 以闹钟理由叫醒她，或者用 `agent.reflect` 先让图书管理员写日记、整理笔记、汇总月记年记，再让她加载 `memory_system` 反思。每次唤醒、闹钟、整理、笔记改动、策略改动和汇总都在 `data/journal/` 留一条可读记录。

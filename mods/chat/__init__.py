@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 from datetime import datetime, timezone
+from pathlib import Path
 import re
 import threading
 import time
@@ -310,7 +311,7 @@ def get_handler(session: llm.Chat):
 
 
 def _window_storage(window: tuple) -> dict:
-    """只为 `#hint` 取本窗口 storage，键就是 `history.window(...)`。
+    """只为把旧 `#hint` 配置搬进文件取本窗口 storage，键就是 `history.window(...)`。
 
     WHY: 不经过 `context.current()`——hint 在 `chat` 的 `finally` 里跑，那个窗口就是调用方
     手上的实参；由实参决定"哪个窗口"，触发点就不依赖线程局部的当前事件，也不跟捕获、派发
@@ -410,6 +411,62 @@ def _hint_effective(default: dict, chat_hint: dict | None) -> dict:
     return {**default, **(chat_hint if isinstance(chat_hint, dict) else {})}
 
 
+_HINT_ROOT = Path("data") / "hint"
+
+
+def _hint_path(window: tuple | None) -> Path:
+    if window is None:
+        return _HINT_ROOT / "default.py"
+    return _HINT_ROOT / f"{'g' if window[0] == 'group' else 'u'}{window[1]}.py"
+
+
+def hint_config(window: tuple | None) -> dict:
+    """One `#hint` file as the `{code?, on?}` dict the merge rule expects.
+
+    WHY: 2026-10-22 维护者让 `#hint` 退化成普通文件：`data/hint/default.py` 是全局默认，
+    `data/hint/g<群号>.py`／`u<QQ号>.py` 是窗口覆盖。首行 `# on` 或 `# off` 是开关，其余
+    是代码；只写开关、不写代码的窗口文件照旧继承默认的代码。以前存在 storage 的配置在
+    第一次读到时搬进文件并删掉旧键。
+    """
+    path = _hint_path(window)
+    home = storage.get("", "hint") if window is None else _window_storage(window)
+    legacy = home if window is None else home.get("hint")
+    if isinstance(legacy, dict) and legacy:
+        if not path.is_file():
+            save_hint(window, legacy)
+        if window is None:
+            home.clear()
+        else:
+            del home["hint"]
+        storage.save()
+    if not path.is_file():
+        return {}
+    head, _, rest = path.read_text(encoding="utf-8").partition("\n")
+    config: dict = {}
+    if head.strip() in ("# on", "# off"):
+        config["on"] = head.strip() == "# on"
+        code = rest
+    else:
+        code = head + ("\n" + rest if rest else "")
+    if code.strip():
+        config["code"] = code.strip("\n")
+    return config
+
+
+def save_hint(window: tuple | None, config: dict) -> None:
+    path = _hint_path(window)
+    lines = []
+    if "on" in config:
+        lines.append("# on" if config["on"] else "# off")
+    if isinstance(config.get("code"), str) and config["code"].strip():
+        lines.append(config["code"].strip("\n"))
+    if not lines:
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def _run_hint(window: tuple, turn=None) -> None:
     """求值本窗口的结束提示，并把结果发出去；触发点写在 `chat` 的 `finally`。
 
@@ -421,7 +478,7 @@ def _run_hint(window: tuple, turn=None) -> None:
     写的、每次聊天都自动跑，让它抛出去就等于一段烂代码能污染聊天主流程的返回路径。
     """
     try:
-        merged = _hint_effective(storage.get("", "hint"), _window_storage(window).get("hint"))
+        merged = _hint_effective(hint_config(None), hint_config(window))
         code = merged.get("code")
         if not merged.get("on", False) or not isinstance(code, str) or not code.strip():
             return
