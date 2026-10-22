@@ -25,6 +25,7 @@ DEFAULT_HELPER_MODEL = "deepseek/deepseek-flash"
 _LIBRARIAN_CALLS = 12
 _SEARCH_DAYS = 7
 _SEARCH_HITS = 30
+_READ_CHARS = 8000
 
 
 def _root():
@@ -85,20 +86,35 @@ def read_log(window: str, count: int = 30, before: str = "") -> str:
     return _screen.render(target, items) or "（没有记录）"
 
 
-def read_actions(ids: list[str] | None = None, count: int = 10, keyword: str = "") -> str:
-    """读自己过去的行动记录原文（输出、工具调用与结果）。
+def read_actions(ids: list[str] | None = None, count: int = 10, keyword: str = "", start: int = 0) -> str:
+    """读自己过去的行动记录原文（输出、工具调用与结果），一次最多 8000 字，更长的按 start 往后翻。
 
     @param
     ids: 行动号列表，如 20261019-12；留空则取最近 count 条
     count: 不给 ids 时取最近多少条，1 到 50
-    keyword: 只取原文里含这个词的行动（不区分大小写）
+    keyword: 只取原文里含这个词的行动（不区分大小写，在完整原文里找）
+    start: 从第几个字开始读，用上一次结尾提示的位置接着读
     """
-    rendered = [_actions.render(output, result, chars=4000) for output, result in _actions.pairs(ids=ids or None)]
+    # WHY: 先按完整原文筛选、再分页（2026-10-22 审查发现：先截 4000 字再搜，长工具结果的
+    # 尾部既按行动号读不到、也搜不到；原文只在行动记录里，召回工具得能拿全）。
+    rendered = [_actions.render(output, result, chars=10**9) for output, result in _actions.pairs(ids=ids or None)]
     if keyword:
         rendered = [text for text in rendered if keyword.casefold() in text.casefold()]
     if not ids:
         rendered = rendered[-max(1, min(int(count), 50)):]
-    return "\n".join(rendered) or "（没有记录）"
+    text = "\n".join(rendered)
+    if not text:
+        return "（没有记录）"
+    start = max(0, int(start))
+    if start >= len(text):
+        return f"（共 {len(text)} 字，start 超出范围）"
+    end = start + _READ_CHARS
+    page = text[start:end]
+    if start:
+        page = f"（第 {start} 字起）\n" + page
+    if end < len(text):
+        page += f"\n（共 {len(text)} 字，还有 {len(text) - end} 字；用同样的参数加 start={end} 接着读）"
+    return page
 
 
 def search_log(keyword: str, window: str = "", days: int = _SEARCH_DAYS) -> str:

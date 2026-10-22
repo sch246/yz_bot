@@ -115,7 +115,7 @@ Skill 也是可编辑的长期笔记：把可重复使用的经验、做法、�
 
 - 聊天记录就是 `chatlog/` 的原文，`read_log(window, count, before)` 读任意窗口，格式与画面相同；`before` 写 `YYYY-MM-DD HH:MM:SS` 往前翻页。
 - 记得一点线索（名字、话题、某个词）就用 `search_log(keyword, window, days)` 找出原文和时间，再用 `read_log` 读前后文。
-- 自己做过的事用 `read_actions(ids)` 按行动号读，或不给号读最近几条，`keyword` 按词筛。
+- 自己做过的事用 `read_actions(ids)` 按行动号读，或不给号读最近几条，`keyword` 按词筛；太长的结果按结尾提示用 `start` 接着读。
 - 笔记都是 `data/notes/` 下的普通文件，你随时能读能写：global 是你的做法，recent 是短期记忆，todo 是待办，awaker 是你的闹钟规则，person:<QQ号>、group:<群号> 记认识与经历，diary:<日期> 是夜里写的日记（月、年各有汇总）。`read_note(scope)` 读，`write_note(scope, text)` 整份替换，改前自动备份。认识了新的人、答应了什么、被纠正了什么，想记就当场记。
 - 放下是图书管理员的事：你调用 `tidy`、一次唤醒里上下文太长、或者今天的行动列表太长时，他把上次整理以来你看过做过的东西收成结论和出处写进笔记，之后这些行动不再出现在你眼前；每天夜里他写日记、整理笔记。
 - 想定时醒来（比如每 10 分钟看一眼，或者某个时刻提醒谁），就改 awaker 笔记，每行一条：`every 10m 理由`、`daily 23:30 理由`、`at 2026-10-23 08:00 理由`；`daily 04:00 reflect` 是每晚的整理与反思，删掉它就不再反思。到点的闹钟会把理由交给你，`at` 规则响过后记得删掉。
@@ -249,17 +249,18 @@ def search_log(keyword: str, window: str = "", days: int = 7) -> str:
     return chat.roles.search_log(keyword, window, days)
 
 
-def read_actions(ids: list[str] | None = None, count: int = 10, keyword: str = "") -> str:
-    """读自己过去的行动记录原文：说过的话、调用过的工具及其结果。
+def read_actions(ids: list[str] | None = None, count: int = 10, keyword: str = "", start: int = 0) -> str:
+    """读自己过去的行动记录原文：说过的话、调用过的工具及其结果。一次最多 8000 字，更长的按 start 往后翻。
 
     @param
     ids: 行动号列表，如 20261019-12；留空则取最近 count 条
     count: 不给 ids 时取最近多少条，1 到 50
-    keyword: 只取原文里含这个词的行动（不区分大小写）
+    keyword: 只取原文里含这个词的行动（不区分大小写，在完整原文里找）
+    start: 从第几个字开始读，用上一次结尾提示的位置接着读
     """
     from mods import chat
 
-    return chat.roles.read_actions(ids, count, keyword)
+    return chat.roles.read_actions(ids, count, keyword, start)
 
 
 def read_note(scope: str) -> str:

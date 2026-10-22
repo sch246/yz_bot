@@ -124,7 +124,7 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 中心 agent 每次请求都从持久状态重新组装（2026-10-19 起，取舍见[无状态主循环提案](working/proposals/stateless-agent-loop.md)），不再重放自己的输出与结果。2026-10-22 起召回由她自己做、放下由图书管理员做。`agent._plan` 只给叫醒她的窗口画面、global、recent 与最新日记、这些窗口与作者的笔记；`agent._assemble` 再附一份可召回内容的目录和 `agent.tidied_at` 之后她做过的事。其余由模型用召回工具读。
 
-窗口画面直接读 `chatlog/` 的普通日志文件、保留原文格式，`storage` 的 `agent.seen` 记各窗口看到的时间，用来标出新消息；被唤醒窗口里看到时间之后的消息总会展示。第一次输出时记下看到的时间，并对画面里的窗口调用 `reader.mark_window_read` 把未读登记标为已读。已加载工具模块的完整状态在每次组装时放在系统提示之后，一次唤醒内的变化由 context provider 追加。一次唤醒内多轮工具调用照常累积在 `session.messages`。
+窗口画面直接读 `chatlog/` 的普通日志文件、保留原文格式，`storage` 的 `agent.seen` 记各窗口看到的时间，用来标出新消息；被唤醒窗口里看到时间之后的消息总会展示。第一次输出时记下看到的时间，并对画面里的窗口调用 `reader.mark_window_read` 把未读登记标为已读；只标到读画面时取下的到达边界，生成期间新到的未读留给收尾接续。已加载工具模块的完整状态在每次组装时放在系统提示之后，一次唤醒内的变化由 context provider 追加。一次唤醒内多轮工具调用照常累积在 `session.messages`。
 
 图书管理员只在三种情况下同步运行，不在每次唤醒后自动跑：
 - 她调 `tidy`；
@@ -137,7 +137,7 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 `oplog` 对可预见的非法记录在写盘前用与重放相同的校验拒绝，不改变日志或内存；追加、fsync 或落盘后索引应用失败会进入持久化失败态，后续写入和同批尚未派发的工具行动均停止，直到重启检查日志。离线回放入口 `run_offline` 与 `experiments/memory_replay.py` 已随旧阅读模型删除；按新循环重写回放之前，没有离线评估路径。
 
-模型可用 `read_log`（任意窗口的 chatlog 原文，格式与画面相同，可按时间往前翻）、`search_log`（按线索在聊天记录里找）、`read_actions`（按行动号、最近若干条或关键词读自己的行动记录）与 `read_note` 召回画面之外的内容，用 `write_note` 改笔记、`tidy` 请图书管理员整理；`edit_hint` 已被笔记 todo 取代，`cover_events`、`recall_events`、`event_links` 与 `take`／`status`／`mentions`／`fetch`／`read_messages`／`mark_read`／`pull` 已从工具集移除。`聊天开始`／`聊天结束`是普通内容。旧窗口聊天设置不再读取，也不并入全局设置；窗口 `#hint` 独立保留。启动恢复与补回仍把 NapCat 历史写进按日 sidecar 与 oplog 信源页；窗口画面目前只读普通日志，sidecar 中补回的消息暂不出现在画面里。`#` 控制消息不投影。主模型与图书管理员的费用统一记入 Bot 账。
+模型可用 `read_log`（任意窗口的 chatlog 原文，格式与画面相同，可按时间往前翻）、`search_log`（按线索在聊天记录里找）、`read_actions`（按行动号、最近若干条或关键词读自己的行动记录，在完整原文里筛，长的按 `start` 分页）与 `read_note` 召回画面之外的内容，用 `write_note` 改笔记、`tidy` 请图书管理员整理；`edit_hint` 已被笔记 todo 取代，`cover_events`、`recall_events`、`event_links` 与 `take`／`status`／`mentions`／`fetch`／`read_messages`／`mark_read`／`pull` 已从工具集移除。`聊天开始`／`聊天结束`是普通内容。旧窗口聊天设置不再读取，也不并入全局设置；窗口 `#hint` 独立保留。启动恢复与补回仍把 NapCat 历史写进按日 sidecar 与 oplog 信源页；窗口画面目前只读普通日志，sidecar 中补回的消息暂不出现在画面里。`#` 控制消息不投影。主模型与图书管理员的费用统一记入 Bot 账。
 
 终端打印是实际运维界面的一部分：收发消息、流式 LLM 内容、工具调用、图片捕获/缓存、link/capture 命中、模块失败和生命周期进度都应保留可观察输出。这些产出者各自选一条**流名**（`mods.log.stream(...)`，即 `yz.*` logger），终端订阅其中一组；流是「属于哪个子系统」这条轴，与 logger 级别表达的「是不是故障」互不替代。每条流有自己的 `log/<流>.log`；`app.log` 只记严重程度；chatlog 保存产品聊天历史，三者不是同一用途。落盘的记录由一个 filter 自动补上交互归属，调用点不传参。终端行为、订阅集与 `.log` 见[运行时](runtime.md)。
 

@@ -124,13 +124,18 @@ def _mark_arrival_prefix_read(window: tuple, entries: list[dict],
 
 
 def mark_window_read(window: tuple, count: int | None = None,
-                     read_by: str | None = None) -> dict:
-    """Mark the current ordered unread prefix as read without creating input events."""
+                     read_by: str | None = None, through=...) -> dict:
+    """Mark the ordered unread prefix as read without creating input events.
+
+    *through* is the last arrival to mark, as ``oplog.latest_pending_arrival``
+    gave it when the screen was read; left out, it is whatever is unread now.
+    """
     with context.window_lock(window):
         sources = _recovery_sources(window)
         if any(source["state"] == "fetching" for source in sources):
             raise ValueError("该窗口离线补回仍在进行，未读前端尚未固定")
-        through = oplog.latest_pending_arrival(window)
+        if through is ...:
+            through = oplog.latest_pending_arrival(window)
         frozen_sources = {source["key"]: source["remaining"] for source in sources}
         marked = mentions = 0
 
@@ -160,10 +165,9 @@ def mark_window_read(window: tuple, count: int | None = None,
                 marked += removed
                 mentions += mentioned
         if count is None or marked < count:
-            pending = oplog.unread(window)
-            if through is not None:
-                pending = [entry for entry in pending
-                           if oplog.arrival_before_or_at(entry["arrival"], through)]
+            pending = ([entry for entry in oplog.unread(window)
+                        if oplog.arrival_before_or_at(entry["arrival"], through)]
+                       if through is not None else [])
             removed, mentioned = _mark_arrival_prefix_read(
                 window, pending[:allowance(len(pending))], read_by)
             marked += removed
