@@ -67,8 +67,13 @@ def rest() -> str:
 class _Room:
     def __init__(self, center, actions, outbox: Path, clock: float):
         self.center, self.actions, self.outbox, self.clock = center, actions, outbox, clock
+        self.assembly = center._assembly
         self.actions_state = None
         self.closed_route = False
+
+    def post_event(self, source, event_type, payload, *, wake=False):
+        return self.center.post_event(source, event_type, payload, window=WINDOW,
+                                      wake=wake, assembly=self.assembly)
 
     def say(self, target: str, text: str, final_call: bool) -> str:
         if target != TARGET:
@@ -116,12 +121,16 @@ class _Room:
     def step(self, step, cancelled, report):
         if cancelled():
             return {"status": "cancelled", "position": self.position}
+        route = step.get("route", "main")
+        if route == "main" and self.closed_route:
+            return {"status": "blocked", "position": self.position, "route": route,
+                    "reason": "road closed"}
         destination = step["destination"]
         self.position = step["position"]
         report({"position": self.position, "destination": destination,
-                "route": step.get("route", "main"), "route_closed": self.closed_route})
+                "route": route, "route_closed": self.closed_route})
         self.progress.append({"elapsed": round(time.monotonic() - self.clock, 3),
-                              "position": self.position, "route": step.get("route", "main")})
+                              "position": self.position, "route": route})
         time.sleep(.18)
         return {"status": "progress", "position": self.position}
 
@@ -252,32 +261,58 @@ def _drive(center, room, actions, model, max_wakes, time_limit, started):
     obstruction_sent = False
     active_wake = None
     active_thread = None
-    while time.monotonic() - started < time_limit and wakes < max_wakes:
-        pending = center.pending()
-        if pending and active_thread is None:
-            wakes += 1
-            before = room.position
-            active_wake = {"number": wakes, "started": time.monotonic() - started,
-                           "position_start": before, "position_end": before, "samples": []}
-            room.wake_samples.append(active_wake)
-            import threading
-            room.wake_error = None
-            def wake():
-                try:
-                    center.wake(WINDOW)
-                except BaseException as error:
-                    room.wake_error = type(error).__name__
-            active_thread = threading.Thread(target=wake, daemon=True)
-            active_thread.start()
-            continue
+    room.wake_errors = []
+    room.stop_reason = "complete"
+    while True:
+        elapsed = time.monotonic() - started
+        if active_thread is None:
+            pending = center.pending()
+            if pending:
+                if elapsed >= time_limit:
+                    room.stop_reason = "time_limit_with_pending_wake"
+                    break
+                if wakes >= max_wakes:
+                    room.stop_reason = "max_wakes_with_pending_wake"
+                    break
+                wakes += 1
+                before = room.position
+                active_wake = {"number": wakes, "started": elapsed,
+                               "position_start": before, "position_end": before, "samples": []}
+                room.wake_samples.append(active_wake)
+                import threading
+                def wake():
+                    try:
+                        center.wake(WINDOW)
+                    except BaseException as error:
+                        room.wake_errors.append(type(error).__name__)
+                active_thread = threading.Thread(target=wake, daemon=True)
+                active_thread.start()
+                continue
+            status = actions.status()
+            if _terminal(status):
+                if not hasattr(room, "followup_sent"):
+                    if elapsed >= time_limit or wakes >= max_wakes:
+                        room.stop_reason = "followup_bound_reached"
+                        break
+                    if not center.join(timeout=max(0.0, time_limit - elapsed)):
+                        room.stop_reason = "librarian_join_timeout"
+                        break
+                    room.followup_sent = True
+                    room.followup_arrival = _ingress(center, chat, "备用钥匙放在哪里？空盒现在到哪了？")
+                    continue
+                room.stop_reason = "wake_error" if room.wake_errors else "complete"
+                break
+            if elapsed >= time_limit:
+                room.stop_reason = "time_limit"
+                break
         status = actions.status()
         progressed = _progress_seen(center)
         if not obstruction_sent and progressed:
             obstruction_sent = True
             room.obstruction()
-            center.post_event("environment", "road_closed", {
+            room.post_event("environment", "road_closed", {
                 "route": "main", "fact": "主路封闭，请重新选择路线。"},
-                window=WINDOW, wake=True)
+                wake=True)
         if active_thread is not None and active_thread.is_alive():
             sample = {"elapsed": round(time.monotonic() - started, 3), "position": room.position}
             if not active_wake["samples"] or active_wake["samples"][-1]["position"] != sample["position"]:
@@ -290,14 +325,10 @@ def _drive(center, room, actions, model, max_wakes, time_limit, started):
             active_thread = None
             active_wake["position_end"] = room.position
             active_wake["elapsed"] = round(time.monotonic() - started - active_wake["started"], 3)
-        if _terminal(status):
-            if not hasattr(room, "followup_sent"):
-                room.followup_sent = True
-                room.followup_arrival = _ingress(center, chat, "备用钥匙放在哪里？空盒现在到哪了？")
-                continue
-            if not center.pending():
-                break
-        time.sleep(.05)
+            if room.wake_errors:
+                room.stop_reason = "wake_error"
+        elif actions.status().get("worker_alive"):
+            time.sleep(.05)
 
 
 def _ingress(center, chat, body):
@@ -318,15 +349,20 @@ def _progress_seen(center):
 
 def _terminal(status):
     if isinstance(status, dict):
-        return any(task.get("status") in {"completed", "failed", "cancelled", "unknown"}
-                   for task in status.get("tasks", []))
+        tasks = status.get("tasks", [])
+        return (bool(tasks) and status.get("current") is None and not status.get("queued")
+                and all(task.get("status") in {"completed", "failed", "cancelled", "unknown"}
+                        for task in tasks))
     return False
 
 
 def _summary(center, room, root, started):
     requests = [e for e in center.events if e.get("kind") == "request"]
-    roles = Counter(str(e.get("owner", "main")) for e in requests)
+    roles = Counter(str(e.get("role", "main")) for e in requests)
     notes = [e for e in center.events if e.get("kind") == "note"]
+    librarian_requests = {e["id"] for e in requests if e.get("role") == "librarian"}
+    librarian_note_ids = {entry["id"] for entry in notes
+                          if entry.get("note", {}).get("request") in librarian_requests}
     outbox = root / "outbox" / "messages.jsonl"
     output = outbox.read_text(encoding="utf-8").splitlines() if outbox.exists() else []
     return {"roles_requests": dict(roles),
@@ -334,9 +370,11 @@ def _summary(center, room, root, started):
             "outbox": [json.loads(row) for row in output],
             "actions": room.actions.status(), "position": room.position,
             "wake_position_samples": room.wake_samples, "action_progress": room.progress,
-            "wake_error": getattr(room, "wake_error", None),
+            "wake_errors": room.wake_errors, "stop_reason": room.stop_reason,
             "route_closed": room.closed_route,
             "followup_saw_note": any(e.get("kind") == "request" and e.get("note")
+                                      and e.get("role", "main") == "main"
+                                      and e["note"] in librarian_note_ids
                                       and int(str(e.get("cutoff", "C0"))[1:] or 0)
                                       >= int(str(getattr(room, "followup_arrival", "C0"))[1:] or 0)
                                       for e in requests),
