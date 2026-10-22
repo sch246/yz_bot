@@ -47,11 +47,17 @@ def say(target: str, text: str, final_call: bool = True) -> str:
     return _room().say(target, text, final_call)
 
 def observe_room() -> str:
-    """Observe the fictional workroom and current walking state."""
+    """Observe position range, both ends, open routes, queue modes and walk state."""
     return _room().observe_room()
 
 def start_walk(destination: int, route: str = "main", queue: str = "append") -> str:
-    """Move the empty box toward a numbered room location."""
+    """Move the empty box to an integer position from 0 through 10.
+
+    @param
+    destination: integer 0..10; 0 is the starting end and 10 is the opposite end
+    route: enum: [main, side]; main is blocked after the road closure
+    queue: enum: [append, replace, now]; append keeps waiting tasks, replace drops waiting tasks, now requests current cancellation and prepends this task
+    """
     return _room().start_walk(destination, route, queue)
 
 def stop_walk() -> str:
@@ -89,7 +95,17 @@ class _Room:
 
     def observe_room(self) -> str:
         return json.dumps({"room": "fictional workroom", "box": "empty", "position": self.position,
-                           "destination": self.destination, "route_closed": self.closed_route,
+                           "position_range": {"minimum": 0, "maximum": 10},
+                           "position_0": "starting end", "position_10": "opposite end",
+                           "destination": self.destination,
+                           "available_routes": ["side"] if self.closed_route else ["main", "side"],
+                           "route_status": {"main": "closed" if self.closed_route else "open",
+                                            "side": "open"},
+                           "queue_modes": {
+                               "append": "keep the current queue",
+                               "replace": "drop waiting tasks; let the current task finish",
+                               "now": "request current cancellation and put this task first"},
+                           "route_closed": self.closed_route,
                            "walk": self.actions.status()}, ensure_ascii=False)
 
     @property
@@ -111,6 +127,13 @@ class _Room:
     def start_walk(self, destination: int, route: str = "main", queue: str = "append") -> str:
         if type(destination) is not int or not 0 <= destination <= 10:
             raise ValueError("destination must be an integer from 0 to 10")
+        if route not in {"main", "side"}:
+            raise ValueError("route must be exactly 'main' or 'side'")
+        if queue not in {"append", "replace", "now"}:
+            raise ValueError("queue must be append, replace or now")
+        if destination == self.position:
+            return json.dumps({"status": "already_at_destination", "position": self.position,
+                               "destination": destination}, ensure_ascii=False)
         self.destination = destination
         direction = 1 if destination >= self.position else -1
         steps = [{"position": point, "destination": destination, "route": route}
@@ -264,6 +287,9 @@ def _drive(center, room, actions, model, max_wakes, time_limit, started):
     room.wake_errors = []
     room.stop_reason = "complete"
     while True:
+        if room.wake_errors:
+            room.stop_reason = "wake_error"
+            break
         elapsed = time.monotonic() - started
         if active_thread is None:
             pending = center.pending()
