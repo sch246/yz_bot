@@ -19,7 +19,7 @@ import traceback
 
 from mods import chatlog, history, llm, log
 
-from . import actions as _actions, notes as _notes, screen as _screen
+from . import actions as _actions, journal as _journal, notes as _notes, screen as _screen
 
 
 _stream = log.stream("agent")
@@ -245,8 +245,12 @@ def organize(job: dict) -> None:
         _organize(job)
 
 
+_LIMITS = {"recent": 20, "global": 40}
+
+
 def _organize(job: dict) -> None:
     calls = [0]
+    written: list[str] = []
     session = llm.Chat(model=helper_model("librarian_model"), chat_client=llm.get_client())
     session.fail_fast = True
 
@@ -258,7 +262,12 @@ def _organize(job: dict) -> None:
         text: 这份笔记更新后的完整内容
         """
         calls[0] += 1
-        _notes.write(scope, text)
+        previous = _notes.write(scope, text)
+        written.append(f"改 {scope}：")
+        written.extend("  " + line for line in _journal.diff(previous, text))
+        size = len(text.strip().split("\n")) if text.strip() else 0
+        if size > _LIMITS.get(scope, 10**9):
+            written.append(f"⚠ {scope} 有 {size} 行，超过 {_LIMITS[scope]} 行")
         return f"已写入 {scope}" if text.strip() else f"已删除 {scope}"
 
     session.set_tools([write_note, _counted(read_note, calls), _counted(read_log, calls),
@@ -271,8 +280,11 @@ def _organize(job: dict) -> None:
         current.append(f"### {scope}" + (f"（维护者设定的称呼：{name}）" if name else "")
                        + "\n" + (text or "（空）"))
     others = [item["scope"] for item in _notes.listing() if item["scope"] not in ("recent", *job["scopes"])]
+    guidance = _notes.read_policy("librarian").strip()
+    system = _LIBRARIAN_PROMPT + (
+        "\n\n## 柚子给你的附加说明\n她在每晚反思里写的；和上面的规则冲突时以上面为准。\n" + guidance if guidance else "")
     session.set_messages([
-        {"role": "system", "content": _LIBRARIAN_PROMPT},
+        {"role": "system", "content": system},
         {"role": "user", "content": "\n\n".join(part for part in [
             f"现在是 {_screen.clock(job['time'])}。" + _PHASES[job.get("phase", "end")],
             "## 她看到的画面\n" + "\n\n".join(job["screens"]) if job["screens"] else "",
@@ -281,4 +293,12 @@ def _organize(job: dict) -> None:
             "## 其它已有笔记\n" + ", ".join(others[:60]) if others else "",
         ] if part)},
     ])
-    session.chat(recall_func=_charge(session))
+    try:
+        session.chat(recall_func=_charge(session))
+    finally:
+        phase = "放下" if job.get("phase") == "release" else "收尾"
+        try:
+            _journal.append(f"整理（{phase}）唤醒 {job.get('wake', '?')[11:]} 起",
+                            written or ["没有改笔记"])
+        except OSError:
+            _stream.exception("整理记录写入失败")

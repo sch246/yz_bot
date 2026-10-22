@@ -31,6 +31,13 @@ _SUBCOMMAND_HELP = (
 #limit                  显示三个值，并标出来自全局覆盖还是默认
 #limit <画面条数> <token> [放下百分比] 写入全局设置；省略百分比则保留原设置
 #limit reset            清掉全局设置，回落到默认"""),
+    ("reflect [HH:MM|off|now]", """查看或设置每晚反思（管理员）。
+
+每晚到点，中心 agent 读上次反思以来的记忆系统日志（data/journal/），评估自己之前的策略改动，必要时改给图书管理员的附加说明或自己的做法笔记；不对外说话。默认 05:00。
+#reflect          显示反思时刻与上次反思时间
+#reflect HH:MM    改成每天这个时刻
+#reflect off      关掉每晚反思
+#reflect now      现在就反思一次（中心 agent 正忙时不执行）"""),
     ("hint [get|set|default]", """查看、编写或开关本窗口的结束提示（管理员）。
 
 格式：#hint | #hint get | #hint set <代码> | #hint set | #hint default [get|set <代码>]
@@ -52,7 +59,7 @@ def requires_op(value: str) -> bool:
     name, _, tail = value.strip().partition(" ")
     return (name == "hint" or name in {"use_model", "add_prompt", "use_setting", "set_setting",
                                        "del_setting"}
-            or name in {"image", "reasoning", "limit"} and bool(tail.strip()))
+            or name in {"image", "reasoning", "limit", "reflect"} and bool(tail.strip()))
 
 
 def _subcommand_help(name: str = "") -> str:
@@ -269,6 +276,21 @@ def _limit_set(tail: str) -> str:
     return "\n".join(f"{name}: {number}" for name, number in written)
 
 
+def _reflect_subcommand(tail: str) -> str:
+    data = storage.get("", "agent")
+    if not tail:
+        last = data.get("reflected_at")
+        shown = datetime.fromtimestamp(last).strftime("%Y-%m-%d %H:%M") if isinstance(last, (int, float)) else "还没有"
+        return f"每晚反思：{_chat_root.agent_setting('reflect_at')}；上次反思：{shown}"
+    if tail == "now":
+        return "开始反思，记录写在 data/journal/" if _chat_root.reflect_now() else "中心 agent 正忙，稍后再试"
+    if tail != "off" and _chat_root.normalize_reflect_at(tail) != tail.zfill(5):
+        return "reflect 参数错误，可用 #help reflect 查看"
+    data["reflect_at"] = _chat_root.normalize_reflect_at(tail)
+    storage.save()
+    return f"每晚反思：{_chat_root.schedule_reflection()}"
+
+
 def _subcommand(value: str):
     # WHY: hint 的源码要求原样取（含缩进与换行），所以先留一份没 strip 的原文。
     raw = value
@@ -395,6 +417,8 @@ def _subcommand(value: str):
         return _limit_report()
     if name == "limit" and tail:
         return _limit_set(tail)
+    if name == "reflect":
+        return _reflect_subcommand(tail.strip())
     if name == "hint":
         return _hint_subcommand(raw)
     return "子命令格式错误，可用 #help 查看"

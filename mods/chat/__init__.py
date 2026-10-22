@@ -98,13 +98,75 @@ def _bounded_int(minimum: int, fallback: int, maximum: int | None = None):
 
 
 # 单值全局 agent 配置：storage 键与归一化。
+# WHY: 每晚反思的默认时刻是 2026-10-22 实现时选的：维护者只说"每天晚上"，这里取多数人
+# 睡着、群里最安静的时候；反思不对外说话，`#reflect HH:MM|off` 可以改。
+DEFAULT_REFLECT_AT = "05:00"
+
+
+def normalize_reflect_at(value) -> str:
+    text = str(value or "").strip().lower()
+    if text == "off":
+        return "off"
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
+    if match and int(match[1]) < 24 and int(match[2]) < 60:
+        return f"{int(match[1]):02d}:{match[2]}"
+    return DEFAULT_REFLECT_AT
+
+
 AGENT_SETTINGS = {
     "image": ("image", normalize_image_mode),
     "reasoning": ("reasoning", normalize_reasoning_mode),
     "max_events": ("max_events", _bounded_int(1, DEFAULT_MAX_EVENTS)),
     "max_token": ("max_token", _bounded_int(1, DEFAULT_MAX_TOKEN)),
     "pressure_percent": ("pressure_percent", _bounded_int(1, _PRESSURE_PERCENT, 100)),
+    "reflect_at": ("reflect_at", normalize_reflect_at),
 }
+
+_REFLECT_JOB = "chat-reflect"
+_REFLECT_RETRIES = 6
+_reflect_stream = log.stream("agent")
+
+
+def schedule_reflection() -> str:
+    """(Re)register the nightly reflection job from the global setting; returns the time or "off"."""
+    from mods import scheduler
+
+    when = agent_setting("reflect_at")
+    try:
+        instance = scheduler.get_scheduler()
+    except RuntimeError:
+        return when
+    if instance.get_job(_REFLECT_JOB) is not None:
+        instance.remove_job(_REFLECT_JOB)
+    if when != "off":
+        hour, minute = when.split(":")
+        instance.add_job(_reflect_job, "cron", hour=int(hour), minute=int(minute), id=_REFLECT_JOB,
+                         coalesce=True, misfire_grace_time=3600)
+    return when
+
+
+def _reflect_job(attempt: int = 0) -> None:
+    from datetime import timedelta
+
+    from mods import scheduler
+
+    try:
+        done = _agent.reflect()
+    except Exception:
+        _reflect_stream.exception("每晚反思失败")
+        return
+    if not done and attempt < _REFLECT_RETRIES:
+        # 中心 agent 正在聊天：过一会儿再试，不打断她。
+        scheduler.get_scheduler().add_job(_reflect_job, "date", args=[attempt + 1],
+                                          run_date=datetime.now() + timedelta(minutes=10))
+
+
+def reflect_now() -> bool:
+    """Start a reflection on its own thread; False when the agent is busy right now."""
+    if context.get_turn(AGENT_WINDOW) is not None:
+        return False
+    threading.Thread(target=_reflect_job, args=[_REFLECT_RETRIES], name="chat-reflect", daemon=True).start()
+    return True
 
 
 def get_prompt() -> list:
@@ -584,7 +646,7 @@ def _subcommand_call(event: dict) -> Callable | None:
     if subcommand not in _subcommands._SUBCOMMAND_NAMES:
         return None
     if _subcommands.requires_op(value[1:]) and not op.require_op(
-            event, pattern=r"^#\s*(hint|use_model|add_prompt|use_setting|set_setting|del_setting|image|reasoning|limit)"):
+            event, pattern=r"^#\s*(hint|use_model|add_prompt|use_setting|set_setting|del_setting|image|reasoning|limit|reflect)"):
         # WHY: 全局设置不可由普通群友改写；只读子命令保持公开。
         return None
     return lambda value=value: _subcommands._subcommand(value[1:])
@@ -748,19 +810,20 @@ def on_load(ctx) -> None:
 
         if not wait_booted(120):
             return
-        if not oplog.has_unnotified():
-            return
-        window = next(iter(oplog.unacknowledged_windows()), None)
-        if window is None:
-            window = next((window for window, _count, active in oplog.pending_summary()
-                           if active and window[0] in ("group", "private")), None)
-        if window is not None:
-            try:
-                _agent._drive_agent(None, window)
-            except Exception:
-                traceback.print_exc()
+        try:
+            _agent.pick_up_pending()
+        except Exception:
+            traceback.print_exc()
 
     threading.Thread(target=resume_pending, name="chat-agent-resume", daemon=True).start()
+
+    def start_reflection_schedule() -> None:
+        from mods import wait_booted
+
+        if wait_booted(120):
+            schedule_reflection()
+
+    threading.Thread(target=start_reflection_schedule, name="chat-reflect-schedule", daemon=True).start()
 from . import view as _view, reader as _reader, agent as _agent, roles as _roles, subcommands as _subcommands
 from .view import has_at, msg_split, msg2chat, event2chat
 from .reader import parse_target, unread_details, prepare_recovery_sources, fetch_remote_source, unread_members, mark_window_read, mark_source_read

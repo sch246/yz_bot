@@ -43,18 +43,37 @@ def pairs(*, ids=None, after: float | None = None) -> list[tuple[dict, dict | No
     return found
 
 
+def _speech(output: dict) -> tuple[str, list[dict]]:
+    """Body and calls of one output.
+
+    WHY: 旧日志翻译过来的输出可能没有 `assistant`，只有 `body` 与 `actions`
+    （name/arguments，没有调用号）；生产日志里两种都有，读回时一并认。
+    """
+    assistant = output.get("assistant")
+    if isinstance(assistant, dict):
+        calls = [{"id": call.get("id"), "name": call.get("function", {}).get("name", "?"),
+                  "arguments": call.get("function", {}).get("arguments", "")}
+                 for call in assistant.get("tool_calls") or []]
+        return str(assistant.get("content") or ""), calls
+    calls = [{"id": None, "name": action.get("name", "?"), "arguments": action.get("arguments", "")}
+             for action in output.get("actions") or []]
+    return str(output.get("body") or ""), calls
+
+
 def render(output: dict, result: dict | None, *, chars: int = 1200) -> str:
     stamp = time.strftime("%m-%d %H:%M:%S", time.localtime(output.get("read_at", 0)))
     lines = [f"[{stamp}] 行动 {output['id']}"]
-    assistant = output.get("assistant") or {}
-    body = assistant.get("content") or ""
-    if isinstance(body, str) and body.strip():
+    body, calls = _speech(output)
+    if body.strip():
         lines.append("    （自语）" + _short(body.strip(), chars))
-    returns = {item.get("tool_call_id"): item for item in (result or {}).get("returns", [])}
-    for call in assistant.get("tool_calls") or []:
-        function = call.get("function", {})
-        lines.append(f"    {function.get('name', '?')}({_short(function.get('arguments', ''), chars)})")
-        answer = returns.get(call.get("id"))
+    returns = (result or {}).get("returns", [])
+    by_id = {item.get("tool_call_id"): item for item in returns if item.get("tool_call_id")}
+    by_position = {item.get("position"): item for item in returns}
+    for position, call in enumerate(calls):
+        lines.append(f"    {call['name']}({_short(call['arguments'], chars)})")
+        answer = by_id.get(call["id"]) if call["id"] else None
+        if answer is None:
+            answer = by_position.get(position)
         if answer is not None:
             lines.append("      → " + _short(answer.get("content", ""), chars))
         elif result is None:
@@ -63,19 +82,16 @@ def render(output: dict, result: dict | None, *, chars: int = 1200) -> str:
 
 
 def title(output: dict) -> str:
-    assistant = output.get("assistant") or {}
     stamp = time.strftime("%m-%d %H:%M", time.localtime(output.get("read_at", 0)))
-    names = [call.get("function", {}).get("name", "?") for call in assistant.get("tool_calls") or []]
-    said = [json.loads(call["function"].get("arguments") or "{}").get("text", "")
-            for call in assistant.get("tool_calls") or []
-            if call.get("function", {}).get("name") == "say"
-            and _parses(call["function"].get("arguments"))]
-    summary = _short(said[0], 40) if said else _short(assistant.get("content") or "", 40)
-    return f"{output['id']} [{stamp}] {','.join(names) or '（无工具）'} {summary}".rstrip()
+    body, calls = _speech(output)
+    said = [parse_arguments(call["arguments"]).get("text", "") for call in calls if call["name"] == "say"]
+    summary = _short(str(said[0]), 40) if said else _short(body, 40)
+    return f"{output['id']} [{stamp}] {','.join(call['name'] for call in calls) or '（无工具）'} {summary}".rstrip()
 
 
-def _parses(arguments) -> bool:
+def parse_arguments(arguments) -> dict:
     try:
-        return isinstance(json.loads(arguments or "{}"), dict)
+        value = json.loads(arguments or "{}")
     except (TypeError, ValueError):
-        return False
+        return {}
+    return value if isinstance(value, dict) else {}

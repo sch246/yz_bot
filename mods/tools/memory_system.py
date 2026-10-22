@@ -1,0 +1,122 @@
+"""你的记忆系统怎么运作、怎么观察、怎么改：每晚反思和排查"我为什么忘了"时加载。
+
+## 你的上下文从哪来
+
+每次被叫醒，上下文都重新组装，不重放上一次的对话：
+
+1. 系统提示和当前工具状态。
+2. 笔记：global（你的做法）、recent（短期记忆）、叫醒你的窗口对应的群或人的笔记、叫你的人的笔记。
+3. "可以召回的东西"目录：其它最近有消息的窗口、笔记目录、最近的行动标题。
+4. 本次唤醒里已经做过的行动（被放下的只剩标题）。
+5. 叫醒你的窗口画面：chatlog 原文，默认最多 80 条，上次看到的位置之后标出新消息。
+6. 末尾：待办、其它窗口的未读数、当前时间。
+
+别的都要你自己召回：`read_log`、`search_log`、`read_actions`、`read_note`。
+
+## 谁在放下
+
+图书管理员（另一个模型）在每次唤醒结束后、以及一次唤醒里上下文太长时，读你看过的画面和做过的行动，改写 `data/notes/` 下的笔记：global 和 recent 要短；人和群的笔记分"认识"和"经历"两段，经历带日期和出处。每次改写前旧版本备份在 `data/notes/.history/`。
+
+## 怎么观察
+
+`data/journal/YYYY-MM-DD.log` 是记忆系统的日志，`read_journal` 读它：
+
+- 每次唤醒一条：叫醒你的是谁、组装了什么（笔记、画面、多少 token）、你召回了什么、说了几次话、有没有放下。
+- 每次图书管理员整理一条：改了哪份笔记、具体改了哪些行。
+- 每次策略改动一条。
+- 带 `⚠` 的是值得看的信号：去聊天记录里找的东西其实笔记里已经有、找了没找到、刚放下的行动又被读回来、画面里有人说你忘了、笔记超长。信号只是线索，要读原文确认。
+
+## 你能改什么
+
+| 层 | 改什么 | 怎么改 |
+|---|---|---|
+| 策略 | 给图书管理员的附加说明（`librarian`）、你的做法（`global` 笔记） | `edit_policy`，必须写原因和预期 |
+| 提案 | 醒来时带什么、画面多少条、阈值、代码 | `edit_policy("proposals", …)` 写给维护者，由维护者动手 |
+| 评估 | 之前的改动有没有用 | `assess_change` 记一条结论 |
+
+改动都记在 `changes`，旧版本都有备份，改错了可以改回去。
+
+## 反思的做法
+
+1. 先评估：看 `changes` 里还没评估的改动，对照它之后的日志，问题少了吗？用 `assess_change` 写结论；没用的改回去。
+2. 再找失败：从 `⚠` 和被人指出忘了的地方出发，用 `read_log`、`read_actions` 看原文，弄清是没记下、记下了没想起来、还是放下太早。
+3. 一次最多改一两处，写清原因和预期，下次反思才能判断它有没有用。
+4. 没发现问题就什么都不改。为了改而改，只会让笔记越来越长。
+"""
+
+import time
+
+
+def read_journal(day: str = "", count: int = 0, keyword: str = "") -> str:
+    """读记忆系统日志：每次唤醒、每次整理、每次策略改动各一条。
+
+    @param
+    day: 日期 YYYY-MM-DD；留空是今天
+    count: 只取最后几条；0 表示全部
+    keyword: 只取含这个词的记录，比如 ⚠
+    """
+    from mods.chat import journal
+
+    day = day.strip() or time.strftime("%Y-%m-%d")
+    found = journal.records(day)
+    if keyword:
+        found = [record for record in found if keyword in record]
+    if count > 0:
+        found = found[-count:]
+    if found:
+        return f"# {day}\n" + "\n".join(found)
+    known = journal.days()
+    return f"（{day} 没有记录；有记录的日期：{'、'.join(known[-10:]) or '无'}）"
+
+
+def read_policy(name: str) -> str:
+    """读一份策略文件全文。
+
+    @param
+    name: librarian（给图书管理员的附加说明）、changes（改动与评估记录）、proposals（给维护者的提案）
+    """
+    from mods.chat import notes
+
+    return notes.read_policy(name) or f"（{name} 还是空的）"
+
+
+def edit_policy(name: str, text: str, reason: str, expect: str) -> str:
+    """用新全文替换一份策略文件，并把原因和预期记进 changes。
+
+    @param
+    name: librarian、global（你的做法笔记）或 proposals
+    text: 更新后的完整内容；空串表示清空
+    reason: 看到了什么问题才改（写日志里的日期时间或行动号）
+    expect: 改完之后预期会看到什么变化，下次反思用来判断有没有用
+    """
+    from mods.chat import journal, notes
+
+    if name not in ("librarian", "global", "proposals"):
+        return "只能改 librarian、global 或 proposals；changes 用 assess_change 追加"
+    if not reason.strip() or not expect.strip():
+        return "reason 和 expect 都要写：说不清为什么改、期待什么，就先别改"
+    previous = notes.write("global", text) if name == "global" else notes.write_policy(name, text)
+    stamp = time.strftime("%Y-%m-%d %H:%M")
+    notes.append_policy("changes", f"- {stamp} 改 {name}：原因：{reason.strip()}；预期：{expect.strip()}")
+    journal.append(f"改策略 {name}", [f"原因：{reason.strip()}", f"预期：{expect.strip()}",
+                                          *journal.diff(previous, text)])
+    return f"已改 {name}，并记进 changes"
+
+
+def assess_change(text: str) -> str:
+    """给之前的一次策略改动记评估结论，追加到 changes。
+
+    @param
+    text: 评估哪次改动（写它的日期时间）、依据是什么、结论是保留还是改回
+    """
+    from mods.chat import journal, notes
+
+    if not text.strip():
+        return "评估内容不能为空"
+    stamp = time.strftime("%Y-%m-%d %H:%M")
+    notes.append_policy("changes", f"- {stamp} 评估：{text.strip()}")
+    journal.append("评估策略改动", [text.strip()])
+    return "已记进 changes"
+
+
+__all__ = ["read_journal", "read_policy", "edit_policy", "assess_change"]

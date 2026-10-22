@@ -15,7 +15,7 @@
 
 群内其它成员之间的戳一戳不会单独触发 LLM，但 chatlog 会记下它，之后出现在该群的窗口画面里。因此“能被模型看见”与“立即触发模型”是两个不同边界。
 
-中心设置命令直接使用 `#` 前缀，没有 `#agent` 层：`#model`、`#models`、`#prompt`、`#setting`、无参 `#image`、`#reasoning`、`#limit` 和 `#help` 可查看；`#use_model`、`#add_prompt`、`#use_setting`、`#set_setting`、`#del_setting`、带参数的 `#image`／`#reasoning`／`#limit` 修改全局设置，要求 op。`#add_prompt` 只接收显式列表。`#hint` 不属于这些全局聊天设置：它由 op 管理，可覆盖本窗口或全局默认，并在最初触发窗口的聊天循环停下时向 QQ 发送状态。
+中心设置命令直接使用 `#` 前缀，没有 `#agent` 层：`#model`、`#models`、`#prompt`、`#setting`、无参 `#image`、`#reasoning`、`#limit` 和 `#help` 可查看；`#use_model`、`#add_prompt`、`#use_setting`、`#set_setting`、`#del_setting`、带参数的 `#image`／`#reasoning`／`#limit`／`#reflect` 修改全局设置，要求 op；无参 `#reflect` 可查看。`#add_prompt` 只接收显式列表。`#hint` 不属于这些全局聊天设置：它由 op 管理，可覆盖本窗口或全局默认，并在最初触发窗口的聊天循环停下时向 QQ 发送状态。
 
 每次中心请求都会新建一个 `Chat` 对象，但共享进程级 `LLMClient`、供应商客户端和 storage。中心 agent 不保留跨唤醒的对话：每次被叫醒都从 chatlog、oplog 行动记录、笔记与待办重新组装上下文。chatlog 保存原始聊天档案，`oplog` 登记窗口到达、唤醒与模型的输出和结果。因此：
 
@@ -33,6 +33,9 @@
 4. **行动记录**（`chat.actions`）：oplog 的输出与结果渲染成和 chatlog 同形的记录：顶格一行时间与行动号，缩进的「（自语）」正文、工具调用与结果。本次唤醒的行动在重组后：已被图书管理员放下的只列标题；其余最近 12 条附原文（每项截到 1500 字），更早的只列标题。
 5. **一次唤醒之内**：原生 assistant/tool 配对（含思考）照常累积在 `Chat.messages`，唤醒结束即丢弃。每个工具批次结束时估算 `Chat.messages` 的文本 token；超过 `max_token × pressure_percent / 100` 且本轮新增超过阈值的三分之一时，`turn_done` 正常结束本轮并设置放下，`_drive_agent` 同步跑一次图书管理员（`phase="release"`，提示它把接下来还要用到的结论和出处写进 recent），再不等新唤醒立即重新组装。只看本轮新增，是为了开局材料本身就大时不空转。
 6. **图书管理员**（`chat.roles.organize`）：唤醒结束后，后台线程用 `agent.librarian_model`（默认 `deepseek/deepseek-flash`，配置里没有该供应商时退回主模型）读这次的画面、尚未放下的行动、recent 与相关范围的现有笔记，用 `write_note(scope, text)` 改写或删除笔记，也能用 `read_note`／`read_log`／`search_log`／`read_actions` 读原文（总共 12 次工具调用）。范围是 global（做法）、recent（短期记忆，不超过二十行，每次改写成当前的样子）、`person:<QQ号>`、`group:<群号>`（"认识"与"经历"两段）；私聊窗口对应这个人的笔记。后台收尾与唤醒中途的放下串行执行。笔记在 `data/notes/`，改写和删除前把旧文件复制到 `.history/`。
+
+7. **记忆系统日志**（`chat.journal`）：`data/journal/YYYY-MM-DD.log`，格式同 chatlog。`agent._write_journal` 在每次唤醒结束时写一条：叫醒行、每次组装（醒来／续做／放下后：笔记 scope 与字数、各窗口画面条数与新消息数、约多少 token）、每个召回工具调用（参数与"多少字／没有找到"）、各目标说话次数（没开口也记）、其它工具次数、最高 token。`⚠` 信号由代码判断：`search_log` 没找到；`search_log` 的关键词在某份笔记里已经有；`read_actions` 读回了本次唤醒已放下的行动；画面正文里出现"忘了""说过了"等说法；图书管理员写出的 recent 超过 20 行或 global 超过 40 行。图书管理员每次整理写一条（放下或收尾，改了哪份笔记，`difflib` 逐行差异，最多 40 行）；`memory_system` 的策略改动和评估也各写一条。
+8. **每晚反思**（`chat.agent.reflect`）：`chat.schedule_reflection` 按 `reflect_at` 在全局 APScheduler 上登记 `chat-reflect` cron 任务（启动后由 `chat-reflect-schedule` 线程等 boot 完成再登记，`#reflect HH:MM|off` 重新登记）。到点时若 `AGENT_WINDOW` 被占，10 分钟后重试，最多 6 次。反思占住 `AGENT_WINDOW`，材料是 global 与 recent 笔记、`journal.since(agent.reflected_at)`（上次反思以来的日志，超过 24000 字时较早的记录只留标题行和 `⚠` 行）、`changes` 最近 40 行与 `proposals` 最近 20 行，以及一段反思说明；会话照常走 `_activate_chat`，并加载 `memory_system`。上下文超过 `max_token` 就结束。日志里没有新记录时跳过模型调用。反思的输出与结果照常记进 oplog，但不交给图书管理员；结束后 `agent.pick_up_pending` 接上反思期间登记的召唤。
 
 窗口第一次有输出时确认这次的通知，记下画面中每个窗口的看到时间，并调用 `reader.mark_window_read` 把未读登记标为已读。
 
@@ -179,10 +182,10 @@ hint 与追加式上下文是两层，判据是一句话：**频繁变化、且�
 
 ### 中心设置与旧窗口配置
 
-`image`（图片档位）、`reasoning`、`max_events`、`max_token`、`pressure_percent` 共用 `mods.chat.AGENT_SETTINGS` 的全局归一化规则。中心主会话只读全局 `agent` storage；op 用 `#use_model`、`#image`、`#reasoning`、`#limit` 等命令修改它。旧窗口聊天配置不自动迁移，也不再读取；`#hint` 的窗口配置是独立例外。
+`image`（图片档位）、`reasoning`、`max_events`、`max_token`、`pressure_percent`、`reflect_at` 共用 `mods.chat.AGENT_SETTINGS` 的全局归一化规则。中心主会话只读全局 `agent` storage；op 用 `#use_model`、`#image`、`#reasoning`、`#limit` 等命令修改它。旧窗口聊天配置不自动迁移，也不再读取；`#hint` 的窗口配置是独立例外。
 
 - **缺省值写死在代码里**（`DEFAULT_MAX_EVENTS` / `DEFAULT_MAX_TOKEN` 与各归一化函数的兜底分支），不再读 `llm_system/config.json`。中心运行期覆盖只有全局 `agent` storage 一份；`#limit` 是唯一预算命令入口。
-- **三个预算**：`max_events`（默认 80）是窗口画面的默认条数；`max_token`（默认 40000）乘 `pressure_percent`（默认 75%）是一次唤醒内触发放下的上下文大小。存储键沿用旧名。旧窗口覆盖不自动迁入全局主体。`agent.librarian_model` 可选，缺省用便宜模型。
+- **三个预算**：`max_events`（默认 80）是窗口画面的默认条数；`max_token`（默认 40000）乘 `pressure_percent`（默认 75%）是一次唤醒内触发放下的上下文大小。存储键沿用旧名。旧窗口覆盖不自动迁入全局主体。`agent.librarian_model` 可选，缺省用便宜模型。`reflect_at`（默认 `05:00`，`off` 关闭）是每晚反思的时刻，`agent.reflected_at` 记上次反思的时间。
 - **`hint` 与 `prompt` 不在表里**：窗口结束提示的 `#hint` 独立合并全局默认与窗口覆盖；中心提示词从全局 `agent.prompt` 选择内置设置或显式列表。它们不是单值档位，不使用 `AGENT_SETTINGS` 的归一化。
 - 已退役的窗口聊天设置仍可能留在生产 storage，但运行代码不再读取；其清理需先获维护者授权，见[第二轮调查](working/round2-legacy-and-backfill-audit.md)。
 

@@ -17,7 +17,7 @@ import time
 from mods import context, image, llm, oplog, storage
 
 import mods.chat as _chat_root
-from . import actions as _actions, notes as _notes, reader as _reader, roles as _roles, screen as _screen, view as _view
+from . import actions as _actions, journal as _journal, notes as _notes, reader as _reader, roles as _roles, screen as _screen, view as _view
 
 _SEEN_KEY = "seen"
 # Within one activation, results older than these stay readable by id only.
@@ -88,11 +88,13 @@ def _current_actions(turn) -> list[str]:
     return lines
 
 
-def _assemble(plan: dict, turn, woken: list[tuple]) -> tuple[list[dict], dict[str, str], dict[tuple, int | None]]:
+def _assemble(plan: dict, turn, woken: list[tuple]) -> tuple[list[dict], dict[str, str], dict[tuple, int | None], list[str]]:
     """Build the request body; nothing from earlier requests is replayed."""
     seen = _seen()
     messages: list[dict] = []
     note_parts = [text for scope in plan["notes"] if (text := _notes.render(scope))]
+    summary = ["笔记 " + ("、".join(f"{part.split(chr(10), 1)[0].removeprefix('## 笔记 ')}({len(part)}字)"
+                                   for part in note_parts) or "（无）")]
     if note_parts:
         messages.append({"role": "user", "content": "以下是你的笔记（图书管理员整理，可能不完整）：\n\n"
                          + "\n\n".join(note_parts)})
@@ -116,9 +118,10 @@ def _assemble(plan: dict, turn, woken: list[tuple]) -> tuple[list[dict], dict[st
             continue
         text = _screen.render(window, shown, mark)
         screens[_screen.label(window)] = text
+        summary.append(f"画面 {_screen.label(window)} {len(shown)} 条（新 {len(fresh) if mark is not None else len(shown)} 条）")
         newest[window] = _screen.latest_time(shown)
         messages.append({"role": "user", "content": _view.msg_split(text)})
-    return messages, screens, newest
+    return messages, screens, newest, summary
 
 
 def _unread_hint(on_screen: set[tuple]) -> str:
@@ -152,6 +155,7 @@ def _job(turn, phase: str) -> dict:
     return {
         "time": time.time(),
         "phase": phase,
+        "wake": _screen.clock(turn.log["start"]),
         "screens": list(turn.screens.values()),
         "actions": [_actions.title(output) for output, _result in found[:turn.released]]
                    + [_actions.render(output, result) for output, result in found[turn.released:]],
@@ -160,18 +164,86 @@ def _job(turn, phase: str) -> dict:
     }
 
 
-def _drive_agent(model: str | None, window: tuple) -> None:
-    turn, owner = context.begin_turn(_chat_root.AGENT_WINDOW)
-    if not owner:
-        return
+_RECALL = ("read_log", "search_log", "read_actions", "read_note")
+
+
+def _begin(turn, window: tuple | None, kind: str) -> None:
     turn._chat_usage_tokens = 0
     turn.requested_reads = []
-    turn.associated_windows = {window}
+    turn.associated_windows = {window} if window is not None else set()
     turn.action_ids = []
     turn.screens = {}
     turn.authors = []
     turn.release = False
     turn.released = 0
+    turn.log = {"kind": kind, "start": time.time(), "lines": [], "warnings": [], "peak": 0,
+                "assemblies": 0, "said": {}, "other": {}}
+
+
+def _note_results(turn, results) -> None:
+    """Journal lines for one result batch: what she recalled, said and used."""
+    log = turn.log
+    released = set(turn.action_ids[:turn.released])
+    for result in results:
+        name = result.name.rsplit("__", 1)[-1]
+        arguments = _actions.parse_arguments(result.arguments)
+        content = str(result.content)
+        if name == "say":
+            target = str(arguments.get("target", "?"))
+            log["said"][target] = log["said"].get(target, 0) + 1
+            continue
+        if name not in _RECALL:
+            log["other"][name] = log["other"].get(name, 0) + 1
+            continue
+        shown = json.dumps(arguments, ensure_ascii=False)
+        outcome = "没有找到" if content.startswith("（没有") else f"{len(content)} 字"
+        log["lines"].append(f"召回：{name}({shown[:160]}) → {outcome}")
+        if name == "search_log":
+            keyword = str(arguments.get("keyword", "")).strip()
+            if outcome == "没有找到":
+                log["warnings"].append(f"⚠ search_log 没找到：{keyword}")
+            holders = [scope for scope in ["global", "recent", *(item["scope"] for item in _notes.listing())]
+                       if keyword and keyword.casefold() in _notes.read(scope).casefold()]
+            if holders:
+                log["warnings"].append(f"⚠ 去聊天记录里找的「{keyword}」，笔记 {'、'.join(dict.fromkeys(holders))} 里已经有")
+        if name == "read_actions":
+            again = released & set(arguments.get("ids") or [])
+            if again:
+                log["warnings"].append(f"⚠ 读回了刚放下的行动 {'、'.join(sorted(again))}：放下太早，或结论没写够")
+
+
+def _write_journal(turn, cancelled: bool) -> None:
+    try:
+        _compose_journal(turn, cancelled)
+    except Exception:
+        _roles._stream.exception("唤醒记录写入失败")
+
+
+def _compose_journal(turn, cancelled: bool) -> None:
+    log = turn.log
+    if not log["assemblies"] and not turn.action_ids and not log["lines"]:
+        return
+    ids = turn.action_ids
+    head = f"{log['kind']} {_screen.clock(log['start'])[11:]} 起" + (
+        f"（行动 {ids[0]} 至 {ids[-1]}，共 {len(ids)} 次）" if ids else "（没有行动）")
+    body = list(log["lines"])
+    if log["said"]:
+        body.append("说话：" + "；".join(f"{target} {count} 次" for target, count in log["said"].items()))
+    elif log["kind"] == "唤醒":
+        body.append("说话：没有开口")
+    if log["other"]:
+        body.append("其它工具：" + "、".join(f"{name}×{count}" for name, count in log["other"].items()))
+    body.append(f"结束：最高约 {log['peak']} token" + ("；被取消" if cancelled else ""))
+    body.extend(f"⚠ 画面里可能有人在说她忘了：{line}" for line in _journal.forgot_lines(list(turn.screens.values())))
+    body.extend(dict.fromkeys(log["warnings"]))
+    _journal.append(head, body)
+
+
+def _drive_agent(model: str | None, window: tuple) -> None:
+    turn, owner = context.begin_turn(_chat_root.AGENT_WINDOW)
+    if not owner:
+        return
+    _begin(turn, window, "唤醒")
     # WHY: 一次对话 = 这次持有的全过程（多轮 + 插话续写，直到 finally），图片检查台账就
     # 活在这段里：同一张图不重复下载/解析，对话结束即清掉，下次再聊重新检查一遍。
     image_ledger = image.begin_conversation()
@@ -192,11 +264,13 @@ def _drive_agent(model: str | None, window: tuple) -> None:
                 # 同一次唤醒里上下文涨过阈值：先让图书管理员把已做的事放下（写进短期记忆），
                 # 再重新组装接着干，不等新消息。
                 turn.release = False
+                turn.log["lines"].append(f"放下：上下文约 {turn._chat_usage_tokens} token，请图书管理员整理")
                 try:
                     _roles.organize(_job(turn, "release"))
                 except Exception:
                     # 放下失败也照样重组：行动仍按"最近原文、较早标题"出现，只是没有新结论。
                     _roles._stream.exception("唤醒中途的放下失败")
+                    turn.log["warnings"].append("⚠ 唤醒中途的放下失败，见终端日志")
                 else:
                     turn.released = len(turn.action_ids)
                 continue
@@ -207,7 +281,10 @@ def _drive_agent(model: str | None, window: tuple) -> None:
     finally:
         image.end_conversation(image_ledger)
         context.end_turn(_chat_root.AGENT_WINDOW, turn)
-        if not turn.cancelled and (turn.screens or turn.action_ids) and _chat_root._offline_scope.get() is None:
+        offline = _chat_root._offline_scope.get() is not None
+        if not offline:
+            _write_journal(turn, turn.cancelled)
+        if not turn.cancelled and (turn.screens or turn.action_ids) and not offline:
             _roles.enqueue(_job(turn, "end"))
         # WHY: 循环停下的唯一信号就在这里，见 _run_hint。
         if origin is not None:
@@ -217,9 +294,6 @@ def _drive_agent(model: str | None, window: tuple) -> None:
 def _run_agent(model: str | None, turn) -> bool:
     if _chat_root._offline_scope.get() is not None:
         raise RuntimeError("离线回放尚未按无状态主循环重写")
-    session = llm.Chat(model=model or _chat_root.get_model(), chat_client=llm.get_client())
-    session.requested_reads = turn.requested_reads
-    session.associated_windows = turn.associated_windows
     max_events, max_tokens = _chat_root.limit()
     turn._chat_limit = (max_events, max_tokens)
     notice = oplog.deliver_notifications(_chat_root.AGENT_WINDOW)
@@ -229,12 +303,44 @@ def _run_agent(model: str | None, turn) -> bool:
     focus = woken or [_reader.parse_target(label) for label in turn.screens]
     if notice is None and not focus and not turn.action_ids:
         return True
-    messages, screens, newest = _assemble(_plan(focus, turn.authors, max_events), turn, focus)
+    reason = "醒来" if not turn.log["assemblies"] else "放下后" if turn.released else "续做"
+    messages, screens, newest, summary = _assemble(_plan(focus, turn.authors, max_events), turn, focus)
     if not messages and notice is None:
         return True
     if notice is not None:
         messages.append({"role": "user", "content": "这次唤醒你的是：\n" + "\n".join(activation_lines)})
+        turn.log["lines"].extend("叫醒：" + line for line in activation_lines)
+    threshold = max_tokens * _chat_root.agent_setting("pressure_percent") // 100
+
+    def first_output() -> None:
+        if notice is not None:
+            oplog.acknowledge_notification(notice["id"])
+        _mark_seen(newest)
+        turn.screens.update(screens)
+
+    def over_budget(used: int, initial: int) -> bool:
+        # WHY: 不是"到 N 轮就截断"（见 llm.chat 的 WHY）：截下来的行动已经写进 oplog，
+        # 重新组装时最近的行动原文仍在，较早的留标题、可按号读回；前提没有被砍掉，只是收起了。
+        # 只算这次唤醒里长出来的部分：开局材料本身就大时，放下也不会变小，不能因此空转。
+        if used > threshold and used - initial > threshold // 3:
+            turn.release = True
+            return True
+        return False
+
+    return _run_session(model, turn, messages, first_output, over_budget,
+                        hints=[lambda: _unread_hint(set(newest))],
+                        assembly=f"组装 {turn.log['assemblies'] + 1}（{reason}）", summary=summary)
+
+
+def _run_session(model: str | None, turn, messages: list[dict], first_output, stop_when,
+                 *, hints=(), assembly: str, summary: list[str], load: tuple[str, ...] = ()) -> bool:
+    """One model session over freshly assembled messages; every output and result goes to the oplog."""
+    session = llm.Chat(model=model or _chat_root.get_model(), chat_client=llm.get_client())
+    session.requested_reads = turn.requested_reads
+    session.associated_windows = turn.associated_windows
     binding = _chat_root._activate_chat(session, messages)
+    if load:
+        binding.load(list(load))
     # WHY: 已加载模块的正文（Skill）以前只在加载那一刻进经历、靠重放留在眼前；现在每次
     # 重建都给出完整工具状态，放在系统提示之后，跨唤醒不变的部分仍能命中前缀缓存。
     binding.sync_registry()
@@ -259,15 +365,15 @@ def _run_agent(model: str | None, turn) -> bool:
     session.keep_reasoning = True
     session.output_recorded = False
     initial = _text_tokens(session.messages)
+    turn.log["assemblies"] += 1
+    turn.log["peak"] = max(turn.log["peak"], initial)
+    turn.log["lines"].append(f"{assembly}：约 {initial} token；" + "；".join(summary))
 
     def record_output(assistant, calls):
         source = oplog.output(_chat_root.AGENT_WINDOW, assistant, calls)
         turn.action_ids.append(source)
         if not session.output_recorded:
-            if notice is not None:
-                oplog.acknowledge_notification(notice["id"])
-            _mark_seen(newest)
-            turn.screens.update(screens)
+            first_output()
         session.output_recorded = True
         return source
 
@@ -279,25 +385,106 @@ def _run_agent(model: str | None, turn) -> bool:
                 {"position": position, "name": result.name, "arguments": result.arguments,
                  "content": result.content, "tool_call_id": result.tool_call_id}
                 for position, result in enumerate(results)], "")
+            try:
+                _note_results(turn, results)
+            except Exception:
+                # 日志只是观察；它出错不能打断她正在做的事。
+                _roles._stream.exception("唤醒记录整理失败")
 
-    def over_budget() -> bool:
-        # WHY: 不是"到 N 轮就截断"（见 llm.chat 的 WHY）：截下来的行动已经写进 oplog，
-        # 重新组装时最近的行动原文仍在，较早的留标题、可按号读回；前提没有被砍掉，只是收起了。
-        # 只算这次唤醒里长出来的部分：开局材料本身就大时，放下也不会变小，不能因此空转。
+    def turn_done() -> bool:
         used = _text_tokens(session.messages)
         turn._chat_usage_tokens = used
-        threshold = max_tokens * _chat_root.agent_setting("pressure_percent") // 100
-        if used > threshold and used - initial > threshold // 3:
-            turn.release = True
-            return True
-        return False
+        turn.log["peak"] = max(turn.log["peak"], used)
+        return stop_when(used, initial)
 
     session.on_output = record_output
     session.on_results = record_results
-    session.turn_done = over_budget
+    session.turn_done = turn_done
     session.add_context_provider(tool_changes)
-    session.add_hint(lambda: _unread_hint(set(newest)))
+    for hint in hints:
+        session.add_hint(hint)
     session.add_hint(lambda: f"现在是 {_screen.clock()}。")
     session.should_stop = lambda: turn.cancelled
     session.chat(recall_func=_chat_root.get_handler(session), description_cache=_chat_root.description_cache)
     return session.output_recorded
+
+
+_REFLECT_CHARS = 24000
+_REFLECT_PROMPT = """现在是每晚反思的时间（{now}）。没有人叫你，这次不要对外说话。
+
+上面是上次反思以来的记忆系统日志、你的策略改动记录和给维护者的提案。memory_system 已经加载，它的说明里有你的上下文怎么来、你能改什么。
+
+1. 先评估：changes 里还没有评估结论的改动，对照它之后的日志，问题少了吗？用 assess_change 写下结论；没用的就用 edit_policy 改回去。
+2. 再找失败：从带 ⚠ 的行和被人指出忘了的地方出发，需要时用 read_log、read_actions、read_journal 看原文，弄清是没记下、记下了没想起来、还是放下太早。
+3. 一次最多改一两处：edit_policy 改给图书管理员的附加说明或你的做法（global），写明原因和预期；醒来时带什么、阈值或代码要改，写进 proposals 交给维护者。
+4. 没发现值得改的就什么都不改，直接结束。"""
+
+
+def _tail(text: str, lines: int) -> str:
+    return "\n".join(text.strip().split("\n")[-lines:]) if text.strip() else ""
+
+
+def reflect(model: str | None = None) -> bool:
+    """The nightly look back over how memory ran.  False means the agent was busy; try later.
+
+    WHY: 维护者 2026-10-22：她要像人调试她那样调试自己，每晚观察记忆系统运行得怎么样。
+    这里只准备材料并给她 memory_system；看什么、改不改由她决定。占住 AGENT_WINDOW，
+    反思期间来的召唤照常登记，结束后由 pick_up_pending 接上。
+    """
+    if _chat_root._offline_scope.get() is not None:
+        raise RuntimeError("离线回放尚未按无状态主循环重写")
+    turn, owner = context.begin_turn(_chat_root.AGENT_WINDOW)
+    if not owner:
+        return False
+    _begin(turn, None, "反思")
+    data = storage.get("", "agent")
+    last = data.get("reflected_at")
+    image_ledger = image.begin_conversation()
+    try:
+        material = _journal.since(last if isinstance(last, (int, float)) else None, _REFLECT_CHARS)
+        if not material.strip():
+            turn.log["lines"].append("上次反思以来没有新的记录，跳过")
+        else:
+            context.set_current(None)
+            context.set_agent_mode(True)
+            try:
+                _run_reflection(model, turn, material)
+            finally:
+                context.set_agent_mode(False)
+        data["reflected_at"] = turn.log["start"]
+        storage.save()
+    finally:
+        image.end_conversation(image_ledger)
+        context.end_turn(_chat_root.AGENT_WINDOW, turn)
+        _write_journal(turn, turn.cancelled)
+    pick_up_pending()
+    return True
+
+
+def _run_reflection(model: str | None, turn, material: str) -> None:
+    _max_events, max_tokens = _chat_root.limit()
+    notes = [text for scope in ("global", "recent") if (text := _notes.render(scope))]
+    changes = _tail(_notes.read_policy("changes"), 40)
+    proposals = _tail(_notes.read_policy("proposals"), 20)
+    messages = [
+        {"role": "user", "content": "以下是你的笔记：\n\n" + ("\n\n".join(notes) or "（还没有）")},
+        {"role": "user", "content": "## 上次反思以来的记忆系统日志\n" + material},
+        {"role": "user", "content": "## 策略改动记录（changes，最近的）\n" + (changes or "（还没有）")
+         + "\n\n## 给维护者的提案（proposals，最近的）\n" + (proposals or "（还没有）")},
+        {"role": "user", "content": _REFLECT_PROMPT.format(now=_screen.clock())},
+    ]
+    _run_session(model, turn, messages, lambda: None, lambda used, _initial: used > max_tokens,
+                 assembly="组装（反思）", summary=[f"日志 {len(material)} 字", f"改动记录 {len(changes)} 字"],
+                 load=("memory_system",))
+
+
+def pick_up_pending() -> None:
+    """Start a wake for calls that arrived while nobody was there to take them."""
+    if not oplog.has_unnotified():
+        return
+    window = next(iter(oplog.unacknowledged_windows()), None)
+    if window is None:
+        window = next((window for window, _count, active in oplog.pending_summary()
+                       if active and window[0] in ("group", "private")), None)
+    if window is not None:
+        _drive_agent(None, window)

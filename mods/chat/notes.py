@@ -23,7 +23,7 @@ from mods import storage
 
 
 ROOT = Path("data") / "notes"
-_lock = threading.Lock()
+_lock = threading.RLock()
 _SCOPE = re.compile(r"^(global|recent|person:\d+|group:\d+)$")
 
 
@@ -66,23 +66,59 @@ def _backup(path: Path) -> None:
     if not path.is_file():
         return
     relative = path.relative_to(ROOT)
-    target = ROOT / ".history" / relative.parent / f"{relative.stem}.{time.strftime('%Y%m%d-%H%M%S')}.md"
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    target = ROOT / ".history" / relative.parent / f"{relative.stem}.{stamp}.md"
+    number = 1
+    while target.exists():
+        number += 1
+        target = target.with_name(f"{relative.stem}.{stamp}-{number}.md")
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(path.read_bytes())
 
 
-def write(scope: str, text: str) -> None:
-    path = _path(scope)
+def _replace(path: Path, text: str) -> str:
+    """Back up, then write or delete one file; returns the text it replaced."""
     with _lock:
+        previous = path.read_text(encoding="utf-8") if path.is_file() else ""
         _backup(path)
         if not text.strip():
             if path.is_file():
                 path.unlink()
-            return
+            return previous
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(".md.tmp")
         temporary.write_text(text.strip() + "\n", encoding="utf-8")
         os.replace(temporary, path)
+        return previous
+
+
+def write(scope: str, text: str) -> str:
+    return _replace(_path(scope), text)
+
+
+# WHY: 策略文件是她在反思里能改的那一层（2026-10-22）：librarian 是给图书管理员的附加说明，
+# changes 是每次改动的原因、预期和事后评估，proposals 是要维护者动手的改动（代码、醒来时带什么）。
+POLICIES = ("librarian", "changes", "proposals")
+
+
+def _policy_path(name: str) -> Path:
+    if name not in POLICIES:
+        raise ValueError("策略文件只有 " + "、".join(POLICIES))
+    return ROOT / "policy" / f"{name}.md"
+
+
+def read_policy(name: str) -> str:
+    path = _policy_path(name)
+    return path.read_text(encoding="utf-8") if path.is_file() else ""
+
+
+def write_policy(name: str, text: str) -> str:
+    return _replace(_policy_path(name), text)
+
+
+def append_policy(name: str, line: str) -> None:
+    with _lock:
+        write_policy(name, (read_policy(name).rstrip() + "\n" + line).strip())
 
 
 def listing(limit: int = 60) -> list[dict]:
