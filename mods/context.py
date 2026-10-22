@@ -97,11 +97,6 @@ def register_waiter(key: tuple[Any, Any], waiter: Any) -> Any:
     return waiter
 
 
-def get_waiter(key: tuple[Any, Any]) -> Any | None:
-    with _lock:
-        return _waiters.get(key)
-
-
 def pop_waiter(key: tuple[Any, Any]) -> Any | None:
     with _lock:
         return _waiters.pop(key, None)
@@ -183,7 +178,6 @@ class WindowTurn:
 
 
 _turns: dict[Any, WindowTurn] = {}
-_turn_finished = threading.Condition(_lock)
 
 
 def begin_turn(key: Any) -> tuple[WindowTurn, bool]:
@@ -211,14 +205,6 @@ def end_turn(key: Any, turn: WindowTurn) -> None:
     with _lock:
         if _turns.get(key) is turn:
             del _turns[key]
-            _turn_finished.notify_all()
-
-
-def wait_turn_end(key: Any) -> None:
-    """Wait for an existing reader to release its turn before a recovery wake."""
-    with _turn_finished:
-        while key in _turns:
-            _turn_finished.wait()
 
 
 def finish_turn(key: Any, turn: WindowTurn, has_work: Callable[[], bool] | None = None) -> bool:
@@ -228,7 +214,6 @@ def finish_turn(key: Any, turn: WindowTurn, has_work: Callable[[], bool] | None 
             return True
         if _turns.get(key) is turn:
             del _turns[key]
-            _turn_finished.notify_all()
         return False
 
 

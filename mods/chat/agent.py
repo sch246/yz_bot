@@ -281,10 +281,8 @@ def _drive_agent(model: str | None, window: tuple) -> None:
     finally:
         image.end_conversation(image_ledger)
         context.end_turn(_chat_root.AGENT_WINDOW, turn)
-        offline = _chat_root._offline_scope.get() is not None
-        if not offline:
-            _write_journal(turn, turn.cancelled)
-        if not turn.cancelled and (turn.screens or turn.action_ids) and not offline:
+        _write_journal(turn, turn.cancelled)
+        if not turn.cancelled and (turn.screens or turn.action_ids):
             _roles.enqueue(_job(turn, "end"))
         # WHY: 循环停下的唯一信号就在这里，见 _run_hint。
         if origin is not None:
@@ -292,8 +290,6 @@ def _drive_agent(model: str | None, window: tuple) -> None:
 
 
 def _run_agent(model: str | None, turn) -> bool:
-    if _chat_root._offline_scope.get() is not None:
-        raise RuntimeError("离线回放尚未按无状态主循环重写")
     max_events, max_tokens = _chat_root.limit()
     turn._chat_limit = (max_events, max_tokens)
     notice = oplog.deliver_notifications(_chat_root.AGENT_WINDOW)
@@ -431,8 +427,6 @@ def reflect(model: str | None = None) -> bool:
     这里只准备材料并给她 memory_system；看什么、改不改由她决定。占住 AGENT_WINDOW，
     反思期间来的召唤照常登记，结束后由 pick_up_pending 接上。
     """
-    if _chat_root._offline_scope.get() is not None:
-        raise RuntimeError("离线回放尚未按无状态主循环重写")
     turn, owner = context.begin_turn(_chat_root.AGENT_WINDOW)
     if not owner:
         return False

@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import ast
-from contextvars import ContextVar
 from datetime import datetime, timezone
-import json
 import re
 import threading
 import time
@@ -39,7 +37,6 @@ llm_config: dict = {}
 DEFAULT_MAX_EVENTS = 80
 DEFAULT_MAX_TOKEN = 40000
 AGENT_WINDOW = oplog.AGENT_WINDOW
-MAX_PULL_EVENTS = 500
 NOTICE_TOKENS = 500
 _PRESSURE_PERCENT = 75
 _cost_lock = threading.Lock()
@@ -49,7 +46,6 @@ _image_stream = log.stream("image")
 _self_talk = log.stream("msg")
 # hint 求值失败只记日志，所以它有自己的流，不混进聊天流量。
 _hint_stream = log.stream("hint")
-_offline_scope: ContextVar[dict | None] = ContextVar("chat_offline_scope", default=None)
 
 
 def normalize_image_mode(value) -> str:
@@ -98,9 +94,8 @@ def _bounded_int(minimum: int, fallback: int, maximum: int | None = None):
 
 
 # 单值全局 agent 配置：storage 键与归一化。
-# WHY: 每晚反思的默认时刻是 2026-10-22 实现时选的：维护者只说"每天晚上"，这里取多数人
-# 睡着、群里最安静的时候；反思不对外说话，`#reflect HH:MM|off` 可以改。
-DEFAULT_REFLECT_AT = "05:00"
+# WHY: 凌晨 4 点是维护者 2026-10-22 定的；反思不对外说话，`#reflect HH:MM|off` 可以改。
+DEFAULT_REFLECT_AT = "04:00"
 
 
 def normalize_reflect_at(value) -> str:
@@ -198,18 +193,6 @@ def count_tokens(value: str) -> int:
         return max(1, len(value) // 3)
 
 
-def bounded_excerpt(value: str, max_tokens: int) -> str:
-    """Take the longest leading character span within a token budget."""
-    low, high = 0, len(value)
-    while low < high:
-        middle = (low + high + 1) // 2
-        if count_tokens(value[:middle]) <= max_tokens:
-            low = middle
-        else:
-            high = middle - 1
-    return value[:low]
-
-
 def context_usage(turn=None) -> int:
     """Estimate the last request's actual stream view when a reader owns it."""
     if turn is None:
@@ -275,12 +258,10 @@ def init_chat(
     """Assemble one Chat and return its tool binding and window."""
     prompts["base"] = _view._base_prompt()
     state = {"role": "system", "content": "你是唯一的中心 agent；窗口只是来源与明确发送目标。"}
-    offline = _offline_scope.get()
     window = AGENT_WINDOW
     session.set_messages([
         *get_prompt(),
         *prompts["base"],
-        *([{"role": "system", "content": offline["fact"]}] if offline else []),
         state,
         *(messages or []),
     ])
@@ -295,9 +276,9 @@ def init_chat(
     binding = tool_modules.bind_session(
         session,
         None,
-        registry=offline["registry"] if offline else None,
-        visible=(lambda name, module: name not in {"baidumap", "dianping"}
-                 and tool_modules.bot_op_tool_visible(name, module)) if not offline else None,
+        registry=None,
+        visible=lambda name, module: (name not in {"baidumap", "dianping"}
+                                      and tool_modules.bot_op_tool_visible(name, module)),
         persist=_persist_modules,
         schema_modules=_schema_modules(),
         persist_schema=_persist_schema_modules,
@@ -364,9 +345,6 @@ def get_handler(session: llm.Chat):
     宁可静默一轮、在终端留下证据。
     """
     def handle(chunk: llm.LLMResponse) -> None:
-        offline = _offline_scope.get()
-        if offline is not None:
-            offline["on_chunk"](chunk)
         if chunk.role == "assistant" and chunk.content:
             _self_talk.info(f'[{time.strftime("%H:%M:%S")}]【自言自语】{chunk.content}')
         if chunk.total_tokens:
@@ -410,7 +388,6 @@ def set_agent_hint(text: str) -> None:
 # 会话主体持久激活的工具模块名，以及各自最后一次被调用的时刻。
 _ACTIVE_MODULES_KEY = "active_tools"
 _SCHEMA_MODULES_KEY = "tool_schema_modules"
-_TOLD_TOOLS_KEY = "tool_state_told"
 
 
 def _schema_modules() -> list[str]:
@@ -493,7 +470,7 @@ def _run_hint(window: tuple, turn=None) -> None:
             return
         result = _hint_evaluate(code, window, turn)
         if result is not None:
-            # `#` 前缀让结束提示不回流进 LLM 上下文，见 _model_event。
+            # `#` 前缀让结束提示不回流进 LLM 上下文，见 chat.screen.records。
             message.sendmsg("#" + cq.escape(str(result)))
     except Exception:
         _report_hint_failure()
@@ -519,7 +496,7 @@ def _report_hint_failure() -> None:
     """照 link._report_error 的惯例，把 traceback 用 `#` 前缀发出去。"""
     _hint_stream.exception("hint 执行失败")
     try:
-        # `#` 前缀让 traceback 不回流进 LLM 上下文，见 _model_event。
+        # `#` 前缀让 traceback 不回流进 LLM 上下文，见 chat.screen.records。
         message.sendmsg("#" + "".join(traceback.format_exc().splitlines(True)[3:]).strip())
     except Exception:
         _hint_stream.exception("hint 的错误报告也发不出去")
@@ -532,24 +509,6 @@ def chat(model: str | None = None) -> None:
         return
     oplog.ensure_available()
     _agent._drive_agent(model, window)
-
-
-def run_offline(model: str, window: tuple, *, fact: str, registry,
-                on_chunk: Callable, persist_reasoning: bool,
-                send_context, send_sink: Callable) -> None:
-    """Drive the production reader with an explicit temporary replay scope."""
-    oplog.ensure_available()
-    scope = _offline_scope.set({"model": model, "fact": fact,
-                                "persist_reasoning": persist_reasoning,
-                                "registry": registry, "on_chunk": on_chunk})
-    try:
-        sink = send_context.set(send_sink)
-        try:
-            _agent._drive_agent(model, window)
-        finally:
-            send_context.reset(sink)
-    finally:
-        _offline_scope.reset(scope)
 
 
 def _in_chat_scope(event: dict) -> bool:
@@ -666,7 +625,7 @@ def cond() -> Callable | bool:
 
 def call(data: Callable | bool):
     if callable(data):
-        # `#` 前缀让子命令的输出不回流进 LLM 上下文，见 _model_event。
+        # `#` 前缀让子命令的输出不回流进 LLM 上下文，见 chat.screen.records。
         return "#" + cq.escape(str(data()))
     return chat()
 
@@ -825,5 +784,5 @@ def on_load(ctx) -> None:
 
     threading.Thread(target=start_reflection_schedule, name="chat-reflect-schedule", daemon=True).start()
 from . import view as _view, reader as _reader, agent as _agent, roles as _roles, subcommands as _subcommands
-from .view import has_at, msg_split, msg2chat, event2chat
-from .reader import parse_target, unread_details, prepare_recovery_sources, fetch_remote_source, unread_members, mark_window_read, mark_source_read
+from .view import has_at, msg_split
+from .reader import parse_target, prepare_recovery_sources, mark_window_read

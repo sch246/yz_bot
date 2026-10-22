@@ -124,9 +124,9 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 中心 agent 每次请求都从持久状态重新组装（2026-10-19 起，取舍见[无状态主循环提案](working/proposals/stateless-agent-loop.md)），不再重放自己的输出与结果。2026-10-22 起召回由她自己做、放下由图书管理员做：`agent._plan` 只给叫醒她的窗口画面、global 与 recent 笔记、这些窗口与作者的笔记，`agent._assemble` 再附一份可召回内容的目录；其余由模型用召回工具读。窗口画面直接读 `chatlog/` 的普通日志文件、保留原文格式，`storage` 的 `agent.seen` 记各窗口看到的时间，用来标出新消息；被唤醒窗口里看到时间之后的消息总会展示。第一次输出时记下看到的时间，并对画面里的窗口调用 `reader.mark_window_read` 把未读登记标为已读。已加载工具模块的完整状态在每次组装时放在系统提示之后，一次唤醒内的变化由 context provider 追加。一次唤醒内多轮工具调用照常累积在 `session.messages`；长过 `max_token × pressure_percent` 且主要是本轮新增时，`turn_done` 正常结束本轮并设置放下，`_drive_agent` 同步跑一次图书管理员把已做的事收进短期记忆，再不等新唤醒立即重新组装。本次唤醒的行动在重组后以 `actions.render` 的可读记录出现，已放下的只留标题。唤醒结束后 `roles.enqueue` 把这次的画面与行动交给后台图书管理员线程，由它改写 `data/notes/` 的笔记；改写和删除前把旧文件复制到 `.history/`。每次唤醒、整理和策略改动都在 `data/journal/` 留一条可读记录；`chat.schedule_reflection` 在全局 scheduler 上登记每晚反思任务，`agent.reflect` 占住 `AGENT_WINDOW` 读这些记录并加载 `memory_system` 工具模块，她能改的只有给图书管理员的附加说明、做法笔记和给维护者的提案。
 
-输出在派发工具前持久登记，同一模型输出的同步工具返回整批登记一个 result；这些仍是 `oplog` 事实，供 `read_actions` 与图书管理员读取，不再作为上下文整段重放。旧版留下的阅读 input、覆盖事实与 `_stream_results` 兼容桥仍在日志与代码里，新循环不再使用，待下一片清理。
+输出在派发工具前持久登记，同一模型输出的同步工具返回整批登记一个 result；这些仍是 `oplog` 事实，供 `read_actions` 与图书管理员读取，不再作为上下文整段重放。旧版留下的阅读 input、覆盖事实仍在日志里，`oplog` 照样重放校验它们，但写入这些记录的代码已删除；`_stream_results` 到达只在未读统计里被跳过。
 
-`oplog` 对可预见的非法记录在写盘前用与重放相同的校验拒绝，不改变日志或内存；追加、fsync 或落盘后索引应用失败会进入持久化失败态，后续写入和同批尚未派发的工具行动均停止，直到重启检查日志。`mods.chat.run_offline()` 仍保留入口，但新循环尚未支持离线回放，调用会明确报错；回放要按新循环重写。
+`oplog` 对可预见的非法记录在写盘前用与重放相同的校验拒绝，不改变日志或内存；追加、fsync 或落盘后索引应用失败会进入持久化失败态，后续写入和同批尚未派发的工具行动均停止，直到重启检查日志。离线回放入口 `run_offline` 与 `experiments/memory_replay.py` 已随旧阅读模型删除；按新循环重写回放之前，没有离线评估路径。
 
 模型可用 `read_log`（任意窗口的 chatlog 原文，格式与画面相同，可按时间往前翻）、`search_log`（按线索在聊天记录里找）、`read_actions`（按行动号、最近若干条或关键词读自己的行动记录）与 `read_note` 召回画面之外的内容；`cover_events`、`recall_events`、`event_links` 与 `take`／`status`／`mentions`／`fetch`／`read_messages`／`mark_read`／`pull` 已从工具集移除。`聊天开始`／`聊天结束`是普通内容。旧窗口聊天设置不再读取，也不并入全局设置；窗口 `#hint` 独立保留。启动恢复与补回仍把 NapCat 历史写进按日 sidecar 与 oplog 信源页；窗口画面目前只读普通日志，sidecar 中补回的消息暂不出现在画面里。`#` 控制消息不投影。主模型与图书管理员的费用统一记入 Bot 账。
 

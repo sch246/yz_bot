@@ -41,7 +41,7 @@
 
 `#` 是一条跨模块约定：LLM 失败信息（`llm.Chat.chat`）、`.py` 与 link action 的 traceback、`#` 子命令的输出都以它开头。画面渲染跳过正文以 `#` 开头的记录，使调试输出不回流进模型——它们占 token，还会让模型看到自己的错误堆栈。过滤对所有发送者一视同仁，Bot 自己发的与用户发的 `#help` 一样不进上下文。改任何一个生产端的前缀都会让那类输出开始回流，且不会报错。chatlog 里的通知行（戳一戳、撤回、管理变动等）原样出现在画面里。"聊天开始""聊天结束"是普通消息。
 
-`init_chat()` 装配提示词与身份说明，`_activate_chat()` 计数并从全局 `agent.active_tools` 恢复实际加载状态。`chat.run_offline()` 入口仍在，但新循环尚未支持离线回放，调用会报错。
+`init_chat()` 装配提示词与身份说明，`_activate_chat()` 计数并从全局 `agent.active_tools` 恢复实际加载状态。离线回放入口已删除，见[运行架构](architecture.md)。
 
 中心主聊天的图片档位由 op 用 `#image <mode>` 全局设置。名称与数字别名分别为 `off/0`、`lazy/1`、`eager/2`；历史布尔值兼容为 `False → off`、`True → lazy`。`off` 会把历史消息中的图片 part 降级为 `[图片(URI)]` 文本：避免把 `image_url` 发给纯文本模型。中心 agent 可按需加载 `image` 模块：`recognize_image` 不依赖窗口，生图返回临时文件 URI，由模型再用带显式目标的 `say` 发送。`lazy` 只在 LLM 聊天实际触发时处理本轮上下文中的图片；**一次对话内同一张图只解析一次**——这里的“一次对话”指 `chat.chat()` 的一次持有（多轮工具调用与插话续写都算同一轮，直到它的 `finally`），解析失败的不再逐轮重试（腾讯 `rkey` 过期后只会拿到 HTML），成功的也直接复用，对话结束后重新聊会重新检查。这项检查台账挂在线程局部，eager 预取另在线程记账。`eager` 在图片消息到达时立即启动后台下载：中心聊天模型能直接读图时只缓存原图，纯文本模型才会同时预生成文字描述。同一来源若恰好同时被 eager 和聊天请求，描述生成会等待同一个进行中任务，避免重复计费。纯文本模型的识别结果统一压成一个 `[图片(URI)识别结果：描述]` 文本 part，明确 URL 与描述属于同一张图片；视觉模型收到的实际图片 part 前会保留一段“下方图片的原始链接”文本。图片加载失败或没有可用视觉模型时也使用同一个带 URI 的单段格式。
 
@@ -185,7 +185,7 @@ hint 与追加式上下文是两层，判据是一句话：**频繁变化、且�
 `image`（图片档位）、`reasoning`、`max_events`、`max_token`、`pressure_percent`、`reflect_at` 共用 `mods.chat.AGENT_SETTINGS` 的全局归一化规则。中心主会话只读全局 `agent` storage；op 用 `#use_model`、`#image`、`#reasoning`、`#limit` 等命令修改它。旧窗口聊天配置不自动迁移，也不再读取；`#hint` 的窗口配置是独立例外。
 
 - **缺省值写死在代码里**（`DEFAULT_MAX_EVENTS` / `DEFAULT_MAX_TOKEN` 与各归一化函数的兜底分支），不再读 `llm_system/config.json`。中心运行期覆盖只有全局 `agent` storage 一份；`#limit` 是唯一预算命令入口。
-- **三个预算**：`max_events`（默认 80）是窗口画面的默认条数；`max_token`（默认 40000）乘 `pressure_percent`（默认 75%）是一次唤醒内触发放下的上下文大小。存储键沿用旧名。旧窗口覆盖不自动迁入全局主体。`agent.librarian_model` 可选，缺省用便宜模型。`reflect_at`（默认 `05:00`，`off` 关闭）是每晚反思的时刻，`agent.reflected_at` 记上次反思的时间。
+- **三个预算**：`max_events`（默认 80）是窗口画面的默认条数；`max_token`（默认 40000）乘 `pressure_percent`（默认 75%）是一次唤醒内触发放下的上下文大小。存储键沿用旧名。旧窗口覆盖不自动迁入全局主体。`agent.librarian_model` 可选，缺省用便宜模型。`reflect_at`（默认 `04:00`，`off` 关闭）是每晚反思的时刻，`agent.reflected_at` 记上次反思的时间。
 - **`hint` 与 `prompt` 不在表里**：窗口结束提示的 `#hint` 独立合并全局默认与窗口覆盖；中心提示词从全局 `agent.prompt` 选择内置设置或显式列表。它们不是单值档位，不使用 `AGENT_SETTINGS` 的归一化。
 - 已退役的窗口聊天设置仍可能留在生产 storage，但运行代码不再读取；其清理需先获维护者授权，见[第二轮调查](working/round2-legacy-and-backfill-audit.md)。
 
@@ -199,7 +199,7 @@ hint 与追加式上下文是两层，判据是一句话：**频繁变化、且�
 - `cover_events`、`recall_events`、`event_links` 已移除。旧日志里的覆盖、阅读 input 与 `condensed`/`clear` 记录仍按原样重放，新代码不再写入。
 - 流式结果中途截断不会登记半个输出或派发行动；输出写入日志失败则不派发。`oplog` 在写盘前校验可预见的拒绝条件；追加、fsync 或落盘后索引应用失败会进入失败态，后续写入和同批尚未执行的工具行动都停止，直到重启检查磁盘。行动开始后不会自动重放。
 
-`chat.view._closing_hint` 只为旧的重放上下文服务（DeepSeek 在带 `tools` 的 thinking 请求中要求最后一条 `user` 后的每条 `assistant` 携带 `reasoning_content`）；新循环每次组装都以 user 消息结尾，一次唤醒内原生思考原样保留，不再挂它。
+DeepSeek 在带 `tools` 的 thinking 请求中要求最后一条 `user` 后的每条 `assistant` 携带 `reasoning_content`；新循环每次组装都以 user 消息结尾，一次唤醒内原生思考原样保留，所以旧的 `_closing_hint` 已删除。
 
 ### 思考内容开关
 
