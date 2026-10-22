@@ -235,6 +235,9 @@ D7 让 [chatlog 格式](../../chatlog-format.md)里"模型看到的名字是另�
 | D11 | 谁决定她看到什么 | 召回由她自己做，放下由图书管理员做；去掉前置选材。维护者全程用 `deepseek/deepseek-flash`，拆出一个便宜模型来选材省不了钱 |
 | D12 | 记忆分类 | 图书管理员要区分情景、语义、过程三种记忆，并且要有检索机制；检索可以是情景化、按线索的 |
 | D13 | 反思时刻与旧代码 | 每晚反思定在凌晨 4 点；旧阅读代码清掉 |
+| D14 | 图书管理员什么时候跑 | 极简：白天只有一份"做过的事"的列表，她可以主动调用整理，也可以由条件（上下文占用）触发；不触发就留到夜里整理成日记，月、年再汇总 |
+| D15 | 笔记 | 个人笔记随时可用：笔记就是她随时能读写的普通文件，"能用普通文件的不搞复杂系统"；待办（原 storage 里的 hint）也退化成普通文件 |
+| D16 | 自己什么时候醒 | 专门一个模块 `awaker`，她或维护者都能设，比如每 10 分钟醒一次 |
 
 D10 因此只剩图书管理员一个对象。D11 背后的想法是维护者的原话："检索如果可以迭代的话，那好像不需要主会话了，她本身就是过程，只需要维持自己的短期记忆就能思考和行事了。"拆出选材原本是为了让检索过程不进主上下文；现在由图书管理员在上下文太长时替她放下，同样的目的换到了另一端。
 
@@ -295,12 +298,14 @@ S1 之后系统就能单独运行；S3、S4 的效果用 S2 的回放逐个对�
 | S1 画面与格式 | `mods/chat/screen.py`、`agent._assemble` | 直接读 chatlog 普通日志的原文记录；`agent.seen` 记看到的时间并标出新消息；跳过 `#` 开头的控制消息 |
 | S1 行动记录 | `mods/chat/actions.py` | oplog 的输出与结果渲染成和 chatlog 同形的记录；`read_actions` 按号读回 |
 | S1 去掉重放 | `agent._run_agent`、`tools/meta.py` | 不再重放经历流；移除固定起点、压力提示、`#reset_start`、工具状态差量通告，以及 `cover_events`、`recall_events`、`event_links` 与七个聊天软件式阅读工具；新增 `read_log`、`read_actions`、`read_note` |
-| 过程放下 | `agent._run_agent.over_budget`、`_drive_agent`、`_job` | 一次唤醒内上下文长过 `max_token × pressure_percent` 且主要是本轮新增时，正常结束本轮，同步跑一次图书管理员（`phase="release"`）把已做的事收进 recent，再重新组装；放下过的行动只留标题 |
+| 整理（D14） | `agent._tidy`、`agent._day_actions`、`tools/meta.tidy` | 白天的列表是 `agent.tidied_at` 之后的全部行动。她调用 `tidy`、一次唤醒里上下文长过 `max_token × pressure_percent`、或列表本身超过它的三分之一时，同步跑一次图书管理员，之后列表从当时重新开始。不再在每次唤醒结束后整理 |
 | D11 召回 | `agent._plan`、`roles.directory`、`roles.search_log` | 醒来时只有 global、recent、叫醒她的窗口画面、这些窗口与作者的笔记，以及一份可召回内容的目录；其余由她用 `read_log`／`search_log`／`read_actions`／`read_note` 自己读。`search_log` 按子串在聊天记录里找线索，`read_actions` 可按词筛，`read_log` 的 `before` 接受画面里的日期时间。2026-10-22 上午的第一版曾有前置选材（`roles.select`），按 D11 移除 |
-| S3 图书管理员 | `roles.organize`、`mods/chat/notes.py` | 每次唤醒结束后后台整理，唤醒中途也会被叫来放下；两者串行。范围：global（做法，过程记忆）、recent（短期记忆，二十行以内，每次改写成当前的样子）、person／group（"认识"语义与"经历"情景索引两段）。改写与删除前备份到 `.history/`；提示词参照 retro：读一手材料、纠正优先、决定与承诺写成经历、删掉不再改变行为的条目 |
+| S3 图书管理员 | `roles.organize`、`roles.summarize` | 只在整理和夜间运行，串行；不改 todo 和 awaker。夜间写 `diary:<日期>`、整理人和群的笔记、global 和交接用的 recent；月末、年末各汇总一篇。提示词参照 retro：读一手材料、纠正优先、决定与承诺写成经历、删掉不再改变行为的条目 |
+| 笔记（D15） | `mods/chat/notes.py`、`tools/meta.write_note` | `data/notes/` 下的普通 Markdown：global、recent、todo、awaker、person、group、diary。她随时用 `write_note` 改，维护者直接编辑；改前备份到 `.history/`，内容没变不写。旧 storage 待办第一次读到时搬进 todo |
 | 可观察 | `mods/chat/journal.py`、`agent._write_journal`、`roles._organize` | `data/journal/YYYY-MM-DD.log`：每次唤醒、每次整理、每次策略改动各一条，chatlog 同形；`⚠` 标出代码能判断的信号（找了没找到、找的东西笔记里已有、读回刚放下的行动、画面里有人说她忘了、笔记超长） |
 | 自我改进 | `mods/tools/memory_system.py`、`notes.POLICIES` | 工具模块说明上下文怎么来、能改什么；`read_journal`、`read_policy`、`edit_policy`（librarian／global／proposals，必须写原因和预期，自动记进 changes）、`assess_change`。图书管理员的附加说明每次整理时附在它的提示词后 |
-| 每晚反思 | `agent.reflect`、`chat.schedule_reflection`、`#reflect` | APScheduler cron，默认 04:00；忙时 10 分钟后重试，最多 6 次；读上次反思以来的日志与改动记录，加载 `memory_system`；不对外说话；结束后接上反思期间的召唤 |
+| 闹钟（D16） | `mods/chat/awaker.py`、`#awaker` | 笔记 awaker 每行一条规则：`every 10m`、`daily HH:MM`、`at YYYY-MM-DD HH:MM` 加理由；每分钟检查一次。理由 `reflect` 是夜间整理与反思，笔记为空时默认 `daily 04:00 reflect`。定点规则忙时下一分钟再试，错过三小时就等下一次 |
+| 夜间整理与反思 | `agent.reflect`、`agent._night`、`#reflect now` | 先让图书管理员写日记、整理笔记、汇总月记年记，再读上次反思以来的日志和改动记录，加载 `memory_system`；不对外说话；结束后接上期间的召唤 |
 | D7 | `notes.custom_name` | `.setname` 自定义称呼随个人笔记出现，不迁移数据、不改 chatlog |
 
 同时加了一句"被叫醒不等于必须开口"，回应维护者"比起学会什么时候说，更重要的是学会怎么少说"。
@@ -308,7 +313,7 @@ S1 之后系统就能单独运行；S3、S4 的效果用 S2 的回放逐个对�
 ### 验证
 
 - `run.py --check` 通过（129 个文件 / 85 个公开模块，新增 4 个文件）；`--smoke` 83/85，可选失败仍只有 `mcf` 与 `minecraft`，与改动前相同。
-- 仓库外的临时脚本用 smoke 的方式在临时目录启动整个应用，配假 OneBot 与假模型，按维护者的例子跑 A（长任务）→ 无关的 B → 回到 A，检查每次实际发出的请求。加上日志、反思和 `#reflect` 之后共 40 项检查，全部通过：
+- 仓库外的临时脚本用 smoke 的方式在临时目录启动整个应用，配假 OneBot 与假模型，按维护者的例子跑 A（长任务）→ 无关的 B → 回到 A，检查每次实际发出的请求。D14–D16 之后的版本共 36 项检查，全部通过（下面几条是 D14 之前那一版的检查，现在的版本另外覆盖了：她自己写笔记和待办、`tidy` 把她的说明交给图书管理员、唤醒结束不再整理、图书管理员改不了 todo、旧 storage 待办搬进文件、闹钟按间隔响且只响一次、过期的一次性规则不响、`reflect` 规则触发夜间整理写出日记、下一次唤醒带上日记、月记汇总、awaker 每分钟任务已登记）：
   - A：醒来就带着叫她的人的笔记；中途上下文涨过阈值时图书管理员以 release 阶段被调用，重组后的请求带着它写的 recent，之前的行动只剩标题、原始 `read_log` 结果不再出现；唤醒结束后写出群笔记；整个过程没有选材调用。
   - B：请求里没有 A 的画面和原始记录，但 recent 仍在（连续性）。
   - 回到 A：群笔记在；她用 `search_log` 按一个词找到了 A 的那条原始记录，用 `read_actions` 按词找到了自己之前说的话；"新消息"分隔线在，B 的内容不在。

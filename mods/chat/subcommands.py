@@ -24,20 +24,27 @@ _SUBCOMMAND_HELP = (
     ("del_setting <name>", "删除设定"),
     ("image [off|lazy|eager]", "查看或设置图片读取档位"),
     ("reasoning [keep|drop]", "查看或设置中心已读输出是否原生带回思考内容"),
-    ("limit [<画面条数> <token> [放下百分比]|reset]", """查看或设置中心 agent 的窗口画面条数、单次唤醒上下文上限与放下阈值（管理员）。
+    ("limit [<画面条数> <token> [整理百分比]|reset]", """查看或设置中心 agent 的窗口画面条数、单次唤醒上下文上限与整理阈值（管理员）。
 
-格式：#limit | #limit <画面条数> <token> [放下百分比] | #limit reset
-每次唤醒都重新组装上下文：画面条数是一个窗口默认展示多少条聊天记录；一次唤醒里上下文长到 token×放下百分比 时，先让图书管理员把已做的事放下进短期记忆，再重新组装继续。默认值分别为 80、40000、75%。
+格式：#limit | #limit <画面条数> <token> [整理百分比] | #limit reset
+每次唤醒都重新组装上下文：画面条数是一个窗口默认展示多少条聊天记录；一次唤醒里上下文长到 token×整理百分比、或上次整理以来的行动列表长到它的三分之一时，先让图书管理员把她做过的事收进笔记，再重新组装继续。默认值分别为 80、40000、75%。
 #limit                  显示三个值，并标出来自全局覆盖还是默认
-#limit <画面条数> <token> [放下百分比] 写入全局设置；省略百分比则保留原设置
+#limit <画面条数> <token> [整理百分比] 写入全局设置；省略百分比则保留原设置
 #limit reset            清掉全局设置，回落到默认"""),
-    ("reflect [HH:MM|off|now]", """查看或设置每晚反思（管理员）。
+    ("reflect [now]", """查看上次反思时间，或现在就跑一次夜间整理与反思（管理员）。
 
-每晚到点，中心 agent 读上次反思以来的记忆系统日志（data/journal/），评估自己之前的策略改动，必要时改给图书管理员的附加说明或自己的做法笔记；不对外说话。默认 04:00。
-#reflect          显示反思时刻与上次反思时间
-#reflect HH:MM    改成每天这个时刻
-#reflect off      关掉每晚反思
-#reflect now      现在就反思一次（中心 agent 正忙时不执行）"""),
+夜间整理：图书管理员把这一天写成日记（data/notes/diary/），整理笔记；月末、年末各汇总一次。反思：她读上次反思以来的记忆系统日志（data/journal/），评估自己之前的策略改动，必要时改给图书管理员的附加说明或自己的做法笔记；不对外说话。什么时候自动跑由 awaker 规则决定，默认 daily 04:00 reflect。
+#reflect          显示上次反思时间
+#reflect now      现在就跑一次（中心 agent 正忙时不执行）"""),
+    ("awaker [set <规则>]", """查看或改写她的闹钟规则（改写要管理员）。
+
+规则就是笔记 awaker（data/notes/awaker.md），她自己也能改，每行一条：
+every 10m <理由>             每隔一段时间叫醒她一次（最短 1m）
+daily 23:30 <理由>           每天这个时刻
+at 2026-10-23 08:00 <理由>   某个时刻一次
+理由写 reflect 表示夜间整理与反思；其它理由原样交给她。文件为空时只有 daily 04:00 reflect。
+#awaker              显示规则、上次响的时间和不认识的行
+#awaker set <规则>   整份替换；set 之后第一个换行起是规则全文"""),
     ("hint [get|set|default]", """查看、编写或开关本窗口的结束提示（管理员）。
 
 格式：#hint | #hint get | #hint set <代码> | #hint set | #hint default [get|set <代码>]
@@ -59,7 +66,7 @@ def requires_op(value: str) -> bool:
     name, _, tail = value.strip().partition(" ")
     return (name == "hint" or name in {"use_model", "add_prompt", "use_setting", "set_setting",
                                        "del_setting"}
-            or name in {"image", "reasoning", "limit", "reflect"} and bool(tail.strip()))
+            or name in {"image", "reasoning", "limit", "reflect", "awaker"} and bool(tail.strip()))
 
 
 def _subcommand_help(name: str = "") -> str:
@@ -247,9 +254,9 @@ def _limit_report() -> str:
 
 
 def _limit_set(tail: str) -> str:
-    """`#limit <画面条数> <token> [放下百分比]` 写全局设置；`reset` 回落默认。
+    """`#limit <画面条数> <token> [整理百分比]` 写全局设置；`reset` 回落默认。
 
-    WHY: 画面条数与 token 上限仍一起写，避免只改其中一个造成难解释的半份配置。放下百分比
+    WHY: 画面条数与 token 上限仍一起写，避免只改其中一个造成难解释的半份配置。整理百分比
     可选，不写就保留原设置；老的两参数命令因此不会意外重置它。
     """
     data = storage.get("", "agent")
@@ -277,18 +284,28 @@ def _limit_set(tail: str) -> str:
 
 
 def _reflect_subcommand(tail: str) -> str:
-    data = storage.get("", "agent")
     if not tail:
-        last = data.get("reflected_at")
+        last = storage.get("", "agent").get("reflected_at")
         shown = datetime.fromtimestamp(last).strftime("%Y-%m-%d %H:%M") if isinstance(last, (int, float)) else "还没有"
-        return f"每晚反思：{_chat_root.agent_setting('reflect_at')}；上次反思：{shown}"
+        return f"上次反思：{shown}；什么时候自动跑见 #awaker"
     if tail == "now":
-        return "开始反思，记录写在 data/journal/" if _chat_root.reflect_now() else "中心 agent 正忙，稍后再试"
-    if tail != "off" and _chat_root.normalize_reflect_at(tail) != tail.zfill(5):
-        return "reflect 参数错误，可用 #help reflect 查看"
-    data["reflect_at"] = _chat_root.normalize_reflect_at(tail)
-    storage.save()
-    return f"每晚反思：{_chat_root.schedule_reflection()}"
+        return "开始夜间整理与反思，记录写在 data/journal/" if _chat_root.reflect_now() else "中心 agent 正忙，稍后再试"
+    return "reflect 参数错误，可用 #help reflect 查看"
+
+
+def _awaker_subcommand(raw: str) -> str:
+    body = raw.lstrip()[len("awaker"):]
+    head, _, rest = body.partition("\n")
+    if not head.strip() and not rest.strip():
+        return _chat_root._awaker.report()
+    if head.strip().partition(" ")[0] != "set":
+        return "awaker 参数错误，可用 #help awaker 查看"
+    text = cq.unescape((head.strip()[3:].strip() + "\n" + rest).strip())
+    from . import journal
+
+    previous = _chat_root._notes.write("awaker", text)
+    journal.append("维护者改 awaker", journal.diff(previous, text))
+    return _chat_root._awaker.report()
 
 
 def _subcommand(value: str):
@@ -419,6 +436,8 @@ def _subcommand(value: str):
         return _limit_set(tail)
     if name == "reflect":
         return _reflect_subcommand(tail.strip())
+    if name == "awaker":
+        return _awaker_subcommand(raw)
     if name == "hint":
         return _hint_subcommand(raw)
     return "子命令格式错误，可用 #help 查看"

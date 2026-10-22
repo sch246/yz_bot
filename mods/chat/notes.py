@@ -1,8 +1,12 @@
 """Plain Markdown notes kept by the librarian.
 
 ``global`` holds how she does things (procedural memory), ``recent`` what is
-going on right now (short-term memory), and one note per person and per group
-what she knows and what happened with them.
+going on right now (short-term memory), ``todo`` what is still open, ``awaker``
+when she wakes herself, one note per person and per group what she knows and
+what happened with them, and ``diary:<day|month|year>`` the nightly diary.
+
+WHY: 2026-10-22 维护者："能用普通文件的不搞复杂系统"。这些都是她随时能读写的普通
+Markdown 文件，维护者也能用任何编辑器改；图书管理员只是另一个会写它们的人。
 
 WHY: files, not storage JSON, so the maintainer can read and fix them with any
 editor while the Bot runs.  Every overwrite or deletion first copies the old
@@ -24,13 +28,13 @@ from mods import storage
 
 ROOT = Path("data") / "notes"
 _lock = threading.RLock()
-_SCOPE = re.compile(r"^(global|recent|person:\d+|group:\d+)$")
+_SCOPE = re.compile(r"^(global|recent|todo|awaker|person:\d+|group:\d+|diary:\d{4}(-\d{2}(-\d{2})?)?)$")
 
 
 def _path(scope: str) -> Path:
     if not _SCOPE.fullmatch(scope):
-        raise ValueError("scope 只能是 global、recent、person:<QQ号> 或 group:<群号>")
-    if scope in ("global", "recent"):
+        raise ValueError("scope 只能是 global、recent、todo、awaker、person:<QQ号>、group:<群号> 或 diary:<日期>")
+    if ":" not in scope:
         return ROOT / f"{scope}.md"
     kind, number = scope.split(":")
     return ROOT / kind / f"{number}.md"
@@ -80,6 +84,8 @@ def _replace(path: Path, text: str) -> str:
     """Back up, then write or delete one file; returns the text it replaced."""
     with _lock:
         previous = path.read_text(encoding="utf-8") if path.is_file() else ""
+        if previous.strip() == text.strip():
+            return previous
         _backup(path)
         if not text.strip():
             if path.is_file():
@@ -128,7 +134,7 @@ def listing(limit: int = 60) -> list[dict]:
     found = []
     for path in ROOT.rglob("*.md"):
         relative = path.relative_to(ROOT)
-        if relative.parts[0] == ".history":
+        if relative.parts[0] in (".history", "diary", "policy"):
             continue
         scope = path.stem if len(relative.parts) == 1 else f"{relative.parts[0]}:{path.stem}"
         if not _SCOPE.fullmatch(scope):
@@ -138,3 +144,11 @@ def listing(limit: int = 60) -> list[dict]:
                       "first": text.split("\n", 1)[0][:80], "chars": len(text)})
     found.sort(key=lambda item: item["changed"], reverse=True)
     return found[:limit]
+
+
+def diaries(prefix: str = "") -> list[str]:
+    """Diary keys (``YYYY``, ``YYYY-MM`` or ``YYYY-MM-DD``), oldest first."""
+    directory = ROOT / "diary"
+    if not directory.is_dir():
+        return []
+    return sorted(path.stem for path in directory.glob("*.md") if path.stem.startswith(prefix))

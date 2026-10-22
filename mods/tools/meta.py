@@ -1,6 +1,6 @@
 '''指导模型增删查改统一工具与 Skill 模块，并说明 last-good、显式应用和当前会话激活原理。
 
-同一模型输出的多个工具调用按顺序执行，却看不到彼此结果；整批完成后结果在下一子请求可见。若 `say(final_call=true)` 结束、请求取消或失败，不会只为结果强迫续轮。每次唤醒眼前只有做法笔记、短期记忆、叫醒你的窗口和相关人的笔记；别的要自己召回：按窗口翻聊天记录用 `read_log`，按线索找用 `search_log`，自己过去的行动用 `read_actions`，笔记用 `read_note`。
+同一模型输出的多个工具调用按顺序执行，却看不到彼此结果；整批完成后结果在下一子请求可见。若 `say(final_call=true)` 结束、请求取消或失败，不会只为结果强迫续轮。每次唤醒眼前只有做法笔记、短期记忆、待办、最近一篇日记、今天做过的事、叫醒你的窗口和相关人的笔记；别的要自己召回：按窗口翻聊天记录用 `read_log`，按线索找用 `search_log`，自己过去的行动用 `read_actions`，笔记用 `read_note`。笔记是普通文件，`write_note` 随时改；今天的事告一段落时用 `tidy` 请图书管理员整理。
 
 ## 直接执行 Python
 
@@ -95,7 +95,7 @@ Python 模块可以正常 import 第三方依赖、其它 `mods`，也可以 `fr
 
 Markdown 不需要 front matter、额外 summary 字段或同步机制，也不导出函数。目录不递归扫描；Skill 可在正文中引用子目录资源。写完同样先 `reload_tools(["foo"])`，需要在当前任务使用时再 `load_tools(["foo"])`。
 
-Skill 也是可编辑的长期笔记：把可重复使用的经验、做法、失败教训按主题写进去，首行说明何时值得加载；下次可从模块目录发现，再按需 `load_tools` 把正文带进上下文。要自己落盘时，先 `load_tools(["host"])`，用 `host__read_file`／`host__write_file` 精确编辑源文件，再 `reload_tools` 应用。不要为了记一件事就改始终加载的基础 prompt，也不要把整段聊天照搬进 Skill。Skill 文件可被中心 agent 发现；私人聊天原话仍保留原来源窗口，中心 agent 可按旧正式号反查。Skill 只写可复用的做法，临时待办不要塞进 Skill，用 `edit_hint`。
+Skill 也是可编辑的长期笔记：把可重复使用的经验、做法、失败教训按主题写进去，首行说明何时值得加载；下次可从模块目录发现，再按需 `load_tools` 把正文带进上下文。要自己落盘时，先 `load_tools(["host"])`，用 `host__read_file`／`host__write_file` 精确编辑源文件，再 `reload_tools` 应用。不要为了记一件事就改始终加载的基础 prompt，也不要把整段聊天照搬进 Skill。Skill 文件可被中心 agent 发现；私人聊天原话仍保留原来源窗口，中心 agent 可按旧正式号反查。Skill 只写可复用的做法，临时待办不要塞进 Skill，写进 `todo` 笔记。
 
 ## 修改
 
@@ -111,18 +111,20 @@ Skill 也是可编辑的长期笔记：把可重复使用的经验、做法、�
 
 ## 经历与笔记
 
-每次模型输出（正文、多个行动）记进 oplog，有一个 `YYYYMMDD-N` 行动号；工具结果随它记下。每次唤醒不重放旧的对话，眼前只有做法笔记（global）、短期记忆（recent）、叫醒你的窗口和相关的人或群的笔记；没出现的东西没有丢，召回是你自己的事。
+每次模型输出（正文、多个行动）记进 oplog，有一个 `YYYYMMDD-N` 行动号；工具结果随它记下。每次唤醒不重放旧的对话，眼前只有做法笔记（global）、短期记忆（recent）、最近一篇日记、上次整理以来做过的事、叫醒你的窗口和相关的人或群的笔记，末尾是待办（todo）；没出现的东西没有丢，召回是你自己的事。
 
 - 聊天记录就是 `chatlog/` 的原文，`read_log(window, count, before)` 读任意窗口，格式与画面相同；`before` 写 `YYYY-MM-DD HH:MM:SS` 往前翻页。
 - 记得一点线索（名字、话题、某个词）就用 `search_log(keyword, window, days)` 找出原文和时间，再用 `read_log` 读前后文。
 - 自己做过的事用 `read_actions(ids)` 按行动号读，或不给号读最近几条，`keyword` 按词筛。
-- 笔记由图书管理员整理：global 是你的做法，recent 是你的短期记忆，person:<QQ号>、group:<群号> 记认识与经历；`read_note(scope)` 读全文。放下是图书管理员的事：唤醒结束、或者一次唤醒里上下文太长时，他把你看过做过的东西收成结论和出处写进笔记。你不用自己写笔记，跨唤醒没做完的事写进 `edit_hint` 待办。
+- 笔记都是 `data/notes/` 下的普通文件，你随时能读能写：global 是你的做法，recent 是短期记忆，todo 是待办，awaker 是你的闹钟规则，person:<QQ号>、group:<群号> 记认识与经历，diary:<日期> 是夜里写的日记（月、年各有汇总）。`read_note(scope)` 读，`write_note(scope, text)` 整份替换，改前自动备份。认识了新的人、答应了什么、被纠正了什么，想记就当场记。
+- 放下是图书管理员的事：你调用 `tidy`、一次唤醒里上下文太长、或者今天的行动列表太长时，他把上次整理以来你看过做过的东西收成结论和出处写进笔记，之后这些行动不再出现在你眼前；每天夜里他写日记、整理笔记。
+- 想定时醒来（比如每 10 分钟看一眼，或者某个时刻提醒谁），就改 awaker 笔记，每行一条：`every 10m 理由`、`daily 23:30 理由`、`at 2026-10-23 08:00 理由`；`daily 04:00 reflect` 是每晚的整理与反思，删掉它就不再反思。到点的闹钟会把理由交给你，`at` 规则响过后记得删掉。
 - 记忆系统本身怎么运作、每次唤醒组装了什么、图书管理员改了什么、你能怎么改它，见 `memory_system`；每晚反思会自动加载它。
 - 更长时间跨度的自查可加载 `self_inspection` Skill，用 `exec_code` 读磁盘记录。
 
-## 全局待办
+## 待办
 
-`edit_hint(text)` 整体替换中心 agent 的全局待办；传空字符串清空。它持久保存，下一次模型子请求会在末尾 hint 看到最新内容；hint 自身不逐版追加，但 `edit_hint` 行动仍照常留在信息流里。同一模型输出中的多个工具调用彼此看不到结果：先等工具返回进入下一子请求，再记录依赖成败的待办。改动不会发送 QQ 消息；要对人说话仍须调用 `say`。这里的模型可见 hint 与聊天结束后向 QQ 发状态消息的 `#hint` 命令不是一回事。只放尚待处理的事，做完及时更新；可复用经验放 Skill；聊天证据本来就在聊天记录和行动记录里，可按窗口或行动号读回。
+待办就是 `todo` 笔记：`write_note("todo", 全文)` 整体替换，传空串清空。每次模型子请求的末尾都会显示最新内容。同一模型输出中的多个工具调用彼此看不到结果：先等工具返回进入下一子请求，再记录依赖成败的待办。改动不会发送 QQ 消息；要对人说话仍须调用 `say`。它与聊天结束后向 QQ 发状态消息的 `#hint` 命令不是一回事。只放尚待处理的事，做完及时更新；可复用经验放 Skill。
 
 ## 说话
 
@@ -364,18 +366,37 @@ def say(text: str, final_call: bool = True, target: str = "") -> str:
     return str(message_id)
 
 
-def edit_hint(text: str) -> str:
-    """整体替换中心 agent 的全局待办 hint；传空字符串清空，不会向 QQ 发送消息。跨唤醒还没做完的事写在这里。
+def write_note(scope: str, text: str) -> str:
+    """用新全文替换一份笔记（普通 Markdown 文件，改前自动备份）；空串删除整份笔记。
 
     @param
-    text: 更新后的完整待办文本；请保留仍未完成的事项，空字符串表示清空
+    scope: global、recent、todo、awaker、person:<QQ号>、group:<群号> 或 diary:<日期>
+    text: 这份笔记更新后的完整内容；改之前先 read_note 看现有内容，别把别人写的覆盖掉
+    """
+    from mods.chat import awaker, journal, notes
+
+    previous = notes.write(scope, text)
+    if previous.strip() != text.strip():
+        journal.append(f"她改笔记 {scope}", journal.diff(previous, text))
+    if scope == "awaker":
+        found, skipped = awaker.parse(text if text.strip() else awaker.DEFAULT)
+        lines = [f"已写入 awaker，{len(found)} 条规则生效"] + [f"不认识：{line}" for line in skipped]
+        return "\n".join(lines)
+    return f"已写入 {scope}" if text.strip() else f"已删除 {scope}"
+
+
+def tidy(note: str = "") -> str:
+    """请图书管理员现在整理：把上次整理以来你看过做过的东西收进笔记，这一轮结束后你的上下文重新组装。一件事告一段落、或刚读了一大堆材料只需要记住结论时用。
+
+    @param
+    note: 想让他特别注意的地方，比如"结论是端口没问题，细节不用记"；可以留空
     """
     from mods import chat
 
-    if _tool_window() != chat.AGENT_WINDOW:
-        return "只有中心 reader 可以编辑待办 hint"
-    chat.set_agent_hint(text)
-    return "已更新待办 hint；下次模型请求会看到新内容" if text.strip() else "已清空待办 hint"
+    if not chat.agent.request_tidy(note.strip()):
+        return "现在没有进行中的唤醒，不需要整理"
+    current_binding().session.turn_done = lambda: True
+    return "图书管理员会在这一轮结束后整理，之后你的上下文会重新组装"
 
 
 def _format_results(results: Mapping) -> str:
@@ -410,7 +431,8 @@ __all__ = [
     "search_log",
     "read_actions",
     "read_note",
-    "edit_hint",
+    "write_note",
+    "tidy",
     "exec_code",
     "list_tools",
     "reload_tools",

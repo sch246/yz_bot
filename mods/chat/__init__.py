@@ -94,73 +94,29 @@ def _bounded_int(minimum: int, fallback: int, maximum: int | None = None):
 
 
 # 单值全局 agent 配置：storage 键与归一化。
-# WHY: 凌晨 4 点是维护者 2026-10-22 定的；反思不对外说话，`#reflect HH:MM|off` 可以改。
-DEFAULT_REFLECT_AT = "04:00"
-
-
-def normalize_reflect_at(value) -> str:
-    text = str(value or "").strip().lower()
-    if text == "off":
-        return "off"
-    match = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
-    if match and int(match[1]) < 24 and int(match[2]) < 60:
-        return f"{int(match[1]):02d}:{match[2]}"
-    return DEFAULT_REFLECT_AT
-
-
 AGENT_SETTINGS = {
     "image": ("image", normalize_image_mode),
     "reasoning": ("reasoning", normalize_reasoning_mode),
     "max_events": ("max_events", _bounded_int(1, DEFAULT_MAX_EVENTS)),
     "max_token": ("max_token", _bounded_int(1, DEFAULT_MAX_TOKEN)),
     "pressure_percent": ("pressure_percent", _bounded_int(1, _PRESSURE_PERCENT, 100)),
-    "reflect_at": ("reflect_at", normalize_reflect_at),
 }
 
-_REFLECT_JOB = "chat-reflect"
-_REFLECT_RETRIES = 6
 _reflect_stream = log.stream("agent")
 
 
-def schedule_reflection() -> str:
-    """(Re)register the nightly reflection job from the global setting; returns the time or "off"."""
-    from mods import scheduler
-
-    when = agent_setting("reflect_at")
-    try:
-        instance = scheduler.get_scheduler()
-    except RuntimeError:
-        return when
-    if instance.get_job(_REFLECT_JOB) is not None:
-        instance.remove_job(_REFLECT_JOB)
-    if when != "off":
-        hour, minute = when.split(":")
-        instance.add_job(_reflect_job, "cron", hour=int(hour), minute=int(minute), id=_REFLECT_JOB,
-                         coalesce=True, misfire_grace_time=3600)
-    return when
-
-
-def _reflect_job(attempt: int = 0) -> None:
-    from datetime import timedelta
-
-    from mods import scheduler
-
-    try:
-        done = _agent.reflect()
-    except Exception:
-        _reflect_stream.exception("每晚反思失败")
-        return
-    if not done and attempt < _REFLECT_RETRIES:
-        # 中心 agent 正在聊天：过一会儿再试，不打断她。
-        scheduler.get_scheduler().add_job(_reflect_job, "date", args=[attempt + 1],
-                                          run_date=datetime.now() + timedelta(minutes=10))
-
-
 def reflect_now() -> bool:
-    """Start a reflection on its own thread; False when the agent is busy right now."""
+    """Start the nightly pass right away on its own thread; False when the agent is busy."""
     if context.get_turn(AGENT_WINDOW) is not None:
         return False
-    threading.Thread(target=_reflect_job, args=[_REFLECT_RETRIES], name="chat-reflect", daemon=True).start()
+
+    def run() -> None:
+        try:
+            _agent.reflect()
+        except Exception:
+            _reflect_stream.exception("反思失败")
+
+    threading.Thread(target=run, name="chat-reflect", daemon=True).start()
     return True
 
 
@@ -370,19 +326,20 @@ _AGENT_HINT_KEY = "agent_hint"
 
 
 def _agent_hint() -> str:
-    value = storage.get("", "agent").get(_AGENT_HINT_KEY)
-    if not isinstance(value, str) or not value.strip():
-        return ""
-    return f"待办（你用 edit_hint 保存，可整体替换或清空）：\n{value}"
+    """The todo note, shown at the end of every sub-request so edits show up at once.
 
-
-def set_agent_hint(text: str) -> None:
+    WHY: 待办以前存在 storage 的 `agent_hint` 键里，2026-10-22 维护者让它退化成普通文件
+    （笔记 `todo`）。第一次读到旧键时搬过去并删掉旧键，之后只认文件。
+    """
     data = storage.get("", "agent")
-    if text.strip():
-        data[_AGENT_HINT_KEY] = text.strip()
-    else:
-        data.pop(_AGENT_HINT_KEY, None)
-    storage.save()
+    legacy = data.get(_AGENT_HINT_KEY)
+    if isinstance(legacy, str) and legacy.strip() and not _notes.read("todo").strip():
+        _notes.write("todo", legacy)
+    if _AGENT_HINT_KEY in data:
+        del data[_AGENT_HINT_KEY]
+        storage.save()
+    value = _notes.read("todo").strip()
+    return f"待办（笔记 todo，用 write_note 改）：\n{value}" if value else ""
 
 
 # 会话主体持久激活的工具模块名，以及各自最后一次被调用的时刻。
@@ -605,7 +562,7 @@ def _subcommand_call(event: dict) -> Callable | None:
     if subcommand not in _subcommands._SUBCOMMAND_NAMES:
         return None
     if _subcommands.requires_op(value[1:]) and not op.require_op(
-            event, pattern=r"^#\s*(hint|use_model|add_prompt|use_setting|set_setting|del_setting|image|reasoning|limit|reflect)"):
+            event, pattern=r"^#\s*(hint|use_model|add_prompt|use_setting|set_setting|del_setting|image|reasoning|limit|reflect|awaker)"):
         # WHY: 全局设置不可由普通群友改写；只读子命令保持公开。
         return None
     return lambda value=value: _subcommands._subcommand(value[1:])
@@ -776,13 +733,13 @@ def on_load(ctx) -> None:
 
     threading.Thread(target=resume_pending, name="chat-agent-resume", daemon=True).start()
 
-    def start_reflection_schedule() -> None:
+    def start_awaker() -> None:
         from mods import wait_booted
 
         if wait_booted(120):
-            schedule_reflection()
+            _awaker.schedule()
 
-    threading.Thread(target=start_reflection_schedule, name="chat-reflect-schedule", daemon=True).start()
-from . import view as _view, reader as _reader, agent as _agent, roles as _roles, subcommands as _subcommands
+    threading.Thread(target=start_awaker, name="chat-awaker-start", daemon=True).start()
+from . import view as _view, reader as _reader, agent as _agent, roles as _roles, subcommands as _subcommands, notes as _notes, awaker as _awaker
 from .view import has_at, msg_split
 from .reader import parse_target, prepare_recovery_sources, mark_window_read

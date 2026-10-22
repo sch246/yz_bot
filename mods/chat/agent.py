@@ -5,8 +5,12 @@ a fixed start" with a per-activation rebuild (see
 docs/working/proposals/stateless-agent-loop.md).  The oplog still records every
 output and result; it is no longer shown back wholesale.  Each wake shows only
 what a person would have in mind on being called: how she does things, what was
-going on just now, the window that called her and who is in it.  Everything else
-she recalls herself; the librarian lets go of what she looked at (2026-10-22).
+going on just now, what she has done today, the window that called her and who
+is in it.  Everything else she recalls herself.
+
+WHY: 2026-10-22 维护者定的极简做法：白天只有一份"今天做过的事"的列表，跟着每次唤醒
+往下长；图书管理员不在每次唤醒后自动跑，只在她自己调用 `tidy`、上下文太长、这份列表
+太长时把它收进笔记，夜里再统一写日记、整理笔记。
 """
 
 from __future__ import annotations
@@ -20,9 +24,10 @@ import mods.chat as _chat_root
 from . import actions as _actions, journal as _journal, notes as _notes, reader as _reader, roles as _roles, screen as _screen, view as _view
 
 _SEEN_KEY = "seen"
-# Within one activation, results older than these stay readable by id only.
+# The day's list keeps this many latest actions in full; older ones keep their title.
 _CURRENT_FULL = 12
 _CURRENT_CHARS = 1500
+_TIDIED_KEY = "tidied_at"
 # A window shows at least this many lines before its first unseen one.
 _LEAD_IN = 3
 _KNOWN_PEOPLE = 6
@@ -70,20 +75,33 @@ def _woken(notice: dict | None, turn) -> tuple[list[tuple], list[str], list[int]
 def _plan(woken: list[tuple], authors: list[int], count: int) -> dict:
     """What is in mind on waking, before she recalls anything herself.
 
-    WHY: 做法（global）和短期记忆（recent）每次都在；叫醒她的窗口和叫她的人的笔记也在——
-    认出是谁在叫自己不是一次检索，是看到就想起来的。除此之外都由她自己召回。
+    WHY: 做法（global）、短期记忆（recent）和最近一篇日记每次都在（待办在末尾 hint）；叫醒她的
+    窗口和叫她的人的笔记也在——认出是谁在叫自己不是一次检索，是看到就想起来的。除此之外
+    都由她自己召回。
     """
-    scopes = ["global", "recent", *(_notes.scope_of(window) for window in woken)]
+    days = [key for key in _notes.diaries() if len(key) == 10]
+    scopes = ["global", "recent", *(f"diary:{days[-1]}" for _ in days[-1:]),
+              *(_notes.scope_of(window) for window in woken)]
     scopes.extend(f"person:{author}" for author in authors[:_KNOWN_PEOPLE])
     return {"windows": [(window, count) for window in woken], "notes": list(dict.fromkeys(scopes))}
 
 
-def _current_actions(turn) -> list[str]:
-    """This wake's actions; those the librarian already let go of keep only their title."""
-    found = _actions.pairs(ids=turn.action_ids) if turn.action_ids else []
-    released, kept = found[:turn.released], found[turn.released:]
-    older, recent = kept[:-_CURRENT_FULL], kept[-_CURRENT_FULL:]
-    lines = [_actions.title(output) for output, _result in released + older]
+def tidied_at() -> float:
+    """When the librarian last folded the day's actions into notes."""
+    data = storage.get("", "agent")
+    value = data.get(_TIDIED_KEY)
+    if not isinstance(value, (int, float)):
+        # 第一次运行新循环：从现在起算，不把旧日志里的行动一股脑算进今天。
+        value = data[_TIDIED_KEY] = time.time()
+        storage.save()
+    return float(value)
+
+
+def _day_actions() -> list[str]:
+    """Everything she has done since the last tidy; older entries keep only their title."""
+    found = _actions.pairs(after=tidied_at())
+    older, recent = found[:-_CURRENT_FULL], found[-_CURRENT_FULL:]
+    lines = [_actions.title(output) for output, _result in older]
     lines.extend(_actions.render(output, result, chars=_CURRENT_CHARS) for output, result in recent)
     return lines
 
@@ -96,14 +114,15 @@ def _assemble(plan: dict, turn, woken: list[tuple]) -> tuple[list[dict], dict[st
     summary = ["笔记 " + ("、".join(f"{part.split(chr(10), 1)[0].removeprefix('## 笔记 ')}({len(part)}字)"
                                    for part in note_parts) or "（无）")]
     if note_parts:
-        messages.append({"role": "user", "content": "以下是你的笔记（图书管理员整理，可能不完整）：\n\n"
+        messages.append({"role": "user", "content": "以下是你的笔记（普通文件，你和图书管理员都会写，可能不完整）：\n\n"
                          + "\n\n".join(note_parts)})
     messages.append({"role": "user", "content": "你可以召回的东西（用 read_log、search_log、read_actions、read_note 读原文）：\n"
-                     + _roles.directory(woken, turn.action_ids)})
-    current = _current_actions(turn)
-    if current:
-        messages.append({"role": "user", "content": "本次唤醒中你已经做过的行动（只剩标题的已由图书管理员整理进短期记忆，"
-                         "可用 read_actions 读全文）：\n" + "\n".join(current)})
+                     + _roles.directory(woken, tidied_at())})
+    today = _day_actions()
+    summary.append(f"今天的行动 {len(today)} 条")
+    if today:
+        messages.append({"role": "user", "content": "你上次整理以来做过的事（较早的只列标题，可用 read_actions 读全文；"
+                         "整理过的已经收进笔记）：\n" + "\n".join(today)})
     screens: dict[str, str] = {}
     newest: dict[tuple, int | None] = {}
     for window, count in plan["windows"]:
@@ -149,19 +168,34 @@ def _mark_seen(newest: dict[tuple, int | None]) -> None:
     storage.save()
 
 
-def _job(turn, phase: str) -> dict:
-    """What the librarian gets: the screens she saw and this wake's actions not yet let go of."""
-    found = _actions.pairs(ids=turn.action_ids) if turn.action_ids else []
+def _job(turn, phase: str, note: str = "") -> dict:
+    """What the librarian gets: the screens she saw this wake and everything since the last tidy."""
     return {
         "time": time.time(),
         "phase": phase,
+        "note": note,
         "wake": _screen.clock(turn.log["start"]),
         "screens": list(turn.screens.values()),
-        "actions": [_actions.title(output) for output, _result in found[:turn.released]]
-                   + [_actions.render(output, result) for output, result in found[turn.released:]],
+        "actions": [_actions.render(output, result) for output, result in _actions.pairs(after=tidied_at())],
         "scopes": _roles.involved_scopes(
             [_reader.parse_target(label) for label in turn.screens], list(turn.screens.values())),
     }
+
+
+def _tidy(turn, phase: str, note: str) -> None:
+    """Let the librarian fold the day's list into notes; the list restarts from now."""
+    turn.log["lines"].append(f"整理（{note}）：上下文约 {turn._chat_usage_tokens} token")
+    started = time.time()
+    try:
+        _roles.organize(_job(turn, phase, note))
+    except Exception:
+        # 整理失败也照样继续：列表还在，只是没有收进笔记。
+        _roles._stream.exception("整理失败")
+        turn.log["warnings"].append("⚠ 整理失败，见终端日志")
+        return
+    turn.tidied.update(turn.action_ids)
+    storage.get("", "agent")[_TIDIED_KEY] = started
+    storage.save()
 
 
 _RECALL = ("read_log", "search_log", "read_actions", "read_note")
@@ -174,8 +208,9 @@ def _begin(turn, window: tuple | None, kind: str) -> None:
     turn.action_ids = []
     turn.screens = {}
     turn.authors = []
-    turn.release = False
-    turn.released = 0
+    turn.release = ""
+    turn.tidied = set()
+    turn.alarm = None
     turn.log = {"kind": kind, "start": time.time(), "lines": [], "warnings": [], "peak": 0,
                 "assemblies": 0, "said": {}, "other": {}}
 
@@ -183,7 +218,7 @@ def _begin(turn, window: tuple | None, kind: str) -> None:
 def _note_results(turn, results) -> None:
     """Journal lines for one result batch: what she recalled, said and used."""
     log = turn.log
-    released = set(turn.action_ids[:turn.released])
+    released = turn.tidied
     for result in results:
         name = result.name.rsplit("__", 1)[-1]
         arguments = _actions.parse_arguments(result.arguments)
@@ -229,7 +264,7 @@ def _compose_journal(turn, cancelled: bool) -> None:
     body = list(log["lines"])
     if log["said"]:
         body.append("说话：" + "；".join(f"{target} {count} 次" for target, count in log["said"].items()))
-    elif log["kind"] == "唤醒":
+    elif log["kind"] in ("唤醒", "闹钟"):
         body.append("说话：没有开口")
     if log["other"]:
         body.append("其它工具：" + "、".join(f"{name}×{count}" for name, count in log["other"].items()))
@@ -239,11 +274,13 @@ def _compose_journal(turn, cancelled: bool) -> None:
     _journal.append(head, body)
 
 
-def _drive_agent(model: str | None, window: tuple) -> None:
+def _drive_agent(model: str | None, window: tuple | None, alarm: tuple[str, str] | None = None) -> bool:
+    """Hold the agent's turn until nothing is left to do; False when someone else holds it."""
     turn, owner = context.begin_turn(_chat_root.AGENT_WINDOW)
     if not owner:
-        return
-    _begin(turn, window, "唤醒")
+        return False
+    _begin(turn, window, "闹钟" if alarm else "唤醒")
+    turn.alarm = alarm
     # WHY: 一次对话 = 这次持有的全过程（多轮 + 插话续写，直到 finally），图片检查台账就
     # 活在这段里：同一张图不重复下载/解析，对话结束即清掉，下次再聊重新检查一遍。
     image_ledger = image.begin_conversation()
@@ -254,39 +291,43 @@ def _drive_agent(model: str | None, window: tuple) -> None:
             context.set_agent_mode(True)
             try:
                 if not _run_agent(model, turn):
-                    return
+                    return True
             finally:
                 context.set_agent_mode(False)
                 context.set_current(origin)
             if turn.cancelled:
-                return
+                return True
             if turn.release:
-                # 同一次唤醒里上下文涨过阈值：先让图书管理员把已做的事放下（写进短期记忆），
-                # 再重新组装接着干，不等新消息。
-                turn.release = False
-                turn.log["lines"].append(f"放下：上下文约 {turn._chat_usage_tokens} token，请图书管理员整理")
-                try:
-                    _roles.organize(_job(turn, "release"))
-                except Exception:
-                    # 放下失败也照样重组：行动仍按"最近原文、较早标题"出现，只是没有新结论。
-                    _roles._stream.exception("唤醒中途的放下失败")
-                    turn.log["warnings"].append("⚠ 唤醒中途的放下失败，见终端日志")
-                else:
-                    turn.released = len(turn.action_ids)
+                # 她叫了 tidy，或者这次唤醒的上下文涨过阈值：先让图书管理员把今天的事收进
+                # 笔记，再重新组装接着干，不等新消息。
+                note, turn.release = turn.release, ""
+                _tidy(turn, "release", note)
                 continue
             turn.associated_windows.intersection_update(
                 {window for window, _count, active in oplog.pending_summary() if active})
             if not context.finish_turn(_chat_root.AGENT_WINDOW, turn, oplog.has_unnotified):
-                return
+                return True
     finally:
         image.end_conversation(image_ledger)
         context.end_turn(_chat_root.AGENT_WINDOW, turn)
         _write_journal(turn, turn.cancelled)
-        if not turn.cancelled and (turn.screens or turn.action_ids):
-            _roles.enqueue(_job(turn, "end"))
         # WHY: 循环停下的唯一信号就在这里，见 _run_hint。
-        if origin is not None:
+        if origin is not None and window is not None:
             _chat_root._run_hint(window, turn)
+
+
+def alarm(reason: str, rule: str) -> bool:
+    """A wake she or the maintainer scheduled in the awaker note; False when she is busy."""
+    return _drive_agent(None, None, (reason, rule))
+
+
+def request_tidy(note: str) -> bool:
+    """Called by the `tidy` tool: fold the day's list into notes once this round ends."""
+    turn = context.get_turn(_chat_root.AGENT_WINDOW)
+    if turn is None or not hasattr(turn, "release"):
+        return False
+    turn.release = note or "她自己要求整理"
+    return True
 
 
 def _run_agent(model: str | None, turn) -> bool:
@@ -297,18 +338,27 @@ def _run_agent(model: str | None, turn) -> bool:
     turn.authors = list(dict.fromkeys([*turn.authors, *authors]))
     # 续做时没有新唤醒，沿用刚才看着的窗口。
     focus = woken or [_reader.parse_target(label) for label in turn.screens]
-    if notice is None and not focus and not turn.action_ids:
+    if notice is None and not focus and not turn.action_ids and not turn.alarm:
         return True
-    reason = "醒来" if not turn.log["assemblies"] else "放下后" if turn.released else "续做"
+    threshold = max_tokens * _chat_root.agent_setting("pressure_percent") // 100
+    if _chat_root.count_tokens("\n".join(_day_actions())) > threshold // 3:
+        # 今天的列表本身已经太长：先收进笔记再组装，免得每次醒来都背着它。
+        _tidy(turn, "release", "今天的行动列表太长")
+    reason = "醒来" if not turn.log["assemblies"] else "整理后" if turn.tidied else "续做"
     messages, screens, newest, summary = _assemble(_plan(focus, turn.authors, max_events), turn, focus)
     if not messages and notice is None:
         return True
     if notice is not None:
         messages.append({"role": "user", "content": "这次唤醒你的是：\n" + "\n".join(activation_lines)})
         turn.log["lines"].extend("叫醒：" + line for line in activation_lines)
-    threshold = max_tokens * _chat_root.agent_setting("pressure_percent") // 100
+    if turn.alarm:
+        reason_text, rule = turn.alarm
+        messages.append({"role": "user", "content": f"这次是 awaker 笔记里的闹钟叫醒你的（规则：{rule}）：{reason_text}\n"
+                         "没有人在等你回话；看看要不要做点什么，没事就直接结束。"})
+        turn.log["lines"].append(f"闹钟：{rule}")
 
     def first_output() -> None:
+        turn.alarm = None
         if notice is not None:
             oplog.acknowledge_notification(notice["id"])
         _mark_seen(newest)
@@ -319,11 +369,11 @@ def _run_agent(model: str | None, turn) -> bool:
         # 重新组装时最近的行动原文仍在，较早的留标题、可按号读回；前提没有被砍掉，只是收起了。
         # 只算这次唤醒里长出来的部分：开局材料本身就大时，放下也不会变小，不能因此空转。
         if used > threshold and used - initial > threshold // 3:
-            turn.release = True
+            turn.release = "上下文太长"
             return True
         return False
 
-    return _run_session(model, turn, messages, first_output, over_budget,
+    return _run_session(model, turn, messages, first_output, lambda used, initial: bool(turn.release) or over_budget(used, initial),
                         hints=[lambda: _unread_hint(set(newest))],
                         assembly=f"组装 {turn.log['assemblies'] + 1}（{reason}）", summary=summary)
 
@@ -424,8 +474,9 @@ def reflect(model: str | None = None) -> bool:
     """The nightly look back over how memory ran.  False means the agent was busy; try later.
 
     WHY: 维护者 2026-10-22：她要像人调试她那样调试自己，每晚观察记忆系统运行得怎么样。
-    这里只准备材料并给她 memory_system；看什么、改不改由她决定。占住 AGENT_WINDOW，
-    反思期间来的召唤照常登记，结束后由 pick_up_pending 接上。
+    先让图书管理员把这一天收成日记、整理笔记，再准备反思材料并给她 memory_system；
+    看什么、改不改由她决定。占住 AGENT_WINDOW，期间来的召唤照常登记，结束后由
+    pick_up_pending 接上。
     """
     turn, owner = context.begin_turn(_chat_root.AGENT_WINDOW)
     if not owner:
@@ -435,6 +486,7 @@ def reflect(model: str | None = None) -> bool:
     last = data.get("reflected_at")
     image_ledger = image.begin_conversation()
     try:
+        _night(turn)
         material = _journal.since(last if isinstance(last, (int, float)) else None, _REFLECT_CHARS)
         if not material.strip():
             turn.log["lines"].append("上次反思以来没有新的记录，跳过")
@@ -453,6 +505,41 @@ def reflect(model: str | None = None) -> bool:
         _write_journal(turn, turn.cancelled)
     pick_up_pending()
     return True
+
+
+def diary_day(moment: float) -> str:
+    """The day a nightly run writes about: before noon it is still yesterday's night."""
+    return time.strftime("%Y-%m-%d", time.localtime(moment - 12 * 3600))
+
+
+def _night(turn) -> None:
+    """The librarian's nightly pass: the day's diary, notes, and month/year roll-ups."""
+    day = diary_day(turn.log["start"])
+    started = time.time()
+    try:
+        _roles.organize({**_job(turn, "night"), "day": day,
+                         "journal": _journal.since(tidied_at() - 1, 12000)})
+    except Exception:
+        _roles._stream.exception("夜间整理失败")
+        turn.log["warnings"].append("⚠ 夜间整理失败，见终端日志")
+        return
+    storage.get("", "agent")[_TIDIED_KEY] = started
+    storage.save()
+    turn.log["lines"].append(f"夜间整理：日记 diary:{day}")
+    # 一个月、一年的最后一夜各汇总一次；汇总只读日记，原文仍在 chatlog 里。
+    following = time.localtime(time.mktime(time.strptime(day, "%Y-%m-%d")) + 36 * 3600)
+    periods = []
+    if following.tm_mday == 1:
+        periods.append(day[:7])
+        if following.tm_mon == 1:
+            periods.append(day[:4])
+    for period in periods:
+        try:
+            _roles.summarize(period)
+            turn.log["lines"].append(f"汇总：diary:{period}")
+        except Exception:
+            _roles._stream.exception(f"汇总 {period} 失败")
+            turn.log["warnings"].append(f"⚠ 汇总 diary:{period} 失败")
 
 
 def _run_reflection(model: str | None, turn, material: str) -> None:
