@@ -21,17 +21,17 @@ _SUBCOMMAND_HELP = (
 #prompt              显示全文
 #prompt set <全文>   整份替换；set 之后第一个换行起是全文，留空表示清空"""),
     ("image [off|lazy|eager]", "查看或设置图片读取档位"),
-    ("reasoning [keep|drop]", "查看或设置中心已读输出是否原生带回思考内容"),
+    ("reasoning [keep|drop]", "查看或设置以前几次唤醒的思考是否随这一段上下文带回"),
     ("limit [<画面条数> <整理阈值>|reset]", """查看或设置中心 agent 的窗口画面条数与整理阈值（管理员）。
 
 格式：#limit | #limit <画面条数> <整理阈值> | #limit reset
-每次唤醒都重新组装上下文：画面条数是一个窗口默认展示多少条聊天记录；整理阈值（token）是什么时候请图书管理员把她做过的事收进笔记，即 data/notes/policy/tidy.py 里的 limit。默认条件是一次唤醒里上下文超过阈值（且主要是这次长出来的），或上次整理以来的行动列表超过阈值的三分之一。默认值分别为 80、30000。
+画面条数是一个窗口第一次出现在这一段上下文里时展示多少条聊天记录；整理阈值（token）是这一段上下文长到多少就交接，即 data/notes/policy/tidy.py 里的 limit。默认值分别为 80、30000。
 #limit                      显示两个值，并标出来自全局覆盖还是默认
 #limit <画面条数> <整理阈值>  写入全局设置
 #limit reset                清掉全局设置，回落到默认"""),
-    ("reflect [now]", """查看上次反思时间，或现在就跑一次夜间整理与反思（管理员）。
+    ("reflect [now]", """查看上次反思时间，或现在就跑一次夜间交接与反思（管理员）。
 
-夜间整理：图书管理员把这一天写成日记（data/notes/diary/），整理笔记；月末、年末各汇总一次。反思：她读上次反思以来的记忆系统日志（data/journal/），评估自己之前的策略改动，必要时改给图书管理员的附加说明或自己的做法笔记；不对外说话。什么时候自动跑由 awaker 规则决定，默认 daily 04:00 reflect。
+先把手上这一段上下文交接掉（笔记、日记确认到位后归档到 data/context/archive/），月末、年末各汇总一次日记；然后她用新的一段反思：像人排查一样从症状出发，读归档的上下文、聊天记录、行动记录和笔记的历史版本找原因，必要时改策略或写提案；不对外说话。什么时候自动跑由 awaker 规则决定，默认 daily 04:00 reflect。
 #reflect          显示上次反思时间
 #reflect now      现在就跑一次（中心 agent 正忙时不执行）"""),
     ("awaker [set <规则>]", """查看或改写她的闹钟规则（改写要管理员）。
@@ -40,7 +40,7 @@ _SUBCOMMAND_HELP = (
 every 10m <理由>             每隔一段时间叫醒她一次（最短 1m）
 daily 23:30 <理由>           每天这个时刻
 at 2026-10-23 08:00 <理由>   某个时刻一次
-理由写 reflect 表示夜间整理与反思；其它理由原样交给她。文件为空时只有 daily 04:00 reflect。
+理由写 reflect 表示夜间交接与反思；其它理由原样交给她。文件为空时只有 daily 04:00 reflect。
 #awaker              显示规则、上次响的时间和不认识的行
 #awaker set <规则>   整份替换；set 之后第一个换行起是规则全文"""),
     ("hint [get|set|default]", """查看、编写或开关本窗口的结束提示（管理员）。
@@ -261,7 +261,7 @@ def _reflect_subcommand(tail: str) -> str:
         shown = datetime.fromtimestamp(last).strftime("%Y-%m-%d %H:%M") if isinstance(last, (int, float)) else "还没有"
         return f"上次反思：{shown}；什么时候自动跑见 #awaker"
     if tail == "now":
-        return "开始夜间整理与反思，记录写在 data/journal/" if _chat_root.reflect_now() else "中心 agent 正忙，稍后再试"
+        return "开始夜间交接与反思，反思这一段归档在 data/context/archive/" if _chat_root.reflect_now() else "中心 agent 正忙，稍后再试"
     return "reflect 参数错误，可用 #help reflect 查看"
 
 
@@ -273,10 +273,7 @@ def _awaker_subcommand(raw: str) -> str:
     if head.strip().partition(" ")[0] != "set":
         return "awaker 参数错误，可用 #help awaker 查看"
     text = cq.unescape((head.strip()[3:].strip() + "\n" + rest).strip())
-    from . import journal
-
-    previous = _chat_root._notes.write("awaker", text)
-    journal.append("维护者改 awaker", journal.diff(previous, text))
+    _chat_root._notes.write("awaker", text)
     return _chat_root._awaker.report()
 
 
@@ -289,10 +286,7 @@ def _prompt_subcommand(raw: str) -> str:
     if head.strip().partition(" ")[0] != "set":
         return "prompt 参数错误，可用 #help prompt 查看"
     text = cq.unescape((head.strip()[3:].strip() + "\n" + rest).strip())
-    from . import journal
-
-    previous = _chat_root._notes.write("self", text)
-    journal.append("维护者改 self", journal.diff(previous, text))
+    _chat_root._notes.write("self", text)
     return "已改写 self" if text else "已清空 self"
 
 

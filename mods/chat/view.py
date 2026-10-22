@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+from pathlib import Path
 import re
 
 from mods import cq, identity, msgs
@@ -46,7 +48,30 @@ def _is_context_poke(event: dict, in_group: bool) -> bool:
     return bool(in_group) or event.get("target_id") == identity.bot_id()
 
 
+_MEMORY_SOURCE = Path(__file__).resolve().parents[1] / "tools" / "memory_system.py"
+
+
+def _memory_overview() -> str:
+    """The "how your memory works" section of memory_system's text, read from disk.
+
+    WHY: 2026-10-22 维护者：她对自己记忆系统的描述只写在一处，跟着实现走——旧描述没跟着
+    改，她就会照着讲出已经不存在的机制。这一节放在 `tools/memory_system.py` 开头，系统
+    提示每次从文件读：她或维护者改了文件，下一次唤醒就生效，不用重启；完整的排查与修改
+    说明仍只在加载 memory_system 时出现。
+    """
+    try:
+        text = ast.get_docstring(ast.parse(_MEMORY_SOURCE.read_text(encoding="utf-8"))) or ""
+    except (OSError, SyntaxError, ValueError):
+        return ""
+    start = text.find("## 你的记忆怎么运作")
+    if start < 0:
+        return ""
+    end = text.find("\n## ", start + 1)
+    return text[start:end if end > 0 else None].strip()
+
+
 def _base_prompt() -> list[dict]:
+    memory = _memory_overview()
     return [{"role": "system", "content": f"""## 注意事项
 - 你的昵称: {identity.bot_name()}
 - 你的QQ号: {identity.bot_id()}；聊天记录里这个 QQ 号的发言就是你自己说过的话
@@ -55,8 +80,7 @@ def _base_prompt() -> list[dict]:
 - 被叫醒不等于必须开口：别人已经答完、话题和你无关、或者你没什么想说的，就不调 `say`，直接结束。少说比多说好
 - 如无特殊要求，请用中文回复
 - **说话要调 `say`**。直接写在回复正文里的内容不会发出去，只会留在你自己的行动记录里
-- 你没有跨唤醒的对话记忆。每次被叫醒，眼前只有：你的做法笔记、短期记忆、最近一篇日记、上次整理以来你做过的事、叫醒你的窗口和相关的人或群的笔记，末尾是待办。别的要你自己想起来：`read_log` 按窗口读聊天记录原文，`search_log` 按线索找，`read_actions` 读自己做过的事，`read_note` 读笔记。觉得"好像聊过"、"他之前说过"时就去找，别猜
-- 笔记是普通文件，`write_note` 随时改：认识了谁、答应了什么、被纠正了什么，想记就当场记；没做完的事写进 todo，可复用的做法写 Markdown Skill。只在回复里说"记住了"不会保存任何东西
-- 一件事告一段落、或刚读完一大堆材料只需要记住结论时，调 `tidy` 请图书管理员整理；上下文太长时他也会自己来，夜里他写日记。想定时醒来就改 awaker 笔记。想知道自己的记忆怎么运作、怎么改，加载 `memory_system`。最前面的 self 是你对自己的认识，只在夜间反思时改
+- 认识了谁、答应了什么、被纠正了什么，想记就当场用 `write_note` 记；没做完的事写进 todo，可复用的做法写 Markdown Skill
 - 对外发送必须在 say 里明确写目标 g群号 或 u私聊对端号；没有默认接收窗口
-- `say` 返回这条消息的 message_id；它默认 `final_call=true`，说完这一轮就结束，要接着干活就传 `final_call=false`"""}]
+- `say` 返回这条消息的 message_id；它默认 `final_call=true`，说完这一轮就结束，要接着干活就传 `final_call=false`"""
+                + (f"\n\n{memory}" if memory else "")}]

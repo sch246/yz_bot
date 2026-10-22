@@ -244,6 +244,13 @@ D7 让 [chatlog 格式](../../chatlog-format.md)里"模型看到的名字是另�
 
 D10 因此只剩图书管理员一个对象。D11 背后的想法是维护者的原话："检索如果可以迭代的话，那好像不需要主会话了，她本身就是过程，只需要维持自己的短期记忆就能思考和行事了。"拆出选材原本是为了让检索过程不进主上下文；现在由图书管理员在上下文太长时替她放下，同样的目的换到了另一端。
 
+### 7.2 同一段上下文与交接（2026-10-22）
+
+| 编号 | 问题 | 维护者的裁定 |
+|---|---|---|
+| D20 | 白天的上下文与"放下" | 只要不跑交接，就一直是同一个上下文，每次唤醒只往后追加；"上次整理以来"不用另算，它就是这一段。交接的驱动力是"这段上下文要被移除了，确认交接做好"：在同一段末尾说一句，她把不同类型的信息确认到各自的地方（recent、人和群的笔记、global、todo、当天日记），然后这段归档。交接要能安全地多次运行：笔记和日记都是改写成应有的样子，日记不累加。不再另起一个只看到摘要的图书管理员会话，也不再有每次重组和"今天的行动列表"。夜里反思和人排查她一样：从症状出发，读归档的上下文和原始记录找原因。记忆系统日志（journal）删除：她的行动在行动记录里，交接写笔记的操作也在，归档的上下文和笔记历史版本已包含排查要的东西 |
+| D20.1 | 交接后第一次被叫醒怎么组装 | 开头是 self、注意事项（含"你的记忆怎么运作"，只写在 `tools/memory_system.py` 一处）和工具状态，接着是 global、recent、最近一篇日记和只列名字的目录，然后是这次唤醒的画面（新的一段里给默认 80 条，包括已经看过的旧消息）。之后每次唤醒只追加新消息、第一次出现的人或群的笔记和叫醒原因 |
+
 ## 8. 验证
 
 **离线回放对照**：用重写后的回放（5.4）在同一段 chatlog 上比较：
@@ -300,17 +307,17 @@ S1 之后系统就能单独运行；S3、S4 的效果用 S2 的回放逐个对�
 |---|---|---|
 | S1 画面与格式 | `mods/chat/screen.py`、`agent._assemble` | 直接读 chatlog 普通日志的原文记录；`agent.seen` 记看到的时间并标出新消息；跳过 `#` 开头的控制消息 |
 | S1 行动记录 | `mods/chat/actions.py` | oplog 的输出与结果渲染成和 chatlog 同形的记录；`read_actions` 按号读回 |
-| S1 去掉重放 | `agent._run_agent`、`tools/meta.py` | 不再重放经历流；移除固定起点、压力提示、`#reset_start`、工具状态差量通告，以及 `cover_events`、`recall_events`、`event_links` 与七个聊天软件式阅读工具；新增 `read_log`、`read_actions`、`read_note` |
-| 整理（D14、D17） | `agent._tidy`、`agent._tidy_reason`、`agent._day_actions`、`tools/meta.tidy` | 白天的列表是 `agent.tidied_at` 之后的全部行动。她调用 `tidy`，或 `data/notes/policy/tidy.py` 的 Python 条件成立时（默认：一次唤醒里上下文长过整理阈值 `agent.tidy_token`，2026-10-22 起由 `#limit <画面条数> <整理阈值>` 设，取代 `max_token × pressure_percent`；或列表本身超过它的三分之一），同步跑一次图书管理员，之后列表从当时重新开始。条件写坏时按默认判断并记 `⚠`。不再在每次唤醒结束后整理 |
+| 同一段上下文（D20） | `chat.segment`、`agent._run_agent`、`agent._head`、`agent._people` | `data/context/current.json` 存当前一段（系统提示每次重建，其余原样，含原生 assistant/tool 配对），每轮后更新；新一段以笔记和目录开头，之后每次唤醒只追加；已经出现过的窗口从 `last_shown` 那条之后接着给；被打断的工具调用读回时补结果 |
+| 交接（D20） | `agent._handoff`、`agent._tidy_reason`、`roles.handoff_prompt`、`tools/meta.tidy` | 她调用 `tidy`、`data/notes/policy/tidy.py` 的条件成立（默认 `used > limit`）或夜里到点时，在同一段末尾追加交接指令，用同样的上下文和工具跑一次，`say` 拒绝发言；完成后归档到 `data/context/archive/`，没完成不归档；一次唤醒最多交接 3 次 |
 | `#hint` 文件（D17） | `chat.hint_config`、`chat.save_hint` | `data/hint/default.py` 与 `g<群号>.py`／`u<QQ号>.py`，首行 `# on`／`# off`，其余是代码；合并规则不变；旧 storage 配置第一次读到时搬进文件 |
 | self 与正在输入（D18） | `chat.get_prompt`、`chat._migrate_self`、`tools/memory_system.edit_policy`、`agent._keep_typing` | `data/notes/self.md` 在系统提示最前；旧提示词第一次读到时搬入，storage 旧值不删；`write_note("self")` 和图书管理员被拒，`edit_policy("self")` 只在反思时可用；`#prompt [set]`。私聊唤醒期间每 5 秒 `set_input_status` |
-| D11 召回 | `agent._plan`、`roles.directory`、`roles.search_log` | 醒来时只有 global、recent、叫醒她的窗口画面、这些窗口与作者的笔记，以及一份可召回内容的目录；其余由她用 `read_log`／`search_log`／`read_actions`／`read_note` 自己读。`search_log` 按子串在聊天记录里找线索，`read_actions` 可按词筛，`read_log` 的 `before` 接受画面里的日期时间。2026-10-22 上午的第一版曾有前置选材（`roles.select`），按 D11 移除 |
-| S3 图书管理员 | `roles.organize`、`roles.summarize` | 只在整理和夜间运行，串行；不改 todo 和 awaker。夜间写 `diary:<日期>`、整理人和群的笔记、global 和交接用的 recent；月末、年末各汇总一篇。提示词参照 retro：读一手材料、纠正优先、决定与承诺写成经历、删掉不再改变行为的条目 |
+| D11 召回 | `roles.directory`、`roles.search_log`、`roles.read_actions` | 一段开头只有 global、recent、最近一篇日记和只列名字的目录；其余由她用召回工具读 |
+| 日记汇总 | `roles.summarize` | 月末、年末把日记改写成 `diary:YYYY-MM`／`diary:YYYY`，用主模型；单独的图书管理员会话已删除 |
 | 笔记（D15） | `mods/chat/notes.py`、`tools/meta.write_note` | `data/notes/` 下的普通 Markdown：global、recent、todo、awaker、person、group、diary。她随时用 `write_note` 改，维护者直接编辑；改前备份到 `.history/`，内容没变不写。旧 storage 待办第一次读到时搬进 todo |
-| 可观察 | `mods/chat/journal.py`、`agent._write_journal`、`roles._organize` | `data/journal/YYYY-MM-DD.log`：每次唤醒、每次整理、每次策略改动各一条，chatlog 同形；`⚠` 标出代码能判断的信号（找了没找到、找的东西笔记里已有、读回刚放下的行动、画面里有人说她忘了、笔记超长） |
-| 自我改进 | `mods/tools/memory_system.py`、`notes.POLICIES` | 工具模块说明上下文怎么来、能改什么；`read_journal`、`read_policy`、`edit_policy`（librarian／global／proposals，必须写原因和预期，自动记进 changes）、`assess_change`。图书管理员的附加说明每次整理时附在它的提示词后 |
+| 可观察 | `chat.segment`、`notes.versions` | 归档的每一段上下文原样留着，笔记旧版本在 `.history/`；`chat.journal` 已删除 |
+| 自我改进 | `mods/tools/memory_system.py`、`view._memory_overview` | 开头"你的记忆怎么运作"一节每次进系统提示；工具 `read_context`（读归档段）、`note_history`、`read_policy`、`edit_policy`（self／handoff／global／tidy／proposals，必须写原因和预期）、`assess_change` |
 | 闹钟（D16） | `mods/chat/awaker.py`、`#awaker` | 笔记 awaker 每行一条规则：`every 10m`、`daily HH:MM`、`at YYYY-MM-DD HH:MM` 加理由；每分钟检查一次。理由 `reflect` 是夜间整理与反思，笔记为空时默认 `daily 04:00 reflect`。定点规则忙时下一分钟再试，错过三小时就等下一次 |
-| 夜间整理与反思 | `agent.reflect`、`agent._night`、`#reflect now` | 先让图书管理员写日记、整理笔记、汇总月记年记，再读上次反思以来的日志和改动记录，加载 `memory_system`；不对外说话；结束后接上期间的召唤 |
+| 夜间交接与反思 | `agent.reflect`、`#reflect now` | 先交接手上这一段、汇总月记年记，再用新的一段像人排查一样反思，加载 `memory_system`；反思这一段也归档（`-reflect`） |
 | D7 | `notes.custom_name` | `.setname` 自定义称呼随个人笔记出现，不迁移数据、不改 chatlog |
 
 同时加了一句"被叫醒不等于必须开口"，回应维护者"比起学会什么时候说，更重要的是学会怎么少说"。
@@ -318,14 +325,8 @@ S1 之后系统就能单独运行；S3、S4 的效果用 S2 的回放逐个对�
 ### 验证
 
 - `run.py --check` 通过（129 个文件 / 85 个公开模块，新增 4 个文件）；`--smoke` 83/85，可选失败仍只有 `mcf` 与 `minecraft`，与改动前相同。
-- 仓库外的临时脚本用 smoke 的方式在临时目录启动整个应用，配假 OneBot 与假模型，按维护者的例子跑 A（长任务）→ 无关的 B → 回到 A，检查每次实际发出的请求。D14–D17 之后的版本共 42 项检查，全部通过（下面几条是 D14 之前那一版的检查，现在的版本另外覆盖了：她自己写笔记和待办、`tidy` 把她的说明交给图书管理员、唤醒结束不再整理、图书管理员改不了 todo、旧 storage 待办搬进文件、闹钟按间隔响且只响一次、过期的一次性规则不响、`reflect` 规则触发夜间整理写出日记、下一次唤醒带上日记、月记汇总、awaker 每分钟任务已登记、旧 `#hint` 配置搬进文件、`#hint set` 与开关改写文件、自定义整理条件生效、写坏的整理条件按默认判断并留下 ⚠）：
-  - A：醒来就带着叫她的人的笔记；中途上下文涨过阈值时图书管理员以 release 阶段被调用，重组后的请求带着它写的 recent，之前的行动只剩标题、原始 `read_log` 结果不再出现；唤醒结束后写出群笔记；整个过程没有选材调用。
-  - B：请求里没有 A 的画面和原始记录，但 recent 仍在（连续性）。
-  - 回到 A：群笔记在；她用 `search_log` 按一个词找到了 A 的那条原始记录，用 `read_actions` 按词找到了自己之前说的话；"新消息"分隔线在，B 的内容不在。
-  - 边界：主 agent 不调 `say` 时什么都不发，`#` 开头的消息不进画面。
-  - 日志：每次唤醒都有记录，含组装、召回、放下、说话（没开口也记）；图书管理员的逐行改动在；她去聊天记录找一个笔记里已有的词时出现 `⚠`。
-  - 反思：读到了日志和改动记录，`memory_system` 的工具可用；`edit_policy` 写出附加说明并在 changes 记下原因与预期，`assess_change` 记下评估；之后的图书管理员提示词带上了附加说明；反思期间来的 at 在反思结束后被接上；`#reflect 04:30` 登记了 cron，`off` 移除，`25:00` 被拒绝。
-- 真实模型没有测：这个环境的网络策略拒绝连接 `api.deepseek.com`。她是否会主动召回、图书管理员放下得好不好、token 和费用都还没有证据。
+- 仓库外的临时脚本用 smoke 的方式在临时目录启动整个应用，配假 OneBot 与假模型，检查每次实际发出的请求。D20 之后的版本覆盖：第二次唤醒的请求以保存的一段原样开头、只追加新窗口和它的笔记；回到同一窗口只给新消息；`tidy` 后交接请求就是同一段加交接指令，交接时 `say` 被拒，写出 recent、人物笔记和当天日记，这一段连同交接往来归档，接着用新的一段继续；没有新内容时再交接一次不改写任何笔记；中途超过阈值时交接后继续；被打断的工具调用补结果；`#reasoning drop` 去掉以前的思考；生成期间同窗口的第二次召唤不丢；长工具结果分页读回；超过 200 条新消息的画面；白天写 self 被拒；私聊正在输入；`#limit`、`#hint`；自定义与写坏的交接条件；夜里交接后反思列出归档段、`read_context` 读回原样、`note_history` 列出版本、能改 self，反思这一段也归档。
+- 真实模型没有测：这个环境的网络策略拒绝连接 `api.deepseek.com`。她是否会主动召回、交接做得好不好、token 和费用都还没有证据。
 
 ### 还没做
 
