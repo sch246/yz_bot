@@ -181,7 +181,11 @@ class Actions:
                         tasks=list(self._tasks().values()))
 
     def close(self):
-        """Stop and join. A skill that ignores cancellation can delay this call."""
+        """Stop and join; retain journal/assembly failures without raising them.
+
+        A skill that ignores cancellation can delay this call. Failed writes
+        remain in the Center's failure gate and this worker's status.
+        """
         if threading.current_thread() is self._thread:
             raise RuntimeError("action worker cannot join itself")
         try:
@@ -191,8 +195,15 @@ class Actions:
                         self._available()
                         self._clear_waiting("worker closed")
                         self._cancel_current("worker closed")
+                    except Exception as error:
+                        # WHY: close runs in the owner's finally block. A closed
+                        # persistence gate must not mask its original failure or
+                        # prevent cooperative cleanup; no receipt can be trusted
+                        # after that gate closes, so leave journal outcomes open.
+                        self._halt(error)
                     finally:
                         self._closed = True
+                        self._queue.clear()
                         if self._current:
                             self._current["cancel"].set()
                         self._condition.notify_all()
