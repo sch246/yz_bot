@@ -76,6 +76,7 @@ class _Room:
         self.assembly = center._assembly
         self.actions_state = None
         self.closed_route = False
+        self.current_route = None
 
     def post_event(self, source, event_type, payload, *, wake=False):
         return self.center.post_event(source, event_type, payload, window=WINDOW,
@@ -145,17 +146,21 @@ class _Room:
         if cancelled():
             return {"status": "cancelled", "position": self.position}
         route = step.get("route", "main")
-        if route == "main" and self.closed_route:
-            return {"status": "blocked", "position": self.position, "route": route,
-                    "reason": "road closed"}
-        destination = step["destination"]
-        self.position = step["position"]
-        report({"position": self.position, "destination": destination,
-                "route": route, "route_closed": self.closed_route})
-        self.progress.append({"elapsed": round(time.monotonic() - self.clock, 3),
-                              "position": self.position, "route": route})
-        time.sleep(.18)
-        return {"status": "progress", "position": self.position}
+        self.current_route = route
+        try:
+            if route == "main" and self.closed_route:
+                return {"status": "blocked", "position": self.position, "route": route,
+                        "reason": "road closed"}
+            destination = step["destination"]
+            self.position = step["position"]
+            report({"position": self.position, "destination": destination,
+                    "route": route, "route_closed": self.closed_route})
+            self.progress.append({"elapsed": round(time.monotonic() - self.clock, 3),
+                                  "position": self.position, "route": route})
+            time.sleep(.18)
+            return {"status": "progress", "position": self.position}
+        finally:
+            self.current_route = None
 
     def stop_walk(self) -> str:
         return json.dumps(self.actions.stop("room tool requested stop"), ensure_ascii=False)
@@ -166,7 +171,19 @@ class _Room:
 
     def obstruction(self):
         self.closed_route = True
-        self.actions.stop("synthetic road closure")
+        route = self.current_route
+        if route is None:
+            status = self.actions.status()
+            current = status.get("current")
+            task = next((task for task in status.get("tasks", [])
+                         if task.get("task_id") == current), None)
+            if task is not None:
+                steps = task.get("steps", [])
+                step_index = task.get("step_index", 0)
+                if 0 <= step_index < len(steps):
+                    route = steps[step_index].get("route", "main")
+        if route == "main":
+            self.actions.stop("synthetic road closure")
 
 
 def _active_room():
