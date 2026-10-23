@@ -290,7 +290,7 @@ def _activate_chat(
     binding.restore_schema()
     session.tool_binding = binding
     session.add_hint(lambda: _agent_hint())
-    session.add_hint("对外说话必须实际调用 say；回复正文只是自言自语，不会发送到聊天窗口。")
+    session.add_hint("对外说话要先 type_word 打进输入框、下一步再 send；回复正文只是自言自语，不会发送到聊天窗口。")
     # WHY: 工具恢复可能持久化 ttl 回收；它必须先于其余全局设置读取，避免无关的配置异常
     # 改变这一轮是否完成回收。
     session.do_process_image = get_image_mode() != "off"
@@ -321,16 +321,16 @@ def _restore_agent_tools(binding) -> None:
 def get_handler(session: llm.Chat):
     """The per-chunk sink: self-talk to the terminal, cost to the ledger.
 
-    WHY: 模型写在回复正文里的内容**不发进聊天**。发言仍只能调用 `say`（见
-    `tools/meta.py`）；正文是自己的输出轨迹，记进 oplog，之后以行动记录里的「（自语）」
+    WHY: 模型写在回复正文里的内容**不发进聊天**。发言仍只能 `type_word` 再 `send`（见
+    `tools/meta.py`；2026-10-23 以前是 `say`）；正文是自己的输出轨迹，记进 oplog，之后以行动记录里的「（自语）」
     出现。这样模型能记得刚才的计划，但不会把自言自语误当成已发送消息。
 
-    WHY: 但它要打到终端。人得看得见模型在想什么，尤其是在它**忘了调 `say`**的时候——那
+    WHY: 但它要打到终端。人得看得见模型在想什么，尤其是在它**忘了发**的时候——那
     种轮对聊天窗口是完全静默的，终端这一行是唯一的痕迹。用 msg 流而不是另开一个，是为了
     和 `bot._route`、`message._chatlog_write` 的回显共用同一把行租约，终端顺序才不会乱。
 
-    WHY: 这里不做兜底发送。"正文非空却没调 say 就替它发出去"会把刚删掉的那条旁路原样装
-    回来，而且是隐式的——模型会学会不调 say 照样能说话，`final_call` 那套终止语义随之失效。
+    WHY: 这里不做兜底发送。"正文非空却没发就替它发出去"会把刚删掉的那条旁路原样装
+    回来，而且是隐式的——模型会学会不调 send 照样能说话，`final_call` 那套终止语义随之失效。
     宁可静默一轮、在终端留下证据。
     """
     def handle(chunk: llm.LLMResponse) -> None:
@@ -698,25 +698,41 @@ def capture_chat(event: dict) -> bool:
         if result is not None:
             message.sendmsg(result)
         return True
-    if not activation_signal(event) or history.window(event) is None or not _mail_candidate(event):
+    window = history.window(event)
+    if window is None or not _mail_candidate(event):
+        return False
+    matched = activation_signal(event)
+    # 她给自己埋的「这个窗口来消息就叫我」「等这个人的后续」，见 awaker。
+    waited = (_awaker.take_waiting(window, event.get("user_id"))
+              if msgs.is_msg(event) and event.get("user_id") != identity.bot_id() else [])
+    if not matched and not waited:
         return False
     kind = ("mention" if msgs.is_msg(event) and _reader._addressed(event, msgs.body(event))
             else "poke" if msgs.is_poke(event)
-            else "private" if msgs.is_msg(event) and _private_from_peer(event) else "wake")
+            else "private" if msgs.is_msg(event) and _private_from_peer(event)
+            else "wake" if matched else "")
+    if waited:
+        kind = "；".join(filter(None, [kind, *(f"等到了（{rule['key']}）" for rule in waited)]))
     wake(event, kind)
     return True
 
 
-def wake(event: dict, kind: str = "wake") -> bool:
-    """叫醒她看 *event* 所在的窗口；False 表示没有可叫的（不是聊天消息、已经读过或已经叫过）。
+def wake(event: dict | None = None, kind: str = "wake", reason: str = "") -> bool:
+    """叫醒她：带 *event* 时看那条消息所在的窗口，不带时把 *reason* 交给她；False 表示没有可叫的。
+
+    带消息时 False 是不是聊天消息、已经读过或已经叫过。不带消息时 *kind* 写谁在叫（比如
+    「MC 版本检查」），她正忙时排着，这次唤醒收尾前接上，总是 True。
 
     WHY: 维护者 2026-10-23：唤醒条件不做成规则文件，但要为更多唤醒方式留一个函数入口。
     判据各管各的——`activation_signal` 的 at、名字、私聊、戳一戳，以后别的模块、link 或
     `.py`——判定要叫醒她时都调这里。激活登记在 oplog 里，她正忙时也不丢，这一轮收尾时
     接上。*kind* 原样出现在她看到的「这次唤醒你的是」里。
     只能在这条消息的派发过程中调用（capture、link 节点、它触发的 `.py`）：到达号派发完就
-    释放，事后调用 `event_arrival` 会报错。不带消息的唤醒走 `agent.alarm`。
+    释放，事后调用 `event_arrival` 会报错。不带消息的唤醒（awaker 规则、她用 exec_code 包在
+    某个函数上的钩子、别的模块）随时可以调。
     """
+    if event is None:
+        return _agent.alarm(reason or kind, kind)
     window = history.window(event)
     if window is None or not _mail_candidate(event):
         return False

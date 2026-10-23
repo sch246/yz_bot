@@ -1,4 +1,4 @@
-"""What is left of the old reader: who a message addresses, explicit say targets,
+"""What is left of the old reader: who a message addresses, explicit send targets,
 boot recovery sources, and marking a window read once the agent has seen it."""
 
 from __future__ import annotations

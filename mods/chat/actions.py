@@ -83,7 +83,8 @@ def render(output: dict, result: dict | None, *, chars: int = 1200) -> str:
 def title(output: dict) -> str:
     stamp = time.strftime("%m-%d %H:%M", time.localtime(output.get("read_at", 0)))
     body, calls = _speech(output)
-    said = [parse_arguments(call["arguments"]).get("text", "") for call in calls if call["name"] == "say"]
+    said = [parse_arguments(call["arguments"]).get("text", "") for call in calls
+            if call["name"] in ("type_word", "say")]
     summary = _short(str(said[0]), 40) if said else _short(body, 40)
     return f"{output['id']} [{stamp}] {','.join(call['name'] for call in calls) or '（无工具）'} {summary}".rstrip()
 

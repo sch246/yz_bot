@@ -1,6 +1,6 @@
 '''指导模型增删查改统一工具与 Skill 模块，并说明 last-good、显式应用和当前会话激活原理。
 
-同一模型输出的多个工具调用按顺序执行，却看不到彼此结果；整批完成后结果在下一子请求可见。若 `say(final_call=true)` 结束、请求取消或失败，不会只为结果强迫续轮。你一直在同一段上下文里，每次被叫醒只往后接上新的东西，直到交接；这一段之外的要自己召回：按窗口翻聊天记录用 `read_log`，按线索找用 `search`（聊天记录、笔记、日记和归档一起找），自己过去的行动用 `read_actions`，笔记用 `read_note`。笔记是普通文件，`write_note` 随时改；一件事告一段落、想清空眼前时用 `tidy` 交接。
+同一模型输出的多个工具调用按顺序执行，却看不到彼此结果；整批完成后结果在下一子请求可见。若 `send(final_call=true)` 结束、请求取消或失败，不会只为结果强迫续轮。你一直在同一段上下文里，每次被叫醒只往后接上新的东西，直到交接；这一段之外的要自己召回：按窗口翻聊天记录用 `read_log`，按线索找用 `search`（聊天记录、笔记、日记和归档一起找），自己过去的行动用 `read_actions`，笔记用 `read_note`。笔记是普通文件，`write_note` 随时改；一件事告一段落、想清空眼前时用 `tidy` 交接。
 
 ## 直接执行 Python
 
@@ -124,16 +124,18 @@ Skill 也是可编辑的长期笔记：把可重复使用的经验、做法、�
 
 ## 待办
 
-待办就是 `todo` 笔记：`write_note("todo", 全文)` 整体替换，传空串清空。每次模型子请求的末尾都会显示最新内容。同一模型输出中的多个工具调用彼此看不到结果：先等工具返回进入下一子请求，再记录依赖成败的待办。改动不会发送 QQ 消息；要对人说话仍须调用 `say`。它与聊天结束后向 QQ 发状态消息的 `#hint` 命令不是一回事。只放尚待处理的事，做完及时更新；可复用经验放 Skill。
+待办就是 `todo` 笔记：`write_note("todo", 全文)` 整体替换，传空串清空。每次模型子请求的末尾都会显示最新内容。同一模型输出中的多个工具调用彼此看不到结果：先等工具返回进入下一子请求，再记录依赖成败的待办。改动不会发送 QQ 消息；要对人说话仍须 `type_word` 再 `send`。它与聊天结束后向 QQ 发状态消息的 `#hint` 命令不是一回事。只放尚待处理的事，做完及时更新；可复用经验放 Skill。
 
 ## 说话
 
-`say(text, target, final_call)` 是你**唯一**的发言方式——直接写在回复正文里的内容不会发出去，那是你的自言自语；它会作为自己的输出轨迹保留，但聊天参与者收不到。中心会话每次发言必须写明 `target="g<群号>"` 或 `target="u<私聊对端号>"`，不能凭最近读到谁来猜接收窗口。
+说话像人用手机打字：先 `type_word(target, text)` 把话打进那个窗口的输入框，下一步再 `send(target)` 发出去。这是你**唯一**的发言方式——直接写在回复正文里的内容不会发出去，那是你的自言自语；它会作为自己的输出轨迹保留，但聊天参与者收不到。每次都要写明 `target="g<群号>"` 或 `target="u<私聊对端号>"`，不能凭最近读到谁来猜接收窗口。
 
-- 返回值就是这条消息的 `message_id`，可用于与聊天记录里的回声核对。
-- `final_call` 默认 **true**：说完这句，当前工具循环结束；同一批里其它工具的结果这次看不到。只有新召唤会让中心 agent 接着运行。若要在当前循环接着干活，显式传 `final_call=false`。
-- 发送**失败**或**未确认**时，不管 `final_call` 传了什么，都会照常再跑一轮，让你看到发生了什么。"未确认"的意思是请求被收下了但没给回号码，消息很可能已经发出去——别直接重发，先看下一轮的聊天记录。
-- 一次 `say` 发一条消息。要发几条就调几次，最后一条传默认的 `final_call=true`。
+- `type_word` 覆盖输入框里原来的内容，返回框里现在的字；每次子请求末尾也会列出还没发的输入框。想改就再打一遍，不想说了就不发，这次唤醒结束时没发的会清空。
+- 同一次输出里刚打的字 `send` 不发：打字和发送之间你至少要再看一眼，这期间到的新消息会出现在下一次请求里，看完再决定发、改还是不发。
+- `send` 返回这条消息的 `message_id`，可用于与聊天记录里的回声核对。
+- `final_call` 默认 **true**：发完这句，当前工具循环结束；同一批里其它工具的结果这次看不到。只有新召唤会让中心 agent 接着运行。若要在当前循环接着干活，显式传 `final_call=false`。
+- 发送**失败**或**未确认**时，不管 `final_call` 传了什么，都会照常再跑一轮，让你看到发生了什么。失败时输入框里的字还在；"未确认"的意思是请求被收下了但没给回号码，消息很可能已经发出去——输入框已清空，别直接重发，先看下一轮的聊天记录。
+- 一个输入框一次发一条消息。要发几条就打一条、发一条，最后一条传默认的 `final_call=true`。
 
 ## 原子性与请求边界
 
@@ -289,13 +291,68 @@ def attach_image(uri: str, note: str = "") -> str:
 _SAY_TIMEOUT = 30.0
 
 
-def say(text: str, final_call: bool = True, target: str = "") -> str:
-    """发一句话并返回 message_id；中心会话必须显式指定目标，默认说完这一轮就结束。
+def _box_label(target: str) -> str:
+    from mods import chat
+
+    kind, number = chat.parse_target(target)
+    return f"{'g' if kind == 'group' else 'u'}{number}"
+
+
+def _boxes() -> dict:
+    """The input boxes, one per window; the central agent shares one set across a wake's sessions."""
+    from mods.tools import current_binding
+
+    session = current_binding().session
+    if not isinstance(getattr(session, "boxes", None), dict):
+        session.boxes = {}
+    return session.boxes
+
+
+def _this_output() -> str | None:
+    from mods.tools import current_binding
+
+    action = getattr(current_binding().session, "active_action", None)
+    return action.split("#")[0] if isinstance(action, str) else None
+
+
+def type_word(target: str, text: str) -> str:
+    """把要说的话打进 target 的输入框，覆盖原来的内容；不发送，下一步看过新消息再 send。
 
     @param
-    text: 要说的话。CQ 码原样写，at、reply、图片都照常生效
+    target: g<群号> 或 u<私聊对端号>
+    text: 输入框里的完整内容。CQ 码原样写，at、reply、图片都照常生效；空串清空输入框
+
+    WHY: 维护者 2026-10-23：说话先打字、再发送，参照 Cortico 的起草-确认门，但用"输入框"
+    的说法——她打出来的字自己看得见。打字和发送之间至少隔一次请求（见 send），于是这期间
+    到的消息她一定看过；不靠延迟，人可能隔几分钟才接上下一句。
+    """
+    from mods.tools import current_binding
+
+    if getattr(current_binding().session, "quiet", False):
+        return "现在是交接或反思，不对外说话，什么都没打"
+    try:
+        label = _box_label(target)
+    except ValueError as error:
+        return str(error)
+    boxes = _boxes()
+    body = str(text)
+    if not body.strip():
+        boxes.pop(label, None)
+        return f"{label} 的输入框已清空"
+    boxes[label] = {"text": body, "typed_in": _this_output()}
+    return (f"{label} 的输入框：\n{body}\n"
+            f"（还没发。下一步看过新到的消息再 send(\"{label}\")；不想说了就不发，这次唤醒结束时会清空）")
+
+
+def send(target: str, final_call: bool = True) -> str:
+    """把 target 输入框里打好的字发出去，返回 message_id；默认发完这一轮就结束。
+
+    @param
+    target: g<群号> 或 u<私聊对端号>，要和 type_word 用的一样
     final_call: 这次发言是不是本轮最后一个动作。默认 true；要接着干活就显式传 false
-    target: g<群号> 或 u<私聊对端号>；中心会话必填
+
+    WHY: 同一次输出里刚 type_word 的字不发。那一批调用的参数是一起生成的，她还没看到
+    打字之后到的消息；拒绝一次，下一次请求里新消息就在眼前（维护者 2026-10-23）。
 
     WHY: 它**等**发送结果，不是投递完就返回。这不是谨慎，是终止语义逼出来的：一轮的结束
     由 `final_call` 声明，而"失败时照常再跑一轮"要求这里能分辨成败——成败只有 SendFuture
@@ -322,11 +379,11 @@ def say(text: str, final_call: bool = True, target: str = "") -> str:
 
     WHY: 它住在 meta 而不是自己一个模块，因为发言是模型**永远**该有的能力，而
     `tools._BASE_MODULE_NAME` 是单数、基础模块只有一个。meta 早就不只是"管工具模块"了
-    （事件反查和覆盖工具也管上下文），它实际是那组不可卸载的基础能力，`say`
+    （事件反查和覆盖工具也管上下文），它实际是那组不可卸载的基础能力，`type_word`/`send`
     属于这一组。改成支持多个基础模块也行，代价是那条"基础模块的导出不加模块名前缀"的
     规则会多出命名冲突的可能，眼下不值得。
 
-    WHY?: 子代理（`tools/agents.py`）因此也拿得到 `say`，于是它能直接往窗口里说话——这是
+    WHY?: 子代理（`tools/agents.py`）因此也拿得到 `type_word`/`send`（2026-10-23 以前是 `say`），于是它能直接往窗口里说话——这是
     工具化带来的**新**能力，以前子代理的正文只回给主模型。没有给它加门控，因为"子代理该
     不该能说话"还没有人拍过；先记在这里，真出现不想要的发言再决定是挡掉还是保留。
     """
@@ -334,36 +391,36 @@ def say(text: str, final_call: bool = True, target: str = "") -> str:
     from mods import chat, context
     from mods.tools import current_binding
 
-    body = str(text)
-    if not body.strip():
-        return "text 为空，什么都没发。要说话就给出正文"
+    try:
+        label = _box_label(target)
+    except ValueError as error:
+        return str(error)
+    boxes = _boxes()
+    box = boxes.get(label)
+    if not box:
+        return f"{label} 的输入框是空的，什么都没发。先用 type_word 把要说的话打进去"
     if getattr(current_binding().session, "quiet", False):
         return "现在是交接或反思，不对外说话，什么都没发"
-    destination = {}
+    if box["typed_in"] is not None and box["typed_in"] == _this_output():
+        return (f"{label} 的字是这一步刚打的，你还没看过打字之后到的消息，这一步先不发。"
+                f"下一步看一眼，再决定 send、改还是不发")
+    window = chat.parse_target(target)
+    destination = {"group_id" if window[0] == "group" else "user_id": window[1]}
     if context.agent_mode():
-        try:
-            window = chat.parse_target(target)
-        except ValueError as error:
-            return str(error)
-        destination = {"group_id" if window[0] == "group" else "user_id": window[1]}
         current_binding().session.associated_windows.add(window)
-    elif target:
-        try:
-            window = chat.parse_target(target)
-        except ValueError as error:
-            return str(error)
-        destination = {"group_id" if window[0] == "group" else "user_id": window[1]}
     unconfirmed = (
         "先在下一轮的聊天记录里看它在不在，再决定要不要重发——不要直接重发。"
     )
     try:
-        message_id = message.sendmsg(body, **destination).result(timeout=_SAY_TIMEOUT)
+        message_id = message.sendmsg(box["text"], **destination).result(timeout=_SAY_TIMEOUT)
     except TimeoutError:
-        return f"未确认：等了 {_SAY_TIMEOUT:.0f} 秒还没有结果，这句话可能正在发、也可能已经发出去。" + unconfirmed
+        boxes.pop(label, None)
+        return f"未确认：等了 {_SAY_TIMEOUT:.0f} 秒还没有结果，这句话可能正在发、也可能已经发出去。输入框已清空。" + unconfirmed
     except Exception as error:
-        return f"发送失败（{type(error).__name__}）：{error}。这句话没有发出去。"
+        return f"发送失败（{type(error).__name__}）：{error}。这句话没有发出去，还在输入框里。"
+    boxes.pop(label, None)
     if message_id is None:
-        return "未确认：对端收下了请求，却没有回一个 message_id，所以这句话可能已经发出去了。" + unconfirmed
+        return "未确认：对端收下了请求，却没有回一个 message_id，所以这句话可能已经发出去了。输入框已清空。" + unconfirmed
     if final_call:
         current_binding().session.turn_done = lambda: True
     return str(message_id)
@@ -388,6 +445,29 @@ def write_note(scope: str, text: str) -> str:
         lines = [f"已写入 awaker，{len(found)} 条规则生效"] + [f"不认识：{line}" for line in skipped]
         return "\n".join(lines)
     return f"已写入 {scope}" if text.strip() else f"已删除 {scope}"
+
+
+def wake_me(when: str, reason: str) -> str:
+    """给自己埋一个唤醒：过一会儿、到某个时刻、某个窗口来消息、等某人的后续、或者某个条件成立时叫醒你。
+
+    @param
+    when: 下面一种写法——"10m"/"2h"：过这么久；"2026-10-23 08:00"：到这个时刻；"on g123"、"on g123:30001"、"on u456"：这个窗口（或窗口里这个人）下一条消息来时；"wait g123:30001 10m"：等这个人的后续，来了或者 10 分钟都没来都叫你，只叫一次；"when <Python 表达式>"：每分钟用 exec_code 那份环境求值，第一次为真时叫你，例如 when mcversion.ver["release"] != "1.21.4"；"every 30m"、"daily 23:30"：反复叫你
+    reason: 叫醒时你会看到的原因，写给到时候的自己，比如"他刚才问到一半"
+
+    WHY: 维护者 2026-10-23：她要能自己决定什么时候再醒。最常用的是 wait——对方话说了一半、
+    她决定先不接，后续一直不来那半句就挂着；死板的延迟唤醒也不行，对方接上了延迟到点还会再
+    叫一遍。规则写进笔记 awaker（相对时间换成时刻），她用 read_note/write_note 能看能改。
+    想在某个函数被调用时醒，用 exec_code 包一层它，里面调 chat.wake(reason=..., kind=...)，
+    重启后要重新包。
+    """
+    from mods.chat import awaker
+
+    try:
+        line = awaker.plant(when, reason)
+    except ValueError as error:
+        return str(error)
+    once = line.split(" ", 1)[0] in ("at", "on", "wait", "when")
+    return f"已写进 awaker：{line}" + ("（响过就划掉；不要了用 write_note 改 awaker）" if once else "（不要了用 write_note 改 awaker）")
 
 
 def tidy(note: str = "") -> str:
@@ -431,13 +511,15 @@ def _format_results(results: Mapping) -> str:
 
 
 __all__ = [
-    "say",
+    "type_word",
+    "send",
     "read_log",
     "search",
     "read_actions",
     "read_note",
     "write_note",
     "tidy",
+    "wake_me",
     "exec_code",
     "list_tools",
     "reload_tools",

@@ -974,7 +974,7 @@ class Chat:
                 record_output if self.on_output is not None else None,
                 record_results if self.on_results is not None else None,
                 # WHY: 工具在这次生成器已经开始以后才会声明完成；直接传 self.turn_done 会把
-                # 开始时的 None 按值交进去，say 后来安装的回调永远到不了检查点。
+                # 开始时的 None 按值交进去，send 后来安装的回调永远到不了检查点。
                 lambda: self.turn_done() if self.turn_done is not None else False,
                 lambda reference: setattr(self, "active_action", reference),
                 self.preserve_native,

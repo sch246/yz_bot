@@ -45,6 +45,10 @@ _TYPING_EVERY = 5
 _HANDOFFS_PER_WAKE = 3
 _FORCE_AFTER_FAILURES = 2
 _FORCE_OVER_THRESHOLD = 2
+# 不带消息的唤醒（awaker 规则、别处的代码调 chat.wake(reason=...)）：(原因, 来源)，她正忙时排在这里，
+# 这次唤醒收尾前接上。只在内存里：重启时排着的会丢，awaker 的规则本身在笔记里，没响成的下一分钟还在。
+_alarms: list[tuple[str, str]] = []
+_alarms_lock = threading.Lock()
 
 
 def _text_tokens(messages: list[dict]) -> int:
@@ -211,7 +215,15 @@ def _late_hint(newest: dict[tuple, tuple], last_shown: dict[str, str]) -> str:
     if not blocks:
         return ""
     return ("你读画面之后，这些消息才到（还没进画面，下次看这个窗口时会在画面里）：\n\n" + "\n\n".join(blocks)
-            + "\n\n人常常一句话分几条发；对方可能还没说完时，不用急着接。")
+            + "\n\n人常常一句话分几条发；输入框里打好的话要不要改、还发不发，看完再定。")
+
+
+def _box_hint(session) -> str:
+    """What she has typed and not sent yet (`type_word` in tools/meta.py)."""
+    boxes = getattr(session, "boxes", None)
+    if not boxes:
+        return ""
+    return "你的输入框里还有没发的字：\n" + "\n".join(f"{label}：{box['text']}" for label, box in boxes.items())
 
 
 def _mark_seen(newest: dict[tuple, tuple]) -> None:
@@ -370,7 +382,9 @@ def _begin(turn, window: tuple | None, kind: str) -> None:
     turn.handoff_note = ""
     turn.handoff_failed = False
     turn.handoffs = 0
-    turn.alarm = None
+    turn.alarm = []
+    # 输入框（type_word）跟着这次唤醒走：中途交接换了会话也还在，唤醒结束就没了。
+    turn.boxes = {}
     turn.log = {"kind": kind, "start": time.time(), "peak": 0}
 
 
@@ -400,13 +414,28 @@ def _keep_typing(turn, window: tuple | None, stop: threading.Event) -> None:
         stop.wait(_TYPING_EVERY)
 
 
-def _drive_agent(model: str | None, window: tuple | None, alarm: tuple[str, str] | None = None) -> bool:
+def _queued_alarms() -> bool:
+    with _alarms_lock:
+        return bool(_alarms)
+
+
+def _take_alarms() -> list[tuple[str, str]]:
+    with _alarms_lock:
+        taken = list(_alarms)
+        _alarms.clear()
+    return taken
+
+
+def _has_work() -> bool:
+    return oplog.has_unnotified() or _queued_alarms()
+
+
+def _drive_agent(model: str | None, window: tuple | None, alarm: bool = False) -> bool:
     """Hold the agent's turn until nothing is left to do; False when someone else holds it."""
     turn, owner = context.begin_turn(_chat_root.AGENT_WINDOW)
     if not owner:
         return False
     _begin(turn, window, "闹钟" if alarm else "唤醒")
-    turn.alarm = alarm
     typing = threading.Event()
     threading.Thread(target=_keep_typing, args=(turn, window, typing), name="chat-typing", daemon=True).start()
     # WHY: 一次对话 = 这次持有的全过程（多轮 + 插话续写，直到 finally），图片检查台账就
@@ -433,7 +462,7 @@ def _drive_agent(model: str | None, window: tuple | None, alarm: tuple[str, str]
                 return True
             turn.associated_windows.intersection_update(
                 {window for window, _count, active in oplog.pending_summary() if active})
-            if not context.finish_turn(_chat_root.AGENT_WINDOW, turn, oplog.has_unnotified):
+            if not context.finish_turn(_chat_root.AGENT_WINDOW, turn, _has_work):
                 return True
     finally:
         typing.set()
@@ -444,9 +473,15 @@ def _drive_agent(model: str | None, window: tuple | None, alarm: tuple[str, str]
             _chat_root._run_hint(window, turn)
 
 
-def alarm(reason: str, rule: str) -> bool:
-    """A wake she or the maintainer scheduled in the awaker note; False when she is busy."""
-    return _drive_agent(None, None, (reason, rule))
+def alarm(reason: str, source: str) -> bool:
+    """Wake her with a reason instead of a message; when she is busy it waits for this wake to end.
+
+    *source* says who is calling, e.g. the awaker rule; she sees both.
+    """
+    with _alarms_lock:
+        _alarms.append((reason, source))
+    _drive_agent(None, None, alarm=True)
+    return True
 
 
 def request_tidy(note: str) -> bool:
@@ -464,6 +499,7 @@ def _run_agent(model: str | None, turn) -> bool:
     woken, activation_lines, authors = _woken(notice, turn)
     turn.authors = list(dict.fromkeys([*turn.authors, *authors]))
     continuing = turn.handed_off
+    turn.alarm.extend(_take_alarms())
     if notice is None and not woken and not turn.alarm and not continuing:
         return True
     segment = _segment.load()
@@ -499,9 +535,9 @@ def _run_agent(model: str | None, turn) -> bool:
     if notice is not None:
         material.append({"role": "user", "content": f"这次唤醒你的是（{now}）：\n" + "\n".join(activation_lines)})
     if turn.alarm:
-        reason_text, rule = turn.alarm
-        material.append({"role": "user", "content": f"这次是 awaker 笔记里的闹钟叫醒你的（{now}，规则：{rule}）：{reason_text}\n"
-                         "没有人在等你回话；看看要不要做点什么，没事就直接结束。"})
+        lines = [f"- {source}：{reason_text}" for reason_text, source in turn.alarm]
+        material.append({"role": "user", "content": f"这次叫醒你的不是消息（{now}）：\n" + "\n".join(lines)
+                         + "\n没有人在等你回话；看看要不要做点什么，没事就直接结束。"})
     if segment.get("notice"):
         material.append({"role": "user", "content": segment["notice"]})
     if continuing:
@@ -512,7 +548,7 @@ def _run_agent(model: str | None, turn) -> bool:
         return True
 
     def first_output() -> None:
-        turn.alarm = None
+        turn.alarm = []
         if notice is not None:
             oplog.acknowledge_notification(notice["id"])
         _mark_seen(newest)
@@ -554,6 +590,7 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
     session = llm.Chat(model=model or _chat_root.get_model(), chat_client=llm.get_client())
     session.requested_reads = turn.requested_reads
     session.associated_windows = turn.associated_windows
+    session.boxes = turn.boxes
     session.quiet = quiet
     session.fail_fast = fail_fast
     binding = _chat_root._activate_chat(session, messages)
@@ -626,6 +663,7 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
     session.add_context_provider(tool_changes)
     for hint in hints:
         session.add_hint(hint)
+    session.add_hint(lambda: _box_hint(session))
     session.add_hint(lambda: f"现在是 {_screen.clock()}。")
     session.should_stop = lambda: turn.cancelled
     session.chat(recall_func=_chat_root.get_handler(session), description_cache=_chat_root.description_cache)
@@ -726,6 +764,8 @@ def _run_reflection(model: str | None, turn, segments: list[dict]) -> None:
 def pick_up_pending() -> None:
     """Start a wake for calls that arrived while nobody was there to take them."""
     if not oplog.has_unnotified():
+        if _queued_alarms():
+            _drive_agent(None, None, alarm=True)
         return
     window = next(iter(oplog.unacknowledged_windows()), None)
     if window is None:
