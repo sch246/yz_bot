@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator
+import itertools
 import json
 import logging
 import os
@@ -31,6 +32,10 @@ from .types import LLMResponse, ModelCapabilities, ToolCallResult
 
 LOAD_AFTER = ("image", "storage", "watchdog")
 _log = logging.getLogger(__name__)
+# WHY: 没有事件日志的会话（子代理）输出拿不到正式号，行动引用就用这个本地序号顶上。
+# send 靠它分辨"同一次输出里刚打的字"；以前是 None，子代理一批里打字加发送直接发了出去
+# （2026-10-23 审查）。
+_local_outputs = itertools.count(1)
 
 # WHY: 自动图片描述路径固定使用这段 prompt（_get_image_description 调 describe_image 时
 # 不传 prompt），结果按内容摘要长期缓存。改这里必须同时提升
@@ -763,6 +768,7 @@ class LLMClient:
                 elif preserve_native and isinstance(recorded, str) and on_results is not None:
                     on_results(recorded, [], [])
                 return
+            local_output = f"local-{next(_local_outputs)}"
             results: list[ToolCallResult] = []
             for position, (call, tool, arguments) in enumerate(pending_calls):
                 raise_if_failed()
@@ -781,7 +787,7 @@ class LLMClient:
                 job = watchdog.begin()
                 try:
                     if on_action is not None:
-                        on_action(f"{output_id}#{position + 1}" if output_id is not None else None)
+                        on_action(f"{output_id if output_id is not None else local_output}#{position + 1}")
                     content = str(tool.call(**arguments))
                 except PersistenceError:
                     raise

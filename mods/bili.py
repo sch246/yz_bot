@@ -163,13 +163,18 @@ def _send(window: tuple, text: str) -> str:
     rpid = str((result or {}).get("rpid_str") or (result or {}).get("rpid") or "")
     if not rpid:
         raise windows.Unconfirmed("B 站收下了，却没有回评论号，这条评论可能已经发出去了。")
-    remember_root(rpid, root)
-    storage.save()
-    # WHY: 她自己的评论只写进记录、不登记到达。QQ 里她的话是回声事件带回来的；B 站没有
-    # 回声，不写就只有对方的回复、没有她说过什么。不登记到达，因为自己的话不是"未读"。
-    with context.window_lock(window):
-        chatlog.append_record("bili", window[1], _me(), (f"[CQ:reply,id={parent}]" if parent else "") + text,
-                              time.time(), rpid)
+    # WHY: 拿到评论号就是已经发出去了，后面的记账失败只记日志、照常返回评论号。抛出去会被
+    # send 说成"没有发出去，还在输入框里"，她再 send 一次就公开重复发了一条（2026-10-23 审查）。
+    try:
+        remember_root(rpid, root)
+        storage.save()
+        # WHY: 她自己的评论只写进记录、不登记到达。QQ 里她的话是回声事件带回来的；B 站没有
+        # 回声，不写就只有对方的回复、没有她说过什么。不登记到达，因为自己的话不是"未读"。
+        with context.window_lock(window):
+            chatlog.append_record("bili", window[1], _me(), (f"[CQ:reply,id={parent}]" if parent else "") + text,
+                                  time.time(), rpid)
+    except Exception:
+        _stream.exception("B 站评论 %s 已发出，本地记录失败", rpid)
     return rpid
 
 
@@ -221,9 +226,9 @@ def poll() -> None:
         items = data.get("items") or []
         keys = [(int(item.get(stamp) or 0), int(item.get("id") or 0)) for item in items]
         last = tuple(state[feed]) if state.get(feed) else None
-        if keys:
-            state[feed] = list(max(keys + ([last] if last else [])))
         if last is None:
+            if keys:
+                state[feed] = list(max(keys))
             continue
         if keys and min(keys) > last and not (data.get("cursor") or {}).get("is_end", True):
             from mods import chat
@@ -231,9 +236,12 @@ def poll() -> None:
             name = "回复" if feed == "reply" else "@"
             chat.push(chat.windows.ME, "B 站", f"B 站上次查过之后来的{name}超过一页，只有最新的 {len(items)} 条进了评论区窗口；"
                       f"更早的用 bili__inbox(\"{feed}\") 往前翻。", wake=f"B 站{name}太多")
+        # WHY: 位置一条一条往前推，投递成功才推。先推到整页末尾再投，中间一条失败，它和后面
+        # 没投的下次都被当成已经处理过（2026-10-23 审查）。
         for key, item in sorted(zip(keys, items), key=lambda pair: pair[0]):
             if key > last:
                 _deliver(feed, item)
+                state[feed] = list(key)
     state.pop("error", None)
     storage.save()
 

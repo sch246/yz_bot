@@ -11,6 +11,7 @@ from mods import _napcat_history, chatlog
 
 logger = logging.getLogger(__name__)
 PAGE_SIZE = 100
+OFFLINE_CALL = "离线时叫你"
 # 窗口 → (开机前最后一条本地消息号, 它的时间)；live 消息进来之前冻结，见 connect.on_load。
 _anchors: dict[tuple, tuple[str, int | None]] = {}
 
@@ -88,7 +89,7 @@ def _register_calls(window: tuple, events: list[dict]) -> int:
             continue
         with context.window_lock(window):
             arrival = oplog.arrive(window, event)
-            oplog.activate(arrival, "离线时叫你")
+            oplog.activate(arrival, OFFLINE_CALL)
         found += 1
     return found
 

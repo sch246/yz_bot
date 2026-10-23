@@ -137,6 +137,37 @@ def _people(windows: list[tuple], authors: list[int], segment: dict) -> list[dic
     return [block] if block else []
 
 
+def _offline_calls(window: tuple, shown: list[dict]) -> list[dict]:
+    """Unread recovered calls to her that the screen's slice leaves out, oldest first.
+
+    WHY: 补回的消息按时间插在开机后实时到的消息前面。这一段已经给过这个窗口时，画面只
+    接着"上次给到哪一条"往后给，看到时间也已经过了它们，叫她的那条就不在画面里，第一次
+    输出却会把它标成已读（2026-10-23 审查）。所以按消息号把还没读的离线呼叫找出来补上。
+    """
+    from mods import _backfill, chatlog
+
+    calls = [entry["event"] for entry in oplog.unread(window)
+             if entry.get("activation_kind") == _backfill.OFFLINE_CALL]
+    if not calls:
+        return []
+    wanted = {chatlog.recall_key(event.get("message_id")) for event in calls}
+    texts = {item["text"] for item in shown}
+    found = []
+    for item in _screen.records(window, 1_000_000, since=min(int(event["time"]) for event in calls)):
+        head = chatlog._split_head(item["text"].partition("\n")[0])
+        if (item["text"] not in texts and head is not None and head["message_id"] is not None
+                and chatlog.recall_key(head["message_id"]) in wanted):
+            found.append(item)
+    return found
+
+
+def _with_calls(window: tuple, calls: list[dict], text: str) -> str:
+    if not calls:
+        return text
+    return ("（下面是离线期间叫你的消息，补回时插在了更早的位置）\n" + _screen.render(window, calls)
+            + ("\n" + text if text else ""))
+
+
 def _screen_text(window: tuple, count: int, last: str | None) -> tuple[str, tuple, str | None]:
     """One window's chatlog lines for this wake, the (time, arrival) to mark seen, and its last record.
 
@@ -154,14 +185,15 @@ def _screen_text(window: tuple, count: int, last: str | None) -> tuple[str, tupl
         # WHY: 这一段里已经给过这个窗口：按"上次给到哪一条"接着给，不按看到时间——看到
         # 时间只精确到秒，同一秒里后到的那条按时间会被当成看过。
         after = items[len(texts) - texts[::-1].index(last):]
-        if not after:
-            return "", (None, through), last
         shown = after[-_FRESH_MAX:]
+        calls = _offline_calls(window, shown)
+        if not shown:
+            return _with_calls(window, calls, ""), (None, through), last
         text = _screen.render(window, shown, mark)
         if len(after) > _FRESH_MAX:
             text = (f"（{_screen.label(window)} 又有 {len(after)} 条新消息，这里只展示最新的 {len(shown)} 条；"
                     f"更早的用 read_log(\"{_screen.label(window)}\", before=\"{_screen.clock(shown[0]['time'])}\") 往前翻）\n" + text)
-        return text, (_screen.latest_time(shown), through), shown[-1]["text"]
+        return _with_calls(window, calls, text), (_screen.latest_time(shown), through), shown[-1]["text"]
     fresh = [item for item in items if mark is not None and item["time"] is not None and item["time"] > mark]
     # WHY: 新消息（_FRESH_MAX 条以内）全部展示，画面条数只决定还附多少旧消息；至少带上新消息之前的
     # 几条接上话头。看到时间只精确到秒，同一秒里后到的那条也靠这几条不丢。
@@ -182,7 +214,7 @@ def _screen_text(window: tuple, count: int, last: str | None) -> tuple[str, tupl
         text = (f"（{_screen.label(window)} 上次之后有 {skipped + len(shown)} 条新消息，这里只展示最新的 "
                 f"{len(shown)} 条；更早的 {skipped} 条要看就用 read_log(\"{_screen.label(window)}\", "
                 f"before=\"{_screen.clock(shown[0]['time'])}\") 往前翻）\n" + text)
-    return text, (_screen.latest_time(shown), through), shown[-1]["text"]
+    return _with_calls(window, _offline_calls(window, shown), text), (_screen.latest_time(shown), through), shown[-1]["text"]
 
 
 def _unread_hint(on_screen: set[tuple]) -> str:

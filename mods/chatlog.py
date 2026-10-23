@@ -162,9 +162,13 @@ def insert_recovered(kind: str, target: int, events: list[dict]) -> list[dict]:
     ``.backfill.jsonl``，画面、read_log、search 都不读，补回等于没补。
 
     WHY: 按时间插，不追加。日档按到达顺序追加，补回的消息却比开机后实时到的旧，追加在
-    后面画面就乱了序。所以每条插在同一天最后一条不晚于它的记录后面；同一秒的按
-    message_seq 先后。日档里已有同号同秒的就跳过：开机后实时到的那些，补回时 NapCat
-    也会给一遍。
+    后面画面就乱了序。所以每条插在同一天最后一条不晚于它的记录后面。日档里已有同号同秒
+    的就跳过：开机后实时到的那些，补回时 NapCat 也会给一遍。
+
+    WHY: 同一秒的，排在之前几页补回（或认出是重复）的记录前面。日档没有 message_seq，
+    同秒只能靠来路分先后：补漏从新往旧一页页取，前几页的都比这一页新；开机后实时到的
+    也在第一页里认出过。认不出来路的同秒记录（断线前实时写的）比这一页旧，排在它后面。
+    页内本来就按远端顺序给，排序是稳定的，不动它（2026-10-23 审查：跨页同秒曾倒序）。
 
     WHY: 改写走临时文件加 ``os.replace``。读日档的人不加锁，看到的要么是旧文件要么是新
     文件；换了 inode 也让档案索引整份重建，而不是当成追加去增量读。
@@ -212,16 +216,20 @@ def insert_recovered(kind: str, target: int, events: list[dict]) -> list[dict]:
             present = {record[1] for record in records}
             added = []
             for stamp, key, text, event in items:
-                _recovered.add(key)
                 if key in present:
                     continue
                 present.add(key)
                 place = len(records)
-                while place and records[place - 1][0] is not None and records[place - 1][0] > stamp:
+                while place and records[place - 1][0] is not None and (
+                        records[place - 1][0] > stamp
+                        or records[place - 1][0] == stamp and records[place - 1][1] in _recovered):
                     place -= 1
                 records.insert(place, [stamp, key, text.rstrip("\n").split("\n")])
                 added.append(event)
+            # WHY: 去重键在新文件换上去以后才登记。先登记的话写盘失败，同一条实时到达时
+            # 会被当成已补回而不落盘，重启后就没了（2026-10-23 审查）。
             if not added:
+                _recovered.update(item[1] for item in items)
                 continue
             os.makedirs(os.path.dirname(path), exist_ok=True)
             temporary = f"{path}.{os.getpid()}.tmp"
@@ -230,6 +238,7 @@ def insert_recovered(kind: str, target: int, events: list[dict]) -> list[dict]:
                 file.flush()
                 os.fsync(file.fileno())
             os.replace(temporary, path)
+            _recovered.update(item[1] for item in items)
             written.extend(added)
     return written
 
@@ -1235,6 +1244,10 @@ def _locate_origin(kind: str, target: int | str | None, origin: str,
     return day, row[4], row[:4]
 
 
+# WHY?: `read_origin` 和 `read_range(before=...)` 的定位是"路径:行号"。离线补漏往日档里
+# 按时间插行以后，补漏之前拿到的定位会静默指到另一条记录，不报错（2026-10-23 审查复现）。
+# 现在没有代码保存或传回这种定位（画面和 read_log 都按时间翻），所以没有修；要么给定位带上
+# 记录身份，要么这两个入口连同 `_locate_origin` 一起删掉，等维护者定。
 def read_origin(
     kind: str,
     target: int | str | None,
