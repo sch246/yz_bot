@@ -699,7 +699,7 @@ def capture_chat(event: dict) -> bool:
     if window is None or not _mail_candidate(event):
         return False
     matched = activation_signal(event)
-    # 她给自己埋的「这个窗口来消息就叫我」「等这个人的后续」，见 awaker。
+    # 她给自己埋的「这个窗口来消息就叫我」「等这个人的后续」「聚焦这个群」，见 awaker。
     waited = (_awaker.take_waiting(window, event.get("user_id"))
               if msgs.is_msg(event) and event.get("user_id") != identity.bot_id() else [])
     if not matched and not waited:
@@ -709,7 +709,7 @@ def capture_chat(event: dict) -> bool:
             else "private" if msgs.is_msg(event) and _private_from_peer(event)
             else "wake" if matched else "")
     if waited:
-        kind = "；".join(filter(None, [kind, *(f"等到了（{rule['key']}）" for rule in waited)]))
+        kind = "；".join(filter(None, [kind, *(f"{'聚焦中' if rule['kind'] == 'follow' else '等到了'}（{rule['key']}）" for rule in waited)]))
     wake(event, kind)
     return True
 

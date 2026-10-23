@@ -24,6 +24,16 @@ WHY: 2026-10-23 维护者要她有更强的唤醒自己的能力，于是又有�
 ——死板的延迟唤醒做不到这个，人接上了话，延迟到点还会再叫一遍。``on``/``wait`` 由
 ``chat.capture_chat`` 在消息到达时认领（``take_waiting``），只认开了聊天的窗口。``when`` 每分钟
 用 ``.py`` 那份共享环境求值一次。她用 ``wake_me`` 工具写这些行，相对时间在写的时候换成时刻。
+
+WHY: 2026-10-23 维护者要她能聚焦一个群：感兴趣或正在聊的时候，这个群每条消息都像私聊一样
+叫醒她，直到她自己退出。不另设模式，就是一条响了不划掉的 ``on``，但必须带期限：
+
+    follow g123 until 2026-10-23 22:30 在跟大家聊游戏
+
+``wake_me("follow g123 30m", ...)`` 写它（不写多久就是 30 分钟），再写一次是续期，替换同一目标
+的旧行；``follow g123 off`` 或删掉这一行是退出；到期由每分钟检查静静划掉，不叫醒她。期限必填
+是因为忘了退出的代价：热闹的群每条都花一次模型调用，话题早过去了她还挂着；有期限最坏也就
+多花到期为止。
 """
 
 from __future__ import annotations
@@ -50,6 +60,8 @@ _TARGET = r"([gu][1-9][0-9]*(?::[1-9][0-9]*)?)"
 _ON = re.compile(r"^\s*(?:[-*]\s+)?on\s+" + _TARGET + r"\s+(.+?)\s*$")
 _WAIT = re.compile(r"^\s*(?:[-*]\s+)?wait\s+" + _TARGET
                    + r"\s+until\s+(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})\s+(.+?)\s*$")
+_FOLLOW = re.compile(r"^\s*(?:[-*]\s+)?follow\s+" + _TARGET
+                     + r"\s+until\s+(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})\s+(.+?)\s*$")
 _WHEN = re.compile(r"^\s*(?:[-*]\s+)?when\s+(.+?)\s+->\s+(.+?)\s*$")
 # 改笔记的地方（划掉响过的行、wake_me 追加）互相排队；她用 write_note 整份改不经过这里。
 _edit = threading.Lock()
@@ -79,8 +91,15 @@ def _target(text: str) -> tuple[tuple, int | None]:
 
 
 def _once(line: str) -> dict | None:
-    """The one-shot rules beyond ``at``; None when the line is not one."""
+    """The rules beyond ``every``/``daily``/``at``; None when the line is not one."""
     key = line.strip()
+    if match := _FOLLOW.match(line):
+        moment = _moment(match[2], match[3], match[4])
+        if moment is None:
+            return {"key": key, "kind": "bad", "why": "日期不对"}
+        window, author = _target(match[1])
+        return {"key": key, "kind": "follow", "target": match[1], "window": window, "author": author,
+                "moment": moment, "until": f"{match[2]} {int(match[3]):02d}:{match[4]}", "reason": match[5]}
     if match := _ON.match(line):
         window, author = _target(match[1])
         return {"key": key, "kind": "on", "target": match[1], "window": window, "author": author, "reason": match[2]}
@@ -216,6 +235,10 @@ def check(now: float | None = None) -> None:
     for key in [key for key in last if key not in live]:
         del last[key]
     for rule in found:
+        if rule["kind"] == "follow":
+            if now >= rule["moment"]:
+                _claim([rule["key"]])
+            continue
         if rule["kind"] == "on":
             continue
         if rule["kind"] in ("wait", "when"):
@@ -258,14 +281,31 @@ def check(now: float | None = None) -> None:
 
 
 def take_waiting(window: tuple, author) -> list[dict]:
-    """The ``on``/``wait`` rules this message satisfies, struck out of the note."""
+    """The ``on``/``wait``/``follow`` rules this message satisfies; ``on``/``wait`` are struck out of the note."""
     found, _skipped = rules()
-    matched = [rule for rule in found if rule["kind"] in ("on", "wait") and rule["window"] == window
-               and (rule["author"] is None or rule["author"] == author)]
+    now = time.time()
+    matched = [rule for rule in found if rule["kind"] in ("on", "wait", "follow") and rule["window"] == window
+               and (rule["author"] is None or rule["author"] == author)
+               and not (rule["kind"] == "follow" and now >= rule["moment"])]
     if not matched:
         return []
-    claimed = set(_claim([rule["key"] for rule in matched]))
-    return [rule for rule in matched if rule["key"] in claimed]
+    claimed = set(_claim([rule["key"] for rule in matched if rule["kind"] != "follow"]))
+    return [rule for rule in matched if rule["kind"] == "follow" or rule["key"] in claimed]
+
+
+def _follows(line: str, target: str) -> bool:
+    return bool((match := _FOLLOW.match(line)) and match[1] == target)
+
+
+def unfollow(target: str) -> bool:
+    """Strike the ``follow`` lines for *target*; False when there were none."""
+    with _edit:
+        lines = _notes.read("awaker").split("\n")
+        kept = [line for line in lines if not _follows(line, target)]
+        if len(kept) == len(lines):
+            return False
+        _notes.write("awaker", "\n".join(kept).strip("\n") + "\n" if any(x.strip() for x in kept) else "")
+    return True
 
 
 def plant(when: str, reason: str, now: float | None = None) -> str:
@@ -288,6 +328,11 @@ def plant(when: str, reason: str, now: float | None = None) -> str:
         line = f"wait {match[1]} until {stamp(seconds)} {reason}"
     elif match := re.fullmatch(r"on\s+" + _TARGET, when):
         line = f"on {match[1]} {reason}"
+    elif match := re.fullmatch(r"follow\s+" + _TARGET + r"(?:\s+(\S+))?", when):
+        seconds = _interval(match[2] or "30m")
+        if not seconds:
+            raise ValueError("follow 后面写目标和聚焦多久，例如 follow g123 30m；退出写 follow g123 off")
+        line = f"follow {match[1]} until {stamp(seconds)} {reason}"
     elif when.startswith("when "):
         from mods import op
 
@@ -302,6 +347,9 @@ def plant(when: str, reason: str, now: float | None = None) -> str:
     with _edit:
         text = _notes.read("awaker")
         base = text if text.strip() else DEFAULT + "\n"
+        if found[0]["kind"] == "follow":
+            # 续期：同一目标只留一行，期限以这次为准。
+            base = "\n".join(old for old in base.split("\n") if not _follows(old, found[0]["target"]))
         _notes.write("awaker", base.rstrip("\n") + "\n" + line + "\n")
     return line
 
@@ -311,6 +359,9 @@ def report() -> str:
     last = _last()
     lines = [("（awaker 笔记是空的，用默认）" if not _notes.read("awaker").strip() else "awaker 规则：")]
     for rule in found:
+        if rule["kind"] == "follow":
+            lines.append(f"{rule['key']}  ← 聚焦中，期间每条都叫醒，到期划掉")
+            continue
         if rule["kind"] in ("on", "wait", "when"):
             lines.append(f"{rule['key']}  ← 等着，响过就划掉")
             continue

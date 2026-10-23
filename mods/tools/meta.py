@@ -431,10 +431,12 @@ def write_note(scope: str, text: str) -> str:
 
 
 def wake_me(when: str, reason: str) -> str:
-    """给自己埋一个唤醒：过一会儿、到某个时刻、某个窗口来消息、等某人的后续、或者某个条件成立时叫醒你。
+    """给自己埋一个唤醒：过一会儿、到某个时刻、某个窗口来消息、等某人的后续、聚焦一个群、或者某个条件成立时叫醒你。
+
+    聚焦（follow）是你自己选的：感兴趣、正在聊的群可以先跟上一阵。每条都叫醒不等于每条都要回，大家多半不是在对你说话；聊完了、插不上话了就 off，别挂到期。
 
     @param
-    when: 下面一种写法——"10m"/"2h"：过这么久；"2026-10-23 08:00"：到这个时刻；"on g123"、"on g123:30001"、"on u456"：这个窗口（或窗口里这个人）下一条消息来时；"wait g123:30001 10m"：等这个人的后续，来了或者 10 分钟都没来都叫你，只叫一次；"when <Python 表达式>"：每分钟用 exec_code 那份环境求值，第一次为真时叫你，例如 when mcversion.ver["release"] != "1.21.4"；"every 30m"、"daily 23:30"：反复叫你
+    when: 下面一种写法——"10m"/"2h"：过这么久；"2026-10-23 08:00"：到这个时刻；"on g123"、"on g123:30001"、"on u456"：这个窗口（或窗口里这个人）下一条消息来时；"wait g123:30001 10m"：等这个人的后续，来了或者 10 分钟都没来都叫你，只叫一次；"follow g123 30m"：聚焦这个群 30 分钟（不写多久就是 30 分钟），期间每条消息都像私聊一样叫醒你，再写一次是续期，"follow g123 off" 是退出，到期自动退出；"when <Python 表达式>"：每分钟用 exec_code 那份环境求值，第一次为真时叫你，例如 when mcversion.ver["release"] != "1.21.4"；"every 30m"、"daily 23:30"：反复叫你
     reason: 叫醒时你会看到的原因，写给到时候的自己，比如"他刚才问到一半"
 
     WHY: 维护者 2026-10-23：她要能自己决定什么时候再醒。最常用的是 wait——对方话说了一半、
@@ -443,13 +445,20 @@ def wake_me(when: str, reason: str) -> str:
     想在某个函数被调用时醒，用 exec_code 包一层它，里面调 chat.wake(reason=..., kind=...)，
     重启后要重新包。
     """
+    import re
+
     from mods.chat import awaker
 
+    if match := re.fullmatch(r"follow\s+" + awaker._TARGET + r"\s+off", " ".join(when.split())):
+        return f"已退出聚焦 {match[1]}" if awaker.unfollow(match[1]) else f"本来就没有在聚焦 {match[1]}"
     try:
         line = awaker.plant(when, reason)
     except ValueError as error:
         return str(error)
-    once = line.split(" ", 1)[0] in ("at", "on", "wait", "when")
+    kind = line.split(" ", 1)[0]
+    if kind == "follow":
+        return f"已写进 awaker：{line}（期间这个窗口每条消息都叫醒你；续期再写一次，退出写 follow {line.split()[1]} off）"
+    once = kind in ("at", "on", "wait", "when")
     return f"已写进 awaker：{line}" + ("（响过就划掉；不要了用 write_note 改 awaker）" if once else "（不要了用 write_note 改 awaker）")
 
 
