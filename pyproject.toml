@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "apscheduler",
     "beautifulsoup4",
+    "bilibili-api-python",
     "click",
     "cryptography",
     "httpx[socks]",

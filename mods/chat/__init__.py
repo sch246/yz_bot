@@ -753,7 +753,7 @@ def wake(event: dict | None = None, kind: str = "wake", reason: str = "") -> boo
     return True
 
 
-def push(window: tuple, author: str, text: str, *, wake: str = "") -> str:
+def push(window: tuple, author: str, text: str, *, wake: str = "", record_id: str = "") -> str:
     """Put one record into a non-QQ window and, when *wake* names a reason, wake her; returns the record id.
 
     *window* is ``(种类, 目标)`` of a kind registered with `kind`, or ``me``. The record is
@@ -761,6 +761,8 @@ def push(window: tuple, author: str, text: str, *, wake: str = "") -> str:
     the same order QQ messages use; so it shows on her screen, in ``read_log`` and in
     ``search``, stays unread until she has seen it, and survives a restart. *wake* is
     what she reads in "这次唤醒你的是". When she is busy it waits for this wake to end.
+    *record_id* is the source's own id for the record (a comment's rpid), so she can name
+    it the way she names a QQ message_id; left out, an 8-digit hex id is made up.
 
     WHY: 维护者 2026-10-23：别的来源也要带着内容叫醒她、能被她回，不另造一套"源"。QQ 消息
     不走这里，它们的内容由 NapCat 事件决定，撤回、补漏都在 chatlog 那条路上。
@@ -777,7 +779,7 @@ def push(window: tuple, author: str, text: str, *, wake: str = "") -> str:
     from mods import chatlog
 
     now = time.time()
-    record_id = uuid4().hex[:8]
+    record_id = " ".join(str(record_id).split()) or uuid4().hex[:8]
     with context.window_lock(window):
         chatlog.append_record(window[0], window[1], author, body, now, record_id)
         arrival = oplog.arrive(window, {"post_type": "push", "time": int(now), "author": str(author),

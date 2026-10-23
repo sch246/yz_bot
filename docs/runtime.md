@@ -75,6 +75,7 @@ uv run --frozen python run.py --smoke
 | `data/context/current.json` 与 `archive/` | 她当时看到了什么、想了什么 | 实际进上下文的材料和顺序、段边界、思考（默认 `keep` 时） | 一直留，按段归档 |
 | `log/llm.log`（`yz.llm.request`） | 每次请求发了什么 | 每次请求末尾的临时提示（待办、未读数、时间）；同一段里已经记过的前缀不再重复打印，只写"前 N 条已经记过" | 7 天 |
 | `data/notes/.history/` | 笔记改写或删除前是什么样 | 每个旧版本 | 一直留 |
+| `data/bili/credential.json` | B 站登录凭证 | 柚子 B 站号的 cookie（权限 600）；已读位置、昵称和"评论属于哪一楼"在 storage `bili/state` | 一直留，失效后重新 `.bili login` |
 | `data/notes/policy/changes.md` | 策略为什么改、改了有没有用 | 原因、预期和评估；只往后追加，追加不备份 | 一直留 |
 
 "一直留"的几份都没有自动清理，会随使用增长；查体积用 `du -sh chatlog data/event_stream data/context data/notes/.history`。
