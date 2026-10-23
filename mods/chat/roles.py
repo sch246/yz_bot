@@ -128,7 +128,7 @@ def _matching(lines, needle: str, most: int) -> tuple[int, list[str]]:
 def _archive_lines(messages: list[dict]):
     """What only an archived segment holds: her thinking, output, calls and their results.
 
-    WHY: 段里 user 消息是画面、笔记和提示，原文在聊天记录和笔记里，再搜一遍只会让每段
+    WHY: 段里 user 和 system 消息是画面、笔记和提示，原文在聊天记录和笔记里，再搜一遍只会让每段
     都因为开头那份 global 命中；她当时想了什么、说了什么、调了什么，才是要靠段名找回的。
     """
     for message in messages:

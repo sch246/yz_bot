@@ -105,7 +105,7 @@ def _note_block(scopes: list[str], title: str) -> dict | None:
     parts = [text for scope in scopes if (text := _notes.render(scope))]
     if not parts:
         return None
-    return {"role": "user", "content": title + "\n\n" + "\n\n".join(parts)}
+    return {"role": "system", "content": title + "\n\n" + "\n\n".join(parts)}
 
 
 def _head(woken: list[tuple], segment: dict) -> list[dict]:
@@ -122,7 +122,7 @@ def _head(woken: list[tuple], segment: dict) -> list[dict]:
     block = _note_block(scopes, "以下是你的笔记（普通文件，你随时能改，可能不完整）：")
     if block:
         messages.append(block)
-    messages.append({"role": "user", "content": "还能召回的东西（用 search 找，read_log、read_actions、read_note 读）：\n"
+    messages.append({"role": "system", "content": "还能召回的东西（用 search 找，read_log、read_actions、read_note 读）：\n"
                      + _roles.directory(woken)})
     return messages
 
@@ -234,7 +234,7 @@ def _late_arrivals(newest: dict[tuple, tuple], last_shown: dict[str, str],
                  + (f" 作者={entry['event']['user_id']}" if entry["event"].get("user_id") is not None else "")
                  for entry in late if entry.get("activated")]
         facts = ["你干活时刚到的", _screen.clock(), *([f"叫你的：{'、'.join(calls)}"] if calls else [])]
-        added.extend(_view.incoming(label, facts, text))
+        added.append(_view.outside(label, facts, text))
     return added, marks
 
 
@@ -321,7 +321,7 @@ def _handoff(turn, reason: str, model: str | None = None) -> bool:
         turn.handoff_note = ""
         return True
     messages = [*segment["messages"],
-                {"role": "user", "content": _roles.handoff_prompt(reason, diary_day(time.time()))}]
+                {"role": "system", "content": _roles.handoff_prompt(reason, diary_day(time.time()))}]
     grew = []
 
     def stop_when(used: int, initial: int) -> bool:
@@ -390,8 +390,12 @@ def _archive(turn, segment: dict, reason: str) -> str:
 
 
 def _system_count(session: llm.Chat) -> int:
-    return next((index for index, message in enumerate(session.messages) if message.get("role") != "system"),
-                len(session.messages))
+    """How many leading messages are the system prompt rebuilt on every wake.
+
+    WHY: 2026-10-23 起这一段里也有 system 消息（系统自己说的话），不能再按"第一条不是
+    system 的消息"找边界，否则这一段开头的笔记会被当成系统提示、存的时候丢掉。
+    """
+    return session.prompt_count
 
 
 def _begin(turn, window: tuple | None, kind: str) -> None:
@@ -525,17 +529,17 @@ def _run_agent(model: str | None, turn) -> bool:
         if text:
             screens[label] = text
             shown_last[label] = last
-            material.extend(_view.incoming(label, ["画面", _screen.clock()], text))
+            material.append(_view.outside(label, ["画面", _screen.clock()], text))
     now = _screen.clock()
     if notice is not None:
-        material.append({"role": "user", "content": f"这次唤醒你的是（{now}）：\n" + "\n".join(activation_lines)})
+        material.append({"role": "system", "content": f"这次唤醒你的是（{now}）：\n" + "\n".join(activation_lines)})
     if segment.get("notice"):
-        material.append({"role": "user", "content": segment["notice"]})
+        material.append({"role": "system", "content": segment["notice"]})
     if continuing:
         if turn.handoff_note:
-            material.append({"role": "user", "content": turn.handoff_note})
+            material.append({"role": "system", "content": turn.handoff_note})
         if turn.boxes:
-            material.append({"role": "user", "content": _box_note(turn.boxes)})
+            material.append({"role": "system", "content": _box_note(turn.boxes)})
         turn.handed_off = ""
     if not material:
         return True
@@ -603,6 +607,13 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
     session.quiet = quiet
     session.fail_fast = fail_fast
     binding = _chat_root._activate_chat(session, messages)
+    session.prompt_count = len(session.messages) - len(messages)
+    # WHY: 维护者 2026-10-23：别人说的话放 user，系统自己说的话（唤醒原因、笔记、交接、工具
+    # 状态、末尾提示）放对话中间的 system。DeepSeek 官方文档说 Chat Completions 支持在对话
+    # 中间插 system、不支持插工具调用，所以先前那对合成的 incoming 工具调用换成了这样；实测
+    # （仓库外的脚本）对话中间的 system 在思考模式、带工具、前面的思考被删掉时都被接受，四个
+    # 行为任务上不比合成框差。
+    session.hint_role = "system"
     if load:
         binding.load(list(load))
     binding.sync_registry()
@@ -611,9 +622,7 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
         # 新的一段：完整工具状态放在系统提示之后，这一段里不再变。
         state = binding.state_text(None)
         if state:
-            position = next((index for index, message in enumerate(session.messages)
-                             if message.get("role") != "system"), len(session.messages))
-            session.messages.insert(position, {"role": "user", "content": state})
+            session.messages.insert(session.prompt_count, {"role": "system", "content": state})
         told[0] = binding.state_snapshot()
     # WHY: 请求日志以前每次唤醒都从头打印，同一段越长、醒得越勤，llm.log 里同样的前缀就重复
     # 越多遍（2026-10-23 审查）。这一段已有的部分在 current.json 和归档里都有原样；新的一段
@@ -627,7 +636,7 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
             return []
         text = binding.state_text(told[0])
         told[0] = current
-        return [{"role": "user", "content": text}] if text else []
+        return [{"role": "system", "content": text}] if text else []
     # WHY: 原生 assistant/tool 配对原样留在 messages（含思考，DeepSeek 带工具时要求回传），
     # 并随这一段一起存下：下次唤醒看到的就是这一路下来的原样。
     session.preserve_native = True
@@ -765,11 +774,11 @@ def _run_reflection(model: str | None, turn, segments: list[dict]) -> None:
     changes = _tail(_notes.read_policy("changes"), 40)
     proposals = _tail(_notes.read_policy("proposals"), 20)
     messages = [
-        {"role": "user", "content": "以下是你的笔记：\n\n" + ("\n\n".join(notes) or "（还没有）")},
-        {"role": "user", "content": "## 上次反思以来归档的上下文（用 read_context 读原样）\n" + listing},
-        {"role": "user", "content": "## 策略改动记录（changes，最近的）\n" + (changes or "（还没有）")
+        {"role": "system", "content": "以下是你的笔记：\n\n" + ("\n\n".join(notes) or "（还没有）")},
+        {"role": "system", "content": "## 上次反思以来归档的上下文（用 read_context 读原样）\n" + listing},
+        {"role": "system", "content": "## 策略改动记录（changes，最近的）\n" + (changes or "（还没有）")
          + "\n\n## 给维护者的提案（proposals，最近的）\n" + (proposals or "（还没有）")},
-        {"role": "user", "content": _REFLECT_PROMPT.format(now=_screen.clock())},
+        {"role": "system", "content": _REFLECT_PROMPT.format(now=_screen.clock())},
     ]
     reflection = _segment.fresh()
     # 反思材料本身可能就很大：只限制它之后长出来的部分。

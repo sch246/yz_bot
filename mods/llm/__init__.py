@@ -849,6 +849,8 @@ class Chat:
         # 它和 system 提示词一样支持用函数生成，只是重置时机不同：system 在建会话时定一次，
         # hint 每个子请求重来一次。
         self.hints: list[Callable[[], str] | str] = []
+        # 末尾 hint 用哪个角色发；中心 agent 设成 system，见 chat.agent._run_session。
+        self.hint_role = "user"
         # WHY: 中心 agent 的完整输出与结果留在原生载体中；私有会话仍按
         # keep/drop 控制本轮工具循环的思考字段。
         self.keep_reasoning: bool = True
@@ -916,7 +918,7 @@ class Chat:
             if value and str(value).strip():
                 parts.append(str(value).strip())
         # 合成一条：多个 hint 之间没有先后语义，拆成多条只会占更多消息位。
-        return [{"role": "user", "content": "\n\n".join(parts)}] if parts else []
+        return [{"role": self.hint_role, "content": "\n\n".join(parts)}] if parts else []
 
     def add_context_provider(self, provider: Callable[[], list[dict]]):
         """Register one source of messages appended before each sub-request."""

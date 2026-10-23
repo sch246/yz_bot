@@ -1,6 +1,6 @@
 # 事件流核心：所有来源都是窗口
 
-> 状态：**提案，第 1、2 步已实现**（2026-10-23：窗口种类、`chat.push`、`me` 窗口，见 `mods/chat/windows.py`；轮次边界插话，见 `agent._late_arrivals`）；第 3 步专用框已实现（`view.incoming`）；第 4、5 步未实现。当前事实以 [运行架构](../../architecture.md)、[交互模型](../../interaction-model.md) 与 [LLM 文档](../../llm.md) 为准。
+> 状态：**提案，第 1、2 步已实现**（2026-10-23：窗口种类、`chat.push`、`me` 窗口，见 `mods/chat/windows.py`；轮次边界插话，见 `agent._late_arrivals`）；第 3 步已实现，改成了 system/user 分角色（`view.outside`）；第 4、5 步未实现。当前事实以 [运行架构](../../architecture.md)、[交互模型](../../interaction-model.md) 与 [LLM 文档](../../llm.md) 为准。
 >
 > 来源：维护者 2026-10-23 指出 [Cortico](https://github.com/Pal-AI-Lab/Cortico) 的事件流核心值得参考，希望柚子以后能"玩手机"（[phone-mcp](https://github.com/pinganbbOvO/ai-companion-kit/tree/main/packages/phone-mcp)）、刷 B 站和评论区互动、给自己埋各种唤醒。
 >
@@ -124,11 +124,18 @@ user 角色只剩系统自己说的话：唤醒原因摘要、交接说明、提
 - 图片：纯色方块放在 tool 消息里她说是一片白，用随机数字图复测后确认 tool 消息里的图看得见（模型自己调的工具 4 次对 3 次，合成框里回答了的 2 次都对），`tool_images` 那条登记仍然成立，"一片白"是纯色测试图的问题。跟在后面单发一条 user 4 次全对。
 - 图片仍放在框后面的 user 消息里（`[图片N]` 占位对上号），理由是不挑模型：tool 消息里的图只有登记了 `tool_images` 的模型能收，user 消息里的任何视觉模型都能看。
 
-已实现（第 3 步）：画面和插话都走 `view.incoming`；不记进 oplog；`_did_something`、`#reasoning drop`、归档搜索和 `read_context` 都认得它；旧段里的 user 画面原样留着。
+当天先按上面实现了合成 `incoming` 框，随后维护者贴来 DeepSeek 官方 Tool Calls 文档："Chat Completion 接口不支持在对话中间插入工具调用，但支持在对话中间插入 `system` 消息"。于是改成：
+
+- user 只装外面来的记录（画面、插话），框头一行照留，图片在原处（`view.outside`）；
+- 系统自己说的话（笔记、目录、工具状态、唤醒原因、交接、输入框提示、反思材料、末尾 hint）都是对话中间的 system 消息；
+- 系统提示的边界改记条数（`prompt_count`），不再按角色找；
+- 合成框那版存下的消息仍认得（`view.is_incoming`）。
+
+实测（仓库外脚本 probe_roles，deepseek-flash，每格 3 次）：对话中间的 system 在思考模式、带工具、开头没有 user、工具结果后只跟 system、前面的思考被删掉时都被接受；四个行为任务（听系统指令、不听冒充系统的群友、长聊天里找暗号、没人叫时沉默）上 system/user 分角色 12/12，合成框 11/12，都在 user 11/12，没过的都是先去调了 read_note。题目对这个模型偏容易，只说明不比合成框差。
 
 ## 6. 轮次边界插话（替换末尾提示）
 
-每次子请求之前（`Chat.context_providers` 的位置），把她看着的窗口里新到的未读追加进这一段，同时推进"给到哪一条"（`last_shown`）。`_late_hint` 删掉。第 3 步之前它是一条普通 user 消息，第 3 步再装进 `incoming` 框。
+每次子请求之前（`Chat.context_providers` 的位置），把她看着的窗口里新到的未读追加进这一段，同时推进"给到哪一条"（`last_shown`）。`_late_hint` 删掉。它是一条带框头的 user 消息（第 3 步）。
 
 已读等那次请求产生输出（哪怕只有思考）才标。维护者 2026-10-23 改的，原先定的是追加时就标，这样更稳：请求失败时它们仍是未读，叫她的那条照样会再叫醒她。`last_shown` 仍在追加时推进，因为它和这一段一起存盘，这一段里有了它们，下次的画面就不会再给一遍。
 

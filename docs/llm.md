@@ -41,7 +41,7 @@
    - 目录（`roles.directory`），只列名字：其它最近有消息的窗口、笔记、日记。
 2. **每次唤醒追加的材料**（`agent._run_agent`），前面的消息一个字都不动：
    - 这一段里第一次出现的窗口和作者（最多 6 人）的笔记（`agent._people`）；
-   - 叫醒她的窗口画面，装在专用框里（2026-10-23 起，学 Cortico）：每个窗口一对系统合成的 `incoming` 工具调用和结果（`view.incoming`），结果第一行是框头（`窗口 g123 · 画面 · 时刻`，插话时写"你干活时刚到的"和其中叫她的激活），下面是 chatlog 原文；图片换成 `[图片N]` 占位，原图跟在框后面单发一条 user 消息（tool 消息里的图只有登记了 `tool_images` 的模型能收，user 消息里的任何视觉模型都能看）。别人说的话只在框里，user 消息只剩系统自己说的话。合成调用带空的 `reasoning_content`（deepseek-flash 实测不带会 400），`incoming` 不在工具列表里（实测照样接受），她调不了；它不记进 oplog、不算她做过的事，`search` 的归档部分不搜它，`read_context` 显示成【incoming】。以前的段里画面是 user 消息，原样留着。这一段里第一次出现的窗口给 `max_events` 条，已经出现过的从这一段里上次给到的那条记录之后接着给（记在这一段的 `last_shown`，不按看到时间，因为它只精确到秒）；交接后续做时沿用刚才看着的窗口；
+   - 叫醒她的窗口画面（2026-10-23 起学 Cortico 分开别人的话和系统的话）：每个窗口一条 user 消息（`view.outside`），第一行是框头（`窗口 g123 · 画面 · 时刻`，插话时写"你干活时刚到的"和其中叫她的激活），下面是 chatlog 原文，图片在原处。user 消息只装外面来的记录；系统自己说的话——笔记块、目录、工具状态、"这次唤醒你的是"、交接说明和交接指令、输入框提示、反思材料、末尾 hint（`Chat.hint_role`）——都是对话中间的 system 消息。DeepSeek 文档说 Chat Completions 支持在对话中间插 system、不支持插工具调用；当天先做过一版合成 `incoming` 工具调用的框，随即换成这样，那时存下的框（`view.is_incoming`）仍不算她做过的事，`search` 的归档部分不搜，`read_context` 显示成【incoming】。系统提示有几条由 `agent._system_count` 记的 `prompt_count` 决定，不再按角色找边界。这一段里第一次出现的窗口给 `max_events` 条，已经出现过的从这一段里上次给到的那条记录之后接着给（记在这一段的 `last_shown`，不按看到时间，因为它只精确到秒）；交接后续做时沿用刚才看着的窗口；
    - "这次唤醒你的是（时刻）"、闹钟理由，或"你刚把上一段上下文交接掉了"；
    - 第一次输出之后，每次子请求之前 `agent._late_arrivals` 把画面里的窗口新到的未读按画面同样的规则（从 `last_shown` 接着给，最多 200 条）追加进这一段，标题写窗口、时刻和其中的激活。`last_shown` 在追加时推进（它和这一段一起存盘）；看到时间和已读等那次请求产生输出（哪怕只有思考）才记，所以收尾不再为它们多叫一次，请求失败时它们仍是未读、照样再叫醒她，画面也不会再给一遍。只有她自己发出去的回显时不插。
 
@@ -229,7 +229,7 @@ hint 与追加式上下文是两层，判据是一句话：**频繁变化、且�
 - **`hint` 与 `prompt` 不在表里**：窗口结束提示的 `#hint` 是 `data/hint/` 下的文件，独立合并全局默认与窗口覆盖；她对自己的认识是笔记 self（`data/notes/self.md`）。它们不是单值档位，不使用 `AGENT_SETTINGS` 的归一化。
 - 已退役的窗口聊天设置仍可能留在生产 storage，但运行代码不再读取；其清理需先获维护者授权，见[第二轮调查](working/round2-legacy-and-backfill-audit.md)。
 
-**召回画面以外的内容。** 中心 agent 用 `read_log(window, count, before)` 读任意窗口的 chatlog 原文（格式与画面相同，`before` 写 `YYYY-MM-DD HH:MM:SS` 或 Unix 秒，用来往前翻），`search(keyword, window, days)` 按子串一次找遍四处，按出处分组：一个或所有窗口最近若干天（默认 30，最多 365）的聊天记录，最新的 30 条在前；所有笔记和日记（不限时间，每份列前 3 行命中，最多 20 份）；同一时间范围内归档的段（只找 assistant 的思考、正文、工具调用和工具结果，不找画面（`incoming` 框和以前的 user 画面）、笔记这些别处有原文的消息，每段列命中数和前 2 处，最多 10 段，最新在前）。`read_actions(ids, count, keyword, start)` 读自己的行动记录，`read_note(scope)` 读笔记。旧的 `take`、`status`、`mentions`、`fetch`、`read_messages`、`mark_read`、`pull` 已移除。`#hint` 不触发阅读。
+**召回画面以外的内容。** 中心 agent 用 `read_log(window, count, before)` 读任意窗口的 chatlog 原文（格式与画面相同，`before` 写 `YYYY-MM-DD HH:MM:SS` 或 Unix 秒，用来往前翻），`search(keyword, window, days)` 按子串一次找遍四处，按出处分组：一个或所有窗口最近若干天（默认 30，最多 365）的聊天记录，最新的 30 条在前；所有笔记和日记（不限时间，每份列前 3 行命中，最多 20 份）；同一时间范围内归档的段（只找 assistant 的思考、正文、工具调用和工具结果，不找画面、笔记、系统消息这些别处有原文的 user 与 system 消息，每段列命中数和前 2 处，最多 10 段，最新在前）。`read_actions(ids, count, keyword, start)` 读自己的行动记录，`read_note(scope)` 读笔记。旧的 `take`、`status`、`mentions`、`fetch`、`read_messages`、`mark_read`、`pull` 已移除。`#hint` 不触发阅读。
 
 ### 行动记录
 
@@ -298,7 +298,7 @@ Chat.chat
 中心 agent 登记在 `context.WindowTurn` 的 `AGENT_WINDOW` 键下。`context.window_lock` 串行化同窗口的 chatlog/history 写入与 arrival 登记；路由期间的事件对象→arrival 关联由 `context.remember_arrival`／`event_arrival`／`release_arrival` 临时保存，不写进事件 dict。相关窗口的群友可用 `^C` 取消共享请求。
 
 - **先接纳，后展示。** 路由在同一窗口锁内写 chatlog/history 与 arrival；Bot 的 `message_sent` 回声也写进 chatlog，因此自己说过的话会出现在下次的画面里，但不再执行命令。
-- **召唤不是全部。** 通知列出这次的唤醒（窗口、类型、作者、时间），它们决定这次画面里的窗口和作者笔记；一次唤醒里新到的消息不打断当前请求：画面里的窗口又来的消息在下一次子请求之前装进 `incoming` 框追加进这一段，其它窗口只在末尾 hint 里给未读数，模型可用 `read_log` 去看。话没说完就回的问题不靠延迟（人可能隔几分钟才想到下一句；群一热闹也安静不下来，按安静判据攒批几乎每次都拖到上限），靠三样：注意事项里的沉默纪律（沉默是正常的行动）；输入框，`type_word` 与 `send` 之间至少隔一次请求，期间到的消息她一定看过；以及 `wake_me` 的 `wait`，对方没下文时也会再叫她。
+- **召唤不是全部。** 通知列出这次的唤醒（窗口、类型、作者、时间），它们决定这次画面里的窗口和作者笔记；一次唤醒里新到的消息不打断当前请求：画面里的窗口又来的消息在下一次子请求之前作为带框头的 user 消息追加进这一段，其它窗口只在末尾 hint 里给未读数，模型可用 `read_log` 去看。话没说完就回的问题不靠延迟（人可能隔几分钟才想到下一句；群一热闹也安静不下来，按安静判据攒批几乎每次都拖到上限），靠三样：注意事项里的沉默纪律（沉默是正常的行动）；输入框，`type_word` 与 `send` 之间至少隔一次请求，期间到的消息她一定看过；以及 `wake_me` 的 `wait`，对方没下文时也会再叫她。
 - **`#` 只参与控制，不进入模型正文。** 这类事件可留下到达和激活事实（`#poke` 会唤醒），但不会作为聊天正文投影；本地子命令仍就地执行。
 - **收尾没有缝。** `context.finish_turn` 在全局登记锁内检查是否还有未递交的唤醒；新召唤要么被当前 agent 接住，要么在注销后领取新的。整理之后不经过这一步，直接继续。
 - **`^C` 打断。** `bot._route` 取消该交互线 waiter；若窗口属于中心请求的关联窗口，还取消 `AGENT_WINDOW` turn 并调用 `watchdog.stop(AGENT_WINDOW)`。LLM 在轮间与每个流式 chunk 后检查停止并关闭响应；已输出的文本不能收回，未完成的行动不会自动重放。
