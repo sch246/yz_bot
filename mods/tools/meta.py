@@ -431,10 +431,14 @@ def write_note(scope: str, text: str) -> str:
 
 
 def wake_me(when: str, reason: str) -> str:
-    """给自己埋一个唤醒：过一会儿、到某个时刻、某个窗口来消息、等某人的后续、或者某个条件成立时叫醒你。
+    """给自己埋一个唤醒：过一会儿、到某个时刻、某个窗口来消息、等某人的后续、或者某个条件成立时叫醒你；也能给窗口盖一层限时的覆盖层，聚焦（follow）或者静音（mute）。
+
+    每个窗口有默认的叫醒条件（私聊每条都叫，群里是 @、叫名字、戳一戳，B 站是回复和 @）。覆盖层盖着的时候由它说了算：follow 每条都叫，mute 都不叫；消息照样记成未读，你醒着时照样看得见，你自己埋的 on、wait 照样响。盖了覆盖层的窗口在画面头和未读提示里会标出来，比如"mute 到 2026-10-24 08:00"。
+    follow 是你自己选的聚焦：感兴趣、正在聊的群可以先跟上一阵。每条都叫醒不等于每条都要回，大家多半不是在对你说话；聊完了、插不上话了就 off。
+    要按自己的条件决定某个窗口叫不叫，在 exec_code 里 `from mods.chat import awaker` 再调 `awaker.override(目标, 函数, until=时间戳)`：函数收到这条事件（B 站这类是 None），返回叫不叫，显示为 other，重启就没了。
 
     @param
-    when: 下面一种写法——"10m"/"2h"：过这么久；"2026-10-23 08:00"：到这个时刻；"on g123"、"on g123:30001"、"on u456"：这个窗口（或窗口里这个人）下一条消息来时；"wait g123:30001 10m"：等这个人的后续，来了或者 10 分钟都没来都叫你，只叫一次；"when <Python 表达式>"：每分钟用 exec_code 那份环境求值，第一次为真时叫你，例如 when mcversion.ver["release"] != "1.21.4"；"every 30m"、"daily 23:30"：反复叫你
+    when: 下面一种写法——"10m"/"2h"：过这么久；"2026-10-23 08:00"：到这个时刻；"on g123"、"on g123:30001"、"on u456"：这个窗口（或窗口里这个人）下一条消息来时；"wait g123:30001 10m"：等这个人的后续，来了或者 10 分钟都没来都叫你，只叫一次；"follow g123 30m"：聚焦这个群 30 分钟，期间每条消息都像私聊一样叫醒你（只认 QQ 窗口）；"mute g123 2h"：这段时间这个窗口不叫醒你；覆盖层不写多久就是 30 分钟，写多久都行；目标可以是 g群号、u私聊号、g群号:QQ号（只管这个人）、bili:BV号 这样的窗口，或者 group、private、bili 这样的一整类；同一目标再写一次就替换，"mute g123 off" 揭掉；"when <Python 表达式>"：每分钟用 exec_code 那份环境求值，第一次为真时叫你，例如 when mcversion.ver["release"] != "1.21.4"；"every 30m"、"daily 23:30"：反复叫你
     reason: 叫醒时你会看到的原因，写给到时候的自己，比如"他刚才问到一半"
 
     WHY: 维护者 2026-10-23：她要能自己决定什么时候再醒。最常用的是 wait——对方话说了一半、
@@ -443,13 +447,20 @@ def wake_me(when: str, reason: str) -> str:
     想在某个函数被调用时醒，用 exec_code 包一层它，里面调 chat.wake(reason=..., kind=...)，
     重启后要重新包。
     """
+    import re
+
     from mods.chat import awaker
 
+    if match := re.fullmatch(r"(?:follow|mute)\s+(\S+)\s+off", " ".join(when.split())):
+        return f"已揭掉 {match[1]} 的覆盖层" if awaker.lift(match[1]) else f"{match[1]} 本来就没有覆盖层"
     try:
         line = awaker.plant(when, reason)
     except ValueError as error:
         return str(error)
-    once = line.split(" ", 1)[0] in ("at", "on", "wait", "when")
+    kind = line.split(" ", 1)[0]
+    if kind in ("follow", "mute"):
+        return f"已写进 awaker：{line}（同一目标再写一次就替换，揭掉写 {kind} {line.split()[1]} off）"
+    once = kind in ("at", "on", "wait", "when")
     return f"已写进 awaker：{line}" + ("（响过就划掉；不要了用 write_note 改 awaker）" if once else "（不要了用 write_note 改 awaker）")
 
 

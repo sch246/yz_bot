@@ -699,17 +699,26 @@ def capture_chat(event: dict) -> bool:
     if window is None or not _mail_candidate(event):
         return False
     matched = activation_signal(event)
-    # 她给自己埋的「这个窗口来消息就叫我」「等这个人的后续」，见 awaker。
+    author = history.author(event)
+    # 默认触发器之上的覆盖层（follow／mute／other），见 awaker。它看每条消息，以及别的会叫醒她
+    # 的事件（戳她）；撤回、别人之间的戳一戳不归它管。她自己发的不算。
+    wanted, layer = (_awaker.triggered(window, event, author, matched)
+                     if author != identity.bot_id() and (msgs.is_msg(event) or matched) else (matched, None))
+    # 她给自己埋的「这个窗口来消息就叫我」「等这个人的后续」，见 awaker；覆盖层压不住它们。
     waited = (_awaker.take_waiting(window, event.get("user_id"))
               if msgs.is_msg(event) and event.get("user_id") != identity.bot_id() else [])
-    if not matched and not waited:
-        return False
+    if not wanted and not waited:
+        # WHY: 被 mute 压住的点名照样返回 True、吃掉这条：放它往下走，后面的
+        # capture_addressed_fallback 认出「柚子，」会直接调 chat()，静音就漏了。
+        return matched
     kind = ("mention" if msgs.is_msg(event) and _reader._addressed(event, msgs.body(event))
             else "poke" if msgs.is_poke(event)
             else "private" if msgs.is_msg(event) and _private_from_peer(event)
             else "wake" if matched else "")
     if waited:
         kind = "；".join(filter(None, [kind, *(f"等到了（{rule['key']}）" for rule in waited)]))
+    if wanted and layer is not None:
+        kind = "；".join(filter(None, [kind, f"覆盖层 {_awaker.describe(layer)}" + (f"：{layer['reason']}" if layer["reason"] else "")]))
     wake(event, kind)
     return True
 
@@ -780,6 +789,9 @@ def push(window: tuple, author: str, text: str, *, wake: str = "", record_id: st
 
     now = time.time()
     record_id = " ".join(str(record_id).split()) or uuid4().hex[:8]
+    if wake and window != _windows.ME and not _awaker.triggered(window, None, None, True)[0]:
+        # 被覆盖层压住：照样记下、照样未读，只是不叫醒。
+        wake = ""
     with context.window_lock(window):
         chatlog.append_record(window[0], window[1], author, body, now, record_id)
         arrival = oplog.arrive(window, {"post_type": "push", "time": int(now), "author": str(author),

@@ -224,7 +224,8 @@ def _unread_hint(on_screen: set[tuple]) -> str:
         if not _windows.known(window) or window in on_screen:
             continue
         rows.append(f"{_screen.label(window)} {detail['unread']} 条"
-                    + (f"（@你 {detail['mentions']}）" if detail["mentions"] else ""))
+                    + (f"（@你 {detail['mentions']}）" if detail["mentions"] else "")
+                    + "".join(f"（{badge}）" for badge in _chat_root._awaker.badges(window)))
     return ("其它窗口还有没看过的消息：" + "；".join(rows[:10])
             + "。要看就用 read_log 读原文。") if rows else ""
 
@@ -265,7 +266,8 @@ def _late_arrivals(newest: dict[tuple, tuple], last_shown: dict[str, str],
         calls = [f"{entry.get('activation_kind')}"
                  + (f" 作者={entry['event']['user_id']}" if entry["event"].get("user_id") is not None else "")
                  for entry in late if entry.get("activated")]
-        facts = ["你干活时刚到的", _screen.clock(), *([f"叫你的：{'、'.join(calls)}"] if calls else [])]
+        facts = ["你干活时刚到的", _screen.clock(), *([f"叫你的：{'、'.join(calls)}"] if calls else []),
+                 *_chat_root._awaker.badges(window)]
         added.append(_view.outside(label, facts, text))
     return added, marks
 
@@ -557,7 +559,7 @@ def _run_agent(model: str | None, turn) -> bool:
         if text:
             screens[label] = text
             shown_last[label] = last
-            material.append(_view.outside(label, ["画面", _screen.clock()], text))
+            material.append(_view.outside(label, ["画面", _screen.clock(), *_chat_root._awaker.badges(window)], text))
     now = _screen.clock()
     if notice is not None:
         material.append({"role": "system", "content": f"这次唤醒你的是（{now}）：\n" + "\n".join(activation_lines)})
