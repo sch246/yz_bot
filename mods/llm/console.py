@@ -112,7 +112,8 @@ def print_request(model: str, messages: list[dict], start: int = 0) -> None:
     pending = messages[start:]
     if not pending:
         return
-    lines = [colored(f"发送给 {model} 的{'新增' if start else ''}消息：", "light_grey")]
+    skipped = f"新增消息（前 {start} 条已经记过）" if start else "消息"
+    lines = [colored(f"发送给 {model} 的{skipped}：", "light_grey")]
     for entry in pending:
         role = entry.get("role", "system")
         if role == "assistant" and entry.get("tool_calls"):

@@ -44,8 +44,8 @@ _EXPORT_SPECS = {
     "getstorage": ("identity", "getstorage"),
     "getgroupstorage": ("identity", "getgroupstorage"),
     "getgroupname": ("identity", "getgroupname"),
-    # Self-authored tools may edit named prompt objects through the same
-    # trusted Python surface instead of requiring a dedicated prompt editor.
+    # Legacy named prompt objects, kept readable; since 2026-10-22 who she is
+    # lives in the plain note data/notes/self.md instead.
     "prompts": ("chat", "prompts"),
     "headshot": ("identity", "headshot"),
     "headshot_url": ("identity", "headshot_url"),

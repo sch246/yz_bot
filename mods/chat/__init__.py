@@ -31,15 +31,16 @@ prompts: dict = {}
 chat_groups: list = []
 description_cache: dict = {}
 llm_config: dict = {}
-# WHY: 两个上限的默认值写死在这里，不再读 llm_system/config.json；运行期由全局
-# agent storage 覆盖。2026-10-19 起每次请求都重新组装：max_events 是一个窗口画面
-# 默认展示的条数（参照 QQ-agent 的 80），max_token 乘提醒百分比是一次唤醒里上下文
-# 长到多少就请图书管理员放下一部分再重新组装。存储键沿用旧名，免得已有的全局设置失效。
+# WHY: 两个值的默认写死在这里，不再读 llm_system/config.json；运行期由全局 agent
+# storage 覆盖。max_events 是一个窗口画面默认展示的条数（参照 QQ-agent 的 80，存储键
+# 沿用旧名）；tidy_token 是整理阈值，tidy.py 里的 `limit`。2026-10-22 以前它是
+# max_token × pressure_percent 两个数，维护者觉得一个阈值拆成两个数没有意义，合成一个。
+# 2026-10-23 维护者定默认 50 万，约是模型上下文的一半：同一段上下文一直往后接，阈值
+# 要给交接本身（整段再加一句交接指令）留出余量，也让"超长卡死"在正常使用里遇不到。
 DEFAULT_MAX_EVENTS = 80
-DEFAULT_MAX_TOKEN = 40000
+DEFAULT_TIDY_TOKEN = 500000
 AGENT_WINDOW = oplog.AGENT_WINDOW
 NOTICE_TOKENS = 500
-_PRESSURE_PERCENT = 75
 _cost_lock = threading.Lock()
 # Eager capture is image work reported on the image stream, not chat traffic.
 _image_stream = log.stream("image")
@@ -64,7 +65,14 @@ def agent_setting(name: str, data: dict | None = None):
 
 
 def limit() -> tuple[int, int]:
-    return agent_setting("max_events"), agent_setting("max_token")
+    """Screen size and tidy threshold."""
+    data = storage.get("", "agent")
+    if "max_token" in data or "pressure_percent" in data:
+        # 旧的两个数是按每次重组上下文定的预算，套到同一段上下文上会太小：直接删掉，用默认。
+        data.pop("max_token", None)
+        data.pop("pressure_percent", None)
+        storage.save()
+    return agent_setting("max_events", data), agent_setting("tidy_token", data)
 
 
 def get_image_mode(data: dict | None = None) -> str:
@@ -99,8 +107,7 @@ AGENT_SETTINGS = {
     "image": ("image", normalize_image_mode),
     "reasoning": ("reasoning", normalize_reasoning_mode),
     "max_events": ("max_events", _bounded_int(1, DEFAULT_MAX_EVENTS)),
-    "max_token": ("max_token", _bounded_int(1, DEFAULT_MAX_TOKEN)),
-    "pressure_percent": ("pressure_percent", _bounded_int(1, _PRESSURE_PERCENT, 100)),
+    "tidy_token": ("tidy_token", _bounded_int(1, DEFAULT_TIDY_TOKEN)),
 }
 
 _reflect_stream = log.stream("agent")
@@ -122,12 +129,38 @@ def reflect_now() -> bool:
 
 
 def get_prompt() -> list:
-    selected = storage.get("", "agent").get("prompt")
-    if not selected:
-        return settings
+    """Who she is: the ``self`` note, at the head of the system prompt."""
+    text = _notes.read("self").strip() or _migrate_self()
+    return [{"role": "system", "content": text}] if text else []
+
+
+def _migrate_self() -> str:
+    """Move the old persona prompt into ``data/notes/self.md`` once.
+
+    WHY: 维护者 2026-10-22 定：旧的提示词／命名设定是按窗口配人设时代留下的，中心化以后
+    人设就是她对自己的认识，改成普通文件 self，由她在夜间反思里迭代。只搬当时生效的那份；
+    storage 里的 `settings`、`agent.prompt` 和命名设定原样留着不删（`.py` 里仍能用 `prompts` 读到），
+    搬过一次就记下，之后维护者删掉 self.md 表示真的不要人设，不会再被搬回来。
+    """
+    data = storage.get("", "agent")
+    if data.get("self_migrated"):
+        return ""
+    selected = data.get("prompt") or settings
     if isinstance(selected, str):
         selected = prompts.get(selected)
-    return selected if isinstance(selected, list) else []
+    messages = [message for message in selected if isinstance(message, dict)] if isinstance(selected, list) else []
+    parts = [str(message.get("content", "")).strip() for message in messages if message.get("role") == "system"]
+    examples = [message for message in messages if message.get("role") != "system"]
+    if examples:
+        parts.append("## 示例对话\n" + "\n".join(
+            ("你" if message.get("role") == "assistant" else "对方") + "：" + str(message.get("content", "")).strip()
+            for message in examples))
+    text = "\n\n".join(part for part in parts if part)
+    if text:
+        _notes.write("self", text)
+    data["self_migrated"] = True
+    storage.save()
+    return text
 
 
 def get_model(data: dict | None = None) -> str:
@@ -213,12 +246,11 @@ def init_chat(
     messages: list | None = None,
 ) -> tuple[tool_modules.SessionBinding, tuple | None]:
     """Assemble one Chat and return its tool binding and window."""
-    prompts["base"] = _view._base_prompt()
     state = {"role": "system", "content": "你是唯一的中心 agent；窗口只是来源与明确发送目标。"}
     window = AGENT_WINDOW
     session.set_messages([
         *get_prompt(),
-        *prompts["base"],
+        *_view._base_prompt(),
         state,
         *(messages or []),
     ])
@@ -494,15 +526,14 @@ def _hint_evaluate(code: str, window: tuple, turn=None):
     """在 `py.loc` 的一份私用副本里跑一次 *code*，返回末行的值。
 
     WHY: 名字要照旧认（`sendmsg`/`storage`/…都在），痕迹不能留——副本 + 单次求值就够了：
-    `window`/`usage` 是这一次临时的，代码里的赋值也只落进副本，`py.loc` 一个键都不会多。
+    `window`/`usage`/`peak`/`limit` 是这一次临时的，代码里的赋值也只落进副本，`py.loc` 一个键都不会多。
     仍走 `py.eval_last`，于是「末行是表达式才发」和 Traceback 指回作者那几行都不变。
     """
     namespace = dict(py.loc)
     namespace["window"] = window
     namespace["usage"] = context_usage(turn)
-    namespace["event_count"] = getattr(turn, "_chat_event_count", 0)
-    namespace["context_limit"] = getattr(
-        turn, "_chat_limit", (DEFAULT_MAX_EVENTS, DEFAULT_MAX_TOKEN))
+    namespace["peak"] = getattr(turn, "log", {}).get("peak", 0)
+    namespace["limit"] = limit()[1]
     return py.eval_last(code, namespace)
 
 
@@ -619,7 +650,7 @@ def _subcommand_call(event: dict) -> Callable | None:
     if subcommand not in _subcommands._SUBCOMMAND_NAMES:
         return None
     if _subcommands.requires_op(value[1:]) and not op.require_op(
-            event, pattern=r"^#\s*(hint|use_model|add_prompt|use_setting|set_setting|del_setting|image|reasoning|limit|reflect|awaker)"):
+            event, pattern=r"^#\s*(hint|use_model|prompt|image|reasoning|limit|reflect|awaker)"):
         # WHY: 全局设置不可由普通群友改写；只读子命令保持公开。
         return None
     return lambda value=value: _subcommands._subcommand(value[1:])

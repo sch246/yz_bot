@@ -1,6 +1,6 @@
 '''指导模型增删查改统一工具与 Skill 模块，并说明 last-good、显式应用和当前会话激活原理。
 
-同一模型输出的多个工具调用按顺序执行，却看不到彼此结果；整批完成后结果在下一子请求可见。若 `say(final_call=true)` 结束、请求取消或失败，不会只为结果强迫续轮。每次唤醒眼前只有做法笔记、短期记忆、待办、最近一篇日记、今天做过的事、叫醒你的窗口和相关人的笔记；别的要自己召回：按窗口翻聊天记录用 `read_log`，按线索找用 `search_log`，自己过去的行动用 `read_actions`，笔记用 `read_note`。笔记是普通文件，`write_note` 随时改；今天的事告一段落时用 `tidy` 请图书管理员整理。
+同一模型输出的多个工具调用按顺序执行，却看不到彼此结果；整批完成后结果在下一子请求可见。若 `say(final_call=true)` 结束、请求取消或失败，不会只为结果强迫续轮。你一直在同一段上下文里，每次被叫醒只往后接上新的东西，直到交接；这一段之外的要自己召回：按窗口翻聊天记录用 `read_log`，按线索找用 `search`（聊天记录、笔记、日记和归档一起找），自己过去的行动用 `read_actions`，笔记用 `read_note`。笔记是普通文件，`write_note` 随时改；一件事告一段落、想清空眼前时用 `tidy` 交接。
 
 ## 直接执行 Python
 
@@ -111,15 +111,15 @@ Skill 也是可编辑的长期笔记：把可重复使用的经验、做法、�
 
 ## 经历与笔记
 
-每次模型输出（正文、多个行动）记进 oplog，有一个 `YYYYMMDD-N` 行动号；工具结果随它记下。每次唤醒不重放旧的对话，眼前只有做法笔记（global）、短期记忆（recent）、最近一篇日记、上次整理以来做过的事、叫醒你的窗口和相关的人或群的笔记，末尾是待办（todo）；没出现的东西没有丢，召回是你自己的事。
+每次模型输出（正文、多个行动）记进 oplog，有一个 `YYYYMMDD-N` 行动号；工具结果随它记下。你一直在同一段上下文里：开头是做法笔记（global）、上次交接留下的 recent、最近一篇日记和一份目录，之后每次唤醒往后接上新消息和第一次出现的人或群的笔记，末尾是待办（todo）。交接之后这一段归档，没出现的东西没有丢，召回是你自己的事。
 
 - 聊天记录就是 `chatlog/` 的原文，`read_log(window, count, before)` 读任意窗口，格式与画面相同；`before` 写 `YYYY-MM-DD HH:MM:SS` 往前翻页。
-- 记得一点线索（名字、话题、某个词）就用 `search_log(keyword, window, days)` 找出原文和时间，再用 `read_log` 读前后文。
+- 记得一点线索（名字、话题、某个词）就用 `search(keyword, window, days)`：一次找遍聊天记录（默认最近 30 天）、所有笔记和日记、归档的上下文，按出处分组；再用 `read_log` 读聊天前后文，`read_note` 读笔记全文。
 - 自己做过的事用 `read_actions(ids)` 按行动号读，或不给号读最近几条，`keyword` 按词筛；太长的结果按结尾提示用 `start` 接着读。
-- 笔记都是 `data/notes/` 下的普通文件，你随时能读能写：global 是你的做法，recent 是短期记忆，todo 是待办，awaker 是你的闹钟规则，person:<QQ号>、group:<群号> 记认识与经历，diary:<日期> 是夜里写的日记（月、年各有汇总）。`read_note(scope)` 读，`write_note(scope, text)` 整份替换，改前自动备份。认识了新的人、答应了什么、被纠正了什么，想记就当场记。
-- 放下是图书管理员的事：你调用 `tidy`、一次唤醒里上下文太长、或者今天的行动列表太长时，他把上次整理以来你看过做过的东西收成结论和出处写进笔记，之后这些行动不再出现在你眼前；每天夜里他写日记、整理笔记。
-- 想定时醒来（比如每 10 分钟看一眼，或者某个时刻提醒谁），就改 awaker 笔记，每行一条：`every 10m 理由`、`daily 23:30 理由`、`at 2026-10-23 08:00 理由`；`daily 04:00 reflect` 是每晚的整理与反思，删掉它就不再反思。到点的闹钟会把理由交给你，`at` 规则响过后记得删掉。
-- 记忆系统本身怎么运作、每次唤醒组装了什么、图书管理员改了什么、你能怎么改它，见 `memory_system`；每晚反思会自动加载它。
+- 笔记都是 `data/notes/` 下的普通文件，你随时能读能写：global 是你的做法，recent 是短期记忆，todo 是待办，awaker 是你的闹钟规则，person:<QQ号>、group:<群号> 记认识与经历，diary:<日期> 是当天的日记，每次交接改写成到目前为止的这一天（月、年各有汇总）。`read_note(scope)` 读，`write_note(scope, text)` 整份替换，改前自动备份。认识了新的人、答应了什么、被纠正了什么，想记就当场记。
+- 交接：你调用 `tidy`、这一段上下文太长、或者到了夜里，这段就要被移除。你会在这一段末尾收到交接指令，确认眼下的事、关于人和群的、做法的教训、答应的事、今天的事都在各自的笔记里，然后这段归档，下一段从新的笔记开始。
+- 想定时醒来（比如每 10 分钟看一眼，或者某个时刻提醒谁），就改 awaker 笔记，每行一条：`every 10m 理由`、`daily 23:30 理由`、`at 2026-10-23 08:00 理由`；`daily 04:00 reflect` 是每晚的交接与反思，删掉它就不再反思。到点的闹钟会把理由交给你，`at` 规则响过后记得删掉。
+- 记忆系统本身怎么运作、怎么像人一样排查自己、你能怎么改它，见 `memory_system`；每晚反思会自动加载它。
 - 更长时间跨度的自查可加载 `self_inspection` Skill，用 `exec_code` 读磁盘记录。
 
 ## 待办
@@ -236,17 +236,17 @@ def read_log(window: str, count: int = 30, before: str = "") -> str:
     return chat.roles.read_log(window, count, before)
 
 
-def search_log(keyword: str, window: str = "", days: int = 7) -> str:
-    """按线索在聊天记录里找：名字、QQ号、话题里的词都行，返回含这个词的记录原文，最新的在前。找到时间点后可以用 read_log 的 before 读前后文。
+def search(keyword: str, window: str = "", days: int = 30) -> str:
+    """按线索一次找遍：聊天记录、笔记、日记和归档的上下文，按出处分组列出，每条带出处（窗口和日期、笔记名、日记日期、段名）。找到后用对应的工具读全文：聊天记录用 read_log 的 before 读前后文，笔记和日记用 read_note，归档的段加载 memory_system 后用 read_context。
 
     @param
-    keyword: 要找的词（不区分大小写，按原文子串匹配）
-    window: 只找这个窗口（g<群号> 或 u<私聊对端号>）；留空找所有窗口
-    days: 往前找多少天，1 到 90
+    keyword: 要找的词（不区分大小写，按原文子串匹配；名字、QQ号、话题里的词都行）
+    window: 聊天记录只找这个窗口（g<群号> 或 u<私聊对端号>）；留空找所有窗口。笔记、日记和归档照样都找
+    days: 聊天记录和归档往前找多少天，1 到 365；笔记和日记不限时间
     """
     from mods import chat
 
-    return chat.roles.search_log(keyword, window, days)
+    return chat.roles.search(keyword, window, days)
 
 
 def read_actions(ids: list[str] | None = None, count: int = 10, keyword: str = "", start: int = 0) -> str:
@@ -264,10 +264,10 @@ def read_actions(ids: list[str] | None = None, count: int = 10, keyword: str = "
 
 
 def read_note(scope: str) -> str:
-    """读一份图书管理员整理的笔记全文。
+    """读一份笔记全文。
 
     @param
-    scope: global（做法）、recent（短期记忆）、person:<QQ号> 或 group:<群号>
+    scope: self、global（做法）、recent（上次交接留下的）、todo、awaker、person:<QQ号>、group:<群号> 或 diary:<日期>
     """
     from mods import chat
 
@@ -337,6 +337,8 @@ def say(text: str, final_call: bool = True, target: str = "") -> str:
     body = str(text)
     if not body.strip():
         return "text 为空，什么都没发。要说话就给出正文"
+    if getattr(current_binding().session, "quiet", False):
+        return "现在是交接或反思，不对外说话，什么都没发"
     destination = {}
     if context.agent_mode():
         try:
@@ -371,14 +373,16 @@ def write_note(scope: str, text: str) -> str:
     """用新全文替换一份笔记（普通 Markdown 文件，改前自动备份）；空串删除整份笔记。
 
     @param
-    scope: global、recent、todo、awaker、person:<QQ号>、group:<群号> 或 diary:<日期>
+    scope: global、recent、todo、awaker、person:<QQ号>、group:<群号> 或 diary:<日期>（self 只能在夜间反思时用 edit_policy 改）
     text: 这份笔记更新后的完整内容；改之前先 read_note 看现有内容，别把别人写的覆盖掉
     """
-    from mods.chat import awaker, journal, notes
+    from mods.chat import awaker, notes
 
-    previous = notes.write(scope, text)
-    if previous.strip() != text.strip():
-        journal.append(f"她改笔记 {scope}", journal.diff(previous, text))
+    if scope == "self":
+        # WHY: 维护者 2026-10-22 定：自我认知只在夜间反思里改，白天被人一句话说动的事
+        # 要隔一晚回头看过才变成"我是谁"，免得一次聊天里的诱导变成每次醒来都生效的人设。
+        return "self 是你对自己的认识，白天不改；想到的先记进 recent 或 todo，夜里反思时再决定要不要用 edit_policy 改"
+    notes.write(scope, text)
     if scope == "awaker":
         found, skipped = awaker.parse(text if text.strip() else awaker.DEFAULT)
         lines = [f"已写入 awaker，{len(found)} 条规则生效"] + [f"不认识：{line}" for line in skipped]
@@ -387,17 +391,17 @@ def write_note(scope: str, text: str) -> str:
 
 
 def tidy(note: str = "") -> str:
-    """请图书管理员现在整理：把上次整理以来你看过做过的东西收进笔记，这一轮结束后你的上下文重新组装。一件事告一段落、或刚读了一大堆材料只需要记住结论时用。
+    """交接：这一轮结束后，把这一段上下文要记的东西确认到各自的笔记里，然后清空眼前、从新的一段接着做。一件事告一段落、或刚读了一大堆材料只需要记住结论时用。
 
     @param
-    note: 想让他特别注意的地方，比如"结论是端口没问题，细节不用记"；可以留空
+    note: 交接的原因或要特别注意的地方，比如"结论是端口没问题，细节不用记"；可以留空
     """
     from mods import chat
 
     if not chat.agent.request_tidy(note.strip()):
-        return "现在没有进行中的唤醒，不需要整理"
+        return "现在没有进行中的唤醒，不需要交接"
     current_binding().session.turn_done = lambda: True
-    return "图书管理员会在这一轮结束后整理，之后你的上下文会重新组装"
+    return "这一轮结束后交接，之后从新的一段接着做"
 
 
 def _format_results(results: Mapping) -> str:
@@ -429,7 +433,7 @@ def _format_results(results: Mapping) -> str:
 __all__ = [
     "say",
     "read_log",
-    "search_log",
+    "search",
     "read_actions",
     "read_note",
     "write_note",

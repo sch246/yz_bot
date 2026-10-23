@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 from datetime import datetime, timezone
 import re
 
@@ -16,24 +15,23 @@ _SUBCOMMAND_HELP = (
     ("model <selection>", "查看指定模型信息"),
     ("models", "列出当前供应商的模型（优先在线列表）"),
     ("use_model [selection]", "设置或重置当前模型"),
-    ("prompt", "查看当前提示词"),
-    ("add_prompt <list>", "将显式给定的消息列表追加到全局提示词（管理员）"),
-    ("setting [name]", "列出或查看设定"),
-    ("use_setting [name]", "应用或重置设定"),
-    ("set_setting <name> [list]", "保存当前或给定设定"),
-    ("del_setting <name>", "删除设定"),
+    ("prompt [set <全文>]", """查看或改写她对自己的认识（改写要管理员）。
+
+就是笔记 self（data/notes/self.md），放在系统提示最前面，取代以前的提示词和命名设定。维护者可以直接编辑文件；她只能在夜间反思里改，要写原因和预期。
+#prompt              显示全文
+#prompt set <全文>   整份替换；set 之后第一个换行起是全文，留空表示清空"""),
     ("image [off|lazy|eager]", "查看或设置图片读取档位"),
-    ("reasoning [keep|drop]", "查看或设置中心已读输出是否原生带回思考内容"),
-    ("limit [<画面条数> <token> [整理百分比]|reset]", """查看或设置中心 agent 的窗口画面条数、单次唤醒上下文上限与整理阈值（管理员）。
+    ("reasoning [keep|drop]", "查看或设置以前几次唤醒的思考是否随这一段上下文带回"),
+    ("limit [<画面条数> <整理阈值>|reset]", """查看或设置中心 agent 的窗口画面条数与整理阈值（管理员）。
 
-格式：#limit | #limit <画面条数> <token> [整理百分比] | #limit reset
-每次唤醒都重新组装上下文：画面条数是一个窗口默认展示多少条聊天记录；一次唤醒里上下文长到 token×整理百分比、或上次整理以来的行动列表长到它的三分之一时，先让图书管理员把她做过的事收进笔记，再重新组装继续。默认值分别为 80、40000、75%。
-#limit                  显示三个值，并标出来自全局覆盖还是默认
-#limit <画面条数> <token> [整理百分比] 写入全局设置；省略百分比则保留原设置
-#limit reset            清掉全局设置，回落到默认"""),
-    ("reflect [now]", """查看上次反思时间，或现在就跑一次夜间整理与反思（管理员）。
+格式：#limit | #limit <画面条数> <整理阈值> | #limit reset
+画面条数是一个窗口第一次出现在这一段上下文里时展示多少条聊天记录；整理阈值（token）是这一段上下文长到多少就交接，即 data/notes/policy/tidy.py 里的 limit。默认值分别为 80、500000。
+#limit                      显示两个值，并标出来自全局覆盖还是默认
+#limit <画面条数> <整理阈值>  写入全局设置
+#limit reset                清掉全局设置，回落到默认"""),
+    ("reflect [now]", """查看上次反思时间，或现在就跑一次夜间交接与反思（管理员）。
 
-夜间整理：图书管理员把这一天写成日记（data/notes/diary/），整理笔记；月末、年末各汇总一次。反思：她读上次反思以来的记忆系统日志（data/journal/），评估自己之前的策略改动，必要时改给图书管理员的附加说明或自己的做法笔记；不对外说话。什么时候自动跑由 awaker 规则决定，默认 daily 04:00 reflect。
+先把手上这一段上下文交接掉（笔记、日记确认到位后归档到 data/context/archive/），月末、年末各汇总一次日记；然后她用新的一段反思：像人排查一样从症状出发，读归档的上下文、聊天记录、行动记录和笔记的历史版本找原因，必要时改策略或写提案；不对外说话。什么时候自动跑由 awaker 规则决定，默认 daily 04:00 reflect。
 #reflect          显示上次反思时间
 #reflect now      现在就跑一次（中心 agent 正忙时不执行）"""),
     ("awaker [set <规则>]", """查看或改写她的闹钟规则（改写要管理员）。
@@ -42,7 +40,7 @@ _SUBCOMMAND_HELP = (
 every 10m <理由>             每隔一段时间叫醒她一次（最短 1m）
 daily 23:30 <理由>           每天这个时刻
 at 2026-10-23 08:00 <理由>   某个时刻一次
-理由写 reflect 表示夜间整理与反思；其它理由原样交给她。文件为空时只有 daily 04:00 reflect。
+理由写 reflect 表示夜间交接与反思；其它理由原样交给她。文件为空时只有 daily 04:00 reflect。
 #awaker              显示规则、上次响的时间和不认识的行
 #awaker set <规则>   整份替换；set 之后第一个换行起是规则全文"""),
     ("hint [get|set|default]", """查看、编写或开关本窗口的结束提示（管理员）。
@@ -50,7 +48,7 @@ at 2026-10-23 08:00 <理由>   某个时刻一次
 格式：#hint | #hint get | #hint set <代码> | #hint set | #hint default [get|set <代码>]
 配置是普通文件：全局默认在 data/hint/default.py，本窗口在 data/hint/g<群号>.py 或 u<QQ号>.py；首行 # on 或 # off 是开关，其余是代码。生效的是两者按 {**默认, **窗口} 合并之后 code 非空、on 为真的那份。
 聊天循环停下时求值一次，非 None 的结果作为一条消息发出（自带 # 前缀，不进模型上下文）。
-求值环境是共享动态环境，另外注入 window（触发窗口）与 usage（中心 reader 最近一次子请求实际收到的已编号事件文本 token 估算；不含系统提示与工具 schema）。
+求值环境是共享动态环境，另外注入 window（触发窗口）、usage（这次唤醒最后一次子请求的上下文 token 估算）、peak（这次唤醒里最大的一次）与 limit（#limit 的整理阈值）。例：f'上下文 {usage}/{limit} token'
 #hint              切换本窗口的开关（只写本窗口）
 #hint get          显示合并后生效的代码与开关，并标出代码来自哪里
 #hint set <代码>   写入本窗口的代码并打开开关；set 之后第一个换行起即为源码
@@ -64,9 +62,8 @@ _SUBCOMMAND_NAMES = {pattern.partition(" ")[0] for pattern, _description in _SUB
 
 def requires_op(value: str) -> bool:
     name, _, tail = value.strip().partition(" ")
-    return (name == "hint" or name in {"use_model", "add_prompt", "use_setting", "set_setting",
-                                       "del_setting"}
-            or name in {"image", "reasoning", "limit", "reflect", "awaker"} and bool(tail.strip()))
+    return (name == "hint" or name == "use_model"
+            or name in {"image", "reasoning", "limit", "reflect", "awaker", "prompt"} and bool(tail.strip()))
 
 
 def _subcommand_help(name: str = "") -> str:
@@ -131,13 +128,6 @@ def _first_argument(value: str) -> tuple[str, str]:
     if not value.strip():
         return "", ""
     return text.read_params(" " + value.strip(), read_str=True)
-
-
-def _list_argument(value: str) -> list:
-    parsed = ast.literal_eval(value)
-    if not isinstance(parsed, list):
-        raise ValueError("参数必须是 list")
-    return parsed
 
 
 def _after_tokens(line: str, count: int) -> str:
@@ -233,45 +223,36 @@ def _hint_subcommand(raw: str) -> str:
 
 
 def _limit_report() -> str:
-    """`#limit` 查看中心 agent 的全局上限与提醒阈值。"""
+    """`#limit` 查看画面条数与整理阈值。"""
+    _chat_root.limit()
     data = storage.get("", "agent")
     lines = []
-    for name in ("max_events", "max_token", "pressure_percent"):
+    for name, label in (("max_events", "画面条数"), ("tidy_token", "整理阈值")):
         key, normalize = _chat_root.AGENT_SETTINGS[name]
         origin = "全局" if key in data else "默认"
-        value = normalize(data.get(key))
-        lines.append(f"{name}: {value}（{origin}）")
+        lines.append(f"{label}: {normalize(data.get(key))}（{origin}）")
     return "\n".join(lines)
 
 
 def _limit_set(tail: str) -> str:
-    """`#limit <画面条数> <token> [整理百分比]` 写全局设置；`reset` 回落默认。
+    """`#limit <画面条数> <整理阈值>` 写全局设置；`reset` 回落默认。
 
-    WHY: 画面条数与 token 上限仍一起写，避免只改其中一个造成难解释的半份配置。整理百分比
-    可选，不写就保留原设置；老的两参数命令因此不会意外重置它。
+    WHY: 两个值仍一起写，避免只改其中一个造成难解释的半份配置。
     """
     data = storage.get("", "agent")
     if tail.strip() == "reset":
-        for name in ("max_events", "max_token", "pressure_percent"):
-            data.pop(_chat_root.AGENT_SETTINGS[name][0], None)
+        for name in ("max_events", "tidy_token", "max_token", "pressure_percent"):
+            data.pop(name, None)
         storage.save()
-        return "已重置中心 agent 上限，回落到默认"
+        return "已重置画面条数与整理阈值，回落到默认"
     parts = tail.split()
-    if len(parts) not in (2, 3):
-        return "limit 参数错误，可用 #help limit 查看"
-    written = []
-    for name, raw_value in zip(("max_events", "max_token", "pressure_percent"), parts):
-        try:
-            number = int(raw_value)
-        except ValueError:
-            return "limit 参数错误，可用 #help limit 查看"
-        if number < 1 or name == "pressure_percent" and number > 100:
-            return "limit 参数错误，可用 #help limit 查看"
-        written.append((name, number))
-    for name, number in written:
-        data[_chat_root.AGENT_SETTINGS[name][0]] = number
+    if len(parts) != 2 or not all(part.isdigit() and int(part) >= 1 for part in parts):
+        return "limit 参数错误：#limit <画面条数> <整理阈值>，可用 #help limit 查看"
+    data["max_events"], data["tidy_token"] = int(parts[0]), int(parts[1])
+    data.pop("max_token", None)
+    data.pop("pressure_percent", None)
     storage.save()
-    return "\n".join(f"{name}: {number}" for name, number in written)
+    return f"画面条数: {parts[0]}\n整理阈值: {parts[1]}"
 
 
 def _reflect_subcommand(tail: str) -> str:
@@ -280,7 +261,7 @@ def _reflect_subcommand(tail: str) -> str:
         shown = datetime.fromtimestamp(last).strftime("%Y-%m-%d %H:%M") if isinstance(last, (int, float)) else "还没有"
         return f"上次反思：{shown}；什么时候自动跑见 #awaker"
     if tail == "now":
-        return "开始夜间整理与反思，记录写在 data/journal/" if _chat_root.reflect_now() else "中心 agent 正忙，稍后再试"
+        return "开始夜间交接与反思，反思这一段归档在 data/context/archive/" if _chat_root.reflect_now() else "中心 agent 正忙，稍后再试"
     return "reflect 参数错误，可用 #help reflect 查看"
 
 
@@ -292,11 +273,21 @@ def _awaker_subcommand(raw: str) -> str:
     if head.strip().partition(" ")[0] != "set":
         return "awaker 参数错误，可用 #help awaker 查看"
     text = cq.unescape((head.strip()[3:].strip() + "\n" + rest).strip())
-    from . import journal
-
-    previous = _chat_root._notes.write("awaker", text)
-    journal.append("维护者改 awaker", journal.diff(previous, text))
+    _chat_root._notes.write("awaker", text)
     return _chat_root._awaker.report()
+
+
+def _prompt_subcommand(raw: str) -> str:
+    body = raw.lstrip()[len("prompt"):]
+    head, _, rest = body.partition("\n")
+    if not head.strip() and not rest.strip():
+        text = _chat_root._notes.read("self").strip()
+        return (text or "（self 还是空的）") + "\n(data/notes/self.md)"
+    if head.strip().partition(" ")[0] != "set":
+        return "prompt 参数错误，可用 #help prompt 查看"
+    text = cq.unescape((head.strip()[3:].strip() + "\n" + rest).strip())
+    _chat_root._notes.write("self", text)
+    return "已改写 self" if text else "已清空 self"
 
 
 def _subcommand(value: str):
@@ -365,62 +356,8 @@ def _subcommand(value: str):
         data["reasoning"] = mode
         storage.save()
         return f"reasoning: {mode}"
-    if name == "prompt" and not tail:
-        selected = data.get("prompt")
-        if selected is None:
-            return f"{_chat_root.settings}\n(默认)"
-        if isinstance(selected, str):
-            return f"{_chat_root.prompts.get(selected, [])}\n({selected})"
-        return str(selected)
-    if name == "add_prompt":
-        try:
-            addition = _list_argument(tail)
-        except (SyntaxError, ValueError) as error:
-            return f"add_prompt 参数错误: {error}"
-        data["prompt"] = [*_chat_root.get_prompt(), *addition]
-        storage.save()
-        return "提示词已追加"
-    if name == "setting":
-        if not tail:
-            return "\n".join(_chat_root.prompts)
-        setting_name, remaining = _first_argument(tail)
-        if remaining.strip():
-            return "setting 参数过多"
-        return str(_chat_root.prompts.get(setting_name, "未找到设定，你可能需要先创建设定"))
-    if name == "use_setting":
-        if not tail:
-            data.pop("prompt", None)
-            storage.save()
-            return "已重置提示词"
-        setting_name, remaining = _first_argument(tail)
-        if remaining.strip() or setting_name not in _chat_root.prompts:
-            return "未找到设定，你可能需要先创建设定"
-        data["prompt"] = setting_name
-        storage.save()
-        return "设定已应用"
-    if name == "del_setting" and tail:
-        setting_name, remaining = _first_argument(tail)
-        if remaining.strip() or setting_name not in _chat_root.prompts:
-            return "未找到设定"
-        del _chat_root.prompts[setting_name]
-        storage.save()
-        return "设定已删除"
-    if name == "set_setting" and tail:
-        setting_name, remaining = _first_argument(tail)
-        if not setting_name:
-            return "set_setting 需要设定名"
-        if remaining.strip():
-            try:
-                prompt = _list_argument(remaining.strip())
-            except (SyntaxError, ValueError) as error:
-                return f"set_setting 参数错误: {error}"
-        elif "prompt" in data:
-            prompt = data["prompt"]
-        else:
-            return "当前没有可保存的自定义提示词"
-        _chat_root.prompts[setting_name] = prompt
-        storage.save()
-        return "设定已保存"
+    if name == "prompt":
+        return _prompt_subcommand(raw)
     if name == "limit" and not tail:
         return _limit_report()
     if name == "limit" and tail:

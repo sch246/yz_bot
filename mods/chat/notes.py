@@ -1,16 +1,18 @@
-"""Plain Markdown notes kept by the librarian.
+"""Plain Markdown notes she keeps.
 
-``global`` holds how she does things (procedural memory), ``recent`` what is
+``self`` is who she is (it replaced the old persona prompt), ``global`` how
+she does things (procedural memory), ``recent`` what is
 going on right now (short-term memory), ``todo`` what is still open, ``awaker``
 when she wakes herself, one note per person and per group what she knows and
-what happened with them, and ``diary:<day|month|year>`` the nightly diary.
+what happened with them, and ``diary:<day|month|year>`` the diary each handoff
+rewrites for its day.
 
 WHY: 2026-10-22 维护者："能用普通文件的不搞复杂系统"。这些都是她随时能读写的普通
-Markdown 文件，维护者也能用任何编辑器改；图书管理员只是另一个会写它们的人。
+Markdown 文件，维护者也能用任何编辑器改。
 
 WHY: files, not storage JSON, so the maintainer can read and fix them with any
 editor while the Bot runs.  Every overwrite or deletion first copies the old
-text under ``.history/``: the librarian has no external judge, so a wrong edit
+text under ``.history/``: nobody checks an edit before it lands, so a wrong one
 must stay recoverable.  A private chat has no note of its own; it is the
 person's note (decided 2026-10-19).
 """
@@ -28,12 +30,12 @@ from mods import storage
 
 ROOT = Path("data") / "notes"
 _lock = threading.RLock()
-_SCOPE = re.compile(r"^(global|recent|todo|awaker|person:\d+|group:\d+|diary:\d{4}(-\d{2}(-\d{2})?)?)$")
+_SCOPE = re.compile(r"^(self|global|recent|todo|awaker|person:\d+|group:\d+|diary:\d{4}(-\d{2}(-\d{2})?)?)$")
 
 
 def _path(scope: str) -> Path:
     if not _SCOPE.fullmatch(scope):
-        raise ValueError("scope 只能是 global、recent、todo、awaker、person:<QQ号>、group:<群号> 或 diary:<日期>")
+        raise ValueError("scope 只能是 self、global、recent、todo、awaker、person:<QQ号>、group:<群号> 或 diary:<日期>")
     if ":" not in scope:
         return ROOT / f"{scope}.md"
     kind, number = scope.split(":")
@@ -102,16 +104,42 @@ def write(scope: str, text: str) -> str:
     return _replace(_path(scope), text)
 
 
-# WHY: 策略文件是她在反思里能改的那一层（2026-10-22）：librarian 是给图书管理员的附加说明，
-# tidy 是什么时候请图书管理员整理的 Python 条件，changes 是每次改动的原因、预期和事后评估，
+def versions(scope: str) -> list[str]:
+    """Backed-up versions of one note, oldest first, as their time stamps."""
+    path = _path(scope)
+    relative = path.relative_to(ROOT)
+    directory = ROOT / ".history" / relative.parent
+    if not directory.is_dir():
+        return []
+    prefix = relative.stem + "."
+    return sorted(item.name[len(prefix):-len(path.suffix)] for item in directory.glob(f"{relative.stem}.*{path.suffix}")
+                  if item.name.startswith(prefix))
+
+
+def read_version(scope: str, version: str) -> str:
+    path = _path(scope)
+    if not re.fullmatch(r"\d{8}-\d{6}(-\d+)?", version):
+        raise ValueError("version 写 versions 列出的时间戳，如 20261022-153000")
+    relative = path.relative_to(ROOT)
+    target = ROOT / ".history" / relative.parent / f"{relative.stem}.{version}{path.suffix}"
+    return target.read_text(encoding="utf-8") if target.is_file() else ""
+
+
+# WHY: 策略文件是她在反思里能改的那一层（2026-10-22）：handoff 是她给交接写的附加说明，
+# tidy 是什么时候交接的 Python 条件，changes 是每次改动的原因、预期和事后评估，
 # proposals 是要维护者动手的改动（代码、醒来时带什么）。
-POLICIES = ("librarian", "tidy", "changes", "proposals")
+POLICIES = ("handoff", "tidy", "changes", "proposals")
 
 
 def _policy_path(name: str) -> Path:
     if name not in POLICIES:
         raise ValueError("策略文件只有 " + "、".join(POLICIES))
-    return ROOT / "policy" / (f"{name}.py" if name == "tidy" else f"{name}.md")
+    path = ROOT / "policy" / (f"{name}.py" if name == "tidy" else f"{name}.md")
+    old = ROOT / "policy" / "librarian.md"
+    if name == "handoff" and not path.exists() and old.is_file():
+        # 以前给图书管理员的附加说明，现在给交接；第一次读到时改名。
+        os.replace(old, path)
+    return path
 
 
 def read_policy(name: str) -> str:
@@ -124,8 +152,18 @@ def write_policy(name: str, text: str) -> str:
 
 
 def append_policy(name: str, line: str) -> None:
+    """Add one line at the end, without a backup.
+
+    WHY: 维护者 2026-10-23 定：changes 是只往后加的流水账，旧内容都还在文件里；以前每追加
+    一行都把整个旧文件复制进 .history，备份总量随条数平方增长（一万条约 15 GB）。整份改写
+    仍走 write_policy，改前照样备份。
+    """
     with _lock:
-        write_policy(name, (read_policy(name).rstrip() + "\n" + line).strip())
+        path = _policy_path(name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        previous = path.read_bytes() if path.is_file() else b""
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(("\n" if previous and not previous.endswith(b"\n") else "") + line.strip() + "\n")
 
 
 def listing(limit: int = 60) -> list[dict]:
@@ -138,7 +176,8 @@ def listing(limit: int = 60) -> list[dict]:
         if relative.parts[0] in (".history", "diary", "policy"):
             continue
         scope = path.stem if len(relative.parts) == 1 else f"{relative.parts[0]}:{path.stem}"
-        if not _SCOPE.fullmatch(scope):
+        # self 总在系统提示最前面，不用列进"可以召回的东西"。
+        if not _SCOPE.fullmatch(scope) or scope == "self":
             continue
         text = path.read_text(encoding="utf-8").strip()
         found.append({"scope": scope, "changed": path.stat().st_mtime,

@@ -2,8 +2,7 @@
 
 Each output and the result batch that answered it become one record shaped like
 a chatlog entry: an unindented head with time and id, an indented body.  The
-oplog stays the write authority; this is only how the model and the librarian
-read it back.
+oplog stays the write authority; this is only how she reads it back.
 """
 
 from __future__ import annotations

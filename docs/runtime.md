@@ -66,6 +66,19 @@ uv run --frozen python run.py --smoke
 
 三个落盘出口各管一件事：`log/<流>.log` 是每条流自己的证据，按顶层流名一个文件（`yz.llm.request` 和 `yz.llm` 同写 `log/llm.log`，子流是订阅粒度不是文件粒度，完整 logger 名在每行上可以 grep），第一次产出时才建，午夜轮转保留 7 天，`tmux` 开窗口 `tail -f log/llm.log` 就是在看一条流；`app.log` 回到只记严重程度——所有 logger 的 WARNING 以上，加上非流 logger 的 INFO 以上；`chatlog` 仍是产品聊天历史。`log/` 与 `app.log*` 都已在 `.gitignore` 内。
 
+除了这三个出口，中心 agent 还有几份各管一件事的记录。它们有重叠，但没有一份能被别的完整替代：
+
+| 记录 | 回答什么 | 只在这里有的 | 保留 |
+|---|---|---|---|
+| `chatlog/` | QQ 上发生了什么 | 没进模型画面的消息、通知、发送回声 | 一直留 |
+| `data/event_stream/`（`oplog`） | 她做了什么、消息怎么登记 | 到达、激活、通知确认、已读、行动号与结果的对应；`read_actions` 读它 | 一直留，启动时整份重放进内存 |
+| `data/context/current.json` 与 `archive/` | 她当时看到了什么、想了什么 | 实际进上下文的材料和顺序、段边界、思考（默认 `keep` 时） | 一直留，按段归档 |
+| `log/llm.log`（`yz.llm.request`） | 每次请求发了什么 | 每次请求末尾的临时提示（待办、未读数、时间）；同一段里已经记过的前缀不再重复打印，只写"前 N 条已经记过" | 7 天 |
+| `data/notes/.history/` | 笔记改写或删除前是什么样 | 每个旧版本 | 一直留 |
+| `data/notes/policy/changes.md` | 策略为什么改、改了有没有用 | 原因、预期和评估；只往后追加，追加不备份 | 一直留 |
+
+"一直留"的几份都没有自动清理，会随使用增长；查体积用 `du -sh chatlog data/event_stream data/context data/notes/.history`。
+
 落盘的每行都带归属：一个 filter 在写文件前从 `context` 读当前事件，群聊补 `[g<群号> u<QQ>]`、私聊补 `[u<QQ>]`，没有当前事件就什么都不补（行的形状与之前一致）。**没有任何调用点需要传参**，现有和以后的日志调用都自动带上，这也是它做成 filter 而不是参数的原因。终端不显示归属：终端是状态面，保持产出者自己选的形状。
 
 LLM 的逐字输出不是流，而是终端的交互效果：它仍然直写 `sys.stdout`，因此 `.log` 退订 `yz.llm.request` 只会让请求栈消失，模型仍然逐字出现在终端。`main.py` 的启动/退出摘要和 `identity` 的首次配置验证码同样不走流——恢复入口不可被订阅集关掉。
@@ -257,8 +270,9 @@ Mods 两阶段加载已经成为当前架构。多项目共存、storage 值校�
 
 以下目录或文件属于真实运行状态，不是测试夹具：
 
-- `data/`：storage、`pyload.py`、临时文件和功能数据；
+- `data/`：storage、`pyload.py`、临时文件和功能数据，包括 `data/context/`（她的上下文原样，含思考和工具结果）与 `data/notes/`；
 - `chatlog/`：真实群聊和私聊记录；
+- `log/`、`app.log*`：流日志与应用日志，`log/llm.log` 带聊天正文、提示词和工具参数；
 - `config.json`、`.env*`、密钥文件：账号、服务和模型配置；
 - `outputs/`、`woutputs/`：模型或 RAG 输出；
 - 仓库内虚拟环境目录。
