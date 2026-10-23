@@ -236,15 +236,21 @@ def _handoff(turn, reason: str, model: str | None = None) -> bool:
         _roles._stream.warning(f"这次唤醒已经交接了 {turn.handoffs} 次，不再交接（原因：{reason}）")
         turn.handoff_failed = True
         return False
+    # 强制归档也算一次：续做时每段都长过两倍阈值的话，不能借它绕过上限原地打转。
+    turn.handoffs += 1
     _max_events, threshold = _chat_root.limit()
     forced = _forced_reason(segment, threshold)
     if forced:
         name = _archive(turn, segment, f"未交接，强制归档（{forced}；本来要交接的原因：{reason}）")
         _roles._stream.warning(f"这一段{forced}，没有交接就归档为 {name}")
-        turn.handoff_note = (f"上一段上下文没能交接（{forced}），已经原样归档为 {name}。recent 和其它笔记可能没记到最后；"
-                             f"需要时加载 memory_system 用 read_context(\"{name}\") 读那一段，把漏下的补进笔记。")
+        # WHY: 这句提醒不能只挂在这次唤醒上：接下来的请求要是失败、没有输出，新的一段不会保存，
+        # 她就再也不知道该去补哪一段（2026-10-23 审查）。所以写进新的一段里，第一次输出时才消掉。
+        fresh = _segment.fresh()
+        fresh["notice"] = (f"上一段上下文没能交接（{forced}），已经原样归档为 {name}。recent 和其它笔记可能没记到最后；"
+                           f"需要时加载 memory_system 用 read_context(\"{name}\") 读那一段，把漏下的补进笔记。")
+        _segment.save(fresh)
+        turn.handoff_note = ""
         return True
-    turn.handoffs += 1
     messages = [*segment["messages"],
                 {"role": "user", "content": _roles.handoff_prompt(reason, diary_day(time.time()))}]
     grew = []
@@ -462,8 +468,11 @@ def _run_agent(model: str | None, turn) -> bool:
         reason_text, rule = turn.alarm
         material.append({"role": "user", "content": f"这次是 awaker 笔记里的闹钟叫醒你的（{now}，规则：{rule}）：{reason_text}\n"
                          "没有人在等你回话；看看要不要做点什么，没事就直接结束。"})
+    if segment.get("notice"):
+        material.append({"role": "user", "content": segment["notice"]})
     if continuing:
-        material.append({"role": "user", "content": turn.handoff_note})
+        if turn.handoff_note:
+            material.append({"role": "user", "content": turn.handoff_note})
         turn.handed_off = ""
     if not material:
         return True
@@ -476,6 +485,7 @@ def _run_agent(model: str | None, turn) -> bool:
         turn.screens.update(screens)
         segment["windows"] = list(dict.fromkeys([*segment["windows"], *screens]))
         segment["last_shown"].update(shown_last)
+        segment.pop("notice", None)
 
     def stop_when(used: int, initial: int) -> bool:
         if turn.release:

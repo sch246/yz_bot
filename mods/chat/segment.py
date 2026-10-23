@@ -98,7 +98,8 @@ def each_archived(since: float = 0, newest_first: bool = False):
     """``(name, data)`` for archived segments that ended after *since*, one file at a time."""
     if not _ARCHIVE.is_dir():
         return
-    paths = sorted(_ARCHIVE.glob("*.json"), reverse=newest_first)
+    # 按段名排：同一秒开始的段名后缀 -2、-3，按文件名排会排到不带后缀的那个前面。
+    paths = sorted(_ARCHIVE.glob("*.json"), key=lambda path: path.stem, reverse=newest_first)
     for path in paths:
         # 归档文件写下后不再改，修改时间就是结束时刻：早于 since 的不用解析。
         if since and path.stat().st_mtime <= since:
