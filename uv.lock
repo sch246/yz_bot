@@ -2934,7 +2934,7 @@ requires-dist = [
     { name = "bilibili-api-python" },
     { name = "click" },
     { name = "cryptography" },
-    { name = "edge-tts", specifier = ">=7.3.1" },
+    { name = "edge-tts" },
     { name = "httpx", extras = ["socks"] },
     { name = "jmcomic" },
     { name = "lunardate" },
