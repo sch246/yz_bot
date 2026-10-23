@@ -47,10 +47,13 @@ def recover(window: tuple, call_api) -> int:
     anchor, anchor_time = _anchors[window]
     kind, target = window
     written = 0
+    calls = 0
 
     def save_page(rows: list[dict]) -> None:
-        nonlocal written
-        written += chatlog.insert_recovered(kind, target, rows)
+        nonlocal written, calls
+        added = chatlog.insert_recovered(kind, target, rows)
+        written += len(added)
+        calls += _register_calls(window, added)
 
     try:
         result = _napcat_history.crawl_history(
@@ -61,7 +64,33 @@ def recover(window: tuple, call_api) -> int:
                            window, written)
     except _napcat_history.HistoryGap as error:
         logger.warning("离线补回 %s 中断（%s），补回了 %d 条，再往前可能有缺口", window, error.reason, written)
+    if calls:
+        from mods import chat
+
+        threading.Thread(target=chat._agent._drive_agent, args=(None, window),
+                         name="napcat-backfill-wake", daemon=True).start()
     return written
+
+
+def _register_calls(window: tuple, events: list[dict]) -> int:
+    """Register the recovered messages that would have woken her live as activated arrivals.
+
+    WHY: 维护者 2026-10-23：补回里有人叫她就叫醒。判据和实时消息同一个
+    （``chat.activation_signal``：at、名字开头、私聊对方发来的）；只有这些登记到达，
+    别的补回消息不算未读，画面里照样能看到。唤醒原因写「离线时叫你」，她从时间也看得出
+    是离线期间的。一个窗口补完才叫一次，其中几条叫她的合进同一次唤醒。
+    """
+    from mods import chat, context, oplog
+
+    found = 0
+    for event in events:
+        if event.get("post_type") != "message" or not chat.activation_signal(event):
+            continue
+        with context.window_lock(window):
+            arrival = oplog.arrive(window, event)
+            oplog.activate(arrival, "离线时叫你")
+        found += 1
+    return found
 
 
 def start(call_api) -> None:

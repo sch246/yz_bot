@@ -151,8 +151,12 @@ def _recovered_key(kind: str, target: int, event: dict) -> tuple[str, int, str, 
     return kind, int(target), recall_key(event.get("message_id")), int(event.get("time") or 0)
 
 
-def insert_recovered(kind: str, target: int, events: list[dict]) -> int:
-    """Write messages NapCat returned for an offline gap into the ordinary day files; returns how many were new.
+def insert_recovered(kind: str, target: int, events: list[dict]) -> list[dict]:
+    """Write messages NapCat returned for an offline gap into the ordinary day files; returns the new ones.
+
+    The returned events are completed into the shape a live event has (``post_type``,
+    the CQ-string ``message``, ``group_id`` or ``target_id``), so the wake criteria
+    can read them.
 
     WHY: 维护者 2026-10-23：补漏改成补回的消息直接写进 chatlog。以前写在日档旁边的
     ``.backfill.jsonl``，画面、read_log、search 都不读，补回等于没补。
@@ -165,26 +169,33 @@ def insert_recovered(kind: str, target: int, events: list[dict]) -> int:
     WHY: 改写走临时文件加 ``os.replace``。读日档的人不加锁，看到的要么是旧文件要么是新
     文件；换了 inode 也让档案索引整份重建，而不是当成追加去增量读。
     """
-    rendered: list[tuple[int, tuple, str]] = []
+    rendered: list[tuple[int, tuple, str, dict]] = []
     for event in events:
         event = dict(event)
         if isinstance(event.get("raw_message"), str):
             event["message"] = event["raw_message"]
         sender = event.get("sender") if isinstance(event.get("sender"), dict) else {}
         sender_id = int(sender.get("user_id", event.get("user_id", 0)))
+        event.setdefault("user_id", sender_id)
+        event.setdefault("post_type", "message_sent" if sender_id == _bot_id() else "message")
+        # 名字用这条消息自己带的（当时的群名片或昵称），和实时消息先用事件里的 sender 更新身份
+        # 缓存再取名是同一个结果；补回不去改身份缓存，免得旧名片盖掉现在的。
         if kind == "group":
             event["group_id"] = int(target)
-            title, name = identity.get_group_user_info(int(target), sender_id)
+            title, name = ((str(sender.get("title", "")), str(sender.get("card") or sender.get("nickname")))
+                           if sender.get("card") or sender.get("nickname")
+                           else identity.get_group_user_info(int(target), sender_id))
             text = format_message(event, name, title)
         else:
             event.pop("group_id", None)
-            text = format_message(event, identity.get_user_name(sender_id))
-        rendered.append((int(event["time"]), _recovered_key(kind, target, event), text))
+            event["target_id"] = int(target)
+            text = format_message(event, str(sender.get("nickname") or identity.get_user_name(sender_id)))
+        rendered.append((int(event["time"]), _recovered_key(kind, target, event), text, event))
     rendered.sort(key=lambda item: item[0])
-    by_path: dict[str, list[tuple[int, tuple, str]]] = {}
+    by_path: dict[str, list[tuple[int, tuple, str, dict]]] = {}
     for item in rendered:
         by_path.setdefault(get_path(str(window_path(kind, target)), item[0]), []).append(item)
-    written = 0
+    written: list[dict] = []
     with _window_lock(window_path(kind, target)), _append_lock:
         for path, items in by_path.items():
             day = day_of(path)
@@ -199,8 +210,8 @@ def insert_recovered(kind: str, target: int, events: list[dict]) -> int:
                        if head is not None and head["message_id"] else None)
                 records.append([stamp, key, lines[start:end]])
             present = {record[1] for record in records}
-            added = 0
-            for stamp, key, text in items:
+            added = []
+            for stamp, key, text, event in items:
                 _recovered.add(key)
                 if key in present:
                     continue
@@ -209,7 +220,7 @@ def insert_recovered(kind: str, target: int, events: list[dict]) -> int:
                 while place and records[place - 1][0] is not None and records[place - 1][0] > stamp:
                     place -= 1
                 records.insert(place, [stamp, key, text.rstrip("\n").split("\n")])
-                added += 1
+                added.append(event)
             if not added:
                 continue
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -219,7 +230,7 @@ def insert_recovered(kind: str, target: int, events: list[dict]) -> int:
                 file.flush()
                 os.fsync(file.fileno())
             os.replace(temporary, path)
-            written += added
+            written.extend(added)
     return written
 
 
