@@ -119,7 +119,9 @@ def default_config() -> dict:
                 # deepseek-flash 就是原 v4-flash 系列（DeepSeek-V4.1-Flash），自带图像理解；
                 # 两个旧名仍可调用、按 Flash 计费，保留它们以免存量的模型选择失效。
                 # tool_images：图片可以放进 tool 消息（工具结果里带图），2026-09-18 实测
-                # deepseek-flash 读对了工具结果里那张图的随机码。同族的两个旧名一起登记；
+                # deepseek-flash 读对了工具结果里那张图的随机码；2026-10-23 用随机数字图复测仍然
+                # 成立（4 次对 3 次，错的一次是 1031 读成 1021）。别用纯色图测，它会被说成一片白。
+                # 同族的两个旧名一起登记；
                 # 别的供应商没验过，一律不写（默认 False）。
                 "deepseek-flash": {"vision": True, "tool_images": True, "function_calling": True, "prompt_price": 2, "prompt_cached_price": 0.04, "completion_price": 8},
                 "deepseek-v4-pro": {"vision": False, "function_calling": True, "prompt_price": 9, "prompt_cached_price": 0.30, "completion_price": 27},

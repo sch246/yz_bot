@@ -58,8 +58,13 @@ def incoming(label: str, facts: list[str], text: str) -> list[dict]:
     落在同一个角色里；框头还放得下元信息。2026-10-23 对 deepseek-flash 实测
     （仓库外的脚本，开不开 thinking 都一样）：合成的调用不带 `reasoning_content` 会被拒
     （400，思考模式要求回传），带空串就过；`incoming` 不在工具列表里也照样接受，所以不
-    登记成工具，她也就调不了它；图片放在 tool 消息里她看不见（说是一片白），跟在框后面单
-    发一条 user 能看见，所以图片拆出去。
+    登记成工具，她也就调不了它。
+
+    WHY: 图片拆到框后面单发一条 user，不是因为 tool 消息里看不见——同日用数字图复测，
+    deepseek-flash 读得出工具结果里的图（先前"一片白"是纯色测试图的问题）。拆出去是为了不挑
+    模型：tool 消息里的图只有登记了 `tool_images` 的模型才原样送出，别的会降级成占位文字；
+    user 消息里的图任何视觉模型都能看（实测 4/4）。图片本身不会冒充系统说话，框里留着
+    `[图片N]` 对上号。
     """
     call_id = f"{INCOMING}_{uuid4().hex[:12]}"
     images: list[dict] = []
