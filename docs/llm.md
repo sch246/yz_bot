@@ -155,6 +155,7 @@
 | `amap` | `amap__login`、`amap__search`、`amap__around` 等地点与路线查询 |
 | `host` | `host__read_file`、`host__write_file`、`host__run_command` |
 | `minecraft` | `minecraft__search_mc_mod`、`minecraft__check_mod` |
+| `meme` | 表情柜子：`meme__collect` 把聊天里或网上的图下载进 `data/memes/<sha256>.<扩展名>`（同一张只存一份），连同她起的心情和一句话记进 storage `meme/index`；`meme__pick` 按心情或关键词随机挑一张（优先最久没发的），返回带 `sub_type=1` 的 `[CQ:image,file=file://…]`，她再经 `type_word`／`send` 发；`meme__browse` 看总览、`meme__edit` 改或扔 |
 | `tts` | `tts__speak`：用 edge-tts（微软 Edge 在线朗读，非官方、免账号）把文字念成 mp3，默认音色晓伊 `zh-CN-XiaoyiNeural`，存进 `data/tmp_files` 返回 `file://` 路径；她再用 `[CQ:record,file=…]` 经 `type_word`／`send` 发语音 |
 | `weather` | `weather__search_city`、`weather__get_realtime_weather`、`weather__get_daily_forecast`、`weather__get_hourly_forecast` |
 
