@@ -154,6 +154,8 @@ def _send(window: tuple, text: str) -> str:
         text = text[matched.end():]
     if not text.strip():
         raise ValueError("评论正文是空的")
+    if "[CQ:" in text:
+        raise ValueError("B 站评论只能发文字，图片和别的 CQ 码发不出去（开头的 [CQ:reply,id=…] 除外）")
     root = int(_state().get("roots", {}).get(str(parent), parent)) if parent else None
     try:
         result = call(comment.send_comment(text=text, oid=oid, type_=comment.CommentResourceType(type_),
@@ -163,13 +165,18 @@ def _send(window: tuple, text: str) -> str:
     rpid = str((result or {}).get("rpid_str") or (result or {}).get("rpid") or "")
     if not rpid:
         raise windows.Unconfirmed("B 站收下了，却没有回评论号，这条评论可能已经发出去了。")
-    remember_root(rpid, root)
-    storage.save()
-    # WHY: 她自己的评论只写进记录、不登记到达。QQ 里她的话是回声事件带回来的；B 站没有
-    # 回声，不写就只有对方的回复、没有她说过什么。不登记到达，因为自己的话不是"未读"。
-    with context.window_lock(window):
-        chatlog.append_record("bili", window[1], _me(), (f"[CQ:reply,id={parent}]" if parent else "") + text,
-                              time.time(), rpid)
+    # WHY: 拿到评论号就是已经发出去了，后面的记账失败只记日志、照常返回评论号。抛出去会被
+    # send 说成"没有发出去，还在输入框里"，她再 send 一次就公开重复发了一条（2026-10-23 审查）。
+    try:
+        remember_root(rpid, root)
+        storage.save()
+        # WHY: 她自己的评论只写进记录、不登记到达。QQ 里她的话是回声事件带回来的；B 站没有
+        # 回声，不写就只有对方的回复、没有她说过什么。不登记到达，因为自己的话不是"未读"。
+        with context.window_lock(window):
+            chatlog.append_record("bili", window[1], _me(), (f"[CQ:reply,id={parent}]" if parent else "") + text,
+                                  time.time(), rpid)
+    except Exception:
+        _stream.exception("B 站评论 %s 已发出，本地记录失败", rpid)
     return rpid
 
 
@@ -187,7 +194,10 @@ def _deliver(feed: str, item: dict) -> None:
     rpid = str(body.get("source_id") or "")
     remember_root(rpid, body.get("root_id"))
     parent = body.get("target_id")
-    text = (f"[CQ:reply,id={parent}]" if parent else "") + str(body.get("source_content") or "")
+    # WHY: 通知里只有文字（source_content），表情是 `[名字]` 文字；只发了图或大表情的那条可能是空的，
+    # 空正文 push 会拒收，那一条就永远投不进去、卡住后面的通知。
+    content = str(body.get("source_content") or "").strip() or "（这条没有文字，可能只有图片；要看用 bili__thread 翻原评论）"
+    text = (f"[CQ:reply,id={parent}]" if parent else "") + content
     title = str(body.get("title") or "")
     reason = ("B 站有人回复你" if feed == "reply" else "B 站有人 @ 你") + (f"：《{title}》" if title else "")
     chat.push(("bili", target_of(type_, oid)), f"{user.get('nickname') or '?'}({user.get('mid') or '?'})",
@@ -221,9 +231,9 @@ def poll() -> None:
         items = data.get("items") or []
         keys = [(int(item.get(stamp) or 0), int(item.get("id") or 0)) for item in items]
         last = tuple(state[feed]) if state.get(feed) else None
-        if keys:
-            state[feed] = list(max(keys + ([last] if last else [])))
         if last is None:
+            if keys:
+                state[feed] = list(max(keys))
             continue
         if keys and min(keys) > last and not (data.get("cursor") or {}).get("is_end", True):
             from mods import chat
@@ -231,9 +241,17 @@ def poll() -> None:
             name = "回复" if feed == "reply" else "@"
             chat.push(chat.windows.ME, "B 站", f"B 站上次查过之后来的{name}超过一页，只有最新的 {len(items)} 条进了评论区窗口；"
                       f"更早的用 bili__inbox(\"{feed}\") 往前翻。", wake=f"B 站{name}太多")
+        # WHY: 位置一条一条往前推，投递成功才推。先推到整页末尾再投，中间一条失败，它和后面
+        # 没投的下次都被当成已经处理过（2026-10-23 审查）。只有写盘这类环境错误停下来等下次重试；
+        # 这一条自己的数据不对（ValueError、TypeError、KeyError）重试也一样，记下来跳过，不然它
+        # 卡住这一路后面的通知，整次轮询退出又连带 @ 那一路也收不到（维护者 2026-10-23 同意）。
         for key, item in sorted(zip(keys, items), key=lambda pair: pair[0]):
             if key > last:
-                _deliver(feed, item)
+                try:
+                    _deliver(feed, item)
+                except (ValueError, TypeError, KeyError):
+                    _stream.exception("B 站通知 %s 投不进窗口，跳过", item.get("id"))
+                state[feed] = list(key)
     state.pop("error", None)
     storage.save()
 

@@ -16,9 +16,9 @@
 
 这些判据判定要叫醒她时都走 `chat.wake(event, kind)`：在 oplog 里把这条到达标为激活，再驱动中心 agent；她正忙时激活留着，这一轮收尾时接上。它是唤醒方式的函数入口，link 节点、`.py` 或其它模块也可以在**这条消息的派发过程中**调用（到达号只在派发期间可查，事后调用会报错）；`kind` 原样出现在她看到的"这次唤醒你的是"里。不带消息时写 `chat.wake(reason=..., kind=...)`，随时能调（awaker 规则到点、`when` 条件成立、她用 `exec_code` 包在某个函数上的钩子）：等于 `chat.push(me, kind, reason, wake=kind)`，理由作为一条记录写进她自己的 `me` 窗口，见下一段。夜间反思走 `agent.reflect`。
 
-**窗口种类**（`chat.windows`，2026-10-23 起）：窗口是 `(种类, 目标)`。QQ 的群和私聊是两种，标签 `g123`／`u456`；`me` 是她自己的窗口；别的来源用 `chat.kind(名字, send=发送函数)` 登记一种，标签写 `名字:目标`。所有窗口的记录都在 `chatlog/<种类>/<目标>/` 下、格式相同，所以画面、`read_log`、`search`、未读与唤醒不分种类。QQ 以外的窗口由 `chat.push(window, author, text, wake="原因")` 写入：在窗口锁里先追加 chatlog，再登记 oplog 到达；`wake` 非空就激活，原因出现在"这次唤醒你的是"里，她正忙时这一轮收尾接上。到达在 oplog 里，重启不丢。`type_word`／`send` 按种类调登记的发送函数；发送函数返回记录号表示发出去了，抛 `windows.Unconfirmed` 表示可能发出去了，抛别的表示没发出去。没有发送函数的种类（包括 `me`）只能看。`push` 可以带 `record_id`（来源自己的编号，比如 B 站评论号），不带就编一个 8 位十六进制号。
+**窗口种类**（`chat.windows`，2026-10-23 起）：窗口是 `(种类, 目标)`。QQ 的群和私聊是两种，标签 `g123`／`u456`；`me` 是她自己的窗口；别的来源用 `chat.kind(名字, send=发送函数)` 登记一种，标签写 `名字:目标`。所有窗口的记录都在 `chatlog/<种类>/<目标>/` 下、格式相同，所以画面、`read_log`、`search`、未读与唤醒不分种类。QQ 以外的窗口由 `chat.push(window, author, text, wake="原因")` 写入：在窗口锁里先追加 chatlog，再登记 oplog 到达；`wake` 非空就激活，原因出现在"这次唤醒你的是"里，另开线程驱动她，她正忙时这一轮收尾接上；`push` 写完就返回，报错只表示记录或到达没写成。到达在 oplog 里，重启不丢。`type_word`／`send` 按种类调登记的发送函数；发送函数返回记录号表示发出去了，抛 `windows.Unconfirmed` 表示可能发出去了，抛别的表示没发出去。没有发送函数的种类（包括 `me`）只能看。`push` 可以带 `record_id`（来源自己的编号，比如 B 站评论号），不带就编一个 8 位十六进制号。
 
-**B 站**（`mods/bili.py`，2026-10-23 起）：柚子自己的 B 站号，种类 `bili`。一个评论区是一个窗口：视频写 `bili:BV…`，动态、图文、专栏写 `bili:t<评论区类型>-<oid>`。每两分钟轮询一次"回复我的"和"@ 我的"，新的一条以评论号为记录号 `push` 进对应窗口并叫醒她，原因写"B 站有人回复你：《标题》"或"B 站有人 @ 你"；第一次轮询只记位置，不把账号以前的通知倒进来。每次只看第一页（约 20 条）；两分钟里来了一页以上，不往前翻、不全记在本地，而是在她的 `me` 窗口留一句并叫醒她，让她用 `bili__inbox` 去 B 站消息中心翻。她用 `type_word`／`send` 发评论，正文开头 `[CQ:reply,id=评论号]` 表示回复那条，楼中楼的楼主号由模块记着（通知、评论工具和她自己的回复都会记）。她发出去的评论只写进 chatlog、不登记到达（B 站没有回声）。刷首页、热门、搜索、视频详情、字幕原文、评论和楼中楼，以及直接读 B 站消息中心的 `inbox`（回复、@、赞、系统通知、私信会话，带未读数和翻页）和读私信的 `dm`，是工具模块 `bili`（`mods/tools/bili.py`），不进窗口；私信还不能回。登录是 `.bili login`，二维码只发到管理员私聊：管理员自己发，或者她用 `cmds__run_command(".bili login", target="u<管理员>")` 在管理员私聊里发起（谁扫码谁的号就成了她的号，所以不能发进群或发给别人）；凭证在 `data/bili/credential.json`，每天检查一次要不要刷新。
+**B 站**（`mods/bili.py`，2026-10-23 起）：柚子自己的 B 站号，种类 `bili`。一个评论区是一个窗口：视频写 `bili:BV…`，动态、图文、专栏写 `bili:t<评论区类型>-<oid>`。每两分钟轮询一次"回复我的"和"@ 我的"，新的一条以评论号为记录号 `push` 进对应窗口并叫醒她，原因写"B 站有人回复你：《标题》"或"B 站有人 @ 你"；第一次轮询只记位置，不把账号以前的通知倒进来。每次只看第一页（约 20 条）；两分钟里来了一页以上，不往前翻、不全记在本地，而是在她的 `me` 窗口留一句并叫醒她，让她用 `bili__inbox` 去 B 站消息中心翻。通知里只有文字，表情是 `[doge]` 这样的文字，只有图片的那条正文换成一句占位；某一条数据不对就记日志跳过，写盘这类错误停在那一条、下次重试。她用 `type_word`／`send` 发评论，只能发文字（表情照 B 站写法写在正文里），正文开头 `[CQ:reply,id=评论号]` 表示回复那条，别的 CQ 码会被拒绝；评论工具把评论带的图片列成 `[图片] 地址`，她用 `attach_image` 看。楼中楼的楼主号由模块记着（通知、评论工具和她自己的回复都会记）。她发出去的评论只写进 chatlog、不登记到达（B 站没有回声）。刷首页、热门、搜索、视频详情、字幕原文、评论和楼中楼，以及直接读 B 站消息中心的 `inbox`（回复、@、赞、系统通知、私信会话，带未读数和翻页）和读私信的 `dm`，是工具模块 `bili`（`mods/tools/bili.py`），不进窗口；私信还不能回。登录是 `.bili login`，二维码只发到管理员私聊：管理员自己发，或者她用 `cmds__run_command(".bili login", target="u<管理员>")` 在管理员私聊里发起（谁扫码谁的号就成了她的号，所以不能发进群或发给别人）；凭证在 `data/bili/credential.json`，每天检查一次要不要刷新。
 
 群聊只有群号位于 `chat_groups` 时才进入这条路径；私聊没有这层群白名单。普通 `#` 命令先由本地子命令解析，返回的 callable 直接执行而不请求模型；`#poke` 和不能解析成控制命令的普通触发才会进入聊天。`.chat` 命令已删除，`.chattop` 月账命令仍保留。
 
@@ -155,6 +155,7 @@
 | `amap` | `amap__login`、`amap__search`、`amap__around` 等地点与路线查询 |
 | `host` | `host__read_file`、`host__write_file`、`host__run_command` |
 | `minecraft` | `minecraft__search_mc_mod`、`minecraft__check_mod` |
+| `tts` | `tts__speak`：用 edge-tts（微软 Edge 在线朗读，非官方、免账号）把文字念成 mp3，默认音色晓伊 `zh-CN-XiaoyiNeural`，存进 `data/tmp_files` 返回 `file://` 路径；她再用 `[CQ:record,file=…]` 经 `type_word`／`send` 发语音 |
 | `weather` | `weather__search_city`、`weather__get_realtime_weather`、`weather__get_daily_forecast`、`weather__get_hourly_forecast` |
 
 `host` 是 `exec_code` 之外的常用出口：文件读写和 shell 都不必再绕一次任意代码执行。读取按本次实际截取的窗口计字节，超过 `max_bytes` 时只回大小和后续建议（缩小区间、先 `grep -n` 定位、或用 `assign_tasks` 开子会话通读后带回摘要），不做分页会话。改写靠 `read_file` 首行 header 里的 `line`/`size`/`v` 定位与对账：位置与新内容的写法无关，`v` 只在该区间自读取后被改动过时失配，失配的返回自带现状和新 header。渲染格式与 `.edit` 同源，所以手动编辑和模型改写看到的是同一种东西；它没有目录白名单，`data/`、`config.json`、`.env` 和聊天记录都在可及范围内。
@@ -335,7 +336,7 @@ Chat.chat
 - `recognize_image` 可以下载模型指定的网络图片，或读取模型指定的本机 `file://` 绝对路径，再把图片及识别要求发送给视觉供应商，产生额外网络访问、宿主机文件读取和模型费用；
 - `create_image` 会产生按张计费的外部 API 调用，返回可能过期的临时本地文件路径；
 - `create_image_from_references` 还会下载模型指定的网络图片或读取本机 `file://` 绝对路径，并作为 multipart 文件上传给生图供应商；它同样只返回临时路径，发送须另用 `type_word`／`send` 明确目标；
-- 天气和 MC 搜索会向外部站点发请求。
+- 天气和 MC 搜索会向外部站点发请求；`tts__speak` 会把要念的文字发给微软的在线朗读服务（`speech.platform.bing.com`）。
 
 账户相关配置不进入源码或 storage。`main.py` 启动时加载仓库根的 `.env`：生图调用复用 `BYTECAT_BASE_URL` 并读取独立的 `BYTECAT_IMAGE_API_KEY`；天气调用分别读取 `QWEATHER_API_HOST`、`QWEATHER_KEY_ID`、`QWEATHER_PROJECT_ID` 和可选的 `QWEATHER_PRIVATE_KEY_FILE`。可从 [`.env.example`](../.env.example) 复制空白模板；缺少必需值时，调用会显式失败，不会回退到硬编码账户。
 

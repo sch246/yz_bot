@@ -786,8 +786,13 @@ def push(window: tuple, author: str, text: str, *, wake: str = "", record_id: st
                                         "text": body, "id": record_id})
         if wake:
             oplog.activate(arrival, wake)
+    # WHY: 叫醒放到别的线程，不在调用方线程里跑完她这一轮（2026-10-23）。调用方是 B 站轮询、
+    # awaker 这类定时线程：同步跑会卡住它们几分钟，一次来几条也只能一条条分开叫醒；她那一轮
+    # 出了错还会算成 push 失败，B 站轮询就把已经写进去的那条再投一遍。现在 push 报错只表示
+    # 记录或到达没写成；激活在 oplog 里，这一轮怎么结束都不丢。
     if wake:
-        _agent._drive_agent(None, window)
+        threading.Thread(target=_agent._drive_agent, args=(None, window),
+                         name=f"push-wake-{window[0]}", daemon=True).start()
     return record_id
 
 

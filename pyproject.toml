@@ -9,6 +9,7 @@ dependencies = [
     "bilibili-api-python",
     "click",
     "cryptography",
+    "edge-tts",
     "httpx[socks]",
     "jmcomic",
     "lunardate",
