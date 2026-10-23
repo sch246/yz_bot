@@ -439,12 +439,10 @@ def run(body: str):
         if scanner is None:
             return "登录二维码只能发到管理员私聊：管理员自己发 .bili login，或者在管理员的私聊窗口里跑"
         threading.Thread(target=_login, args=(scanner,), name="bili-login", daemon=True).start()
-        from mods import history, identity
-
-        if int(history.author(event)) != identity.bot_id():
-            return None
-        return (f"二维码马上私聊发给 {scanner}，只有一张图，要扫哪个号、确认时选长期登录这些由你来说；"
-                "三分钟内有效，登好了、过期了都会写进你的 me 窗口")
+        # WHY: 成功时不回任何字，谁发起都一样。以前她自己跑时回一句给她看的说明，她用
+        # cmds 的 capture=false 跑，那句就原样上了屏（2026-10-23 设备上）。该知道的写在
+        # 工具说明里，结果另写进她的 me 窗口。
+        return None
     if body.strip():
         return run.__doc__
     state = _state()
