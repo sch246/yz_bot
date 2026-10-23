@@ -73,7 +73,7 @@ uv run --frozen python run.py --smoke
 | `chatlog/` | QQ 上发生了什么 | 没进模型画面的消息、通知、发送回声 | 一直留 |
 | `data/event_stream/`（`oplog`） | 她做了什么、消息怎么登记 | 到达、激活、通知确认、已读、行动号与结果的对应；`read_actions` 读它 | 一直留，启动时整份重放进内存 |
 | `data/context/current.json` 与 `archive/` | 她当时看到了什么、想了什么 | 实际进上下文的材料和顺序、段边界、思考（默认 `keep` 时） | 一直留，按段归档 |
-| `log/llm.log`（`yz.llm.request`） | 每次请求发了什么 | 每次请求末尾的临时提示（待办、未读数、时间）；同一段里已经记过的前缀不再重复打印，只写"前 N 条已经记过" | 7 天 |
+| `log/llm.log`（`yz.llm.request`） | 每次请求发了什么 | 每次请求末尾的临时提示（待办、读画面之后又来的消息、未读数、时间）；同一段里已经记过的前缀不再重复打印，只写"前 N 条已经记过" | 7 天 |
 | `data/notes/.history/` | 笔记改写或删除前是什么样 | 每个旧版本 | 一直留 |
 | `data/notes/policy/changes.md` | 策略为什么改、改了有没有用 | 原因、预期和评估；只往后追加，追加不备份 | 一直留 |
 

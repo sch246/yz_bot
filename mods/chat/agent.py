@@ -37,6 +37,8 @@ DEFAULT_TIDY = """# 什么时候交接。每次子请求结束（stage == "round
 # A window shows at least this many lines before its first unseen one.
 _LEAD_IN = 3
 _FRESH_MAX = 200
+# 读画面之后又来的消息在末尾最多展示几条。
+_LATE_MAX = 20
 _KNOWN_PEOPLE = 6
 _TYPING_EVERY = 5
 # 一次唤醒里最多交接几次：防她每一段都调 tidy 时原地打转，不是常态限制。
@@ -178,6 +180,38 @@ def _unread_hint(on_screen: set[tuple]) -> str:
                     + (f"（@你 {detail['mentions']}）" if detail["mentions"] else ""))
     return ("其它窗口还有没看过的消息：" + "；".join(rows[:10])
             + "。要看就用 read_log 读原文。") if rows else ""
+
+
+def _late_hint(newest: dict[tuple, tuple], last_shown: dict[str, str]) -> str:
+    """Messages that reached the windows on screen after she read them.
+
+    WHY: 维护者 2026-10-23：私聊每条都叫醒她以后，人分几条发的话会在她干活时陆续到，
+    这时不用延迟、也不打断请求，下一次子请求末尾给她看，由她自己决定接不接。放 hint 而不
+    追加进这一段：它随时能从 chatlog 重算，而且下次看这个窗口时画面从上次给到的那条接着
+    给，它们会照常进这一段，追加一次反而会出现两份。
+    """
+    blocks = []
+    for window, (_stamp, through) in newest.items():
+        late = [entry for entry in oplog.unread(window)
+                if through is None or not oplog.arrival_before_or_at(entry["arrival"], through)]
+        if not late:
+            continue
+        label = _screen.label(window)
+        items = _screen.records(window, _LATE_MAX + 1)
+        texts = [item["text"] for item in items]
+        last = last_shown.get(label)
+        after = items[len(texts) - texts[::-1].index(last):] if last in texts else items[-len(late):]
+        shown = after[-_LATE_MAX:]
+        if not shown:
+            continue
+        head = f"{label} 又来了 {len(late)} 条"
+        if len(late) > len(shown):
+            head += f"，这里是最新的 {len(shown)} 条，更早的用 read_log 读"
+        blocks.append(head + "：\n" + _screen.render(window, shown))
+    if not blocks:
+        return ""
+    return ("你读画面之后，这些消息才到（还没进画面，下次看这个窗口时会在画面里）：\n\n" + "\n\n".join(blocks)
+            + "\n\n人常常一句话分几条发；对方可能还没说完时，不用急着接。")
 
 
 def _mark_seen(newest: dict[tuple, tuple]) -> None:
@@ -497,7 +531,8 @@ def _run_agent(model: str | None, turn) -> bool:
         return False
 
     session = _run_session(model, turn, segment, [*segment["messages"], *material], first_output, stop_when,
-                           hints=[lambda: _unread_hint(set(newest))], known=len(segment["messages"]))
+                           hints=[lambda: _late_hint(newest, {**segment["last_shown"], **shown_last}),
+                                  lambda: _unread_hint(set(newest))], known=len(segment["messages"]))
     return session.output_recorded
 
 

@@ -632,7 +632,19 @@ def activation_signal(event: dict) -> bool:
             if value[1:].strip().partition(" ")[0] in _subcommands._SUBCOMMAND_NAMES:
                 # 子命令那一支：就地执行，不激活。谁来执行见 _subcommand_call。
                 return False
+        if _private_from_peer(event):
+            return True
     return msgs.is_poke(event) and event.get("target_id") == identity.bot_id()
+
+
+def _private_from_peer(event: dict) -> bool:
+    """对方在私聊里发来的消息；她自己发出去的那条回显不算。
+
+    WHY: 维护者 2026-10-23：私聊每次都要先叫「柚子，」太累，私聊每条都叫醒她。话没说完
+    就回的问题不靠延迟解决（人可能隔几分钟才想到下一句），靠她的沉默纪律和末尾那份
+    「读画面之后又来的消息」，见 view._base_prompt 与 agent._late_hint。
+    """
+    return event.get("group_id") is None and event.get("user_id") != identity.bot_id()
 
 
 def _subcommand_call(event: dict) -> Callable | None:
@@ -686,24 +698,44 @@ def capture_chat(event: dict) -> bool:
         if result is not None:
             message.sendmsg(result)
         return True
-    matched = activation_signal(event)
+    if not activation_signal(event) or history.window(event) is None or not _mail_candidate(event):
+        return False
+    kind = ("mention" if msgs.is_msg(event) and _reader._addressed(event, msgs.body(event))
+            else "poke" if msgs.is_poke(event)
+            else "private" if msgs.is_msg(event) and _private_from_peer(event) else "wake")
+    wake(event, kind)
+    return True
+
+
+def wake(event: dict, kind: str = "wake") -> bool:
+    """叫醒她看 *event* 所在的窗口；False 表示没有可叫的（不是聊天消息、已经读过或已经叫过）。
+
+    WHY: 维护者 2026-10-23：唤醒条件不做成规则文件，但要为更多唤醒方式留一个函数入口。
+    判据各管各的——`activation_signal` 的 at、名字、私聊、戳一戳，以后别的模块、link 或
+    `.py`——判定要叫醒她时都调这里。激活登记在 oplog 里，她正忙时也不丢，这一轮收尾时
+    接上。*kind* 原样出现在她看到的「这次唤醒你的是」里。
+    只能在这条消息的派发过程中调用（capture、link 节点、它触发的 `.py`）：到达号派发完就
+    释放，事后调用 `event_arrival` 会报错。不带消息的唤醒走 `agent.alarm`。
+    """
     window = history.window(event)
     if window is None or not _mail_candidate(event):
         return False
     with context.window_lock(window):
         arrival = context.event_arrival(event)
-        if not matched:
-            return False
         if arrival is None:
-            return True
+            return False
         pending = next((entry for entry in oplog.unread(window)
                         if entry["arrival"] == arrival), None)
         if pending is None or pending["activated"]:
-            return True
-        kind = ("mention" if msgs.is_msg(event) and _reader._addressed(event, msgs.body(event))
-                else "poke" if msgs.is_poke(event) else "wake")
+            return False
         oplog.activate(arrival, kind)
-    chat()
+    # `chat()` 按当前事件找窗口，`#hint` 也发回当前事件的窗口；从别处调用时临时换成这条。
+    previous = context.current()
+    context.set_current(event)
+    try:
+        chat()
+    finally:
+        context.set_current(previous)
     return True
 
 
