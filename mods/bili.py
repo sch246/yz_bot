@@ -301,6 +301,11 @@ def _tell(text: str) -> None:
     chat.push(chat.windows.ME, "B 站登录", text, wake="B 站登录")
 
 
+_PASSPORT = "https://passport.bilibili.com/x/passport-login/web/qrcode/"
+_BROWSER = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/140.0 Safari/537.36", "Referer": "https://www.bilibili.com/"}
+
+
 def _login(user_id: int) -> None:
     """Send a login QR code to *user_id* and wait up to three minutes for the scan, telling her how it went.
 
@@ -310,42 +315,63 @@ def _login(user_id: int) -> None:
     WHY: 维护者 2026-10-23：私聊里只弹二维码，别的话柚子自己说。以前码前码后各有一句模块
     写死的说明，加上她自己的一句，读起来像人机。扫没扫、登没登好、过没过期写进她的 me
     窗口叫醒她，由她决定跟对方说什么。
+
+    WHY: 生成和轮询自己做，不用 bilibili-api 的 ``QrCodeLogin``。它只在轮询返回的 ``url``
+    的查询串里找 SESSDATA，找不到也报成功；2026-10-23 设备上两次扫码都是这样，存下来的
+    凭证只有刷新令牌（她自己挖出来的）。所以这里查询串和响应的 Set-Cookie 都看，拿不到
+    SESSDATA 就如实说没登上。它的 TV 渠道也不能换：遇到"已扫码未确认"会直接抛错。
     """
-    from bilibili_api import user
-    from bilibili_api.login_v2 import QrCodeLogin, QrCodeLoginEvents
+    import io
+    from urllib.parse import parse_qsl, urlsplit
+
+    from bilibili_api import Credential, user
+    import httpx
+    import qrcode
 
     try:
-        login = QrCodeLogin()
-        call(login.generate_qrcode())
-        picture = base64.b64encode(login.get_qrcode_picture().content).decode()
+        with httpx.Client(headers=_BROWSER, timeout=15) as client:
+            data = client.get(_PASSPORT + "generate").json()["data"]
+            picture = io.BytesIO()
+            qrcode.make(data["url"]).save(picture, format="PNG")
+            message.send(f"[CQ:image,file=base64://{base64.b64encode(picture.getvalue()).decode()}]", user_id=user_id)
+            deadline = time.time() + 180
+            while time.time() < deadline:
+                time.sleep(3)
+                response = client.get(_PASSPORT + "poll", params={"qrcode_key": data["qrcode_key"]})
+                body = response.json()["data"]
+                # 86101 还没扫，86090 扫了还没确认，86038 过期，0 登上了。
+                if body["code"] == 86038:
+                    break
+                if body["code"] != 0:
+                    continue
+                cookies = dict(parse_qsl(urlsplit(body.get("url") or "").query))
+                cookies.update({name: value for name, value in response.cookies.items() if value})
+                if not cookies.get("SESSDATA"):
+                    _stream.warning("B 站扫码确认了却没拿到 SESSDATA，拿到的字段：%s", sorted(cookies))
+                    _tell("B 站扫码确认了，但 B 站没给登录票据（SESSDATA），这次没登上，凭证没存。"
+                          f"拿到的字段只有：{'、'.join(sorted(cookies)) or '（没有）'}。")
+                    return
+                found = Credential(sessdata=cookies["SESSDATA"], bili_jct=cookies.get("bili_jct"),
+                                   dedeuserid=cookies.get("DedeUserID"), ac_time_value=body.get("refresh_token"))
+                _save_credential(found)
+                state = _state()
+                for key in ("reply", "at", "error", "uid", "name"):
+                    state.pop(key, None)
+                try:
+                    info = call(user.get_self_info(found))
+                    if not info.get("mid"):
+                        raise ValueError("资料里没有 uid，票据大概不管用")
+                    state.update(uid=info.get("mid"), name=info.get("name"))
+                except Exception as error:
+                    storage.save()
+                    _tell(f"B 站登录票据存下了，但用它查自己的资料失败（{type(error).__name__}）：{error}")
+                    return
+                storage.save()
+                _tell(f"B 站登录好了：{_me()}")
+                return
     except Exception as error:
-        _tell(f"B 站登录二维码没生成出来（{type(error).__name__}）：{error}")
+        _tell(f"B 站登录出错了（{type(error).__name__}）：{error}，这次登录作废，要登录就再跑一次 .bili login")
         return
-    message.send(f"[CQ:image,file=base64://{picture}]", user_id=user_id)
-    deadline = time.time() + 180
-    while time.time() < deadline:
-        time.sleep(3)
-        try:
-            event = call(login.check_state())
-        except Exception as error:
-            _tell(f"查 B 站登录状态失败（{type(error).__name__}）：{error}，这次登录作废，要登录就再跑一次 .bili login")
-            return
-        if event == QrCodeLoginEvents.TIMEOUT:
-            break
-        if event == QrCodeLoginEvents.DONE:
-            found = login.get_credential()
-            _save_credential(found)
-            state = _state()
-            try:
-                info = call(user.get_self_info(found))
-                state.update(uid=info.get("mid"), name=info.get("name"))
-            except Exception:
-                _stream.exception("登录成功，但读不到自己的昵称")
-            for key in ("reply", "at", "error"):
-                state.pop(key, None)
-            storage.save()
-            _tell(f"B 站登录好了：{_me()}")
-            return
     _tell(f"发给 {user_id} 的 B 站登录二维码三分钟没人扫，过期了；要登录就再跑一次 .bili login")
 
 
