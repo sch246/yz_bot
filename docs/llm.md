@@ -76,7 +76,7 @@
 7. **夜间交接与反思**（`chat.agent.reflect`）：占住 `AGENT_WINDOW`。
     1. 先交接手上这一段（原因"夜里了"）。
     2. 若这天是月末，`roles.summarize` 把当月日记改写成 `diary:YYYY-MM`；年末再把月记改写成 `diary:YYYY`。
-    3. 反思像人排查一样：材料是 global 与 recent 笔记、上次反思以来归档的段（段名、起止时刻、消息数、窗口）、`changes` 最近 40 行与 `proposals` 最近 20 行，以及一段说明：从症状出发，用 `read_context` 读当时那一段的原样，用 `search`／`read_log`／`read_actions`／`note_history` 查原始记录，找到原因再改。会话用新的一段，加载 `memory_system`，`type_word`／`send` 拒绝发言；材料之后新长出来的上下文超过整理阈值就结束；没有新归档的段时跳过模型调用。反思这一段也归档，名字带 `-reflect`。
+    3. 反思像人排查一样：材料是 global 与 recent 笔记、上次反思以来归档的段（段名、起止时刻、消息数、窗口）、`changes` 最近 40 行与 `proposals` 最近 20 行，以及一段说明（`agent._REFLECT_PROMPT`）：从症状出发，用 `read_context` 读当时那一段的原样，用 `search`／`read_log`／`read_actions`／`note_history` 查原始记录（日记和交接说明只当线索），分清问题属于哪一类（记忆、不知道去哪找、反复的失误、判断、说明过时或冲突、花销、环境坏了；各类该改哪里写在 `memory_system` 里），找到原因再改，优先改已有的规则，一次性的失误不写成长期规则；提案按证据、原因、最小改动、代价、验证方法写。会话用新的一段，加载 `memory_system`，`type_word`／`send` 拒绝发言；材料之后新长出来的上下文超过整理阈值就结束；没有新归档的段时跳过模型调用。反思这一段也归档，名字带 `-reflect`。
     4. 结束后 `agent.pick_up_pending` 接上期间登记的召唤。
 
 窗口第一次有输出时确认这次的通知，记下画面中每个窗口的看到时间，并调用 `reader.mark_window_read` 把未读登记标为已读。
