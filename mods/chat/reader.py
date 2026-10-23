@@ -5,16 +5,22 @@ from __future__ import annotations
 
 import re
 
-from mods import context, identity, oplog
+from mods import context, cq, identity, oplog
 
 from . import view as _view
 
 
 def _addressed(event: dict, value: str) -> bool:
-    """这条消息是冲着 Bot 说的吗：at、`<名字>，`、或者 `柚子，`。"""
+    """这条消息是冲着 Bot 说的吗：at、以她的某个名字开头且后面跟逗号或空白、或者 `柚子，`。
+
+    WHY: 名字的认法和 `chat.capture_addressed_fallback` 一样（`{名字}[,，\s]+`）。以前这里只认
+    全角逗号，「柚子,在吗」「柚子 在吗」从 capture_chat 漏过去，落到那个兜底里直接调 `chat()`，
+    照样叫醒她，却绕开了覆盖层，mute 压不住（2026-10-23 临时脚本试出来的）。
+    """
+    names = "|".join(re.escape(name) for name in identity.names or (identity.bot_name(),))
     return (_view.has_at(identity.bot_id())(event)
-            or value.startswith(f"{identity.bot_name()}，")
-            or value.startswith("柚子，"))
+            or value.startswith("柚子，")
+            or re.match(rf"(?:{names})[,，\s]", cq.unescape(value)) is not None)
 
 
 def parse_target(target: str) -> tuple[str, int]:
