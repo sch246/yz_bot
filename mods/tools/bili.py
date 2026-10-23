@@ -20,8 +20,8 @@
 其余的在 inbox 里往前翻。
 
 **登录**：工具说"B 站还没登录"或登录失效时，用 `cmds__run_command(".bili login", target="u<管理员QQ号>")`
-把登录二维码私聊发给管理员。私聊里只会出现一张二维码，要用哪个号的 B 站 App 扫、确认时选长期登录，由你自己跟对方说；
-登好了、过期了或者出错，会写进你的 me 窗口叫醒你。
+把登录二维码私聊发给管理员，`capture` 用默认的就行：二维码是另开线程发的，不会被收走。命令本身没有输出，私聊里只会出现一张二维码（三分钟内有效），要用哪个号的 B 站 App 扫、
+确认时选长期登录，由你自己跟对方说；登好了、过期了或者出错，会写进你的 me 窗口叫醒你。
 二维码只能发到管理员的私聊。也可以在你自己的浏览器里登：`browser__open_page("https://passport.bilibili.com/login")`，
 扫码（截图发给管理员）或者输密码都行，登好以后 `browser__get_cookies("https://www.bilibili.com")` 取出整条 Cookie，
 交给 `bili__use_cookie`；想让它每天自动续期，在末尾加上 `; ac_time_value=` 和 `browser__run_js("localStorage.ac_time_value")` 的结果。
