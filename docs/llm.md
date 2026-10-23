@@ -14,7 +14,9 @@
 
 此外，她用 `wake_me` 在笔记 awaker 里埋下的 `on`／`wait` 规则在消息到达时由 `capture_chat` 认领（`awaker.take_waiting`）：这个窗口（或窗口里这个人）来了消息就叫醒她，唤醒原因写"等到了（规则原文）"，规则划掉。
 
-这些判据判定要叫醒她时都走 `chat.wake(event, kind)`：在 oplog 里把这条到达标为激活，再驱动中心 agent；她正忙时激活留着，这一轮收尾时接上。它是唤醒方式的函数入口，link 节点、`.py` 或其它模块也可以在**这条消息的派发过程中**调用（到达号只在派发期间可查，事后调用会报错）；`kind` 原样出现在她看到的"这次唤醒你的是"里。不带消息时写 `chat.wake(reason=..., kind=...)`，随时能调（awaker 规则到点、`when` 条件成立、她用 `exec_code` 包在某个函数上的钩子）：交给 `agent.alarm` 排队，她正忙时这次唤醒收尾前接上，她看到"这次叫醒你的不是消息"和每条的来源与原因。只排在内存里，重启时排着的会丢；awaker 规则本身在笔记里。夜间反思走 `agent.reflect`。
+这些判据判定要叫醒她时都走 `chat.wake(event, kind)`：在 oplog 里把这条到达标为激活，再驱动中心 agent；她正忙时激活留着，这一轮收尾时接上。它是唤醒方式的函数入口，link 节点、`.py` 或其它模块也可以在**这条消息的派发过程中**调用（到达号只在派发期间可查，事后调用会报错）；`kind` 原样出现在她看到的"这次唤醒你的是"里。不带消息时写 `chat.wake(reason=..., kind=...)`，随时能调（awaker 规则到点、`when` 条件成立、她用 `exec_code` 包在某个函数上的钩子）：等于 `chat.push(me, kind, reason, wake=kind)`，理由作为一条记录写进她自己的 `me` 窗口，见下一段。夜间反思走 `agent.reflect`。
+
+**窗口种类**（`chat.windows`，2026-10-23 起）：窗口是 `(种类, 目标)`。QQ 的群和私聊是两种，标签 `g123`／`u456`；`me` 是她自己的窗口；别的来源用 `chat.kind(名字, send=发送函数)` 登记一种，标签写 `名字:目标`。所有窗口的记录都在 `chatlog/<种类>/<目标>/` 下、格式相同，所以画面、`read_log`、`search`、未读与唤醒不分种类。QQ 以外的窗口由 `chat.push(window, author, text, wake="原因")` 写入：在窗口锁里先追加 chatlog，再登记 oplog 到达；`wake` 非空就激活，原因出现在"这次唤醒你的是"里，她正忙时这一轮收尾接上。到达在 oplog 里，重启不丢。`type_word`／`send` 按种类调登记的发送函数；发送函数返回记录号表示发出去了，抛 `windows.Unconfirmed` 表示可能发出去了，抛别的表示没发出去。没有发送函数的种类（包括 `me`）只能看。
 
 群聊只有群号位于 `chat_groups` 时才进入这条路径；私聊没有这层群白名单。普通 `#` 命令先由本地子命令解析，返回的 callable 直接执行而不请求模型；`#poke` 和不能解析成控制命令的普通触发才会进入聊天。`.chat` 命令已删除，`.chattop` 月账命令仍保留。
 
@@ -67,7 +69,7 @@
    - 每条规则上次响的时间记在 `agent.awaker_last`。
    - 间隔规则第一次见到时只记下当下；忙时也算响过。
    - 定点和一次性规则在到点后三小时内补一次；忙时留到下一分钟。
-   - 理由是 `reflect` 时调 `agent.reflect`，否则调 `agent.alarm(理由, 规则)`。闹钟唤醒走 `_drive_agent`，没有窗口，理由追加在这一段末尾。
+   - 理由是 `reflect` 时调 `agent.reflect`，否则 `chat.push` 把理由写进 `me` 窗口（作者是 `awaker「规则」`）并叫醒她。
 7. **夜间交接与反思**（`chat.agent.reflect`）：占住 `AGENT_WINDOW`。
     1. 先交接手上这一段（原因"夜里了"）。
     2. 若这天是月末，`roles.summarize` 把当月日记改写成 `diary:YYYY-MM`；年末再把月记改写成 `diary:YYYY`。

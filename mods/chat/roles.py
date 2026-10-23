@@ -34,7 +34,7 @@ def _root():
 
 
 def _parse_window(target: str) -> tuple:
-    return _root().parse_target(target)
+    return _root()._windows.parse(target)
 
 
 def _charge(session: llm.Chat):
@@ -64,7 +64,7 @@ def read_log(window: str, count: int = 30, before: str = "") -> str:
     """读一个聊天窗口的 chatlog 原文（与画面同一格式），从最新往前取。
 
     @param
-    window: g<群号> 或 u<私聊对端号>
+    window: g<群号>、u<私聊对端号>、me（你自己的窗口：闹钟和别处叫你的记录），或画面里出现过的 种类:目标
     count: 取多少条记录，1 到 200
     before: 只取这个时刻之前的记录，用来往前翻页或读 search 找到的那条的前文；写 YYYY-MM-DD HH:MM:SS 或 Unix 秒，留空表示到最新
     """
@@ -151,7 +151,7 @@ def search(keyword: str, window: str = "", days: int = _SEARCH_DAYS) -> str:
 
     @param
     keyword: 要找的词（不区分大小写，按原文子串匹配，名字、QQ号、话题都行）
-    window: 聊天记录只找这个窗口（g<群号> 或 u<私聊对端号>）；留空找所有窗口。笔记、日记和归档照样都找
+    window: 聊天记录只找这个窗口（g<群号>、u<私聊对端号>、me 或 种类:目标）；留空找所有窗口。笔记、日记和归档照样都找
     days: 聊天记录和归档往前找多少天，1 到 365；笔记和日记不限时间
     """
     # WHY: 2026-10-23 维护者同意把 search_log 扩成一处找遍：以前笔记和日记只能按名字整份读、
@@ -164,7 +164,7 @@ def search(keyword: str, window: str = "", days: int = _SEARCH_DAYS) -> str:
     oldest = time.time() - days * 86400
     sections = []
 
-    windows = [_parse_window(window)] if window else chatlog.known_windows()
+    windows = [_parse_window(window)] if window else _root()._windows.logged()
     hits = []
     for target in windows:
         for item in _screen.records(target, 100_000, since=oldest):

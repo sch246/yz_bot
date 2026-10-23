@@ -721,7 +721,7 @@ def wake(event: dict | None = None, kind: str = "wake", reason: str = "") -> boo
     """叫醒她：带 *event* 时看那条消息所在的窗口，不带时把 *reason* 交给她；False 表示没有可叫的。
 
     带消息时 False 是不是聊天消息、已经读过或已经叫过。不带消息时 *kind* 写谁在叫（比如
-    「MC 版本检查」），她正忙时排着，这次唤醒收尾前接上，总是 True。
+    「MC 版本检查」），记进她自己的 `me` 窗口（见 `push`），总是 True。
 
     WHY: 维护者 2026-10-23：唤醒条件不做成规则文件，但要为更多唤醒方式留一个函数入口。
     判据各管各的——`activation_signal` 的 at、名字、私聊、戳一戳，以后别的模块、link 或
@@ -732,7 +732,8 @@ def wake(event: dict | None = None, kind: str = "wake", reason: str = "") -> boo
     某个函数上的钩子、别的模块）随时可以调。
     """
     if event is None:
-        return _agent.alarm(reason or kind, kind)
+        push(_windows.ME, kind, reason or kind, wake=kind)
+        return True
     window = history.window(event)
     if window is None or not _mail_candidate(event):
         return False
@@ -753,6 +754,42 @@ def wake(event: dict | None = None, kind: str = "wake", reason: str = "") -> boo
     finally:
         context.set_current(previous)
     return True
+
+
+def push(window: tuple, author: str, text: str, *, wake: str = "") -> str:
+    """Put one record into a non-QQ window and, when *wake* names a reason, wake her; returns the record id.
+
+    *window* is ``(种类, 目标)`` of a kind registered with `kind`, or ``me``. The record is
+    written to chatlog first and then registered as an arrival, under the window lock,
+    the same order QQ messages use; so it shows on her screen, in ``read_log`` and in
+    ``search``, stays unread until she has seen it, and survives a restart. *wake* is
+    what she reads in "这次唤醒你的是". When she is busy it waits for this wake to end.
+
+    WHY: 维护者 2026-10-23：别的来源也要带着内容叫醒她、能被她回，不另造一套"源"。QQ 消息
+    不走这里，它们的内容由 NapCat 事件决定，撤回、补漏都在 chatlog 那条路上。
+    """
+    window = tuple(window)
+    if not _windows.known(window) or window[0] in _windows.QQ or _windows.parse_all([_windows.label(window)]) != [window]:
+        raise ValueError(f"push 只收已登记的非 QQ 窗口，目标是非空字符串：{window}")
+    body = str(text).strip("\n")
+    if not body.strip():
+        raise ValueError("push 的正文不能空")
+    oplog.ensure_available()
+    from uuid import uuid4
+
+    from mods import chatlog
+
+    now = time.time()
+    record_id = uuid4().hex[:8]
+    with context.window_lock(window):
+        origin = chatlog.append_record(window[0], window[1], author, body, now, record_id)
+        arrival = oplog.arrive(window, {"post_type": "push", "time": int(now), "author": str(author),
+                                        "text": body, "id": record_id}, origin=origin)
+        if wake:
+            oplog.activate(arrival, wake)
+    if wake:
+        _agent._drive_agent(None, window)
+    return record_id
 
 
 @capture(before="name加复读")
@@ -879,3 +916,5 @@ def on_load(ctx) -> None:
 from . import view as _view, reader as _reader, agent as _agent, roles as _roles, subcommands as _subcommands, notes as _notes, awaker as _awaker
 from .view import has_at, msg_split
 from .reader import parse_target, prepare_recovery_sources, mark_window_read
+from . import windows as _windows
+from .windows import kind

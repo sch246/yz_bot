@@ -10,9 +10,13 @@
 chatlog/group/{群号}/{YYYY-MM}/{DD}.log
 chatlog/private/{QQ号}/{YYYY-MM}/{DD}.log
 chatlog/bot/{YYYY-MM}/{DD}.log
+chatlog/me/{YYYY-MM}/{DD}.log
+chatlog/{种类}/{目标}/{YYYY-MM}/{DD}.log
 ```
 
 窗口和日期**只由路径承载**，不在行内重复。`bot/` 是没有窗口的事件的堆放处：好友请求、`friend_add`、以及写入失败时的兜底 `repr`。
+
+`me/` 是柚子自己的窗口，`{种类}/{目标}/` 是 QQ 以外登记过的窗口种类（2026-10-23 起，见 `mods/chat/windows.py`）。它们没有 OneBot 事件，由 `chat.push` 经 `chatlog.append_record` 写入，每条是私聊形状的消息记录：`{作者} 时:分:秒 | {记录号}`，正文缩进 4 格。作者是写入方给的名字（比如 `awaker「…」`、`MC 版本检查`），不带号码；记录号是 8 位十六进制。`parse_log`、补漏和按消息号定位只处理 QQ 的两种。
 
 时间戳按**本地时区**渲染，解析时假定同一时区。设备换时区会平移历史时间——这是已知的推导假设，不用一个字段消灭它。
 

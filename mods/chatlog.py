@@ -868,9 +868,27 @@ def window_path(kind: str, target: int | str | None = None, root: str | os.PathL
     base = Path(rootfile if root is None else root)
     if kind == "bot":
         return base / "bot"
-    if kind not in ("group", "private"):
-        raise ValueError(f"未知窗口类型：{kind}")
-    return base / kind / str(target)
+    if kind in ("group", "private"):
+        return base / kind / str(target)
+    # WHY: 2026-10-23 起 QQ 以外的窗口（她自己的 `me`、以后的 B 站、手机）也把记录写在这里，
+    # 格式相同，见 mods/chat/windows.py。名字和目标会变成路径，只挡住能跳出这棵树的写法。
+    if (not re.fullmatch(r"[a-z][a-z0-9_]*", kind)
+            or not re.fullmatch(r"[^/\\\x00-\x1f]*", str(target or "")) or str(target or "") in (".", "..")):
+        raise ValueError(f"未知窗口：{kind} {target}")
+    return base / kind / str(target or "")
+
+
+def append_record(kind: str, target: int | str | None, author: str, text: str,
+                  timestamp: float, record_id: str) -> str:
+    """Append one record of a window that has no OneBot event, e.g. her own ``me``; returns its locator.
+
+    Same head-plus-indented-body shape as a private message, so the screen and
+    ``read_log`` read it like any other record.
+    """
+    head = " ".join(str(author).split()) or "?"
+    _text, origin = _append(get_path(str(window_path(kind, target)), timestamp),
+                            _private_str(head, timestamp, text, record_id))
+    return origin
 
 
 def _day_bounds(day: tuple[int, int, int]) -> tuple[int, int]:

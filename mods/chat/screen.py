@@ -17,9 +17,7 @@ import time
 
 from mods import chatlog
 
-
-def label(window: tuple) -> str:
-    return ("g" if window[0] == "group" else "u") + str(window[1])
+from .windows import label
 
 
 def _day_files(window: tuple) -> list[tuple[tuple[int, int, int], Path]]:

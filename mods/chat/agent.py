@@ -22,7 +22,7 @@ import time
 from mods import context, image, llm, oplog, py, storage
 
 import mods.chat as _chat_root
-from . import notes as _notes, reader as _reader, roles as _roles, screen as _screen, segment as _segment, view as _view
+from . import notes as _notes, reader as _reader, roles as _roles, screen as _screen, segment as _segment, view as _view, windows as _windows
 
 _SEEN_KEY = "seen"
 # WHY: 什么时候交接是可以改的策略（2026-10-22 维护者："唤醒条件本身也配置化"）。
@@ -45,10 +45,6 @@ _TYPING_EVERY = 5
 _HANDOFFS_PER_WAKE = 3
 _FORCE_AFTER_FAILURES = 2
 _FORCE_OVER_THRESHOLD = 2
-# 不带消息的唤醒（awaker 规则、别处的代码调 chat.wake(reason=...)）：(原因, 来源)，她正忙时排在这里，
-# 这次唤醒收尾前接上。只在内存里：重启时排着的会丢，awaker 的规则本身在笔记里，没响成的下一分钟还在。
-_alarms: list[tuple[str, str]] = []
-_alarms_lock = threading.Lock()
 
 
 def _text_tokens(messages: list[dict]) -> int:
@@ -83,10 +79,11 @@ def _woken(notice: dict | None, turn) -> tuple[list[tuple], list[str], list[int]
             window = tuple(item["window"])
             windows.append(window)
             stamp = _screen.clock(item["time"]) if isinstance(item.get("time"), (int, float)) else "?"
-            lines.append(f"{_screen.label(window)} {item.get('kind')} 作者={item.get('user_id')} 时间={stamp}")
+            author = f" 作者={item['user_id']}" if item.get("user_id") is not None else ""
+            lines.append(f"{_screen.label(window)} {item.get('kind')}{author} 时间={stamp}")
         for window in notice.get("windows", []):
             windows.append(tuple(window))
-    windows.extend(window for window in turn.associated_windows if window[0] in ("group", "private"))
+    windows.extend(window for window in turn.associated_windows if _windows.known(window))
     return list(dict.fromkeys(windows)), lines, authors
 
 
@@ -118,7 +115,7 @@ def _head(woken: list[tuple], segment: dict) -> list[dict]:
 
 def _people(windows: list[tuple], authors: list[int], segment: dict) -> list[dict]:
     """Notes for windows and people appearing in this segment for the first time."""
-    scopes = [_notes.scope_of(window) for window in windows]
+    scopes = [_notes.scope_of(window) for window in windows if window[0] in _windows.QQ]
     scopes.extend(f"person:{author}" for author in authors[:_KNOWN_PEOPLE])
     new = [scope for scope in dict.fromkeys(scopes) if scope not in segment["scopes"]]
     segment["scopes"].extend(new)
@@ -178,7 +175,7 @@ def _unread_hint(on_screen: set[tuple]) -> str:
     rows = []
     for detail in oplog.pending_details():
         window = tuple(detail["window"])
-        if window[0] not in ("group", "private") or window in on_screen:
+        if not _windows.known(window) or window in on_screen:
             continue
         rows.append(f"{_screen.label(window)} {detail['unread']} 条"
                     + (f"（@你 {detail['mentions']}）" if detail["mentions"] else ""))
@@ -385,7 +382,6 @@ def _begin(turn, window: tuple | None, kind: str) -> None:
     turn.handoff_note = ""
     turn.handoff_failed = False
     turn.handoffs = 0
-    turn.alarm = []
     # 输入框（type_word）跟着这次唤醒走：中途交接换了会话也还在，唤醒结束就没了。
     turn.boxes = {}
     turn.log = {"kind": kind, "start": time.time(), "peak": 0}
@@ -417,28 +413,12 @@ def _keep_typing(turn, window: tuple | None, stop: threading.Event) -> None:
         stop.wait(_TYPING_EVERY)
 
 
-def _queued_alarms() -> bool:
-    with _alarms_lock:
-        return bool(_alarms)
-
-
-def _take_alarms() -> list[tuple[str, str]]:
-    with _alarms_lock:
-        taken = list(_alarms)
-        _alarms.clear()
-    return taken
-
-
-def _has_work() -> bool:
-    return oplog.has_unnotified() or _queued_alarms()
-
-
-def _drive_agent(model: str | None, window: tuple | None, alarm: bool = False) -> bool:
+def _drive_agent(model: str | None, window: tuple | None) -> bool:
     """Hold the agent's turn until nothing is left to do; False when someone else holds it."""
     turn, owner = context.begin_turn(_chat_root.AGENT_WINDOW)
     if not owner:
         return False
-    _begin(turn, window, "闹钟" if alarm else "唤醒")
+    _begin(turn, window, "闹钟" if window == _windows.ME else "唤醒")
     typing = threading.Event()
     threading.Thread(target=_keep_typing, args=(turn, window, typing), name="chat-typing", daemon=True).start()
     # WHY: 一次对话 = 这次持有的全过程（多轮 + 插话续写，直到 finally），图片检查台账就
@@ -465,26 +445,15 @@ def _drive_agent(model: str | None, window: tuple | None, alarm: bool = False) -
                 return True
             turn.associated_windows.intersection_update(
                 {window for window, _count, active in oplog.pending_summary() if active})
-            if not context.finish_turn(_chat_root.AGENT_WINDOW, turn, _has_work):
+            if not context.finish_turn(_chat_root.AGENT_WINDOW, turn, oplog.has_unnotified):
                 return True
     finally:
         typing.set()
         image.end_conversation(image_ledger)
         context.end_turn(_chat_root.AGENT_WINDOW, turn)
-        # WHY: 循环停下的唯一信号就在这里，见 _run_hint。
-        if origin is not None and window is not None:
+        # WHY: 循环停下的唯一信号就在这里，见 _run_hint。`#hint` 只有 QQ 窗口有。
+        if origin is not None and window is not None and window[0] in _windows.QQ:
             _chat_root._run_hint(window, turn)
-
-
-def alarm(reason: str, source: str) -> bool:
-    """Wake her with a reason instead of a message; when she is busy it waits for this wake to end.
-
-    *source* says who is calling, e.g. the awaker rule; she sees both.
-    """
-    with _alarms_lock:
-        _alarms.append((reason, source))
-    _drive_agent(None, None, alarm=True)
-    return True
 
 
 def request_tidy(note: str) -> bool:
@@ -502,8 +471,7 @@ def _run_agent(model: str | None, turn) -> bool:
     woken, activation_lines, authors = _woken(notice, turn)
     turn.authors = list(dict.fromkeys([*turn.authors, *authors]))
     continuing = turn.handed_off
-    turn.alarm.extend(_take_alarms())
-    if notice is None and not woken and not turn.alarm and not continuing:
+    if notice is None and not woken and not continuing:
         return True
     segment = _segment.load()
     if _did_something(segment["messages"]) and not turn.handoff_failed:
@@ -521,7 +489,7 @@ def _run_agent(model: str | None, turn) -> bool:
     if not segment["messages"]:
         material.extend(_head(woken, segment))
     # 交接后续做时没有新唤醒，沿用刚才看着的窗口。
-    focus = woken or [_reader.parse_target(label) for label in turn.screens]
+    focus = woken or _windows.parse_all(turn.screens)
     material.extend(_people(focus, turn.authors, segment))
     screens: dict[str, str] = {}
     newest: dict[tuple, tuple] = {}
@@ -537,10 +505,6 @@ def _run_agent(model: str | None, turn) -> bool:
     now = _screen.clock()
     if notice is not None:
         material.append({"role": "user", "content": f"这次唤醒你的是（{now}）：\n" + "\n".join(activation_lines)})
-    if turn.alarm:
-        lines = [f"- {source}：{reason_text}" for reason_text, source in turn.alarm]
-        material.append({"role": "user", "content": f"这次叫醒你的不是消息（{now}）：\n" + "\n".join(lines)
-                         + "\n没有人在等你回话；看看要不要做点什么，没事就直接结束。"})
     if segment.get("notice"):
         material.append({"role": "user", "content": segment["notice"]})
     if continuing:
@@ -553,7 +517,6 @@ def _run_agent(model: str | None, turn) -> bool:
         return True
 
     def first_output() -> None:
-        turn.alarm = []
         if notice is not None:
             oplog.acknowledge_notification(notice["id"])
         _mark_seen(newest)
@@ -768,12 +731,10 @@ def _run_reflection(model: str | None, turn, segments: list[dict]) -> None:
 def pick_up_pending() -> None:
     """Start a wake for calls that arrived while nobody was there to take them."""
     if not oplog.has_unnotified():
-        if _queued_alarms():
-            _drive_agent(None, None, alarm=True)
         return
     window = next(iter(oplog.unacknowledged_windows()), None)
     if window is None:
         window = next((window for window, _count, active in oplog.pending_summary()
-                       if active and window[0] in ("group", "private")), None)
+                       if active and _windows.known(window)), None)
     if window is not None:
         _drive_agent(None, window)

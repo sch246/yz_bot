@@ -197,6 +197,14 @@ def _holds(expression: str) -> bool:
     return bool(eval(expression, dict(py.loc)))
 
 
+def _ring(rule: dict, reason: str) -> bool:
+    """Write the reason into her ``me`` window and wake her; it is on disk before she is asked."""
+    import mods.chat as chat
+
+    chat.push(chat._windows.ME, f"awaker「{rule['key']}」", reason, wake="闹钟")
+    return True
+
+
 def check(now: float | None = None) -> None:
     """Fire every due rule once; a rule whose wake could not run stays due."""
     from . import agent as _agent
@@ -224,7 +232,10 @@ def check(now: float | None = None) -> None:
                     continue
                 reason = rule["reason"]
             if due and _claim([rule["key"]]):
-                _agent.alarm(reason, f"awaker 规则「{rule['key']}」")
+                try:
+                    _ring(rule, reason)
+                except Exception:
+                    _stream.exception(f"唤醒规则执行失败（已划掉）：{rule['key']}")
             continue
         if rule["key"] not in last and rule["kind"] == "every":
             last[rule["key"]] = now
@@ -234,7 +245,7 @@ def check(now: float | None = None) -> None:
             continue
         try:
             done = (_agent.reflect() if rule["reason"].strip() == "reflect"
-                    else _agent.alarm(rule["reason"], f"awaker 规则「{rule['key']}」"))
+                    else _ring(rule, rule["reason"]))
         except Exception:
             _stream.exception(f"唤醒规则执行失败：{rule['key']}")
             done = True
