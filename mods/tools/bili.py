@@ -20,8 +20,12 @@
 其余的在 inbox 里往前翻。
 
 **登录**：工具说"B 站还没登录"或登录失效时，用 `cmds__run_command(".bili login", target="u<管理员QQ号>")`
-把登录二维码私聊发给管理员，请对方用你那个号的 B 站 App 扫码；过几分钟用 `cmds__run_command(".bili")` 看登好了没有。
-二维码只能发到管理员的私聊。
+把登录二维码私聊发给管理员。私聊里只会出现一张二维码，要用哪个号的 B 站 App 扫、确认时选长期登录，由你自己跟对方说；
+登好了、过期了或者出错，会写进你的 me 窗口叫醒你。
+二维码只能发到管理员的私聊。也可以在你自己的浏览器里登：`browser__open_page("https://passport.bilibili.com/login")`，
+扫码（截图发给管理员）或者输密码都行，登好以后 `browser__get_cookies("https://www.bilibili.com")` 取出整条 Cookie，
+交给 `bili__use_cookie`；想让它每天自动续期，在末尾加上 `; ac_time_value=` 和 `browser__run_js("localStorage.ac_time_value")` 的结果。
+Cookie 是你这个号的登录凭据，不要发进聊天。
 """
 
 from datetime import datetime
@@ -378,4 +382,17 @@ def dm(uid: int) -> str:
     return "\n".join(lines) or "（没有私信）"
 
 
-__all__ = ["feed", "hot", "search", "video", "subtitle", "comments", "thread", "inbox", "dm"]
+
+def use_cookie(cookie: str) -> str:
+    """把你自己浏览器里 B 站号的 Cookie 存成登录凭证，存完用它查一下自己的资料，查得到才算登好。
+
+    @param
+    cookie: 整条 `k=v; k=v`，要有 SESSDATA；在浏览器里登好 B 站后用 browser__get_cookies("https://www.bilibili.com") 取，末尾可加 `; ac_time_value=…` 让它每天自动续期
+    """
+    try:
+        return _bili().use_cookie(cookie)
+    except Exception as error:
+        return _failure(error)
+
+
+__all__ = ["feed", "hot", "search", "video", "subtitle", "comments", "thread", "inbox", "dm", "use_cookie"]

@@ -218,6 +218,8 @@ def poll() -> None:
     found = _load_credential()
     if found is None:
         return
+    if _with_device(found):
+        _save_credential(found)
     state = _state()
     today = datetime.now().strftime("%Y-%m-%d")
     if state.get("refreshed") != today and found.ac_time_value:
@@ -280,7 +282,7 @@ def _scanner(event: dict) -> int | None:
     """Whose private chat the login QR code may go to; None when nobody's.
 
     WHY: 谁扫了这个码，谁的号就成了她的号。码落到别人手里、别人一扫，她就用别人的号说话，
-    所以只发到管理员的私聊：管理员自己发命令就发给他；Bot 自己是作者时（她经
+    所以只发到管理员的私聊：管理员自己发命令就发给管理员本人；Bot 自己是作者时（她经
     ``cmds__run_command`` 跑，维护者 2026-10-23 允许她自己发起登录），只在对端是管理员的
     私聊窗口里才发，发给那个对端。
     """
@@ -295,49 +297,133 @@ def _scanner(event: dict) -> int | None:
     return int(peer) if peer is not None and int(peer) != identity.bot_id() and op.is_op(int(peer)) else None
 
 
+def _tell(text: str) -> None:
+    from mods import chat
+
+    chat.push(chat.windows.ME, "B 站登录", text, wake="B 站登录")
+
+
+def _with_device(found) -> bool:
+    """Give *found* a device identity (buvid3/buvid4) of its own when it lacks one; True when it changed.
+
+    WHY: 维护者 2026-10-23：设备标识这类增强稳定性的要加。凭证里没有 buvid 时，bilibili-api
+    每个进程临时生成、激活一对，重启一次就像换了一台设备，登录却还是同一个，在风控眼里不像
+    真人。所以第一次拿到就存进凭证，之后一直用这一对。拿不到（网络、接口变了）只记日志：
+    没有它照样能用，只是回到库的老办法。
+    """
+    if found.buvid3 and found.buvid4:
+        return False
+    from bilibili_api.utils.network import get_buvid
+
+    try:
+        buvid3, buvid4 = call(get_buvid())
+    except Exception:
+        _stream.exception("B 站设备标识（buvid）拿不到，先不带")
+        return False
+    found.buvid3, found.buvid4 = found.buvid3 or buvid3, found.buvid4 or buvid4
+    return True
+
+
+def adopt(found) -> str:
+    """Save *found* as her login and check it by reading her own profile; returns what happened."""
+    from bilibili_api import user
+
+    _with_device(found)
+    _save_credential(found)
+    state = _state()
+    for key in ("reply", "at", "error", "uid", "name"):
+        state.pop(key, None)
+    try:
+        info = call(user.get_self_info(found))
+        if not info.get("mid"):
+            raise ValueError("资料里没有 uid，票据大概不管用")
+        state.update(uid=info.get("mid"), name=info.get("name"))
+    except Exception as error:
+        return f"B 站登录票据存下了，但用它查自己的资料失败（{type(error).__name__}）：{error}"
+    finally:
+        storage.save()
+    return f"B 站登录好了：{_me()}"
+
+
+def use_cookie(cookie: str) -> str:
+    """Take her login from a ``k=v; k=v`` cookie (her own browser's), save it and check it.
+
+    WHY: 维护者 2026-10-23：柚子有自己的浏览器，可以在里面登 B 站、把 Cookie 取出来交给这里；
+    这个号是她的，Cookie 经过她无所谓。扫码接口哪天再变，这条路不受影响，还顺带 buvid3/buvid4。
+    """
+    from bilibili_api import Credential
+
+    pairs = dict(part.strip().partition("=")[::2] for part in str(cookie).split(";") if "=" in part)
+    if not pairs.get("SESSDATA"):
+        return "Cookie 里没有 SESSDATA，存不了：先在浏览器里登好 B 站，再用 browser__get_cookies(\"https://www.bilibili.com\") 取"
+    return adopt(Credential(sessdata=pairs["SESSDATA"], bili_jct=pairs.get("bili_jct"), buvid3=pairs.get("buvid3"),
+                            buvid4=pairs.get("buvid4"), dedeuserid=pairs.get("DedeUserID"),
+                            ac_time_value=pairs.get("ac_time_value")))
+
+
+_PASSPORT = "https://passport.bilibili.com/x/passport-login/web/qrcode/"
+_BROWSER = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/140.0 Safari/537.36", "Referer": "https://www.bilibili.com/"}
+
+
 def _login(user_id: int) -> None:
-    """Send a login QR code to *user_id* and wait up to three minutes for the scan, reporting there.
+    """Send a login QR code to *user_id* and wait up to three minutes for the scan, telling her how it went.
 
     Runs on its own thread: the code is an image, and ``cmds__run_command`` captures what a command
     sends from the calling thread, which would hand her the whole base64 picture as text.
-    """
-    from bilibili_api import user
-    from bilibili_api.login_v2 import QrCodeLogin, QrCodeLoginEvents
 
+    WHY: 维护者 2026-10-23：私聊里只弹二维码，别的话柚子自己说。以前码前码后各有一句模块
+    写死的说明，加上她自己的一句，读起来像人机。扫没扫、登没登好、过没过期写进她的 me
+    窗口叫醒她，由她决定跟对方说什么。
+
+    WHY: 生成和轮询自己做，不用 bilibili-api 的 ``QrCodeLogin``。它只在轮询返回的 ``url``
+    的查询串里找 SESSDATA，找不到也报成功；2026-10-23 设备上两次扫码都是这样，存下来的
+    凭证只有刷新令牌（她自己挖出来的）。所以这里查询串和响应的 Set-Cookie 都看，拿不到
+    SESSDATA 就如实说没登上。它的 TV 渠道也不能换：遇到"已扫码未确认"会直接抛错。
+    """
+    import io
+    from urllib.parse import parse_qsl, urlsplit
+
+    from bilibili_api import Credential
+    import httpx
+    import qrcode
+
+    device = Credential()
+    _with_device(device)
     try:
-        login = QrCodeLogin()
-        call(login.generate_qrcode())
-        picture = base64.b64encode(login.get_qrcode_picture().content).decode()
+        # 扫码也从这台"设备"登：带着之后要存进凭证的那对 buvid，和浏览器里登录一样。
+        with httpx.Client(headers=_BROWSER, timeout=15,
+                          cookies={key: value for key, value in (("buvid3", device.buvid3), ("buvid4", device.buvid4))
+                                   if value}) as client:
+            data = client.get(_PASSPORT + "generate").json()["data"]
+            picture = io.BytesIO()
+            qrcode.make(data["url"]).save(picture, format="PNG")
+            message.send(f"[CQ:image,file=base64://{base64.b64encode(picture.getvalue()).decode()}]", user_id=user_id)
+            deadline = time.time() + 180
+            while time.time() < deadline:
+                time.sleep(3)
+                response = client.get(_PASSPORT + "poll", params={"qrcode_key": data["qrcode_key"]})
+                body = response.json()["data"]
+                # 86101 还没扫，86090 扫了还没确认，86038 过期，0 登上了。
+                if body["code"] == 86038:
+                    break
+                if body["code"] != 0:
+                    continue
+                cookies = dict(parse_qsl(urlsplit(body.get("url") or "").query))
+                cookies.update({name: value for name, value in response.cookies.items() if value})
+                if not cookies.get("SESSDATA"):
+                    _stream.warning("B 站扫码确认了却没拿到 SESSDATA，拿到的字段：%s", sorted(cookies))
+                    _tell("B 站扫码确认了，但 B 站没给登录票据（SESSDATA），这次没登上，凭证没存。"
+                          f"拿到的字段只有：{'、'.join(sorted(cookies)) or '（没有）'}。")
+                    return
+                _tell(adopt(Credential(sessdata=cookies["SESSDATA"], bili_jct=cookies.get("bili_jct"),
+                                       buvid3=device.buvid3, buvid4=device.buvid4,
+                                       dedeuserid=cookies.get("DedeUserID"), ac_time_value=body.get("refresh_token"))))
+                return
     except Exception as error:
-        message.send(f"B 站登录二维码生成失败（{type(error).__name__}）：{error}", user_id=user_id)
+        _tell(f"B 站登录出错了（{type(error).__name__}）：{error}，这次登录作废，要登录就再跑一次 .bili login")
         return
-    message.send(f"[CQ:image,file=base64://{picture}]", user_id=user_id)
-    message.send("用柚子那个号的 B 站 App 扫这个码，确认时选长期登录。三分钟内有效。", user_id=user_id)
-    deadline = time.time() + 180
-    while time.time() < deadline:
-        time.sleep(3)
-        try:
-            event = call(login.check_state())
-        except Exception as error:
-            message.send(f"查登录状态失败（{type(error).__name__}）：{error}", user_id=user_id)
-            return
-        if event == QrCodeLoginEvents.TIMEOUT:
-            break
-        if event == QrCodeLoginEvents.DONE:
-            found = login.get_credential()
-            _save_credential(found)
-            state = _state()
-            try:
-                info = call(user.get_self_info(found))
-                state.update(uid=info.get("mid"), name=info.get("name"))
-            except Exception:
-                _stream.exception("登录成功，但读不到自己的昵称")
-            for key in ("reply", "at", "error"):
-                state.pop(key, None)
-            storage.save()
-            message.send(f"B 站登录好了：{_me()}", user_id=user_id)
-            return
-    message.send("二维码过期了，要登录就再发一次 .bili login", user_id=user_id)
+    _tell(f"发给 {user_id} 的 B 站登录二维码三分钟没人扫，过期了；要登录就再跑一次 .bili login")
 
 
 @command
@@ -353,7 +439,12 @@ def run(body: str):
         if scanner is None:
             return "登录二维码只能发到管理员私聊：管理员自己发 .bili login，或者在管理员的私聊窗口里跑"
         threading.Thread(target=_login, args=(scanner,), name="bili-login", daemon=True).start()
-        return f"登录二维码马上私聊发给 {scanner}，三分钟内扫"
+        from mods import history, identity
+
+        if int(history.author(event)) != identity.bot_id():
+            return None
+        return (f"二维码马上私聊发给 {scanner}，只有一张图，要扫哪个号、确认时选长期登录这些由你来说；"
+                "三分钟内有效，登好了、过期了都会写进你的 me 窗口")
     if body.strip():
         return run.__doc__
     state = _state()
