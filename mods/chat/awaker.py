@@ -25,15 +25,23 @@ WHY: 2026-10-23 维护者要她有更强的唤醒自己的能力，于是又有�
 ``chat.capture_chat`` 在消息到达时认领（``take_waiting``），只认开了聊天的窗口。``when`` 每分钟
 用 ``.py`` 那份共享环境求值一次。她用 ``wake_me`` 工具写这些行，相对时间在写的时候换成时刻。
 
-WHY: 2026-10-23 维护者要她能聚焦一个群：感兴趣或正在聊的时候，这个群每条消息都像私聊一样
-叫醒她，直到她自己退出。不另设模式，就是一条响了不划掉的 ``on``，但必须带期限：
+WHY: 2026-10-23 维护者要统一触发器：每种窗口有自己的默认触发器（私聊每条都算；群里是 at、
+叫名字、戳一戳，即 ``chat.activation_signal``；B 站这类非 QQ 窗口是投递方给的 ``wake=``），窗口上
+可以盖一层限时的覆盖层，盖着的时候由它决定叫不叫，不管默认怎么说。覆盖层只管叫不叫：
+消息照样登记成未读，她醒着时照样看得见；她自己埋的 ``on``/``wait`` 照样响；``chat.wake``
+的显式调用也不经过它。覆盖层有三种状态：
 
-    follow g123 until 2026-10-23 22:30 在跟大家聊游戏
+    follow g123 until 2026-10-23 22:30 在跟大家聊游戏      （每条都叫）
+    mute bili until 2026-10-24 08:00 先不管 B 站           （都不叫）
+    other：代码用 ``override(目标, 函数)`` 设的，函数看这条决定叫不叫
 
-``wake_me("follow g123 30m", ...)`` 写它（不写多久就是 30 分钟），再写一次是续期，替换同一目标
-的旧行；``follow g123 off`` 或删掉这一行是退出；到期由每分钟检查静静划掉，不叫醒她。期限必填
-是因为忘了退出的代价：热闹的群每条都花一次模型调用，话题早过去了她还挂着；有期限最坏也就
-多花到期为止。
+follow/mute 是写进笔记的两种语法糖，``wake_me("follow g123 30m", ...)`` 写（不写多久就是 30
+分钟，期限不设上限），同一目标再写一次就替换（follow 换成 mute 也是），``off`` 揭掉，到期由每分钟
+检查静静划掉、不叫醒她。目标是一个窗口（``g123``、``u456``、``g123:QQ号`` 只管这个人、
+``bili:BV…``）或者一整类（``group``、``private``、``bili``）；同时有好几层时越具体的越优先。
+``me`` 不能盖；master（``ops`` 第一位）的话 mute 压不住，管理员的可以。follow 只认 QQ：B 站
+这类窗口只收到回复和 @，本来就都叫醒她；维护者不要为 follow 一个评论区单独去轮询它，会被限流。
+other 只在内存里，重启就没了，和她用 exec_code 包的钩子一样。
 """
 
 from __future__ import annotations
@@ -45,7 +53,7 @@ import time
 
 from mods import log, storage
 
-from . import notes as _notes
+from . import notes as _notes, windows as _windows
 
 DEFAULT = "daily 04:00 reflect"
 JOB = "chat-awaker"
@@ -60,11 +68,13 @@ _TARGET = r"([gu][1-9][0-9]*(?::[1-9][0-9]*)?)"
 _ON = re.compile(r"^\s*(?:[-*]\s+)?on\s+" + _TARGET + r"\s+(.+?)\s*$")
 _WAIT = re.compile(r"^\s*(?:[-*]\s+)?wait\s+" + _TARGET
                    + r"\s+until\s+(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})\s+(.+?)\s*$")
-_FOLLOW = re.compile(r"^\s*(?:[-*]\s+)?follow\s+" + _TARGET
-                     + r"\s+until\s+(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})\s+(.+?)\s*$")
+_LAYER = re.compile(r"^\s*(?:[-*]\s+)?(follow|mute)\s+(\S+)"
+                    r"\s+until\s+(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})\s+(.+?)\s*$")
 _WHEN = re.compile(r"^\s*(?:[-*]\s+)?when\s+(.+?)\s+->\s+(.+?)\s*$")
 # 改笔记的地方（划掉响过的行、wake_me 追加）互相排队；她用 write_note 整份改不经过这里。
 _edit = threading.Lock()
+# 代码设的覆盖层（other），目标原文 → {"decide": 函数, "moment": 到期时刻或 None, "reason": …}。
+_custom: dict[str, dict] = {}
 _broken: set[str] = set()
 _UNIT = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
@@ -90,16 +100,49 @@ def _target(text: str) -> tuple[tuple, int | None]:
     return window, int(author) if author else None
 
 
+def _scope(text: str) -> tuple | None:
+    """A layer's target as ("window", window, author or None) or ("kind", 种类, None); None when unreadable."""
+    if re.fullmatch(_TARGET, text):
+        return ("window", *_target(text))
+    if not re.fullmatch(r"[a-z][a-z0-9_]*(?::\S+)?", text):
+        return None
+    name, _, target = text.partition(":")
+    if name in ("me", "bot") or target and name in _windows.QQ:
+        return None
+    return ("window", (name, target), None) if target else ("kind", name, None)
+
+
+def _master() -> int | None:
+    from mods import op
+
+    return op.ops[0] if op.ops else None
+
+
+def _layer_problem(state: str, target: str) -> str:
+    """Why this layer cannot be put on *target*; empty when it can."""
+    scope = _scope(target)
+    if scope is None:
+        return "目标写 g群号、u私聊号、g群号:QQ号、一整类（group、private、bili 这样的种类名）或 种类:目标；me 不能盖"
+    kind = scope[1] if scope[0] == "kind" else scope[1][0]
+    if state == "follow" and kind not in _windows.QQ:
+        return "follow 只认 QQ 窗口：B 站这类窗口只收到回复和 @，本来就都叫醒你"
+    master = _master()
+    if state == "mute" and master is not None and scope[0] == "window" and (
+            scope[2] == master or tuple(scope[1]) == ("private", master)):
+        return "master 不能静音"
+    return ""
+
+
 def _once(line: str) -> dict | None:
     """The rules beyond ``every``/``daily``/``at``; None when the line is not one."""
     key = line.strip()
-    if match := _FOLLOW.match(line):
-        moment = _moment(match[2], match[3], match[4])
-        if moment is None:
-            return {"key": key, "kind": "bad", "why": "日期不对"}
-        window, author = _target(match[1])
-        return {"key": key, "kind": "follow", "target": match[1], "window": window, "author": author,
-                "moment": moment, "until": f"{match[2]} {int(match[3]):02d}:{match[4]}", "reason": match[5]}
+    if match := _LAYER.match(line):
+        moment = _moment(match[3], match[4], match[5])
+        problem = "日期不对" if moment is None else _layer_problem(match[1], match[2])
+        if problem:
+            return {"key": key, "kind": "bad", "why": problem}
+        return {"key": key, "kind": "layer", "state": match[1], "target": match[2], "scope": _scope(match[2]),
+                "moment": moment, "until": f"{match[3]} {int(match[4]):02d}:{match[5]}", "reason": match[6]}
     if match := _ON.match(line):
         window, author = _target(match[1])
         return {"key": key, "kind": "on", "target": match[1], "window": window, "author": author, "reason": match[2]}
@@ -235,7 +278,7 @@ def check(now: float | None = None) -> None:
     for key in [key for key in last if key not in live]:
         del last[key]
     for rule in found:
-        if rule["kind"] == "follow":
+        if rule["kind"] == "layer":
             if now >= rule["moment"]:
                 _claim([rule["key"]])
             continue
@@ -281,31 +324,120 @@ def check(now: float | None = None) -> None:
 
 
 def take_waiting(window: tuple, author) -> list[dict]:
-    """The ``on``/``wait``/``follow`` rules this message satisfies; ``on``/``wait`` are struck out of the note."""
+    """The ``on``/``wait`` rules this message satisfies, struck out of the note."""
     found, _skipped = rules()
-    now = time.time()
-    matched = [rule for rule in found if rule["kind"] in ("on", "wait", "follow") and rule["window"] == window
-               and (rule["author"] is None or rule["author"] == author)
-               and not (rule["kind"] == "follow" and now >= rule["moment"])]
+    matched = [rule for rule in found if rule["kind"] in ("on", "wait") and rule["window"] == window
+               and (rule["author"] is None or rule["author"] == author)]
     if not matched:
         return []
-    claimed = set(_claim([rule["key"] for rule in matched if rule["kind"] != "follow"]))
-    return [rule for rule in matched if rule["kind"] == "follow" or rule["key"] in claimed]
+    claimed = set(_claim([rule["key"] for rule in matched]))
+    return [rule for rule in matched if rule["key"] in claimed]
 
 
-def _follows(line: str, target: str) -> bool:
-    return bool((match := _FOLLOW.match(line)) and match[1] == target)
+def _layers(now: float) -> list[dict]:
+    found, _skipped = rules()
+    layers = [dict(rule, decide=rule["state"] == "follow") for rule in found
+              if rule["kind"] == "layer" and now < rule["moment"]]
+    for target, custom in list(_custom.items()):
+        if custom["moment"] is not None and now >= custom["moment"]:
+            _custom.pop(target, None)
+            continue
+        until = (datetime.fromtimestamp(custom["moment"]).strftime("%Y-%m-%d %H:%M")
+                 if custom["moment"] is not None else "")
+        layers.append({"state": "other", "target": target, "scope": _scope(target), "moment": custom["moment"],
+                       "until": until, "reason": custom["reason"], "decide": custom["decide"]})
+    return layers
 
 
-def unfollow(target: str) -> bool:
-    """Strike the ``follow`` lines for *target*; False when there were none."""
+def layer(window: tuple, author=None, now: float | None = None) -> dict | None:
+    """The layer over *window* for something by *author*, the most specific one; None when there is none."""
+    window = tuple(window)
+    if window == _windows.ME:
+        return None
+    ranked = []
+    for item in _layers(time.time() if now is None else now):
+        scope = item["scope"]
+        if scope[0] == "kind":
+            if window[0] == scope[1]:
+                ranked.append((0, item))
+        elif tuple(scope[1]) == window and (scope[2] is None or scope[2] == author):
+            ranked.append((1 if scope[2] is None else 2, item))
+    return max(ranked, key=lambda pair: pair[0])[1] if ranked else None
+
+
+def triggered(window: tuple, event: dict | None, author, default: bool) -> tuple[bool, dict | None]:
+    """Whether this arrival wakes her, and the layer that decided; *default* is the window kind's own trigger.
+
+    *event* is the QQ event, or None for a ``chat.push`` record, which a layer can only hold back.
+    """
+    item = layer(window, author)
+    if item is None:
+        return default, None
+    try:
+        wanted = item["decide"] if isinstance(item["decide"], bool) else bool(item["decide"](event))
+    except Exception:
+        _stream.exception(f"覆盖层判断出错，按默认触发器：{item['target']}")
+        return default, None
+    if not wanted and default and author is not None and author == _master():
+        return True, None
+    return wanted, item
+
+
+def describe(item: dict) -> str:
+    """``mute 到 2026-10-24 08:00`` / ``follow（只看 30001）到 …`` / ``other（整类 bili）到重启为止``."""
+    scope = item["scope"]
+    where = (f"（整类 {scope[1]}）" if scope[0] == "kind" else f"（只看 {scope[2]}）" if scope[2] is not None else "")
+    return f"{item['state']}{where}" + (f" 到 {item['until']}" if item["until"] else " 到重启为止")
+
+
+def badges(window: tuple) -> list[str]:
+    """Every layer lying on *window* (whole kind, whole window, one person), for her to see on the screen."""
+    window = tuple(window)
+    return [describe(item) for item in _layers(time.time())
+            if item["scope"][0] == "kind" and window[0] == item["scope"][1]
+            or item["scope"][0] == "window" and tuple(item["scope"][1]) == window]
+
+
+def _strip_layer(text: str, target: str) -> str:
+    return "\n".join(line for line in text.split("\n")
+                     if not ((match := _LAYER.match(line)) and match[2] == target))
+
+
+def lift(target: str) -> bool:
+    """Take every layer off *target*, written or set by code; False when there was none."""
+    found = _custom.pop(target, None) is not None
     with _edit:
-        lines = _notes.read("awaker").split("\n")
-        kept = [line for line in lines if not _follows(line, target)]
-        if len(kept) == len(lines):
-            return False
-        _notes.write("awaker", "\n".join(kept).strip("\n") + "\n" if any(x.strip() for x in kept) else "")
-    return True
+        text = _notes.read("awaker")
+        kept = _strip_layer(text, target)
+        if kept != text:
+            found = True
+            _notes.write("awaker", kept.strip("\n") + "\n" if kept.strip() else "")
+    return found
+
+
+def override(target: str, decide, until: float | None = None, reason: str = "") -> str:
+    """Put an ``other`` layer on *target*: ``decide(event)`` says whether it wakes her (event is None for a push).
+
+    *until* is a timestamp, or None to keep it until it is lifted or the Bot restarts; *decide* None lifts.
+    It replaces a follow/mute line on the same target. Returns what she will see on that window.
+    """
+    target = str(target).strip()
+    if decide is None:
+        lift(target)
+        return f"已揭掉 {target} 的覆盖层"
+    if not callable(decide) and not isinstance(decide, bool):
+        raise TypeError("decide 要是函数（收到这条事件，返回叫不叫）或者 True/False")
+    problem = _layer_problem("other", target)
+    if problem:
+        raise ValueError(problem)
+    with _edit:
+        text = _notes.read("awaker")
+        kept = _strip_layer(text, target)
+        if kept != text:
+            _notes.write("awaker", kept.strip("\n") + "\n" if kept.strip() else "")
+    _custom[target] = {"decide": decide, "moment": until, "reason": str(reason)}
+    item = next(item for item in _layers(time.time()) if item["state"] == "other" and item["target"] == target)
+    return f"{target}：{describe(item)}"
 
 
 def plant(when: str, reason: str, now: float | None = None) -> str:
@@ -328,11 +460,14 @@ def plant(when: str, reason: str, now: float | None = None) -> str:
         line = f"wait {match[1]} until {stamp(seconds)} {reason}"
     elif match := re.fullmatch(r"on\s+" + _TARGET, when):
         line = f"on {match[1]} {reason}"
-    elif match := re.fullmatch(r"follow\s+" + _TARGET + r"(?:\s+(\S+))?", when):
-        seconds = _interval(match[2] or "30m")
+    elif match := re.fullmatch(r"(follow|mute)\s+(\S+)(?:\s+(\S+))?", when):
+        problem = _layer_problem(match[1], match[2])
+        if problem:
+            raise ValueError(problem)
+        seconds = _interval(match[3] or "30m")
         if not seconds:
-            raise ValueError("follow 后面写目标和聚焦多久，例如 follow g123 30m；退出写 follow g123 off")
-        line = f"follow {match[1]} until {stamp(seconds)} {reason}"
+            raise ValueError(f"{match[1]} 后面写目标和多久，例如 {match[1]} g123 30m；揭掉写 {match[1]} g123 off")
+        line = f"{match[1]} {match[2]} until {stamp(seconds)} {reason}"
     elif when.startswith("when "):
         from mods import op
 
@@ -347,9 +482,10 @@ def plant(when: str, reason: str, now: float | None = None) -> str:
     with _edit:
         text = _notes.read("awaker")
         base = text if text.strip() else DEFAULT + "\n"
-        if found[0]["kind"] == "follow":
-            # 续期：同一目标只留一行，期限以这次为准。
-            base = "\n".join(old for old in base.split("\n") if not _follows(old, found[0]["target"]))
+        if found[0]["kind"] == "layer":
+            # 同一目标只留一层，以这次为准：续期，或者 follow 换成 mute。
+            base = _strip_layer(base, found[0]["target"])
+            _custom.pop(found[0]["target"], None)
         _notes.write("awaker", base.rstrip("\n") + "\n" + line + "\n")
     return line
 
@@ -359,8 +495,8 @@ def report() -> str:
     last = _last()
     lines = [("（awaker 笔记是空的，用默认）" if not _notes.read("awaker").strip() else "awaker 规则：")]
     for rule in found:
-        if rule["kind"] == "follow":
-            lines.append(f"{rule['key']}  ← 聚焦中，期间每条都叫醒，到期划掉")
+        if rule["kind"] == "layer":
+            lines.append(f"{rule['key']}  ← 覆盖层 {rule['state']}，到期划掉")
             continue
         if rule["kind"] in ("on", "wait", "when"):
             lines.append(f"{rule['key']}  ← 等着，响过就划掉")
@@ -368,6 +504,8 @@ def report() -> str:
         stamp = last.get(rule["key"])
         shown = datetime.fromtimestamp(stamp).strftime("%m-%d %H:%M") if isinstance(stamp, (int, float)) else "还没响过"
         lines.append(f"{rule['key']}  ← 上次 {shown}")
+    lines.extend(f"{item['target']} 覆盖层 {describe(item)}  ← 代码设的，重启就没了"
+                 for item in _layers(time.time()) if item["state"] == "other")
     lines.extend(f"不认识：{line}" for line in skipped)
     return "\n".join(lines)
 
