@@ -1,7 +1,7 @@
 """B 站：柚子自己的账号。评论区是窗口 ``bili:<目标>``，有人回复她、@ 她时写进那个窗口并叫醒她。
 
 WHY: 维护者 2026-10-23：接入 B 站，参考 dsh-bili-scroll（逐条读字幕原文判断、评论区互动）。
-用她自己的新号，扫码登录、二维码私聊发给维护者，接口用 bilibili-api-python。按事件流提案
+用她自己的新号，扫码登录、二维码只发到管理员私聊（她自己也能发起），接口用 bilibili-api-python。按事件流提案
 §3.4，一个评论区就是一个窗口：别人的回复经 ``chat.push`` 进来，她用 type_word/send 发评论；
 刷首页、搜索、看详情、读字幕和评论是工具（``mods/tools/bili.py``），不进窗口。
 
@@ -99,7 +99,7 @@ def credential():
     """The saved login; RuntimeError when there is none."""
     found = _load_credential()
     if found is None:
-        raise RuntimeError("B 站还没登录：要维护者私聊 Bot 发 .bili login 扫码")
+        raise RuntimeError("B 站还没登录：用 cmds__run_command(\".bili login\", target=\"u<管理员QQ号>\") 把二维码发给管理员扫")
     return found
 
 
@@ -197,8 +197,11 @@ def _deliver(feed: str, item: dict) -> None:
 def poll() -> None:
     """Fetch the newest replies and @s and push the ones after the last position into their windows.
 
-    WHY: 第一次（还没有位置）只记下最新位置，不把账号以前的通知整批倒进来叫醒她。每次只看
-    第一页（约 20 条），两分钟一轮够用；两分钟里来了一页以上，更早的那些就漏了。
+    WHY: 第一次（还没有位置）只记下最新位置，不把账号以前的通知整批倒进来叫醒她。
+
+    WHY: 每次只看第一页（约 20 条）。两分钟里来了一页以上时不往前翻、不把它们都写进本地，
+    而是在她自己的 me 窗口留一句、叫醒她，让她用 ``bili__inbox`` 去 B 站消息中心翻
+    （维护者 2026-10-23：漏通知不好，但不想都记在本地）。
     """
     from bilibili_api import session
 
@@ -214,13 +217,20 @@ def poll() -> None:
             _stream.info("B 站凭证刷新了")
         state["refreshed"] = today
     for feed, fetch, stamp in (("reply", session.get_replies, "reply_time"), ("at", session.get_at, "at_time")):
-        items = (call(fetch(found)) or {}).get("items") or []
+        data = call(fetch(found)) or {}
+        items = data.get("items") or []
         keys = [(int(item.get(stamp) or 0), int(item.get("id") or 0)) for item in items]
         last = tuple(state[feed]) if state.get(feed) else None
         if keys:
             state[feed] = list(max(keys + ([last] if last else [])))
         if last is None:
             continue
+        if keys and min(keys) > last and not (data.get("cursor") or {}).get("is_end", True):
+            from mods import chat
+
+            name = "回复" if feed == "reply" else "@"
+            chat.push(chat.windows.ME, "B 站", f"B 站上次查过之后来的{name}超过一页，只有最新的 {len(items)} 条进了评论区窗口；"
+                      f"更早的用 bili__inbox(\"{feed}\") 往前翻。", wake=f"B 站{name}太多")
         for key, item in sorted(zip(keys, items), key=lambda pair: pair[0]):
             if key > last:
                 _deliver(feed, item)
@@ -248,63 +258,89 @@ def _tick() -> None:
 
 # --- 登录 ----------------------------------------------------------------------
 
-def _login(user_id: int) -> str:
+def _scanner(event: dict) -> int | None:
+    """Whose private chat the login QR code may go to; None when nobody's.
+
+    WHY: 谁扫了这个码，谁的号就成了她的号。码落到别人手里、别人一扫，她就用别人的号说话，
+    所以只发到管理员的私聊：管理员自己发命令就发给他；Bot 自己是作者时（她经
+    ``cmds__run_command`` 跑，维护者 2026-10-23 允许她自己发起登录），只在对端是管理员的
+    私聊窗口里才发，发给那个对端。
+    """
+    from mods import history, identity
+
+    author = history.author(event)
+    if author is None:
+        return None
+    if int(author) != identity.bot_id():
+        return int(author) if op.is_op(int(author)) else None
+    peer = event.get("target_id") if event.get("group_id") is None else None
+    return int(peer) if peer is not None and int(peer) != identity.bot_id() and op.is_op(int(peer)) else None
+
+
+def _login(user_id: int) -> None:
+    """Send a login QR code to *user_id* and wait up to three minutes for the scan, reporting there.
+
+    Runs on its own thread: the code is an image, and ``cmds__run_command`` captures what a command
+    sends from the calling thread, which would hand her the whole base64 picture as text.
+    """
     from bilibili_api import user
     from bilibili_api.login_v2 import QrCodeLogin, QrCodeLoginEvents
 
-    login = QrCodeLogin()
-    call(login.generate_qrcode())
-    picture = base64.b64encode(login.get_qrcode_picture().content).decode()
+    try:
+        login = QrCodeLogin()
+        call(login.generate_qrcode())
+        picture = base64.b64encode(login.get_qrcode_picture().content).decode()
+    except Exception as error:
+        message.send(f"B 站登录二维码生成失败（{type(error).__name__}）：{error}", user_id=user_id)
+        return
     message.send(f"[CQ:image,file=base64://{picture}]", user_id=user_id)
     message.send("用柚子那个号的 B 站 App 扫这个码，确认时选长期登录。三分钟内有效。", user_id=user_id)
-
-    def wait() -> None:
-        deadline = time.time() + 180
-        while time.time() < deadline:
-            time.sleep(3)
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        time.sleep(3)
+        try:
+            event = call(login.check_state())
+        except Exception as error:
+            message.send(f"查登录状态失败（{type(error).__name__}）：{error}", user_id=user_id)
+            return
+        if event == QrCodeLoginEvents.TIMEOUT:
+            break
+        if event == QrCodeLoginEvents.DONE:
+            found = login.get_credential()
+            _save_credential(found)
+            state = _state()
             try:
-                event = call(login.check_state())
-            except Exception as error:
-                message.send(f"查登录状态失败（{type(error).__name__}）：{error}", user_id=user_id)
-                return
-            if event == QrCodeLoginEvents.TIMEOUT:
-                break
-            if event == QrCodeLoginEvents.DONE:
-                found = login.get_credential()
-                _save_credential(found)
-                state = _state()
-                try:
-                    info = call(user.get_self_info(found))
-                    state.update(uid=info.get("mid"), name=info.get("name"))
-                except Exception:
-                    _stream.exception("登录成功，但读不到自己的昵称")
-                for key in ("reply", "at", "error"):
-                    state.pop(key, None)
-                storage.save()
-                message.send(f"B 站登录好了：{_me()}", user_id=user_id)
-                return
-        message.send("二维码过期了，要登录就再发一次 .bili login", user_id=user_id)
-
-    threading.Thread(target=wait, name="bili-login", daemon=True).start()
-    return "二维码私聊发给你了"
+                info = call(user.get_self_info(found))
+                state.update(uid=info.get("mid"), name=info.get("name"))
+            except Exception:
+                _stream.exception("登录成功，但读不到自己的昵称")
+            for key in ("reply", "at", "error"):
+                state.pop(key, None)
+            storage.save()
+            message.send(f"B 站登录好了：{_me()}", user_id=user_id)
+            return
+    message.send("二维码过期了，要登录就再发一次 .bili login", user_id=user_id)
 
 
 @command
 def run(body: str):
     """B 站账号。
 
-    格式：.bili 看登录状态；.bili login 扫码登录（只限管理员，二维码私聊发给你）。
+    格式：.bili 看登录状态；.bili login 扫码登录。二维码只发到管理员私聊：管理员自己发，或者
+    柚子在管理员的私聊窗口里跑这条命令。
     """
     event = context.current() or {}
     if body.strip() == "login":
-        if not op.is_op(event):
-            return "只有管理员能登录 B 站账号"
-        return _login(int(event["user_id"]))
+        scanner = _scanner(event)
+        if scanner is None:
+            return "登录二维码只能发到管理员私聊：管理员自己发 .bili login，或者在管理员的私聊窗口里跑"
+        threading.Thread(target=_login, args=(scanner,), name="bili-login", daemon=True).start()
+        return f"登录二维码马上私聊发给 {scanner}，三分钟内扫"
     if body.strip():
         return run.__doc__
     state = _state()
     if _load_credential() is None:
-        return "B 站没登录。管理员发 .bili login 扫码"
+        return "B 站没登录。管理员发 .bili login 扫码，或者在管理员的私聊窗口里跑 .bili login"
     return (f"B 站：{_me()}" + (f"\n上次轮询出错：{state['error']}" if state.get("error") else "\n轮询正常"))
 
 
