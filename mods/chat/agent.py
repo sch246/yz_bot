@@ -218,12 +218,15 @@ def _late_hint(newest: dict[tuple, tuple], last_shown: dict[str, str]) -> str:
             + "\n\n人常常一句话分几条发；输入框里打好的话要不要改、还发不发，看完再定。")
 
 
-def _box_hint(session) -> str:
-    """What she has typed and not sent yet (`type_word` in tools/meta.py)."""
-    boxes = getattr(session, "boxes", None)
-    if not boxes:
-        return ""
-    return "你的输入框里还有没发的字：\n" + "\n".join(f"{label}：{box['text']}" for label, box in boxes.items())
+def _box_note(boxes: dict) -> str:
+    """Unsent input boxes, told once after a handoff.
+
+    WHY: 维护者 2026-10-23：type_word 的返回已经在上下文里，每次请求末尾再列一遍是重复。
+    只有交接后要说：输入框跟着唤醒走还在，打字那次的返回却随上一段归档了。
+    """
+    return ("交接前你在输入框里打了还没发的字：\n"
+            + "\n".join(f"{label}：{box['text']}" for label, box in boxes.items())
+            + "\n要发就 send，不发就不管它。")
 
 
 def _mark_seen(newest: dict[tuple, tuple]) -> None:
@@ -543,6 +546,8 @@ def _run_agent(model: str | None, turn) -> bool:
     if continuing:
         if turn.handoff_note:
             material.append({"role": "user", "content": turn.handoff_note})
+        if turn.boxes:
+            material.append({"role": "user", "content": _box_note(turn.boxes)})
         turn.handed_off = ""
     if not material:
         return True
@@ -663,7 +668,6 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
     session.add_context_provider(tool_changes)
     for hint in hints:
         session.add_hint(hint)
-    session.add_hint(lambda: _box_hint(session))
     session.add_hint(lambda: f"现在是 {_screen.clock()}。")
     session.should_stop = lambda: turn.cancelled
     session.chat(recall_func=_chat_root.get_handler(session), description_cache=_chat_root.description_cache)

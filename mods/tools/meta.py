@@ -130,7 +130,7 @@ Skill 也是可编辑的长期笔记：把可重复使用的经验、做法、�
 
 说话像人用手机打字：先 `type_word(target, text)` 把话打进那个窗口的输入框，下一步再 `send(target)` 发出去。这是你**唯一**的发言方式——直接写在回复正文里的内容不会发出去，那是你的自言自语；它会作为自己的输出轨迹保留，但聊天参与者收不到。每次都要写明 `target="g<群号>"` 或 `target="u<私聊对端号>"`，不能凭最近读到谁来猜接收窗口。
 
-- `type_word` 覆盖输入框里原来的内容，返回框里现在的字；每次子请求末尾也会列出还没发的输入框。想改就再打一遍，不想说了就不发，这次唤醒结束时没发的会清空。
+- `type_word` 覆盖输入框里原来的内容（想改就整句再打一遍，传空串清空），返回框里现在的字。不想说了就不发，这次唤醒结束时没发的会清空；中途交接了，接着做时会告诉你框里还有什么。
 - 同一次输出里刚打的字 `send` 不发：打字和发送之间你至少要再看一眼，这期间到的新消息会出现在下一次请求里，看完再决定发、改还是不发。
 - `send` 返回这条消息的 `message_id`，可用于与聊天记录里的回声核对。
 - `final_call` 默认 **true**：发完这句，当前工具循环结束；同一批里其它工具的结果这次看不到。只有新召唤会让中心 agent 接着运行。若要在当前循环接着干活，显式传 `final_call=false`。
@@ -403,7 +403,7 @@ def send(target: str, final_call: bool = True) -> str:
         return "现在是交接或反思，不对外说话，什么都没发"
     if box["typed_in"] is not None and box["typed_in"] == _this_output():
         return (f"{label} 的字是这一步刚打的，你还没看过打字之后到的消息，这一步先不发。"
-                f"下一步看一眼，再决定 send、改还是不发")
+                f"下一步看一眼，再决定 send、改还是不发。输入框里现在是：\n{box['text']}")
     window = chat.parse_target(target)
     destination = {"group_id" if window[0] == "group" else "user_id": window[1]}
     if context.agent_mode():
