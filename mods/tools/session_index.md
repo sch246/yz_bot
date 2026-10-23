@@ -4,6 +4,7 @@
 一句话：take/pull 消费即读；status 只看数量；mentions 只认 @／名字开头／「柚子，…」，不含 poke；
 cover_events 范围调用必须显式传 ids=[]；想取刚触发那条用 take(start=序号,count=1)。
 来源：20260926-105~165（cover 节点）；语义细节 20260926-124~128。
+（2026-10-23 注：take、pull、status、mentions、cover_events 都已删除，这条只当历史看；现在怎么读、怎么记见 memory_hygiene。）
 
 ## 记忆系统离好用还缺什么（柚子答）
 一句话：骨架（只追加／可反查／覆盖不改号）已对，缺中间层——①检索层 ②事实层（断言卡）③时效与冲突
