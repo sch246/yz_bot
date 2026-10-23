@@ -15,7 +15,7 @@ import time
 
 from mods import chatlog, history, llm, log
 
-from . import actions as _actions, notes as _notes, screen as _screen, segment as _segment
+from . import actions as _actions, notes as _notes, screen as _screen, segment as _segment, view as _view
 
 
 _stream = log.stream("agent")
@@ -133,6 +133,9 @@ def _archive_lines(messages: list[dict]):
     """
     for message in messages:
         role = message.get("role")
+        if _view.is_incoming(message):
+            # incoming 是系统替她打开的窗口，原文在聊天记录里，和画面一样不搜。
+            continue
         if role == "assistant":
             for line in str(message.get("reasoning_content") or "").splitlines():
                 yield "【她想】" + line

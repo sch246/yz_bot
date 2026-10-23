@@ -217,8 +217,8 @@ def _late_arrivals(newest: dict[tuple, tuple], last_shown: dict[str, str],
         calls = [f"{entry.get('activation_kind')}"
                  + (f" 作者={entry['event']['user_id']}" if entry["event"].get("user_id") is not None else "")
                  for entry in late if entry.get("activated")]
-        head = f"{label} 刚到的消息（{_screen.clock()}" + (f"；叫你的：{'、'.join(calls)}" if calls else "") + "）："
-        added.append({"role": "user", "content": _view.msg_split(head + "\n" + text)})
+        facts = ["你干活时刚到的", _screen.clock(), *([f"叫你的：{'、'.join(calls)}"] if calls else [])]
+        added.extend(_view.incoming(label, facts, text))
     return added, marks
 
 
@@ -247,7 +247,7 @@ def _mark_seen(newest: dict[tuple, tuple]) -> None:
 
 
 def _did_something(messages: list[dict]) -> bool:
-    return any(message.get("role") == "assistant" for message in messages)
+    return any(message.get("role") == "assistant" and not _view.is_incoming(message) for message in messages)
 
 
 def _tidy_reason(turn, segment: dict, stage: str, used: int, grown: int = 0) -> str:
@@ -491,7 +491,8 @@ def _run_agent(model: str | None, turn) -> bool:
     if _chat_root.get_reasoning_mode() == "drop":
         # 以前几次唤醒的思考不再带回；这次唤醒之内照旧原样保留（DeepSeek 带工具时要求）。
         for message in segment["messages"]:
-            message.pop("reasoning_content", None)
+            if not _view.is_incoming(message):
+                message.pop("reasoning_content", None)
     material: list[dict] = []
     if not segment["messages"]:
         material.extend(_head(woken, segment))
@@ -508,7 +509,7 @@ def _run_agent(model: str | None, turn) -> bool:
         if text:
             screens[label] = text
             shown_last[label] = last
-            material.append({"role": "user", "content": _view.msg_split(text)})
+            material.extend(_view.incoming(label, ["画面", _screen.clock()], text))
     now = _screen.clock()
     if notice is not None:
         material.append({"role": "user", "content": f"这次唤醒你的是（{now}）：\n" + "\n".join(activation_lines)})

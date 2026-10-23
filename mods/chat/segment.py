@@ -145,7 +145,13 @@ def render(messages: list[dict]) -> str:
         if isinstance(content, list):
             content = "".join(part.get("text", "[图片]") if isinstance(part, dict) else str(part) for part in content)
         content = str(content or "")
-        if role == "assistant":
+        if role == "tool" and str(message.get("tool_call_id") or "").startswith("incoming_"):
+            lines.append("【incoming】" + content)
+        elif role == "assistant" and message.get("tool_calls") and all(
+                call.get("function", {}).get("name") == "incoming" for call in message["tool_calls"]):
+            # 系统替她打开窗口的那一半，不是她的调用。
+            continue
+        elif role == "assistant":
             if str(message.get("reasoning_content") or "").strip():
                 lines.append("【她想】" + message["reasoning_content"])
             if content.strip():

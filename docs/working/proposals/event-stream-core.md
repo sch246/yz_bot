@@ -1,6 +1,6 @@
 # 事件流核心：所有来源都是窗口
 
-> 状态：**提案，第 1、2 步已实现**（2026-10-23：窗口种类、`chat.push`、`me` 窗口，见 `mods/chat/windows.py`；轮次边界插话，见 `agent._late_arrivals`）；其余未实现。当前事实以 [运行架构](../../architecture.md)、[交互模型](../../interaction-model.md) 与 [LLM 文档](../../llm.md) 为准。
+> 状态：**提案，第 1、2 步已实现**（2026-10-23：窗口种类、`chat.push`、`me` 窗口，见 `mods/chat/windows.py`；轮次边界插话，见 `agent._late_arrivals`）；第 3 步专用框已实现（`view.incoming`）；第 4、5 步未实现。当前事实以 [运行架构](../../architecture.md)、[交互模型](../../interaction-model.md) 与 [LLM 文档](../../llm.md) 为准。
 >
 > 来源：维护者 2026-10-23 指出 [Cortico](https://github.com/Pal-AI-Lab/Cortico) 的事件流核心值得参考，希望柚子以后能"玩手机"（[phone-mcp](https://github.com/pinganbbOvO/ai-companion-kit/tree/main/packages/phone-mcp)）、刷 B 站和评论区互动、给自己埋各种唤醒。
 >
@@ -116,6 +116,15 @@ user 角色只剩系统自己说的话：唤醒原因摘要、交接说明、提
 要实测的两件事：
 1. DeepSeek 开着思考和工具时，合成的 assistant 工具调用（没有 `reasoning_content`）能不能回传。
 2. 工具返回多半不能带图片。图片要么跟在框后面单发一条 user 消息，要么框里只写占位，她要看再调工具。
+
+2026-10-23 实测 deepseek-flash（仓库外脚本，不加 thinking 参数和显式开 thinking 各跑一遍）：
+- 合成调用不带 `reasoning_content` 会 400（"must be passed back"），带空串就过；最后一条 user 消息之前的不检查。
+- `incoming` 不在工具列表里也接受，所以不登记，她调不了。
+- 开场就是框、连着几个框、她回复后再插框都正常；框里有人冒充系统时她两次都认出是群友的话。
+- 图片放在 tool 消息里她说是一片白（2/2）；跟在框后面单发一条 user 能看见（3/4）。所以图片换成 `[图片N]` 占位，原图跟在后面。
+- 疑点：`models.py` 记着 2026-09-18 实测工具结果里能看图（`tool_images`），和上一条不符，`attach_image` 靠它，待用真图复测。
+
+已实现（第 3 步）：画面和插话都走 `view.incoming`；不记进 oplog；`_did_something`、`#reasoning drop`、归档搜索和 `read_context` 都认得它；旧段里的 user 画面原样留着。
 
 ## 6. 轮次边界插话（替换末尾提示）
 
