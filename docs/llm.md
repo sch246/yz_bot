@@ -233,7 +233,7 @@ DeepSeek 在带 `tools` 的 thinking 请求中要求最后一条 `user` 后的�
 
 ### 思考内容开关
 
-原生 assistant 消息（含 `reasoning_content`）随这一段上下文一起保存在 `data/context/current.json`，交接后随段归档；oplog 仍不写思考。`#reasoning keep`（默认）时以前几次唤醒的思考照样带回；`drop` 时每次唤醒读回这一段时去掉以前的思考，这次唤醒之内照旧保留（DeepSeek 带工具请求要求回传）。2026-10-19 的裁定是"思考只在一次唤醒之内保留"，改成同一段上下文之后默认值是否改回 `drop` 待维护者定。子代理的工具循环里 `drop` 仍会把思考字段换成空字符串。
+原生 assistant 消息（含 `reasoning_content`）随这一段上下文一起保存在 `data/context/current.json`，交接后随段归档；oplog 仍不写思考。`#reasoning keep`（默认）时以前几次唤醒的思考照样带回；`drop` 时每次唤醒读回这一段时去掉以前的思考，这次唤醒之内照旧保留（DeepSeek 带工具请求要求回传）。2026-10-19 的裁定是"思考只在一次唤醒之内保留"；改成同一段上下文之后，维护者 2026-10-23 定默认保持 `keep`。子代理的工具循环里 `drop` 仍会把思考字段换成空字符串。
 
 
 ### 窗口的结束提示（`#hint`）
