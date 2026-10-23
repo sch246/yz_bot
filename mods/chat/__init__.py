@@ -11,7 +11,7 @@ import time
 import traceback
 from typing import Callable
 
-from mods import _source_pages, context, cq, history, identity, image, llm, log, message, msgs, op, oplog, py, storage, text, thread, tools as tool_modules
+from mods import context, cq, history, identity, image, llm, log, message, msgs, op, oplog, py, storage, text, thread, tools as tool_modules
 from mods.capture import capture
 from mods.llm import pricing
 
@@ -290,7 +290,7 @@ def _activate_chat(
     binding.restore_schema()
     session.tool_binding = binding
     session.add_hint(lambda: _agent_hint())
-    session.add_hint("对外说话必须实际调用 say；回复正文只是自言自语，不会发送到聊天窗口。")
+    session.add_hint("对外说话要先 type_word 打进输入框、下一步再 send；回复正文只是自言自语，不会发送到聊天窗口。")
     # WHY: 工具恢复可能持久化 ttl 回收；它必须先于其余全局设置读取，避免无关的配置异常
     # 改变这一轮是否完成回收。
     session.do_process_image = get_image_mode() != "off"
@@ -321,16 +321,16 @@ def _restore_agent_tools(binding) -> None:
 def get_handler(session: llm.Chat):
     """The per-chunk sink: self-talk to the terminal, cost to the ledger.
 
-    WHY: 模型写在回复正文里的内容**不发进聊天**。发言仍只能调用 `say`（见
-    `tools/meta.py`）；正文是自己的输出轨迹，记进 oplog，之后以行动记录里的「（自语）」
+    WHY: 模型写在回复正文里的内容**不发进聊天**。发言仍只能 `type_word` 再 `send`（见
+    `tools/meta.py`；2026-10-23 以前是 `say`）；正文是自己的输出轨迹，记进 oplog，之后以行动记录里的「（自语）」
     出现。这样模型能记得刚才的计划，但不会把自言自语误当成已发送消息。
 
-    WHY: 但它要打到终端。人得看得见模型在想什么，尤其是在它**忘了调 `say`**的时候——那
+    WHY: 但它要打到终端。人得看得见模型在想什么，尤其是在它**忘了发**的时候——那
     种轮对聊天窗口是完全静默的，终端这一行是唯一的痕迹。用 msg 流而不是另开一个，是为了
     和 `bot._route`、`message._chatlog_write` 的回显共用同一把行租约，终端顺序才不会乱。
 
-    WHY: 这里不做兜底发送。"正文非空却没调 say 就替它发出去"会把刚删掉的那条旁路原样装
-    回来，而且是隐式的——模型会学会不调 say 照样能说话，`final_call` 那套终止语义随之失效。
+    WHY: 这里不做兜底发送。"正文非空却没发就替它发出去"会把刚删掉的那条旁路原样装
+    回来，而且是隐式的——模型会学会不调 send 照样能说话，`final_call` 那套终止语义随之失效。
     宁可静默一轮、在终端留下证据。
     """
     def handle(chunk: llm.LLMResponse) -> None:
@@ -338,6 +338,8 @@ def get_handler(session: llm.Chat):
             _self_talk.info(f'[{time.strftime("%H:%M:%S")}]【自言自语】{chunk.content}')
         if chunk.total_tokens:
             inc_call_cost(session.model, chunk.prompt_tokens, chunk.completion_tokens, chunk.cached_tokens, chunk.requested_at)
+            # 这一段有多长以接口报的为准，见 agent._context_size。
+            session.last_usage = (chunk.prompt_tokens or 0) + (chunk.completion_tokens or 0)
 
     return handle
 
@@ -589,14 +591,9 @@ def record_event(event: dict, write: Callable[[], object]) -> object:
                           else None)
             arrival = (oplog.pending_message(window, message_id, event.get("time"),
                                              event.get("message_seq")) if message_id is not None else None)
-            if arrival is None and message_id is not None and oplog.message_seen(
-                    window, message_id, event.get("time"), event.get("message_seq")):
-                from mods import chatlog
-
-                chatlog.consume_origin(event)
-            elif arrival is None:
+            if arrival is None:
                 arrival = oplog.arrive(window, event)
-        except oplog.FormatRestoreError:
+        except oplog.RestoreError:
             # WHY: The explicit maintenance routes run after chat recording.
             # An unreadable journal disables agent mail, not .py/.reboot.
             context.remember_arrival(event, None)
@@ -632,7 +629,19 @@ def activation_signal(event: dict) -> bool:
             if value[1:].strip().partition(" ")[0] in _subcommands._SUBCOMMAND_NAMES:
                 # 子命令那一支：就地执行，不激活。谁来执行见 _subcommand_call。
                 return False
+        if _private_from_peer(event):
+            return True
     return msgs.is_poke(event) and event.get("target_id") == identity.bot_id()
+
+
+def _private_from_peer(event: dict) -> bool:
+    """对方在私聊里发来的消息；她自己发出去的那条回显不算。
+
+    WHY: 维护者 2026-10-23：私聊每次都要先叫「柚子，」太累，私聊每条都叫醒她。话没说完
+    就回的问题不靠延迟解决（人可能隔几分钟才想到下一句），靠她的沉默纪律和干活时
+    插进这一段的新消息，见 view._base_prompt 与 agent._late_arrivals。
+    """
+    return event.get("group_id") is None and event.get("user_id") != identity.bot_id()
 
 
 def _subcommand_call(event: dict) -> Callable | None:
@@ -686,25 +695,100 @@ def capture_chat(event: dict) -> bool:
         if result is not None:
             message.sendmsg(result)
         return True
+    window = history.window(event)
+    if window is None or not _mail_candidate(event):
+        return False
     matched = activation_signal(event)
+    # 她给自己埋的「这个窗口来消息就叫我」「等这个人的后续」，见 awaker。
+    waited = (_awaker.take_waiting(window, event.get("user_id"))
+              if msgs.is_msg(event) and event.get("user_id") != identity.bot_id() else [])
+    if not matched and not waited:
+        return False
+    kind = ("mention" if msgs.is_msg(event) and _reader._addressed(event, msgs.body(event))
+            else "poke" if msgs.is_poke(event)
+            else "private" if msgs.is_msg(event) and _private_from_peer(event)
+            else "wake" if matched else "")
+    if waited:
+        kind = "；".join(filter(None, [kind, *(f"等到了（{rule['key']}）" for rule in waited)]))
+    wake(event, kind)
+    return True
+
+
+def wake(event: dict | None = None, kind: str = "wake", reason: str = "") -> bool:
+    """叫醒她：带 *event* 时看那条消息所在的窗口，不带时把 *reason* 交给她；False 表示没有可叫的。
+
+    带消息时 False 是不是聊天消息、已经读过或已经叫过。不带消息时 *kind* 写谁在叫（比如
+    「MC 版本检查」），记进她自己的 `me` 窗口（见 `push`），总是 True。
+
+    WHY: 维护者 2026-10-23：唤醒条件不做成规则文件，但要为更多唤醒方式留一个函数入口。
+    判据各管各的——`activation_signal` 的 at、名字、私聊、戳一戳，以后别的模块、link 或
+    `.py`——判定要叫醒她时都调这里。激活登记在 oplog 里，她正忙时也不丢，这一轮收尾时
+    接上。*kind* 原样出现在她看到的「这次唤醒你的是」里。
+    只能在这条消息的派发过程中调用（capture、link 节点、它触发的 `.py`）：到达号派发完就
+    释放，事后调用 `event_arrival` 会报错。不带消息的唤醒（awaker 规则、她用 exec_code 包在
+    某个函数上的钩子、别的模块）随时可以调。
+    """
+    if event is None:
+        push(_windows.ME, kind, reason or kind, wake=kind)
+        return True
     window = history.window(event)
     if window is None or not _mail_candidate(event):
         return False
     with context.window_lock(window):
         arrival = context.event_arrival(event)
-        if not matched:
-            return False
         if arrival is None:
-            return True
+            return False
         pending = next((entry for entry in oplog.unread(window)
                         if entry["arrival"] == arrival), None)
         if pending is None or pending["activated"]:
-            return True
-        kind = ("mention" if msgs.is_msg(event) and _reader._addressed(event, msgs.body(event))
-                else "poke" if msgs.is_poke(event) else "wake")
+            return False
         oplog.activate(arrival, kind)
-    chat()
+    # `chat()` 按当前事件找窗口，`#hint` 也发回当前事件的窗口；从别处调用时临时换成这条。
+    previous = context.current()
+    context.set_current(event)
+    try:
+        chat()
+    finally:
+        context.set_current(previous)
     return True
+
+
+def push(window: tuple, author: str, text: str, *, wake: str = "", record_id: str = "") -> str:
+    """Put one record into a non-QQ window and, when *wake* names a reason, wake her; returns the record id.
+
+    *window* is ``(种类, 目标)`` of a kind registered with `kind`, or ``me``. The record is
+    written to chatlog first and then registered as an arrival, under the window lock,
+    the same order QQ messages use; so it shows on her screen, in ``read_log`` and in
+    ``search``, stays unread until she has seen it, and survives a restart. *wake* is
+    what she reads in "这次唤醒你的是". When she is busy it waits for this wake to end.
+    *record_id* is the source's own id for the record (a comment's rpid), so she can name
+    it the way she names a QQ message_id; left out, an 8-digit hex id is made up.
+
+    WHY: 维护者 2026-10-23：别的来源也要带着内容叫醒她、能被她回，不另造一套"源"。QQ 消息
+    不走这里，它们的内容由 NapCat 事件决定，撤回、补漏都在 chatlog 那条路上。
+    """
+    window = tuple(window)
+    if not _windows.known(window) or window[0] in _windows.QQ or _windows.parse_all([_windows.label(window)]) != [window]:
+        raise ValueError(f"push 只收已登记的非 QQ 窗口，目标是非空字符串：{window}")
+    body = str(text).strip("\n")
+    if not body.strip():
+        raise ValueError("push 的正文不能空")
+    oplog.ensure_available()
+    from uuid import uuid4
+
+    from mods import chatlog
+
+    now = time.time()
+    record_id = " ".join(str(record_id).split()) or uuid4().hex[:8]
+    with context.window_lock(window):
+        chatlog.append_record(window[0], window[1], author, body, now, record_id)
+        arrival = oplog.arrive(window, {"post_type": "push", "time": int(now), "author": str(author),
+                                        "text": body, "id": record_id})
+        if wake:
+            oplog.activate(arrival, wake)
+    if wake:
+        _agent._drive_agent(None, window)
+    return record_id
 
 
 @capture(before="name加复读")
@@ -775,37 +859,8 @@ def on_load(ctx) -> None:
     def resume_recovery() -> None:
         from mods import _backfill, connect, wait_booted
 
-        if not wait_booted(120):
-            return
-        waiting: dict[tuple, list[dict]] = {}
-        for source in oplog.sources():
-            if source["source_type"] == "napcat_boot" and source["state"] == "fetching":
-                waiting.setdefault(tuple(source["window"]), []).append(source)
-        tasks = list(waiting.values())
-        task_lock = threading.Lock()
-
-        def recover() -> None:
-            while True:
-                with task_lock:
-                    if not tasks:
-                        return
-                    sources = tasks.pop()
-                for source in sources:
-                    try:
-                        _backfill.recover_source(source, connect.call_api)
-                    except Exception:
-                        traceback.print_exc()
-                        try:
-                            with context.window_lock(tuple(source["window"])):
-                                state = oplog.resolve_source(source["key"])
-                                oplog.finish_source(source["key"], gap="本地归档或入列失败；可重试",
-                                                    stop_cursor=state["cursor"])
-                        except Exception:
-                            traceback.print_exc()
-                        break
-
-        for index in range(min(2, len(tasks))):
-            threading.Thread(target=recover, name=f"napcat-backfill-{index}", daemon=True).start()
+        if wait_booted(120):
+            _backfill.start(connect.call_api)
 
     threading.Thread(target=resume_recovery, name="napcat-backfill-start", daemon=True).start()
 
@@ -830,4 +885,6 @@ def on_load(ctx) -> None:
     threading.Thread(target=start_awaker, name="chat-awaker-start", daemon=True).start()
 from . import view as _view, reader as _reader, agent as _agent, roles as _roles, subcommands as _subcommands, notes as _notes, awaker as _awaker
 from .view import has_at, msg_split
-from .reader import parse_target, prepare_recovery_sources, mark_window_read
+from .reader import parse_target, mark_window_read
+from . import windows as _windows
+from .windows import kind

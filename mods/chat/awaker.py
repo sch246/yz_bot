@@ -11,6 +11,19 @@ WHY: 2026-10-22 维护者想要一个专门管"什么条件下叫醒自己"的�
 ``every`` 的间隔写 ``30s``/``10m``/``2h``，最短一分钟；``reflect`` 这个理由表示每晚的
 整理与反思，其它理由原样作为闹钟交给她。不认识的行忽略，``check`` 把它们列出来。
 文件不存在时只有一条 ``daily 04:00 reflect``（维护者 2026-10-22 定的凌晨 4 点）。
+
+WHY: 2026-10-23 维护者要她有更强的唤醒自己的能力，于是又有四种，都是一次性的，响过就从
+笔记里划掉：
+
+    on g123 有人在群里说话就看一眼            （g123:30001 只等这个人，u456 是私聊）
+    wait g123:30001 until 2026-10-23 10:30 他刚才话说了一半
+    when mcversion.ver["release"] != "1.21.4" -> MC 出新版本了
+    at 2026-10-23 08:00 叫维护者起床          （at 也是响过就划掉）
+
+``wait`` 是「等这个人的后续」：后续来了就由那条消息叫醒她，到点还没来也叫醒她，只叫一次
+——死板的延迟唤醒做不到这个，人接上了话，延迟到点还会再叫一遍。``on``/``wait`` 由
+``chat.capture_chat`` 在消息到达时认领（``take_waiting``），只认开了聊天的窗口。``when`` 每分钟
+用 ``.py`` 那份共享环境求值一次。她用 ``wake_me`` 工具写这些行，相对时间在写的时候换成时刻。
 """
 
 from __future__ import annotations
@@ -33,6 +46,14 @@ _stream = log.stream("agent")
 _running = threading.Lock()
 _LINE = re.compile(r"^\s*(?:[-*]\s+)?(?:(every)\s+(\S+)|(daily)\s+(\d{1,2}):(\d{2})"
                    r"|(at)\s+(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2}))\s+(.+?)\s*$")
+_TARGET = r"([gu][1-9][0-9]*(?::[1-9][0-9]*)?)"
+_ON = re.compile(r"^\s*(?:[-*]\s+)?on\s+" + _TARGET + r"\s+(.+?)\s*$")
+_WAIT = re.compile(r"^\s*(?:[-*]\s+)?wait\s+" + _TARGET
+                   + r"\s+until\s+(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})\s+(.+?)\s*$")
+_WHEN = re.compile(r"^\s*(?:[-*]\s+)?when\s+(.+?)\s+->\s+(.+?)\s*$")
+# 改笔记的地方（划掉响过的行、wake_me 追加）互相排队；她用 write_note 整份改不经过这里。
+_edit = threading.Lock()
+_broken: set[str] = set()
 _UNIT = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
@@ -43,12 +64,55 @@ def _interval(text: str) -> int | None:
     return sum(int(number) * _UNIT[unit] for number, unit in parts)
 
 
+def _moment(day: str, hour: str, minute: str) -> float | None:
+    try:
+        return datetime.strptime(f"{day} {int(hour):02d}:{minute}", "%Y-%m-%d %H:%M").timestamp()
+    except ValueError:
+        return None
+
+
+def _target(text: str) -> tuple[tuple, int | None]:
+    """``g123`` / ``g123:30001`` / ``u456`` → (window, author or None)."""
+    head, _, author = text.partition(":")
+    window = ("group" if head[0] == "g" else "private", int(head[1:]))
+    return window, int(author) if author else None
+
+
+def _once(line: str) -> dict | None:
+    """The one-shot rules beyond ``at``; None when the line is not one."""
+    key = line.strip()
+    if match := _ON.match(line):
+        window, author = _target(match[1])
+        return {"key": key, "kind": "on", "target": match[1], "window": window, "author": author, "reason": match[2]}
+    if match := _WAIT.match(line):
+        moment = _moment(match[2], match[3], match[4])
+        if moment is None:
+            return {"key": key, "kind": "bad", "why": "日期不对"}
+        window, author = _target(match[1])
+        return {"key": key, "kind": "wait", "target": match[1], "window": window, "author": author,
+                "moment": moment, "until": f"{match[2]} {int(match[3]):02d}:{match[4]}", "reason": match[5]}
+    if match := _WHEN.match(line):
+        try:
+            compile(match[1], "<awaker>", "eval")
+        except SyntaxError:
+            return {"key": key, "kind": "bad", "why": "表达式写错了"}
+        return {"key": key, "kind": "when", "expression": match[1], "reason": match[2]}
+    return None
+
+
 def parse(text: str) -> tuple[list[dict], list[str]]:
     """Rules and the non-empty lines that are not rules."""
     rules: list[dict] = []
     skipped: list[str] = []
     for line in text.split("\n"):
         if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        once = _once(line)
+        if once is not None:
+            if once["kind"] == "bad":
+                skipped.append(line.strip() + f"（{once['why']}）")
+            else:
+                rules.append(once)
             continue
         match = _LINE.match(line)
         if match is None:
@@ -106,6 +170,41 @@ def _due(rule: dict, last: float | None, now: float) -> float | None:
     return moment
 
 
+def _claim(keys: list[str]) -> list[str]:
+    """Strike these one-shot lines out of the note; only the ones still there are returned.
+
+    消息到达和每分钟检查可能同时看到同一行，谁划掉了谁响，于是只叫一次。
+    """
+    with _edit:
+        lines = _notes.read("awaker").split("\n")
+        present = [key for key in keys if key in {line.strip() for line in lines}]
+        if present:
+            kept = [line for line in lines if line.strip() not in present]
+            _notes.write("awaker", "\n".join(kept).strip("\n") + "\n" if any(x.strip() for x in kept) else "")
+    return present
+
+
+def _holds(expression: str) -> bool:
+    """Evaluate a ``when`` condition in a copy of the shared ``.py`` environment.
+
+    WHY: 这是每分钟自动跑的任意代码，和 exec_code 同一个信任域，所以同样要 Bot 自己有 op；
+    否则 wake_me 或 write_note 写一行 when 就绕过了 exec_code 的门。
+    """
+    from mods import op, py
+
+    if not op.bot_is_op():
+        raise PermissionError("Bot 没有 op，when 规则不求值")
+    return bool(eval(expression, dict(py.loc)))
+
+
+def _ring(rule: dict, reason: str) -> bool:
+    """Write the reason into her ``me`` window and wake her; it is on disk before she is asked."""
+    import mods.chat as chat
+
+    chat.push(chat._windows.ME, f"awaker「{rule['key']}」", reason, wake="闹钟")
+    return True
+
+
 def check(now: float | None = None) -> None:
     """Fire every due rule once; a rule whose wake could not run stays due."""
     from . import agent as _agent
@@ -117,6 +216,27 @@ def check(now: float | None = None) -> None:
     for key in [key for key in last if key not in live]:
         del last[key]
     for rule in found:
+        if rule["kind"] == "on":
+            continue
+        if rule["kind"] in ("wait", "when"):
+            if rule["kind"] == "wait":
+                due = now >= rule["moment"]
+                reason = f"等到 {rule['until']}，{rule['target']} 都没有新消息。当时想的是：{rule['reason']}"
+            else:
+                try:
+                    due = _holds(rule["expression"])
+                except Exception:
+                    if rule["key"] not in _broken:
+                        _broken.add(rule["key"])
+                        _stream.exception(f"唤醒条件求值失败：{rule['key']}")
+                    continue
+                reason = rule["reason"]
+            if due and _claim([rule["key"]]):
+                try:
+                    _ring(rule, reason)
+                except Exception:
+                    _stream.exception(f"唤醒规则执行失败（已划掉）：{rule['key']}")
+            continue
         if rule["key"] not in last and rule["kind"] == "every":
             last[rule["key"]] = now
             continue
@@ -125,14 +245,65 @@ def check(now: float | None = None) -> None:
             continue
         try:
             done = (_agent.reflect() if rule["reason"].strip() == "reflect"
-                    else _agent.alarm(rule["reason"], rule["key"]))
+                    else _ring(rule, rule["reason"]))
         except Exception:
             _stream.exception(f"唤醒规则执行失败：{rule['key']}")
             done = True
-        # 正在聊天时她本来就醒着：间隔规则这次算过，定点规则留到下一分钟再试。
+        # 正在反思时她醒着却不能接：间隔规则这次算过，定点规则留到下一分钟再试。
         if done or rule["kind"] == "every":
             last[rule["key"]] = now if rule["kind"] == "every" else moment
+            if done and rule["kind"] == "at":
+                _claim([rule["key"]])
     storage.save()
+
+
+def take_waiting(window: tuple, author) -> list[dict]:
+    """The ``on``/``wait`` rules this message satisfies, struck out of the note."""
+    found, _skipped = rules()
+    matched = [rule for rule in found if rule["kind"] in ("on", "wait") and rule["window"] == window
+               and (rule["author"] is None or rule["author"] == author)]
+    if not matched:
+        return []
+    claimed = set(_claim([rule["key"] for rule in matched]))
+    return [rule for rule in matched if rule["key"] in claimed]
+
+
+def plant(when: str, reason: str, now: float | None = None) -> str:
+    """Turn what `wake_me` was given into one awaker line and append it; ValueError when unreadable."""
+    now = time.time() if now is None else now
+    when, reason = " ".join(when.split()), " ".join(str(reason).split())
+    if not reason:
+        raise ValueError("reason 不能空：写给到时候的自己，说明为什么叫醒")
+
+    def stamp(seconds: float) -> str:
+        # 规则只记到分钟：往后取整，宁晚不早。
+        return datetime.fromtimestamp(-(-int(now + seconds) // 60) * 60).strftime("%Y-%m-%d %H:%M")
+
+    if (seconds := _interval(when)) is not None:
+        line = f"at {stamp(seconds)} {reason}"
+    elif match := re.fullmatch(r"wait\s+" + _TARGET + r"\s+(\S+)", when):
+        seconds = _interval(match[2])
+        if seconds is None:
+            raise ValueError("wait 后面写目标和等多久，例如 wait g123:30001 10m")
+        line = f"wait {match[1]} until {stamp(seconds)} {reason}"
+    elif match := re.fullmatch(r"on\s+" + _TARGET, when):
+        line = f"on {match[1]} {reason}"
+    elif when.startswith("when "):
+        from mods import op
+
+        if not op.bot_is_op():
+            raise ValueError("when 规则要 Bot 有 op 权限（和 exec_code 一样），现在没有")
+        line = f"when {when[5:].strip()} -> {reason}"
+    else:
+        line = f"at {when} {reason}" if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{1,2}:\d{2}", when) else f"{when} {reason}"
+    found, skipped = parse(line)
+    if not found:
+        raise ValueError(f"看不懂：{skipped[0] if skipped else line}")
+    with _edit:
+        text = _notes.read("awaker")
+        base = text if text.strip() else DEFAULT + "\n"
+        _notes.write("awaker", base.rstrip("\n") + "\n" + line + "\n")
+    return line
 
 
 def report() -> str:
@@ -140,6 +311,9 @@ def report() -> str:
     last = _last()
     lines = [("（awaker 笔记是空的，用默认）" if not _notes.read("awaker").strip() else "awaker 规则：")]
     for rule in found:
+        if rule["kind"] in ("on", "wait", "when"):
+            lines.append(f"{rule['key']}  ← 等着，响过就划掉")
+            continue
         stamp = last.get(rule["key"])
         shown = datetime.fromtimestamp(stamp).strftime("%m-%d %H:%M") if isinstance(stamp, (int, float)) else "还没响过"
         lines.append(f"{rule['key']}  ← 上次 {shown}")

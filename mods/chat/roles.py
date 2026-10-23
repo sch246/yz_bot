@@ -15,7 +15,7 @@ import time
 
 from mods import chatlog, history, llm, log
 
-from . import actions as _actions, notes as _notes, screen as _screen, segment as _segment
+from . import actions as _actions, notes as _notes, screen as _screen, segment as _segment, view as _view
 
 
 _stream = log.stream("agent")
@@ -34,7 +34,7 @@ def _root():
 
 
 def _parse_window(target: str) -> tuple:
-    return _root().parse_target(target)
+    return _root()._windows.parse(target)
 
 
 def _charge(session: llm.Chat):
@@ -64,7 +64,7 @@ def read_log(window: str, count: int = 30, before: str = "") -> str:
     """读一个聊天窗口的 chatlog 原文（与画面同一格式），从最新往前取。
 
     @param
-    window: g<群号> 或 u<私聊对端号>
+    window: g<群号>、u<私聊对端号>、me（你自己的窗口：闹钟和别处叫你的记录），或画面里出现过的 种类:目标
     count: 取多少条记录，1 到 200
     before: 只取这个时刻之前的记录，用来往前翻页或读 search 找到的那条的前文；写 YYYY-MM-DD HH:MM:SS 或 Unix 秒，留空表示到最新
     """
@@ -128,11 +128,14 @@ def _matching(lines, needle: str, most: int) -> tuple[int, list[str]]:
 def _archive_lines(messages: list[dict]):
     """What only an archived segment holds: her thinking, output, calls and their results.
 
-    WHY: 段里 user 消息是画面、笔记和提示，原文在聊天记录和笔记里，再搜一遍只会让每段
+    WHY: 段里 user 和 system 消息是画面、笔记和提示，原文在聊天记录和笔记里，再搜一遍只会让每段
     都因为开头那份 global 命中；她当时想了什么、说了什么、调了什么，才是要靠段名找回的。
     """
     for message in messages:
         role = message.get("role")
+        if _view.is_incoming(message):
+            # incoming 是系统替她打开的窗口，原文在聊天记录里，和画面一样不搜。
+            continue
         if role == "assistant":
             for line in str(message.get("reasoning_content") or "").splitlines():
                 yield "【她想】" + line
@@ -151,7 +154,7 @@ def search(keyword: str, window: str = "", days: int = _SEARCH_DAYS) -> str:
 
     @param
     keyword: 要找的词（不区分大小写，按原文子串匹配，名字、QQ号、话题都行）
-    window: 聊天记录只找这个窗口（g<群号> 或 u<私聊对端号>）；留空找所有窗口。笔记、日记和归档照样都找
+    window: 聊天记录只找这个窗口（g<群号>、u<私聊对端号>、me 或 种类:目标）；留空找所有窗口。笔记、日记和归档照样都找
     days: 聊天记录和归档往前找多少天，1 到 365；笔记和日记不限时间
     """
     # WHY: 2026-10-23 维护者同意把 search_log 扩成一处找遍：以前笔记和日记只能按名字整份读、
@@ -164,7 +167,7 @@ def search(keyword: str, window: str = "", days: int = _SEARCH_DAYS) -> str:
     oldest = time.time() - days * 86400
     sections = []
 
-    windows = [_parse_window(window)] if window else chatlog.known_windows()
+    windows = [_parse_window(window)] if window else _root()._windows.logged()
     hits = []
     for target in windows:
         for item in _screen.records(target, 100_000, since=oldest):

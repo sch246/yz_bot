@@ -1,4 +1,4 @@
-"""Durable event stream: one indexed input, output, or tool-result batch per read."""
+"""Durable event stream: arrivals, activations, notifications, and her outputs and results."""
 
 from __future__ import annotations
 
@@ -24,33 +24,13 @@ _REFERENCE = re.compile(r"(?<![A-Za-z0-9_-])(\d{8}-[1-9]\d*(?:#[1-9]\d*)?)(?![A-
 
 _lock = RLock()
 _root: Path | None = None
-_events: list[dict] = []
-_by_id: dict[str, dict] = {}
-_by_arrival: dict[str, dict] = {}
-_windows: dict[tuple, list[dict]] = {}
-_next: dict[str, int] = {}
-_pending: dict[str, dict] = {}
-_notified: set[str] = set()
-# WHY: Arrival journal replay and dict insertion order preserve live members'
-# relative order; there is no before-insertion caller, so a linked list is redundant.
-_arrival_order: dict[str, int] = {}
-_arrival_members: dict[str, dict] = {}
-_arrival_skips: dict[str, dict] = {}
-_source_arrivals: set[str] = set()
-_covered: dict[tuple, set[str]] = {}
-_coverage_nodes: dict[str, list[str]] = {}
-_mentioned_by: dict[str, list[str]] = {}
-_origins: dict[tuple[tuple, str], dict] = {}
-_sources: dict[str, dict] = {}
-_seen_messages: set[tuple[tuple, str, int, str | None]] = set()
+# pending: 未读到达，按到达顺序；order: 每个到达的序号；notified: 已通知过的未读到达；
+# notices: 还没确认的通知；outputs/actions: 她自己的输出与结果；counters: 每天用到的最大正式号。
+_state: dict[str, Any] = {}
 _failed = False
 _restore_error = None
-_legacy_adapter = None
 
-from .replay import (
-    _apply, _complete_output, _message_identity, _reference_candidates, _validate,
-    _validate_shape, _validate_internal_shape, FormatShapeError,
-)
+from .replay import _apply, _complete_output, _message_identity, _reference_candidates, _validate, _validate_shape
 
 
 class PersistenceError(RuntimeError):
@@ -59,24 +39,6 @@ class PersistenceError(RuntimeError):
 
 class RestoreError(PersistenceError):
     """A journal read could not establish a trustworthy in-memory stream."""
-
-
-class FormatRestoreError(RestoreError):
-    """A row needs an unavailable or unsuccessful format translation."""
-
-
-class _LegacyFormatError(ValueError):
-    pass
-
-
-def register_legacy_adapter(adapter) -> None:
-    """Install an optional read-only journal translator before the first restore."""
-    global _legacy_adapter
-    if _root is not None:
-        raise RuntimeError("event stream already restored")
-    if _legacy_adapter is not None:
-        raise RuntimeError("event stream adapter already registered")
-    _legacy_adapter = adapter
 
 
 def raise_if_failed() -> None:
@@ -99,22 +61,19 @@ def _directory() -> Path:
     return Path(storage.root_path).parent / "event_stream"
 
 
-def source_page_root() -> Path:
-    """Return the private spool directory beside the source journal."""
-    return _directory() / "pages"
-
-
 def _restore() -> None:
     global _restore_error
     raise_if_failed()
     try:
         _restore_impl()
-    except _LegacyFormatError as error:
-        _restore_error = FormatRestoreError
-        raise FormatRestoreError("event stream format could not be restored") from error
     except Exception as error:
         _restore_error = RestoreError
         raise RestoreError("event stream restore failed; refusing further actions") from error
+
+
+def _empty() -> dict[str, Any]:
+    return {"pending": {}, "order": {}, "notified": set(), "notices": {},
+            "outputs": {}, "actions": [], "counters": {}}
 
 
 def _restore_impl() -> None:
@@ -122,40 +81,13 @@ def _restore_impl() -> None:
     directory = _directory()
     if _root == directory:
         return
-    restored: list[dict] = []
-    indexes: dict[str, dict] = {}
-    windows: dict[tuple, list[dict]] = {}
-    counters: dict[str, int] = {}
-    pending: dict[str, dict] = {}
-    notified: set[str] = set()
-    arrival_order: dict[str, int] = {}
-    arrival_members: dict[str, dict] = {}
-    arrival_skips: dict[str, dict] = {}
-    source_arrivals: set[str] = set()
-    covered: dict[tuple, set[str]] = {}
-    coverage_nodes: dict[str, list[str]] = {}
-    mentioned_by: dict[str, list[str]] = {}
-    origins: dict[tuple[tuple, str], dict] = {}
-    sources: dict[str, dict] = {}
-    seen_messages: set[tuple[tuple, str, int, str | None]] = set()
+    restored = _empty()
     incomplete: list[tuple[Path, bytes, int]] = []
     for path in sorted(directory.glob("????????.jsonl")):
         data = path.read_bytes()
         complete = data.rfind(b"\n") + 1
         for line in data[:complete].splitlines():
-            entry, adapted = _internalize(json.loads(line.decode("utf-8")),
-                                          {"events": restored, "indexes": indexes,
-                                           "windows": windows, "pending": pending,
-                                           "arrival_order": arrival_order, "sources": sources})
-            try:
-                _validate(entry, indexes, pending, coverage_nodes, arrival_order, sources)
-                _apply(entry, restored, indexes, windows, counters, pending, covered, coverage_nodes,
-                       origins, mentioned_by, notified, arrival_order, sources, seen_messages,
-                       arrival_members, arrival_skips, source_arrivals)
-            except Exception as error:
-                if adapted:
-                    raise _LegacyFormatError("translated row is invalid") from error
-                raise
+            _apply(json.loads(line.decode("utf-8")), restored)
         if complete != len(data):
             incomplete.append((path, data, complete))
     for path, data, complete in incomplete:
@@ -175,58 +107,10 @@ def _restore_impl() -> None:
             os.fsync(stream.fileno())
         logging.warning("event stream recovered %d trailing bytes from %s into %s",
                         len(data) - complete, path.name, backup.name)
-    _events[:] = restored
-    _by_id.clear()
-    _by_id.update(indexes)
-    _by_arrival.clear()
-    for entry in restored:
-        if entry.get("arrival"):
-            _by_arrival.setdefault(entry["arrival"], entry)
-    _windows.clear()
-    _windows.update(windows)
-    _next.clear()
-    _next.update(counters)
-    _pending.clear()
-    _pending.update(pending)
-    _notified.clear()
-    _notified.update(notified)
-    _arrival_order.clear()
-    _arrival_order.update(arrival_order)
-    _arrival_members.clear()
-    _arrival_members.update(arrival_members)
-    _arrival_skips.clear()
-    _arrival_skips.update(arrival_skips)
-    _source_arrivals.clear()
-    _source_arrivals.update(source_arrivals)
-    _covered.clear()
-    _covered.update(covered)
-    _coverage_nodes.clear()
-    _coverage_nodes.update(coverage_nodes)
-    _mentioned_by.clear()
-    _mentioned_by.update(mentioned_by)
-    _origins.clear()
-    _origins.update(origins)
-    _sources.clear()
-    _sources.update(sources)
-    _seen_messages.clear()
-    _seen_messages.update(seen_messages)
+    _state.clear()
+    _state.update(restored)
     _root = directory
     _failed = False
-
-
-def _internalize(entry: dict, state: dict) -> tuple[dict, bool]:
-    try:
-        _validate_shape(entry)
-        return entry, False
-    except FormatShapeError as error:
-        if _legacy_adapter is None:
-            raise _LegacyFormatError("unsupported event stream shape") from error
-    try:
-        translated = _legacy_adapter(entry, state)
-        _validate_internal_shape(translated)
-    except Exception as error:
-        raise _LegacyFormatError("event stream translation failed") from error
-    return translated, True
 
 
 def _event_bound(value: str | None, name: str) -> tuple[str, int] | None:
@@ -239,11 +123,11 @@ def _event_bound(value: str | None, name: str) -> tuple[str, int] | None:
 
 
 def iter_events(start: str | None = None, stop: str | None = None) -> Iterable[dict]:
-    """Iterate detached formal experiences and cover facts straight from disk.
+    """Iterate detached formal rows straight from disk.
 
     ``start`` is inclusive and ``stop`` is exclusive.  Both are optional
-    formal event ids.  Cover rows have no id; they appear at their physical
-    journal position between the selected formal events.  The iterator does
+    formal event ids.  Old journals also hold ``input`` rows, the formal reads
+    of the old reading model; they are yielded as written.  The iterator does
     not restore or mutate live oplog state.
     """
     lower = _event_bound(start, "start")
@@ -269,23 +153,19 @@ def iter_events(start: str | None = None, stop: str | None = None) -> Iterable[d
                     break
                 entry = json.loads(line.decode("utf-8"))
                 event_id = entry.get("id")
-                if event_id is not None:
-                    entry, _adapted = _internalize(entry, {})
-                    position = _event_bound(event_id, "journal id")
-                    if upper is not None and position >= upper:
-                        return
-                    if not started:
-                        if position < lower:
-                            continue
-                        started = True
-                    if entry.get("kind") not in ("input", "output", "result", "notification"):
+                if event_id is None:
+                    continue
+                position = _event_bound(event_id, "journal id")
+                if upper is not None and position >= upper:
+                    return
+                if not started:
+                    if position < lower:
                         continue
-                    if entry["kind"] == "output":
-                        _complete_output(entry)
-                    entry["references"] = list(dict.fromkeys(_reference_candidates(entry)))
-                    yield entry
-                elif started and entry.get("kind") == "cover":
-                    yield entry
+                    started = True
+                if entry.get("kind") == "output":
+                    _complete_output(entry)
+                entry["references"] = list(dict.fromkeys(_reference_candidates(entry)))
+                yield entry
 
 
 def _append(entry: dict, day: str) -> None:
@@ -294,7 +174,7 @@ def _append(entry: dict, day: str) -> None:
     # 外部副作用失去可信的来源记录。保持失败直到重启恢复检查磁盘，而非在进程内重试编号。
     raise_if_failed()
     _validate_shape(entry)
-    _validate(entry, _by_id, _pending, _coverage_nodes, _arrival_order, _sources)
+    _validate(entry, _state)
     path = _root / f"{day}.jsonl"
     line = (json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
     try:
@@ -304,11 +184,7 @@ def _append(entry: dict, day: str) -> None:
             stream.write(line)
             stream.flush()
             os.fsync(stream.fileno())
-        _apply(entry, _events, _by_id, _windows, _next, _pending, _covered, _coverage_nodes,
-               _origins, _mentioned_by, _notified, _arrival_order, _sources,
-               _seen_messages, _arrival_members, _arrival_skips, _source_arrivals)
-        if entry.get("id") and entry.get("arrival"):
-            _by_arrival.setdefault(entry["arrival"], entry)
+        _apply(entry, _state)
     except BaseException as error:
         _failed = True
         if not isinstance(error, Exception):
@@ -317,41 +193,16 @@ def _append(entry: dict, day: str) -> None:
 
 
 def _ordered_pending(window: tuple | None = None) -> list[dict]:
-    return [entry for entry in _pending.values()
+    return [entry for entry in _state["pending"].values()
             if window is None or entry["window"] == list(window)]
 
 
-def _arrival_before_or_at(arrival: str, through: str) -> bool:
-    return _arrival_order[arrival] <= _arrival_order[through]
-
-
-def _source_snapshot(state: dict) -> dict:
-    return {**{key: value for key, value in state.items()
-               if key not in ("read_positions", "read_entries", "skip_entries")},
-            "window": list(state["window"]),
-            "queue_window": list(state["queue_window"]),
-            "page_counts": list(state["page_counts"]),
-            "previous_gaps": list(state["previous_gaps"]),
-            "read_count": len(state["read_positions"]),
-            "remaining": state["member_count"] - len(state["read_positions"])}
-
-
-def source_position_read(source: str, page: int, offset: int) -> bool:
-    """Check one derived page-coordinate fact without copying all read positions."""
-    with _lock:
-        _restore()
-        return (page, offset) in _sources[source]["read_positions"]
-
-
-def arrive(window: tuple, event: dict, *, activated: bool = False, origin: str | None = None) -> str:
-    from mods import chatlog
-
+def arrive(window: tuple, event: dict, *, activated: bool = False) -> str:
     with _lock:
         _restore()
         arrival_id = uuid4().hex
         entry = {"kind": "arrival", "window": list(window), "arrival": arrival_id,
-                 "arrived_at": time.time(), "event": event, "activated": activated,
-                 "origin": origin if origin is not None else chatlog.consume_origin(event)}
+                 "arrived_at": time.time(), "event": event, "activated": activated}
         _append(entry, datetime.now().strftime("%Y%m%d"))
         return arrival_id
 
@@ -362,29 +213,16 @@ def unread(window: tuple) -> list[dict]:
         return _ordered_pending(window)
 
 
-def mark_arrivals_read(window: tuple, arrivals: Iterable[str], read_by: str | None = None) -> int:
+def mark_arrivals_read(window: tuple, arrivals: Iterable[str]) -> int:
     """Durably mark one exact unread window prefix without assigning event ids."""
     with _lock:
         _restore()
         selected = list(arrivals)
-        _append({"kind": "mark_read", "window": list(window), "arrivals": selected,
-                 "read_by": read_by},
+        # WHY: 「标为已读」只推进持久未读水位，不是一段经历，所以它没有正式事件号。
+        # read_by 不再有人填，仍写 None：回退到旧代码时它按旧形状照样能读。
+        _append({"kind": "mark_read", "window": list(window), "arrivals": selected, "read_by": None},
                 datetime.now().strftime("%Y%m%d"))
         return len(selected)
-
-
-def mark_source_read(source: str, positions: Iterable[tuple[int, int]], mention_count: int,
-                     arrivals: Iterable[str] = (), read_by: str | None = None) -> dict:
-    """Advance one sealed source without presenting its members to the model."""
-    with _lock:
-        _restore()
-        state = _sources[source]
-        selected = [list(position) for position in positions]
-        entry = {"kind": "source_mark_read", "source": source,
-                 "positions": selected, "count": len(selected), "mention_count": mention_count,
-                 "arrivals": list(arrivals), "read_by": read_by}
-        _append(entry, datetime.now().strftime("%Y%m%d"))
-        return _source_snapshot(_sources[source])
 
 
 def pending_message(window: tuple, message_id: int | str, event_time: int,
@@ -396,86 +234,8 @@ def pending_message(window: tuple, message_id: int | str, event_time: int,
                                               "message_seq": event_seq})
         if identity is None:
             return None
-        return next((entry["arrival"] for entry in _pending.values()
-                     if (tuple(_sources[entry["source"]]["window"]) if entry.get("source")
-                         else tuple(entry["window"])) == window
-                     if entry["event"].get("message_id") is not None
-                     and _message_identity(window, entry["event"]) == identity), None)
-
-
-def message_seen(window: tuple, message_id: int | str, event_time: int,
-                 event_seq: int | str | None = None) -> bool:
-    """Check pending and already-read inputs for the same original QQ message."""
-    with _lock:
-        _restore()
-        if pending_message(window, message_id, event_time, event_seq) is not None:
-            return True
-        return _message_identity(window, {"message_id": message_id, "time": event_time,
-                                          "message_seq": event_seq}) in _seen_messages
-
-
-def start_source(name: str, window: tuple, source_type: str, *, anchor: str | None = None,
-                 anchor_time: int | None = None,
-                 queue_window: tuple | str | None = None,
-                 start_seq: str | None = None) -> dict:
-    """Start a named fetch; 'new' creates a separate durable unread source."""
-    with _lock:
-        _restore()
-        source = uuid4().hex
-        if queue_window == "new":
-            queue_window = ("source", source)
-        elif queue_window is None:
-            queue_window = window
-        if not name or not source_type or not isinstance(queue_window, tuple):
-            raise ValueError("source needs a name, type, and queue window")
-        existing = _ordered_pending(queue_window)
-        boundary = existing[-1]["arrival"] if existing else None
-        _append({"kind": "source_start", "source": source, "name": name,
-                 "window": list(window), "queue_window": list(queue_window),
-                 "source_type": source_type, "anchor": anchor, "anchor_time": anchor_time,
-                 "start_seq": start_seq,
-                 "pending_boundary": boundary}, datetime.now().strftime("%Y%m%d"))
-        return _source_snapshot(_sources[source])
-
-
-def publish_source_page(source: str, page_number: int, cursor: str | None,
-                        member_count: int, mention_count: int = 0) -> dict:
-    """Commit metadata only after the bounded page body is durable."""
-    with _lock:
-        _restore()
-        _append({"kind": "source_page", "source": source, "page_number": page_number,
-                 "cursor": cursor, "member_count": member_count, "mention_count": mention_count},
-                datetime.now().strftime("%Y%m%d"))
-        return _source_snapshot(_sources[source])
-
-
-def finish_source(source: str, *, gap: str | None = None, error: str | None = None,
-                  stop_cursor: str | None = None) -> dict:
-    with _lock:
-        _restore()
-        state = "failed" if error is not None else "gap" if gap is not None else "complete"
-        _append({"kind": "source_finish", "source": source, "state": state,
-                 "gap": gap, "error": error, "stop_cursor": stop_cursor},
-                datetime.now().strftime("%Y%m%d"))
-        return _source_snapshot(_sources[source])
-
-
-def sources() -> list[dict]:
-    """List all sources, including empty queues that are fetching or have gaps."""
-    with _lock:
-        _restore()
-        return [_source_snapshot(state) for state in _sources.values()]
-
-
-def resolve_source(name_or_key: str) -> dict | None:
-    """Resolve an exact key or the most recently started source with this name."""
-    with _lock:
-        _restore()
-        state = _sources.get(name_or_key)
-        if state is None:
-            state = next((item for item in reversed(list(_sources.values()))
-                          if item["name"] == name_or_key), None)
-        return _source_snapshot(state) if state is not None else None
+        return next((entry["arrival"] for entry in _ordered_pending(window)
+                     if _message_identity(window, entry["event"]) == identity), None)
 
 
 def pending_summary() -> list[tuple[tuple, int, bool]]:
@@ -497,7 +257,7 @@ def pending_details() -> list[dict]:
     with _lock:
         _restore()
         details: dict[tuple, dict] = {}
-        for entry in _pending.values():
+        for entry in _ordered_pending():
             if tuple(entry["window"]) == AGENT_WINDOW and "_stream_results" in entry["event"]:
                 continue
             window = tuple(entry["window"])
@@ -523,22 +283,21 @@ def has_unnotified() -> bool:
     with _lock:
         _restore()
         return bool(unacknowledged_windows()) or any(
-            entry.get("activated") and arrival not in _notified
-            for arrival, entry in _pending.items())
+            entry.get("activated") and arrival not in _state["notified"]
+            for arrival, entry in _state["pending"].items())
 
 
 def unacknowledged_windows() -> list[tuple]:
     with _lock:
         _restore()
-        return list(dict.fromkeys(tuple(window) for entry in _events
-                                  if entry["kind"] == "notification" and not entry.get("acknowledged")
+        return list(dict.fromkeys(tuple(window) for entry in _state["notices"].values()
                                   for window in entry["windows"]))
 
 
 def acknowledge_notification(event_id: str) -> None:
     with _lock:
         _restore()
-        if not _by_id[event_id].get("acknowledged"):
+        if event_id in _state["notices"]:
             _append({"kind": "notification_ack", "notification": event_id},
                     datetime.now().strftime("%Y%m%d"))
 
@@ -547,13 +306,11 @@ def deliver_notifications(agent_window: tuple) -> dict | None:
     """Offer only newly activated arrivals, retrying any unacknowledged notice."""
     with _lock:
         _restore()
-        for entry in _windows.get(agent_window, ()):
-            if entry["kind"] == "notification" and not entry.get("acknowledged"):
+        for entry in _state["notices"].values():
+            if entry["window"] == list(agent_window):
                 return entry
-        newly_activated = []
-        for entry in _pending.values():
-            if entry.get("activated") and entry["arrival"] not in _notified:
-                newly_activated.append(entry)
+        newly_activated = [entry for entry in _state["pending"].values()
+                           if entry.get("activated") and entry["arrival"] not in _state["notified"]]
         if not newly_activated:
             return None
         windows = list(dict.fromkeys(tuple(entry["window"]) for entry in newly_activated))
@@ -578,21 +335,15 @@ def latest_pending_arrival(window: tuple) -> str | None:
 def arrival_before_or_at(arrival: str, through: str) -> bool:
     with _lock:
         _restore()
-        return _arrival_before_or_at(arrival, through)
+        return _state["order"][arrival] <= _state["order"][through]
 
 
 def activate(arrival: str, kind: str = "wake") -> None:
     with _lock:
         _restore()
-        if arrival in _pending and not _pending[arrival]["activated"]:
+        if arrival in _state["pending"] and not _state["pending"][arrival]["activated"]:
             _append({"kind": "activation", "arrival": arrival, "activation_kind": kind},
                     datetime.now().strftime("%Y%m%d"))
-
-
-def read(arrival: str) -> dict | None:
-    with _lock:
-        _restore()
-        return _by_arrival.get(arrival)
 
 
 def _register(window: tuple | None, kind: str, **values: Any) -> dict | None:
@@ -603,26 +354,11 @@ def _register(window: tuple | None, kind: str, **values: Any) -> dict | None:
         day = datetime.now().strftime("%Y%m%d")
         # WHY: 当日号只随追加递增，clear 和覆盖都不回拨。模型写下的引用与反查
         # 必须在重建、重启和清理视图之后仍指向同一次经历。
-        number = _next.get(day, 0) + 1
+        number = _state["counters"].get(day, 0) + 1
         entry = {"id": f"{day}-{number}", "window": list(window), "kind": kind,
                  "read_at": time.time(), **values}
         _append(entry, day)
         return entry
-
-
-def input(window: tuple | None, event: dict, projection: dict | None, arrival: str,
-          source_window: tuple | None = None, *, read_by: str | None = None,
-          read_via: str | None = None) -> dict | None:
-    with _lock:
-        _restore()
-        pending = _pending.get(arrival, {})
-        origin = pending.get("origin")
-        original = (_sources[pending["source"]]["window"] if pending.get("source")
-                    else list(window or ()))
-        return _register(window, "input", event=event, projection=projection, arrival=arrival,
-                         origin=origin, source=pending.get("source"),
-                         source_window=list(source_window) if source_window is not None else original,
-                         read_by=read_by, read_via=read_via)
 
 
 def output(window: tuple | None, assistant: dict, calls: list[dict],
@@ -648,10 +384,8 @@ def result(window: tuple | None, source: str, returns: list[dict], arrival: str)
     return _register(window, "result", source=source, returns=returns, arrival=arrival)
 
 
-def events(window: tuple | None, include_condensed: bool = False) -> list[dict]:
+def events() -> list[dict]:
+    """Her outputs and the result batches that answered them, oldest first."""
     with _lock:
         _restore()
-        return [item for item in _windows.get(tuple(window or ()), ())
-                if not item.get("hidden")
-                and (include_condensed or (not item.get("collapsed")
-                                           and item["id"] not in _covered.get(tuple(window or ()), ())))]
+        return list(_state["actions"])

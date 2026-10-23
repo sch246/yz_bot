@@ -19,10 +19,10 @@ import json
 import threading
 import time
 
-from mods import context, image, llm, oplog, py, storage
+from mods import context, identity, image, llm, oplog, py, storage
 
 import mods.chat as _chat_root
-from . import notes as _notes, reader as _reader, roles as _roles, screen as _screen, segment as _segment, view as _view
+from . import notes as _notes, reader as _reader, roles as _roles, screen as _screen, segment as _segment, view as _view, windows as _windows
 
 _SEEN_KEY = "seen"
 # WHY: 什么时候交接是可以改的策略（2026-10-22 维护者："唤醒条件本身也配置化"）。
@@ -30,7 +30,7 @@ _SEEN_KEY = "seen"
 # （或是一段说明原因的文字）就交接；文件不存在时用下面这份默认，和它写成文件后一模一样。
 DEFAULT_TIDY = """# 什么时候交接。每次子请求结束（stage == "round"）和每次唤醒往这一段追加之前（stage == "assemble"）
 # 各求值一次：前面的行照常执行，最后一行是一个表达式，它的值为真就交接，是字符串时就是交接的原因。
-# 可用的名字：stage、used（这一段上下文的 token 估算）、grown（这次唤醒长了多少）、limit（#limit 设的整理阈值）、
+# 可用的名字：stage、used（这一段上下文的 token 数，以接口上次报的为准，之后追加的按字数估）、grown（这次唤醒长了多少）、limit（#limit 设的整理阈值）、
 # since_handoff（这一段开始了多少秒）、kind（唤醒／闹钟／反思）、hour。
 "上下文太长" if used > limit else None
 """
@@ -58,6 +58,22 @@ def _text_tokens(messages: list[dict]) -> int:
     return _chat_root.count_tokens(json.dumps(strip(messages), ensure_ascii=False))
 
 
+def _context_size(reported, body: list[dict]) -> int:
+    """How long *body* is: the size the API last reported for its first messages, plus an estimate of the rest.
+
+    *reported* is ``[tokens, count]``: the API counted ``tokens`` when ``body[:count]``
+    was the whole request and its answer.
+
+    WHY: 维护者 2026-10-23：以接口返回的为准。字数估算把图片当成几个字，DeepSeek 每张图
+    却最多算 1024 token（官方图像理解文档），图多的群攒上几百张也不会交接，直到撞上单个
+    请求 600 张图或 48 MiB 的上限；接口报的 prompt+completion 连系统提示、工具定义和图片都
+    算在内。报数之后才追加的（工具结果、新画面）还没人报过，先按字数估。
+    """
+    if isinstance(reported, list) and len(reported) == 2 and 0 <= reported[1] <= len(body):
+        return reported[0] + _text_tokens(body[reported[1]:])
+    return _text_tokens(body)
+
+
 def _seen() -> dict:
     data = storage.get("", "agent")
     value = data.get(_SEEN_KEY)
@@ -77,10 +93,11 @@ def _woken(notice: dict | None, turn) -> tuple[list[tuple], list[str], list[int]
             window = tuple(item["window"])
             windows.append(window)
             stamp = _screen.clock(item["time"]) if isinstance(item.get("time"), (int, float)) else "?"
-            lines.append(f"{_screen.label(window)} {item.get('kind')} 作者={item.get('user_id')} 时间={stamp}")
+            author = f" 作者={item['user_id']}" if item.get("user_id") is not None else ""
+            lines.append(f"{_screen.label(window)} {item.get('kind')}{author} 时间={stamp}")
         for window in notice.get("windows", []):
             windows.append(tuple(window))
-    windows.extend(window for window in turn.associated_windows if window[0] in ("group", "private"))
+    windows.extend(window for window in turn.associated_windows if _windows.known(window))
     return list(dict.fromkeys(windows)), lines, authors
 
 
@@ -88,7 +105,7 @@ def _note_block(scopes: list[str], title: str) -> dict | None:
     parts = [text for scope in scopes if (text := _notes.render(scope))]
     if not parts:
         return None
-    return {"role": "user", "content": title + "\n\n" + "\n\n".join(parts)}
+    return {"role": "system", "content": title + "\n\n" + "\n\n".join(parts)}
 
 
 def _head(woken: list[tuple], segment: dict) -> list[dict]:
@@ -105,14 +122,14 @@ def _head(woken: list[tuple], segment: dict) -> list[dict]:
     block = _note_block(scopes, "以下是你的笔记（普通文件，你随时能改，可能不完整）：")
     if block:
         messages.append(block)
-    messages.append({"role": "user", "content": "还能召回的东西（用 search 找，read_log、read_actions、read_note 读）：\n"
+    messages.append({"role": "system", "content": "还能召回的东西（用 search 找，read_log、read_actions、read_note 读）：\n"
                      + _roles.directory(woken)})
     return messages
 
 
 def _people(windows: list[tuple], authors: list[int], segment: dict) -> list[dict]:
     """Notes for windows and people appearing in this segment for the first time."""
-    scopes = [_notes.scope_of(window) for window in windows]
+    scopes = [_notes.scope_of(window) for window in windows if window[0] in _windows.QQ]
     scopes.extend(f"person:{author}" for author in authors[:_KNOWN_PEOPLE])
     new = [scope for scope in dict.fromkeys(scopes) if scope not in segment["scopes"]]
     segment["scopes"].extend(new)
@@ -172,7 +189,7 @@ def _unread_hint(on_screen: set[tuple]) -> str:
     rows = []
     for detail in oplog.pending_details():
         window = tuple(detail["window"])
-        if window[0] not in ("group", "private") or window in on_screen:
+        if not _windows.known(window) or window in on_screen:
             continue
         rows.append(f"{_screen.label(window)} {detail['unread']} 条"
                     + (f"（@你 {detail['mentions']}）" if detail["mentions"] else ""))
@@ -180,21 +197,69 @@ def _unread_hint(on_screen: set[tuple]) -> str:
             + "。要看就用 read_log 读原文。") if rows else ""
 
 
+def _late_arrivals(newest: dict[tuple, tuple], last_shown: dict[str, str],
+                   count: int) -> tuple[list[dict], dict[tuple, tuple]]:
+    """Messages that reached the windows on screen since she read them, to append to this segment.
+
+    Advances *newest* and *last_shown* now; the marks it returns are applied
+    (seen time, read) only once she has produced output after seeing them.
+
+    WHY: 维护者 2026-10-23：私聊每条都叫醒她以后，人分几条发的话会在她干活时陆续到，
+    不用延迟、也不打断请求，下一次子请求之前写进这一段，由她自己决定接不接（参照 Cortico
+    在轮次边界投递）。以前挂在请求末尾的提示里，每次重算、不进这一段，收尾还要为它们再叫
+    一次。
+
+    WHY: 已读要等她看过以后有了一次输出（哪怕只是思考）才标，维护者说这样最稳：请求失败
+    时它们仍是未读，叫她的那条照样会再叫醒她。`last_shown` 却在追加时就推进，它和这一段
+    一起存盘，这一段里有了它们，下次的画面就不会再给一遍。
+
+    WHY: 只是她自己发出去的回显不单独插一条：她刚 send 的话不用再看一遍，它们留着未读，
+    下次和别的新消息一起出现。
+    """
+    added: list[dict] = []
+    marks: dict[tuple, tuple] = {}
+    bot = identity.bot_id()
+    for window, (_stamp, through) in list(newest.items()):
+        late = [entry for entry in oplog.unread(window)
+                if through is None or not oplog.arrival_before_or_at(entry["arrival"], through)]
+        if not any(entry["event"].get("user_id") != bot for entry in late):
+            continue
+        label = _screen.label(window)
+        text, mark, last = _screen_text(window, count, last_shown.get(label))
+        newest[window] = marks[window] = mark
+        if not text:
+            continue
+        last_shown[label] = last
+        calls = [f"{entry.get('activation_kind')}"
+                 + (f" 作者={entry['event']['user_id']}" if entry["event"].get("user_id") is not None else "")
+                 for entry in late if entry.get("activated")]
+        facts = ["你干活时刚到的", _screen.clock(), *([f"叫你的：{'、'.join(calls)}"] if calls else [])]
+        added.append(_view.outside(label, facts, text))
+    return added, marks
+
+
+def _box_note(boxes: dict) -> str:
+    """Unsent input boxes, told once after a handoff.
+
+    WHY: 维护者 2026-10-23：type_word 的返回已经在上下文里，每次请求末尾再列一遍是重复。
+    只有交接后要说：输入框跟着唤醒走还在，打字那次的返回却随上一段归档了。
+    """
+    return ("交接前你在输入框里打了还没发的字：\n"
+            + "\n".join(f"{label}：{box['text']}" for label, box in boxes.items())
+            + "\n要发就 send，不发就不管它。")
+
+
 def _mark_seen(newest: dict[tuple, tuple]) -> None:
     seen = _seen()
     for window, (stamp, through) in newest.items():
         if stamp is not None:
             seen[_screen.label(window)] = max(stamp, seen.get(_screen.label(window), 0))
-        try:
-            _reader.mark_window_read(window, through=through)
-        except ValueError:
-            # 离线补回仍在进行：未读前端没有固定，下次再标。
-            pass
+        _reader.mark_window_read(window, through=through)
     storage.save()
 
 
 def _did_something(messages: list[dict]) -> bool:
-    return any(message.get("role") == "assistant" for message in messages)
+    return any(message.get("role") == "assistant" and not _view.is_incoming(message) for message in messages)
 
 
 def _tidy_reason(turn, segment: dict, stage: str, used: int, grown: int = 0) -> str:
@@ -252,7 +317,7 @@ def _handoff(turn, reason: str, model: str | None = None) -> bool:
         turn.handoff_note = ""
         return True
     messages = [*segment["messages"],
-                {"role": "user", "content": _roles.handoff_prompt(reason, diary_day(time.time()))}]
+                {"role": "system", "content": _roles.handoff_prompt(reason, diary_day(time.time()))}]
     grew = []
 
     def stop_when(used: int, initial: int) -> bool:
@@ -307,7 +372,7 @@ def _forced_reason(segment: dict, threshold: int) -> str:
     failures = segment.get("handoff_failures", 0)
     if failures >= _FORCE_AFTER_FAILURES:
         return f"交接连着失败了 {failures} 次"
-    used = _text_tokens(segment["messages"])
+    used = _context_size(segment.get("tokens"), segment["messages"])
     if used > threshold * _FORCE_OVER_THRESHOLD:
         return f"已经长到 {used} token，超过整理阈值的 {_FORCE_OVER_THRESHOLD} 倍"
     return ""
@@ -321,8 +386,12 @@ def _archive(turn, segment: dict, reason: str) -> str:
 
 
 def _system_count(session: llm.Chat) -> int:
-    return next((index for index, message in enumerate(session.messages) if message.get("role") != "system"),
-                len(session.messages))
+    """How many leading messages are the system prompt rebuilt on every wake.
+
+    WHY: 2026-10-23 起这一段里也有 system 消息（系统自己说的话），不能再按"第一条不是
+    system 的消息"找边界，否则这一段开头的笔记会被当成系统提示、存的时候丢掉。
+    """
+    return session.prompt_count
 
 
 def _begin(turn, window: tuple | None, kind: str) -> None:
@@ -336,7 +405,8 @@ def _begin(turn, window: tuple | None, kind: str) -> None:
     turn.handoff_note = ""
     turn.handoff_failed = False
     turn.handoffs = 0
-    turn.alarm = None
+    # 输入框（type_word）跟着这次唤醒走：中途交接换了会话也还在，唤醒结束就没了。
+    turn.boxes = {}
     turn.log = {"kind": kind, "start": time.time(), "peak": 0}
 
 
@@ -366,13 +436,12 @@ def _keep_typing(turn, window: tuple | None, stop: threading.Event) -> None:
         stop.wait(_TYPING_EVERY)
 
 
-def _drive_agent(model: str | None, window: tuple | None, alarm: tuple[str, str] | None = None) -> bool:
+def _drive_agent(model: str | None, window: tuple | None) -> bool:
     """Hold the agent's turn until nothing is left to do; False when someone else holds it."""
     turn, owner = context.begin_turn(_chat_root.AGENT_WINDOW)
     if not owner:
         return False
-    _begin(turn, window, "闹钟" if alarm else "唤醒")
-    turn.alarm = alarm
+    _begin(turn, window, "闹钟" if window == _windows.ME else "唤醒")
     typing = threading.Event()
     threading.Thread(target=_keep_typing, args=(turn, window, typing), name="chat-typing", daemon=True).start()
     # WHY: 一次对话 = 这次持有的全过程（多轮 + 插话续写，直到 finally），图片检查台账就
@@ -405,14 +474,9 @@ def _drive_agent(model: str | None, window: tuple | None, alarm: tuple[str, str]
         typing.set()
         image.end_conversation(image_ledger)
         context.end_turn(_chat_root.AGENT_WINDOW, turn)
-        # WHY: 循环停下的唯一信号就在这里，见 _run_hint。
-        if origin is not None and window is not None:
+        # WHY: 循环停下的唯一信号就在这里，见 _run_hint。`#hint` 只有 QQ 窗口有。
+        if origin is not None and window is not None and window[0] in _windows.QQ:
             _chat_root._run_hint(window, turn)
-
-
-def alarm(reason: str, rule: str) -> bool:
-    """A wake she or the maintainer scheduled in the awaker note; False when she is busy."""
-    return _drive_agent(None, None, (reason, rule))
 
 
 def request_tidy(note: str) -> bool:
@@ -430,11 +494,11 @@ def _run_agent(model: str | None, turn) -> bool:
     woken, activation_lines, authors = _woken(notice, turn)
     turn.authors = list(dict.fromkeys([*turn.authors, *authors]))
     continuing = turn.handed_off
-    if notice is None and not woken and not turn.alarm and not continuing:
+    if notice is None and not woken and not continuing:
         return True
     segment = _segment.load()
     if _did_something(segment["messages"]) and not turn.handoff_failed:
-        reason = _tidy_reason(turn, segment, "assemble", _text_tokens(segment["messages"]))
+        reason = _tidy_reason(turn, segment, "assemble", _context_size(segment.get("tokens"), segment["messages"]))
         if reason:
             if _handoff(turn, reason, model):
                 continuing = turn.handed_off
@@ -443,12 +507,13 @@ def _run_agent(model: str | None, turn) -> bool:
     if _chat_root.get_reasoning_mode() == "drop":
         # 以前几次唤醒的思考不再带回；这次唤醒之内照旧原样保留（DeepSeek 带工具时要求）。
         for message in segment["messages"]:
-            message.pop("reasoning_content", None)
+            if not _view.is_incoming(message):
+                message.pop("reasoning_content", None)
     material: list[dict] = []
     if not segment["messages"]:
         material.extend(_head(woken, segment))
     # 交接后续做时没有新唤醒，沿用刚才看着的窗口。
-    focus = woken or [_reader.parse_target(label) for label in turn.screens]
+    focus = woken or _windows.parse_all(turn.screens)
     material.extend(_people(focus, turn.authors, segment))
     screens: dict[str, str] = {}
     newest: dict[tuple, tuple] = {}
@@ -460,25 +525,23 @@ def _run_agent(model: str | None, turn) -> bool:
         if text:
             screens[label] = text
             shown_last[label] = last
-            material.append({"role": "user", "content": _view.msg_split(text)})
+            material.append(_view.outside(label, ["画面", _screen.clock()], text))
     now = _screen.clock()
     if notice is not None:
-        material.append({"role": "user", "content": f"这次唤醒你的是（{now}）：\n" + "\n".join(activation_lines)})
-    if turn.alarm:
-        reason_text, rule = turn.alarm
-        material.append({"role": "user", "content": f"这次是 awaker 笔记里的闹钟叫醒你的（{now}，规则：{rule}）：{reason_text}\n"
-                         "没有人在等你回话；看看要不要做点什么，没事就直接结束。"})
+        material.append({"role": "system", "content": f"这次唤醒你的是（{now}）：\n" + "\n".join(activation_lines)})
     if segment.get("notice"):
-        material.append({"role": "user", "content": segment["notice"]})
+        material.append({"role": "system", "content": segment["notice"]})
     if continuing:
         if turn.handoff_note:
-            material.append({"role": "user", "content": turn.handoff_note})
+            material.append({"role": "system", "content": turn.handoff_note})
+        if turn.boxes:
+            material.append({"role": "system", "content": _box_note(turn.boxes)})
         turn.handed_off = ""
     if not material:
         return True
 
     def first_output() -> None:
-        turn.alarm = None
+        started.append(True)
         if notice is not None:
             oplog.acknowledge_notification(notice["id"])
         _mark_seen(newest)
@@ -496,8 +559,25 @@ def _run_agent(model: str | None, turn) -> bool:
             return True
         return False
 
+    started: list[bool] = []
+    unconfirmed: dict[tuple, tuple] = {}
+
+    def late() -> list[dict]:
+        # 第一次输出之前画面还没标已读，刚到的留给下一次请求一起给。
+        if not started:
+            return []
+        added, marks = _late_arrivals(newest, segment["last_shown"], max_events)
+        unconfirmed.update(marks)
+        return added
+
+    def seen_late() -> None:
+        if unconfirmed:
+            _mark_seen(dict(unconfirmed))
+            unconfirmed.clear()
+
     session = _run_session(model, turn, segment, [*segment["messages"], *material], first_output, stop_when,
-                           hints=[lambda: _unread_hint(set(newest))], known=len(segment["messages"]))
+                           providers=[late], hints=[lambda: _unread_hint(set(newest))],
+                           known=len(segment["messages"]), each_output=seen_late)
     return session.output_recorded
 
 
@@ -507,8 +587,8 @@ def _body(session: llm.Chat) -> list[dict]:
 
 
 def _run_session(model: str | None, turn, segment: dict, messages: list[dict], first_output, stop_when,
-                 *, hints=(), load: tuple[str, ...] = (), quiet: bool = False, persist: bool = True,
-                 fail_fast: bool = False, known: int = 0) -> llm.Chat:
+                 *, providers=(), hints=(), load: tuple[str, ...] = (), quiet: bool = False, persist: bool = True,
+                 fail_fast: bool = False, known: int = 0, each_output=None) -> llm.Chat:
     """One model session over the segment plus this wake's material; outputs and results go to the oplog.
 
     With *persist*, the segment file follows the session after every round, but only
@@ -519,9 +599,17 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
     session = llm.Chat(model=model or _chat_root.get_model(), chat_client=llm.get_client())
     session.requested_reads = turn.requested_reads
     session.associated_windows = turn.associated_windows
+    session.boxes = turn.boxes
     session.quiet = quiet
     session.fail_fast = fail_fast
     binding = _chat_root._activate_chat(session, messages)
+    session.prompt_count = len(session.messages) - len(messages)
+    # WHY: 维护者 2026-10-23：别人说的话放 user，系统自己说的话（唤醒原因、笔记、交接、工具
+    # 状态、末尾提示）放对话中间的 system。DeepSeek 官方文档说 Chat Completions 支持在对话
+    # 中间插 system、不支持插工具调用，所以先前那对合成的 incoming 工具调用换成了这样；实测
+    # （仓库外的脚本）对话中间的 system 在思考模式、带工具、前面的思考被删掉时都被接受，四个
+    # 行为任务上不比合成框差。
+    session.hint_role = "system"
     if load:
         binding.load(list(load))
     binding.sync_registry()
@@ -530,9 +618,7 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
         # 新的一段：完整工具状态放在系统提示之后，这一段里不再变。
         state = binding.state_text(None)
         if state:
-            position = next((index for index, message in enumerate(session.messages)
-                             if message.get("role") != "system"), len(session.messages))
-            session.messages.insert(position, {"role": "user", "content": state})
+            session.messages.insert(session.prompt_count, {"role": "system", "content": state})
         told[0] = binding.state_snapshot()
     # WHY: 请求日志以前每次唤醒都从头打印，同一段越长、醒得越勤，llm.log 里同样的前缀就重复
     # 越多遍（2026-10-23 审查）。这一段已有的部分在 current.json 和归档里都有原样；新的一段
@@ -546,13 +632,15 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
             return []
         text = binding.state_text(told[0])
         told[0] = current
-        return [{"role": "user", "content": text}] if text else []
+        return [{"role": "system", "content": text}] if text else []
     # WHY: 原生 assistant/tool 配对原样留在 messages（含思考，DeepSeek 带工具时要求回传），
     # 并随这一段一起存下：下次唤醒看到的就是这一路下来的原样。
     session.preserve_native = True
     session.keep_reasoning = True
     session.output_recorded = False
-    initial = _text_tokens(session.messages)
+    session.last_usage = None
+    reported = [segment.get("tokens")]
+    initial = _context_size(reported[0], _body(session))
     turn._chat_usage_tokens = initial
     turn.log["peak"] = max(turn.log["peak"], initial)
 
@@ -563,10 +651,18 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
             _segment.save(segment)
 
     def record_output(assistant, calls):
+        if session.last_usage:
+            # 报的是刚发出去的整份请求加这次回答；回答在这之后才追加进 messages。
+            reported[0] = [session.last_usage, len(_body(session)) + 1]
+            session.last_usage = None
+            if persist:
+                segment["tokens"] = reported[0]
         source = oplog.output(_chat_root.AGENT_WINDOW, assistant, calls)
         if not session.output_recorded:
             first_output()
         session.output_recorded = True
+        if each_output is not None:
+            each_output()
         return source
 
     def record_results(source, results, _native):
@@ -579,7 +675,7 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
                 for position, result in enumerate(results)], "")
 
     def turn_done() -> bool:
-        used = _text_tokens(session.messages)
+        used = _context_size(reported[0], _body(session))
         turn._chat_usage_tokens = used
         turn.log["peak"] = max(turn.log["peak"], used)
         save()
@@ -589,6 +685,8 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
     session.on_results = record_results
     session.turn_done = turn_done
     session.add_context_provider(tool_changes)
+    for provider in providers:
+        session.add_context_provider(provider)
     for hint in hints:
         session.add_hint(hint)
     session.add_hint(lambda: f"现在是 {_screen.clock()}。")
@@ -672,11 +770,11 @@ def _run_reflection(model: str | None, turn, segments: list[dict]) -> None:
     changes = _tail(_notes.read_policy("changes"), 40)
     proposals = _tail(_notes.read_policy("proposals"), 20)
     messages = [
-        {"role": "user", "content": "以下是你的笔记：\n\n" + ("\n\n".join(notes) or "（还没有）")},
-        {"role": "user", "content": "## 上次反思以来归档的上下文（用 read_context 读原样）\n" + listing},
-        {"role": "user", "content": "## 策略改动记录（changes，最近的）\n" + (changes or "（还没有）")
+        {"role": "system", "content": "以下是你的笔记：\n\n" + ("\n\n".join(notes) or "（还没有）")},
+        {"role": "system", "content": "## 上次反思以来归档的上下文（用 read_context 读原样）\n" + listing},
+        {"role": "system", "content": "## 策略改动记录（changes，最近的）\n" + (changes or "（还没有）")
          + "\n\n## 给维护者的提案（proposals，最近的）\n" + (proposals or "（还没有）")},
-        {"role": "user", "content": _REFLECT_PROMPT.format(now=_screen.clock())},
+        {"role": "system", "content": _REFLECT_PROMPT.format(now=_screen.clock())},
     ]
     reflection = _segment.fresh()
     # 反思材料本身可能就很大：只限制它之后长出来的部分。
@@ -695,6 +793,6 @@ def pick_up_pending() -> None:
     window = next(iter(oplog.unacknowledged_windows()), None)
     if window is None:
         window = next((window for window, _count, active in oplog.pending_summary()
-                       if active and window[0] in ("group", "private")), None)
+                       if active and _windows.known(window)), None)
     if window is not None:
         _drive_agent(None, window)

@@ -1,4 +1,4 @@
-"""Human-readable append-only QQ chat history."""
+"""Human-readable chat history, one file per window and day; appended, except offline backfill inserts by time."""
 
 from __future__ import annotations
 
@@ -25,8 +25,8 @@ _append_lock = threading.RLock()
 _window_locks_lock = threading.Lock()
 _window_locks: dict[Path, threading.RLock] = {}
 _boot_anchors: dict[tuple[str, int], str | None] | None = None
-_line_positions: dict[str, tuple[int, int]] = {}
-_live_origins: dict[int, tuple[dict, str]] = {}
+# 这次开机补回写进日档的消息，(种类, 目标, 消息号, 时间)；同一条之后再实时到达时不再写一遍。
+_recovered: set[tuple[str, int, str, int]] = set()
 
 
 def _window_lock(directory: Path) -> threading.RLock:
@@ -139,54 +139,99 @@ def display(record: str) -> str:
     return "\n".join(_unescape(line) if line.startswith("    ") else line for line in record.split("\n"))
 
 
-def _append(path: str, text: str) -> tuple[str, str]:
-    """Append one record and return its stable file/head-line locator."""
-    encoded = text.encode("utf-8")
+def _append(path: str, text: str) -> str:
     with _window_lock(Path(path).parent.parent), _append_lock:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "a+b") as file:
-            file.seek(0, os.SEEK_END)
-            size = file.tell()
-            cached = _line_positions.get(path)
-            if cached is not None and cached[0] == size:
-                lines = cached[1]
-            else:
-                file.seek(0)
-                lines = 0
-                while chunk := file.read(65536):
-                    lines += chunk.count(b"\n")
-            file.seek(0, os.SEEK_END)
-            file.write(encoded)
-            file.flush()
-            _line_positions[path] = (size + len(encoded), lines + encoded.count(b"\n"))
-        origin = f"{Path(path).relative_to(rootfile)}:{lines + 1}"
-        return text, origin
+        with open(path, "ab") as file:
+            file.write(text.encode("utf-8"))
+    return text
 
 
-def _remember_origin(event: dict, origin: str) -> None:
-    _live_origins[id(event)] = (event, origin)
-    if len(_live_origins) > 4096:
-        _live_origins.pop(next(iter(_live_origins)))
+def _recovered_key(kind: str, target: int, event: dict) -> tuple[str, int, str, int]:
+    return kind, int(target), recall_key(event.get("message_id")), int(event.get("time") or 0)
 
 
-def consume_origin(event: dict) -> str | None:
-    """Pass writer provenance to the arrival journal without changing the OneBot event."""
-    saved = _live_origins.pop(id(event), None)
-    return saved[1] if saved is not None and saved[0] is event else None
+def insert_recovered(kind: str, target: int, events: list[dict]) -> list[dict]:
+    """Write messages NapCat returned for an offline gap into the ordinary day files; returns the new ones.
 
+    The returned events are completed into the shape a live event has (``post_type``,
+    the CQ-string ``message``, ``group_id`` or ``target_id``), so the wake criteria
+    can read them.
 
-def append_backfill_page(kind: str, target: int, messages: list[dict]) -> list[str]:
-    """Commit a remote page without building a window-sized identity map."""
-    return _backfill_archive.append_messages(kind, target, messages, root=rootfile)
+    WHY: 维护者 2026-10-23：补漏改成补回的消息直接写进 chatlog。以前写在日档旁边的
+    ``.backfill.jsonl``，画面、read_log、search 都不读，补回等于没补。
 
+    WHY: 按时间插，不追加。日档按到达顺序追加，补回的消息却比开机后实时到的旧，追加在
+    后面画面就乱了序。所以每条插在同一天最后一条不晚于它的记录后面；同一秒的按
+    message_seq 先后。日档里已有同号同秒的就跳过：开机后实时到的那些，补回时 NapCat
+    也会给一遍。
 
-def _existing_backfill_origin(kind: str, target: int, event: dict) -> str | None:
-    message_id = event.get("message_id")
-    if message_id is None:
-        return None
-    return _backfill_archive.lookup_origin(
-        kind, target, message_id, int(event["time"]), event.get("message_seq"), root=rootfile
-    )
+    WHY: 改写走临时文件加 ``os.replace``。读日档的人不加锁，看到的要么是旧文件要么是新
+    文件；换了 inode 也让档案索引整份重建，而不是当成追加去增量读。
+    """
+    rendered: list[tuple[int, tuple, str, dict]] = []
+    for event in events:
+        event = dict(event)
+        if isinstance(event.get("raw_message"), str):
+            event["message"] = event["raw_message"]
+        sender = event.get("sender") if isinstance(event.get("sender"), dict) else {}
+        sender_id = int(sender.get("user_id", event.get("user_id", 0)))
+        event.setdefault("user_id", sender_id)
+        event.setdefault("post_type", "message_sent" if sender_id == _bot_id() else "message")
+        # 名字用这条消息自己带的（当时的群名片或昵称），和实时消息先用事件里的 sender 更新身份
+        # 缓存再取名是同一个结果；补回不去改身份缓存，免得旧名片盖掉现在的。
+        if kind == "group":
+            event["group_id"] = int(target)
+            title, name = ((str(sender.get("title", "")), str(sender.get("card") or sender.get("nickname")))
+                           if sender.get("card") or sender.get("nickname")
+                           else identity.get_group_user_info(int(target), sender_id))
+            text = format_message(event, name, title)
+        else:
+            event.pop("group_id", None)
+            event["target_id"] = int(target)
+            text = format_message(event, str(sender.get("nickname") or identity.get_user_name(sender_id)))
+        rendered.append((int(event["time"]), _recovered_key(kind, target, event), text, event))
+    rendered.sort(key=lambda item: item[0])
+    by_path: dict[str, list[tuple[int, tuple, str, dict]]] = {}
+    for item in rendered:
+        by_path.setdefault(get_path(str(window_path(kind, target)), item[0]), []).append(item)
+    written: list[dict] = []
+    with _window_lock(window_path(kind, target)), _append_lock:
+        for path, items in by_path.items():
+            day = day_of(path)
+            lines = Path(path).read_text(encoding="utf-8").split("\n") if os.path.isfile(path) else []
+            if lines and lines[-1] == "":
+                lines.pop()
+            records = []
+            for start, end in _file_records(lines) if lines else ():
+                head = _split_head(lines[start])
+                stamp = _epoch(day, head["stamp"]) if head is not None else None
+                key = ((kind, int(target), recall_key(head["message_id"]), stamp)
+                       if head is not None and head["message_id"] else None)
+                records.append([stamp, key, lines[start:end]])
+            present = {record[1] for record in records}
+            added = []
+            for stamp, key, text, event in items:
+                _recovered.add(key)
+                if key in present:
+                    continue
+                present.add(key)
+                place = len(records)
+                while place and records[place - 1][0] is not None and records[place - 1][0] > stamp:
+                    place -= 1
+                records.insert(place, [stamp, key, text.rstrip("\n").split("\n")])
+                added.append(event)
+            if not added:
+                continue
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            temporary = f"{path}.{os.getpid()}.tmp"
+            with open(temporary, "wb") as file:
+                file.write("".join(line + "\n" for record in records for line in record[2]).encode("utf-8"))
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temporary, path)
+            written.extend(added)
+    return written
 
 
 def get_path(root: str, timestamp: int | float) -> str:
@@ -255,21 +300,19 @@ def _notice_str(timestamp: int | float, text: str) -> str:
 
 
 def _group_write(msg: dict[str, Any], group_id: int, text: str) -> str:
-    result, origin = _append(get_path(os.path.join(rootfile, "group", str(group_id)), msg["time"]), text)
-    _remember_origin(msg, origin)
+    result = _append(get_path(os.path.join(rootfile, "group", str(group_id)), msg["time"]), text)
     history.add_msg("group", group_id, msg)
     return result
 
 
 def _private_write(msg: dict[str, Any], user_id: int, text: str) -> str:
-    result, origin = _append(get_path(os.path.join(rootfile, "private", str(user_id)), msg["time"]), text)
-    _remember_origin(msg, origin)
+    result = _append(get_path(os.path.join(rootfile, "private", str(user_id)), msg["time"]), text)
     history.add_msg("private", user_id, msg)
     return result
 
 
 def _bot_write(msg: dict[str, Any], text: str) -> str:
-    result, _origin = _append(get_path(os.path.join(rootfile, "bot"), msg["time"]), text)
+    result = _append(get_path(os.path.join(rootfile, "bot"), msg["time"]), text)
     history.add_self_msg(msg)
     return result
 
@@ -345,14 +388,8 @@ def _message(msg: dict[str, Any]) -> str:
         title, display = identity.get_group_user_info(group_id, sender_id)
         rendered = format_message(msg, display, title)
         with _window_lock(window_path(kind, group_id)), _append_lock:
-            try:
-                archived = _existing_backfill_origin(kind, group_id, msg)
-            except (OSError, ValueError):
-                logger.exception("检查回填档案失败，实时消息仍写入正常日档")
-                archived = None
-            if archived is None:
+            if _recovered_key(kind, group_id, msg) not in _recovered:
                 return _group_write(msg, group_id, rendered)
-            _remember_origin(msg, archived)
         history.add_msg("group", group_id, msg)
         return rendered
     window_user = int(target)
@@ -362,14 +399,8 @@ def _message(msg: dict[str, Any]) -> str:
     # anyone can change, so a private window has no reliable author at all.
     rendered = format_message(msg, display)
     with _window_lock(window_path(kind, window_user)), _append_lock:
-        try:
-            archived = _existing_backfill_origin(kind, window_user, msg)
-        except (OSError, ValueError):
-            logger.exception("检查回填档案失败，实时消息仍写入正常日档")
-            archived = None
-        if archived is None:
+        if _recovered_key(kind, window_user, msg) not in _recovered:
             return _private_write(msg, window_user, rendered)
-        _remember_origin(msg, archived)
     history.add_msg("private", window_user, msg)
     return rendered
 
@@ -868,9 +899,25 @@ def window_path(kind: str, target: int | str | None = None, root: str | os.PathL
     base = Path(rootfile if root is None else root)
     if kind == "bot":
         return base / "bot"
-    if kind not in ("group", "private"):
-        raise ValueError(f"未知窗口类型：{kind}")
-    return base / kind / str(target)
+    if kind in ("group", "private"):
+        return base / kind / str(target)
+    # WHY: 2026-10-23 起 QQ 以外的窗口（她自己的 `me`、以后的 B 站、手机）也把记录写在这里，
+    # 格式相同，见 mods/chat/windows.py。名字和目标会变成路径，只挡住能跳出这棵树的写法。
+    if (not re.fullmatch(r"[a-z][a-z0-9_]*", kind)
+            or not re.fullmatch(r"[^/\\\x00-\x1f]*", str(target or "")) or str(target or "") in (".", "..")):
+        raise ValueError(f"未知窗口：{kind} {target}")
+    return base / kind / str(target or "")
+
+
+def append_record(kind: str, target: int | str | None, author: str, text: str,
+                  timestamp: float, record_id: str) -> None:
+    """Append one record of a window that has no OneBot event, e.g. her own ``me``.
+
+    Same head-plus-indented-body shape as a private message, so the screen and
+    ``read_log`` read it like any other record.
+    """
+    head = " ".join(str(author).split()) or "?"
+    _append(get_path(str(window_path(kind, target)), timestamp), _private_str(head, timestamp, text, record_id))
 
 
 def _day_bounds(day: tuple[int, int, int]) -> tuple[int, int]:

@@ -13,12 +13,6 @@ import time
 from mods import oplog
 
 
-def _window():
-    from mods import chat
-
-    return chat.AGENT_WINDOW
-
-
 def _short(value, limit: int) -> str:
     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
     text = " ".join(text.split()) if limit < 200 else text
@@ -27,7 +21,7 @@ def _short(value, limit: int) -> str:
 
 def pairs(*, ids=None, after: float | None = None) -> list[tuple[dict, dict | None]]:
     """Outputs in order, each with the result that answered it."""
-    entries = oplog.events(_window(), include_condensed=True)
+    entries = oplog.events()
     results = {entry["source"]: entry for entry in entries if entry["kind"] == "result"}
     wanted = set(ids) if ids is not None else None
     found = []
@@ -83,7 +77,8 @@ def render(output: dict, result: dict | None, *, chars: int = 1200) -> str:
 def title(output: dict) -> str:
     stamp = time.strftime("%m-%d %H:%M", time.localtime(output.get("read_at", 0)))
     body, calls = _speech(output)
-    said = [parse_arguments(call["arguments"]).get("text", "") for call in calls if call["name"] == "say"]
+    said = [parse_arguments(call["arguments"]).get("text", "") for call in calls
+            if call["name"] in ("type_word", "say")]
     summary = _short(str(said[0]), 40) if said else _short(body, 40)
     return f"{output['id']} [{stamp}] {','.join(call['name'] for call in calls) or '（无工具）'} {summary}".rstrip()
 

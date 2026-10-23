@@ -40,6 +40,10 @@ _SUBCOMMAND_HELP = (
 every 10m <理由>             每隔一段时间叫醒她一次（最短 1m）
 daily 23:30 <理由>           每天这个时刻
 at 2026-10-23 08:00 <理由>   某个时刻一次
+on g123 <理由>               这个窗口下一条消息来时（g123:QQ号 只等这个人，u号 是私聊）
+wait g123:QQ号 until 2026-10-23 10:30 <理由>   等这个人的后续，来了或到点都叫她，只叫一次
+when <Python 表达式> -> <理由>   每分钟求值，第一次为真时叫她
+at、on、wait、when 响过就从笔记里划掉。她平时用 wake_me 写这些行。
 理由写 reflect 表示夜间交接与反思；其它理由原样交给她。文件为空时只有 daily 04:00 reflect。
 #awaker              显示规则、上次响的时间和不认识的行
 #awaker set <规则>   整份替换；set 之后第一个换行起是规则全文"""),
@@ -48,7 +52,7 @@ at 2026-10-23 08:00 <理由>   某个时刻一次
 格式：#hint | #hint get | #hint set <代码> | #hint set | #hint default [get|set <代码>]
 配置是普通文件：全局默认在 data/hint/default.py，本窗口在 data/hint/g<群号>.py 或 u<QQ号>.py；首行 # on 或 # off 是开关，其余是代码。生效的是两者按 {**默认, **窗口} 合并之后 code 非空、on 为真的那份。
 聊天循环停下时求值一次，非 None 的结果作为一条消息发出（自带 # 前缀，不进模型上下文）。
-求值环境是共享动态环境，另外注入 window（触发窗口）、usage（这次唤醒最后一次子请求的上下文 token 估算）、peak（这次唤醒里最大的一次）与 limit（#limit 的整理阈值）。例：f'上下文 {usage}/{limit} token'
+求值环境是共享动态环境，另外注入 window（触发窗口）、usage（这次唤醒最后一次子请求的上下文 token 数，以接口报的为准）、peak（这次唤醒里最大的一次）与 limit（#limit 的整理阈值）。例：f'上下文 {usage}/{limit} token'
 #hint              切换本窗口的开关（只写本窗口）
 #hint get          显示合并后生效的代码与开关，并标出代码来自哪里
 #hint set <代码>   写入本窗口的代码并打开开关；set 之后第一个换行起即为源码

@@ -3,7 +3,7 @@
 ## 四种记录
 
 - `ctx` 只是“模块名 → 已加载模块”的字典，不是当前上下文。
-- `ctx["oplog"]` 的结构化记录描述你输出和行动过什么（旧记录里还有当年的阅读与覆盖）。
+- `ctx["oplog"]` 的结构化记录描述你输出和行动过什么（旧记录里还有当年的正式阅读 input）。
 - `ctx["chatlog"]` 保存聊天窗口实际发生的事；`read_log` 读的就是它。
 - 每一段上下文交接后原样归档在 `data/context/archive/`，加载 `memory_system` 后用 `read_context` 读：那是你当时看到了什么、做了什么。
 - 终端运行日志只用于排查代码如何执行，不是你的经历或聊天档案。
@@ -19,8 +19,8 @@ selected = [row for row in records if row["kind"] == "output" and "关键词" in
 
 `start` 含、`stop` 不含；留空表示不限制这一端。返回的是普通 dict：
 
-- `input`、`output`、`result`、`notification` 是有正式号的经历；
-- 正式经历的 `references` 是正文或行动参数里实际出现的正式号，包括已经断掉的引用，便于自检。
+- `output`、`result`、`notification` 是有正式号的经历，旧日志里还有 `input`，原样给出；
+- 输出和结果的 `references` 是正文、行动参数或返回里实际出现的正式号，包括已经断掉的引用，便于自检。
 
 迭代器逐条读磁盘，不改变未读成员或运行中的上下文。Python 扫描过一条记录不等于你在聊天中重新经历了它；只有最终返回给你的筛选结果会成为本次行动返回。
 
