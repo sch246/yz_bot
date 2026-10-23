@@ -64,7 +64,7 @@ def read_context(name: str = "", start: int = 0) -> str:
     from mods.chat import screen, segment
 
     if not name.strip():
-        found = segment.archived()[-30:]
+        found = segment.archived(last=30)
         if not found:
             return "（还没有归档的上下文）"
         return "\n".join(f"{item['name']}  {screen.clock(item['started'])[5:16]} 至 {screen.clock(item['ended'])[5:16]}  "

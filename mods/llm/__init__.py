@@ -654,10 +654,10 @@ class LLMClient:
             reasoning_content=reasoning_content,
         )
 
-    def chat(self, messages: list[dict], tools: list[Tool] | Callable[[], list[Tool]] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None, on_round: Callable[[], list[dict]] | None = None, should_stop: Callable[[], bool] | None = None, hints: Callable[[], list[dict]] | None = None, keep_reasoning: bool = True, on_output: Callable[[dict, list[dict]], str | tuple[str, dict] | None] | None = None, on_results: Callable[[str, list[ToolCallResult], list[dict]], None] | None = None, turn_done: Callable[[], bool] | None = None, on_action: Callable[[str | None], None] | None = None, preserve_native: bool = False) -> Generator[LLMResponse, None, None]:
+    def chat(self, messages: list[dict], tools: list[Tool] | Callable[[], list[Tool]] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None, on_round: Callable[[], list[dict]] | None = None, should_stop: Callable[[], bool] | None = None, hints: Callable[[], list[dict]] | None = None, keep_reasoning: bool = True, on_output: Callable[[dict, list[dict]], str | tuple[str, dict] | None] | None = None, on_results: Callable[[str, list[ToolCallResult], list[dict]], None] | None = None, turn_done: Callable[[], bool] | None = None, on_action: Callable[[str | None], None] | None = None, preserve_native: bool = False, logged: int = 0) -> Generator[LLMResponse, None, None]:
         # Every message appended below is printed live as it happens, so each
         # further round only logs what it has not shown yet -- usually nothing.
-        logged = 0
+        # *logged* starts past whatever the caller already logged before.
         # WHY: 工具循环有意没有最大轮数、总时限、确认步骤或副作用回滚，恢复手段是
         # .reboot。取舍与它暴露在同一条提示注入路径上的能力都记在 docs/llm.md 的
         # 「当前信任边界与维护取舍」一节——加限制前先读那里，这不是漏了。
@@ -858,6 +858,10 @@ class Chat:
         self.active_action: str | None = None
         self.reads_window_mail = False
         self.fail_fast = False
+        # How many leading messages an earlier request already put in the request
+        # log; a caller resuming a stored conversation sets it so they are not
+        # printed again.
+        self.logged = 0
         if messages is not None:
             self.set_messages(messages)
         if functions is not None:
@@ -974,6 +978,7 @@ class Chat:
                 lambda: self.turn_done() if self.turn_done is not None else False,
                 lambda reference: setattr(self, "active_action", reference),
                 self.preserve_native,
+                self.logged,
             )
             results = []
             for chunk in response:

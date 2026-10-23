@@ -84,11 +84,15 @@ def read_actions(ids: list[str] | None = None, count: int = 10, keyword: str = "
     """
     # WHY: 先按完整原文筛选、再分页（2026-10-22 审查发现：先截 4000 字再搜，长工具结果的
     # 尾部既按行动号读不到、也搜不到；原文只在行动记录里，召回工具得能拿全）。
-    rendered = [_actions.render(output, result, chars=10**9) for output, result in _actions.pairs(ids=ids or None)]
+    found = _actions.pairs(ids=ids or None)
+    if not ids and not keyword:
+        # 只要最近几条时先截再渲染；按词筛只能在完整原文里找，没法先截。
+        found = found[-max(1, min(int(count), 50)):]
+    rendered = [_actions.render(output, result, chars=10**9) for output, result in found]
     if keyword:
         rendered = [text for text in rendered if keyword.casefold() in text.casefold()]
-    if not ids:
-        rendered = rendered[-max(1, min(int(count), 50)):]
+        if not ids:
+            rendered = rendered[-max(1, min(int(count), 50)):]
     text = "\n".join(rendered)
     if not text:
         return "（没有记录）"
@@ -106,14 +110,19 @@ def read_actions(ids: list[str] | None = None, count: int = 10, keyword: str = "
 
 def _matching(lines, needle: str, most: int) -> tuple[int, list[str]]:
     """How many lines contain *needle*, and the first *most* of them, long ones cut around the hit."""
-    found = [line for line in lines if needle in line.casefold()]
+    count, picked = 0, []
+    for line in lines:
+        if needle in line.casefold():
+            count += 1
+            if len(picked) < most:
+                picked.append(line)
     shown = []
-    for line in found[:most]:
+    for line in picked:
         if len(line) > _SNIPPET:
             at = max(0, line.casefold().find(needle) - _SNIPPET // 3)
             line = ("…" if at else "") + line[at:at + _SNIPPET] + "…"
         shown.append(line)
-    return len(found), shown
+    return count, shown
 
 
 def _archive_lines(messages: list[dict]):
@@ -182,15 +191,18 @@ def search(keyword: str, window: str = "", days: int = _SEARCH_DAYS) -> str:
             more = f"，列前 {_NOTE_HITS} 份" if len(found) > _NOTE_HITS else ""
             sections.append(f"## {title}（{len(found)} 份{more}；用 read_note 读全文）\n" + "\n".join(found[:_NOTE_HITS]))
 
-    found = []
-    for name, data in reversed(list(_segment.each_archived(oldest))):
-        count, shown = _matching(list(_archive_lines(data.get("messages", []))), needle, 2)
+    found, total = [], 0
+    # 一次只解析一段：只留要列出来的摘要，其余只计数。
+    for name, data in _segment.each_archived(oldest, newest_first=True):
+        count, shown = _matching(_archive_lines(data.get("messages", [])), needle, 2)
         if count:
-            found.append(f"# {name}（{count} 处）\n" + "\n".join(shown))
+            total += 1
+            if len(found) < _SEGMENT_HITS:
+                found.append(f"# {name}（{count} 处）\n" + "\n".join(shown))
     if found:
-        more = f"，列最新 {_SEGMENT_HITS} 段" if len(found) > _SEGMENT_HITS else ""
-        sections.append(f"## 归档的上下文（{len(found)} 段{more}；只找你当时想的、说的、调用和结果；"
-                        "加载 memory_system 后用 read_context 读那一段）\n" + "\n".join(found[:_SEGMENT_HITS]))
+        more = f"，列最新 {_SEGMENT_HITS} 段" if total > _SEGMENT_HITS else ""
+        sections.append(f"## 归档的上下文（{total} 段{more}；只找你当时想的、说的、调用和结果；"
+                        "加载 memory_system 后用 read_context 读那一段）\n" + "\n".join(found))
 
     return "\n\n".join(sections) if sections else f"（最近 {days} 天的聊天记录、笔记、日记和归档里都没有找到）"
 

@@ -41,6 +41,8 @@ _KNOWN_PEOPLE = 6
 _TYPING_EVERY = 5
 # 一次唤醒里最多交接几次：防她每一段都调 tidy 时原地打转，不是常态限制。
 _HANDOFFS_PER_WAKE = 3
+_FORCE_AFTER_FAILURES = 2
+_FORCE_OVER_THRESHOLD = 2
 
 
 def _text_tokens(messages: list[dict]) -> int:
@@ -223,30 +225,98 @@ def _handoff(turn, reason: str, model: str | None = None) -> bool:
     """Confirm the handoff at the end of the current segment, then archive it.
 
     WHY: 交接没跑完（出错、被打断、没有输出）就不归档：这一段原样留着，下次再交接一遍。
-    笔记都是改写成应有的样子、内容没变就不写，所以重跑不会重复。
+    笔记都是改写成应有的样子、内容没变就不写，所以重跑不会重复。"跑完"指她最后一次回复
+    不再调用工具：2026-10-23 审查发现，只看"有过输出"时，中途出错、被打断、被阈值停下
+    都会被当成交接完成而归档，没来得及记下的东西就跟着这段一起离开了眼前。
     """
     segment = _segment.load()
-    if not _did_something(segment["messages"]) or turn.handoffs >= _HANDOFFS_PER_WAKE:
+    if not _did_something(segment["messages"]):
         return False
-    turn.handoffs += 1
-    _max_events, threshold = _chat_root.limit()
-    messages = [*segment["messages"],
-                {"role": "user", "content": _roles.handoff_prompt(reason, diary_day(time.time()))}]
-    try:
-        session = _run_session(model, turn, segment, messages, lambda: None,
-                               lambda used, initial: used - initial > threshold, quiet=True, persist=False)
-    except Exception:
-        _roles._stream.exception("交接失败")
-        session = None
-    turn.release = ""
-    if session is None or not session.output_recorded:
+    if turn.handoffs >= _HANDOFFS_PER_WAKE:
+        _roles._stream.warning(f"这次唤醒已经交接了 {turn.handoffs} 次，不再交接（原因：{reason}）")
         turn.handoff_failed = True
         return False
+    _max_events, threshold = _chat_root.limit()
+    forced = _forced_reason(segment, threshold)
+    if forced:
+        name = _archive(turn, segment, f"未交接，强制归档（{forced}；本来要交接的原因：{reason}）")
+        _roles._stream.warning(f"这一段{forced}，没有交接就归档为 {name}")
+        turn.handoff_note = (f"上一段上下文没能交接（{forced}），已经原样归档为 {name}。recent 和其它笔记可能没记到最后；"
+                             f"需要时加载 memory_system 用 read_context(\"{name}\") 读那一段，把漏下的补进笔记。")
+        return True
+    turn.handoffs += 1
+    messages = [*segment["messages"],
+                {"role": "user", "content": _roles.handoff_prompt(reason, diary_day(time.time()))}]
+    grew = []
+
+    def stop_when(used: int, initial: int) -> bool:
+        if used - initial > threshold:
+            grew.append(used - initial)
+            return True
+        return False
+
+    session, failure = None, ""
+    try:
+        session = _run_session(model, turn, segment, messages, lambda: None, stop_when,
+                               quiet=True, persist=False, fail_fast=True, known=len(segment["messages"]))
+    except Exception as error:
+        _roles._stream.exception("交接出错")
+        failure = f"出错：{type(error).__name__}: {error}"
+    turn.release = ""
+    if not failure:
+        added = session.messages[_system_count(session) + len(messages):]
+        last = session.messages[-1] if session.messages else {}
+        if turn.cancelled:
+            failure = "被打断"
+        elif grew:
+            failure = f"交接时又长了 {grew[0]} token，超过整理阈值，被停下"
+        elif not any(message.get("role") == "assistant" and (str(message.get("content") or "").strip()
+                                                             or message.get("tool_calls")) for message in added):
+            failure = "没有输出"
+        elif last.get("role") != "assistant" or last.get("tool_calls"):
+            failure = "没有正常结束"
+    if failure:
+        turn.handoff_failed = True
+        if failure != "被打断":
+            # 被打断是有人 ^C，不算交接本身的毛病；其余的记在这一段里，连着失败就强制归档。
+            segment["handoff_failures"] = segment.get("handoff_failures", 0) + 1
+            _segment.save(segment)
+        _roles._stream.warning(f"交接没完成（{failure}），这一段（{_screen.clock(segment['started'])} 开始）原样留着；"
+                               f"已经连着失败 {segment.get('handoff_failures', 0)} 次")
+        return False
     segment["messages"] = _body(session)
-    segment["reason"] = reason
-    _segment.archive(segment)
-    turn.handed_off = reason
+    name = _archive(turn, segment, reason)
+    _roles._stream.info(f"交接完成（{reason}），归档为 {name}")
+    turn.handoff_note = f"你刚把上一段上下文交接掉了（原因：{reason}）。接着做刚才的事，做到哪儿见 recent。"
     return True
+
+
+def _forced_reason(segment: dict, threshold: int) -> str:
+    """Why this segment must be archived without a handoff, or empty.
+
+    WHY: 维护者 2026-10-23：整理阈值设在模型上下文的一半左右，正常不会走到这里；真走到了
+    （交接连着失败，或者这一段已经是阈值的两倍、连交接请求本身都发不出去），就别卡死，
+    原样归档、告诉她，由她自己去读那一段补笔记。
+    """
+    failures = segment.get("handoff_failures", 0)
+    if failures >= _FORCE_AFTER_FAILURES:
+        return f"交接连着失败了 {failures} 次"
+    used = _text_tokens(segment["messages"])
+    if used > threshold * _FORCE_OVER_THRESHOLD:
+        return f"已经长到 {used} token，超过整理阈值的 {_FORCE_OVER_THRESHOLD} 倍"
+    return ""
+
+
+def _archive(turn, segment: dict, reason: str) -> str:
+    segment["reason"] = reason
+    name = _segment.archive(segment)
+    turn.handed_off = reason
+    return name
+
+
+def _system_count(session: llm.Chat) -> int:
+    return next((index for index, message in enumerate(session.messages) if message.get("role") != "system"),
+                len(session.messages))
 
 
 def _begin(turn, window: tuple | None, kind: str) -> None:
@@ -257,6 +327,7 @@ def _begin(turn, window: tuple | None, kind: str) -> None:
     turn.authors = []
     turn.release = ""
     turn.handed_off = ""
+    turn.handoff_note = ""
     turn.handoff_failed = False
     turn.handoffs = 0
     turn.alarm = None
@@ -358,8 +429,10 @@ def _run_agent(model: str | None, turn) -> bool:
     segment = _segment.load()
     if _did_something(segment["messages"]) and not turn.handoff_failed:
         reason = _tidy_reason(turn, segment, "assemble", _text_tokens(segment["messages"]))
-        if reason and _handoff(turn, reason, model):
-            continuing = ""
+        if reason:
+            if _handoff(turn, reason, model):
+                continuing = turn.handed_off
+            # 没交接成功时文件里多了失败次数，也要重读，否则这次唤醒的保存会把它盖掉。
             segment = _segment.load()
     if _chat_root.get_reasoning_mode() == "drop":
         # 以前几次唤醒的思考不再带回；这次唤醒之内照旧原样保留（DeepSeek 带工具时要求）。
@@ -390,8 +463,7 @@ def _run_agent(model: str | None, turn) -> bool:
         material.append({"role": "user", "content": f"这次是 awaker 笔记里的闹钟叫醒你的（{now}，规则：{rule}）：{reason_text}\n"
                          "没有人在等你回话；看看要不要做点什么，没事就直接结束。"})
     if continuing:
-        material.append({"role": "user", "content": f"你刚把上一段上下文交接掉了（原因：{continuing}）。"
-                         "接着做刚才的事，做到哪儿见 recent。"})
+        material.append({"role": "user", "content": turn.handoff_note})
         turn.handed_off = ""
     if not material:
         return True
@@ -415,29 +487,30 @@ def _run_agent(model: str | None, turn) -> bool:
         return False
 
     session = _run_session(model, turn, segment, [*segment["messages"], *material], first_output, stop_when,
-                           hints=[lambda: _unread_hint(set(newest))])
+                           hints=[lambda: _unread_hint(set(newest))], known=len(segment["messages"]))
     return session.output_recorded
 
 
 def _body(session: llm.Chat) -> list[dict]:
     """Everything after the system prompt, which is rebuilt on every wake."""
-    start = next((index for index, message in enumerate(session.messages) if message.get("role") != "system"),
-                 len(session.messages))
-    return session.messages[start:]
+    return session.messages[_system_count(session):]
 
 
 def _run_session(model: str | None, turn, segment: dict, messages: list[dict], first_output, stop_when,
-                 *, hints=(), load: tuple[str, ...] = (), quiet: bool = False, persist: bool = True) -> llm.Chat:
+                 *, hints=(), load: tuple[str, ...] = (), quiet: bool = False, persist: bool = True,
+                 fail_fast: bool = False, known: int = 0) -> llm.Chat:
     """One model session over the segment plus this wake's material; outputs and results go to the oplog.
 
     With *persist*, the segment file follows the session after every round, but only
     once she has produced output: a request that fails before that leaves the file
-    as it was, so the same material is not appended twice.
+    as it was, so the same material is not appended twice.  The first *known* of
+    *messages* are already in the segment, so the request log skips them.
     """
     session = llm.Chat(model=model or _chat_root.get_model(), chat_client=llm.get_client())
     session.requested_reads = turn.requested_reads
     session.associated_windows = turn.associated_windows
     session.quiet = quiet
+    session.fail_fast = fail_fast
     binding = _chat_root._activate_chat(session, messages)
     if load:
         binding.load(list(load))
@@ -451,6 +524,10 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
                              if message.get("role") != "system"), len(session.messages))
             session.messages.insert(position, {"role": "user", "content": state})
         told[0] = binding.state_snapshot()
+    # WHY: 请求日志以前每次唤醒都从头打印，同一段越长、醒得越勤，llm.log 里同样的前缀就重复
+    # 越多遍（2026-10-23 审查）。这一段已有的部分在 current.json 和归档里都有原样；新的一段
+    # 从头打印，系统提示因此每段记一次。
+    session.logged = _system_count(session) + known if known else 0
 
     def tool_changes() -> list[dict]:
         binding.sync_registry()
@@ -580,7 +657,8 @@ def _run_reflection(model: str | None, turn, segments: list[dict]) -> None:
     notes = [text for scope in ("global", "recent") if (text := _notes.render(scope))]
     listing = "\n".join(
         f"{item['name']}  {_screen.clock(item['started'])[5:16]} 至 {_screen.clock(item['ended'])[5:16]}  "
-        f"{item['messages']} 条消息  窗口 {'、'.join(item['windows']) or '无'}" for item in segments)
+        f"{item['messages']} 条消息  窗口 {'、'.join(item['windows']) or '无'}"
+        + (f"  {item['reason']}" if item.get("reason") else "") for item in segments)
     changes = _tail(_notes.read_policy("changes"), 40)
     proposals = _tail(_notes.read_policy("proposals"), 20)
     messages = [

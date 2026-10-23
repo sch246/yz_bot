@@ -94,11 +94,12 @@ def archive(segment: dict, kind: str = "") -> str:
         return target.stem
 
 
-def each_archived(since: float = 0):
-    """``(name, data)`` for archived segments that ended after *since*, oldest first."""
+def each_archived(since: float = 0, newest_first: bool = False):
+    """``(name, data)`` for archived segments that ended after *since*, one file at a time."""
     if not _ARCHIVE.is_dir():
         return
-    for path in sorted(_ARCHIVE.glob("*.json")):
+    paths = sorted(_ARCHIVE.glob("*.json"), reverse=newest_first)
+    for path in paths:
         # 归档文件写下后不再改，修改时间就是结束时刻：早于 since 的不用解析。
         if since and path.stat().st_mtime <= since:
             continue
@@ -110,11 +111,19 @@ def each_archived(since: float = 0):
             yield path.stem, data
 
 
-def archived(since: float = 0) -> list[dict]:
-    """Archived segments that ended after *since*, oldest first: name, times, size, windows."""
-    return [{"name": name, "started": data.get("started", 0), "ended": data.get("ended", 0),
-             "messages": len(data.get("messages", [])), "windows": data.get("windows", [])}
-            for name, data in each_archived(since)]
+def archived(since: float = 0, last: int | None = None) -> list[dict]:
+    """Archived segments that ended after *since*, oldest first: name, times, size, windows, reason.
+
+    With *last*, only the newest that many are read.
+    """
+    found = []
+    for name, data in each_archived(since, newest_first=last is not None):
+        found.append({"name": name, "started": data.get("started", 0), "ended": data.get("ended", 0),
+                      "messages": len(data.get("messages", [])), "windows": data.get("windows", []),
+                      "reason": data.get("reason", "")})
+        if last is not None and len(found) >= last:
+            break
+    return found[::-1] if last is not None else found
 
 
 def read_archived(name: str) -> dict | None:
@@ -136,6 +145,8 @@ def render(messages: list[dict]) -> str:
             content = "".join(part.get("text", "[图片]") if isinstance(part, dict) else str(part) for part in content)
         content = str(content or "")
         if role == "assistant":
+            if str(message.get("reasoning_content") or "").strip():
+                lines.append("【她想】" + message["reasoning_content"])
             if content.strip():
                 lines.append("【她】" + content)
             for call in message.get("tool_calls") or []:

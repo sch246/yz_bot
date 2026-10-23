@@ -34,10 +34,11 @@ llm_config: dict = {}
 # WHY: 两个值的默认写死在这里，不再读 llm_system/config.json；运行期由全局 agent
 # storage 覆盖。max_events 是一个窗口画面默认展示的条数（参照 QQ-agent 的 80，存储键
 # 沿用旧名）；tidy_token 是整理阈值，tidy.py 里的 `limit`。2026-10-22 以前它是
-# max_token × pressure_percent 两个数，维护者觉得一个阈值拆成两个数没有意义，合成一个；
-# 默认 30000 就是旧默认 40000 × 75%。
+# max_token × pressure_percent 两个数，维护者觉得一个阈值拆成两个数没有意义，合成一个。
+# 2026-10-23 维护者定默认 50 万，约是模型上下文的一半：同一段上下文一直往后接，阈值
+# 要给交接本身（整段再加一句交接指令）留出余量，也让"超长卡死"在正常使用里遇不到。
 DEFAULT_MAX_EVENTS = 80
-DEFAULT_TIDY_TOKEN = 30000
+DEFAULT_TIDY_TOKEN = 500000
 AGENT_WINDOW = oplog.AGENT_WINDOW
 NOTICE_TOKENS = 500
 _cost_lock = threading.Lock()
@@ -66,11 +67,10 @@ def agent_setting(name: str, data: dict | None = None):
 def limit() -> tuple[int, int]:
     """Screen size and tidy threshold."""
     data = storage.get("", "agent")
-    if "tidy_token" not in data and ("max_token" in data or "pressure_percent" in data):
-        # 旧的两个数第一次读到时折成一个阈值，并删掉旧键。
-        old_max = _bounded_int(1, 40000)(data.pop("max_token", None))
-        old_percent = _bounded_int(1, 75, 100)(data.pop("pressure_percent", None))
-        data["tidy_token"] = max(1, old_max * old_percent // 100)
+    if "max_token" in data or "pressure_percent" in data:
+        # 旧的两个数是按每次重组上下文定的预算，套到同一段上下文上会太小：直接删掉，用默认。
+        data.pop("max_token", None)
+        data.pop("pressure_percent", None)
         storage.save()
     return agent_setting("max_events", data), agent_setting("tidy_token", data)
 

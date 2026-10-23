@@ -152,8 +152,18 @@ def write_policy(name: str, text: str) -> str:
 
 
 def append_policy(name: str, line: str) -> None:
+    """Add one line at the end, without a backup.
+
+    WHY: 维护者 2026-10-23 定：changes 是只往后加的流水账，旧内容都还在文件里；以前每追加
+    一行都把整个旧文件复制进 .history，备份总量随条数平方增长（一万条约 15 GB）。整份改写
+    仍走 write_policy，改前照样备份。
+    """
     with _lock:
-        write_policy(name, (read_policy(name).rstrip() + "\n" + line).strip())
+        path = _policy_path(name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        previous = path.read_bytes() if path.is_file() else b""
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(("\n" if previous and not previous.endswith(b"\n") else "") + line.strip() + "\n")
 
 
 def listing(limit: int = 60) -> list[dict]:

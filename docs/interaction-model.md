@@ -106,7 +106,7 @@ generator 与 `.py input()` 共用 `mods.context` 的 continuation 登记。`^C`
 - **不由她改的**：醒来时带什么、阈值和代码。她写进 `data/notes/policy/proposals.md` 交给维护者。
 
 **设置**：主模型、提示词、工具激活与这些预算只从全局 agent 设置读取；`#model` 等命令查看全局状态，修改命令由管理员操作。
-- `#limit` 查看或修改窗口画面默认条数（默认 80）与整理阈值（token，默认 30000）；
+- `#limit` 查看或修改窗口画面默认条数（默认 80）与整理阈值（token，默认 500000，约是模型上下文的一半）；
 - `#awaker` 查看或改写闹钟规则；
 - `#reflect` 查看上次反思时间，`#reflect now` 立即跑一次夜间交接与反思。
 

@@ -25,7 +25,7 @@ _SUBCOMMAND_HELP = (
     ("limit [<画面条数> <整理阈值>|reset]", """查看或设置中心 agent 的窗口画面条数与整理阈值（管理员）。
 
 格式：#limit | #limit <画面条数> <整理阈值> | #limit reset
-画面条数是一个窗口第一次出现在这一段上下文里时展示多少条聊天记录；整理阈值（token）是这一段上下文长到多少就交接，即 data/notes/policy/tidy.py 里的 limit。默认值分别为 80、30000。
+画面条数是一个窗口第一次出现在这一段上下文里时展示多少条聊天记录；整理阈值（token）是这一段上下文长到多少就交接，即 data/notes/policy/tidy.py 里的 limit。默认值分别为 80、500000。
 #limit                      显示两个值，并标出来自全局覆盖还是默认
 #limit <画面条数> <整理阈值>  写入全局设置
 #limit reset                清掉全局设置，回落到默认"""),
