@@ -12,7 +12,7 @@
 - 戳一戳 Bot；
 - `#...` 控制命令。
 
-此外，她用 `wake_me` 在笔记 awaker 里埋下的 `on`／`wait` 规则在消息到达时由 `capture_chat` 认领（`awaker.take_waiting`）：这个窗口（或窗口里这个人）来了消息就叫醒她，唤醒原因写"等到了（规则原文）"，规则划掉。在这些默认判据之上，窗口可以盖一层限时的覆盖层（`awaker.triggered`）：笔记里的 `follow`（每条消息都叫）、`mute`（都不叫），或者代码用 `awaker.override` 设的 `other`（一个函数决定）。它决定 `activation_signal` 的结果算不算数，也决定 `chat.push` 的 `wake=` 算不算数；`on`／`wait` 和显式的 `chat.wake` 不经过它，`me` 不能盖，master 的话 mute 压不住。被 mute 压住的点名照样由 `capture_chat` 吃掉，免得后面的 `capture_addressed_fallback` 直接调 `chat()`。盖着的窗口在画面框头和未读提示里带上 `awaker.badges`，被它叫醒时唤醒原因写"覆盖层 follow 到 …：理由"。
+此外，她用 `wake_me` 在笔记 awaker 里埋下的 `on`／`wait` 规则在消息到达时由 `capture_chat` 认领（`awaker.take_waiting`）：这个窗口（或窗口里这个人）来了消息就叫醒她，唤醒原因写"等到了（规则原文）"，规则划掉。在这些默认判据之上，窗口可以盖一层限时的覆盖层（`awaker.triggered`）：笔记里的 `follow`（每条消息都叫）、`mute`（都不叫），或者代码用 `awaker.override` 设的 `other`（一个函数决定）。它决定 `activation_signal` 的结果算不算数，也决定 `chat.push` 的 `wake=` 算不算数；`on`／`wait` 和显式的 `chat.wake` 不经过它，`me` 不能盖，master 的话 mute 压不住。被 mute 压住的点名照样由 `capture_chat` 吃掉，免得后面的 `capture_addressed_fallback` 直接调 `chat()`。盖着的窗口在画面框头和未读提示里带上 `awaker.badges`，被它叫醒时唤醒原因写"覆盖层 follow 到 …：理由"。只有覆盖层要叫的消息不当场叫：`capture_chat` 交给 `awaker.gather`，窗口安静 15 秒（最多攒一分钟）后由 `chat.wake_window` 激活这个窗口最后一条别人的未读，连着几批她没开口就按 30 秒起翻倍、最多 5 分钟退避。她用 `send` 发出去以后（`awaker.spoke`），这个群 5 分钟内没有别的覆盖层时自动算 `follow`，连着两批不开口就停。
 
 这些判据判定要叫醒她时都走 `chat.wake(event, kind)`：在 oplog 里把这条到达标为激活，再驱动中心 agent；她正忙时激活留着，这一轮收尾时接上。它是唤醒方式的函数入口，link 节点、`.py` 或其它模块也可以在**这条消息的派发过程中**调用（到达号只在派发期间可查，事后调用会报错）；`kind` 原样出现在她看到的"这次唤醒你的是"里。不带消息时写 `chat.wake(reason=..., kind=...)`，随时能调（awaker 规则到点、`when` 条件成立、她用 `exec_code` 包在某个函数上的钩子）：等于 `chat.push(me, kind, reason, wake=kind)`，理由作为一条记录写进她自己的 `me` 窗口，见下一段。夜间反思走 `agent.reflect`。
 

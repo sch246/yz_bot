@@ -375,7 +375,7 @@ def send(target: str, final_call: bool = True) -> str:
     不该能说话"还没有人拍过；先记在这里，真出现不想要的发言再决定是挡掉还是保留。
     """
     from mods import context
-    from mods.chat import windows
+    from mods.chat import awaker, windows
     from mods.tools import current_binding
 
     try:
@@ -400,10 +400,13 @@ def send(target: str, final_call: bool = True) -> str:
         message_id = windows.sender(window)(window, box["text"])
     except windows.Unconfirmed as error:
         boxes.pop(label, None)
+        awaker.spoke(window)
         return f"未确认：{error}输入框已清空。" + unconfirmed
     except Exception as error:
         return f"发送失败（{type(error).__name__}）：{error}。这句话没有发出去，还在输入框里。"
     boxes.pop(label, None)
+    # 说完话这个群自动听一会儿，见 awaker。
+    awaker.spoke(window)
     if final_call:
         current_binding().session.turn_done = lambda: True
     return str(message_id)
@@ -433,12 +436,13 @@ def write_note(scope: str, text: str) -> str:
 def wake_me(when: str, reason: str) -> str:
     """给自己埋一个唤醒：过一会儿、到某个时刻、某个窗口来消息、等某人的后续、或者某个条件成立时叫醒你；也能给窗口盖一层限时的覆盖层，聚焦（follow）或者静音（mute）。
 
-    每个窗口有默认的叫醒条件（私聊每条都叫，群里是 @、叫名字、戳一戳，B 站是回复和 @）。覆盖层盖着的时候由它说了算：follow 每条都叫，mute 都不叫；消息照样记成未读，你醒着时照样看得见，你自己埋的 on、wait 照样响。盖了覆盖层的窗口在画面头和未读提示里会标出来，比如"mute 到 2026-10-24 08:00"。
+    每个窗口有默认的叫醒条件（私聊每条都叫，群里是 @、叫名字、戳一戳，B 站是回复和 @）。覆盖层盖着的时候由它说了算：follow 每条都叫（攒一批叫一次），mute 都不叫；消息照样记成未读，你醒着时照样看得见，你自己埋的 on、wait 照样响。盖了覆盖层的窗口在画面头和未读提示里会标出来，比如"mute 到 2026-10-24 08:00"。
     follow 是你自己选的聚焦：感兴趣、正在聊的群可以先跟上一阵。每条都叫醒不等于每条都要回，大家多半不是在对你说话；聊完了、插不上话了就 off。
+    覆盖层叫醒你的消息会攒一批：那个窗口安静 15 秒（最多攒一分钟）才叫你一次，看的是这一批；连着几批你都没在那说话，间隔会拉长到最多 5 分钟，你一开口就恢复。@、叫名字、戳一戳不攒。你在群里说完话的 5 分钟里，那个群自动算 follow（标成"说完话自动听"），连着两批都没开口就停；不想听可以 "follow g123 off"。
     要按自己的条件决定某个窗口叫不叫，在 exec_code 里 `from mods.chat import awaker` 再调 `awaker.override(目标, 函数, until=时间戳)`：函数收到这条事件（B 站这类是 None），返回叫不叫，显示为 other，重启就没了。
 
     @param
-    when: 下面一种写法——"10m"/"2h"：过这么久；"2026-10-23 08:00"：到这个时刻；"on g123"、"on g123:30001"、"on u456"：这个窗口（或窗口里这个人）下一条消息来时；"wait g123:30001 10m"：等这个人的后续，来了或者 10 分钟都没来都叫你，只叫一次；"follow g123 30m"：聚焦这个群 30 分钟，期间每条消息都像私聊一样叫醒你（只认 QQ 窗口）；"mute g123 2h"：这段时间这个窗口不叫醒你；覆盖层不写多久就是 30 分钟，写多久都行；目标可以是 g群号、u私聊号、g群号:QQ号（只管这个人）、bili:BV号 这样的窗口，或者 group、private、bili 这样的一整类；同一目标再写一次就替换，"mute g123 off" 揭掉；"when <Python 表达式>"：每分钟用 exec_code 那份环境求值，第一次为真时叫你，例如 when mcversion.ver["release"] != "1.21.4"；"every 30m"、"daily 23:30"：反复叫你
+    when: 下面一种写法——"10m"/"2h"：过这么久；"2026-10-23 08:00"：到这个时刻；"on g123"、"on g123:30001"、"on u456"：这个窗口（或窗口里这个人）下一条消息来时；"wait g123:30001 10m"：等这个人的后续，来了或者 10 分钟都没来都叫你，只叫一次；"follow g123 30m"：聚焦这个群 30 分钟，期间每条消息都会叫醒你，攒一批叫一次（只认 QQ 窗口）；"mute g123 2h"：这段时间这个窗口不叫醒你；覆盖层不写多久就是 30 分钟，写多久都行；目标可以是 g群号、u私聊号、g群号:QQ号（只管这个人）、bili:BV号 这样的窗口，或者 group、private、bili 这样的一整类；同一目标再写一次就替换，"mute g123 off" 揭掉；"when <Python 表达式>"：每分钟用 exec_code 那份环境求值，第一次为真时叫你，例如 when mcversion.ver["release"] != "1.21.4"；"every 30m"、"daily 23:30"：反复叫你
     reason: 叫醒时你会看到的原因，写给到时候的自己，比如"他刚才问到一半"
 
     WHY: 维护者 2026-10-23：她要能自己决定什么时候再醒。最常用的是 wait——对方话说了一半、

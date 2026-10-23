@@ -719,6 +719,10 @@ def capture_chat(event: dict) -> bool:
         kind = "；".join(filter(None, [kind, *(f"等到了（{rule['key']}）" for rule in waited)]))
     if wanted and layer is not None:
         kind = "；".join(filter(None, [kind, f"覆盖层 {_awaker.describe(layer)}" + (f"：{layer['reason']}" if layer["reason"] else "")]))
+    if wanted and layer is not None and not matched and not waited:
+        # 只有覆盖层要叫的（follow、说完话自动听）攒一批再叫，见 awaker 模块说明最后一段。
+        _awaker.gather(window, kind)
+        return True
     wake(event, kind)
     return True
 
@@ -759,6 +763,26 @@ def wake(event: dict | None = None, kind: str = "wake", reason: str = "") -> boo
         chat()
     finally:
         context.set_current(previous)
+    return True
+
+
+def wake_window(window: tuple, kind: str) -> bool:
+    """叫醒她看 *window* 里还没读的消息；False 表示那里没有别人的未读，或者已经有一条在叫她了。
+
+    和 `wake` 不同，随时可以调：激活的是这个窗口最后一条别人的未读，不要求正在派发它。
+    awaker 攒够一批时用它，*kind* 后面会添上这里有几条没看。
+    """
+    window = tuple(window)
+    oplog.ensure_available()
+    bot = identity.bot_id()
+    with context.window_lock(window):
+        unread = [entry for entry in oplog.unread(window) if entry["event"].get("user_id") != bot]
+        if not unread or any(entry["activated"] for entry in unread):
+            return False
+        oplog.activate(unread[-1]["arrival"], f"{kind}（攒了一批，{len(unread)} 条没看）")
+    # 和 push 一样另开线程：调用方是计时器线程，不该陪她跑完这一轮。
+    threading.Thread(target=_agent._drive_agent, args=(None, window),
+                     name=f"batch-wake-{window[0]}", daemon=True).start()
     return True
 
 
