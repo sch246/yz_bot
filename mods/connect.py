@@ -195,13 +195,13 @@ def recv_msg() -> dict | None:
 
 def on_load(ctx) -> None:
     global _server
-    from mods import chat
+    from mods import _backfill
 
-    # WHY: The archive anchor and mail boundary must both predate live ingress;
-    # otherwise a newly received message could hide the offline gap. Chat's
-    # normal on_load is later, so only its preparation hook runs here.
+    # WHY: The archive anchor must predate live ingress; otherwise a newly
+    # received message could hide the offline gap. Chat's normal on_load is
+    # later, so only the freezing runs here.
     try:
-        chat.prepare_recovery_sources()
+        _backfill.prepare()
     except Exception:
         # WHY: Offline recovery is optional; a broken archive must not prevent
         # the required OneBot listener from accepting fresh messages.

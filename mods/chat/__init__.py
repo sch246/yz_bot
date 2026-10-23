@@ -11,7 +11,7 @@ import time
 import traceback
 from typing import Callable
 
-from mods import _source_pages, context, cq, history, identity, image, llm, log, message, msgs, op, oplog, py, storage, text, thread, tools as tool_modules
+from mods import context, cq, history, identity, image, llm, log, message, msgs, op, oplog, py, storage, text, thread, tools as tool_modules
 from mods.capture import capture
 from mods.llm import pricing
 
@@ -591,14 +591,9 @@ def record_event(event: dict, write: Callable[[], object]) -> object:
                           else None)
             arrival = (oplog.pending_message(window, message_id, event.get("time"),
                                              event.get("message_seq")) if message_id is not None else None)
-            if arrival is None and message_id is not None and oplog.message_seen(
-                    window, message_id, event.get("time"), event.get("message_seq")):
-                from mods import chatlog
-
-                chatlog.consume_origin(event)
-            elif arrival is None:
+            if arrival is None:
                 arrival = oplog.arrive(window, event)
-        except oplog.FormatRestoreError:
+        except oplog.RestoreError:
             # WHY: The explicit maintenance routes run after chat recording.
             # An unreadable journal disables agent mail, not .py/.reboot.
             context.remember_arrival(event, None)
@@ -784,9 +779,9 @@ def push(window: tuple, author: str, text: str, *, wake: str = "") -> str:
     now = time.time()
     record_id = uuid4().hex[:8]
     with context.window_lock(window):
-        origin = chatlog.append_record(window[0], window[1], author, body, now, record_id)
+        chatlog.append_record(window[0], window[1], author, body, now, record_id)
         arrival = oplog.arrive(window, {"post_type": "push", "time": int(now), "author": str(author),
-                                        "text": body, "id": record_id}, origin=origin)
+                                        "text": body, "id": record_id})
         if wake:
             oplog.activate(arrival, wake)
     if wake:
@@ -862,37 +857,8 @@ def on_load(ctx) -> None:
     def resume_recovery() -> None:
         from mods import _backfill, connect, wait_booted
 
-        if not wait_booted(120):
-            return
-        waiting: dict[tuple, list[dict]] = {}
-        for source in oplog.sources():
-            if source["source_type"] == "napcat_boot" and source["state"] == "fetching":
-                waiting.setdefault(tuple(source["window"]), []).append(source)
-        tasks = list(waiting.values())
-        task_lock = threading.Lock()
-
-        def recover() -> None:
-            while True:
-                with task_lock:
-                    if not tasks:
-                        return
-                    sources = tasks.pop()
-                for source in sources:
-                    try:
-                        _backfill.recover_source(source, connect.call_api)
-                    except Exception:
-                        traceback.print_exc()
-                        try:
-                            with context.window_lock(tuple(source["window"])):
-                                state = oplog.resolve_source(source["key"])
-                                oplog.finish_source(source["key"], gap="本地归档或入列失败；可重试",
-                                                    stop_cursor=state["cursor"])
-                        except Exception:
-                            traceback.print_exc()
-                        break
-
-        for index in range(min(2, len(tasks))):
-            threading.Thread(target=recover, name=f"napcat-backfill-{index}", daemon=True).start()
+        if wait_booted(120):
+            _backfill.start(connect.call_api)
 
     threading.Thread(target=resume_recovery, name="napcat-backfill-start", daemon=True).start()
 
@@ -917,6 +883,6 @@ def on_load(ctx) -> None:
     threading.Thread(target=start_awaker, name="chat-awaker-start", daemon=True).start()
 from . import view as _view, reader as _reader, agent as _agent, roles as _roles, subcommands as _subcommands, notes as _notes, awaker as _awaker
 from .view import has_at, msg_split
-from .reader import parse_target, prepare_recovery_sources, mark_window_read
+from .reader import parse_target, mark_window_read
 from . import windows as _windows
 from .windows import kind

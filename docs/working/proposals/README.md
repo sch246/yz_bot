@@ -9,7 +9,7 @@
 - [Mods 模块手册](module-manual.md)与[源码覆盖索引](source-coverage.md)（迁移记录）
 - [Storage 加载校验与历史恢复](storage-and-history.md)（热同步已实施，剩余部分仍是提案）
 - [统一消息模型：窗口、正文与双向转换](message-model.md)（已实施；行格式协议已移入[chatlog 记录格式](../../chatlog-format.md)，运行事实见[运行架构](../../architecture.md)，本篇保留取舍与被排除的做法）
-- [重启后的离线消息恢复](offline-message-backfill.md)（主线代码已接入启动补回、按日 sidecar、持久页与有名信源；真实停机空窗尚未验收，不重放入站行为）
+- [重启后的离线消息恢复](offline-message-backfill.md)（2026-10-23 起被取代：补回的消息按时间直接插进普通日档，sidecar、信源页与有名信源已删；真实停机空窗尚未验收）
 - [数组消息格式迁移](array-message-format.md)（长期方向，尚未切换 NapCat 或迁移 CQ 字符串消费者）
 - [LLF 纯文本工具调用迁移](llf-tool-protocol.md)（长期方向，尚未替换原生工具调用与结果协议）
 - [可自维护的同相上下文](self-maintaining-context.md)（研究提案；中心主体与 reader 已部分落地，当前分开追问系统能力上限与可逆实践反馈；其余外显状态转移和自修改仍待证；[讨论来源与演化索引](self-maintaining-context-discussion.md)保留原话与修正链）
@@ -37,7 +37,7 @@
 - [权限演进](permissions.md)（部分已实现；**模型工具已按 Bot 自身固定权限运行**，不因阅读消息改变；显式代行按被代行者判权，但不能借人类 op 取得 Bot 自身没有的权限；其余演进方案尚未实施）
 - [多项目共存](multicore.md)
 - [模型选择的宽松解析与在线模型列表](model-selection.md)（已实现；未登记的模型照常调用，`#models` 先问对端、取不到才用本地配置）
-- [事件流核心：所有来源都是窗口](event-stream-core.md)（提案，第 1–3 步已实现（第 3 步改成 system/user 分角色）；窗口从群和私聊放开到任意种类，记录都在 chatlog，`chat.push` 写入并叫醒，闹钟进她自己的 `me` 窗口；轮次边界插话；画面装进 Cortico 式专用框；清理旧阅读模型的条目）
+- [事件流核心：所有来源都是窗口](event-stream-core.md)（提案，第 1–4 步已实现（第 3 步改成 system/user 分角色；第 4 步清理旧条目、补漏直接写进 chatlog）；窗口从群和私聊放开到任意种类，记录都在 chatlog，`chat.push` 写入并叫醒，闹钟进她自己的 `me` 窗口；轮次边界插话；画面装进 Cortico 式专用框；清理旧阅读模型的条目）
 - [op 工具集与事件注入](op-toolbox.md)（未实现；op 专属工具集：把事件交给唯一事件循环的注入原语，以及「开一轮聊天」的续话原语——`.reboot chat` 是后者的第一个消费者）
 - [窗口级 `#hint`](chat-hint.md)（已实现；给聊天窗口存一段可配置代码（本质是文本管理），聊天循环停止时求值并发送——用于显示已用上下文这类运行状态，也让用户看到循环停没停）
 - [浏览器、计算机使用与远程操作](browser-computer-remote.md)（未来支线备忘，不是当前提案；保存已有家底、外部调查入口和以后进入实现前需要验证的问题）

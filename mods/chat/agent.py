@@ -254,11 +254,7 @@ def _mark_seen(newest: dict[tuple, tuple]) -> None:
     for window, (stamp, through) in newest.items():
         if stamp is not None:
             seen[_screen.label(window)] = max(stamp, seen.get(_screen.label(window), 0))
-        try:
-            _reader.mark_window_read(window, through=through)
-        except ValueError:
-            # 离线补回仍在进行：未读前端没有固定，下次再标。
-            pass
+        _reader.mark_window_read(window, through=through)
     storage.save()
 
 

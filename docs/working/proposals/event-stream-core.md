@@ -1,6 +1,6 @@
 # 事件流核心：所有来源都是窗口
 
-> 状态：**提案，第 1、2 步已实现**（2026-10-23：窗口种类、`chat.push`、`me` 窗口，见 `mods/chat/windows.py`；轮次边界插话，见 `agent._late_arrivals`）；第 3 步已实现，改成了 system/user 分角色（`view.outside`）；第 4、5 步未实现。当前事实以 [运行架构](../../architecture.md)、[交互模型](../../interaction-model.md) 与 [LLM 文档](../../llm.md) 为准。
+> 状态：**提案，第 1、2 步已实现**（2026-10-23：窗口种类、`chat.push`、`me` 窗口，见 `mods/chat/windows.py`；轮次边界插话，见 `agent._late_arrivals`）；第 3 步已实现，改成了 system/user 分角色（`view.outside`）；第 4 步已实现（清理旧条目，见 `mods/oplog/replay.py`；补漏直接写进 chatlog，见 `mods/_backfill.py`、`chatlog.insert_recovered`）；第 5 步未实现。当前事实以 [运行架构](../../architecture.md)、[交互模型](../../interaction-model.md) 与 [LLM 文档](../../llm.md) 为准。
 >
 > 来源：维护者 2026-10-23 指出 [Cortico](https://github.com/Pal-AI-Lab/Cortico) 的事件流核心值得参考，希望柚子以后能"玩手机"（[phone-mcp](https://github.com/pinganbbOvO/ai-companion-kit/tree/main/packages/phone-mcp)）、刷 B 站和评论区互动、给自己埋各种唤醒。
 >
@@ -159,6 +159,11 @@ user 角色只剩系统自己说的话：唤醒原因摘要、交接说明、提
 
 NapCat 离线补漏那套 `source_*`（`_backfill`、`_source_pages`、`reader` 里的 recovery source）现在还在启动时跑，但画面不读它的页。维护者定：改成补回的消息直接写进 chatlog（§9）。这是改写，不只是删除，还要处理补回的消息和已有记录交错、重复的情况。
 
+已实现（第 4 步）：
+- 重放只留未读到达、激活、未确认通知、她自己的输出与结果；输出不留思考。旧行照常接受：正式阅读、`source_mark_read`、`floor` 消掉的到达照算，其余跳过。删掉了 `oplog_legacy` 适配器、覆盖树、`input`、信源和 `message_seen`、chatlog 写入位置（origin）那条链。
+- 新旧重放对比（仓库外的合成日志，41 行，覆盖所有新旧行种和一个崩溃残尾）：未读、激活、通知、"已通知"、正式号计数一致。只差两处，都是有意的：旧 `fetch` 工具单开的 `("source", 键)` 队列不再算未读；旧 `clear` 藏掉的结果现在 `read_actions` 也能翻到。新代码追加的行旧代码照样能重放，可以回退。72 MB 的合成日志上，重放后留在内存里的从 83 MB 降到 24 MB，耗时从 7.3 秒降到 1.4 秒。
+- 补漏：开机前冻结每个窗口最后一条带消息号的本地记录，没有的窗口不补；补回的每一页按时间插进普通日档，日档里同号同秒的跳过；补回后同一条再实时到达也不重写。补回的消息不登记到达、不唤醒。中断只记日志，下次开机不续补。不再写 `.backfill.jsonl`，已有的照常可读。
+
 ## 8. 切片
 
 1. **窗口种类 + `push` + `me` 窗口**：
@@ -185,6 +190,10 @@ NapCat 离线补漏那套 `source_*`（`_backfill`、`_source_pages`、`reader` 
 1. 标签写法：新种类用 `种类:目标`，她自己的窗口叫 `me`。已按此实现。
 2. NapCat 离线补漏改成补回的消息直接写进 chatlog，不再走 oplog 信源页；放在 §7 清理那一步做。
 3. §6 已读等那次请求产生输出才标（起初定的是追加时就标，实现第 2 步时维护者改了）。
+
+第 4 步实现时的取舍（待维护者确认）：
+- 补回的消息不进未读，离线期间有人 @ 她，开机后也不会因此被叫醒。以前补回的成员只在信源页里计数，画面不读，等于同样不叫醒。
+- 没有可靠锚点的窗口不补；补漏中断、或远端翻到底也没遇到锚点，留下的缺口下次开机不续补。
 
 第 1 步实现时的两处取舍：
 - `chat.push` 只收非 QQ 窗口；QQ 消息仍走 NapCat 事件那条路。

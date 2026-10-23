@@ -13,12 +13,6 @@ import time
 from mods import oplog
 
 
-def _window():
-    from mods import chat
-
-    return chat.AGENT_WINDOW
-
-
 def _short(value, limit: int) -> str:
     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
     text = " ".join(text.split()) if limit < 200 else text
@@ -27,7 +21,7 @@ def _short(value, limit: int) -> str:
 
 def pairs(*, ids=None, after: float | None = None) -> list[tuple[dict, dict | None]]:
     """Outputs in order, each with the result that answered it."""
-    entries = oplog.events(_window(), include_condensed=True)
+    entries = oplog.events()
     results = {entry["source"]: entry for entry in entries if entry["kind"] == "result"}
     wanted = set(ids) if ids is not None else None
     found = []

@@ -52,7 +52,7 @@
    - 第一次输出时只把读画面那一刻之前到达的未读标为已读；生成期间同窗口新到的由插话追加进这一段，那次请求有了输出再标已读。
    - 正文是 OneBot 原始串，图片 CQ 码按 `msg_split` 拆成图片 part，再按图片档位处理。
    - 名字是 chatlog 写入时的 QQ 侧名字，`.setname` 自定义称呼改为出现在这个人的笔记里。
-   - sidecar 里的离线补回暂不渲染。
+   - 开机补回的离线消息已按时间插在日档里，和别的记录一样渲染；以前写在 sidecar 里的不渲染。
 4. **交接**（`agent._handoff`）：驱动力是"这段上下文要被移除了，确认交接做好"。
    - 触发：她调用 `tidy(note)`；交接条件成立；夜里 awaker 的 `reflect` 规则到点。
    - 交接条件是 `data/notes/policy/tidy.py` 里的一段普通 Python，用 `.py` 的共享环境副本经 `py.eval_last` 求值，每次子请求结束（`stage="round"`）和每次唤醒往这一段追加之前（`stage="assemble"`）各一次，末行为真就交接，是字符串时就是原因。可用的名字有 `used`（这一段的 token 数：接口上次报的 prompt+completion，加上报数之后追加的部分的字数估算，见 `agent._context_size`；记在这一段的 `tokens`，图片、系统提示和工具定义都由接口算进去）、`grown`（这次唤醒长了多少）、`limit`（`#limit` 的整理阈值，`agent.tidy_token`）、`since_handoff`、`kind`、`hour`。文件不存在时用 `agent.DEFAULT_TIDY`：`used > limit`。写坏时按默认判断，终端留下 traceback。这一段里她还没有任何输出时不交接，免得开头材料本身就大时空转。她在反思里用 `edit_policy("tidy", …)` 改它，要 Bot 自身有 op 权限，写入前检查语法。
@@ -236,7 +236,7 @@ hint 与追加式上下文是两层，判据是一句话：**频繁变化、且�
 模型子请求的一次完整输出（正文、零到多个行动）在派发工具之前取得一个全局 `YYYYMMDD-N` 号；同步结果在批次完成时整批登记。这些记录写入 `data/event_stream/YYYYMMDD.jsonl`，chatlog 仍是 QQ 消息正文权威。新循环不把思考写进日志。
 
 - 这一段上下文里她的输出和工具结果原样都在；交接之后要用 `read_actions` 按号或按词读回。
-- `cover_events`、`recall_events`、`event_links` 已移除。旧日志里的覆盖、阅读 input 与 `condensed`/`clear` 记录仍按原样重放，新代码不再写入。
+- `cover_events`、`recall_events`、`event_links` 已移除。旧日志里的覆盖、阅读 input、`condensed`/`clear`/`floor` 与补回信源行仍被接受，只把它们对未读的影响算进去，不再进内存；新代码不再写入。`iter_events` 从磁盘逐条给出正式行，旧的 input 原样给出。
 - 流式结果中途截断不会登记半个输出或派发行动；输出写入日志失败则不派发。`oplog` 在写盘前校验可预见的拒绝条件；追加、fsync 或落盘后索引应用失败会进入失败态，后续写入和同批尚未执行的工具行动都停止，直到重启检查磁盘。行动开始后不会自动重放。
 
 DeepSeek 在带 `tools` 的 thinking 请求中要求最后一条 `user` 后的每条 `assistant` 携带 `reasoning_content`；每次唤醒追加的材料以 user 消息结尾，原生思考原样保存在这一段里（`#reasoning drop` 时以前几次唤醒的思考不再带回），所以旧的 `_closing_hint` 已删除。
