@@ -132,7 +132,7 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 `oplog` 对可预见的非法记录在写盘前用与重放相同的校验拒绝，不改变日志或内存；追加、fsync 或落盘后索引应用失败会进入持久化失败态，后续写入和同批尚未派发的工具行动均停止，直到重启检查日志。离线回放入口 `run_offline` 与 `experiments/memory_replay.py` 已随旧阅读模型删除；按新循环重写回放之前，没有离线评估路径。
 
-模型可用 `read_log`（任意窗口的 chatlog 原文，格式与画面相同，可按时间往前翻）、`search_log`（按线索在聊天记录里找）、`read_actions`（按行动号、最近若干条或关键词读自己的行动记录，在完整原文里筛，长的按 `start` 分页）与 `read_note` 召回画面之外的内容，用 `write_note` 改笔记、`tidy` 交接；`edit_hint` 已被笔记 todo 取代，`cover_events`、`recall_events`、`event_links` 与 `take`／`status`／`mentions`／`fetch`／`read_messages`／`mark_read`／`pull` 已从工具集移除。`聊天开始`／`聊天结束`是普通内容。旧窗口聊天设置不再读取，也不并入全局设置；窗口 `#hint` 独立保留。启动恢复与补回仍把 NapCat 历史写进按日 sidecar 与 oplog 信源页；窗口画面目前只读普通日志，sidecar 中补回的消息暂不出现在画面里。`#` 控制消息不投影。主模型与日记汇总的费用统一记入 Bot 账。
+模型可用 `read_log`（任意窗口的 chatlog 原文，格式与画面相同，可按时间往前翻）、`search`（按线索一次找遍聊天记录、笔记、日记和归档的上下文）、`read_actions`（按行动号、最近若干条或关键词读自己的行动记录，在完整原文里筛，长的按 `start` 分页）与 `read_note` 召回画面之外的内容，用 `write_note` 改笔记、`tidy` 交接；`edit_hint` 已被笔记 todo 取代，`cover_events`、`recall_events`、`event_links` 与 `take`／`status`／`mentions`／`fetch`／`read_messages`／`mark_read`／`pull` 已从工具集移除。`聊天开始`／`聊天结束`是普通内容。旧窗口聊天设置不再读取，也不并入全局设置；窗口 `#hint` 独立保留。启动恢复与补回仍把 NapCat 历史写进按日 sidecar 与 oplog 信源页；窗口画面目前只读普通日志，sidecar 中补回的消息暂不出现在画面里。`#` 控制消息不投影。主模型与日记汇总的费用统一记入 Bot 账。
 
 终端打印是实际运维界面的一部分：收发消息、流式 LLM 内容、工具调用、图片捕获/缓存、link/capture 命中、模块失败和生命周期进度都应保留可观察输出。这些产出者各自选一条**流名**（`mods.log.stream(...)`，即 `yz.*` logger），终端订阅其中一组；流是「属于哪个子系统」这条轴，与 logger 级别表达的「是不是故障」互不替代。每条流有自己的 `log/<流>.log`；`app.log` 只记严重程度；chatlog 保存产品聊天历史，三者不是同一用途。落盘的记录由一个 filter 自动补上交互归属，调用点不传参。终端行为、订阅集与 `.log` 见[运行时](runtime.md)。
 

@@ -15,12 +15,15 @@ import time
 
 from mods import chatlog, history, llm, log
 
-from . import actions as _actions, notes as _notes, screen as _screen
+from . import actions as _actions, notes as _notes, screen as _screen, segment as _segment
 
 
 _stream = log.stream("agent")
-_SEARCH_DAYS = 7
+_SEARCH_DAYS = 30
 _SEARCH_HITS = 30
+_NOTE_HITS = 20
+_SEGMENT_HITS = 10
+_SNIPPET = 300
 _READ_CHARS = 8000
 
 
@@ -63,7 +66,7 @@ def read_log(window: str, count: int = 30, before: str = "") -> str:
     @param
     window: g<群号> 或 u<私聊对端号>
     count: 取多少条记录，1 到 200
-    before: 只取这个时刻之前的记录，用来往前翻页或读 search_log 找到的那条的前文；写 YYYY-MM-DD HH:MM:SS 或 Unix 秒，留空表示到最新
+    before: 只取这个时刻之前的记录，用来往前翻页或读 search 找到的那条的前文；写 YYYY-MM-DD HH:MM:SS 或 Unix 秒，留空表示到最新
     """
     target = _parse_window(window)
     items = _screen.records(target, max(1, min(int(count), 200)), _moment(before))
@@ -101,32 +104,95 @@ def read_actions(ids: list[str] | None = None, count: int = 10, keyword: str = "
     return page
 
 
-def search_log(keyword: str, window: str = "", days: int = _SEARCH_DAYS) -> str:
-    """按线索在聊天记录里找：返回含这个词的记录原文，最新的在前。
+def _matching(lines, needle: str, most: int) -> tuple[int, list[str]]:
+    """How many lines contain *needle*, and the first *most* of them, long ones cut around the hit."""
+    found = [line for line in lines if needle in line.casefold()]
+    shown = []
+    for line in found[:most]:
+        if len(line) > _SNIPPET:
+            at = max(0, line.casefold().find(needle) - _SNIPPET // 3)
+            line = ("…" if at else "") + line[at:at + _SNIPPET] + "…"
+        shown.append(line)
+    return len(found), shown
+
+
+def _archive_lines(messages: list[dict]):
+    """What only an archived segment holds: her thinking, output, calls and their results.
+
+    WHY: 段里 user 消息是画面、笔记和提示，原文在聊天记录和笔记里，再搜一遍只会让每段
+    都因为开头那份 global 命中；她当时想了什么、说了什么、调了什么，才是要靠段名找回的。
+    """
+    for message in messages:
+        role = message.get("role")
+        if role == "assistant":
+            for line in str(message.get("reasoning_content") or "").splitlines():
+                yield "【她想】" + line
+            for line in str(message.get("content") or "").splitlines():
+                yield "【她】" + line
+            for call in message.get("tool_calls") or []:
+                function = call.get("function", {})
+                yield f"【她调用】{function.get('name')}({function.get('arguments')})"
+        elif role == "tool":
+            for line in str(message.get("content") or "").splitlines():
+                yield "【结果】" + line
+
+
+def search(keyword: str, window: str = "", days: int = _SEARCH_DAYS) -> str:
+    """按线索一次找遍聊天记录、笔记、日记和归档的上下文，按出处分组，各自最新的在前。
 
     @param
     keyword: 要找的词（不区分大小写，按原文子串匹配，名字、QQ号、话题都行）
-    window: 只找这个窗口（g<群号> 或 u<私聊对端号>）；留空找所有窗口
-    days: 往前找多少天，1 到 90
+    window: 聊天记录只找这个窗口（g<群号> 或 u<私聊对端号>）；留空找所有窗口。笔记、日记和归档照样都找
+    days: 聊天记录和归档往前找多少天，1 到 365；笔记和日记不限时间
     """
+    # WHY: 2026-10-23 维护者同意把 search_log 扩成一处找遍：以前笔记和日记只能按名字整份读、
+    # 归档只能按段名整段读，"谁说过喜欢什么""哪天聊过这事"只能先猜在哪。仍是子串匹配，
+    # 不加索引和语义检索——这个规模下逐个文件扫一遍就够。
     needle = keyword.strip().casefold()
     if not needle:
         raise ValueError("keyword 不能为空")
+    days = max(1, min(int(days), 365))
+    oldest = time.time() - days * 86400
+    sections = []
+
     windows = [_parse_window(window)] if window else chatlog.known_windows()
-    oldest = time.time() - max(1, min(int(days), 90)) * 86400
     hits = []
     for target in windows:
         for item in _screen.records(target, 100_000, since=oldest):
             if needle in item["text"].casefold():
                 hits.append((item["time"] or 0, target, item))
     hits.sort(key=lambda hit: hit[0], reverse=True)
-    lines = []
-    for _stamp, target, item in hits[:_SEARCH_HITS]:
-        day = "{:04d}-{:02d}-{:02d}".format(*item["day"])
-        text = item["text"] if len(item["text"]) <= 400 else item["text"][:400] + "…"
-        lines.append(f"# {_screen.label(target)} {day}\n{text}")
-    more = f"\n（共 {len(hits)} 条，只列最新 {_SEARCH_HITS} 条；缩小 window 或 days 再找）" if len(hits) > _SEARCH_HITS else ""
-    return "\n".join(lines) + more if lines else "（没有找到）"
+    if hits:
+        lines = [f"## 聊天记录（{len(hits)} 条" + (f"，列最新 {_SEARCH_HITS} 条" if len(hits) > _SEARCH_HITS else "")
+                 + "；用 read_log 的 before 读前后文）"]
+        for _stamp, target, item in hits[:_SEARCH_HITS]:
+            day = "{:04d}-{:02d}-{:02d}".format(*item["day"])
+            text = item["text"] if len(item["text"]) <= 400 else item["text"][:400] + "…"
+            lines.append(f"# {_screen.label(target)} {day}\n{text}")
+        sections.append("\n".join(lines))
+
+    for title, scopes in (("笔记", [item["scope"] for item in _notes.listing(limit=10**6)]),
+                          ("日记", [f"diary:{key}" for key in reversed(_notes.diaries())])):
+        found = []
+        for scope in scopes:
+            count, shown = _matching(_notes.read(scope).splitlines(), needle, 3)
+            if count:
+                found.append(f"# {scope}" + (f"（{count} 处）" if count > len(shown) else "") + "\n" + "\n".join(shown))
+        if found:
+            more = f"，列前 {_NOTE_HITS} 份" if len(found) > _NOTE_HITS else ""
+            sections.append(f"## {title}（{len(found)} 份{more}；用 read_note 读全文）\n" + "\n".join(found[:_NOTE_HITS]))
+
+    found = []
+    for name, data in reversed(list(_segment.each_archived(oldest))):
+        count, shown = _matching(list(_archive_lines(data.get("messages", []))), needle, 2)
+        if count:
+            found.append(f"# {name}（{count} 处）\n" + "\n".join(shown))
+    if found:
+        more = f"，列最新 {_SEGMENT_HITS} 段" if len(found) > _SEGMENT_HITS else ""
+        sections.append(f"## 归档的上下文（{len(found)} 段{more}；只找你当时想的、说的、调用和结果；"
+                        "加载 memory_system 后用 read_context 读那一段）\n" + "\n".join(found[:_SEGMENT_HITS]))
+
+    return "\n\n".join(sections) if sections else f"（最近 {days} 天的聊天记录、笔记、日记和归档里都没有找到）"
 
 
 def read_note(scope: str) -> str:

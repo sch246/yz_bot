@@ -311,7 +311,7 @@ S1 之后系统就能单独运行；S3、S4 的效果用 S2 的回放逐个对�
 | 交接（D20） | `agent._handoff`、`agent._tidy_reason`、`roles.handoff_prompt`、`tools/meta.tidy` | 她调用 `tidy`、`data/notes/policy/tidy.py` 的条件成立（默认 `used > limit`）或夜里到点时，在同一段末尾追加交接指令，用同样的上下文和工具跑一次，`say` 拒绝发言；完成后归档到 `data/context/archive/`，没完成不归档；一次唤醒最多交接 3 次 |
 | `#hint` 文件（D17） | `chat.hint_config`、`chat.save_hint` | `data/hint/default.py` 与 `g<群号>.py`／`u<QQ号>.py`，首行 `# on`／`# off`，其余是代码；合并规则不变；旧 storage 配置第一次读到时搬进文件 |
 | self 与正在输入（D18） | `chat.get_prompt`、`chat._migrate_self`、`tools/memory_system.edit_policy`、`agent._keep_typing` | `data/notes/self.md` 在系统提示最前；旧提示词第一次读到时搬入，storage 旧值不删；`write_note("self")` 和图书管理员被拒，`edit_policy("self")` 只在反思时可用；`#prompt [set]`。私聊唤醒期间每 5 秒 `set_input_status` |
-| D11 召回 | `roles.directory`、`roles.search_log`、`roles.read_actions` | 一段开头只有 global、recent、最近一篇日记和只列名字的目录；其余由她用召回工具读 |
+| D11 召回 | `roles.directory`、`roles.search`、`roles.read_actions` | 一段开头只有 global、recent、最近一篇日记和只列名字的目录；其余由她用召回工具读 |
 | 日记汇总 | `roles.summarize` | 月末、年末把日记改写成 `diary:YYYY-MM`／`diary:YYYY`，用主模型；单独的图书管理员会话已删除 |
 | 笔记（D15） | `mods/chat/notes.py`、`tools/meta.write_note` | `data/notes/` 下的普通 Markdown：global、recent、todo、awaker、person、group、diary。她随时用 `write_note` 改，维护者直接编辑；改前备份到 `.history/`，内容没变不写。旧 storage 待办第一次读到时搬进 todo |
 | 可观察 | `chat.segment`、`notes.versions` | 归档的每一段上下文原样留着，笔记旧版本在 `.history/`；`chat.journal` 已删除 |

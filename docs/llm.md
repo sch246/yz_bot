@@ -64,7 +64,7 @@
 7. **夜间交接与反思**（`chat.agent.reflect`）：占住 `AGENT_WINDOW`。
     1. 先交接手上这一段（原因"夜里了"）。
     2. 若这天是月末，`roles.summarize` 把当月日记改写成 `diary:YYYY-MM`；年末再把月记改写成 `diary:YYYY`。
-    3. 反思像人排查一样：材料是 global 与 recent 笔记、上次反思以来归档的段（段名、起止时刻、消息数、窗口）、`changes` 最近 40 行与 `proposals` 最近 20 行，以及一段说明：从症状出发，用 `read_context` 读当时那一段的原样，用 `read_log`／`search_log`／`read_actions`／`note_history` 查原始记录，找到原因再改。会话用新的一段，加载 `memory_system`，`say` 拒绝发言；材料之后新长出来的上下文超过整理阈值就结束；没有新归档的段时跳过模型调用。反思这一段也归档，名字带 `-reflect`。
+    3. 反思像人排查一样：材料是 global 与 recent 笔记、上次反思以来归档的段（段名、起止时刻、消息数、窗口）、`changes` 最近 40 行与 `proposals` 最近 20 行，以及一段说明：从症状出发，用 `read_context` 读当时那一段的原样，用 `search`／`read_log`／`read_actions`／`note_history` 查原始记录，找到原因再改。会话用新的一段，加载 `memory_system`，`say` 拒绝发言；材料之后新长出来的上下文超过整理阈值就结束；没有新归档的段时跳过模型调用。反思这一段也归档，名字带 `-reflect`。
     4. 结束后 `agent.pick_up_pending` 接上期间登记的召唤。
 
 窗口第一次有输出时确认这次的通知，记下画面中每个窗口的看到时间，并调用 `reader.mark_window_read` 把未读登记标为已读。
@@ -129,7 +129,7 @@
 | `reload_tools` | 按模块名从磁盘显式应用、更新或删除模块；逐项返回成功和带完整 traceback 的失败结果，失败保留旧 last-good。 |
 | `load_tools` | 将 last-good 模块激活到当前 Chat；中心名单存全局 `agent`，不读取磁盘。 |
 
-`meta` 还导出 `say`（唯一的发言方式，中心会话必须写明 `target`）、`read_log`／`search_log`／`read_actions`／`read_note`（召回画面以外的聊天记录、自己的行动记录与笔记）、`write_note`（改任何一份笔记，包括待办 todo 和闹钟 awaker）、`tidy`（这一轮结束后交接）和 `attach_image`。
+`meta` 还导出 `say`（唯一的发言方式，中心会话必须写明 `target`）、`search`／`read_log`／`read_actions`／`read_note`（召回画面以外的聊天记录、笔记、日记、归档的上下文与自己的行动记录）、`write_note`（改任何一份笔记，包括待办 todo 和闹钟 awaker）、`tidy`（这一轮结束后交接）和 `attach_image`。
 
 仓库当前提供以下按需模块；函数只在对应模块激活后出现：
 
@@ -219,7 +219,7 @@ hint 与追加式上下文是两层，判据是一句话：**频繁变化、且�
 - **`hint` 与 `prompt` 不在表里**：窗口结束提示的 `#hint` 是 `data/hint/` 下的文件，独立合并全局默认与窗口覆盖；她对自己的认识是笔记 self（`data/notes/self.md`）。它们不是单值档位，不使用 `AGENT_SETTINGS` 的归一化。
 - 已退役的窗口聊天设置仍可能留在生产 storage，但运行代码不再读取；其清理需先获维护者授权，见[第二轮调查](working/round2-legacy-and-backfill-audit.md)。
 
-**召回画面以外的内容。** 中心 agent 用 `read_log(window, count, before)` 读任意窗口的 chatlog 原文（格式与画面相同，`before` 写 `YYYY-MM-DD HH:MM:SS` 或 Unix 秒，用来往前翻），`search_log(keyword, window, days)` 按子串在一个或所有窗口最近若干天（默认 7，最多 90）的聊天记录里找，最新的 30 条在前，`read_actions(ids, count, keyword, start)` 读自己的行动记录，`read_note(scope)` 读笔记。旧的 `take`、`status`、`mentions`、`fetch`、`read_messages`、`mark_read`、`pull` 已移除。`#hint` 不触发阅读。
+**召回画面以外的内容。** 中心 agent 用 `read_log(window, count, before)` 读任意窗口的 chatlog 原文（格式与画面相同，`before` 写 `YYYY-MM-DD HH:MM:SS` 或 Unix 秒，用来往前翻），`search(keyword, window, days)` 按子串一次找遍四处，按出处分组：一个或所有窗口最近若干天（默认 30，最多 365）的聊天记录，最新的 30 条在前；所有笔记和日记（不限时间，每份列前 3 行命中，最多 20 份）；同一时间范围内归档的段（只找 assistant 的思考、正文、工具调用和工具结果，不找画面、笔记这些别处有原文的 user 消息，每段列命中数和前 2 处，最多 10 段，最新在前）。`read_actions(ids, count, keyword, start)` 读自己的行动记录，`read_note(scope)` 读笔记。旧的 `take`、`status`、`mentions`、`fetch`、`read_messages`、`mark_read`、`pull` 已移除。`#hint` 不触发阅读。
 
 ### 行动记录
 

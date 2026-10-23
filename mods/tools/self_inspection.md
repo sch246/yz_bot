@@ -26,4 +26,4 @@ selected = [row for row in records if row["kind"] == "output" and "关键词" in
 
 检查结果不会自动成为长期记忆：它作为行动结果留在这一段上下文里，交接时由你决定写不写进笔记。真要留住某个结论，就在本次行动里把结论和依据说清楚（写明行动号或聊天记录的窗口与时间），不要只保存变量名、查询代码或“当时符合条件的集合”，因为以后重跑可能得到不同成员。
 
-聊天原话直接用 `read_log(window, count, before)` 读、用 `search_log(keyword)` 按线索找，或用 `exec_code` 调 `ctx["chatlog"]` 按日期读文件。这个 Skill 只负责自由检查已经发生的经历，不替代改变事实的提交入口。
+聊天原话直接用 `read_log(window, count, before)` 读、用 `search(keyword)` 按线索在聊天记录、笔记、日记和归档的上下文里一起找，或用 `exec_code` 调 `ctx["chatlog"]` 按日期读文件。这个 Skill 只负责自由检查已经发生的经历，不替代改变事实的提交入口。

@@ -1,6 +1,6 @@
 '''指导模型增删查改统一工具与 Skill 模块，并说明 last-good、显式应用和当前会话激活原理。
 
-同一模型输出的多个工具调用按顺序执行，却看不到彼此结果；整批完成后结果在下一子请求可见。若 `say(final_call=true)` 结束、请求取消或失败，不会只为结果强迫续轮。你一直在同一段上下文里，每次被叫醒只往后接上新的东西，直到交接；这一段之外的要自己召回：按窗口翻聊天记录用 `read_log`，按线索找用 `search_log`，自己过去的行动用 `read_actions`，笔记用 `read_note`。笔记是普通文件，`write_note` 随时改；一件事告一段落、想清空眼前时用 `tidy` 交接。
+同一模型输出的多个工具调用按顺序执行，却看不到彼此结果；整批完成后结果在下一子请求可见。若 `say(final_call=true)` 结束、请求取消或失败，不会只为结果强迫续轮。你一直在同一段上下文里，每次被叫醒只往后接上新的东西，直到交接；这一段之外的要自己召回：按窗口翻聊天记录用 `read_log`，按线索找用 `search`（聊天记录、笔记、日记和归档一起找），自己过去的行动用 `read_actions`，笔记用 `read_note`。笔记是普通文件，`write_note` 随时改；一件事告一段落、想清空眼前时用 `tidy` 交接。
 
 ## 直接执行 Python
 
@@ -114,7 +114,7 @@ Skill 也是可编辑的长期笔记：把可重复使用的经验、做法、�
 每次模型输出（正文、多个行动）记进 oplog，有一个 `YYYYMMDD-N` 行动号；工具结果随它记下。你一直在同一段上下文里：开头是做法笔记（global）、上次交接留下的 recent、最近一篇日记和一份目录，之后每次唤醒往后接上新消息和第一次出现的人或群的笔记，末尾是待办（todo）。交接之后这一段归档，没出现的东西没有丢，召回是你自己的事。
 
 - 聊天记录就是 `chatlog/` 的原文，`read_log(window, count, before)` 读任意窗口，格式与画面相同；`before` 写 `YYYY-MM-DD HH:MM:SS` 往前翻页。
-- 记得一点线索（名字、话题、某个词）就用 `search_log(keyword, window, days)` 找出原文和时间，再用 `read_log` 读前后文。
+- 记得一点线索（名字、话题、某个词）就用 `search(keyword, window, days)`：一次找遍聊天记录（默认最近 30 天）、所有笔记和日记、归档的上下文，按出处分组；再用 `read_log` 读聊天前后文，`read_note` 读笔记全文。
 - 自己做过的事用 `read_actions(ids)` 按行动号读，或不给号读最近几条，`keyword` 按词筛；太长的结果按结尾提示用 `start` 接着读。
 - 笔记都是 `data/notes/` 下的普通文件，你随时能读能写：global 是你的做法，recent 是短期记忆，todo 是待办，awaker 是你的闹钟规则，person:<QQ号>、group:<群号> 记认识与经历，diary:<日期> 是当天的日记，每次交接改写成到目前为止的这一天（月、年各有汇总）。`read_note(scope)` 读，`write_note(scope, text)` 整份替换，改前自动备份。认识了新的人、答应了什么、被纠正了什么，想记就当场记。
 - 交接：你调用 `tidy`、这一段上下文太长、或者到了夜里，这段就要被移除。你会在这一段末尾收到交接指令，确认眼下的事、关于人和群的、做法的教训、答应的事、今天的事都在各自的笔记里，然后这段归档，下一段从新的笔记开始。
@@ -236,17 +236,17 @@ def read_log(window: str, count: int = 30, before: str = "") -> str:
     return chat.roles.read_log(window, count, before)
 
 
-def search_log(keyword: str, window: str = "", days: int = 7) -> str:
-    """按线索在聊天记录里找：名字、QQ号、话题里的词都行，返回含这个词的记录原文，最新的在前。找到时间点后可以用 read_log 的 before 读前后文。
+def search(keyword: str, window: str = "", days: int = 30) -> str:
+    """按线索一次找遍：聊天记录、笔记、日记和归档的上下文，按出处分组列出，每条带出处（窗口和日期、笔记名、日记日期、段名）。找到后用对应的工具读全文：聊天记录用 read_log 的 before 读前后文，笔记和日记用 read_note，归档的段加载 memory_system 后用 read_context。
 
     @param
-    keyword: 要找的词（不区分大小写，按原文子串匹配）
-    window: 只找这个窗口（g<群号> 或 u<私聊对端号>）；留空找所有窗口
-    days: 往前找多少天，1 到 90
+    keyword: 要找的词（不区分大小写，按原文子串匹配；名字、QQ号、话题里的词都行）
+    window: 聊天记录只找这个窗口（g<群号> 或 u<私聊对端号>）；留空找所有窗口。笔记、日记和归档照样都找
+    days: 聊天记录和归档往前找多少天，1 到 365；笔记和日记不限时间
     """
     from mods import chat
 
-    return chat.roles.search_log(keyword, window, days)
+    return chat.roles.search(keyword, window, days)
 
 
 def read_actions(ids: list[str] | None = None, count: int = 10, keyword: str = "", start: int = 0) -> str:
@@ -433,7 +433,7 @@ def _format_results(results: Mapping) -> str:
 __all__ = [
     "say",
     "read_log",
-    "search_log",
+    "search",
     "read_actions",
     "read_note",
     "write_note",

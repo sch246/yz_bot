@@ -103,7 +103,7 @@ def _head(woken: list[tuple], segment: dict) -> list[dict]:
     block = _note_block(scopes, "以下是你的笔记（普通文件，你随时能改，可能不完整）：")
     if block:
         messages.append(block)
-    messages.append({"role": "user", "content": "还能召回的东西（用 read_log、search_log、read_actions、read_note 读）：\n"
+    messages.append({"role": "user", "content": "还能召回的东西（用 search 找，read_log、read_actions、read_note 读）：\n"
                      + _roles.directory(woken)})
     return messages
 
@@ -515,7 +515,7 @@ _REFLECT_PROMPT = """现在是每晚反思的时间（{now}）。没有人叫你
 
 像人排查你的问题那样排查自己：
 1. 从症状出发：上面列出了上次反思以来归档的每一段上下文。有人说你忘了、你找东西没找到、你答错了、交接漏了什么——先找到这样的地方。没有线索时，挑一两段读一读。
-2. 顺着原始记录查：read_context 读那一段当时的原样（你当时看到了什么、做了什么）；read_log、search_log 读聊天原文；read_actions 读行动记录；note_history 看当时笔记里写了什么。弄清是没记下、记下了没想起来、还是交接漏了。
+2. 顺着原始记录查：read_context 读那一段当时的原样（你当时看到了什么、做了什么）；search 一次找遍聊天记录、笔记、日记和归档；read_log 读聊天原文；read_actions 读行动记录；note_history 看当时笔记里写了什么。弄清是没记下、记下了没想起来、还是交接漏了。
 3. 先评估：changes 里还没有评估结论的改动，对照它之后的记录，问题少了吗？用 assess_change 写下结论；没用的就改回去。
 4. 找到原因再改，一次最多一两处，用 edit_policy 写明原因和预期：交接的附加说明（handoff）、你的做法（global）、什么时候交接（tidy）、你对自己的认识（self，只有现在能改，大多数晚上不需要动它）。机制本身要改就写进 proposals 交给维护者。
 5. 没发现问题就什么都不改，直接结束。"""

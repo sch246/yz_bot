@@ -94,21 +94,27 @@ def archive(segment: dict, kind: str = "") -> str:
         return target.stem
 
 
-def archived(since: float = 0) -> list[dict]:
-    """Archived segments that ended after *since*, oldest first: name, times, size, windows."""
+def each_archived(since: float = 0):
+    """``(name, data)`` for archived segments that ended after *since*, oldest first."""
     if not _ARCHIVE.is_dir():
-        return []
-    found = []
+        return
     for path in sorted(_ARCHIVE.glob("*.json")):
+        # 归档文件写下后不再改，修改时间就是结束时刻：早于 since 的不用解析。
+        if since and path.stat().st_mtime <= since:
+            continue
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if data.get("ended", 0) <= since:
-            continue
-        found.append({"name": path.stem, "started": data.get("started", 0), "ended": data.get("ended", 0),
-                      "messages": len(data.get("messages", [])), "windows": data.get("windows", [])})
-    return found
+        if data.get("ended", 0) > since:
+            yield path.stem, data
+
+
+def archived(since: float = 0) -> list[dict]:
+    """Archived segments that ended after *since*, oldest first: name, times, size, windows."""
+    return [{"name": name, "started": data.get("started", 0), "ended": data.get("ended", 0),
+             "messages": len(data.get("messages", [])), "windows": data.get("windows", [])}
+            for name, data in each_archived(since)]
 
 
 def read_archived(name: str) -> dict | None:
