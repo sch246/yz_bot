@@ -520,6 +520,13 @@ class LLMClient:
         }.items()})
         if do_process_image:
             messages = self._convert_images(messages, image.image_uri_to_data_uri, capabilities.tool_images) if capabilities.vision else self._describe_images(messages, description_cache or {})
+        elif capabilities.vision and capabilities.tool_images:
+            # WHY: `#image off` 管的是聊天里别人发来的图，工具结果里的图是她自己 attach_image
+            # 要看的，照样展开。以前 off 把它也换成一行链接，她调了 attach_image 却只看见地址，
+            # 以为自己的眼睛不行（2026-10-23 设备上；没设过 #image 时默认就是 off）。
+            messages = [self._convert_images([message], image.image_uri_to_data_uri, True)[0]
+                        if message.get("role") == "tool" else self._replace_images_with_text([message])[0]
+                        for message in messages]
         else:
             messages = self._replace_images_with_text(messages)
         # Image conversion is one output message per input message, so the
