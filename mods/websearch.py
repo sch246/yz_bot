@@ -15,18 +15,27 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
+import logging
 import os
 import urllib.request
+from zoneinfo import ZoneInfo
 
 from mods import FEATURE
 
 
 PHASE = FEATURE
 
-# 官方默认端点与模型名（Anthropic 命名），与仓库里的 chat-completions 配置无关。
+# 官方默认端点与模型名，与仓库里的 chat-completions 配置无关。旧名 deepseek-v4-flash 仍可调用、
+# 由同一个 Flash 模型承接，官方文档（2026-10-23）要求改用 deepseek-flash。
 DEFAULT_BASE_URL = "https://api.deepseek.com/anthropic/v1"
-MODEL = "deepseek-v4-flash"
+MODEL = "deepseek-flash"
+# 记账时按聊天那份配置里的这个模型查单价。
+PRICED_AS = "deepseek/deepseek-flash"
+# 每次成功的服务端搜索（元）；从这个时刻起收费。
+SEARCH_PRICE = 5 / 1000
+SEARCH_BILLED_FROM = datetime(2026, 11, 1, tzinfo=ZoneInfo("Asia/Shanghai"))
 API_VERSION = "2023-06-01"
 MAX_TOKENS = 4096
 MAX_USES = 5
@@ -147,9 +156,32 @@ def search(query: str, max_uses: int = MAX_USES, timeout: float = TIMEOUT) -> di
         },
         method="POST",
     )
+    requested_at = datetime.now(timezone.utc)
     with urllib.request.urlopen(request, timeout=timeout) as response:
         payload = json.load(response)
-    return normalize(payload, query)
+    result = normalize(payload, query)
+    _charge(payload, result["searches"], requested_at)
+    return result
+
+
+def _charge(payload: dict, searches: int, requested_at: datetime) -> None:
+    """Put this request's tokens and searches on the Bot's bill, like a chat request.
+
+    WHY: 维护者 2026-10-23：搜索也要记账。这次请求本身按 Flash 的 token 单价算；服务端搜索
+    按次另算，官方定从北京时间 2026-11-01 起每千次成功请求 5 元，之前不收。记账失败只记
+    日志，不让搜索失败。
+    """
+    try:
+        from mods import chat
+
+        usage = payload.get("usage") or {}
+        cached = int(usage.get("cache_read_input_tokens") or 0)
+        prompt = int(usage.get("input_tokens") or 0) + cached + int(usage.get("cache_creation_input_tokens") or 0)
+        chat.inc_call_cost(PRICED_AS, prompt, int(usage.get("output_tokens") or 0), cached, requested_at)
+        if searches and requested_at >= SEARCH_BILLED_FROM:
+            chat.inc_usage_cost(searches * SEARCH_PRICE)
+    except Exception:
+        logging.getLogger(__name__).exception("网络检索记账失败")
 
 
 __all__ = [

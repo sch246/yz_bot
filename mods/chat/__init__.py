@@ -338,6 +338,8 @@ def get_handler(session: llm.Chat):
             _self_talk.info(f'[{time.strftime("%H:%M:%S")}]【自言自语】{chunk.content}')
         if chunk.total_tokens:
             inc_call_cost(session.model, chunk.prompt_tokens, chunk.completion_tokens, chunk.cached_tokens, chunk.requested_at)
+            # 这一段有多长以接口报的为准，见 agent._context_size。
+            session.last_usage = (chunk.prompt_tokens or 0) + (chunk.completion_tokens or 0)
 
     return handle
 

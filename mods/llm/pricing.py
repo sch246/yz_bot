@@ -11,12 +11,31 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import logging
 from math import isfinite
+import re
 from zoneinfo import ZoneInfo
 
 
 PRICE_KEYS = ("prompt_price", "prompt_cached_price", "completion_price")
 UNIT = 1_000_000
+_log = logging.getLogger(__name__)
+_reminded: set[tuple[int, int]] = set()
+
+
+def _remind_stale_dates(source: str, moment: datetime) -> None:
+    """Warn once a year when every date a price_fn lists lies in an earlier year.
+
+    WHY: 维护者 2026-10-23：DeepSeek 的峰谷价按中国法定节假日算，节假日表是手写在
+    price_fn 里的，只写到当年；过了年没补，节假日会被当成高峰，账上多算一倍。不替人
+    猜下一年的放假安排，只提醒去补。
+    """
+    years = [int(year) for year in re.findall(r"['\"](\d{4})-\d{2}-\d{2}['\"]", source)]
+    if not years or moment.year <= max(years) or (max(years), moment.year) in _reminded:
+        return
+    _reminded.add((max(years), moment.year))
+    _log.warning("price_fn 里列的日期只到 %d 年，现在是 %d 年：节假日表要补上今年的（llm_system/config）",
+                 max(years), moment.year)
 
 
 def _number(value) -> float:
@@ -43,6 +62,7 @@ def unit_prices(provider, capabilities, when: datetime | None = None) -> dict:
     assert isinstance(source, str) and source.strip(), "price_fn 必须是非空 Python 函数源码"
     moment = when if when is not None else datetime.now(timezone.utc)
     assert moment.tzinfo is not None and moment.utcoffset() is not None, "price_fn 的 when 必须带时区"
+    _remind_stale_dates(source, moment)
     namespace = {"ZoneInfo": ZoneInfo}
     exec(source, namespace)
     function = namespace.get("price_fn")

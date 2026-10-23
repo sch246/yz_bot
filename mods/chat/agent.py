@@ -30,7 +30,7 @@ _SEEN_KEY = "seen"
 # （或是一段说明原因的文字）就交接；文件不存在时用下面这份默认，和它写成文件后一模一样。
 DEFAULT_TIDY = """# 什么时候交接。每次子请求结束（stage == "round"）和每次唤醒往这一段追加之前（stage == "assemble"）
 # 各求值一次：前面的行照常执行，最后一行是一个表达式，它的值为真就交接，是字符串时就是交接的原因。
-# 可用的名字：stage、used（这一段上下文的 token 估算）、grown（这次唤醒长了多少）、limit（#limit 设的整理阈值）、
+# 可用的名字：stage、used（这一段上下文的 token 数，以接口上次报的为准，之后追加的按字数估）、grown（这次唤醒长了多少）、limit（#limit 设的整理阈值）、
 # since_handoff（这一段开始了多少秒）、kind（唤醒／闹钟／反思）、hour。
 "上下文太长" if used > limit else None
 """
@@ -56,6 +56,22 @@ def _text_tokens(messages: list[dict]) -> int:
         return value
 
     return _chat_root.count_tokens(json.dumps(strip(messages), ensure_ascii=False))
+
+
+def _context_size(reported, body: list[dict]) -> int:
+    """How long *body* is: the size the API last reported for its first messages, plus an estimate of the rest.
+
+    *reported* is ``[tokens, count]``: the API counted ``tokens`` when ``body[:count]``
+    was the whole request and its answer.
+
+    WHY: 维护者 2026-10-23：以接口返回的为准。字数估算把图片当成几个字，DeepSeek 每张图
+    却最多算 1024 token（官方图像理解文档），图多的群攒上几百张也不会交接，直到撞上单个
+    请求 600 张图或 48 MiB 的上限；接口报的 prompt+completion 连系统提示、工具定义和图片都
+    算在内。报数之后才追加的（工具结果、新画面）还没人报过，先按字数估。
+    """
+    if isinstance(reported, list) and len(reported) == 2 and 0 <= reported[1] <= len(body):
+        return reported[0] + _text_tokens(body[reported[1]:])
+    return _text_tokens(body)
 
 
 def _seen() -> dict:
@@ -360,7 +376,7 @@ def _forced_reason(segment: dict, threshold: int) -> str:
     failures = segment.get("handoff_failures", 0)
     if failures >= _FORCE_AFTER_FAILURES:
         return f"交接连着失败了 {failures} 次"
-    used = _text_tokens(segment["messages"])
+    used = _context_size(segment.get("tokens"), segment["messages"])
     if used > threshold * _FORCE_OVER_THRESHOLD:
         return f"已经长到 {used} token，超过整理阈值的 {_FORCE_OVER_THRESHOLD} 倍"
     return ""
@@ -482,7 +498,7 @@ def _run_agent(model: str | None, turn) -> bool:
         return True
     segment = _segment.load()
     if _did_something(segment["messages"]) and not turn.handoff_failed:
-        reason = _tidy_reason(turn, segment, "assemble", _text_tokens(segment["messages"]))
+        reason = _tidy_reason(turn, segment, "assemble", _context_size(segment.get("tokens"), segment["messages"]))
         if reason:
             if _handoff(turn, reason, model):
                 continuing = turn.handed_off
@@ -617,7 +633,9 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
     session.preserve_native = True
     session.keep_reasoning = True
     session.output_recorded = False
-    initial = _text_tokens(session.messages)
+    session.last_usage = None
+    reported = [segment.get("tokens")]
+    initial = _context_size(reported[0], _body(session))
     turn._chat_usage_tokens = initial
     turn.log["peak"] = max(turn.log["peak"], initial)
 
@@ -628,6 +646,12 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
             _segment.save(segment)
 
     def record_output(assistant, calls):
+        if session.last_usage:
+            # 报的是刚发出去的整份请求加这次回答；回答在这之后才追加进 messages。
+            reported[0] = [session.last_usage, len(_body(session)) + 1]
+            session.last_usage = None
+            if persist:
+                segment["tokens"] = reported[0]
         source = oplog.output(_chat_root.AGENT_WINDOW, assistant, calls)
         if not session.output_recorded:
             first_output()
@@ -646,7 +670,7 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
                 for position, result in enumerate(results)], "")
 
     def turn_done() -> bool:
-        used = _text_tokens(session.messages)
+        used = _context_size(reported[0], _body(session))
         turn._chat_usage_tokens = used
         turn.log["peak"] = max(turn.log["peak"], used)
         save()
