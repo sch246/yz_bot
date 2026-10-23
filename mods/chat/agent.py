@@ -19,7 +19,7 @@ import json
 import threading
 import time
 
-from mods import context, image, llm, oplog, py, storage
+from mods import context, identity, image, llm, oplog, py, storage
 
 import mods.chat as _chat_root
 from . import notes as _notes, reader as _reader, roles as _roles, screen as _screen, segment as _segment, view as _view, windows as _windows
@@ -37,8 +37,6 @@ DEFAULT_TIDY = """# 什么时候交接。每次子请求结束（stage == "round
 # A window shows at least this many lines before its first unseen one.
 _LEAD_IN = 3
 _FRESH_MAX = 200
-# 读画面之后又来的消息在末尾最多展示几条。
-_LATE_MAX = 20
 _KNOWN_PEOPLE = 6
 _TYPING_EVERY = 5
 # 一次唤醒里最多交接几次：防她每一段都调 tidy 时原地打转，不是常态限制。
@@ -183,36 +181,45 @@ def _unread_hint(on_screen: set[tuple]) -> str:
             + "。要看就用 read_log 读原文。") if rows else ""
 
 
-def _late_hint(newest: dict[tuple, tuple], last_shown: dict[str, str]) -> str:
-    """Messages that reached the windows on screen after she read them.
+def _late_arrivals(newest: dict[tuple, tuple], last_shown: dict[str, str],
+                   count: int) -> tuple[list[dict], dict[tuple, tuple]]:
+    """Messages that reached the windows on screen since she read them, to append to this segment.
+
+    Advances *newest* and *last_shown* now; the marks it returns are applied
+    (seen time, read) only once she has produced output after seeing them.
 
     WHY: 维护者 2026-10-23：私聊每条都叫醒她以后，人分几条发的话会在她干活时陆续到，
-    这时不用延迟、也不打断请求，下一次子请求末尾给她看，由她自己决定接不接。放 hint 而不
-    追加进这一段：它随时能从 chatlog 重算，而且下次看这个窗口时画面从上次给到的那条接着
-    给，它们会照常进这一段，追加一次反而会出现两份。
+    不用延迟、也不打断请求，下一次子请求之前写进这一段，由她自己决定接不接（参照 Cortico
+    在轮次边界投递）。以前挂在请求末尾的提示里，每次重算、不进这一段，收尾还要为它们再叫
+    一次。
+
+    WHY: 已读要等她看过以后有了一次输出（哪怕只是思考）才标，维护者说这样最稳：请求失败
+    时它们仍是未读，叫她的那条照样会再叫醒她。`last_shown` 却在追加时就推进，它和这一段
+    一起存盘，这一段里有了它们，下次的画面就不会再给一遍。
+
+    WHY: 只是她自己发出去的回显不单独插一条：她刚 send 的话不用再看一遍，它们留着未读，
+    下次和别的新消息一起出现。
     """
-    blocks = []
-    for window, (_stamp, through) in newest.items():
+    added: list[dict] = []
+    marks: dict[tuple, tuple] = {}
+    bot = identity.bot_id()
+    for window, (_stamp, through) in list(newest.items()):
         late = [entry for entry in oplog.unread(window)
                 if through is None or not oplog.arrival_before_or_at(entry["arrival"], through)]
-        if not late:
+        if not any(entry["event"].get("user_id") != bot for entry in late):
             continue
         label = _screen.label(window)
-        items = _screen.records(window, _LATE_MAX + 1)
-        texts = [item["text"] for item in items]
-        last = last_shown.get(label)
-        after = items[len(texts) - texts[::-1].index(last):] if last in texts else items[-len(late):]
-        shown = after[-_LATE_MAX:]
-        if not shown:
+        text, mark, last = _screen_text(window, count, last_shown.get(label))
+        newest[window] = marks[window] = mark
+        if not text:
             continue
-        head = f"{label} 又来了 {len(late)} 条"
-        if len(late) > len(shown):
-            head += f"，这里是最新的 {len(shown)} 条，更早的用 read_log 读"
-        blocks.append(head + "：\n" + _screen.render(window, shown))
-    if not blocks:
-        return ""
-    return ("你读画面之后，这些消息才到（还没进画面，下次看这个窗口时会在画面里）：\n\n" + "\n\n".join(blocks)
-            + "\n\n人常常一句话分几条发；输入框里打好的话要不要改、还发不发，看完再定。")
+        last_shown[label] = last
+        calls = [f"{entry.get('activation_kind')}"
+                 + (f" 作者={entry['event']['user_id']}" if entry["event"].get("user_id") is not None else "")
+                 for entry in late if entry.get("activated")]
+        head = f"{label} 刚到的消息（{_screen.clock()}" + (f"；叫你的：{'、'.join(calls)}" if calls else "") + "）："
+        added.append({"role": "user", "content": _view.msg_split(head + "\n" + text)})
+    return added, marks
 
 
 def _box_note(boxes: dict) -> str:
@@ -517,6 +524,7 @@ def _run_agent(model: str | None, turn) -> bool:
         return True
 
     def first_output() -> None:
+        started.append(True)
         if notice is not None:
             oplog.acknowledge_notification(notice["id"])
         _mark_seen(newest)
@@ -534,9 +542,25 @@ def _run_agent(model: str | None, turn) -> bool:
             return True
         return False
 
+    started: list[bool] = []
+    unconfirmed: dict[tuple, tuple] = {}
+
+    def late() -> list[dict]:
+        # 第一次输出之前画面还没标已读，刚到的留给下一次请求一起给。
+        if not started:
+            return []
+        added, marks = _late_arrivals(newest, segment["last_shown"], max_events)
+        unconfirmed.update(marks)
+        return added
+
+    def seen_late() -> None:
+        if unconfirmed:
+            _mark_seen(dict(unconfirmed))
+            unconfirmed.clear()
+
     session = _run_session(model, turn, segment, [*segment["messages"], *material], first_output, stop_when,
-                           hints=[lambda: _late_hint(newest, {**segment["last_shown"], **shown_last}),
-                                  lambda: _unread_hint(set(newest))], known=len(segment["messages"]))
+                           providers=[late], hints=[lambda: _unread_hint(set(newest))],
+                           known=len(segment["messages"]), each_output=seen_late)
     return session.output_recorded
 
 
@@ -546,8 +570,8 @@ def _body(session: llm.Chat) -> list[dict]:
 
 
 def _run_session(model: str | None, turn, segment: dict, messages: list[dict], first_output, stop_when,
-                 *, hints=(), load: tuple[str, ...] = (), quiet: bool = False, persist: bool = True,
-                 fail_fast: bool = False, known: int = 0) -> llm.Chat:
+                 *, providers=(), hints=(), load: tuple[str, ...] = (), quiet: bool = False, persist: bool = True,
+                 fail_fast: bool = False, known: int = 0, each_output=None) -> llm.Chat:
     """One model session over the segment plus this wake's material; outputs and results go to the oplog.
 
     With *persist*, the segment file follows the session after every round, but only
@@ -607,6 +631,8 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
         if not session.output_recorded:
             first_output()
         session.output_recorded = True
+        if each_output is not None:
+            each_output()
         return source
 
     def record_results(source, results, _native):
@@ -629,6 +655,8 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
     session.on_results = record_results
     session.turn_done = turn_done
     session.add_context_provider(tool_changes)
+    for provider in providers:
+        session.add_context_provider(provider)
     for hint in hints:
         session.add_hint(hint)
     session.add_hint(lambda: f"现在是 {_screen.clock()}。")

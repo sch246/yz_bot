@@ -641,8 +641,8 @@ def _private_from_peer(event: dict) -> bool:
     """对方在私聊里发来的消息；她自己发出去的那条回显不算。
 
     WHY: 维护者 2026-10-23：私聊每次都要先叫「柚子，」太累，私聊每条都叫醒她。话没说完
-    就回的问题不靠延迟解决（人可能隔几分钟才想到下一句），靠她的沉默纪律和末尾那份
-    「读画面之后又来的消息」，见 view._base_prompt 与 agent._late_hint。
+    就回的问题不靠延迟解决（人可能隔几分钟才想到下一句），靠她的沉默纪律和干活时
+    插进这一段的新消息，见 view._base_prompt 与 agent._late_arrivals。
     """
     return event.get("group_id") is None and event.get("user_id") != identity.bot_id()
 
