@@ -301,6 +301,42 @@ def _tell(text: str) -> None:
     chat.push(chat.windows.ME, "B 站登录", text, wake="B 站登录")
 
 
+def adopt(found) -> str:
+    """Save *found* as her login and check it by reading her own profile; returns what happened."""
+    from bilibili_api import user
+
+    _save_credential(found)
+    state = _state()
+    for key in ("reply", "at", "error", "uid", "name"):
+        state.pop(key, None)
+    try:
+        info = call(user.get_self_info(found))
+        if not info.get("mid"):
+            raise ValueError("资料里没有 uid，票据大概不管用")
+        state.update(uid=info.get("mid"), name=info.get("name"))
+    except Exception as error:
+        return f"B 站登录票据存下了，但用它查自己的资料失败（{type(error).__name__}）：{error}"
+    finally:
+        storage.save()
+    return f"B 站登录好了：{_me()}"
+
+
+def use_cookie(cookie: str) -> str:
+    """Take her login from a ``k=v; k=v`` cookie (her own browser's), save it and check it.
+
+    WHY: 维护者 2026-10-23：柚子有自己的浏览器，可以在里面登 B 站、把 Cookie 取出来交给这里；
+    这个号是她的，Cookie 经过她无所谓。扫码接口哪天再变，这条路不受影响，还顺带 buvid3/buvid4。
+    """
+    from bilibili_api import Credential
+
+    pairs = dict(part.strip().partition("=")[::2] for part in str(cookie).split(";") if "=" in part)
+    if not pairs.get("SESSDATA"):
+        return "Cookie 里没有 SESSDATA，存不了：先在浏览器里登好 B 站，再用 browser__get_cookies(\"https://www.bilibili.com\") 取"
+    return adopt(Credential(sessdata=pairs["SESSDATA"], bili_jct=pairs.get("bili_jct"), buvid3=pairs.get("buvid3"),
+                            buvid4=pairs.get("buvid4"), dedeuserid=pairs.get("DedeUserID"),
+                            ac_time_value=pairs.get("ac_time_value")))
+
+
 _PASSPORT = "https://passport.bilibili.com/x/passport-login/web/qrcode/"
 _BROWSER = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
                           "Chrome/140.0 Safari/537.36", "Referer": "https://www.bilibili.com/"}
@@ -324,7 +360,7 @@ def _login(user_id: int) -> None:
     import io
     from urllib.parse import parse_qsl, urlsplit
 
-    from bilibili_api import Credential, user
+    from bilibili_api import Credential
     import httpx
     import qrcode
 
@@ -351,23 +387,8 @@ def _login(user_id: int) -> None:
                     _tell("B 站扫码确认了，但 B 站没给登录票据（SESSDATA），这次没登上，凭证没存。"
                           f"拿到的字段只有：{'、'.join(sorted(cookies)) or '（没有）'}。")
                     return
-                found = Credential(sessdata=cookies["SESSDATA"], bili_jct=cookies.get("bili_jct"),
-                                   dedeuserid=cookies.get("DedeUserID"), ac_time_value=body.get("refresh_token"))
-                _save_credential(found)
-                state = _state()
-                for key in ("reply", "at", "error", "uid", "name"):
-                    state.pop(key, None)
-                try:
-                    info = call(user.get_self_info(found))
-                    if not info.get("mid"):
-                        raise ValueError("资料里没有 uid，票据大概不管用")
-                    state.update(uid=info.get("mid"), name=info.get("name"))
-                except Exception as error:
-                    storage.save()
-                    _tell(f"B 站登录票据存下了，但用它查自己的资料失败（{type(error).__name__}）：{error}")
-                    return
-                storage.save()
-                _tell(f"B 站登录好了：{_me()}")
+                _tell(adopt(Credential(sessdata=cookies["SESSDATA"], bili_jct=cookies.get("bili_jct"),
+                                       dedeuserid=cookies.get("DedeUserID"), ac_time_value=body.get("refresh_token"))))
                 return
     except Exception as error:
         _tell(f"B 站登录出错了（{type(error).__name__}）：{error}，这次登录作废，要登录就再跑一次 .bili login")

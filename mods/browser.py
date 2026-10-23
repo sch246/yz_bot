@@ -1477,6 +1477,28 @@ def set_cookies(cookie: str, domain: str = "", interval: float = COOKIE_INTERVAL
     return outcome
 
 
+def get_cookies(url: str = "") -> list[dict]:
+    """读浏览器给 *url* 带的 Cookie（含 `httpOnly` 的登录票据，页面里的 JS 读不到这些）。
+
+    @param
+    url: 站点地址，例如 `https://www.bilibili.com`；留空用当前标签页的地址
+    """
+
+    def action(session):
+        session.call("Network.enable", timeout=CALL_TIMEOUT)
+        scope = str(url or "").strip() or str(_evaluate(session, "location.href") or "")
+        if urlparse(scope).scheme not in ("http", "https"):
+            raise ValueError("当前标签页不是 http/https 页面，请用 url 指定站点")
+        found = session.call("Network.getCookies", {"urls": [scope]}, timeout=CALL_TIMEOUT)
+        return [{"name": item.get("name"), "value": item.get("value"), "domain": item.get("domain"),
+                 "httpOnly": bool(item.get("httpOnly"))} for item in found.get("cookies") or []]
+
+    outcome = _with_page(action, create=True)
+    if outcome is None:
+        raise RuntimeError("拿不到标签页")
+    return outcome
+
+
 def clear_cookies(origin: str = "") -> dict:
     """清浏览器里的 Cookie：给 *origin* 只清那个站点看得见的，留空清整个浏览器。
 

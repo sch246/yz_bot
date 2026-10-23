@@ -36,8 +36,10 @@
 ## 需要登录的站点
 
 `set_cookies(cookie, domain)` 把用户提供的整条 Cookie 写进浏览器（走 CDP，`httpOnly` 的票据
-也能写，写一次就留在浏览器 profile 里）；`clear_cookies(origin)` 清掉。Cookie 是**用户的
-凭据**：只按用户在聊天里给的用，不要自己去猜或从别处抓，也不要把它复述进聊天内容。
+也能写，写一次就留在浏览器 profile 里）；`get_cookies(url)` 读出浏览器给某个站点带的 Cookie
+（同样含 `httpOnly`，比如你在浏览器里登了自己的 B 站号，用它取出来交给 `bili__use_cookie`）；
+`clear_cookies(origin)` 清掉。Cookie 是**登录凭据**：用户给的只按用户说的用，不要自己去猜或从
+别处抓；不管是谁的，都不要复述进聊天内容。
 
 ## 边界与红线
 
@@ -274,6 +276,26 @@ def set_cookies(cookie: str, domain: str = "") -> str:
     return "\n".join(lines)
 
 
+def get_cookies(url: str = "") -> str:
+    """读出浏览器给某个站点带的 Cookie，整条 `k=v; k=v` 返回，httpOnly 的登录票据也在里面。
+
+    @param
+    url: 站点地址，例如 `https://www.bilibili.com`；留空用当前标签页的地址
+    """
+    backend = _backend()
+    if backend is None:
+        return "读取失败：浏览器模块没有加载"
+    if not hasattr(backend, "get_cookies"):
+        return "读取失败：浏览器模块还是旧版本，重启（.reboot）之后才会有 get_cookies"
+    try:
+        items = backend.get_cookies(url=url)
+    except Exception as error:
+        return _failed("读取 Cookie", error)
+    if not items:
+        return "这个站点在浏览器里没有 Cookie（还没登录，或者地址不对）"
+    return f"共 {len(items)} 条：\n" + "; ".join(f"{item['name']}={item['value']}" for item in items)
+
+
 def clear_cookies(origin: str = "") -> str:
     """清掉浏览器里的 Cookie；给 origin 只清那个站点，留空清整个浏览器。
 
@@ -460,5 +482,5 @@ def frames(count: int = 4, interval: float = 0.6, region: str = "", scale: float
     return "\n".join(lines)
 
 
-__all__ = ["clear_cookies", "click", "drag", "frames", "press_key", "scroll", "type_text", "look", "open_page", "page_links",
+__all__ = ["clear_cookies", "click", "drag", "frames", "get_cookies", "press_key", "scroll", "type_text", "look", "open_page", "page_links",
            "read_page", "run_js", "screenshot", "set_cookies"]
