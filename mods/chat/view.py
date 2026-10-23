@@ -63,7 +63,9 @@ def incoming(label: str, facts: list[str], text: str) -> list[dict]:
     WHY: 图片拆到框后面单发一条 user，不是因为 tool 消息里看不见——同日用数字图复测，
     deepseek-flash 读得出工具结果里的图（先前"一片白"是纯色测试图的问题）。拆出去是为了不挑
     模型：tool 消息里的图只有登记了 `tool_images` 的模型才原样送出，别的会降级成占位文字；
-    user 消息里的图任何视觉模型都能看（实测 4/4）。图片本身不会冒充系统说话，框里留着
+    user 消息里的图任何视觉模型都能看（实测 4/4）。DeepSeek 官方图像理解文档（维护者
+    2026-10-23 贴来）也只写了 user：Chat Completions 里"图片仅支持出现在 user 消息中"，
+    system、assistant 带图返回 400；tool 消息没提，能用是实测出来的。图片本身不会冒充系统说话，框里留着
     `[图片N]` 对上号。
     """
     call_id = f"{INCOMING}_{uuid4().hex[:12]}"
