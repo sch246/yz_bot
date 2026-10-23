@@ -218,6 +218,8 @@ def poll() -> None:
     found = _load_credential()
     if found is None:
         return
+    if _with_device(found):
+        _save_credential(found)
     state = _state()
     today = datetime.now().strftime("%Y-%m-%d")
     if state.get("refreshed") != today and found.ac_time_value:
@@ -301,10 +303,32 @@ def _tell(text: str) -> None:
     chat.push(chat.windows.ME, "B 站登录", text, wake="B 站登录")
 
 
+def _with_device(found) -> bool:
+    """Give *found* a device identity (buvid3/buvid4) of its own when it lacks one; True when it changed.
+
+    WHY: 维护者 2026-10-23：设备标识这类增强稳定性的要加。凭证里没有 buvid 时，bilibili-api
+    每个进程临时生成、激活一对，重启一次就像换了一台设备，登录却还是同一个，在风控眼里不像
+    真人。所以第一次拿到就存进凭证，之后一直用这一对。拿不到（网络、接口变了）只记日志：
+    没有它照样能用，只是回到库的老办法。
+    """
+    if found.buvid3 and found.buvid4:
+        return False
+    from bilibili_api.utils.network import get_buvid
+
+    try:
+        buvid3, buvid4 = call(get_buvid())
+    except Exception:
+        _stream.exception("B 站设备标识（buvid）拿不到，先不带")
+        return False
+    found.buvid3, found.buvid4 = found.buvid3 or buvid3, found.buvid4 or buvid4
+    return True
+
+
 def adopt(found) -> str:
     """Save *found* as her login and check it by reading her own profile; returns what happened."""
     from bilibili_api import user
 
+    _with_device(found)
     _save_credential(found)
     state = _state()
     for key in ("reply", "at", "error", "uid", "name"):
@@ -364,8 +388,13 @@ def _login(user_id: int) -> None:
     import httpx
     import qrcode
 
+    device = Credential()
+    _with_device(device)
     try:
-        with httpx.Client(headers=_BROWSER, timeout=15) as client:
+        # 扫码也从这台"设备"登：带着之后要存进凭证的那对 buvid，和浏览器里登录一样。
+        with httpx.Client(headers=_BROWSER, timeout=15,
+                          cookies={key: value for key, value in (("buvid3", device.buvid3), ("buvid4", device.buvid4))
+                                   if value}) as client:
             data = client.get(_PASSPORT + "generate").json()["data"]
             picture = io.BytesIO()
             qrcode.make(data["url"]).save(picture, format="PNG")
@@ -388,6 +417,7 @@ def _login(user_id: int) -> None:
                           f"拿到的字段只有：{'、'.join(sorted(cookies)) or '（没有）'}。")
                     return
                 _tell(adopt(Credential(sessdata=cookies["SESSDATA"], bili_jct=cookies.get("bili_jct"),
+                                       buvid3=device.buvid3, buvid4=device.buvid4,
                                        dedeuserid=cookies.get("DedeUserID"), ac_time_value=body.get("refresh_token"))))
                 return
     except Exception as error:
