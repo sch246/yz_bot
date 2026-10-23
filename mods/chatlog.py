@@ -977,8 +977,13 @@ def _reader_index(directory: Path) -> sqlite3.Connection:
                      "position INTEGER, visible INTEGER, PRIMARY KEY (day, source, line))")
     database.execute("CREATE INDEX IF NOT EXISTS reader_order ON reader_rows (day, position)")
     database.execute("CREATE INDEX IF NOT EXISTS reader_ids ON reader_rows (day, message_id, visible)")
-    database.execute("CREATE INDEX IF NOT EXISTS reader_window_ids "
-                     "ON reader_rows (message_id, visible, day, position)")
+    # WHY: reader_window_ids (message_id, visible, day, position) was added for a
+    # cross-day read_around lookup that has since been removed; every remaining
+    # query names its day, which reader_ids covers.  On the device it cost about
+    # 57 MB across the window databases and was rewritten on every day refresh
+    # (2026-10-23 audit).  Existing databases drop it once; the freed pages stay
+    # in the file until someone runs VACUUM by hand.
+    database.execute("DROP INDEX IF EXISTS reader_window_ids")
     return database
 
 

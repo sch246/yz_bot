@@ -161,9 +161,13 @@ def append_policy(name: str, line: str) -> None:
     with _lock:
         path = _policy_path(name)
         path.parent.mkdir(parents=True, exist_ok=True)
-        previous = path.read_bytes() if path.is_file() else b""
+        ending = b""
+        if path.is_file() and path.stat().st_size:
+            with path.open("rb") as stream:
+                stream.seek(-1, os.SEEK_END)
+                ending = stream.read(1)
         with path.open("a", encoding="utf-8") as stream:
-            stream.write(("\n" if previous and not previous.endswith(b"\n") else "") + line.strip() + "\n")
+            stream.write(("\n" if ending and ending != b"\n" else "") + line.strip() + "\n")
 
 
 def listing(limit: int = 60) -> list[dict]:
