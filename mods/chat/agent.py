@@ -37,6 +37,9 @@ DEFAULT_TIDY = """# 什么时候交接。每次子请求结束（stage == "round
 # A window shows at least this many lines before its first unseen one.
 _LEAD_IN = 3
 _FRESH_MAX = 200
+# dismiss 能清回的记号：每次唤醒追加之前，这一段里会被这次唤醒改动的那几项；最多留最近这么多个。
+_MARKED = ("last_shown", "windows", "told", "tokens", "notice")
+_MARKS = 40
 _KNOWN_PEOPLE = 6
 _TYPING_EVERY = 5
 # 一次唤醒里最多交接几次：防她每一段都调 tidy 时原地打转，不是常态限制。
@@ -573,11 +576,17 @@ def _run_agent(model: str | None, turn) -> bool:
         turn.handed_off = ""
     if not material:
         return True
+    mark = ({"at": now, "time": time.time(), "index": len(segment["messages"]),
+             **{key: json.loads(json.dumps(segment.get(key), ensure_ascii=False)) for key in _MARKED},
+             "boxes": {label: box["text"] for label, box in turn.boxes.items() if box.get("text")}}
+            if notice is not None else None)
 
     def first_output() -> None:
         started.append(True)
         if notice is not None:
             oplog.acknowledge_notification(notice["id"])
+        if mark is not None:
+            segment["marks"] = [*segment.get("marks", [])[-(_MARKS - 1):], mark]
         _mark_seen(newest)
         turn.screens.update(screens)
         segment["windows"] = list(dict.fromkeys([*segment["windows"], *screens]))
@@ -612,7 +621,68 @@ def _run_agent(model: str | None, turn) -> bool:
     session = _run_session(model, turn, segment, [*segment["messages"], *material], first_output, stop_when,
                            providers=[late], hints=[lambda: _unread_hint(set(newest))],
                            known=len(segment["messages"]), each_output=seen_late)
+    if getattr(session, "dismiss", None) is not None:
+        # 工具里查过一次；同一次输出里排在它后面的 send、type_word 可能又改了情况，这里再查。
+        problem = _dismiss_problem(session, session.dismiss)
+        if problem:
+            _roles._stream.warning(f"dismiss 没有生效：{problem}")
+        else:
+            _drop_since(segment, session.dismiss)
     return session.output_recorded
+
+
+def request_dismiss(session, since: str = "") -> str:
+    """Called by the `dismiss` tool: drop everything since a wake header once this round ends; returns why not, or "".
+
+    WHY: 维护者 2026-10-23：follow 一个群她看起来很累。这一段里一遍遍叠着"被叫醒、看一眼、
+    没我的事"，她照着这一路往下演，累的是这些痕迹，不是叫醒的次数（先试过攒一批再叫，晚了接不上话，
+    痕迹照样留着，撤了）。现在没什么要做的就清掉：从她点名的那行「这次唤醒你的是」起（不写就是
+    最近一行），画面、插话、思考、工具调用和结果都不留。赌的是她想的时候会有插话：插话照样叫醒她，
+    画面从清掉之前接着给，被清掉的消息和新的连在一起，等于她想的那段时间替她攒了一批。
+
+    WHY: 调过工具也信她：清掉的只是眼前的工作记忆，笔记是文件、行动记录和 llm.log 都还在，
+    和交接时由她决定留什么是同一种信任。只拦两种：那以后她发过话（别人多半在接她的话，她得记得
+    当时为什么这么说；清了只剩聊天记录里那句话）；输入框里有那以后打的、改过的字（本来就有的不拦，
+    维护者说框里的字可能是早先打的）。不跨交接：记号跟着这一段，交接后从新的一段算。
+    """
+    if getattr(session, "quiet", False) or getattr(session, "segment", None) is None:
+        return "只有醒着处理消息的时候能用；交接、反思和子代理里没有可清的"
+    marks = session.segment.get("marks") or []
+    since = " ".join(str(since).split())
+    found = [mark for mark in marks if not since or since in (mark["at"], mark["at"][11:])]
+    if not found:
+        recent = "、".join(mark["at"] for mark in marks[-5:]) or "没有"
+        return f"这一段里找不到「这次唤醒你的是（{since}）」那一行；能清回的最近几次是：{recent}"
+    problem = _dismiss_problem(session, found[-1])
+    if problem:
+        return problem
+    session.dismiss = found[-1]
+    return ""
+
+
+def _dismiss_problem(session, mark: dict) -> str:
+    if (getattr(session, "last_sent", 0) or 0) >= mark["time"]:
+        return f"从 {mark['at']} 起你发过话，这段不能清：别人多半在接你的话，你得记得当时为什么这么说"
+    typed = [label for label, box in session.boxes.items()
+             if box.get("text") and box["text"] != mark["boxes"].get(label)]
+    if typed:
+        return (f"{'、'.join(typed)} 的输入框里有 {mark['at']} 之后打的或改过的字，清掉以后你会不记得打过；"
+                "先 send，或者用 type_word 改回原样或清空，再 dismiss")
+    return ""
+
+
+def _drop_since(segment: dict, mark: dict) -> None:
+    """Put the segment back as it was before *mark*'s wake; what was shown since comes back on the next screen."""
+    shown = [label for label, last in segment.get("last_shown", {}).items() if mark["last_shown"].get(label) != last]
+    segment["messages"] = segment["messages"][:mark["index"]]
+    for key in _MARKED:
+        if mark[key] is None:
+            segment.pop(key, None)
+        else:
+            segment[key] = mark[key]
+    segment["marks"] = [kept for kept in segment.get("marks", []) if kept["time"] < mark["time"]]
+    _segment.save(segment)
+    _chat_root._awaker.dismissed(_windows.parse_all(shown))
 
 
 def _body(session: llm.Chat) -> list[dict]:
@@ -634,6 +704,8 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
     session.requested_reads = turn.requested_reads
     session.associated_windows = turn.associated_windows
     session.boxes = turn.boxes
+    session.segment = segment
+    session.last_sent = segment.get("last_sent", 0.0)
     session.quiet = quiet
     session.fail_fast = fail_fast
     binding = _chat_root._activate_chat(session, messages)
@@ -682,6 +754,8 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
         if persist and session.output_recorded:
             segment["messages"] = _body(session)
             segment["told"] = told[0]
+            if session.last_sent:
+                segment["last_sent"] = session.last_sent
             _segment.save(segment)
 
     def record_output(assistant, calls):

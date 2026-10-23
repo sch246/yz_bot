@@ -43,16 +43,13 @@ follow/mute 是写进笔记的两种语法糖，``wake_me("follow g123 30m", ...
 这类窗口只收到回复和 @，本来就都叫醒她；维护者不要为 follow 一个评论区单独去轮询它，会被限流。
 other 只在内存里，重启就没了，和她用 exec_code 包的钩子一样。
 
-WHY: 2026-10-23 维护者让她 follow 了一个群，每条都叫醒她，她看起来累了；群友讲了麦麦（MaiBot）
-的做法——攒一批再看、连着几次不开口就退避——维护者认可"攒一波再放"。于是覆盖层叫醒的消息
-（默认触发器没认的那些）不当场叫（``gather``）：这个窗口安静 15 秒、或者从第一条起攒满一分钟，才
-叫醒她一次看这一批；之后每批叫醒她都没在这个窗口说话，下一批至少再隔 30 秒、1、2、4 分钟，最多
-5 分钟，她一开口就从头算。@、叫名字、戳一戳、她自己埋的 on/wait 不攒，照样当场叫；她醒着、这个
-窗口又在画面上时，新消息本来就会插进她这一段。
-同一天维护者认可的另一个缺口：她在群里说完话，别人不 @ 她接话，她看不见。所以她在群里 send
-之后的 5 分钟里，这个群算 follow（显示为"说完话自动听"，``spoke``）；连着两批都没开口就不听了，
-再说话重新算。她自己盖的任何一层（包括整类的）都比它优先，``follow g123 off`` 也能提前揭掉。
-这些都只在内存里，重启就没了；攒着还没叫的消息照样是未读，下次醒来看得见。
+WHY: 2026-10-23 她在群里说完话，别人不 @ 她接话，她看不见（维护者认可的缺口，参照群友讲的麦麦
+（MaiBot）回复后观察一会儿）。所以她在群里 send 之后的 5 分钟里，这个群算 follow（显示为"说完话自动听"，
+``spoke``）；连着两次 dismiss 掉看过它的唤醒就不听了，再说话重新算。她自己盖的任何一层（包括整类的）
+都比它优先，``follow g123 off`` 也能提前揭掉。只在内存里，重启就没了。
+同一天试过把覆盖层叫醒的消息攒一批、她不开口就退避，维护者觉得不好（晚了接不上话，痕迹照样留着）：
+follow 一个群让她看起来很累，累的是这一段里叠了一遍遍"被叫醒、看一眼、没我的事"，不是叫醒的次数。
+现在每条照样当场叫醒，没什么要做的就 dismiss，那几次从上下文里清掉，见 ``agent.request_dismiss``。
 """
 
 from __future__ import annotations
@@ -86,11 +83,9 @@ _WHEN = re.compile(r"^\s*(?:[-*]\s+)?when\s+(.+?)\s+->\s+(.+?)\s*$")
 _edit = threading.Lock()
 # 代码设的覆盖层（other），目标原文 → {"decide": 函数, "moment": 到期时刻或 None, "reason": …}。
 _custom: dict[str, dict] = {}
-# 说完话自动听多久、攒一批时等窗口安静多久、最多攒多久、不开口时的间隔从多少起翻倍到多少（秒），
-# 见模块说明最后一段。
-LISTEN, QUIET, LONGEST, BACKOFF, BACKOFF_MAX = 5 * 60, 15, 60, 30, 5 * 60
-# 窗口 → {"spoke": 她上次在这说话的时刻, "woke": [那之后每次攒一批叫醒她的时刻],
-#         "timer": 攒着的那批到点叫醒的计时器, "first": 这批第一条到的时刻, "kind": 叫醒时她看到的原因}
+# 说完话自动听多久（秒），见模块说明最后一段。
+LISTEN = 5 * 60
+# 窗口 → {"spoke": 她上次在这说话的时刻, "dismissed": 那之后 dismiss 掉看过它的唤醒几次}
 _heard: dict[tuple, dict] = {}
 _hearing = threading.Lock()
 _broken: set[str] = set()
@@ -368,16 +363,23 @@ def _layers(now: float) -> list[dict]:
 
 
 def spoke(window: tuple) -> None:
-    """She just sent something into *window*: listen to it for a while, and the silent batches start over."""
+    """She just sent something into *window*: listen to it for a while."""
     with _hearing:
-        heard = _heard.setdefault(tuple(window), {"spoke": 0.0, "woke": [], "timer": None})
-        heard["spoke"], heard["woke"] = time.time(), []
+        _heard[tuple(window)] = {"spoke": time.time(), "dismissed": 0}
+
+
+def dismissed(windows: list[tuple]) -> None:
+    """She dismissed a stretch that showed these windows; two in a row end listening there."""
+    with _hearing:
+        for window in windows:
+            if tuple(window) in _heard:
+                _heard[tuple(window)]["dismissed"] += 1
 
 
 def _listening(window: tuple, now: float) -> dict | None:
     """The automatic follow on a group she has just spoken in, shaped like a layer; None when it is over."""
     heard = _heard.get(window)
-    if window[0] != "group" or heard is None or now >= heard["spoke"] + LISTEN or len(heard["woke"]) >= 2:
+    if window[0] != "group" or heard is None or now >= heard["spoke"] + LISTEN or heard["dismissed"] >= 2:
         return None
     moment = heard["spoke"] + LISTEN
     return {"state": "follow", "target": _windows.label(window), "scope": ("window", window, None),
@@ -439,74 +441,6 @@ def badges(window: tuple) -> list[str]:
     return found + ([describe(auto)] if auto is not None and auto.get("auto") else [])
 
 
-def gather(window: tuple, kind: str) -> None:
-    """A layer wants her for a message in *window*: wake her for the whole batch once it goes quiet.
-
-    *kind* is what she reads in "这次唤醒你的是"; the newest one wins.
-    """
-    window = tuple(window)
-    now = time.time()
-    with _hearing:
-        heard = _heard.setdefault(window, {"spoke": 0.0, "woke": [], "timer": None})
-        if heard["timer"] is None:
-            heard["first"] = now
-        else:
-            heard["timer"].cancel()
-        due = min(now + QUIET, heard["first"] + LONGEST)
-        if heard["woke"]:
-            due = max(due, heard["woke"][-1] + min(BACKOFF_MAX, BACKOFF * 2 ** (len(heard["woke"]) - 1)))
-        heard["kind"] = kind
-        heard["timer"] = threading.Timer(max(0.0, due - now), _release, (window,))
-        heard["timer"].daemon = True
-        heard["timer"].start()
-
-
-def _release(window: tuple) -> None:
-    import mods.chat as chat
-
-    with _hearing:
-        heard = _heard.get(window)
-        # 到点时这批又来了一条、计时器换了新的，这一个就作废。
-        if heard is None or heard["timer"] is not threading.current_thread():
-            return
-        heard["timer"] = None
-        kind = heard["kind"]
-    item = layer(window)
-    if item is not None and item["decide"] is False:
-        return  # 攒着的时候她盖了 mute。
-    try:
-        woke = chat.wake_window(window, kind)
-    except Exception:
-        _stream.exception(f"攒的那批没叫醒她：{_windows.label(window)}")
-        return
-    if woke:
-        with _hearing:
-            heard["woke"].append(time.time())
-
-
-def _start_over(target: str, drop: bool = False) -> bool:
-    """A layer laid on *target* restarts its backoff; *drop* (lifting it) also drops the pending batch.
-
-    Lifting a single window also ends listening there; True when it was listening.
-    """
-    scope = _scope(target)
-    if scope is None or scope[0] == "window" and scope[2] is not None:
-        return False
-    hit = False
-    with _hearing:
-        for window, heard in _heard.items():
-            if not (window[0] == scope[1] if scope[0] == "kind" else window == tuple(scope[1])):
-                continue
-            if drop and scope[0] == "window":
-                hit = _listening(window, time.time()) is not None
-                heard["spoke"] = 0.0
-            if drop and heard["timer"] is not None:
-                heard["timer"].cancel()
-                heard["timer"] = None
-            heard["woke"] = []
-    return hit
-
-
 def _strip_layer(text: str, target: str) -> str:
     return "\n".join(line for line in text.split("\n")
                      if not ((match := _LAYER.match(line)) and match[2] == target))
@@ -514,7 +448,12 @@ def _strip_layer(text: str, target: str) -> str:
 
 def lift(target: str) -> bool:
     """Take every layer off *target*, written or set by code, and stop listening there; False when there was none."""
-    found = _start_over(target, drop=True)
+    scope = _scope(target)
+    window = tuple(scope[1]) if scope is not None and scope[0] == "window" and scope[2] is None else None
+    found = window is not None and _listening(window, time.time()) is not None
+    if window is not None:
+        with _hearing:
+            _heard.pop(window, None)
     found = _custom.pop(target, None) is not None or found
     with _edit:
         text = _notes.read("awaker")
@@ -546,7 +485,6 @@ def override(target: str, decide, until: float | None = None, reason: str = "") 
         if kept != text:
             _notes.write("awaker", kept.strip("\n") + "\n" if kept.strip() else "")
     _custom[target] = {"decide": decide, "moment": until, "reason": str(reason)}
-    _start_over(target)
     item = next(item for item in _layers(time.time()) if item["state"] == "other" and item["target"] == target)
     return f"{target}：{describe(item)}"
 
@@ -598,8 +536,6 @@ def plant(when: str, reason: str, now: float | None = None) -> str:
             base = _strip_layer(base, found[0]["target"])
             _custom.pop(found[0]["target"], None)
         _notes.write("awaker", base.rstrip("\n") + "\n" + line + "\n")
-    if found[0]["kind"] == "layer":
-        _start_over(found[0]["target"])
     return line
 
 
@@ -619,7 +555,7 @@ def report() -> str:
         lines.append(f"{rule['key']}  ← 上次 {shown}")
     lines.extend(f"{item['target']} 覆盖层 {describe(item)}  ← 代码设的，重启就没了"
                  for item in _layers(time.time()) if item["state"] == "other")
-    lines.extend(f"{item['target']} 覆盖层 {describe(item)}  ← 她刚在这说过话，连着两批不开口就停"
+    lines.extend(f"{item['target']} 覆盖层 {describe(item)}  ← 她刚在这说过话，连着两次 dismiss 就停"
                  for window in list(_heard) if (item := layer(window)) is not None and item.get("auto"))
     lines.extend(f"不认识：{line}" for line in skipped)
     return "\n".join(lines)
