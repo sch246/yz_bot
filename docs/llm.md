@@ -155,6 +155,7 @@
 | `amap` | `amap__login`、`amap__search`、`amap__around` 等地点与路线查询 |
 | `host` | `host__read_file`、`host__write_file`、`host__run_command` |
 | `minecraft` | `minecraft__search_mc_mod`、`minecraft__check_mod` |
+| `tts` | `tts__speak`：用 edge-tts（微软 Edge 在线朗读，非官方、免账号）把文字念成 mp3，默认音色晓伊 `zh-CN-XiaoyiNeural`，存进 `data/tmp_files` 返回 `file://` 路径；她再用 `[CQ:record,file=…]` 经 `type_word`／`send` 发语音 |
 | `weather` | `weather__search_city`、`weather__get_realtime_weather`、`weather__get_daily_forecast`、`weather__get_hourly_forecast` |
 
 `host` 是 `exec_code` 之外的常用出口：文件读写和 shell 都不必再绕一次任意代码执行。读取按本次实际截取的窗口计字节，超过 `max_bytes` 时只回大小和后续建议（缩小区间、先 `grep -n` 定位、或用 `assign_tasks` 开子会话通读后带回摘要），不做分页会话。改写靠 `read_file` 首行 header 里的 `line`/`size`/`v` 定位与对账：位置与新内容的写法无关，`v` 只在该区间自读取后被改动过时失配，失配的返回自带现状和新 header。渲染格式与 `.edit` 同源，所以手动编辑和模型改写看到的是同一种东西；它没有目录白名单，`data/`、`config.json`、`.env` 和聊天记录都在可及范围内。
@@ -335,7 +336,7 @@ Chat.chat
 - `recognize_image` 可以下载模型指定的网络图片，或读取模型指定的本机 `file://` 绝对路径，再把图片及识别要求发送给视觉供应商，产生额外网络访问、宿主机文件读取和模型费用；
 - `create_image` 会产生按张计费的外部 API 调用，返回可能过期的临时本地文件路径；
 - `create_image_from_references` 还会下载模型指定的网络图片或读取本机 `file://` 绝对路径，并作为 multipart 文件上传给生图供应商；它同样只返回临时路径，发送须另用 `type_word`／`send` 明确目标；
-- 天气和 MC 搜索会向外部站点发请求。
+- 天气和 MC 搜索会向外部站点发请求；`tts__speak` 会把要念的文字发给微软的在线朗读服务（`speech.platform.bing.com`）。
 
 账户相关配置不进入源码或 storage。`main.py` 启动时加载仓库根的 `.env`：生图调用复用 `BYTECAT_BASE_URL` 并读取独立的 `BYTECAT_IMAGE_API_KEY`；天气调用分别读取 `QWEATHER_API_HOST`、`QWEATHER_KEY_ID`、`QWEATHER_PROJECT_ID` 和可选的 `QWEATHER_PRIVATE_KEY_FILE`。可从 [`.env.example`](../.env.example) 复制空白模板；缺少必需值时，调用会显式失败，不会回退到硬编码账户。
 
