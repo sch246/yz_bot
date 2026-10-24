@@ -560,14 +560,18 @@ def _ready() -> dict:
 
 
 def _snapshot(config: dict, pause: float = 0.0, prefix: str = "shot") -> tuple[str, int]:
-    """解出此刻的最新一帧，返回 (jpg 路径, 它是第几份编码参数下的)。"""
+    """解出此刻的最新一帧，返回 (jpg 路径, 第几份编码参数, 同一次加锁读到的最后收包时刻)。
+
+    收包时刻要跟这一帧一起带出来：解码要花时间，之后再读 `_last_packet` 可能已经是更新的包了，
+    「解出来的这张其实是旧的」就漏掉了（dsh 10-24 22:15 review 第 6 条）。
+    """
     if pause:
         time.sleep(pause)
     with _state:
-        data, epoch = bytes(_gop), _gop_epoch
+        data, epoch, stamped = bytes(_gop), _gop_epoch, _last_packet
     if not data:
         raise RuntimeError("攒的画面刚被清掉，等下一个关键帧再看")
-    return _decode(data, config, prefix), epoch
+    return _decode(data, config, prefix), epoch, stamped
 
 
 def _alive(config: dict) -> bool:
@@ -579,16 +583,20 @@ def _alive(config: dict) -> bool:
     return "device" in (result.stdout or "")
 
 
-def _freshness(config: dict) -> dict:
+def _freshness(config: dict, stamped: float | None = None) -> dict:
     """最后一帧是多久以前的、流还连着吗；静太久了就探一眼手机那头还在不在。
 
     WHY: 掉线时 `_gop` 里还留着最后一帧，`_snapshot` 会把它当成「此刻」交出去，
     看着像游戏卡住（10-24 20:33 草籽清后台把 tailscale 关了，连着几轮都是同一帧弹窗）。
     反过来也不能光看时间：这台手机画面不动时编码器一个包都不发，静着是常态（dsh 10-24
     22:15 的 review 指出的主要问题），所以超过 STALE_SECONDS 才去探活，结果放 alive。
+
+    *stamped* 是 `_snapshot` 同一次加锁里带出来的收包时刻：给了就用它算 age，免得解码那几秒里
+    来了新包、把「这张其实是旧的」漏掉。
     """
     with _state:
-        age = time.time() - _last_packet if _last_packet else None
+        moment = stamped if stamped is not None else _last_packet
+        age = time.time() - moment if moment else None
         connected, error = _connected, _error
     alive = None
     if connected and age is not None and age > STALE_SECONDS:
@@ -619,14 +627,14 @@ def screenshot(wait: float = 0.0, marks: bool = False, elements: bool = False, s
     global _shown, _shown_epoch, _listed, _shown_path, _touched
     config = _ready()
     prefix = "shot" if shown else "frame"
-    path, epoch = _snapshot(config, min(max(wait, 0.0), 10.0), prefix)
+    path, epoch, stamped = _snapshot(config, min(max(wait, 0.0), 10.0), prefix)
     width, height, level = _measure(path)
     if level < DARK:
         _shell(config, "input keyevent KEYCODE_WAKEUP", check=False)
         os.remove(path)
-        path, epoch = _snapshot(config, WAKE_SETTLE, prefix)
+        path, epoch, stamped = _snapshot(config, WAKE_SETTLE, prefix)
         width, height, level = _measure(path)
-    fresh = _freshness(config)
+    fresh = _freshness(config, stamped)
     # 流已经报错、或者静了很久又探不通：这一张是旧的，得明说，别让她把旧画面当成现在。
     # 只是静着（探活还通）也标一下，但分支认 kind、不认文案（dsh 10-24 22:15 review）。
     stale = None
