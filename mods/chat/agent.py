@@ -45,7 +45,8 @@ _KNOWN_PEOPLE = 6
 _TYPING_EVERY = 5
 # 循环：一轮结束后隔几秒叫醒她。
 _LOOP_GAP = 2.0
-# 开着的循环（只在内存里，重启就没了）：在做什么、转到第几轮、下一轮是不是已经排上了。
+# 开着的循环（只在内存里，重启就没了）：在做什么、转到第几轮、下一轮是不是已经排上了、排上的是第几次
+# 排的（她 wait 一下，先排上的那一轮就作废）；她 wait 了还有 `due`（下一轮的时刻）和 `waited`（等了几秒）。
 _loop: dict | None = None
 # 一次唤醒里最多交接几次：防她每一段都调 tidy 时原地打转，不是常态限制。
 _HANDOFFS_PER_WAKE = 3
@@ -553,7 +554,7 @@ def start_loop(note: str) -> dict:
     """
     global _loop
     rounds = _loop["round"] if _loop else 0
-    _loop = {"note": note, "round": rounds, "pending": False}
+    _loop = {"note": note, "round": rounds, "pending": False, "token": 0}
     return dict(_loop)
 
 
@@ -566,27 +567,56 @@ def stop_loop(reason: str) -> dict | None:
     return stopped
 
 
+def wait_loop(seconds: float) -> dict | None:
+    """Called by the `wait` tool: the next round comes *seconds* from now instead of right after this wake.
+
+    WHY: 维护者 2026-10-24：循环开着时 wait 不阻塞，就是"多久之后叫醒我"。要等别人回、等东西加载、
+    等体力恢复时她用它，不必为了等一会儿把循环关掉、再记着重开。已经排上的那一轮作废（换个排号），
+    这次唤醒结束时按 `due` 重排；期间来了消息照样叫醒她，那次唤醒结束也还是按 `due` 排。
+    """
+    loop = _loop
+    if loop is None:
+        return None
+    loop["due"], loop["waited"] = time.time() + seconds, seconds
+    loop["token"] += 1
+    loop["pending"] = False
+    return dict(loop)
+
+
 def _next_loop() -> None:
     """At the end of a wake: queue the next loop round."""
     loop = _loop
     if loop is None or loop["pending"]:
         return
     loop["pending"] = True
-    threading.Timer(_LOOP_GAP, _loop_round, args=(loop,)).start()
+    loop["token"] += 1
+    delay = max(_LOOP_GAP, loop.get("due", 0) - time.time())
+    threading.Timer(delay, _loop_round, args=(loop, loop["token"])).start()
 
 
-def _loop_round(loop: dict) -> None:
-    if _loop is not loop:
-        return  # 这期间她关掉或重开了
+def _loop_round(loop: dict, token: int) -> None:
+    if _loop is not loop or loop["token"] != token:
+        return  # 这期间她关掉、重开了，或者 wait 换了时间
     loop["pending"] = False
+    loop.pop("due", None)
+    waited = loop.pop("waited", None)
     loop["round"] += 1
+    after = f"（等了 {_span(waited)}）" if waited else ""
     try:
-        _chat_root.push(_windows.ME, "循环", f"循环第 {loop['round']} 轮：{loop['note']}",
-                        wake=f"循环第 {loop['round']} 轮：接着做——{loop['note']}；"
-                             "做完了、要等别人、或者不想接着了，用 loop(stop=True) 关掉")
+        _chat_root.push(_windows.ME, "循环", f"循环第 {loop['round']} 轮{after}：{loop['note']}",
+                        wake=f"循环第 {loop['round']} 轮{after}：接着做——{loop['note']}；"
+                             "要等一会儿就 wait(秒数)，到时候再叫你；这件事彻底不做了才 loop(stop=True)")
     except Exception:
         _roles._stream.exception("循环叫醒她失败，循环停了")
         stop_loop("叫醒失败")
+
+
+def _span(seconds: float) -> str:
+    if seconds >= 3600:
+        return f"{seconds / 3600:g} 小时"
+    if seconds >= 60:
+        return f"{seconds / 60:g} 分钟"
+    return f"{seconds:g} 秒"
 
 
 def request_tidy(note: str) -> bool:
