@@ -560,8 +560,9 @@ def _measure(path: str) -> tuple[int, int, float]:
 def screenshot(wait: float = 0.0, marks: bool = False, elements: bool = False) -> dict:
     """截当前画面，返回 `{"uri", "width", "height"}`。
 
-    *marks* 在图上画坐标线和这个方向的键位，结果多一项 `marks`；*elements* 读一遍界面，
-    把控件框出来编号，结果多一项 `elements`（读不出来时是 `elements_error`）。
+    *marks* 画坐标线和这个方向的键位，结果多一项 `marks`；*elements* 读一遍界面、把控件框出来
+    编号，结果多一项 `elements`（读不出来时是 `elements_error`）。画了东西就另存一张，`marked`
+    是它的地址，`uri` 仍是干净的原图。
 
     WHY: 以前每张图都先 `dumpsys power` 问亮没亮，那一次往返 0.15 秒（dsh 实测），比解码还
     贵。现在先解，图整张黑才去点亮：灭屏时流里只有黑帧，正常界面再暗也没那么黑。
@@ -592,7 +593,9 @@ def screenshot(wait: float = 0.0, marks: bool = False, elements: bool = False) -
         except Exception as error:
             shot["elements_error"] = f"{type(error).__name__}: {error}"
     if marks or _listed:
-        _overlay(path, marks, places, _listed)
+        marked = path[:-4] + "-marked.jpg"
+        _overlay(path, marked, marks, places, _listed)
+        shot["marked"] = "file://" + marked
     return shot
 
 
@@ -605,10 +608,13 @@ def _font(size: int):
         return ImageFont.load_default()
 
 
-def _overlay(path: str, grid: bool, places: list[dict], items: list[dict]) -> None:
-    """在截图上画坐标线、键位（K1、K2……，摇杆画出圈和八个方向）和控件框（#1、#2……），原地覆盖。
+def _overlay(path: str, output: str, grid: bool, places: list[dict], items: list[dict]) -> None:
+    """把截图画上坐标线、键位（K1、K2……，摇杆画出圈和八个方向）和控件框（#1、#2……），存成 *output*。
 
     默认字体没有中文，所以图上只写编号，名字在工具结果的列表里。
+
+    WHY: 维护者 2026-10-24：这种标注最大的问题是遮挡，有的按钮上连字都没有，全靠看图标认。所以
+    标注另存一张、和原图一起给她，看内容以原图为准；控件编号写在框外面，不压在图标上。
     """
     from PIL import Image, ImageDraw
 
@@ -641,8 +647,14 @@ def _overlay(path: str, grid: bool, places: list[dict], items: list[dict]) -> No
     for index, item in enumerate(items, 1):
         left, top, right, bottom = item["box"]
         draw.rectangle([left, top, right, bottom], outline=cyan, width=2)
-        draw.text((left + 3, top + 2), f"#{index}", fill=cyan, font=small, **outline)
-    Image.alpha_composite(canvas, layer).convert("RGB").save(path, format="JPEG", quality=85)
+        label = f"#{index}"
+        size = draw.textbbox((0, 0), label, font=small)
+        tall = size[3] - size[1] + 4
+        # 框上面放得下就放上面，贴着屏幕顶边的放到框下面。
+        y = top - tall - 1 if top >= tall + 1 else min(bottom + 1, height - tall)
+        draw.rectangle([left, y, left + size[2] - size[0] + 6, y + tall], fill=(0, 0, 0, 200))
+        draw.text((left + 3, y + 2 - size[1]), label, fill=cyan, font=small)
+    Image.alpha_composite(canvas, layer).convert("RGB").save(output, format="JPEG", quality=85)
 
 
 def _controls(config: dict, width: int, height: int) -> list[dict]:
@@ -676,6 +688,10 @@ def _controls(config: dict, width: int, height: int) -> list[dict]:
             taken.update(id(child) for child in inner)
             label = label or " ".join(child.get("text") or child.get("content-desc") or "" for child in inner)
         label = " ".join(label.split())
+        if not label and clickable:
+            # 只有图标的按钮常常连 content-desc 都没有，开发者起的 id（`iv_search`、`btn_more`）还算个名字。
+            ident = node.get("resource-id", "").rpartition("/")[2]
+            label = f"id:{ident}" if ident else ""
         if not label and not clickable:
             continue
         box = (left * width / across, top * height / down, right * width / across, bottom * height / down)

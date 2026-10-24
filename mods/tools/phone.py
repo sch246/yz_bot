@@ -6,10 +6,11 @@
 
 - `look()` 看一眼当前屏幕：图直接交给你自己看，结果里写着图的宽高。之后的坐标都照**最近
   一次 look 的那张图**写（左上角是 0,0），换算到手机上是工具的事。
-- `look(elements=True)` 另外读一遍界面，列出按钮、文字和坐标，图上框出来编了号，`tap("#3")`
-  就点第 3 个。多花两三秒；游戏画面里读不出东西，别用。
-- `look(marks=True)` 在图上画每 100 像素一条的坐标线，和你定的键位（K1、K2……），估坐标、
-  定键位时用。
+- `look(elements=True)` 另外读一遍界面，列出按钮、文字和坐标，再给一张框出来编了号的图，
+  `tap("#3")` 就点第 3 个。没字的按钮列成 `id:iv_search` 这样，或者“（没有字）”，照图认。
+  多花两三秒；游戏画面里读不出东西，别用。
+- `look(marks=True)` 再给一张画了每 100 像素一条坐标线和你定的键位（K1、K2……）的图，估坐标、
+  定键位时用。标注会挡东西，看内容以干净的那张为准。
 - **动作自己会把做完之后的画面带回来**，不用再补一次 `look`——点一下就能看见点完的样子，
   接着决定下一步就行。只有一种情况才用 `look(wait=3)`：你确知界面还在加载、要看它加载完
   的样子。会动的东西（视频、动画、走路）用 `frames(count, interval)`：隔一会儿取一帧，拼成
@@ -121,8 +122,12 @@ def look(prompt: str = "", wait: float = 0.0, marks: bool = False, elements: boo
         return _failed("看屏幕", error)
     uri, size = shot["uri"], f"{shot['width']}×{shot['height']}"
     lists = _lists(shot)
-    drawn = ("，图上画了坐标线和键位" if marks else "") + ("，框出来的是控件" if shot.get("elements") else "")
-    outcome = _attach_image(uri, f"这是你手机现在的屏幕（{size}，点的时候坐标照这张图{drawn}）。")
+    outcome = _attach_image(uri, f"这是你手机现在的屏幕（{size}，点的时候坐标照这张图）。")
+    if shot.get("marked") and outcome.startswith("✅"):
+        drawn = "、".join(word for word, wanted in (("坐标线和键位（K）", marks), ("控件编号（#）", shot.get("elements")))
+                         if wanted)
+        outcome += "\n" + _attach_image(shot["marked"], f"这是同一张图画上了{drawn}；标注会挡住底下的东西，"
+                                                         "看内容以上一张为准。")
     if outcome.startswith("✅"):
         return f"【手机屏幕】{uri}（{size}）\n{outcome}{lists}" + (f"\n请照它回答：{prompt}" if prompt else "")
     default = (f"这是一台安卓手机的屏幕截图（{size}）：说说屏幕上有什么，列出能点的按钮、图标和输入框，"
