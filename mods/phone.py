@@ -64,7 +64,11 @@ MAX_SIZE = 1280
 MAX_FPS = 10
 BIT_RATE = 4_000_000
 # 多久没人看就关流（秒）。
-IDLE = 300
+# WHY: 冷启动要 5 秒上下（起 server + 等编码器，dsh 实测 5.3 秒），留得比一次对话长，
+# 半小时内再操作就不用重新起。想省电、或者不想让它一直看着屏幕，就把这个数调小。
+IDLE = 1800
+# 整张图的平均亮度（0–255）低于这个数，就当屏幕灭着。灭屏时流里只有黑帧。
+DARK = 10
 # WHY: 游戏满载时 server 要 20–40 秒才接得上（dsh 实测 40 秒）。等得比这短，就会在它快好
 # 的时候判失败，下一轮开头 pkill 把它杀掉、再起一个又超时，一直循环，日志里只有 EOF。
 CONNECT_TIMEOUT = 60
@@ -172,6 +176,10 @@ def _tail(path: str, serial: str, limit: int = 600) -> str:
 
 
 def _idle() -> bool:
+    # WHY: `_used` 是 0 表示这一进程还没看过一眼，不能当成"闲置很久"——否则单独调
+    # `_ensure()`（预热、查状态）起的流线程会立刻自己退出，再等就是等到超时（dsh 实测 90 秒）。
+    if not _used:
+        return False
     return time.time() - _used > IDLE
 
 
@@ -387,6 +395,20 @@ def _ensure() -> None:
             _state.wait(remaining)
 
 
+def warm() -> str:
+    """提前把画面流起好，下一次 look 就不用等冷启动那几秒；不截图、不阻塞。"""
+    global _used, _thread
+    _used = time.time()
+    with _lock:
+        if _thread is not None:
+            return "画面流已经在跑"
+        _stop.clear()
+        thread = threading.Thread(target=_run, name="phone-stream", daemon=True)
+        _thread = thread
+        thread.start()
+    return "画面流开始预热"
+
+
 def stop(reason: str = "") -> str:
     """关掉画面流（下次看时再起）。"""
     with _lock:
@@ -407,15 +429,6 @@ def on_exit() -> None:
 
 
 # --------------------------------------------------------------------------- 看
-
-
-def _awake(config: dict) -> bool:
-    """屏幕灭着就点亮；返回是不是刚点亮的。"""
-    found = re.search(r"mWakefulness=(\w+)", _shell(config, "dumpsys power | grep mWakefulness=", check=False))
-    if found and found.group(1) == "Awake":
-        return False
-    _shell(config, "input keyevent KEYCODE_WAKEUP")
-    return True
 
 
 def _decode(data: bytes, config: dict) -> str:
@@ -452,14 +465,11 @@ def _prune() -> None:
 
 
 def _ready() -> dict:
-    """点亮屏幕、确保流在跑、等到有画面，返回配置。"""
+    """确保流在跑、等到有画面，返回配置。"""
     global _used
     _used = time.time()
     config = _config()
-    woke = _awake(config)
     _ensure()
-    if woke:
-        time.sleep(WAKE_SETTLE)
     with _state:
         # WHY: server 先发设备信息、再去配编码器，所以连上以后第一个关键帧还要等。平时几百毫秒，
         # 游戏满载时能拖很久：dsh 实测原先等 5 秒时撞上过"还没收到关键帧"。所以等得和连接一样久。
@@ -469,21 +479,39 @@ def _ready() -> dict:
     return config
 
 
-def screenshot(wait: float = 0.0) -> dict:
-    """点亮屏幕、确保流在跑，截当前画面，返回 `{"uri", "width", "height"}`。"""
-    global _shown
-    config = _ready()
-    if wait > 0:
-        time.sleep(min(wait, 10.0))
+def _snapshot(config: dict, pause: float = 0.0) -> str:
+    """解出此刻的最新一帧，返回 jpg 路径。"""
+    if pause:
+        time.sleep(pause)
     with _state:
         data = bytes(_gop)
     if not data:
         raise RuntimeError("攒的画面刚被清掉，等下一个关键帧再看")
-    path = _decode(data, config)
-    from PIL import Image
+    return _decode(data, config)
+
+
+def _measure(path: str) -> tuple[int, int, float]:
+    """图的宽、高，和平均亮度（0–255）。"""
+    from PIL import Image, ImageStat
 
     with Image.open(path) as picture:
-        width, height = picture.size
+        return (*picture.size, ImageStat.Stat(picture.convert("L")).mean[0])
+
+
+def screenshot(wait: float = 0.0) -> dict:
+    """截当前画面，返回 `{"uri", "width", "height"}`。
+
+    WHY: 以前每张图都先 `dumpsys power` 问亮没亮，那一次往返 0.15 秒（dsh 实测），比解码还
+    贵。现在先解，图整张黑才去点亮：灭屏时流里只有黑帧，正常界面再暗也没那么黑。
+    """
+    global _shown
+    config = _ready()
+    path = _snapshot(config, min(max(wait, 0.0), 10.0))
+    width, height, level = _measure(path)
+    if level < DARK:
+        _shell(config, "input keyevent KEYCODE_WAKEUP", check=False)
+        path = _snapshot(config, WAKE_SETTLE)
+        width, height, level = _measure(path)
     _shown = (width, height)
     return {"uri": "file://" + path, "width": width, "height": height}
 
@@ -611,11 +639,26 @@ def _point(config: dict, x: float, y: float) -> tuple[int, int]:
     return round(x * across / width), round(y * down / height)
 
 
+def _see(result: dict) -> dict:
+    """动作之后顺手把这一刻的画面并进结果；看不成也不让动作本身失败。
+
+    WHY: 动作一返回画面就是最新的（dsh 实测：下拉通知栏那 7 帧在命令返回时已经全到了），
+    所以这里不用等；动作和看合成一次调用，省掉"做完再 look 一眼"的那一轮模型往返。
+    """
+    try:
+        shot = screenshot()
+    except Exception as error:
+        result["shot_error"] = f"{type(error).__name__}: {error}"
+        return result
+    result.update(uri=shot["uri"], width=shot["width"], height=shot["height"])
+    return result
+
+
 def tap(x: float, y: float) -> dict:
     config = _config()
     left, top = _point(config, x, y)
     _shell(config, f"input tap {left} {top}")
-    return {"at": (left, top)}
+    return _see({"at": (left, top)})
 
 
 def swipe(x1: float, y1: float, x2: float, y2: float, duration: int = 300) -> dict:
@@ -624,21 +667,21 @@ def swipe(x1: float, y1: float, x2: float, y2: float, duration: int = 300) -> di
     duration = max(1, min(int(duration), 60_000))
     _shell(config, f"input swipe {start[0]} {start[1]} {end[0]} {end[1]} {duration}",
            timeout=duration / 1000 + 20)
-    return {"from": start, "to": end, "duration": duration}
+    return _see({"from": start, "to": end, "duration": duration})
 
 
-def key(name: str) -> str:
+def key(name: str) -> dict:
     config = _config()
     code = name.strip().lower()
     code = _KEYS.get(code, code.upper().removeprefix("KEYCODE_"))
     if not re.fullmatch(r"[A-Z0-9_]+", code):
         raise ValueError(f"不认识的按键：{name!r}")
     _shell(config, f"input keyevent KEYCODE_{code}")
-    return code
+    return _see({"code": code})
 
 
-def type_text(text: str, clear: bool = False, enter: bool = False) -> int:
-    """往当前输入框打字，返回字数。
+def type_text(text: str, clear: bool = False, enter: bool = False) -> dict:
+    """往当前输入框打字，返回 `{"count": 字数, ...动作后的画面}`。
 
     WHY: `input text` 只打得出 ASCII，中文走 ADB Keyboard 输入法的广播（dsh 2026-10-24 装好并
     设成了默认输入法）。它必须是当前输入法，否则广播照样成功、什么也没打出来，所以先查一眼。
@@ -658,7 +701,7 @@ def type_text(text: str, clear: bool = False, enter: bool = False) -> int:
         _shell(config, f"am broadcast -a ADB_INPUT_B64 --es msg {encoded}")
     if enter:
         _shell(config, "input keyevent KEYCODE_ENTER")
-    return len(text)
+    return _see({"count": len(text)})
 
 
 def _dump(config: dict) -> str:
@@ -775,4 +818,5 @@ __all__ = [
     "swipe",
     "tap",
     "type_text",
+    "warm",
 ]
