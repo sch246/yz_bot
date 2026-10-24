@@ -654,6 +654,10 @@ def request_dismiss(session, since: str = "") -> str:
     和交接时由她决定留什么是同一种信任。只拦两种：那以后她发过话（别人多半在接她的话，她得记得
     当时为什么这么说；清了只剩聊天记录里那句话）；输入框里有那以后打的、改过的字（本来就有的不拦，
     维护者说框里的字可能是早先打的）。不跨交接：记号跟着这一段，交接后从新的一段算。
+
+    WHY: 维护者 2026-10-24：follow 期间到的消息画面不截，一直 dismiss 就会越攒越多。兜底是思考：
+    一个跟着的窗口里，会被退回去的 follow 期间消息超过 _FRESH_MAX 条，就不让清，她把这批看完留下，
+    画面位置跟着往前推；不想跟了就揭掉 follow。
     """
     if getattr(session, "quiet", False) or getattr(session, "segment", None) is None:
         return "只有醒着处理消息的时候能用；交接、反思和子代理里没有可清的"
@@ -670,9 +674,31 @@ def request_dismiss(session, since: str = "") -> str:
     return ""
 
 
+def _shown_since(segment: dict, mark: dict) -> list[str]:
+    """Labels of the windows shown after *mark*: their screen position moved on since."""
+    return [label for label, last in segment.get("last_shown", {}).items() if mark["last_shown"].get(label) != last]
+
+
+def _piled(window: tuple, mark: dict) -> int:
+    """Follow-time lines of *window* that would come back unread if the stretch since *mark* went."""
+    layer = _chat_root._awaker.layer(window)
+    since = layer.get("since") if layer is not None and layer["state"] == "follow" else None
+    if since is None:
+        return 0
+    seen = mark.get("seen", {}).get(_screen.label(window))
+    return sum(1 for item in _screen.records(window, 1_000_000, since=since)
+               if item["time"] is not None and item["time"] >= int(since) and (seen is None or item["time"] > seen))
+
+
 def _dismiss_problem(session, mark: dict) -> str:
     if (getattr(session, "last_sent", 0) or 0) >= mark["time"]:
         return f"从 {mark['at']} 起你发过话，这段不能清：别人多半在接你的话，你得记得当时为什么这么说"
+    for window in _windows.parse_all(_shown_since(session.segment, mark)):
+        piled = _piled(window, mark)
+        if piled > _FRESH_MAX:
+            label = _screen.label(window)
+            return (f"{label} 从 {mark['at']} 起 follow 期间已经攒了 {piled} 条，超过 {_FRESH_MAX} 条就不能再清："
+                    f"这次留着，把它们看完；不想跟了就 wake_me(\"follow {label} off\")")
     typed = [label for label, box in session.boxes.items()
              if box.get("text") and box["text"] != mark["boxes"].get(label)]
     if typed:
@@ -683,7 +709,7 @@ def _dismiss_problem(session, mark: dict) -> str:
 
 def _drop_since(segment: dict, mark: dict) -> None:
     """Put the segment back as it was before *mark*'s wake; what was shown since comes back on the next screen."""
-    shown = [label for label, last in segment.get("last_shown", {}).items() if mark["last_shown"].get(label) != last]
+    shown = _shown_since(segment, mark)
     segment["messages"] = segment["messages"][:mark["index"]]
     for key in _MARKED:
         if mark[key] is None:
