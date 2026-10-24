@@ -73,6 +73,8 @@ print(attach(phone.stitch(shots, [f"第{i + 1}下" for i in range(8)]), "原地�
 - `phone.find("x,y", target)`：最近看的那张图上这一块，在 target 那张图里跑到了哪（`score`
   低于 0.5 多半没找到）；`phone.stitch(uris, labels)` 把几张图拼成一张。
 - 图要交给自己看：`print(attach(uri, "说明"))`。
+- 脚本要跑很久，`exec_code(..., back="wake")` 放到后台：马上回一张回执，你接着做别的，跑完结果（连同
+  attach 的图）推到 me 窗口叫醒你。`aim`、`frames` 也能这样。
 - 要边拖边连拍，开个线程拖：`threading.Thread(target=phone.swipe, args=(...))`，`start()` 以后
   接着 `phone.burst(...)`。
 
@@ -421,6 +423,11 @@ def aim(area: str, at: str, to: str = "") -> str:
         head = f"还差 {outcome['error']} 像素：{where}，拖了 {outcome['steps']} 下"
     ratio = outcome["ratio"]
     return f"{head}；拖 1 像素画面横着挪 {ratio[0]:g}、竖着挪 {ratio[1]:g} 像素（0 是还没量）"
+
+
+# 拖几下、每下都要截图找，一次要好几秒；连拍也要攒够帧。都可以 back="wake" 放到后台，做完再叫她。
+aim.back = "wait"
+frames.back = "wait"
 
 
 def key(name: str) -> str:

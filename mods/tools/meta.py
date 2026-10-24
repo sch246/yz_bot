@@ -212,6 +212,10 @@ def exec_code(expr: str, code: str, timeout: float) -> str:
     return f"[print输出]\n{printed}\n[结果] {result}" if printed else result
 
 
+# 脚本可以放到后台跑：exec_code(..., back="wake") 立刻回执，跑完结果推到 me 窗口叫醒她（见 mods/tools/_tasks.py）。
+exec_code.back = "wait"
+
+
 def list_tools() -> str:
     """列出完整当前工具状态（目录、已激活说明）、空闲回收、磁盘差异和最近失败；查可用模块名先调用它。"""
     return current_binding().list_text()
