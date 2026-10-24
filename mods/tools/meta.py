@@ -517,6 +517,29 @@ def tidy(note: str = "") -> str:
     return "这一轮结束后交接，之后从新的一段接着做"
 
 
+def loop(note: str = "", stop: bool = False) -> str:
+    """开循环：这次唤醒结束后自动再叫醒你，一轮接一轮接着做手上这件事（玩游戏、一步步操作手机这类要连着做很多轮的事），直到你用 loop(stop=True) 关掉。
+
+    每轮叫醒都会提醒你在做什么。做完了、要等别人、或者不想接着了，就关掉；没关的话一直转到夜里整理的时候。
+
+    @param
+    note: 在做什么、做到哪算完，例如"洛克王国里走到传送点"；每轮叫醒都带着它。开着时再调一次就换成新的说明
+    stop: true 就是关掉循环
+    """
+    from mods import chat
+
+    if stop:
+        stopped = chat.agent.stop_loop("她自己关的")
+        return f"循环关了（转了 {stopped['round']} 轮）" if stopped else "循环本来就没开"
+    session = current_binding().session
+    if getattr(session, "quiet", False) or getattr(session, "segment", None) is None:
+        return "只有醒着处理事情的时候能开循环；交接、反思和子代理里不行"
+    if not note.strip():
+        return "要写在做什么，例如 loop(\"洛克王国里走到传送点\")"
+    chat.agent.start_loop(note.strip())
+    return "循环开着：这一轮结束后会再叫醒你，一轮接一轮，直到你用 loop(stop=True) 关掉"
+
+
 def _format_results(results: Mapping) -> str:
     action_labels = {
         "loaded": "已加载",
@@ -553,6 +576,7 @@ __all__ = [
     "write_note",
     "tidy",
     "dismiss",
+    "loop",
     "wake_me",
     "exec_code",
     "list_tools",

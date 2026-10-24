@@ -43,6 +43,10 @@ _MARKED = ("last_shown", "windows", "scopes", "told", "tokens", "notice")
 _MARKS = 40
 _KNOWN_PEOPLE = 6
 _TYPING_EVERY = 5
+# 循环：一轮结束后隔几秒叫醒她。
+_LOOP_GAP = 2.0
+# 开着的循环（只在内存里，重启就没了）：在做什么、转到第几轮、下一轮是不是已经排上了。
+_loop: dict | None = None
 # 一次唤醒里最多交接几次：防她每一段都调 tidy 时原地打转，不是常态限制。
 _HANDOFFS_PER_WAKE = 3
 _FORCE_AFTER_FAILURES = 2
@@ -516,6 +520,9 @@ def _drive_agent(model: str | None, window: tuple | None) -> bool:
                 return True
             turn.associated_windows.intersection_update(
                 {window for window, _count, active in oplog.pending_summary() if active})
+            # 先排下一轮循环：它隔几秒才到，潜意识照样先整理一遍（维护者 2026-10-24：长时间运行
+            # 恰恰不能停了整理），整理期间到的那一轮由下面 finish_turn 接上。
+            _next_loop()
             if _subconscious.on() and not oplog.has_unnotified():
                 # 她这阵忙完了才轮到潜意识，不挡她的路。它占着同一个 turn，不和她抢这一段；
                 # 期间来的召唤照常登记，下面 finish_turn 看到了就接着处理。
@@ -525,12 +532,61 @@ def _drive_agent(model: str | None, window: tuple | None) -> bool:
             if not context.finish_turn(_chat_root.AGENT_WINDOW, turn, oplog.has_unnotified):
                 return True
     finally:
+        if turn.cancelled:
+            # 被叫停的那一轮，循环也一起停：维护者 ^C 就是要她停下。
+            stop_loop("这一轮被叫停了")
         typing.set()
         image.end_conversation(image_ledger)
         context.end_turn(_chat_root.AGENT_WINDOW, turn)
         # WHY: 循环停下的唯一信号就在这里，见 _run_hint。`#hint` 只有 QQ 窗口有。
         if origin is not None and window is not None and window[0] in _windows.QQ:
             _chat_root._run_hint(window, turn)
+
+
+def start_loop(note: str) -> dict:
+    """Wake her again after every wake until she stops it; returns the loop.
+
+    WHY: 维护者 2026-10-24：她玩游戏时常常不记得接着做，一轮结束会话就停了。循环开着时每轮结束
+    隔 `_LOOP_GAP` 秒，往她自己的 me 窗口推一条"循环第几轮：在做什么"叫醒她，直到她想起来关掉。
+    不设时长（维护者：不知道什么时候需要停下来）；没人干预就一直转到夜里 4 点整理（`reflect`
+    开头关掉它）。维护者叫停她那一轮时也一起停。
+    """
+    global _loop
+    rounds = _loop["round"] if _loop else 0
+    _loop = {"note": note, "round": rounds, "pending": False}
+    return dict(_loop)
+
+
+def stop_loop(reason: str) -> dict | None:
+    """Stop the loop; returns what it was, or None when none was running."""
+    global _loop
+    stopped, _loop = _loop, None
+    if stopped:
+        _roles._stream.info("循环关了（转了 %d 轮）：%s", stopped["round"], reason)
+    return stopped
+
+
+def _next_loop() -> None:
+    """At the end of a wake: queue the next loop round."""
+    loop = _loop
+    if loop is None or loop["pending"]:
+        return
+    loop["pending"] = True
+    threading.Timer(_LOOP_GAP, _loop_round, args=(loop,)).start()
+
+
+def _loop_round(loop: dict) -> None:
+    if _loop is not loop:
+        return  # 这期间她关掉或重开了
+    loop["pending"] = False
+    loop["round"] += 1
+    try:
+        _chat_root.push(_windows.ME, "循环", f"循环第 {loop['round']} 轮：{loop['note']}",
+                        wake=f"循环第 {loop['round']} 轮：接着做——{loop['note']}；"
+                             "做完了、要等别人、或者不想接着了，用 loop(stop=True) 关掉")
+    except Exception:
+        _roles._stream.exception("循环叫醒她失败，循环停了")
+        stop_loop("叫醒失败")
 
 
 def request_tidy(note: str) -> bool:
@@ -960,6 +1016,8 @@ def reflect(model: str | None = None) -> bool:
     （归档的上下文、聊天记录、行动记录、笔记的历史版本）查原因，再决定改不改。
     占住 AGENT_WINDOW，期间来的召唤照常登记，结束后由 pick_up_pending 接上。
     """
+    # 她开着循环时几乎一直在忙，先关掉，这一轮做完反思就接得上（awaker 下一分钟再来）。
+    stop_loop("夜里整理")
     turn, owner = context.begin_turn(_chat_root.AGENT_WINDOW)
     if not owner:
         return False
