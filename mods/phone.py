@@ -66,7 +66,10 @@ CONFIG_PATH = os.path.join("data", "device", "phone.json")
 ROOT = os.path.abspath(os.path.join("data", "phone"))
 SHOT_DIR = os.path.join(ROOT, "shots")
 SERVER_LOG = os.path.join(ROOT, "server.log")
-SHOT_KEEP = 30
+# WHY: 她这一段上下文里引用着之前的截图，按原路径读；删早了，下次请求那张就成了一行占位字，前缀
+# 缓存也从那儿断开。一段里图多了就会交接，几百张够盖住一段。后台连拍的单帧不进这个数（见
+# `screenshot` 的 *shown*）。
+SHOT_KEEP = 300
 
 REMOTE_JAR = "/data/local/tmp/scrcpy-server-1.25.jar"
 SERVER_CLASS = "com.genymobile.scrcpy.Server"
@@ -96,8 +99,12 @@ DOWN, UP, MOVE = 0, 1, 2
 # 点一下按多久、按住以后推到位用多久（秒）。
 TAP_PRESS = 0.05
 GLIDE = 0.15
-# 触摸之后等多久再截动作后的画面（秒），见 `_see`。估的，没在手机上量过。
-TOUCH_SETTLE = 0.15
+# aim：拖完等视角停稳再截（游戏镜头常带缓动，估的）；模板边长占图宽的比例；低于这个相似度
+# 就当没找到；离目标多少像素以内算对准。
+AIM_SETTLE = 0.4
+PATCH = 0.1
+MATCH_MIN = 0.5
+AIM_CLOSE = 12
 # 按住的手指多久没碰手机就自己松开（秒）：她被别的消息叫走、忘了松手时，角色不会一直跑下去。
 HOLD_MAX = 60
 MARKS = os.path.join(ROOT, "marks.json")
@@ -109,7 +116,7 @@ _DIRECTIONS = {
     "up": 0, "up-right": 45, "right": 90, "down-right": 135, "down": 180, "down-left": 225,
     "left": 270, "up-left": 315,
 }
-_POINT = re.compile(r"\(?\s*(-?\d+(?:\.\d+)?)\s*[,，\s]\s*(-?\d+(?:\.\d+)?)\s*\)?")
+_POINT = re.compile(r"\(?\s*([-+]?\d+(?:\.\d+)?)\s*[,，\s]\s*([-+]?\d+(?:\.\d+)?)\s*\)?")
 KEYBOARD = "com.android.adbkeyboard/.AdbIME"
 # keyboard() 切换的两个输入法：设置页上的名字、默认输入法里认它的那段。
 _KEYBOARDS = {"adb": ("ADB Keyboard", "adbkeyboard"), "sogou": ("搜狗", "sogou")}
@@ -117,6 +124,13 @@ _DUMP = "/sdcard/yuzu-ui.xml"
 MAX_TEXT = 2000
 # 连拍拼图里每一格的长边（像素）。
 CELL = 400
+# 自动连拍（`waves`）：最快几秒看一次；比画面变了多少时把图缩到多宽、一个像素的灰度差过多少才算它
+# 变了；变过以后静下来几秒算停了；开了以后一直没动，等她多久。都是估的。
+WATCH_MIN = 0.5
+WATCH_WIDTH = 160
+WATCH_PIXEL = 24
+WATCH_SETTLE = 2.0
+WATCH_START = 60.0
 MAX_OUTPUT = 4000
 
 _KEYS = {
@@ -148,6 +162,8 @@ _packets = 0
 _bytes = 0
 _last_packet = 0.0
 _used = 0.0
+# 她自己上一次看、点手机的时刻；后台连拍不算。按着的手指按它判断有没有人管。
+_touched = 0.0
 # 最近一次给她看的那张图有多大：她给的坐标都照这张图。
 _shown: tuple[int, int] | None = None
 _screen: tuple[int, int] | None = None
@@ -163,6 +179,8 @@ _gop_epoch = 0
 _shown_epoch = -1
 # 最近一次 look 列出的控件，"#3" 指第 3 个。
 _listed: list[dict] = []
+# 最近一次给她看的那张图存在哪：aim、find 从它上面取她指的那块。
+_shown_path = ""
 
 
 # --------------------------------------------------------------------------- 配置与 adb
@@ -490,10 +508,10 @@ def on_exit() -> None:
 # --------------------------------------------------------------------------- 看
 
 
-def _decode(data: bytes, config: dict) -> str:
+def _decode(data: bytes, config: dict, prefix: str = "shot") -> str:
     os.makedirs(SHOT_DIR, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}"
-    path = os.path.join(SHOT_DIR, f"shot-{stamp}.jpg")
+    path = os.path.join(SHOT_DIR, f"{prefix}-{stamp}.jpg")
     source = path[:-4] + ".h264"
     with open(source, "wb") as handle:
         handle.write(data)
@@ -538,7 +556,7 @@ def _ready() -> dict:
     return config
 
 
-def _snapshot(config: dict, pause: float = 0.0) -> tuple[str, int]:
+def _snapshot(config: dict, pause: float = 0.0, prefix: str = "shot") -> tuple[str, int]:
     """解出此刻的最新一帧，返回 (jpg 路径, 它是第几份编码参数下的)。"""
     if pause:
         time.sleep(pause)
@@ -546,7 +564,7 @@ def _snapshot(config: dict, pause: float = 0.0) -> tuple[str, int]:
         data, epoch = bytes(_gop), _gop_epoch
     if not data:
         raise RuntimeError("攒的画面刚被清掉，等下一个关键帧再看")
-    return _decode(data, config), epoch
+    return _decode(data, config, prefix), epoch
 
 
 def _measure(path: str) -> tuple[int, int, float]:
@@ -557,25 +575,34 @@ def _measure(path: str) -> tuple[int, int, float]:
         return (*picture.size, ImageStat.Stat(picture.convert("L")).mean[0])
 
 
-def screenshot(wait: float = 0.0, marks: bool = False, elements: bool = False) -> dict:
+def screenshot(wait: float = 0.0, marks: bool = False, elements: bool = False, shown: bool = True) -> dict:
     """截当前画面，返回 `{"uri", "width", "height"}`。
 
     *marks* 画坐标线和这个方向的键位，结果多一项 `marks`；*elements* 读一遍界面、把控件框出来
     编号，结果多一项 `elements`（读不出来时是 `elements_error`）。画了东西就另存一张，`marked`
     是它的地址，`uri` 仍是干净的原图。
 
+    *shown* 为假时只截图：存成 `frame-*.jpg`（不进 `SHOT_KEEP` 那一堆，用完由调用方删），也不改她
+    "最近看的那张"——坐标、`#n` 列表、`aim` 取图都还照她看过的那张。后台连拍用它：她看的是拼图，
+    拼图上的坐标本来就不能拿去点。
+
     WHY: 以前每张图都先 `dumpsys power` 问亮没亮，那一次往返 0.15 秒（dsh 实测），比解码还
     贵。现在先解，图整张黑才去点亮：灭屏时流里只有黑帧，正常界面再暗也没那么黑。
     """
-    global _shown, _shown_epoch, _listed
+    global _shown, _shown_epoch, _listed, _shown_path, _touched
     config = _ready()
-    path, epoch = _snapshot(config, min(max(wait, 0.0), 10.0))
+    prefix = "shot" if shown else "frame"
+    path, epoch = _snapshot(config, min(max(wait, 0.0), 10.0), prefix)
     width, height, level = _measure(path)
     if level < DARK:
         _shell(config, "input keyevent KEYCODE_WAKEUP", check=False)
-        path, epoch = _snapshot(config, WAKE_SETTLE)
+        os.remove(path)
+        path, epoch = _snapshot(config, WAKE_SETTLE, prefix)
         width, height, level = _measure(path)
-    _shown, _shown_epoch, _listed = (width, height), epoch, []
+    if not shown:
+        return {"uri": "file://" + path, "width": width, "height": height}
+    _shown, _shown_epoch, _listed, _shown_path = (width, height), epoch, [], path
+    _touched = time.time()
     shot = {"uri": "file://" + path, "width": width, "height": height}
     places = []
     if marks:
@@ -717,8 +744,8 @@ def _frames(data: bytes, wanted: list[int], config: dict, folder: str) -> list[s
     return [os.path.join(folder, name) for name in found]
 
 
-def _grid(pictures: list, path: str) -> tuple[int, int]:
-    """按时间顺序排成一张图，格子左上角标 #1、#2……；返回 (列, 行)。"""
+def _grid(pictures: list, path: str, labels: list[str] | None = None) -> tuple[int, int]:
+    """按顺序排成一张图，格子左上角标 #1、#2……（或 *labels*）；返回 (列, 行)。"""
     from PIL import Image, ImageDraw
 
     ratio = CELL / max(pictures[0].size)
@@ -733,7 +760,7 @@ def _grid(pictures: list, path: str) -> tuple[int, int]:
     for index, picture in enumerate(pictures):
         x = gap + index % cols * (width + gap)
         y = gap + index // cols * (height + gap + header)
-        draw.text((x + 2, y + 2), f"#{index + 1}", fill=(20, 20, 20), font=font)
+        draw.text((x + 2, y + 2), labels[index] if labels else f"#{index + 1}", fill=(20, 20, 20), font=font)
         canvas.paste(picture.convert("RGB").resize((width, height)), (x, y + header))
     canvas.save(path, format="JPEG", quality=85, optimize=True)
     return cols, rows
@@ -749,7 +776,7 @@ def burst(count: int = 20, interval: float = 0.4) -> dict:
     一张张 look 做不到这么密，每次都要等模型来回一趟。所以这段时间里读流线程把收到的包
     另抄一份，最后只调一次 ffmpeg，解出要的那几帧。
     """
-    global _used, _tap, _tap_frames
+    global _used, _touched, _tap, _tap_frames
     count, interval = max(2, min(int(count), 30)), max(0.2, min(float(interval), 5.0))
     config = _ready()
     with _state:
@@ -767,7 +794,7 @@ def burst(count: int = 20, interval: float = 0.4) -> dict:
     finally:
         with _state:
             recorded, _tap = _tap or [], None
-    _used = time.time()
+    _used = _touched = time.time()
     seconds = round(time.monotonic() - began, 1)
     os.makedirs(SHOT_DIR, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}"
@@ -793,6 +820,116 @@ def burst(count: int = 20, interval: float = 0.4) -> dict:
         os.rmdir(folder)
     _prune()
     return {"uri": "file://" + path, "count": len(pictures), "seconds": seconds, "cols": cols, "rows": rows}
+
+
+def _change(before, after) -> float:
+    """两张缩小的灰度图之间，百分之几的像素变了。"""
+    import numpy
+
+    if before.shape != after.shape:
+        return 100.0
+    return float((numpy.abs(before - after) > WATCH_PIXEL).mean() * 100)
+
+
+def waves(count: int = 20, interval: float = WATCH_MIN, threshold: float = 5.0, stop: threading.Event | None = None):
+    """自动连拍：每 *interval* 秒（最快 `WATCH_MIN`）看一眼，比上一张留下的变了 *threshold*% 以上就留下，
+    攒满 *count* 张拼成一张交出来；变过以后静下来 `WATCH_SETTLE` 秒，交出最后一波就结束。*stop* 被
+    设上时不交剩下的、直接结束。
+
+    每一波是 `{"uri", "count", "began", "seconds", "last", "reason"}`：`began` 是第一张的时刻，
+    `last` 为真的那波是最后一波，`reason` 说为什么停。格子上标着离这一波第一张几秒、离上一张几秒。
+    第一波的第一张是开始时的样子；最后一波的最后一张是静下来以后的样子。
+
+    WHY: 维护者 2026-10-24：一组组定时连拍太笨，要"画面变了就截、攒够一波就发、静下来就停"，治她
+    截图不积极。画面不动时这台手机的编码器什么都不发（见文件头），没收到新包就不解码：静着的时候
+    几乎不花什么，动着的时候每看一眼都要把关键帧以来的包解一遍（游戏满载时零点几到一两秒）。
+
+    WHY: 开了以后要等她：开连拍、推摇杆是两次工具调用，中间隔着她想的那几秒，那时画面还没动，按
+    `WATCH_SETTLE` 算就提前停了。所以动过之前等到 `WATCH_START`；静下来的时间也从她最后一次碰手机
+    算起，点了按钮、界面还没反应过来时不会停。
+    """
+    global _touched
+    count = max(2, min(int(count), 30))
+    interval = max(WATCH_MIN, min(float(interval), 5.0))
+    threshold = max(0.1, min(float(threshold), 100.0))
+    stop = stop or threading.Event()
+    _touched = time.time()
+    shot = screenshot(shown=False)
+    # 从第一张截到算起：流刚起的时候这一张可能要等几十秒。
+    began = time.time()
+    kept = [(shot["uri"].removeprefix("file://"), began)]
+    reference = _gray(kept[0][0], WATCH_WIDTH)[0]
+    previous = None
+    moved = None
+    latest = ""
+    with _state:
+        seen = _packets
+    try:
+        while not stop.wait(interval):
+            now = time.time()
+            with _state:
+                packets = _packets
+            if packets != seen:
+                seen = packets
+                path = screenshot(shown=False)["uri"].removeprefix("file://")
+                gray = _gray(path, WATCH_WIDTH)[0]
+                _drop(latest)
+                latest = ""
+                if _change(reference, gray) >= threshold:
+                    kept.append((path, now))
+                    reference, moved = gray, now
+                else:
+                    latest = path
+            if len(kept) >= count:
+                yield _wave(kept, previous, False, "")
+                previous, kept = kept[-1][1], []
+                continue
+            if moved is None and now - max(began, _touched) >= WATCH_START:
+                reason = f"开了以后 {WATCH_START:g} 秒画面都没怎么动"
+            elif moved is not None and now - max(moved, _touched) >= WATCH_SETTLE:
+                reason = f"画面静下来了（{WATCH_SETTLE:g} 秒里变动都不到 {threshold:g}%）"
+            elif now - _touched >= IDLE:
+                reason = f"{IDLE // 60} 分钟没碰手机"
+            else:
+                continue
+            if latest:
+                kept.append((latest, now))
+                latest = ""
+            if kept:
+                yield _wave(kept, previous, True, reason)
+            else:
+                yield {"uri": "", "count": 0, "began": now, "seconds": 0.0, "last": True, "reason": reason}
+            kept = []
+            return
+    finally:
+        # 被叫停、出了错、或者调用方不再往下取：没交出去的单帧都删掉。
+        for path, _moment in kept:
+            _drop(path)
+        _drop(latest)
+
+
+def _drop(path: str) -> None:
+    if path:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _wave(kept: list[tuple[str, float]], previous: float | None, last: bool, reason: str) -> dict:
+    """把这一波的单帧拼成一张、删掉单帧；格子标 `#n 几秒 (+离上一张几秒)`。"""
+    first = kept[0][1]
+    labels = []
+    for index, (_path, moment) in enumerate(kept):
+        before = kept[index - 1][1] if index else previous
+        labels.append(f"#{index + 1} {moment - first:.1f}s" + (f" (+{moment - before:.1f})" if before else ""))
+    try:
+        uri = stitch([path for path, _moment in kept], labels)
+    finally:
+        for path, _moment in kept:
+            _drop(path)
+    return {"uri": uri, "count": len(kept), "began": first, "seconds": round(kept[-1][1] - first, 1),
+            "last": last, "reason": reason}
 
 
 # --------------------------------------------------------------------------- 动
@@ -850,8 +987,8 @@ def _spot(at: str) -> dict:
     把摇杆往上推到边。返回 `{"key", "label", "x", "y", "from"}`：`key` 是按住时手指的名字，
     `from` 是起手按下的点（推摇杆时是它的中心）。
 
-    WHY: 维护者 2026-10-24 觉得这就是安卓模拟器的键位映射，应该设计得简单点：所以摇杆只有八个
-    方向、一推到边，没有格数和角度。
+    WHY: 维护者 2026-10-24 觉得这就是安卓模拟器的键位映射，应该设计得简单点：所以方向只有八个、
+    一推到边，没有格数和角度。推到中间某一点、点控件旁边一点，另给偏移，见 `_moved`。
     """
     if _shown is None:
         raise RuntimeError("还没看过手机画面：先 look 一眼，坐标照那张图写")
@@ -893,22 +1030,24 @@ def _spot(at: str) -> dict:
     return {"key": key, "label": f"{key} {rest[0]}", "x": round(x), "y": round(y), "from": center}
 
 
-def _see(result: dict, settle: float = 0.0) -> dict:
-    """动作之后顺手把这一刻的画面并进结果；看不成也不让动作本身失败。
+def _moved(spot: dict, offset: str) -> dict:
+    """*spot* 再挪 *offset*（`"dx,dy"`，图上的像素，右、下为正）；起手按下的点不变。
 
-    WHY: 动作一返回画面就是最新的（dsh 实测：下拉通知栏那 7 帧在命令返回时已经全到了），
-    所以这里不用等；动作和看合成一次调用，省掉"做完再 look 一眼"的那一轮模型往返。那是照
-    `input` 量的，它等应用处理完才返回；走控制连接的触摸是异步注入，先等 *settle* 秒。
+    WHY: 维护者 2026-10-24：八个方向太粗，摇杆要能推到相对中心的任意一点，点击也要能在控件、键位
+    旁边偏一点。起手点留在原处：推摇杆仍从中心按下再滑过去（见 `hold`），按住技能键再拖就是拖着瞄准。
     """
-    if settle:
-        time.sleep(settle)
-    try:
-        shot = screenshot()
-    except Exception as error:
-        result["shot_error"] = f"{type(error).__name__}: {error}"
-        return result
-    result.update(uri=shot["uri"], width=shot["width"], height=shot["height"])
-    return result
+    if not offset.strip():
+        return spot
+    found = _POINT.fullmatch(offset.strip())
+    if not found:
+        raise ValueError(f"偏移写成 \"dx,dy\"，右、下为正，例如 \"40,-90\"；你写的是「{offset}」")
+    dx, dy = (float(value) for value in found.groups())
+    x, y = spot["x"] + dx, spot["y"] + dy
+    width, height = _shown
+    if not (0 <= x <= width and 0 <= y <= height):
+        raise ValueError(f"挪到 ({x:g}, {y:g}) 就出了画面：最近那张图是 {width}×{height}")
+    label = f"{spot['label']} 偏 {dx:+g},{dy:+g}" if spot["label"] else ""
+    return {**spot, "label": label, "x": round(x), "y": round(y)}
 
 
 def _fresh() -> None:
@@ -918,14 +1057,14 @@ def _fresh() -> None:
     （1.25 的 Device.getPhysicalPoint）。转屏、流断了重连都会重发编码参数，这之后她手里那张图
     的尺寸就不一定对了；与其点了没反应还不知道，不如让她先看一眼。
     """
-    global _used
+    global _used, _touched
     if _shown is None:
         raise RuntimeError("还没看过手机画面：先 look 一眼，坐标照那张图写")
     if _control is None:
         raise RuntimeError(f"手机画面流没开着（{IDLE // 60} 分钟没用会自己关）：先 look 一眼再点")
     if _epoch != _shown_epoch:
         raise RuntimeError("看过以后屏幕转过方向、或者画面流重连过：先 look 一眼再点")
-    _used = time.time()
+    _used = _touched = time.time()
 
 
 def _touch(action: int, finger: int, x: float, y: float) -> bytes:
@@ -967,20 +1106,29 @@ def _lift(reason: str) -> None:
 
 
 def _expire() -> None:
-    """读流线程调：按着的手指没人管太久就松开；连拍还在拍时不算没人管。"""
-    if _held and _tap is None and time.time() - _used > HOLD_MAX:
+    """读流线程调：按着的手指没人管太久就松开；连拍还在拍时不算没人管。
+
+    看的是 `_touched` 而不是 `_used`：后台连拍一直在截图，`_used` 一直是新的，按它算的话忘了松的
+    手指永远松不开。
+    """
+    if _held and _tap is None and time.time() - _touched > HOLD_MAX:
         _lift(f"{HOLD_MAX} 秒没碰手机")
 
 
-def tap(at: str) -> dict:
-    """点一下 *at*（写法见 `_spot`），返回那个点。按着的手指不受影响：这一下用的是另一根。"""
+def tap(at: str, offset: str = "") -> dict:
+    """点一下 *at*（写法见 `_spot`，*offset* 见 `_moved`），返回那个点。按着的手指不受影响：这一下用的是另一根。
+
+    WHY: 维护者 2026-10-24：截图和操作分开更好。动作顺手带回的那张图是在固定时刻截的，常常太早
+    或太晚；有了它她也就不主动去看了。所以动作只管做，要看由她自己挑时候 look（界面在动给 wait），
+    想一直看着就开后台连拍。下面几个动作同。
+    """
     _fresh()
-    spot = _spot(at)
+    spot = _moved(_spot(at), offset)
     finger = next(_fingers)
     _send(_touch(DOWN, finger, spot["x"], spot["y"]))
     time.sleep(TAP_PRESS)
     _send(_touch(UP, finger, spot["x"], spot["y"]))
-    return _see(spot, TOUCH_SETTLE)
+    return spot
 
 
 def swipe(start: str, end: str, duration: int = 300) -> dict:
@@ -998,20 +1146,19 @@ def swipe(start: str, end: str, duration: int = 300) -> dict:
             _glide(finger, origin, target, duration / 1000)
     finally:
         _send(_touch(UP, finger, *target))
-    return _see({"from": begin, "to": finish, "duration": duration}, TOUCH_SETTLE)
+    return {"from": begin, "to": finish, "duration": duration}
 
 
-def hold(at: str, seconds: float = 0.0) -> dict:
-    """按住 *at* 不放就返回；同名的手指已经按着，就不抬手、滑到新位置。
+def hold(at: str, seconds: float = 0.0, offset: str = "") -> dict:
+    """按住 *at*（再挪 *offset*，见 `_moved`）不放就返回；同名的手指已经按着，就不抬手、滑到新位置。
 
-    *seconds* 大于 0 时按这么久（最多 30 秒）再松开。返回 `_spot` 那个点外加 `kept`（还按着没有）
-    和动作后的画面。
+    *seconds* 大于 0 时按这么久（最多 30 秒）再松开。返回 `_spot` 那个点外加 `kept`（还按着没有）。
 
     WHY: 摇杆要先按住再推：直接在推到的位置按下，浮动摇杆会把那里当成新的中心，角色不动。所以
     新按下的手指先落在摇杆中心，再用 `GLIDE` 秒推过去。
     """
     _fresh()
-    spot = _spot(at)
+    spot = _moved(_spot(at), offset)
     end = (spot["x"], spot["y"])
     with _touching:
         finger = _held.get(spot["key"])
@@ -1027,17 +1174,16 @@ def hold(at: str, seconds: float = 0.0) -> dict:
     if seconds > 0:
         time.sleep(min(seconds, 30.0))
         _up(spot["key"])
-    return _see({**spot, "kept": seconds <= 0}, TOUCH_SETTLE)
+    return {**spot, "kept": seconds <= 0}
 
 
 def release(at: str = "") -> dict:
-    """抬起按着的手指：*at* 写哪个抬哪个，不写全抬；返回 `{"released": 抬起的名字}` 和动作后的画面。"""
-    released = _up(at)
-    return _see({"released": released}, TOUCH_SETTLE) if released else {"released": []}
+    """抬起按着的手指：*at* 写哪个抬哪个，不写全抬；返回 `{"released": 抬起的名字}`。"""
+    return {"released": _up(at)}
 
 
 def _up(at: str) -> list[str]:
-    global _used
+    global _used, _touched
     name = _name(at)
     with _touching:
         if name and name not in _held:
@@ -1047,7 +1193,7 @@ def _up(at: str) -> list[str]:
             _held.clear()
     for finger in fingers.values():
         _send(_touch(UP, finger["id"], *finger["at"]))
-    _used = time.time()
+    _used = _touched = time.time()
     return list(fingers)
 
 
@@ -1069,13 +1215,176 @@ def mark(name: str, at: str = "", radius: float = 0.0, remove: bool = False) -> 
             raise ValueError(f"半径写 0~{max(_shown)}")
         if name not in marks and len(marks) >= MAX_MARKS:
             raise ValueError(f"键位最多 {MAX_MARKS} 个，先删掉用不着的")
-        marks[name] = {"x": spot["x"], "y": spot["y"], "radius": round(radius), "size": list(_shown)}
+        # 挪了位置，aim 量出来的拖动比例照样有效，留着。
+        kept = {"ratio": marks[name]["ratio"]} if "ratio" in marks.get(name, {}) else {}
+        marks[name] = {"x": spot["x"], "y": spot["y"], "radius": round(radius), "size": list(_shown), **kept}
+    _save_marks(marks)
+    return marks
+
+
+def _save_marks(marks: dict) -> None:
     os.makedirs(ROOT, exist_ok=True)
     temporary = MARKS + ".tmp"
     with open(temporary, "w", encoding="utf-8") as handle:
         json.dump(marks, handle, ensure_ascii=False, indent=1)
     os.replace(temporary, MARKS)
-    return marks
+
+
+# --------------------------------------------------------------------------- 对准：画面和拖动距离的换算
+
+
+def _gray(path: str, width: int):
+    """把图缩到 *width* 宽的灰度数组；返回 (数组, 缩了几倍)。"""
+    import numpy
+    from PIL import Image
+
+    with Image.open(path) as picture:
+        scale = picture.width / width
+        small = picture.convert("L").resize((width, max(1, round(picture.height / scale))))
+    return numpy.asarray(small, dtype=numpy.float64), scale
+
+
+def _locate(source: str, x: float, y: float, target: str) -> tuple[float, float, float]:
+    """*source* 上 (x, y) 那一块，在 *target* 里跑到了哪；返回 (x, y, 相似度 0~1)。
+
+    归一化互相关（模板减均值，按窗口方差归一），用 FFT 一次算完整张图；缩到 320 宽来算，
+    够用也快。视角转动不只是平移（透视、远近不同），所以离得越远越不准，`aim` 靠多走几步来补。
+    """
+    import numpy
+
+    image, scale = _gray(target, 320)
+    template_from, _ = _gray(source, 320)
+    half = max(6, round(320 * PATCH / 2))
+    cx, cy = round(x / scale), round(y / scale)
+    top, left = max(0, cy - half), max(0, cx - half)
+    template = template_from[top:cy + half, left:cx + half]
+    if template.shape[0] < 6 or template.shape[1] < 6:
+        raise ValueError(f"({x:g}, {y:g}) 太靠边，取不出一块来比")
+    template = template - template.mean()
+    norm = numpy.sqrt((template * template).sum())
+    if norm < template.size ** 0.5 * 4:
+        raise ValueError(f"({x:g}, {y:g}) 那一块几乎没有花纹（天空、纯色墙），认不出来；换个有东西的点")
+    th, tw = template.shape
+    height, width = image.shape
+    shape = (height + th - 1, width + tw - 1)
+    product = numpy.fft.rfft2(image, shape) * numpy.fft.rfft2(template[::-1, ::-1], shape)
+    correlation = numpy.fft.irfft2(product, shape)[th - 1:height, tw - 1:width]
+    sums = [numpy.pad(values, ((1, 0), (1, 0))).cumsum(0).cumsum(1) for values in (image, image * image)]
+    window = [table[th:, tw:] - table[:-th, tw:] - table[th:, :-tw] + table[:-th, :-tw] for table in sums]
+    spread = numpy.sqrt(numpy.maximum(window[1] - window[0] ** 2 / template.size, 1e-6))
+    score = correlation / (spread * norm)
+    row, column = numpy.unravel_index(int(numpy.argmax(score)), score.shape)
+    found_x = float((column + (cx - left)) * scale)
+    found_y = float((row + (cy - top)) * scale)
+    return found_x, found_y, float(score[row, column])
+
+
+def find(at: str, target: str = "", source: str = "") -> dict:
+    """*source*（默认最近给她看的那张）上 *at* 那一块，在 *target*（默认现在截一张）里的位置。
+
+    返回 `{"x", "y", "score", "uri"}`：`score` 是相似度，0.5 以下多半没找到；`uri` 是 target。
+    脚本里用来判断转了多少、东西还在不在。
+    """
+    spot = _spot(at)
+    source = (source or _shown_path).removeprefix("file://")
+    if not source:
+        raise RuntimeError("还没看过手机画面：先 look 一眼")
+    uri = target or screenshot()["uri"]
+    x, y, score = _locate(source, spot["x"], spot["y"], uri.removeprefix("file://"))
+    return {"x": round(x), "y": round(y), "score": round(score, 2), "uri": "file://" + uri.removeprefix("file://")}
+
+
+def stitch(uris: list[str], labels: list[str] | None = None) -> str:
+    """把几张图按顺序拼成一张（格子上标 *labels*，不给就是 #1、#2……），返回它的地址。"""
+    from PIL import Image
+
+    if not uris:
+        raise ValueError("没给图")
+    if labels is not None and len(labels) != len(uris):
+        raise ValueError("labels 要和图一样多")
+    pictures = []
+    for uri in uris:
+        with Image.open(uri.removeprefix("file://")) as picture:
+            pictures.append(picture.copy())
+    os.makedirs(SHOT_DIR, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}"
+    path = os.path.join(SHOT_DIR, f"shot-{stamp}-stitch.jpg")
+    _grid(pictures, path, labels)
+    _prune()
+    return "file://" + path
+
+
+def _drag(start: tuple, end: tuple, seconds: float) -> None:
+    """拖视角用：按下、慢慢挪过去、停一下再抬。
+
+    WHY: 拖完立刻抬手，手指还带着速度，不少游戏的镜头会顺着惯性再转一截，那就和拖的距离对不上了。
+    """
+    finger = next(_fingers)
+    _send(_touch(DOWN, finger, *start))
+    try:
+        _glide(finger, start, end, seconds)
+        time.sleep(0.1)
+    finally:
+        _send(_touch(UP, finger, *end))
+
+
+def aim(area: str, at: str, to: str = "", tries: int = 4) -> dict:
+    """在 *area*（拖视角的地方：键位名或 "x,y"）拖动，把图上 *at* 那个东西挪到 *to*（默认画面正中）。
+
+    返回 `{"x", "y"}`（它最后在哪，照最后那张图，它也成了"她最近看的那张"，接着按这个坐标点就行）、
+    `error`（离 *to* 还差几像素）、`ratio`（拖 1 像素画面挪几像素，横竖各一个，带正负）、`steps`、`score`。*area* 是键位时，量出来的 `ratio` 存进
+    这个键位，下次第一下拖得更准。
+
+    WHY: 维护者 2026-10-24：操作时最大的问题是定位，核心是把画面映射到拖动距离上，必须对得上，才
+    知道要滑多少才能对准。可这是 3D 场景：镜头绕着角色转时近处的东西比远处挪得多，越靠边透视越歪，
+    游戏还各有灵敏度，画面怎么动没法靠一个比例算准（维护者也指出了这一点）。所以比例只当第一下的
+    估计，真正靠的是闭环：拖一下、在新画面里找那个东西本身、按它实际挪了多少修正，几步收敛；找不到
+    了就停下说跟丢了。
+    """
+    global _used
+    _fresh()
+    origin, thing = _spot(area), _spot(at)
+    width, height = _shown
+    goal = (_spot(to)["x"], _spot(to)["y"]) if to.strip() else (width // 2, height // 2)
+    marks = _marks()
+    stored = marks.get(origin["key"], {}).get("ratio") if origin["label"] else None
+    ratio = list(stored) if stored else [0.0, 0.0]
+    position, picture = (thing["x"], thing["y"]), _shown_path
+    steps, score, shot = 0, 1.0, None
+    for steps in range(1, max(1, min(int(tries), 8)) + 1):
+        error = (goal[0] - position[0], goal[1] - position[1])
+        if math.hypot(*error) <= AIM_CLOSE:
+            steps -= 1
+            break
+        # 比例还不知道的方向先试着拖差值的四分之一：方向猜错了也只偏一点，量出来就知道了。
+        drag = [error[axis] / ratio[axis] if ratio[axis] else error[axis] * 0.25 for axis in (0, 1)]
+        limit = (width * 0.45, height * 0.45)
+        drag = [max(-limit[axis], min(limit[axis], drag[axis])) for axis in (0, 1)]
+        start = (origin["x"], origin["y"])
+        end = (min(max(start[0] + drag[0], 0), width - 1), min(max(start[1] + drag[1], 0), height - 1))
+        drag = [end[0] - start[0], end[1] - start[1]]
+        _drag(start, end, 0.3)
+        time.sleep(AIM_SETTLE)
+        shot = screenshot()
+        x, y, score = _locate(picture, position[0], position[1], shot["uri"].removeprefix("file://"))
+        if score < MATCH_MIN:
+            break
+        for axis, moved in ((0, x - position[0]), (1, y - position[1])):
+            if abs(drag[axis]) >= 8:
+                measured = moved / drag[axis]
+                ratio[axis] = measured if not ratio[axis] else (ratio[axis] + measured) / 2
+        position, picture = (x, y), shot["uri"].removeprefix("file://")
+    _used = time.time()
+    if origin["label"] and origin["key"] in marks and any(ratio):
+        marks[origin["key"]]["ratio"] = [round(value, 3) for value in ratio]
+        _save_marks(marks)
+    result = {"x": round(position[0]), "y": round(position[1]), "goal": goal,
+              "error": round(math.hypot(goal[0] - position[0], goal[1] - position[1])),
+              "ratio": [round(value, 3) for value in ratio], "steps": steps, "score": round(score, 2),
+              "lost": score < MATCH_MIN}
+    if shot is not None:
+        result["uri"] = shot["uri"]
+    return result
 
 
 def key(name: str) -> dict:
@@ -1085,11 +1394,11 @@ def key(name: str) -> dict:
     if not re.fullmatch(r"[A-Z0-9_]+", code):
         raise ValueError(f"不认识的按键：{name!r}")
     _shell(config, f"input keyevent KEYCODE_{code}")
-    return _see({"code": code})
+    return {"code": code}
 
 
 def type_text(text: str, clear: bool = False, enter: bool = False) -> dict:
-    """往当前输入框打字，返回 `{"count": 字数, ...动作后的画面}`。
+    """往当前输入框打字，返回 `{"count": 字数}`。
 
     WHY: `input text` 只打得出 ASCII，中文走 ADB Keyboard 输入法的广播（dsh 2026-10-24 装好并
     设成了默认输入法）。它必须是当前输入法，否则广播照样成功、什么也没打出来，所以先查一眼。
@@ -1109,7 +1418,7 @@ def type_text(text: str, clear: bool = False, enter: bool = False) -> dict:
         _shell(config, f"am broadcast -a ADB_INPUT_B64 --es msg {encoded}")
     if enter:
         _shell(config, "input keyevent KEYCODE_ENTER")
-    return _see({"count": len(text)})
+    return {"count": len(text)}
 
 
 def _dump(config: dict, tries: int = 3) -> str:
@@ -1218,7 +1527,9 @@ def status() -> dict:
 
 
 __all__ = [
+    "aim",
     "burst",
+    "find",
     "hold",
     "key",
     "keyboard",
@@ -1227,9 +1538,11 @@ __all__ = [
     "screenshot",
     "shell",
     "status",
+    "stitch",
     "stop",
     "swipe",
     "tap",
     "type_text",
     "warm",
+    "waves",
 ]

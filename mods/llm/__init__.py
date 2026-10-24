@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Callable, Generator
 import itertools
 import json
@@ -9,6 +10,7 @@ import logging
 import os
 import re
 import threading
+import time
 from datetime import datetime, timezone
 
 from openai import OpenAI
@@ -82,6 +84,13 @@ def usage_cached_tokens(usage) -> int:
 
 
 _MAX_LISTED_TOOLS = 40
+# Files API：传上去的图留多久（秒，对端允许 1 小时到 30 天）；离过期不到多久就当它没了、重传，
+# 免得请求发出去时正好过期；上传出错后多久内不再试、先内联发。
+# WHY: 只有发给模型时用到、又快过期的图才重传，不用的图到期就没了，不会续。7 天而不是 30 天：对端
+# 每个账号最多存 10000 个文件，图多的群一天几百张，30 天会撞上；她上下文里的图很少留过一周。
+FILE_SECONDS = 7 * 24 * 3600
+FILE_MARGIN = 24 * 3600
+FILE_RETRY = 300
 
 
 def _unavailable_message(name: str, available: list[str], problem: str | None = None) -> str:
@@ -252,6 +261,9 @@ class LLMClient:
         self._description_lock = threading.Lock()
         self.request_policy: Callable[[str, dict], dict] | None = None
         self.strict_tools = False
+        # Files API 上传出错后，到这个时刻之前图片先内联发。
+        self._files_down_until = 0.0
+        self._files_lock = threading.Lock()
         self.reload_clients()
 
     @staticmethod
@@ -289,6 +301,7 @@ class LLMClient:
         known = {field: capabilities.get(field, default) for field, default in {
             "vision": False,
             "tool_images": False,
+            "files_api": False,
             "function_calling": False,
             "prompt_price": 0.0,
             "prompt_cached_price": 0.0,
@@ -335,28 +348,31 @@ class LLMClient:
         return [_rewrite_message_images(message, replace) for message in messages]
 
     @staticmethod
-    def _convert_images(messages: list[dict], convert_url: Callable[[str], str], allow_tool_images: bool = False) -> list[dict]:
+    def _convert_images(messages: list[dict], convert_url: Callable[[str], str], allow_tool_images: bool = False,
+                        files: Callable[[str], tuple[list[str], bool] | None] | None = None) -> list[dict]:
+        """把消息里的图换成对端认的 part：给了 *files*（Files API）就引用传过的 file_id，否则内联 data URI。"""
         def replace(uri: str) -> list[dict]:
-            # WHY: 一次对话里同一张图只走一遍这条路径。台账判定失败的直接给占位文本，
-            # 不再重复下载、也不再每轮报一次错；已经查过的成功图静默复用，不刷日志。
+            # WHY: 同一张图只走一遍这条路径。判定过失败的直接给占位文本，不再重复下载、也不再每轮
+            # 报一次错；成功的静默复用，不刷日志——维护者 2026-10-24 贴的日志里，每次唤醒都把上下文
+            # 里上百张图各打两三行。真有事（下载、上传、失败）时由下面和 image 模块各自说一句。
             if image.checked_failed(uri):
                 return [_text_part(format_image_description(uri))]
             quiet = image.checked_in_conversation(uri)
             parts: list[dict] = []
             try:
-                if not quiet:
-                    console.notice(f"🖼️ 正在准备视觉图片：{console.format_uri(uri)}")
-                data_uri = uri if uri.startswith("data:") else convert_url(uri)
+                uploaded = files(uri) if files is not None and not uri.startswith("data:") else None
+                if uploaded is not None:
+                    ids, split = uploaded
+                    pictures = [{"type": "file", "file_id": value} for value in ids]
+                else:
+                    data_uri = uri if uri.startswith("data:") else convert_url(uri)
+                    slices, split = image.split_long_image_data_uri(data_uri)
+                    pictures = [{"type": "image_url", "image_url": {"url": value}} for value in slices]
                 if uri and not uri.startswith("data:"):
                     parts.append(_text_part(f"[下方图片的原始链接: {uri}]"))
-                slices, split = image.split_long_image_data_uri(data_uri)
-                parts.extend({"type": "image_url", "image_url": {"url": value}} for value in slices)
+                parts.extend(pictures)
                 if split:
                     parts.append(_text_part(image.AUTO_IMAGE_SPLIT_PROMPT))
-                    if not quiet:
-                        console.notice(f"✅ 长图已切分为 {len(slices)} 张视觉输入")
-                elif not quiet:
-                    console.notice("✅ 视觉图片已准备")
             except Exception as error:
                 if not quiet:
                     console.error(
@@ -377,6 +393,62 @@ class LLMClient:
                 continue
             result.append(_rewrite_message_images(message, replace, collapse_text=False))
         return result
+
+    def _image_files(self, provider: str, client: OpenAI, uri: str) -> tuple[list[str], bool] | None:
+        """*uri* 那张图在 *provider* 上的 file_id（长图切成几张就有几个）和切没切；没传过就现在传。
+
+        传过的按内容摘要记在 storage 的 `llm_system/image_files`（`{provider: {摘要: {"ids", "split",
+        "expires_at"}}}`），所以同一张图换个地址、换次唤醒都不再传；地址到摘要先查图片模块的别名表，
+        链接过期了也照样引用得到。本地文件的别名按路径、大小、修改时间算，文件删了就算不出来，所以
+        传过的本地图另记一份路径到摘要（`"_paths"`）：截图目录清掉的旧图，她上下文里还看得见。
+
+        图本身读不出来时照常抛错（调用方换成占位文字）。上传出错时返回 None，这张图改成内联发，并在
+        `FILE_RETRY` 秒内不再走这条路，免得 Files API 出问题时每张图每次请求都去撞一次。
+        """
+        from mods import storage
+
+        with self._files_lock:
+            table = storage.get("llm_system", "image_files")
+            known, paths = table.setdefault(provider, {}), table.setdefault("_paths", {})
+        now = time.time()
+        try:
+            digest = image.get_cached_image_digest(uri)
+        except ValueError:
+            digest = paths.get(uri)
+        entry = known.get(digest) if digest else None
+        if entry and entry.get("expires_at", 0) - now > FILE_MARGIN:
+            return list(entry["ids"]), bool(entry.get("split"))
+        path, mime, digest = image.resolve_image_with_digest(uri)
+        entry = known.get(digest)
+        if entry and entry.get("expires_at", 0) - now > FILE_MARGIN:
+            return list(entry["ids"]), bool(entry.get("split"))
+        with open(path, "rb") as stream:
+            data_uri = f"data:{mime};base64," + base64.b64encode(stream.read()).decode("ascii")
+        slices, split = image.split_long_image_data_uri(data_uri)
+        ids = []
+        try:
+            for index, value in enumerate(slices):
+                header, _, payload = value.partition(",")
+                kind = header[5:].split(";")[0]
+                name = f"{digest[:16]}-{index}.{kind.rpartition('/')[2] or 'img'}"
+                uploaded = client.files.create(file=(name, base64.b64decode(payload), kind), purpose="user_data",
+                                               expires_after={"anchor": "created_at", "seconds": FILE_SECONDS})
+                ids.append(str(uploaded.id))
+        except Exception as error:
+            self._files_down_until = time.time() + FILE_RETRY
+            console.error(f"❌ 图片上传到 {provider} 失败，{FILE_RETRY // 60} 分钟内先内联发：{error}")
+            return None
+        with self._files_lock:
+            for stale in [key for key, value in known.items() if value.get("expires_at", 0) <= now]:
+                del known[stale]
+            known[digest] = {"ids": ids, "split": split, "expires_at": int(now + FILE_SECONDS)}
+            if uri.startswith("file:"):
+                paths[uri] = digest
+            alive = {key for name, values in table.items() if name != "_paths" for key in values}
+            for gone in [key for key, value in paths.items() if value not in alive]:
+                del paths[gone]
+        console.notice(f"⬆️ 图片已传到 {provider}（{len(ids)} 个文件）：{console.format_uri(uri)}")
+        return ids, split
 
     def _get_image_description(self, uri: str, vision_model: str, description_cache: dict) -> str | None:
         identities = []
@@ -515,16 +587,18 @@ class LLMClient:
         if client is None:
             raise ValueError(f"Provider {provider} not configured")
         capabilities = ModelCapabilities(**{key: raw_capabilities.get(key, default) for key, default in {
-            "vision": False, "function_calling": False, "tool_images": False,
+            "vision": False, "function_calling": False, "tool_images": False, "files_api": False,
             "prompt_price": 0.0, "prompt_cached_price": 0.0, "completion_price": 0.0,
         }.items()})
+        files = ((lambda uri: self._image_files(provider, client, uri))
+                 if capabilities.files_api and time.time() >= self._files_down_until else None)
         if do_process_image:
-            messages = self._convert_images(messages, image.image_uri_to_data_uri, capabilities.tool_images) if capabilities.vision else self._describe_images(messages, description_cache or {})
+            messages = self._convert_images(messages, image.image_uri_to_data_uri, capabilities.tool_images, files) if capabilities.vision else self._describe_images(messages, description_cache or {})
         elif capabilities.vision and capabilities.tool_images:
             # WHY: `#image off` 管的是聊天里别人发来的图，工具结果里的图是她自己 attach_image
             # 要看的，照样展开。以前 off 把它也换成一行链接，她调了 attach_image 却只看见地址，
             # 以为自己的眼睛不行（2026-10-23 设备上；没设过 #image 时默认就是 off）。
-            messages = [self._convert_images([message], image.image_uri_to_data_uri, True)[0]
+            messages = [self._convert_images([message], image.image_uri_to_data_uri, True, files)[0]
                         if message.get("role") == "tool" else self._replace_images_with_text([message])[0]
                         for message in messages]
         else:

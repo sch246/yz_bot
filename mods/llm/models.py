@@ -126,6 +126,10 @@ def default_config() -> dict:
                 # 哪天变成 400 就把这里改回 False，attach_image 会自动走老路。
                 # 同族的两个旧名一起登记；
                 # 别的供应商没验过，一律不写（默认 False）。
+                # files_api（2026-08-21 上线的 Files API，图传一次、之后发 file_id）没登记：官方文档只写了
+                # user 消息里的 file 块，她看的截图在 tool 消息里，那里收不收没验过。在设备上验过以后，在
+                # 设备配置的这个模型下加 "files_api": true（已有配置不会被这里的默认值覆盖）。
+
                 "deepseek-flash": {"vision": True, "tool_images": True, "function_calling": True, "prompt_price": 2, "prompt_cached_price": 0.04, "completion_price": 8},
                 "deepseek-v4-pro": {"vision": False, "function_calling": True, "prompt_price": 9, "prompt_cached_price": 0.30, "completion_price": 27},
                 "deepseek-v4-flash": {"vision": True, "tool_images": True, "function_calling": True, "prompt_price": 2, "prompt_cached_price": 0.04, "completion_price": 8},

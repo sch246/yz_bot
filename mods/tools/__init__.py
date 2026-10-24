@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass
 from functools import wraps
 import hashlib
@@ -818,16 +818,37 @@ class SessionBinding:
         模块想借会话做点事（例如把图片附加进下一次请求，见 mods/tools/_vision.py）只能绕路：
         工具是 `llm` 那层直接 `tool.call(**arguments)` 执行的，它不认识 binding。代价只是一次
         ContextVar 的 set/reset，"哪些模块能用"这种区别没有第二个地方需要，所以统一包。
+
+        WHY: 函数设了属性 `back`（wait、wake 或 quiet）就多一个同名参数，由这次调用决定结果怎么回来，
+        不写用函数自己设的；wake、quiet 排进后台队列，立刻回执，做完推进 me 窗口（见 `_tasks`）。没设
+        的照旧阻塞，也不多这个参数（维护者 2026-10-24）。
         """
         tools = {}
         for name, original in module.tools.items():
             bound = Tool(original.call, name)
+            default = getattr(original.call, "back", None)
+            parameters = bound.description["function"]["parameters"]["properties"]
+            if default is not None and "back" not in parameters:
+                parameters["back"] = {
+                    "type": "string", "enum": ["wait", "wake", "quiet"],
+                    "description": f"结果怎么回来：wait 等做完再返回；wake 先回一张回执，做完把结果推到 me 窗口叫醒你；"
+                                   f"quiet 做完只记进 me 窗口、不叫你。不写是 {default}"}
+            else:
+                default = None
 
             @wraps(original.call)
-            def bound_call(*args, __call=original.call, **kwargs):
+            def bound_call(*args, __call=original.call, __name=name, __default=default, **kwargs):
+                mode = (kwargs.pop("back", None) or __default) if __default is not None else "wait"
                 token = _current_binding_var.set(self)
                 try:
-                    return __call(*args, **kwargs)
+                    if mode == "wait":
+                        return __call(*args, **kwargs)
+                    from mods.tools import _tasks
+
+                    if mode not in _tasks.MODES:
+                        return f"back 只能是 {'、'.join(_tasks.MODES)}"
+                    # 拷贝要在设好 binding 之后：后台跑的时候 current_binding() 还问得到这次的会话。
+                    return _tasks.submit(__name, copy_context(), lambda: __call(*args, **kwargs), mode)
                 finally:
                     _current_binding_var.reset(token)
 

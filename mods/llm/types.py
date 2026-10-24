@@ -15,6 +15,11 @@ class ModelCapabilities:
     # 那张图里的随机码。所以它按模型登记，未登记一律 False，退回"把图换成占位文字"那条老路：
     # 那条路不会 400，代价只是模型看不到图，比让整次请求失败好。
     tool_images: bool = False
+    # WHY: 对端有没有 Files API、能不能在消息里用 `{"type": "file", "file_id": ...}` 引用传过的图。
+    # 维护者 2026-10-24：每次请求都把上下文里上百张图重新 base64 一遍发过去，DeepSeek 有 Files API
+    # 就该传一次、之后只发 id（官方文档：deepseek-flash，user 消息里的 file 块）。tool 消息里的 file
+    # 块文档没写，所以和 tool_images 一样按模型登记、实测过再开。
+    files_api: bool = False
     function_calling: bool = False
     prompt_price: float = 0.0
     prompt_cached_price: float = 0.0

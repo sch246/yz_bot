@@ -43,6 +43,12 @@ _MARKED = ("last_shown", "windows", "scopes", "told", "tokens", "notice")
 _MARKS = 40
 _KNOWN_PEOPLE = 6
 _TYPING_EVERY = 5
+# 循环：一轮结束后隔几秒叫醒她；她连着几轮什么都没做时间隔翻倍，最长拉到多久。
+_LOOP_GAP = 2.0
+_LOOP_IDLE_MAX = 1800.0
+# 开着的循环（只在内存里，重启就没了）：在做什么、转到第几轮、下一轮是不是已经排上了、排上的是第几次
+# 排的（她 wait 一下，先排上的那一轮就作废）；她 wait 了还有 `due`（下一轮的时刻）和 `waited`（等了几秒）。
+_loop: dict | None = None
 # 一次唤醒里最多交接几次：防她每一段都调 tidy 时原地打转，不是常态限制。
 _HANDOFFS_PER_WAKE = 3
 _FORCE_AFTER_FAILURES = 2
@@ -454,7 +460,9 @@ def _begin(turn, window: tuple | None, kind: str) -> None:
     turn.settling = False
     # 输入框（type_word）跟着这次唤醒走：中途交接换了会话也还在，唤醒结束就没了。
     turn.boxes = {}
-    turn.log = {"kind": kind, "start": time.time(), "peak": 0}
+    turn.log = {"kind": kind, "start": time.time(), "peak": 0, "acts": 0}
+    # 她这次唤醒里自己关了循环：总开关开着也不在这次唤醒结束时再起一串。
+    turn.loop_stopped = False
 
 
 def _keep_typing(turn, window: tuple | None, stop: threading.Event) -> None:
@@ -516,6 +524,9 @@ def _drive_agent(model: str | None, window: tuple | None) -> bool:
                 return True
             turn.associated_windows.intersection_update(
                 {window for window, _count, active in oplog.pending_summary() if active})
+            # 先排下一轮循环：它隔几秒才到，潜意识照样先整理一遍（维护者 2026-10-24：长时间运行
+            # 恰恰不能停了整理），整理期间到的那一轮由下面 finish_turn 接上。
+            _next_loop(turn)
             if _subconscious.on() and not oplog.has_unnotified():
                 # 她这阵忙完了才轮到潜意识，不挡她的路。它占着同一个 turn，不和她抢这一段；
                 # 期间来的召唤照常登记，下面 finish_turn 看到了就接着处理。
@@ -525,12 +536,128 @@ def _drive_agent(model: str | None, window: tuple | None) -> bool:
             if not context.finish_turn(_chat_root.AGENT_WINDOW, turn, oplog.has_unnotified):
                 return True
     finally:
+        if turn.cancelled:
+            # 被叫停的那一轮，循环也一起停：维护者 ^C 就是要她停下。
+            stop_loop("这一轮被叫停了")
         typing.set()
         image.end_conversation(image_ledger)
         context.end_turn(_chat_root.AGENT_WINDOW, turn)
         # WHY: 循环停下的唯一信号就在这里，见 _run_hint。`#hint` 只有 QQ 窗口有。
         if origin is not None and window is not None and window[0] in _windows.QQ:
             _chat_root._run_hint(window, turn)
+
+
+def loop_on() -> bool:
+    """`#loop` 总开关，默认开。"""
+    return bool(storage.get("", "agent").get("loop", True))
+
+
+def start_loop(note: str) -> dict:
+    """Wake her again after every wake until she stops it; returns the loop.
+
+    WHY: 维护者 2026-10-24：她玩游戏时常常不记得接着做，一轮结束会话就停了。循环开着时每轮结束
+    隔 `_LOOP_GAP` 秒，往她自己的 me 窗口推一条"循环第几轮：在做什么"叫醒她，直到她想起来关掉。
+    不设时长（维护者：不知道什么时候需要停下来）；没人干预就一直转到夜里 4 点整理（`reflect`
+    开头关掉它）。维护者叫停她那一轮时也一起停。
+
+    WHY: 维护者 2026-10-24 又定：做成总开关、默认开（`loop_on`）——循环是常态，结束才要刻意。总开关
+    开着时她不用记着开，每次唤醒结束 `_next_loop` 自己起一串；她 `loop(stop=True)` 只结束这一串，
+    下次被别的叫醒又照常转。她可以用这里写上在做什么，没写时每轮只说"接着做手上的事"。
+    """
+    global _loop
+    if _loop is not None:
+        _loop["note"] = note
+        return dict(_loop)
+    _loop = {"note": note, "round": 0, "pending": False, "token": 0}
+    return dict(_loop)
+
+
+def stop_loop(reason: str, rest: bool = False) -> dict | None:
+    """Stop the loop; returns what it was, or None when none was running.
+
+    *rest* is her own stop: with the switch on, no new loop starts when this wake ends.
+    """
+    global _loop
+    stopped, _loop = _loop, None
+    turn = context.get_turn(_chat_root.AGENT_WINDOW)
+    if rest and turn is not None:
+        turn.loop_stopped = True
+    if stopped:
+        _roles._stream.info("循环关了（转了 %d 轮）：%s", stopped["round"], reason)
+    return stopped
+
+
+def _start_quietly() -> dict:
+    global _loop
+    _loop = {"note": "", "round": 0, "pending": False, "token": 0}
+    return _loop
+
+
+def wait_loop(seconds: float) -> dict | None:
+    """Called by the `wait` tool: the next round comes *seconds* from now instead of right after this wake.
+
+    WHY: 维护者 2026-10-24：循环开着时 wait 不阻塞，就是"多久之后叫醒我"。要等别人回、等东西加载、
+    等体力恢复时她用它，不必为了等一会儿把循环关掉、再记着重开。已经排上的那一轮作废（换个排号），
+    这次唤醒结束时按 `due` 重排；期间来了消息照样叫醒她，那次唤醒结束也还是按 `due` 排。
+    """
+    loop = _loop
+    if loop is None:
+        if not loop_on():
+            return None
+        loop = _start_quietly()
+    loop["due"], loop["waited"] = time.time() + seconds, seconds
+    loop["token"] += 1
+    loop["pending"] = False
+    return dict(loop)
+
+
+def _next_loop(turn) -> None:
+    """At the end of a wake: queue the next loop round, starting a loop when the switch is on.
+
+    WHY: 总开关默认开以后，她被叫醒一次没事做、又没 wait 也没关，就会两秒一轮地空转下去。所以这次
+    唤醒里她一个动作都没做（`dismiss` 不算）时，下一轮的间隔翻倍，最长 `_LOOP_IDLE_MAX`；做了任何事
+    就回到 `_LOOP_GAP`。这不是自动结束，只是没人理时转慢一点。
+    """
+    acts, turn.log["acts"] = turn.log.get("acts", 0), 0
+    loop = _loop
+    if loop is None:
+        if not loop_on() or turn.loop_stopped:
+            return
+        loop = _start_quietly()
+    if loop["pending"]:
+        return
+    loop["idle"] = 0 if acts else loop.get("idle", 0) + 1
+    gap = min(_LOOP_GAP * 2 ** loop["idle"], _LOOP_IDLE_MAX)
+    loop["pending"] = True
+    loop["token"] += 1
+    delay = max(gap, loop.get("due", 0) - time.time())
+    threading.Timer(delay, _loop_round, args=(loop, loop["token"])).start()
+
+
+def _loop_round(loop: dict, token: int) -> None:
+    if _loop is not loop or loop["token"] != token:
+        return  # 这期间她关掉、重开了，或者 wait 换了时间
+    loop["pending"] = False
+    loop.pop("due", None)
+    waited = loop.pop("waited", None)
+    loop["round"] += 1
+    after = f"（等了 {_span(waited)}）" if waited else ""
+    doing = loop["note"] or "手上的事"
+    try:
+        _chat_root.push(_windows.ME, "循环", f"循环第 {loop['round']} 轮{after}：{doing}",
+                        wake=f"循环第 {loop['round']} 轮{after}：接着做——{doing}；"
+                             "要等一会儿、或者暂时没事，就 wait(秒数)，到时候再叫你；这件事彻底做完了才 loop(stop=True)")
+    except Exception:
+        _roles._stream.exception("循环叫醒她失败，循环停了")
+        stop_loop("叫醒失败")
+
+
+def _span(seconds: float) -> str:
+    if seconds >= 3600:
+        return f"{seconds / 3600:g} 小时"
+    if seconds >= 60:
+        return f"{seconds / 60:g} 分钟"
+    return f"{seconds:g} 秒"
 
 
 def request_tidy(note: str) -> bool:
@@ -765,6 +892,56 @@ def _fold_since(segment: dict, mark: dict, label: str) -> str:
     return name
 
 
+def _fold_between(segment: dict, mark: dict, after: dict, label: str) -> str:
+    """Replace the wakes from *mark* up to (not including) *after* with one line; what follows stays as it was.
+
+    WHY: 维护者 2026-10-24：潜意识动不了段中间不太好，本以为是像操作数据一样操作上下文。中间收掉一块，
+    那之后她那条下一次请求要按原价重读（缓存只认前面一样的部分），偶尔一次只是几分钱，贵的是每轮都改
+    中间；所以潜意识看得到每处之后有多少 token，值不值由它按说明判断，代码不设门槛。
+
+    和收到最后不同，后面的唤醒还在：它们的记号下标往前挪，区间里第一次给的笔记从这一段和后面的记号里
+    一起退掉（下次再给），工具状态退回区间开头那时的（下次把变化重新说一遍，重复无妨）。区间不含这一段
+    第一次唤醒，开头那条交接留下的 notice 不会在里面。
+    """
+    start, end = mark["index"], after["index"]
+    removed = segment["messages"][start:end]
+    shown = [window for window, last in after["last_shown"].items() if mark["last_shown"].get(window) != last]
+    name = _segment.archive({"started": mark["time"], "windows": shown, "reason": label, "messages": removed}, "folded")
+    where = f"{'、'.join(shown)} 的画面和" if shown else ""
+    line = {"role": "system", "content": (
+        f"【收起】{label}\n（{mark['at'][5:]} 起到 {after['at'][5:]} 之前，{where}你那时的想法、调用，后台整理时收成了"
+        f"上面这一句；原样存在归档段 {name}，加载 memory_system 用 read_context(\"{name}\") 读，search 也搜得到）")}
+    segment["messages"] = [*segment["messages"][:start], line, *segment["messages"][end:]]
+    shift = 1 - len(removed)
+    saved = _text_tokens(removed) - _text_tokens([line])
+    given = [scope for scope in after.get("scopes") or [] if scope not in (mark.get("scopes") or [])]
+
+    def moved(reported):
+        # 接口报的数若是在这一块之后报的，扣掉这一块的估算；报在这一块里面的已经对不上了，改回按字数估。
+        if not (isinstance(reported, list) and len(reported) == 2) or reported[1] <= start:
+            return reported
+        return [reported[0] - saved, reported[1] + shift] if reported[1] >= end else None
+
+    segment["scopes"] = [scope for scope in segment.get("scopes") or [] if scope not in given]
+    segment["tokens"] = moved(segment.get("tokens"))
+    if "told" in mark:
+        segment["told"] = mark["told"]
+    marks = []
+    for other in segment.get("marks", []):
+        if other["time"] < mark["time"]:
+            marks.append(other)
+        elif other["time"] >= after["time"]:
+            other = {**other, "index": other["index"] + shift, "tokens": moved(other.get("tokens"))}
+            if "scopes" in other:
+                other["scopes"] = [scope for scope in other["scopes"] or [] if scope not in given]
+            if "told" in mark:
+                other["told"] = mark["told"]
+            marks.append(other)
+    segment["marks"] = marks
+    _segment.save(segment)
+    return name
+
+
 def _body(session: llm.Chat) -> list[dict]:
     """Everything after the system prompt, which is rebuilt on every wake."""
     return session.messages[_system_count(session):]
@@ -846,6 +1023,8 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
             if persist:
                 segment["tokens"] = reported[0]
         source = oplog.output(_chat_root.AGENT_WINDOW, assistant, calls)
+        turn.log["acts"] = turn.log.get("acts", 0) + sum(
+            1 for call in calls or [] if call.get("function", {}).get("name") != "dismiss")
         if not session.output_recorded:
             first_output()
         session.output_recorded = True
@@ -910,6 +1089,8 @@ def reflect(model: str | None = None) -> bool:
     （归档的上下文、聊天记录、行动记录、笔记的历史版本）查原因，再决定改不改。
     占住 AGENT_WINDOW，期间来的召唤照常登记，结束后由 pick_up_pending 接上。
     """
+    # 她开着循环时几乎一直在忙，先关掉，这一轮做完反思就接得上（awaker 下一分钟再来）。
+    stop_loop("夜里整理")
     turn, owner = context.begin_turn(_chat_root.AGENT_WINDOW)
     if not owner:
         return False

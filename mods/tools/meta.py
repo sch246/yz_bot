@@ -144,6 +144,7 @@ Skill 也是可编辑的长期笔记：把可重复使用的经验、做法、�
 
 from __future__ import annotations
 
+import contextvars
 import io
 import time
 from typing import Mapping
@@ -182,9 +183,17 @@ def exec_code(expr: str, code: str, timeout: float) -> str:
         sep.join(map(str, values)) + end
     )
 
-    def perform():
+    def run():
         exec(code, py.loc)
         return eval(expr, py.loc)
+
+    # WHY: watchdog.run 起的是新线程，ContextVar 不会跟过去，代码里调 `_vision.attach` 就拿不到
+    # 这次的会话、交不出图。脚本操作手机时要把截图交给她看（维护者 2026-10-24：让她用 exec_code
+    # 组合手机操作），所以在调用方上下文的副本里跑。
+    scope = contextvars.copy_context()
+
+    def perform():
+        return scope.run(run)
 
     try:
         try:
@@ -201,6 +210,10 @@ def exec_code(expr: str, code: str, timeout: float) -> str:
             py.loc["print"] = original
     printed = buffer.getvalue().rstrip()
     return f"[print输出]\n{printed}\n[结果] {result}" if printed else result
+
+
+# 脚本可以放到后台跑：exec_code(..., back="wake") 立刻回执，跑完结果推到 me 窗口叫醒她（见 mods/tools/_tasks.py）。
+exec_code.back = "wait"
 
 
 def list_tools() -> str:
@@ -508,6 +521,46 @@ def tidy(note: str = "") -> str:
     return "这一轮结束后交接，之后从新的一段接着做"
 
 
+def loop(note: str = "", stop: bool = False) -> str:
+    """循环：每次唤醒结束后自动再叫醒你，一轮接一轮接着做手上的事（玩游戏、一步步操作手机这类要连着做很多轮的事）。
+
+    总开关开着时循环是常态：不用你开，每次唤醒结束都会接着叫你，你用它写上在做什么就行。要等别人回、等东西加载、暂时没事，用 wait(秒数) 隔一会儿再叫你；这件事彻底做完了才 loop(stop=True)，下次被别的事叫醒时又照常转。一直没人管就转到夜里整理的时候。
+
+    @param
+    note: 在做什么、做到哪算完，例如"洛克王国里走到传送点"；每轮叫醒都带着它，再调一次就换成新的
+    stop: true 就是结束这一串循环
+    """
+    from mods import chat
+
+    if stop:
+        stopped = chat.agent.stop_loop("她自己关的", rest=True)
+        return f"循环关了（转了 {stopped['round']} 轮）" if stopped else "循环本来就没开"
+    session = current_binding().session
+    if getattr(session, "quiet", False) or getattr(session, "segment", None) is None:
+        return "只有醒着处理事情的时候能开循环；交接、反思和子代理里不行"
+    if not note.strip():
+        return "要写在做什么，例如 loop(\"洛克王国里走到传送点\")"
+    chat.agent.start_loop(note.strip())
+    return "循环开着：这一轮结束后会再叫醒你，一轮接一轮；要等就 wait，彻底做完了 loop(stop=True)"
+
+
+def wait(seconds: float) -> str:
+    """循环开着时用：这一轮到此为止，过 seconds 秒再叫醒你接着做（不阻塞，也不关循环）。等别人回复、等东西加载、等体力恢复都用它；期间来了消息照样叫醒你。
+
+    这一批里别的工具照样执行，只是结果这次看不到。
+
+    @param
+    seconds: 过多少秒再叫你，2 到 86400（一天）
+    """
+    from mods import chat
+
+    seconds = max(2.0, min(float(seconds), 86400.0))
+    if chat.agent.wait_loop(seconds) is None:
+        return "循环关着（#loop off），wait 是循环里用的；只是想过一会儿再醒，用 wake_me(\"10m\", 原因)"
+    current_binding().session.turn_done = lambda: True
+    return f"好，这一轮到此为止，{chat.agent._span(seconds)}后再叫你；期间有消息照样叫你"
+
+
 def _format_results(results: Mapping) -> str:
     action_labels = {
         "loaded": "已加载",
@@ -544,6 +597,8 @@ __all__ = [
     "write_note",
     "tidy",
     "dismiss",
+    "loop",
+    "wait",
     "wake_me",
     "exec_code",
     "list_tools",
