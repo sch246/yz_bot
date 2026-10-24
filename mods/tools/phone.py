@@ -14,7 +14,8 @@
 - **动作自己会把做完之后的画面带回来**，不用再补一次 `look`——点一下就能看见点完的样子，
   接着决定下一步就行。只有一种情况才用 `look(wait=3)`：你确知界面还在加载、要看它加载完
   的样子。会动的东西（视频、动画、走路）用 `frames(count, interval)`：隔一会儿取一帧，拼成
-  一张图，#1 最早，按行往右。拼图上的坐标不能拿去点。
+  一张图，#1 最早，按行往右。拼图上的坐标不能拿去点。要一边推摇杆一边看，先
+  `frames(continuous=True)` 把后台连拍开起来，之后每次调用交回一组，看完 `frames(stop=True)`。
 
 ## 动
 
@@ -45,6 +46,11 @@
 
 # WHY: 维护者 2026-10-24：每个动作后都看一眼也可以；看视频时每秒两三张、攒二三十张拼成一张
 # 也可以；只是别一秒五张、一天开八小时那样一直发。所以上面的说明不劝她少看。
+
+import collections
+import os
+import threading
+import time
 
 from mods import get_available
 
@@ -143,23 +149,83 @@ def look(prompt: str = "", wait: float = 0.0, marks: bool = False, elements: boo
     return f"【手机屏幕】{uri}（{size}）\n{outcome}{lists}\n【视觉模型看到】\n{description}"
 
 
-def frames(count: int = 20, interval: float = 0.4, prompt: str = "") -> str:
-    """连着取几帧拼成一张图交给你看，用来看视频、动画这类会动的东西。
+class _Recorder:
+    """后台一直拍：拍满一组就攒着，等下一次 frames(continuous=True) 来取。
 
-    @param
-    count: 取几帧，2~30，默认 20
-    interval: 每帧隔几秒，0.2~5，默认 0.4（一秒两三帧）
-    prompt: 你想从这几帧里看出什么，例如"这段视频讲了什么"；可以留空
+    WHY: 维护者 2026-10-24 —— frames 想要"能一直截、截满一组就发过来"。一次性连拍得等按完
+    摇杆、模型想完才调得起来，开头那几秒就丢了；后台一直拍，调用时取的是一开始就在录的那一组。
     """
-    backend = _backend()
-    if backend is None:
-        return "连拍失败：手机模块没有加载"
-    try:
-        shot = backend.burst(count=count, interval=interval)
-    except Exception as error:
-        return _failed("连拍", error)
-    uri = shot["uri"]
-    what = (f"手机屏幕在 {shot['seconds']:g} 秒里连拍的 {shot['count']} 帧，排成 {shot['rows']} 行 × {shot['cols']} 列，"
+
+    def __init__(self, backend, count: int, interval: float):
+        self.backend, self.count, self.interval = backend, count, interval
+        self.groups = collections.deque()
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True, name="phone-recorder")
+        self.thread.start()
+
+    def _run(self) -> None:
+        while not self.stop.is_set():
+            began = time.monotonic()
+            shots = []
+            for index in range(self.count):
+                delay = began + index * self.interval - time.monotonic()
+                if delay > 0 and self.stop.wait(delay):
+                    break
+                if self.stop.is_set():
+                    break
+                try:
+                    shot = self.backend.screenshot()
+                except Exception:
+                    continue
+                shots.append(str(shot["uri"]).removeprefix("file://"))
+            if shots and not self.stop.is_set():
+                self.groups.append(shots)
+
+    def take(self, wait_seconds: float) -> list:
+        deadline = time.monotonic() + wait_seconds
+        while not self.groups and time.monotonic() < deadline and not self.stop.is_set():
+            time.sleep(0.05)
+        return self.groups.popleft() if self.groups else []
+
+    def close(self) -> None:
+        self.stop.set()
+
+
+_recorder = None
+
+
+def _stop_recorder() -> str:
+    global _recorder
+    if _recorder is None:
+        return "后台连拍本来就没在跑"
+    _recorder.close()
+    _recorder = None
+    return "后台连拍停了"
+
+
+def _stitch(paths: list) -> tuple:
+    """把几张截图拼成一张带格号的图；返回 (uri, 列, 行)。"""
+    from PIL import Image
+
+    pictures = []
+    for item in paths:
+        try:
+            with Image.open(item) as picture:
+                pictures.append(picture.convert("RGB").copy())
+        except Exception:
+            continue
+    if not pictures:
+        return "", 0, 0
+    from mods import phone as phone_backend
+
+    stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}"
+    target = os.path.join(os.path.dirname(paths[0]), f"shot-{stamp}-cont.jpg")
+    cols, rows = phone_backend._grid(pictures, target)
+    return "file://" + target, cols, rows
+
+
+def _burst_reply(uri: str, count: int, seconds: float, cols: int, rows: int, prompt: str) -> str:
+    what = (f"手机屏幕在 {seconds:g} 秒里连拍的 {count} 帧，排成 {rows} 行 × {cols} 列，"
             "#1 最早、从左上角起按行往右")
     outcome = _attach_image(uri, f"这是{what}。这张图上的坐标不能拿去点。")
     if outcome.startswith("✅"):
@@ -174,6 +240,43 @@ def frames(count: int = 20, interval: float = 0.4, prompt: str = "") -> str:
     if not description:
         return f"视觉模型没有返回内容（拼图保存在 {uri}）\n{outcome}"
     return f"【手机连拍】{uri}（{what}）\n{outcome}\n【视觉模型看到】\n{description}"
+
+
+def frames(count: int = 20, interval: float = 0.4, prompt: str = "",
+           continuous: bool = False, stop: bool = False) -> str:
+    """连着取几帧拼成一张图交给你看，用来看视频、动画、走路这类会动的东西。
+
+    @param
+    count: 取几帧，2~30，默认 20
+    interval: 每帧隔几秒，0.2~5，默认 0.4（一秒两三帧）
+    prompt: 你想从这几帧里看出什么，例如"这段视频讲了什么"；可以留空
+    continuous: true 就后台一直拍，拍满一组再来一组；这次调用交回已经攒满的那一组，下次调用交下一组——要一边推摇杆一边看，先开它，开头那几秒才不会漏
+    stop: true 停掉后台连拍
+    """
+    global _recorder
+    backend = _backend()
+    if backend is None:
+        return "连拍失败：手机模块没有加载"
+    if stop:
+        return _stop_recorder()
+    count, interval = max(2, min(int(count), 30)), max(0.2, min(float(interval), 5.0))
+    if not continuous:
+        try:
+            shot = backend.burst(count=count, interval=interval)
+        except Exception as error:
+            return _failed("连拍", error)
+        return _burst_reply(shot["uri"], shot["count"], shot["seconds"], shot["cols"], shot["rows"], prompt)
+    if _recorder is None or (_recorder.count, _recorder.interval) != (count, interval):
+        _stop_recorder()
+        _recorder = _Recorder(backend, count, interval)
+    paths = _recorder.take(max(8.0, count * interval + 8.0))
+    if not paths:
+        return (f"后台连拍开着（每 {interval:g} 秒一张，一组 {count} 张），这一组还没攒满；"
+                "过一会儿再取，或者 frames(stop=True) 停掉")
+    uri, cols, rows = _stitch(paths)
+    if not uri:
+        return "连拍失败：截下来的图一张也读不出来"
+    return _burst_reply(uri, len(paths), round(len(paths) * interval, 1), cols, rows, prompt)
 
 
 def _where(spot: dict) -> str:
