@@ -98,6 +98,12 @@ TAP_PRESS = 0.05
 GLIDE = 0.15
 # 触摸之后等多久再截动作后的画面（秒），见 `_see`。估的，没在手机上量过。
 TOUCH_SETTLE = 0.15
+# aim：拖完等视角停稳再截（游戏镜头常带缓动，估的）；模板边长占图宽的比例；低于这个相似度
+# 就当没找到；离目标多少像素以内算对准。
+AIM_SETTLE = 0.4
+PATCH = 0.1
+MATCH_MIN = 0.5
+AIM_CLOSE = 12
 # 按住的手指多久没碰手机就自己松开（秒）：她被别的消息叫走、忘了松手时，角色不会一直跑下去。
 HOLD_MAX = 60
 MARKS = os.path.join(ROOT, "marks.json")
@@ -163,6 +169,8 @@ _gop_epoch = 0
 _shown_epoch = -1
 # 最近一次 look 列出的控件，"#3" 指第 3 个。
 _listed: list[dict] = []
+# 最近一次给她看的那张图存在哪：aim、find 从它上面取她指的那块。
+_shown_path = ""
 
 
 # --------------------------------------------------------------------------- 配置与 adb
@@ -567,7 +575,7 @@ def screenshot(wait: float = 0.0, marks: bool = False, elements: bool = False) -
     WHY: 以前每张图都先 `dumpsys power` 问亮没亮，那一次往返 0.15 秒（dsh 实测），比解码还
     贵。现在先解，图整张黑才去点亮：灭屏时流里只有黑帧，正常界面再暗也没那么黑。
     """
-    global _shown, _shown_epoch, _listed
+    global _shown, _shown_epoch, _listed, _shown_path
     config = _ready()
     path, epoch = _snapshot(config, min(max(wait, 0.0), 10.0))
     width, height, level = _measure(path)
@@ -575,7 +583,7 @@ def screenshot(wait: float = 0.0, marks: bool = False, elements: bool = False) -
         _shell(config, "input keyevent KEYCODE_WAKEUP", check=False)
         path, epoch = _snapshot(config, WAKE_SETTLE)
         width, height, level = _measure(path)
-    _shown, _shown_epoch, _listed = (width, height), epoch, []
+    _shown, _shown_epoch, _listed, _shown_path = (width, height), epoch, [], path
     shot = {"uri": "file://" + path, "width": width, "height": height}
     places = []
     if marks:
@@ -717,8 +725,8 @@ def _frames(data: bytes, wanted: list[int], config: dict, folder: str) -> list[s
     return [os.path.join(folder, name) for name in found]
 
 
-def _grid(pictures: list, path: str) -> tuple[int, int]:
-    """按时间顺序排成一张图，格子左上角标 #1、#2……；返回 (列, 行)。"""
+def _grid(pictures: list, path: str, labels: list[str] | None = None) -> tuple[int, int]:
+    """按顺序排成一张图，格子左上角标 #1、#2……（或 *labels*）；返回 (列, 行)。"""
     from PIL import Image, ImageDraw
 
     ratio = CELL / max(pictures[0].size)
@@ -733,7 +741,7 @@ def _grid(pictures: list, path: str) -> tuple[int, int]:
     for index, picture in enumerate(pictures):
         x = gap + index % cols * (width + gap)
         y = gap + index // cols * (height + gap + header)
-        draw.text((x + 2, y + 2), f"#{index + 1}", fill=(20, 20, 20), font=font)
+        draw.text((x + 2, y + 2), labels[index] if labels else f"#{index + 1}", fill=(20, 20, 20), font=font)
         canvas.paste(picture.convert("RGB").resize((width, height)), (x, y + header))
     canvas.save(path, format="JPEG", quality=85, optimize=True)
     return cols, rows
@@ -972,18 +980,21 @@ def _expire() -> None:
         _lift(f"{HOLD_MAX} 秒没碰手机")
 
 
-def tap(at: str) -> dict:
-    """点一下 *at*（写法见 `_spot`），返回那个点。按着的手指不受影响：这一下用的是另一根。"""
+def tap(at: str, see: bool = True) -> dict:
+    """点一下 *at*（写法见 `_spot`），返回那个点。按着的手指不受影响：这一下用的是另一根。
+
+    *see* 为假时不截动作后的画面：脚本里连着做几步、只在最后看一眼时省时间。下面几个动作同。
+    """
     _fresh()
     spot = _spot(at)
     finger = next(_fingers)
     _send(_touch(DOWN, finger, spot["x"], spot["y"]))
     time.sleep(TAP_PRESS)
     _send(_touch(UP, finger, spot["x"], spot["y"]))
-    return _see(spot, TOUCH_SETTLE)
+    return _see(spot, TOUCH_SETTLE) if see else spot
 
 
-def swipe(start: str, end: str, duration: int = 300) -> dict:
+def swipe(start: str, end: str, duration: int = 300, see: bool = True) -> dict:
     """从 *start* 滑到 *end*，用 *duration* 毫秒；两点一样就是长按。"""
     _fresh()
     begin, finish = _spot(start), _spot(end)
@@ -998,10 +1009,11 @@ def swipe(start: str, end: str, duration: int = 300) -> dict:
             _glide(finger, origin, target, duration / 1000)
     finally:
         _send(_touch(UP, finger, *target))
-    return _see({"from": begin, "to": finish, "duration": duration}, TOUCH_SETTLE)
+    result = {"from": begin, "to": finish, "duration": duration}
+    return _see(result, TOUCH_SETTLE) if see else result
 
 
-def hold(at: str, seconds: float = 0.0) -> dict:
+def hold(at: str, seconds: float = 0.0, see: bool = True) -> dict:
     """按住 *at* 不放就返回；同名的手指已经按着，就不抬手、滑到新位置。
 
     *seconds* 大于 0 时按这么久（最多 30 秒）再松开。返回 `_spot` 那个点外加 `kept`（还按着没有）
@@ -1027,13 +1039,14 @@ def hold(at: str, seconds: float = 0.0) -> dict:
     if seconds > 0:
         time.sleep(min(seconds, 30.0))
         _up(spot["key"])
-    return _see({**spot, "kept": seconds <= 0}, TOUCH_SETTLE)
+    result = {**spot, "kept": seconds <= 0}
+    return _see(result, TOUCH_SETTLE) if see else result
 
 
-def release(at: str = "") -> dict:
+def release(at: str = "", see: bool = True) -> dict:
     """抬起按着的手指：*at* 写哪个抬哪个，不写全抬；返回 `{"released": 抬起的名字}` 和动作后的画面。"""
     released = _up(at)
-    return _see({"released": released}, TOUCH_SETTLE) if released else {"released": []}
+    return _see({"released": released}, TOUCH_SETTLE) if released and see else {"released": released}
 
 
 def _up(at: str) -> list[str]:
@@ -1069,26 +1082,190 @@ def mark(name: str, at: str = "", radius: float = 0.0, remove: bool = False) -> 
             raise ValueError(f"半径写 0~{max(_shown)}")
         if name not in marks and len(marks) >= MAX_MARKS:
             raise ValueError(f"键位最多 {MAX_MARKS} 个，先删掉用不着的")
-        marks[name] = {"x": spot["x"], "y": spot["y"], "radius": round(radius), "size": list(_shown)}
+        # 挪了位置，aim 量出来的拖动比例照样有效，留着。
+        kept = {"ratio": marks[name]["ratio"]} if "ratio" in marks.get(name, {}) else {}
+        marks[name] = {"x": spot["x"], "y": spot["y"], "radius": round(radius), "size": list(_shown), **kept}
+    _save_marks(marks)
+    return marks
+
+
+def _save_marks(marks: dict) -> None:
     os.makedirs(ROOT, exist_ok=True)
     temporary = MARKS + ".tmp"
     with open(temporary, "w", encoding="utf-8") as handle:
         json.dump(marks, handle, ensure_ascii=False, indent=1)
     os.replace(temporary, MARKS)
-    return marks
 
 
-def key(name: str) -> dict:
+# --------------------------------------------------------------------------- 对准：画面和拖动距离的换算
+
+
+def _gray(path: str, width: int):
+    """把图缩到 *width* 宽的灰度数组；返回 (数组, 缩了几倍)。"""
+    import numpy
+    from PIL import Image
+
+    with Image.open(path) as picture:
+        scale = picture.width / width
+        small = picture.convert("L").resize((width, max(1, round(picture.height / scale))))
+    return numpy.asarray(small, dtype=numpy.float64), scale
+
+
+def _locate(source: str, x: float, y: float, target: str) -> tuple[float, float, float]:
+    """*source* 上 (x, y) 那一块，在 *target* 里跑到了哪；返回 (x, y, 相似度 0~1)。
+
+    归一化互相关（模板减均值，按窗口方差归一），用 FFT 一次算完整张图；缩到 320 宽来算，
+    够用也快。视角转动不只是平移（透视、远近不同），所以离得越远越不准，`aim` 靠多走几步来补。
+    """
+    import numpy
+
+    image, scale = _gray(target, 320)
+    template_from, _ = _gray(source, 320)
+    half = max(6, round(320 * PATCH / 2))
+    cx, cy = round(x / scale), round(y / scale)
+    top, left = max(0, cy - half), max(0, cx - half)
+    template = template_from[top:cy + half, left:cx + half]
+    if template.shape[0] < 6 or template.shape[1] < 6:
+        raise ValueError(f"({x:g}, {y:g}) 太靠边，取不出一块来比")
+    template = template - template.mean()
+    norm = numpy.sqrt((template * template).sum())
+    if norm < template.size ** 0.5 * 4:
+        raise ValueError(f"({x:g}, {y:g}) 那一块几乎没有花纹（天空、纯色墙），认不出来；换个有东西的点")
+    th, tw = template.shape
+    height, width = image.shape
+    shape = (height + th - 1, width + tw - 1)
+    product = numpy.fft.rfft2(image, shape) * numpy.fft.rfft2(template[::-1, ::-1], shape)
+    correlation = numpy.fft.irfft2(product, shape)[th - 1:height, tw - 1:width]
+    sums = [numpy.pad(values, ((1, 0), (1, 0))).cumsum(0).cumsum(1) for values in (image, image * image)]
+    window = [table[th:, tw:] - table[:-th, tw:] - table[th:, :-tw] + table[:-th, :-tw] for table in sums]
+    spread = numpy.sqrt(numpy.maximum(window[1] - window[0] ** 2 / template.size, 1e-6))
+    score = correlation / (spread * norm)
+    row, column = numpy.unravel_index(int(numpy.argmax(score)), score.shape)
+    found_x = float((column + (cx - left)) * scale)
+    found_y = float((row + (cy - top)) * scale)
+    return found_x, found_y, float(score[row, column])
+
+
+def find(at: str, target: str = "", source: str = "") -> dict:
+    """*source*（默认最近给她看的那张）上 *at* 那一块，在 *target*（默认现在截一张）里的位置。
+
+    返回 `{"x", "y", "score", "uri"}`：`score` 是相似度，0.5 以下多半没找到；`uri` 是 target。
+    脚本里用来判断转了多少、东西还在不在。
+    """
+    spot = _spot(at)
+    source = (source or _shown_path).removeprefix("file://")
+    if not source:
+        raise RuntimeError("还没看过手机画面：先 look 一眼")
+    uri = target or screenshot()["uri"]
+    x, y, score = _locate(source, spot["x"], spot["y"], uri.removeprefix("file://"))
+    return {"x": round(x), "y": round(y), "score": round(score, 2), "uri": "file://" + uri.removeprefix("file://")}
+
+
+def stitch(uris: list[str], labels: list[str] | None = None) -> str:
+    """把几张图按顺序拼成一张（格子上标 *labels*，不给就是 #1、#2……），返回它的地址。"""
+    from PIL import Image
+
+    if not uris:
+        raise ValueError("没给图")
+    if labels is not None and len(labels) != len(uris):
+        raise ValueError("labels 要和图一样多")
+    pictures = []
+    for uri in uris:
+        with Image.open(uri.removeprefix("file://")) as picture:
+            pictures.append(picture.copy())
+    os.makedirs(SHOT_DIR, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}"
+    path = os.path.join(SHOT_DIR, f"shot-{stamp}-stitch.jpg")
+    _grid(pictures, path, labels)
+    _prune()
+    return "file://" + path
+
+
+def _drag(start: tuple, end: tuple, seconds: float) -> None:
+    """拖视角用：按下、慢慢挪过去、停一下再抬。
+
+    WHY: 拖完立刻抬手，手指还带着速度，不少游戏的镜头会顺着惯性再转一截，那就和拖的距离对不上了。
+    """
+    finger = next(_fingers)
+    _send(_touch(DOWN, finger, *start))
+    try:
+        _glide(finger, start, end, seconds)
+        time.sleep(0.1)
+    finally:
+        _send(_touch(UP, finger, *end))
+
+
+def aim(area: str, at: str, to: str = "", tries: int = 4, see: bool = True) -> dict:
+    """在 *area*（拖视角的地方：键位名或 "x,y"）拖动，把图上 *at* 那个东西挪到 *to*（默认画面正中）。
+
+    返回 `{"x", "y"}`（它最后在哪）、`error`（离 *to* 还差几像素）、`ratio`（拖 1 像素画面挪几像素，
+    横竖各一个，带正负）、`steps`、`score`，和最后那张画面。*area* 是键位时，量出来的 `ratio` 存进
+    这个键位，下次第一下拖得更准。
+
+    WHY: 维护者 2026-10-24：操作时最大的问题是定位，核心是把画面映射到拖动距离上，必须对得上，才
+    知道要滑多少才能对准。可这是 3D 场景：镜头绕着角色转时近处的东西比远处挪得多，越靠边透视越歪，
+    游戏还各有灵敏度，画面怎么动没法靠一个比例算准（维护者也指出了这一点）。所以比例只当第一下的
+    估计，真正靠的是闭环：拖一下、在新画面里找那个东西本身、按它实际挪了多少修正，几步收敛；找不到
+    了就停下说跟丢了。
+    """
+    global _used
+    _fresh()
+    origin, thing = _spot(area), _spot(at)
+    width, height = _shown
+    goal = (_spot(to)["x"], _spot(to)["y"]) if to.strip() else (width // 2, height // 2)
+    marks = _marks()
+    stored = marks.get(origin["key"], {}).get("ratio") if origin["label"] else None
+    ratio = list(stored) if stored else [0.0, 0.0]
+    position, picture = (thing["x"], thing["y"]), _shown_path
+    steps, score, shot = 0, 1.0, None
+    for steps in range(1, max(1, min(int(tries), 8)) + 1):
+        error = (goal[0] - position[0], goal[1] - position[1])
+        if math.hypot(*error) <= AIM_CLOSE:
+            steps -= 1
+            break
+        # 比例还不知道的方向先试着拖差值的四分之一：方向猜错了也只偏一点，量出来就知道了。
+        drag = [error[axis] / ratio[axis] if ratio[axis] else error[axis] * 0.25 for axis in (0, 1)]
+        limit = (width * 0.45, height * 0.45)
+        drag = [max(-limit[axis], min(limit[axis], drag[axis])) for axis in (0, 1)]
+        start = (origin["x"], origin["y"])
+        end = (min(max(start[0] + drag[0], 0), width - 1), min(max(start[1] + drag[1], 0), height - 1))
+        drag = [end[0] - start[0], end[1] - start[1]]
+        _drag(start, end, 0.3)
+        time.sleep(AIM_SETTLE)
+        shot = screenshot()
+        x, y, score = _locate(picture, position[0], position[1], shot["uri"].removeprefix("file://"))
+        if score < MATCH_MIN:
+            break
+        for axis, moved in ((0, x - position[0]), (1, y - position[1])):
+            if abs(drag[axis]) >= 8:
+                measured = moved / drag[axis]
+                ratio[axis] = measured if not ratio[axis] else (ratio[axis] + measured) / 2
+        position, picture = (x, y), shot["uri"].removeprefix("file://")
+    _used = time.time()
+    if origin["label"] and origin["key"] in marks and any(ratio):
+        marks[origin["key"]]["ratio"] = [round(value, 3) for value in ratio]
+        _save_marks(marks)
+    result = {"x": round(position[0]), "y": round(position[1]), "goal": goal,
+              "error": round(math.hypot(goal[0] - position[0], goal[1] - position[1])),
+              "ratio": [round(value, 3) for value in ratio], "steps": steps, "score": round(score, 2),
+              "lost": score < MATCH_MIN}
+    if shot is not None:
+        result.update(uri=shot["uri"], width=shot["width"], height=shot["height"])
+        return result
+    return _see(result) if see else result
+
+
+def key(name: str, see: bool = True) -> dict:
     config = _config()
     code = name.strip().lower()
     code = _KEYS.get(code, code.upper().removeprefix("KEYCODE_"))
     if not re.fullmatch(r"[A-Z0-9_]+", code):
         raise ValueError(f"不认识的按键：{name!r}")
     _shell(config, f"input keyevent KEYCODE_{code}")
-    return _see({"code": code})
+    return _see({"code": code}) if see else {"code": code}
 
 
-def type_text(text: str, clear: bool = False, enter: bool = False) -> dict:
+def type_text(text: str, clear: bool = False, enter: bool = False, see: bool = True) -> dict:
     """往当前输入框打字，返回 `{"count": 字数, ...动作后的画面}`。
 
     WHY: `input text` 只打得出 ASCII，中文走 ADB Keyboard 输入法的广播（dsh 2026-10-24 装好并
@@ -1109,7 +1286,7 @@ def type_text(text: str, clear: bool = False, enter: bool = False) -> dict:
         _shell(config, f"am broadcast -a ADB_INPUT_B64 --es msg {encoded}")
     if enter:
         _shell(config, "input keyevent KEYCODE_ENTER")
-    return _see({"count": len(text)})
+    return _see({"count": len(text)}) if see else {"count": len(text)}
 
 
 def _dump(config: dict, tries: int = 3) -> str:
@@ -1218,7 +1395,9 @@ def status() -> dict:
 
 
 __all__ = [
+    "aim",
     "burst",
+    "find",
     "hold",
     "key",
     "keyboard",
@@ -1227,6 +1406,7 @@ __all__ = [
     "screenshot",
     "shell",
     "status",
+    "stitch",
     "stop",
     "swipe",
     "tap",

@@ -35,6 +35,35 @@
 - `shell("命令")` 在手机上跑一条 shell：`monkey -p 包名 1` 打开应用，
   `pm list packages -3` 看装了哪些应用。
 
+## 对准视角
+
+- 先 `mark("视角", "1000,300")` 定一个拖视角的地方：屏幕上能拖动镜头、又没有按钮的空处。
+- `aim("视角", "880,240")` 把图上 (880,240) 那个东西转到画面正中（`to="640,400"` 转到别处）。它会
+  拖几下，每拖一下看一眼、在新画面里找那个东西，按它实际挪了多少修正。3D 场景里近处远处挪得不
+  一样，所以每次都是这样边看边修；量出来的"拖 1 像素画面挪几像素"存进键位，只是让下次第一下更准。
+- 选的点要有花纹（树、房子、人），天空、纯色墙认不出来。
+
+## 写脚本
+
+连续的、要边做边看的操作（原地转一圈看周围、一路走一路拍），用 `exec_code` 写成脚本一次跑完，
+省掉每一步的模型往返：
+
+```python
+from mods import phone
+from mods.tools._vision import attach
+phone.screenshot()
+shots = [phone.swipe("900,300", "1100,300", 300)["uri"] for _ in range(8)]
+print(attach(phone.stitch(shots, [f"第{i + 1}下" for i in range(8)]), "原地往右转，一下一格"))
+```
+
+- `phone` 里的函数和这些工具同名同参，`look` 对应 `phone.screenshot`、`frames` 对应
+  `phone.burst`；返回的是字典，动作后的画面在 `uri`。连着做几步时传 `see=False` 省掉中间的截图。
+- `phone.find("x,y", target)`：最近看的那张图上这一块，在 target 那张图里跑到了哪（`score`
+  低于 0.5 多半没找到）；`phone.stitch(uris, labels)` 把几张图拼成一张。
+- 图要交给自己看：`print(attach(uri, "说明"))`。
+- 要边拖边连拍，开个线程拖：`threading.Thread(target=phone.swipe, args=(...), kwargs={"see": False})`，
+  `start()` 以后接着 `phone.burst(...)`。
+
 ## 要知道的
 
 - 第一次 `look` 要几秒钟把画面流起来（开着大游戏时可能要半分钟），之后每次零点几秒。半小时
@@ -272,6 +301,32 @@ def mark(name: str, at: str = "", radius: float = 0.0, remove: bool = False) -> 
     return f"{done}；现在有：{'、'.join(marks) or '（没有了）'}"
 
 
+def aim(area: str, at: str, to: str = "") -> str:
+    """转视角，把图上某个东西对到画面正中（或 to）；会拖几次、每次看一眼修正，量出的拖动比例存进键位。
+
+    @param
+    area: 拖视角的地方：键位名（例如 "视角"）或 "x,y"，选屏幕上能拖镜头、没有按钮的空处
+    at: 要对准的东西现在在图上的位置，"x,y" 或 "#3"；要选有花纹的地方
+    to: 挪到哪，默认画面正中
+    """
+    backend = _backend()
+    if backend is None:
+        return "对准失败：手机模块没有加载"
+    try:
+        outcome = backend.aim(area, at, to)
+    except Exception as error:
+        return _failed("对准", error)
+    where = f"它现在在 ({outcome['x']}, {outcome['y']})，目标 ({outcome['goal'][0]}, {outcome['goal'][1]})"
+    if outcome["lost"]:
+        head = f"拖到第 {outcome['steps']} 下跟丢了（相似度 {outcome['score']}），停在上一次找到的地方：{where}"
+    elif outcome["error"] <= 12:
+        head = f"对准了：{where}，拖了 {outcome['steps']} 下"
+    else:
+        head = f"还差 {outcome['error']} 像素：{where}，拖了 {outcome['steps']} 下"
+    ratio = outcome["ratio"]
+    return _after(outcome, f"{head}；拖 1 像素画面横着挪 {ratio[0]:g}、竖着挪 {ratio[1]:g} 像素（0 是还没量）")
+
+
 def key(name: str) -> str:
     """按一个键。
 
@@ -343,6 +398,7 @@ def shell(command: str, timeout: float = 30.0) -> str:
 
 
 __all__ = [
+    "aim",
     "frames",
     "hold",
     "key",

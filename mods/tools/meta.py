@@ -144,6 +144,7 @@ Skill 也是可编辑的长期笔记：把可重复使用的经验、做法、�
 
 from __future__ import annotations
 
+import contextvars
 import io
 import time
 from typing import Mapping
@@ -182,9 +183,17 @@ def exec_code(expr: str, code: str, timeout: float) -> str:
         sep.join(map(str, values)) + end
     )
 
-    def perform():
+    def run():
         exec(code, py.loc)
         return eval(expr, py.loc)
+
+    # WHY: watchdog.run 起的是新线程，ContextVar 不会跟过去，代码里调 `_vision.attach` 就拿不到
+    # 这次的会话、交不出图。脚本操作手机时要把截图交给她看（维护者 2026-10-24：让她用 exec_code
+    # 组合手机操作），所以在调用方上下文的副本里跑。
+    scope = contextvars.copy_context()
+
+    def perform():
+        return scope.run(run)
 
     try:
         try:
