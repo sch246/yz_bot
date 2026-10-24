@@ -203,12 +203,14 @@ def _config() -> dict:
     return value
 
 
-def _adb(config: dict, *args: str, timeout: float = 20.0, check: bool = True) -> subprocess.CompletedProcess:
+def _adb(config: dict, *args: str, timeout: float = 20.0, check: bool = True,
+         retry: bool = True) -> subprocess.CompletedProcess:
     adb, serial = config.get("adb") or "adb", config["serial"]
     command = [adb, "-s", serial, *args]
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
-        if result.returncode and ":" in serial and re.search(r"not found|offline", result.stderr):
+        # retry=False 给探活用：只想知道现在通不通，不能为了重连多等十几秒。
+        if retry and result.returncode and ":" in serial and re.search(r"not found|offline", result.stderr):
             # WHY: adb server 重启会丢掉走网络的设备，不重连就是 device not found（dsh 踩过）；
             # 重连是幂等的，所以哪条命令撞上了就重连一次再试。
             subprocess.run([adb, "connect", serial], capture_output=True, text=True, timeout=15, check=False)
@@ -559,7 +561,7 @@ def _ready() -> dict:
     return config
 
 
-def _snapshot(config: dict, pause: float = 0.0, prefix: str = "shot") -> tuple[str, int]:
+def _snapshot(config: dict, pause: float = 0.0, prefix: str = "shot") -> tuple[str, int, float]:
     """解出此刻的最新一帧，返回 (jpg 路径, 第几份编码参数, 同一次加锁读到的最后收包时刻)。
 
     收包时刻要跟这一帧一起带出来：解码要花时间，之后再读 `_last_packet` 可能已经是更新的包了，
@@ -575,16 +577,19 @@ def _snapshot(config: dict, pause: float = 0.0, prefix: str = "shot") -> tuple[s
 
 
 def _alive(config: dict) -> bool:
-    """手机那头还认不认得出来（2 秒超时）。流里没新包时，用它分清「静着」和「断了」。"""
+    """手机那头还认不认得出来（2 秒超时，不触发 adb connect）。流里没新包时，用它分清「静着」和「断了」。"""
     try:
-        result = _adb(config, "get-state", timeout=2.0, check=False)
+        result = _adb(config, "get-state", timeout=2.0, check=False, retry=False)
     except Exception:
         return False
     return "device" in (result.stdout or "")
 
 
-def _freshness(config: dict, stamped: float | None = None) -> dict:
+def _freshness(config: dict, stamped: float | None = None, force: bool = False) -> dict:
     """最后一帧是多久以前的、流还连着吗；静太久了就探一眼手机那头还在不在。
+
+    *force* 是连拍收尾用的：才静了两秒也探一次，因为画面不动正是掉线的样子，等不到
+    `STALE_SECONDS`。
 
     WHY: 掉线时 `_gop` 里还留着最后一帧，`_snapshot` 会把它当成「此刻」交出去，
     看着像游戏卡住（10-24 20:33 草籽清后台把 tailscale 关了，连着几轮都是同一帧弹窗）。
@@ -599,9 +604,27 @@ def _freshness(config: dict, stamped: float | None = None) -> dict:
         age = time.time() - moment if moment else None
         connected, error = _connected, _error
     alive = None
-    if connected and age is not None and age > STALE_SECONDS:
+    if connected and (force or (age is not None and age > STALE_SECONDS)):
         alive = _alive(config)
     return {"age": age, "connected": connected, "error": error, "alive": alive}
+
+
+def _stale(fresh: dict) -> dict | None:
+    """把 `_freshness` 的结果翻成给她的 `stale`；没异常就是 None。
+
+    探活失败优先于时间：连拍收尾时才静两秒，也可能是掉线。
+    """
+    if not fresh["connected"]:
+        return {"kind": "dropped",
+                "seconds": round(fresh["age"], 1) if fresh["age"] is not None else None,
+                "reason": fresh["error"] or "屏幕流断了"}
+    if fresh["alive"] is False:
+        return {"kind": "dropped",
+                "seconds": round(fresh["age"], 1) if fresh["age"] is not None else None,
+                "reason": "adb 探活没通过，手机多半掉线了"}
+    if fresh["age"] is not None and fresh["age"] > STALE_SECONDS and fresh["alive"]:
+        return {"kind": "still", "seconds": round(fresh["age"], 1), "reason": "画面一直没有变化"}
+    return None
 
 
 def _measure(path: str) -> tuple[int, int, float]:
@@ -610,12 +633,17 @@ def _measure(path: str) -> tuple[int, int, float]:
 
     with Image.open(path) as picture:
         return (*picture.size, ImageStat.Stat(picture.convert("L")).mean[0])
+
+
 def screenshot(wait: float = 0.0, marks: bool = False, elements: bool = False, shown: bool = True) -> dict:
     """截当前画面，返回 `{"uri", "width", "height"}`。
 
     *marks* 画坐标线和这个方向的键位，结果多一项 `marks`；*elements* 读一遍界面、把控件框出来
     编号，结果多一项 `elements`（读不出来时是 `elements_error`）。画了东西就另存一张，`marked`
     是它的地址，`uri` 仍是干净的原图。
+
+    画面可能不是现在时，结果多一项 `stale`：`kind` 是 `still`（静着）或 `dropped`（多半断了），
+    另有 `seconds`、`reason` 给她看。
 
     *shown* 为假时只截图：存成 `frame-*.jpg`（不进 `SHOT_KEEP` 那一堆，用完由调用方删），也不改她
     "最近看的那张"——坐标、`#n` 列表、`aim` 取图都还照她看过的那张。后台连拍用它：她看的是拼图，
@@ -634,21 +662,9 @@ def screenshot(wait: float = 0.0, marks: bool = False, elements: bool = False, s
         os.remove(path)
         path, epoch, stamped = _snapshot(config, WAKE_SETTLE, prefix)
         width, height, level = _measure(path)
-    fresh = _freshness(config, stamped)
     # 流已经报错、或者静了很久又探不通：这一张是旧的，得明说，别让她把旧画面当成现在。
     # 只是静着（探活还通）也标一下，但分支认 kind、不认文案（dsh 10-24 22:15 review）。
-    stale = None
-    if not fresh["connected"]:
-        stale = {"kind": "dropped",
-                 "seconds": round(fresh["age"], 1) if fresh["age"] is not None else None,
-                 "reason": fresh["error"] or "屏幕流断了"}
-    elif fresh["age"] is not None and fresh["age"] > STALE_SECONDS:
-        if fresh["alive"]:
-            stale = {"kind": "still", "seconds": round(fresh["age"], 1),
-                     "reason": "画面一直没有变化"}
-        else:
-            stale = {"kind": "dropped", "seconds": round(fresh["age"], 1),
-                     "reason": "adb 探活没通过，手机多半掉线了"}
+    stale = _stale(_freshness(config, stamped))
     if not shown:
         shot = {"uri": "file://" + path, "width": width, "height": height}
         if stale:
@@ -893,7 +909,8 @@ def waves(count: int = 20, interval: float = WATCH_MIN, threshold: float = 5.0, 
 
     每一波是 `{"uri", "count", "began", "seconds", "last", "reason"}`：`began` 是第一张的时刻，
     `last` 为真的那波是最后一波，`reason` 说为什么停。格子上标着离这一波第一张几秒、离上一张几秒。
-    第一波的第一张是开始时的样子；最后一波的最后一张是静下来以后的样子。
+    第一波的第一张是开始时的样子；最后一波的最后一张是静下来以后的样子。收尾时探一次活，画面
+    不是现在的那波多一项 `stale`（和 `screenshot` 一样）。
 
     WHY: 维护者 2026-10-24：一组组定时连拍太笨，要"画面变了就截、攒够一波就发、静下来就停"，治她
     截图不积极。画面不动时这台手机的编码器什么都不发（见文件头），没收到新包就不解码：静着的时候
@@ -950,9 +967,9 @@ def waves(count: int = 20, interval: float = WATCH_MIN, threshold: float = 5.0, 
                 reason = f"{IDLE // 60} 分钟没碰手机"
             else:
                 continue
-            if stale and stale.get("kind") == "dropped":
-                # 静下来也可能是断线了：别让她以为游戏停了（dsh 10-24 review 指出的）。
-                reason += f"；不过最后一次采样就是旧画面（{stale.get('reason')}），多半是手机掉线了"
+            # 收尾时探一次：掉线就没有新包，stale 一直停在上次采样，等不到下一次刷新。
+            # 掉线由 stale 交给 _push_wave 说，别在 reason 里再说一遍（会重复）。
+            stale = _stale(_freshness(_config(), force=True))
             if latest:
                 kept.append((latest, now))
                 latest = ""
@@ -977,6 +994,8 @@ def _drop(path: str) -> None:
             os.remove(path)
         except OSError:
             pass
+
+
 def _wave(kept: list[tuple[str, float]], previous: float | None, last: bool, reason: str,
           stale: dict | None = None) -> dict:
     """把这一波的单帧拼成一张、删掉单帧；格子标 `#n 几秒 (+离上一张几秒)`。"""
@@ -996,6 +1015,8 @@ def _wave(kept: list[tuple[str, float]], previous: float | None, last: bool, rea
         # 连拍这条路也得带上：掉线时画面不动，她会以为游戏停了（dsh 10-24 review）。
         wave["stale"] = stale
     return wave
+
+
 # --------------------------------------------------------------------------- 动
 
 

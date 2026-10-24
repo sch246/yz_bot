@@ -156,7 +156,7 @@ def _stale_note(shot: dict) -> str:
     age = _age_text(stale.get("seconds"))
     when = f"，最后一帧是 {age}前的" if age else ""
     if stale.get("kind") == "still":
-        return (f"\n⚠️ 这张画面 {age}没变过{when}。手机静着就是这样，不一定是掉线——"
+        return (f"\n⚠️ 这张画面 {age}没变过。手机静着就是这样，不一定是掉线——"
                 "点一下有反应就不用管，点不动再去看连接。")
     return (f"\n⚠️ 这是旧画面：{stale.get('reason')}{when}，别把它当成现在。"
             "重连：exec_code 里 `import mods.phone` 再调 `phone.stop()`，下次看屏幕会自己重新起流；"
@@ -183,10 +183,15 @@ def look(prompt: str = "", wait: float = 0.0, marks: bool = False, elements: boo
     stale = shot.get("stale")
     lists = _lists(shot) + _stale_note(shot)
     caption = f"这是你手机现在的屏幕（{size}，点的时候坐标照这张图）。"
-    if stale:
+    if stale and stale.get("kind") == "dropped":
         # 图旧的时候 caption 先改口：它比下面那行字先入眼（dsh 10-24 review 第 3 条）。
         caption = (f"这张可能不是现在（{size}，坐标仍照这张图算）：{stale.get('reason')}。"
                    "先看下面那句提示，确认手机还连着，再把图里的东西当成现在。")
+    elif stale:
+        # still 是探活确认过、只是画面没变：别说成旧图，也别让她去查连接。
+        age = _age_text(stale.get("seconds"))
+        caption = (f"这是你手机屏幕（{size}，坐标照这张图）：手机静着，画面"
+                   f"{' ' + age if age else '一直'}没变，不是旧图。")
     outcome = _attach_image(uri, caption)
     if shot.get("marked") and outcome.startswith("✅"):
         drawn = "、".join(word for word, wanted in (("坐标线和键位（K）", marks), ("控件编号（#）", shot.get("elements")))
@@ -268,6 +273,8 @@ def _push_wave(number: int, wave: dict) -> None:
     else:
         lines.append("还在接着拍；不想看了就 frames(stop=True)。")
         _push("\n".join(lines), f"手机自动连拍第 {number} 波")
+
+
 def _stop_watcher() -> str:
     global _watcher
     if _watcher is None:
