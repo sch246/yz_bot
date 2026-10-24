@@ -39,10 +39,21 @@ _stream = log.stream("image")
 # 只会拿到 HTML），成功的也不必每轮重新查一遍。挂在线程局部：对话在哪个线程跑就在哪个
 # 线程记账，别的线程（例如 eager 预取）各记各的，互不干扰。
 _local = threading.local()
+# 不会自己好起来的失败（下回来的不是图、本地文件没了）：地址 → 判定的时刻，`FAILED_RETRY` 秒内
+# 跨对话也不再试。
+# WHY: 维护者 2026-10-24 贴的日志：她一直在同一段上下文里，每次唤醒都是新的一次对话，台账清空，
+# 二十几个过期的 QQ 图链接每次唤醒都重新 curl 一遍、各报一次错。网络错（curl 失败）可能下次就好，
+# 仍只在一次对话里记。
+_failures: dict[str, float] = {}
+FAILED_RETRY = 3600
 
 
 class AlreadyCheckedFailed(ValueError):
     """本次对话里该图片已检查过且失败——重试没有意义，直接沿用这个失败。"""
+
+
+class _Unreachable(ValueError):
+    """网络没通（curl 失败）：可能下次就好，不进跨对话的失败记录。"""
 
 
 def begin_conversation() -> dict | None:
@@ -73,9 +84,11 @@ def checked_in_conversation(uri) -> bool:
 
 
 def checked_failed(uri) -> bool:
-    """本次对话里是否已经检查过且判定失败——调用方据此跳过重试，也不再重复报错。"""
+    """本次对话里检查过且失败、或者不久前判定过不会好的——调用方据此跳过重试，也不再重复报错。"""
     ledger = _ledger()
     key = _ledger_key(uri)
+    if key is not None and time.time() - _failures.get(key, -FAILED_RETRY) < FAILED_RETRY:
+        return True
     return ledger is not None and key is not None and key in ledger and ledger[key] is None
 
 
@@ -347,7 +360,7 @@ def _download_image_to_cache(uri: str, target_dir: str, max_bytes: int) -> tuple
     except FileNotFoundError as error:
         raise ValueError("找不到 curl，无法下载网络图片") from error
     if result.returncode != 0 or not result.stdout:
-        raise ValueError(f"网络图片下载失败（curl 返回码 {result.returncode}）")
+        raise _Unreachable(f"网络图片下载失败（curl 返回码 {result.returncode}）")
     mime, digest = _validate_image_bytes(result.stdout, max_bytes)
     resolved = _store_content_image(result.stdout, mime, digest, target_dir, max_bytes)
     cache_image_uri_digest(uri, digest)
@@ -369,7 +382,7 @@ def _resolve_cached_network_image(uri: str, target_dir: str, max_bytes: int) -> 
             pass
         return None
     touch_image_cache(path)
-    _stream.info(f"✅ 图片内容缓存命中：{_cache_summary(path, mime, digest)}")
+    _stream.debug(f"✅ 图片内容缓存命中：{_cache_summary(path, mime, digest)}")
     return path, mime, digest
 
 
@@ -378,7 +391,8 @@ def resolve_image_with_digest(uri: str, target_dir: str = TEMP_PATH, max_bytes: 
 
     WHY: 本次对话的台账在这里短路——同一张图第二次被问到就不再解析、不再下载、也不再
     刷日志：成功直接给出上次的结果，失败则抛 `AlreadyCheckedFailed`（调用方据此静默
-    跳过）。台账只活在一次对话之内，对话结束后重新聊会重新检查一遍。
+    跳过）。台账只活在一次对话之内，对话结束后重新聊会重新检查一遍；只有不会自己好的失败
+    （`_failures`）跨对话记 `FAILED_RETRY` 秒。
     """
     ledger = _ledger()
     key = _ledger_key(uri)
@@ -387,11 +401,15 @@ def resolve_image_with_digest(uri: str, target_dir: str = TEMP_PATH, max_bytes: 
         if outcome is None:
             raise AlreadyCheckedFailed(f"本次对话已检查过该图片且失败：{_display_uri(key)}")
         return outcome
+    if key is not None and time.time() - _failures.get(key, -FAILED_RETRY) < FAILED_RETRY:
+        raise AlreadyCheckedFailed(f"不久前判定过这张图拿不到：{_display_uri(key)}")
     try:
         resolved = _resolve_image_with_digest(uri, target_dir, max_bytes)
-    except Exception:
+    except Exception as error:
         if ledger is not None and key is not None:
             ledger[key] = None
+        if key is not None and isinstance(error, ValueError) and not isinstance(error, _Unreachable):
+            _failures[key] = time.time()
         raise
     if ledger is not None and key is not None:
         ledger[key] = resolved
@@ -408,7 +426,7 @@ def _resolve_image_with_digest(uri: str, target_dir: str, max_bytes: int) -> tup
         path, mime = _validate_image_file(file_uri_to_path(uri), max_bytes)
         digest = hash_file(path)
         cache_image_uri_digest(uri, digest)
-        _stream.info(f"✅ 本地图片已解析：{_cache_summary(path, mime, digest)}")
+        _stream.debug(f"✅ 本地图片已解析：{_cache_summary(path, mime, digest)}")
         return path, mime, digest
     if scheme not in {"http", "https"}:
         raise ValueError("图片 URI 只支持 http://、https:// 或 file://")
