@@ -1,67 +1,47 @@
-"""Her subconscious: a context of its own that tidies hers once she is done.
+"""Her subconscious: a stateless fork of her own context that folds wakes into one line.
 
-WHY: 维护者 2026-10-24（提案 attention-and-subconscious）：显意识留痕，潜意识不留痕；用一个
-视角来管理上下文本身，是提高上限的方式。它有自己的一条上下文，只往后接：她忙完一阵，这阵的
-经过接到它末尾，由它决定她那条的末尾怎么办——收成一句记号，或者放下（同 dismiss，回到没读），
-不动就是留着。它的理由只在它这条里，她只看到结果。它记得自己做过什么，所以可以等几轮再从
-第一轮起一起收：只动她那条的末尾，她的前缀照样命中。这条长了它自己交接：写下地图，换新的一条。
+WHY: 维护者 2026-10-25（billion-context 式）：不再另起一条会话、把经过转写过去——那要截断
+（整段 3 万字、工具结果 1000 字），前缀和她那条对不上，它还得自己记着读到哪、上次的决定做没
+做成，满 10 万写下地图换新的一条。现在整理时把她那一整段上下文原样再发一次请求
+（`agent._run_session`，persist=False，系统提示、工具定义、消息都和她那条一样），只在末尾补
+一条整理指令；请求和回复都不存。它要是调工具，不执行，只认文字里的决定。
 
-WHY: 维护者 2026-10-24：动不了段中间不太好，本以为是像操作数据一样操作上下文。所以收起也能只收
-中间几次唤醒（`收起 <从>~<到> <记号>`），代价是她那条从那里往后下一次按原价重读；列给它的每次唤醒
-后面写着那之后约多少 token，值不值由它判断。放下仍只到最后：中间退一块回"没读"，后面几次已经接着
-往下看过了，顺序就乱了。
+WHY: 按增长叫，不是每次唤醒都叫：这一段比上次整理时又长 `_GROWTH_TOKENS` 才叫一次。基线记在
+这一段自己身上（键 `subconscious`），换段自然从头算；她自己 dismiss 清短了也把基线放下。
 
-WHY: 怎么判断写在 data/notes/policy/subconscious.md，不写成代码里的规则——维护者说固定规则
-改起来不方便；文件不存在时用 DEFAULT_GUIDANCE。代码只管格式和机制本身：只认最后一行决定、
-放下只到最后、记号跟着她那一段（不跨交接）、这一段第一次唤醒连着开头的笔记不收起、
-follow 期间攒过 _FRESH_MAX 条的不放下（和她自己 dismiss 的兜底是同一条，维护者定的）。
+WHY: 只收不放。放下是退回没读，那是她自己 `dismiss` 的事；分叉只管把看过的唤醒收成一句。
+怎么判断写在 data/notes/policy/subconscious.md（她也能改），拼进指令；文件不存在时用
+DEFAULT_GUIDANCE。代码只管门槛、格式和机制：这一段第一次唤醒连着开头的笔记不收起。
 """
 
 from __future__ import annotations
 
-import json
-import os
 import re
 import time
 
-from mods import llm, storage
+from mods import storage
 
 import mods.chat as _chat_root
 from . import notes as _notes, roles as _roles, screen as _screen, segment as _segment
 
-_FILE = _segment.ROOT / "subconscious.json"
-# 它这条每次整段读一遍，长了每次都贵：过了这么多 token 就写下地图，换新的一条。
-_LIMIT = 100_000
-# 接给它的一阵经过最多这么多字，从后往前留；其中一次工具结果最多这么多字。
-_ROUND_CHARS = 30_000
-_RESULT_CHARS = 1_000
-# 列给它的、还能从那儿起收起或放下的唤醒，最近这么多个。
-_OFFERED = 10
+# 这一段比上次整理时又长这么多 token 才整理一次（维护者 2026-10-25：几万 token，别每次唤醒都叫）。
+_GROWTH_TOKENS = 30_000
 
-DEFAULT_GUIDANCE = """你是她的潜意识：同一个脑子的另一条思路。你不说话、不行动，只整理她眼前的上下文。她看不到你，只看到你整理的结果。
+DEFAULT_GUIDANCE = """你是她的潜意识：同一个脑子的另一条思路。上面这一段就是她眼前的上下文，原样发给你，不是新消息。你不说话、不行动，也不回答里面任何一个人；只整理她的注意力，她看不到你，只看到你收起来的那一句。
 
-她眼前的上下文就是她的注意力。被叫醒、看一眼、没她的事，这样的痕迹叠多了，她会照着这一路往下演，越来越累；该记着的被收掉，她又会接不上话。你的事是让她眼前只留值得留的。
+被叫醒、看一眼、没她的事，这样的痕迹叠多了，她会照着这一路往下演，越来越累；该记着的被收掉，她又会接不上话。你的事是让她眼前只留值得留的。
 
-- 没什么要她记着的（看了一眼、没她的事、也没想出什么），就放下：消息回到没读，下次和新的一起给她。
-- 看过、想过，但不必每个字都在眼前的，就收起。记号写清楚是什么事、到哪一步、她还要不要管，让她看记号就够用。
-- 几轮都是同一件事，可以先留着，等这件事告一段落再从第一轮起一起收。
-- 中间的也能收：前面几轮的事已经了结、后面又有别的，就只收那几轮。收中间那一块，她那条从那里往后下一次都要按原价重读（缓存价的五十倍，列表里写着约多少 token），所以攒够了、值得时再收，别每轮都动中间。
-- 她在那以后说过话、答应过什么、在等谁的回复，工具报了错或者结果和预期不符，有人点了她的名：这些留着，她得记得。
+- 看过、想过，但不必每个字都在眼前的，就收起。摘要写清楚是什么事、到哪一步、她还要不要管，让她看这一句就够用。
+- 只是一次次被叫醒、看一眼又没她的事的零碎唤醒（她自己忘了 dismiss），就合起来收成一句「看了几眼群，没我的事」。
+- 几轮都是同一件事，等它告一段落再一起收；最近几次唤醒、她正在做的那件事留着别动。
+- 她说过的话、答应过什么、在等谁的回复，工具报了错或者结果和预期不符，有人点了她的名：这些留着，她得记得。
+- 收中间那几段以后，她那条从那里往后下一次要按原价重读（前缀缓存只认前面一样的部分），所以攒够了、值得时再收。
 - 拿不准就留着。"""
 
-_FORMAT = """每次最后单独写一行决定，只写一件：
-收起 <时刻> <记号>　把她那条从这次唤醒起到最后换成一句记号，原样另存，她要看能读回来
-收起 <时刻>~<时刻> <记号>　只收中间这几次唤醒（含后一个时刻那次），后面的原样留着
-放下 <时刻>　　　　 把她那条从这次唤醒起清掉，消息回到没读，下次和新的一起给她（只能放到最后）
-留着　　　　　　　　什么都不动
-时刻照"还能从这些唤醒起"后面列的写，括号里是那次唤醒之后约多少 token。决定之前可以先写几句理由，它们只留在你这条里。"""
-
-_HANDOFF = ("这一条要换新的了。写下新一条开头要用的地图：她眼前现在有哪几摊事、各是什么、到哪一步；"
-            "你收起过哪些（记号原文）；彼此什么关系；还要盯着什么。直接写正文，不写决定。")
-
-# 时刻后面列表里那个"（之后约 N token）"它可能照抄过来，认得出来、不算进记号。
-_TIME = r"((?:\d{4}-\d{2}-\d{2}\s+)?\d{1,2}:\d{2}:\d{2})(?:\s*[（(]之后约[^）)]*[）)])?"
-_DECISION = re.compile(rf"(收起|放下)\s*[（(「]?\s*{_TIME}(?:\s*(?:~|～|到|至)\s*{_TIME})?\s*[）)」]?\s*[:：，,]?\s*(.*)")
+# 列表里那个"（之后约 N token）"它可能照抄过来，先摘掉再解析。
+_AMOUNT = re.compile(r"[（(]\s*之后约[^）)]*[）)]")
+_TIME = r"(?:\d{4}-\d{2}-\d{2}\s+)?\d{1,2}:\d{2}:\d{2}"
+_HEAD = re.compile(rf"^收起\s*({_TIME})(?:\s*(?:~|～|到|至)\s*({_TIME}))?\s*[:：]?\s*(.*)$")
 
 
 def on() -> bool:
@@ -69,116 +49,8 @@ def on() -> bool:
     return bool(storage.get("", "agent").get("subconscious", True))
 
 
-def _fresh(started: float | None = None) -> dict:
-    return {"started": started or time.time(), "messages": [], "map": "", "her": {}, "tokens": 0, "result": ""}
-
-
-def load() -> dict:
-    try:
-        return {**_fresh(), **json.loads(_FILE.read_text(encoding="utf-8"))}
-    except (OSError, ValueError):
-        return _fresh()
-
-
-def _save(state: dict) -> None:
-    _FILE.parent.mkdir(parents=True, exist_ok=True)
-    temporary = _FILE.with_name("subconscious.json.tmp")
-    temporary.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
-    os.replace(temporary, _FILE)
-
-
-def _system(state: dict) -> list[dict]:
-    parts = [_notes.read_policy("subconscious").strip() or DEFAULT_GUIDANCE, _FORMAT]
-    who = _notes.read("self").strip()
-    if who:
-        parts.append("她对自己的认识（笔记 self）：\n" + who)
-    messages = [{"role": "system", "content": "\n\n".join(parts)}]
-    if state["map"]:
-        messages.append({"role": "system", "content": "你上一条交接时写下的地图：\n" + state["map"]})
-    return messages
-
-
-def _shown(messages: list[dict]) -> str:
-    """Her stretch as text, long tool results cut, the newest part kept when it is too long."""
-    trimmed = []
-    for message in messages:
-        content = message.get("content")
-        if message.get("role") == "tool" and isinstance(content, str) and len(content) > _RESULT_CHARS:
-            message = {**message, "content": content[:_RESULT_CHARS] + f"…（共 {len(content)} 字）"}
-        trimmed.append(message)
-    text = _segment.render(trimmed)
-    if len(text) > _ROUND_CHARS:
-        text = f"（前面略了 {len(text) - _ROUND_CHARS} 字）\n" + text[-_ROUND_CHARS:]
-    return text
-
-
-def _decision(reply: str) -> tuple[str, str, str, str] | None:
-    """The last decision line: ``(kind, at, until, label)``, ``("?", line, "", "")`` when it cannot be read, None for 留着.
-
-    *until* is empty unless it named a range.
-    """
-    for line in reversed(reply.strip().splitlines()):
-        stripped = line.strip().strip("*`>#-· ").strip()
-        if stripped.startswith("留着"):
-            return None
-        if stripped.startswith(("收起", "放下")):
-            found = _DECISION.match(stripped)
-            if not found:
-                return "?", stripped, "", ""
-            return (found.group(1), " ".join(found.group(2).split()), " ".join((found.group(3) or "").split()),
-                    found.group(4).strip().strip("*` "))
-    return None
-
-
-def _amount(tokens: int) -> str:
-    return f"{tokens / 10000:.1f} 万" if tokens >= 10000 else str(tokens)
-
-
-def _apply(her: dict, decision: tuple[str, str, str, str] | None) -> str:
-    """Carry out one decision on her segment; returns what to tell it next time."""
-    agent = _chat_root._agent
-    if decision is None:
-        return ""
-    kind, at, until, label = decision
-    if kind == "?":
-        return f"上次最后那行「{at}」没看懂，什么都没动。"
-    marks = her.get("marks") or []
-    found = [mark for mark in marks if at in (mark["at"], mark["at"][11:])]
-    if not found:
-        return f"上次说的「{kind} {at}」没做：她那条里找不到这次唤醒（可能已经被清掉，或者她交接了）。"
-    mark = found[-1]
-    after = None
-    if until:
-        ends = [index for index, other in enumerate(marks) if until in (other["at"], other["at"][11:])]
-        if not ends:
-            return f"上次说的「{kind} {at}~{until}」没做：她那条里找不到 {until} 那次唤醒。"
-        if marks[ends[-1]]["time"] < mark["time"]:
-            return f"上次说的「{kind} {at}~{until}」没做：后一个时刻比前一个早。"
-        after = marks[ends[-1] + 1] if ends[-1] + 1 < len(marks) else None
-        if kind == "放下" and after is not None:
-            return f"上次说的「放下 {at}~{until}」没做：放下只能放到最后，中间的可以收起。"
-        at = f"{at}~{until}"
-    if kind == "放下":
-        for window in _chat_root._windows.parse_all(agent._shown_since(her, mark)):
-            piled = agent._piled(window, mark)
-            if piled > agent._FRESH_MAX:
-                return (f"上次说的「放下 {at}」没做：{_screen.label(window)} follow 期间已经攒了 {piled} 条，"
-                        f"超过 {agent._FRESH_MAX} 条就不放下了，留给她看完。")
-        agent._drop_since(her, mark)
-        return f"上次说的「放下 {at}」做了：她那条从 {at} 起清掉，那些消息回到没读。"
-    if not label:
-        return f"上次说的「收起 {at}」没做：收起要写记号。"
-    if mark["index"] == 0:
-        return f"上次说的「收起 {at}」没做：那是这一段第一次唤醒，连着开头的笔记，不能收起（可以放下）。"
-    if after is not None:
-        name = agent._fold_between(her, mark, after, label)
-        return f"上次说的「收起 {at}」做了：她那条里这几次唤醒换成了你写的记号，后面的没动，原样存成归档段 {name}。"
-    name = agent._fold_since(her, mark, label)
-    return f"上次说的「收起 {at}」做了：她那条从 {at} 起换成了你写的记号，原样存成归档段 {name}。"
-
-
 def settle(model: str | None, turn) -> None:
-    """Look at what she did since last time and maybe tidy the end of her segment; never raises."""
+    """Resend her segment and fold what the fork decides; never raises."""
     try:
         _settle(model, turn)
     except Exception:
@@ -186,90 +58,155 @@ def settle(model: str | None, turn) -> None:
 
 
 def _settle(model: str | None, turn) -> None:
-    state = load()
     her = _segment.load()
     if not her["messages"]:
-        # 交接后、新的一段存下之前，每次读到的都是一份开始时刻不同的空段：等她那条有了东西再看。
+        # 交接后、新的一段存下之前读到的是空段：等她那条有东西再看。
         return
-    pointer = state["her"]
-    notes = [state["result"]] if state["result"] else []
-    if pointer.get("started") != her["started"]:
-        start = 0
-        notes.append("她交接了，下面是她新的一段，从头开始。" if pointer else "下面是她眼前的这一段，从头开始。")
-    else:
-        start = pointer.get("index", 0)
-        later = [mark["index"] for mark in her.get("marks") or [] if mark["time"] > pointer.get("time", 0)]
-        if start > len(her["messages"]) or later and later[0] < start:
-            # 她自己 dismiss 回了它看过的地方，之后可能又接了新的：条数不可信，从它上次之后的第一次唤醒接着看。
-            start = later[0] if later else len(her["messages"])
-            notes.append("她自己用 dismiss 清掉了一段你看过的。")
-    new = her["messages"][start:]
-    if not new:
-        moved = _pointer(her)
-        if (pointer.get("started"), pointer.get("index")) != (moved["started"], moved["index"]):
-            state["her"] = moved
-            state["result"] = "\n".join(notes)
-            _save(state)
+    if not any(mark.get("index", 0) > 0 for mark in her.get("marks") or []):
+        # 只有这一段第一次唤醒：连着开头的笔记，没有能收的。
         return
-    size = _chat_root._agent._text_tokens
-    offered = "、".join(f"{mark['at']}（之后约 {_amount(size(her['messages'][mark['index']:]))} token）"
-                        for mark in (her.get("marks") or [])[-_OFFERED:]) or "（没有）"
-    added = []
-    if notes:
-        added.append({"role": "system", "content": "\n".join(notes)})
-    added.append({"role": "user", "content": f"她又忙完一阵（{_screen.clock()}）。经过：\n{_shown(new)}"
-                                             f"\n\n还能从这些唤醒起收起或放下：{offered}"})
-    reply, used = _ask(model, turn, state, added)
+    size = _chat_root._agent._text_tokens(her["messages"])
+    tidied = her.get("subconscious")
+    last = tidied.get("tokens") if isinstance(tidied, dict) else None
+    if not isinstance(last, int) or size < last:
+        # 第一次见到这一段，或者她自己 dismiss 清短了：记下现在的长度，等它再长。
+        _remember(her, size)
+        return
+    if size - last < _GROWTH_TOKENS or turn.cancelled:
+        return
+    reply = _fork(model, turn, her)
     if reply is None:
         return
-    state["messages"].extend([*added, {"role": "assistant", "content": reply}])
-    state["tokens"] = used
-    state["result"] = _apply(her, _decision(reply))
-    state["her"] = _pointer(her)
-    _save(state)
-    if used > _LIMIT:
-        _hand_off(model, turn, state)
+    applied = _apply(her, _decisions(reply))
+    _remember(her, _chat_root._agent._text_tokens(her["messages"]))
+    if applied:
+        _roles._stream.info(f"潜意识收起了 {applied} 段")
 
 
-def _pointer(her: dict) -> dict:
-    """How far into her segment it has read, and when."""
-    return {"started": her["started"], "index": len(her["messages"]), "time": time.time()}
+def _remember(her: dict, tokens: int) -> None:
+    her["subconscious"] = {"tokens": tokens, "time": time.time()}
+    _segment.save(her)
 
 
-def _ask(model: str | None, turn, state: dict, added: list[dict]) -> tuple[str | None, int]:
-    """One request over its own context plus *added*; ``(None, 0)`` when it fails or says nothing."""
-    session = llm.Chat(model=model or _chat_root.get_model(), chat_client=llm.get_client())
-    session.fail_fast = True
-    session.set_messages([*_system(state), *state["messages"], *added])
-    # 请求日志只记这次新接上的：前面的上一次已经记过。
-    session.logged = len(session.messages) - len(added) if state["messages"] else 0
-    session.should_stop = lambda: turn.cancelled
-    replies = session.chat(recall_func=_roles._charge(session))
-    reply = "".join(chunk.content for chunk in replies
-                    if chunk.role == "assistant" and isinstance(chunk.content, str)).strip()
-    used = max((chunk.total_tokens for chunk in replies), default=0)
-    return (reply, used) if reply and not turn.cancelled else (None, 0)
+def _fork(model: str | None, turn, her: dict) -> str | None:
+    """Her whole context plus one instruction at the end; nothing is stored or executed."""
+    messages = [*her["messages"], {"role": "system", "content": _instruction(her)}]
+    agent = _chat_root._agent
+    session = agent._run_session(model, turn, her, messages, lambda: None,
+                                 lambda used, initial: False,
+                                 quiet=True, persist=False, fail_fast=True,
+                                 known=len(her["messages"]), record=False, execute_tools=False, echo=False)
+    if turn.cancelled:
+        return None
+    replies = session.messages[agent._system_count(session) + len(messages):]
+    text = "\n".join(str(message.get("content") or "") for message in replies
+                     if message.get("role") == "assistant").strip()
+    return text or None
 
 
-def _hand_off(model: str | None, turn, state: dict) -> None:
-    """Write the map, archive this context, start a new one from the map."""
-    written, _used = _ask(model, turn, state, [{"role": "system", "content": _HANDOFF}])
-    if written is None:
-        return
-    name = _segment.archive({**state, "messages": [*state["messages"], {"role": "system", "content": _HANDOFF},
-                                                   {"role": "assistant", "content": written}]}, "subconscious")
-    _roles._stream.info(f"潜意识换了新的一条，旧的归档为 {name}")
-    _save({**_fresh(), "map": written, "her": state["her"], "result": state["result"]})
+def _instruction(her: dict) -> str:
+    size = _chat_root._agent._text_tokens
+    offered = "\n".join(
+        f"{mark['at'][11:]}（之后约 {_amount(size(her['messages'][mark['index']:]))} token）"
+        for mark in her.get("marks") or [] if mark.get("index", 0) > 0) or "（没有）"
+    guidance = _notes.read_policy("subconscious").strip() or DEFAULT_GUIDANCE
+    return f"""这次只是整理：不要回答上面任何人，也不要调用工具（调了也不会执行）。
+
+{guidance}
+
+## 能下手的唤醒
+这一段第一次唤醒连着开头交接留下的说明，不能收；其它都可以，时刻只写时分秒。括号里是收起这一块以后，她那条从那里往后要按原价重读多少 token。
+{offered}
+
+## 怎么写
+一次可以收好几段。一段一行决定，摘要写在它下面（可以写几行）：
+收起 07:12:03~07:40:25
+<摘要>
+收起 08:02:10~08:30:00
+<摘要>
+收到最后就只写开始时刻：收起 07:12:03
+「~」后面那次唤醒不收，从它开始原样留着。
+
+摘要照聊天记录那样写：谁说了什么，带上那条消息的 mid（记录行里「|」后面那串消息号），没有 mid 的写大意；做了什么、结果如何；到哪一步；最后单独一行「还欠着」，写还在等谁、答应过什么，没有就写「还欠着：没有」。
+
+只有收起，没有放下——想退回没读是她自己 dismiss 的事。没什么可收、拿不准，就写一行：留着"""
+
+
+def _amount(tokens: int) -> str:
+    return f"{tokens / 10000:.1f} 万" if tokens >= 10000 else str(tokens)
+
+
+def _decisions(reply: str) -> list[dict]:
+    """The decisions in *reply*: one ``{"at", "until", "label"}`` per ``收起`` block, in written order."""
+    found: list[dict] = []
+    current: dict | None = None
+    for raw in reply.splitlines():
+        line = _AMOUNT.sub("", raw.strip()).strip().strip("*`>#-· ").strip()
+        line = re.sub(r"^(?:决定|decision)\s*[:：]\s*", "", line, flags=re.I)
+        if not line:
+            continue
+        if line.startswith("收起"):
+            head = _HEAD.match(line)
+            if head is None:
+                current = None   # 认不出的决定不猜，跳过这一块。
+                continue
+            current = {"at": " ".join(head.group(1).split()),
+                       "until": " ".join((head.group(2) or "").split()),
+                       "lines": [head.group(3).strip()] if head.group(3).strip() else []}
+            found.append(current)
+        elif line.startswith(("留着", "放下")):
+            current = None
+        elif current is not None:
+            current["lines"].append(raw.strip())
+    return [{"at": item["at"], "until": item["until"], "label": "\n".join(item["lines"]).strip()}
+            for item in found if "\n".join(item["lines"]).strip()]
+
+
+def _find(marks: list[dict], at: str) -> dict | None:
+    found = [mark for mark in marks if at in (mark["at"], mark["at"][11:])]
+    return found[-1] if found else None
+
+
+def _apply(her: dict, decisions: list[dict]) -> int:
+    """Carry out the foldable decisions; returns how many took effect."""
+    resolved = []
+    for item in decisions:
+        mark = _find(her.get("marks") or [], item["at"])
+        if mark is None:
+            continue
+        after = _find(her.get("marks") or [], item["until"]) if item["until"] else None
+        if item["until"] and (after is None or after["time"] <= mark["time"]):
+            continue
+        resolved.append((mark["time"], after["time"] if after is not None else None, item["label"]))
+    applied = 0
+    # 从早到晚收：先收的会把后面记号的下标往前挪，每次重新按时刻找，不拿着旧下标。
+    for start, end, label in sorted(resolved, key=lambda item: item[0]):
+        marks = her.get("marks") or []
+        mark = next((other for other in marks if other["time"] == start), None)
+        if mark is None or mark.get("index", 0) == 0:
+            continue
+        if end is None:
+            _chat_root._agent._fold_since(her, mark, label)
+        else:
+            after = next((other for other in marks if other["time"] == end), None)
+            if after is None:
+                continue   # 前面的决定已经把它收掉了。
+            _chat_root._agent._fold_between(her, mark, after, label)
+        applied += 1
+    return applied
 
 
 def report() -> str:
-    state = load()
-    lines = [f"subconscious: {'on' if on() else 'off'}"]
-    if state["messages"] or state["map"]:
-        lines.append(f"它这一条 {_screen.clock(state['started'])} 开始，{len(state['messages'])} 条消息，"
-                     f"上次请求 {state['tokens']} token（过 {_LIMIT} 就自己交接）")
-    if state["result"]:
-        lines.append("上次的决定：" + state["result"])
+    her = _segment.load()
+    size = _chat_root._agent._text_tokens(her["messages"]) if her["messages"] else 0
+    tidied = her.get("subconscious") if isinstance(her.get("subconscious"), dict) else {}
+    lines = [f"subconscious: {'on' if on() else 'off'}",
+             f"这一段 {_screen.clock(her['started'])} 开始，约 {_amount(size)} token；"
+             f"比上次整理再长 {_GROWTH_TOKENS} token 才整理（subconscious._GROWTH_TOKENS）"]
+    if tidied.get("time"):
+        lines.append(f"上次整理 {_screen.clock(tidied['time'])}，之后又长了 {size - tidied.get('tokens', 0)} token")
+    else:
+        lines.append("这一段还没整理过")
     lines.append("怎么判断：data/notes/policy/subconscious.md" + ("" if _notes.read_policy("subconscious").strip()
-                                                                    else "（还没写，用的是默认）"))
+                                                                else "（还没写，用的是默认）"))
     return "\n".join(lines)

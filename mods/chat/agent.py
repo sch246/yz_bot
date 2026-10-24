@@ -15,6 +15,7 @@ WHY: 交接由她自己在同一段里做，不另起一个只看到摘要的"�
 
 from __future__ import annotations
 
+import copy
 import json
 import threading
 import time
@@ -947,15 +948,33 @@ def _body(session: llm.Chat) -> list[dict]:
     return session.messages[_system_count(session):]
 
 
+def _inert(tool):
+    """The same tool schema with a call that does nothing.
+
+    WHY: 分叉要把她那一整段原样再发一次，工具定义也得一字不差，否则前缀缓存不中；但那是
+    后台整理，它要是调了工具绝不能真的发消息、点手机。定义不动，只把执行换掉。
+    """
+    stub = copy.copy(tool)
+    stub.call = lambda **_arguments: "（后台整理不执行工具；决定只按文字里写的算。）"
+    return stub
+
+
 def _run_session(model: str | None, turn, segment: dict, messages: list[dict], first_output, stop_when,
                  *, providers=(), hints=(), load: tuple[str, ...] = (), quiet: bool = False, persist: bool = True,
-                 fail_fast: bool = False, known: int = 0, each_output=None) -> llm.Chat:
+                 fail_fast: bool = False, known: int = 0, each_output=None, record: bool = True,
+                 execute_tools: bool = True, echo: bool = True) -> llm.Chat:
     """One model session over the segment plus this wake's material; outputs and results go to the oplog.
 
     With *persist*, the segment file follows the session after every round, but only
     once she has produced output: a request that fails before that leaves the file
     as it was, so the same material is not appended twice.  The first *known* of
     *messages* are already in the segment, so the request log skips them.
+
+    *record=False* and *execute_tools=False* are for the subconscious: it re-sends her
+    whole context as a fork, and neither its output nor the tools it may call may have
+    effects.  *echo=False* keeps that reply out of the self-talk stream too: it is not
+    her voice.  The request itself is the same because the prompt, the tool schemas and
+    the messages are built by this same path.
     """
     session = llm.Chat(model=model or _chat_root.get_model(), chat_client=llm.get_client())
     session.requested_reads = turn.requested_reads
@@ -976,6 +995,10 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
     if load:
         binding.load(list(load))
     binding.sync_registry()
+    if not execute_tools:
+        # 每轮重新取一次快照：binding 可能在两轮之间换了工具，定义要跟她那条一样新。
+        make_tools = session.get_tools
+        session.get_tools = lambda: [_inert(tool) for tool in make_tools()]
     told = [segment.get("told")]
     if told[0] is None:
         # 新的一段：完整工具状态放在系统提示之后，这一段里不再变。
@@ -1048,8 +1071,9 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
         save()
         return stop_when(used, initial)
 
-    session.on_output = record_output
-    session.on_results = record_results
+    if record:
+        session.on_output = record_output
+        session.on_results = record_results
     session.turn_done = turn_done
     session.add_context_provider(tool_changes)
     for provider in providers:
@@ -1058,7 +1082,9 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
         session.add_hint(hint)
     session.add_hint(lambda: f"现在是 {_screen.clock()}。")
     session.should_stop = lambda: turn.cancelled
-    session.chat(recall_func=_chat_root.get_handler(session), description_cache=_chat_root.description_cache)
+    # echo=False（潜意识分叉）：回复不是她说的，别在终端和 yz.msg 里挂成她的自言自语；只记费用。
+    session.chat(recall_func=_chat_root.get_handler(session) if echo else _roles._charge(session),
+                 description_cache=_chat_root.description_cache)
     save()
     return session
 
