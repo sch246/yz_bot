@@ -34,7 +34,13 @@ _SUBCOMMAND_HELP = (
 先把手上这一段上下文交接掉（笔记、日记确认到位后归档到 data/context/archive/），月末、年末各汇总一次日记；然后她用新的一段反思：像人排查一样从症状出发，读归档的上下文、聊天记录、行动记录和笔记的历史版本找原因，必要时改策略或写提案；不对外说话。什么时候自动跑由 awaker 规则决定，默认 daily 04:00 reflect。
 #reflect          显示上次反思时间
 #reflect now      现在就跑一次（中心 agent 正忙时不执行）"""),
-    ("subconscious [on|off]", """查看或开关她的潜意识（开关要管理员），默认关。
+    ("loop [on|off]", """查看或开关循环总开关（开关要管理员），默认开。
+
+开着时循环是常态：她每次唤醒结束后隔两秒再叫醒她，一轮接一轮；她用 wait(秒数) 隔一会儿再来，用 loop(stop=True) 结束这一串（下次被别的叫醒又照常转）。她一个动作都没做的那几轮，间隔翻倍、最长半小时。夜里 4 点整理时停，维护者叫停她那一轮也停。关着时只有她自己 loop("在做什么") 才转。
+#loop        显示开关和现在这一串转到第几轮
+#loop on     打开
+#loop off    关掉（正在转的这一串也停）"""),
+    ("subconscious [on|off]", """查看或开关她的潜意识（开关要管理员），默认开。
 
 潜意识有自己的一条上下文（data/context/subconscious.json），只往后接。她每忙完一阵（没有别的召唤在等），这阵的经过接到它末尾，它决定她那条怎么整理：
 收起 <时刻> <记号>  从这次唤醒起换成一句记号，原样另存成归档段（名字带 -folded），记号里写着怎么读回来
@@ -83,7 +89,7 @@ _SUBCOMMAND_NAMES = {pattern.partition(" ")[0] for pattern, _description in _SUB
 def requires_op(value: str) -> bool:
     name, _, tail = value.strip().partition(" ")
     return (name == "hint" or name == "use_model"
-            or name in {"image", "reasoning", "limit", "reflect", "awaker", "prompt", "subconscious"} and bool(tail.strip()))
+            or name in {"image", "reasoning", "limit", "reflect", "awaker", "prompt", "subconscious", "loop"} and bool(tail.strip()))
 
 
 def _subcommand_help(name: str = "") -> str:
@@ -392,6 +398,18 @@ def _subcommand(value: str):
         data["subconscious"] = tail.lower() == "on"
         storage.save()
         return f"subconscious: {tail.lower()}"
+    if name == "loop" and not tail:
+        current = _chat_root.agent._loop
+        state = f"，这一串转到第 {current['round']} 轮" + (f"：{current['note']}" if current["note"] else "") if current else ""
+        return f"loop: {'on' if _chat_root.agent.loop_on() else 'off'}{state}"
+    if name == "loop" and tail:
+        if tail.lower() not in ("on", "off"):
+            return "loop 只能是 on 或 off"
+        data["loop"] = tail.lower() == "on"
+        storage.save()
+        if not data["loop"]:
+            _chat_root.agent.stop_loop("#loop off")
+        return f"loop: {tail.lower()}"
     if name == "awaker":
         return _awaker_subcommand(raw)
     if name == "hint":

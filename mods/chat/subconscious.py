@@ -65,7 +65,8 @@ _DECISION = re.compile(rf"(收起|放下)\s*[（(「]?\s*{_TIME}(?:\s*(?:~|～|�
 
 
 def on() -> bool:
-    return bool(storage.get("", "agent").get("subconscious"))
+    # 维护者 2026-10-24：默认开。
+    return bool(storage.get("", "agent").get("subconscious", True))
 
 
 def _fresh(started: float | None = None) -> dict:

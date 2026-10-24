@@ -43,8 +43,9 @@ _MARKED = ("last_shown", "windows", "scopes", "told", "tokens", "notice")
 _MARKS = 40
 _KNOWN_PEOPLE = 6
 _TYPING_EVERY = 5
-# 循环：一轮结束后隔几秒叫醒她。
+# 循环：一轮结束后隔几秒叫醒她；她连着几轮什么都没做时间隔翻倍，最长拉到多久。
 _LOOP_GAP = 2.0
+_LOOP_IDLE_MAX = 1800.0
 # 开着的循环（只在内存里，重启就没了）：在做什么、转到第几轮、下一轮是不是已经排上了、排上的是第几次
 # 排的（她 wait 一下，先排上的那一轮就作废）；她 wait 了还有 `due`（下一轮的时刻）和 `waited`（等了几秒）。
 _loop: dict | None = None
@@ -459,7 +460,9 @@ def _begin(turn, window: tuple | None, kind: str) -> None:
     turn.settling = False
     # 输入框（type_word）跟着这次唤醒走：中途交接换了会话也还在，唤醒结束就没了。
     turn.boxes = {}
-    turn.log = {"kind": kind, "start": time.time(), "peak": 0}
+    turn.log = {"kind": kind, "start": time.time(), "peak": 0, "acts": 0}
+    # 她这次唤醒里自己关了循环：总开关开着也不在这次唤醒结束时再起一串。
+    turn.loop_stopped = False
 
 
 def _keep_typing(turn, window: tuple | None, stop: threading.Event) -> None:
@@ -523,7 +526,7 @@ def _drive_agent(model: str | None, window: tuple | None) -> bool:
                 {window for window, _count, active in oplog.pending_summary() if active})
             # 先排下一轮循环：它隔几秒才到，潜意识照样先整理一遍（维护者 2026-10-24：长时间运行
             # 恰恰不能停了整理），整理期间到的那一轮由下面 finish_turn 接上。
-            _next_loop()
+            _next_loop(turn)
             if _subconscious.on() and not oplog.has_unnotified():
                 # 她这阵忙完了才轮到潜意识，不挡她的路。它占着同一个 turn，不和她抢这一段；
                 # 期间来的召唤照常登记，下面 finish_turn 看到了就接着处理。
@@ -544,6 +547,11 @@ def _drive_agent(model: str | None, window: tuple | None) -> bool:
             _chat_root._run_hint(window, turn)
 
 
+def loop_on() -> bool:
+    """`#loop` 总开关，默认开。"""
+    return bool(storage.get("", "agent").get("loop", True))
+
+
 def start_loop(note: str) -> dict:
     """Wake her again after every wake until she stops it; returns the loop.
 
@@ -551,20 +559,38 @@ def start_loop(note: str) -> dict:
     隔 `_LOOP_GAP` 秒，往她自己的 me 窗口推一条"循环第几轮：在做什么"叫醒她，直到她想起来关掉。
     不设时长（维护者：不知道什么时候需要停下来）；没人干预就一直转到夜里 4 点整理（`reflect`
     开头关掉它）。维护者叫停她那一轮时也一起停。
+
+    WHY: 维护者 2026-10-24 又定：做成总开关、默认开（`loop_on`）——循环是常态，结束才要刻意。总开关
+    开着时她不用记着开，每次唤醒结束 `_next_loop` 自己起一串；她 `loop(stop=True)` 只结束这一串，
+    下次被别的叫醒又照常转。她可以用这里写上在做什么，没写时每轮只说"接着做手上的事"。
     """
     global _loop
-    rounds = _loop["round"] if _loop else 0
-    _loop = {"note": note, "round": rounds, "pending": False, "token": 0}
+    if _loop is not None:
+        _loop["note"] = note
+        return dict(_loop)
+    _loop = {"note": note, "round": 0, "pending": False, "token": 0}
     return dict(_loop)
 
 
-def stop_loop(reason: str) -> dict | None:
-    """Stop the loop; returns what it was, or None when none was running."""
+def stop_loop(reason: str, rest: bool = False) -> dict | None:
+    """Stop the loop; returns what it was, or None when none was running.
+
+    *rest* is her own stop: with the switch on, no new loop starts when this wake ends.
+    """
     global _loop
     stopped, _loop = _loop, None
+    turn = context.get_turn(_chat_root.AGENT_WINDOW)
+    if rest and turn is not None:
+        turn.loop_stopped = True
     if stopped:
         _roles._stream.info("循环关了（转了 %d 轮）：%s", stopped["round"], reason)
     return stopped
+
+
+def _start_quietly() -> dict:
+    global _loop
+    _loop = {"note": "", "round": 0, "pending": False, "token": 0}
+    return _loop
 
 
 def wait_loop(seconds: float) -> dict | None:
@@ -576,21 +602,35 @@ def wait_loop(seconds: float) -> dict | None:
     """
     loop = _loop
     if loop is None:
-        return None
+        if not loop_on():
+            return None
+        loop = _start_quietly()
     loop["due"], loop["waited"] = time.time() + seconds, seconds
     loop["token"] += 1
     loop["pending"] = False
     return dict(loop)
 
 
-def _next_loop() -> None:
-    """At the end of a wake: queue the next loop round."""
+def _next_loop(turn) -> None:
+    """At the end of a wake: queue the next loop round, starting a loop when the switch is on.
+
+    WHY: 总开关默认开以后，她被叫醒一次没事做、又没 wait 也没关，就会两秒一轮地空转下去。所以这次
+    唤醒里她一个动作都没做（`dismiss` 不算）时，下一轮的间隔翻倍，最长 `_LOOP_IDLE_MAX`；做了任何事
+    就回到 `_LOOP_GAP`。这不是自动结束，只是没人理时转慢一点。
+    """
+    acts, turn.log["acts"] = turn.log.get("acts", 0), 0
     loop = _loop
-    if loop is None or loop["pending"]:
+    if loop is None:
+        if not loop_on() or turn.loop_stopped:
+            return
+        loop = _start_quietly()
+    if loop["pending"]:
         return
+    loop["idle"] = 0 if acts else loop.get("idle", 0) + 1
+    gap = min(_LOOP_GAP * 2 ** loop["idle"], _LOOP_IDLE_MAX)
     loop["pending"] = True
     loop["token"] += 1
-    delay = max(_LOOP_GAP, loop.get("due", 0) - time.time())
+    delay = max(gap, loop.get("due", 0) - time.time())
     threading.Timer(delay, _loop_round, args=(loop, loop["token"])).start()
 
 
@@ -602,10 +642,11 @@ def _loop_round(loop: dict, token: int) -> None:
     waited = loop.pop("waited", None)
     loop["round"] += 1
     after = f"（等了 {_span(waited)}）" if waited else ""
+    doing = loop["note"] or "手上的事"
     try:
-        _chat_root.push(_windows.ME, "循环", f"循环第 {loop['round']} 轮{after}：{loop['note']}",
-                        wake=f"循环第 {loop['round']} 轮{after}：接着做——{loop['note']}；"
-                             "要等一会儿就 wait(秒数)，到时候再叫你；这件事彻底不做了才 loop(stop=True)")
+        _chat_root.push(_windows.ME, "循环", f"循环第 {loop['round']} 轮{after}：{doing}",
+                        wake=f"循环第 {loop['round']} 轮{after}：接着做——{doing}；"
+                             "要等一会儿、或者暂时没事，就 wait(秒数)，到时候再叫你；这件事彻底做完了才 loop(stop=True)")
     except Exception:
         _roles._stream.exception("循环叫醒她失败，循环停了")
         stop_loop("叫醒失败")
@@ -982,6 +1023,8 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
             if persist:
                 segment["tokens"] = reported[0]
         source = oplog.output(_chat_root.AGENT_WINDOW, assistant, calls)
+        turn.log["acts"] = turn.log.get("acts", 0) + sum(
+            1 for call in calls or [] if call.get("function", {}).get("name") != "dismiss")
         if not session.output_recorded:
             first_output()
         session.output_recorded = True

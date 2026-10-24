@@ -518,18 +518,18 @@ def tidy(note: str = "") -> str:
 
 
 def loop(note: str = "", stop: bool = False) -> str:
-    """开循环：这次唤醒结束后自动再叫醒你，一轮接一轮接着做手上这件事（玩游戏、一步步操作手机这类要连着做很多轮的事），直到你用 loop(stop=True) 关掉。
+    """循环：每次唤醒结束后自动再叫醒你，一轮接一轮接着做手上的事（玩游戏、一步步操作手机这类要连着做很多轮的事）。
 
-    每轮叫醒都会提醒你在做什么。要等别人回、等东西加载，用 wait(秒数) 隔一会儿再叫你，不用关；这件事彻底不做了才关。没关的话一直转到夜里整理的时候。
+    总开关开着时循环是常态：不用你开，每次唤醒结束都会接着叫你，你用它写上在做什么就行。要等别人回、等东西加载、暂时没事，用 wait(秒数) 隔一会儿再叫你；这件事彻底做完了才 loop(stop=True)，下次被别的事叫醒时又照常转。一直没人管就转到夜里整理的时候。
 
     @param
-    note: 在做什么、做到哪算完，例如"洛克王国里走到传送点"；每轮叫醒都带着它。开着时再调一次就换成新的说明
-    stop: true 就是关掉循环
+    note: 在做什么、做到哪算完，例如"洛克王国里走到传送点"；每轮叫醒都带着它，再调一次就换成新的
+    stop: true 就是结束这一串循环
     """
     from mods import chat
 
     if stop:
-        stopped = chat.agent.stop_loop("她自己关的")
+        stopped = chat.agent.stop_loop("她自己关的", rest=True)
         return f"循环关了（转了 {stopped['round']} 轮）" if stopped else "循环本来就没开"
     session = current_binding().session
     if getattr(session, "quiet", False) or getattr(session, "segment", None) is None:
@@ -537,7 +537,7 @@ def loop(note: str = "", stop: bool = False) -> str:
     if not note.strip():
         return "要写在做什么，例如 loop(\"洛克王国里走到传送点\")"
     chat.agent.start_loop(note.strip())
-    return "循环开着：这一轮结束后会再叫醒你，一轮接一轮，直到你用 loop(stop=True) 关掉"
+    return "循环开着：这一轮结束后会再叫醒你，一轮接一轮；要等就 wait，彻底做完了 loop(stop=True)"
 
 
 def wait(seconds: float) -> str:
@@ -552,7 +552,7 @@ def wait(seconds: float) -> str:
 
     seconds = max(2.0, min(float(seconds), 86400.0))
     if chat.agent.wait_loop(seconds) is None:
-        return "循环没开，wait 是循环里用的；只是想过一会儿再醒，用 wake_me(\"10m\", 原因)"
+        return "循环关着（#loop off），wait 是循环里用的；只是想过一会儿再醒，用 wake_me(\"10m\", 原因)"
     current_binding().session.turn_done = lambda: True
     return f"好，这一轮到此为止，{chat.agent._span(seconds)}后再叫你；期间有消息照样叫你"
 
