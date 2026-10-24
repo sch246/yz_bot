@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import re
 import socket
@@ -78,6 +79,8 @@ KEYBOARD = "com.android.adbkeyboard/.AdbIME"
 _KEYBOARDS = {"adb": ("ADB Keyboard", "adbkeyboard"), "sogou": ("搜狗", "sogou")}
 _DUMP = "/sdcard/yuzu-ui.xml"
 MAX_TEXT = 2000
+# 连拍拼图里每一格的长边（像素）。
+CELL = 400
 MAX_OUTPUT = 4000
 
 _KEYS = {
@@ -101,6 +104,10 @@ _error = ""
 _device = ""
 _parameters: bytes = b""
 _gop = bytearray()
+_gop_frames = 0
+# 连拍期间读流线程把每个包另抄一份到这里。
+_tap: list[bytes] | None = None
+_tap_frames = 0
 _packets = 0
 _bytes = 0
 _last_packet = 0.0
@@ -242,7 +249,7 @@ def _connect(server: subprocess.Popen, serial: str) -> socket.socket:
     WHY: 手机那头的 server 还没 bind 时，adb forward 也会先接下 TCP 再立刻关掉，所以重试
     要包住"连上 + 读 68 字节"整段，只重试连接没用（dsh 踩过）。
     """
-    global _socket, _connected, _error, _device, _parameters, _gop
+    global _socket, _connected, _error, _device, _parameters, _gop, _gop_frames
     deadline = time.monotonic() + CONNECT_TIMEOUT
     last: Exception | None = None
     while time.monotonic() < deadline and not _stop.is_set():
@@ -271,7 +278,7 @@ def _connect(server: subprocess.Popen, serial: str) -> socket.socket:
         with _state:
             _connected, _error = True, ""
             _device = f"{name} {width}x{height}"
-            _parameters, _gop = b"", bytearray()
+            _parameters, _gop, _gop_frames = b"", bytearray(), 0
             _state.notify_all()
         _stream.info("手机画面流已连上：%s", _device)
         return connection
@@ -303,7 +310,7 @@ def _exact(connection: socket.socket, size: int, deadline: float = 0.0, between:
 
 
 def _read(connection: socket.socket) -> None:
-    global _parameters, _gop, _packets, _bytes, _last_packet
+    global _parameters, _gop, _gop_frames, _packets, _bytes, _last_packet, _tap_frames
     while True:
         header = _exact(connection, HEADER.size, between=True)
         if header is None:
@@ -318,12 +325,16 @@ def _read(connection: socket.socket) -> None:
             if pts >> 63:
                 _parameters = payload
             elif pts >> 62 & 1:
-                _gop = bytearray(_parameters + payload)
+                _gop, _gop_frames = bytearray(_parameters + payload), 1
             elif _gop:
                 # 关键帧丢了（刚连上、或攒太多被清掉）时后面的帧解不出来，不攒，等下一个关键帧。
                 _gop += payload
+                _gop_frames += 1
             if len(_gop) > GOP_MAX:
-                _gop = bytearray()
+                _gop, _gop_frames = bytearray(), 0
+            if _tap is not None:
+                _tap.append(payload)
+                _tap_frames += 0 if pts >> 63 else 1
             _packets += 1
             _bytes += size
             _last_packet = time.time()
@@ -463,6 +474,109 @@ def screenshot(wait: float = 0.0) -> dict:
         width, height = picture.size
     _shown = (width, height)
     return {"uri": "file://" + path, "width": width, "height": height}
+
+
+def _frames(data: bytes, wanted: list[int], config: dict, folder: str) -> list[str]:
+    """从 *data* 里解出第 *wanted* 帧（从 0 数），一帧一个文件，按帧号排好。"""
+    pick = "+".join(f"eq(n\\,{index})" for index in wanted)
+    source = os.path.join(folder, "in.h264")
+    with open(source, "wb") as handle:
+        handle.write(data)
+    result = subprocess.run(
+        [config.get("ffmpeg") or "ffmpeg", "-y", "-v", "error", "-f", "h264", "-i", source,
+         "-vf", f"select={pick}", "-fps_mode", "passthrough", "-q:v", "3", os.path.join(folder, "%03d.jpg")],
+        capture_output=True, text=True, timeout=60, check=False)
+    found = sorted(name for name in os.listdir(folder) if name.endswith(".jpg"))
+    if result.returncode or not found:
+        raise RuntimeError(f"ffmpeg 解码失败（{result.returncode}）：{result.stderr.strip()[-300:]}")
+    return [os.path.join(folder, name) for name in found]
+
+
+def _grid(pictures: list, path: str) -> tuple[int, int]:
+    """按时间顺序排成一张图，格子左上角标 #1、#2……；返回 (列, 行)。"""
+    from PIL import Image, ImageDraw, ImageFont
+
+    ratio = CELL / max(pictures[0].size)
+    width, height = round(pictures[0].width * ratio), round(pictures[0].height * ratio)
+    # 列数让整张图接近正方形：竖屏的格子窄，就多排几列。
+    cols = max(1, min(len(pictures), math.ceil(math.sqrt(len(pictures) * height / width))))
+    rows = math.ceil(len(pictures) / cols)
+    gap, header = 6, 26
+    canvas = Image.new("RGB", (cols * (width + gap) + gap, rows * (height + gap + header) + gap), "white")
+    draw = ImageDraw.Draw(canvas)
+    try:
+        font = ImageFont.load_default(size=20)
+    except Exception:
+        font = ImageFont.load_default()
+    for index, picture in enumerate(pictures):
+        x = gap + index % cols * (width + gap)
+        y = gap + index // cols * (height + gap + header)
+        draw.text((x + 2, y + 2), f"#{index + 1}", fill=(20, 20, 20), font=font)
+        canvas.paste(picture.convert("RGB").resize((width, height)), (x, y + header))
+    canvas.save(path, format="JPEG", quality=85, optimize=True)
+    return cols, rows
+
+
+def burst(count: int = 20, interval: float = 0.4) -> dict:
+    """每隔 *interval* 秒取一帧，取 *count* 帧，拼成一张图。
+
+    返回 `{"uri", "count", "seconds", "cols", "rows"}`。拼图上的坐标不能拿去点，所以不改
+    `_shown`。
+
+    WHY: 维护者 2026-10-24：看视频这种极端情况，每秒两三张、攒二三十张拼成一张给她看也可以。
+    一张张 look 做不到这么密，每次都要等模型来回一趟。所以这段时间里读流线程把收到的包
+    另抄一份，最后只调一次 ffmpeg，解出要的那几帧。
+    """
+    global _used, _tap, _tap_frames
+    count, interval = max(2, min(int(count), 30)), max(0.2, min(float(interval), 5.0))
+    _used = time.time()
+    config = _config()
+    woke = _awake(config)
+    _ensure()
+    if woke:
+        time.sleep(WAKE_SETTLE)
+    with _state:
+        _state.wait_for(lambda: bool(_gop) or not _connected, timeout=5.0)
+        if not _gop:
+            raise RuntimeError(f"还没有画面：{_error or '流连上了但还没收到关键帧'}")
+        start, base = bytes(_gop), _gop_frames
+        _tap, _tap_frames = [], 0
+    marks = []
+    began = time.monotonic()
+    try:
+        for index in range(count):
+            time.sleep(max(0.0, began + index * interval - time.monotonic()))
+            with _state:
+                marks.append(base + _tap_frames - 1)
+    finally:
+        with _state:
+            recorded, _tap = _tap or [], None
+    _used = time.time()
+    seconds = round(time.monotonic() - began, 1)
+    os.makedirs(SHOT_DIR, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}"
+    folder = os.path.join(SHOT_DIR, f"burst-{stamp}")
+    os.makedirs(folder)
+    try:
+        wanted = sorted(set(marks))
+        files = dict(zip(wanted, _frames(start + b"".join(recorded), wanted, config, folder)))
+        from PIL import Image
+
+        pictures = []
+        for mark in marks:
+            if mark in files:
+                with Image.open(files[mark]) as picture:
+                    pictures.append(picture.copy())
+        if not pictures:
+            raise RuntimeError("一帧也没解出来")
+        path = os.path.join(SHOT_DIR, f"shot-{stamp}-burst.jpg")
+        cols, rows = _grid(pictures, path)
+    finally:
+        for name in os.listdir(folder):
+            os.remove(os.path.join(folder, name))
+        os.rmdir(folder)
+    _prune()
+    return {"uri": "file://" + path, "count": len(pictures), "seconds": seconds, "cols": cols, "rows": rows}
 
 
 # --------------------------------------------------------------------------- 动
@@ -645,6 +759,7 @@ def status() -> dict:
 
 
 __all__ = [
+    "burst",
     "key",
     "keyboard",
     "screenshot",
