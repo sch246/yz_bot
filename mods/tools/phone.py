@@ -141,6 +141,28 @@ def _lists(shot: dict) -> str:
     return "".join("\n" + line for line in lines)
 
 
+def _age_text(seconds) -> str:
+    """多久以前，给她看的写法：不用 :g（大了会变成 1.23457e+06）。"""
+    if not isinstance(seconds, (int, float)):
+        return ""
+    return f"{seconds:.1f}".rstrip("0").rstrip(".") + " 秒"
+
+
+def _stale_note(shot: dict) -> str:
+    """画面可能不是现在的时候，明说；分支只认 kind，reason 只当文案（dsh 10-24 review）。"""
+    stale = shot.get("stale")
+    if not stale:
+        return ""
+    age = _age_text(stale.get("seconds"))
+    when = f"，最后一帧是 {age}前的" if age else ""
+    if stale.get("kind") == "still":
+        return (f"\n⚠️ 这张画面 {age}没变过{when}。手机静着就是这样，不一定是掉线——"
+                "点一下有反应就不用管，点不动再去看连接。")
+    return (f"\n⚠️ 这是旧画面：{stale.get('reason')}{when}，别把它当成现在。"
+            "重连：exec_code 里 `import mods.phone` 再调 `phone.stop()`，下次看屏幕会自己重新起流；"
+            "或者等维护者把手机上的 Tailscale 恢复。")
+
+
 def look(prompt: str = "", wait: float = 0.0, marks: bool = False, elements: bool = False) -> str:
     """看一眼手机现在的屏幕，图**直接交给**你自己看（模型没有视觉能力时，退回让视觉模型转述）。
 
@@ -158,8 +180,14 @@ def look(prompt: str = "", wait: float = 0.0, marks: bool = False, elements: boo
     except Exception as error:
         return _failed("看屏幕", error)
     uri, size = shot["uri"], f"{shot['width']}×{shot['height']}"
-    lists = _lists(shot)
-    outcome = _attach_image(uri, f"这是你手机现在的屏幕（{size}，点的时候坐标照这张图）。")
+    stale = shot.get("stale")
+    lists = _lists(shot) + _stale_note(shot)
+    caption = f"这是你手机现在的屏幕（{size}，点的时候坐标照这张图）。"
+    if stale:
+        # 图旧的时候 caption 先改口：它比下面那行字先入眼（dsh 10-24 review 第 3 条）。
+        caption = (f"这张可能不是现在（{size}，坐标仍照这张图算）：{stale.get('reason')}。"
+                   "先看下面那句提示，确认手机还连着，再把图里的东西当成现在。")
+    outcome = _attach_image(uri, caption)
     if shot.get("marked") and outcome.startswith("✅"):
         drawn = "、".join(word for word, wanted in (("坐标线和键位（K）", marks), ("控件编号（#）", shot.get("elements")))
                          if wanted)
@@ -230,14 +258,16 @@ def _push_wave(number: int, wave: dict) -> None:
         lines.append(f"自动连拍第 {number} 波：{wave['count']} 张，{clock} 起 {wave['seconds']:g} 秒，#1 最早、按行往右；"
                      "格子上是离这一波第一张几秒，括号里是离上一张几秒。这张图上的坐标不能拿去点。")
         lines.append(cq.cq("image", url=wave["uri"]))
+    stale = wave.get("stale")
+    if stale and stale.get("kind") == "dropped":
+        lines.append(f"⚠️ 这一波的画面可能不是现在：{stale.get('reason')}——画面不动不等于游戏停了，"
+                     "先看看手机还连着没有。")
     if wave["last"]:
         lines.append(f"自动连拍停了：{wave['reason']}。要接着看就再 frames(auto=True)。")
         _push("\n".join(lines), "手机自动连拍停了")
     else:
         lines.append("还在接着拍；不想看了就 frames(stop=True)。")
         _push("\n".join(lines), f"手机自动连拍第 {number} 波")
-
-
 def _stop_watcher() -> str:
     global _watcher
     if _watcher is None:

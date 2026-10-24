@@ -105,12 +105,15 @@ AIM_SETTLE = 0.4
 PATCH = 0.1
 MATCH_MIN = 0.5
 AIM_CLOSE = 12
+# 最后一帧多久没更新就去探一眼手机那头还通不通（秒）。这台手机画面不动时编码器一个包都不发，
+# 所以「静了几十秒」是常态，不能直接当成掉线（dsh 10-24 22:15 的 review 指出过）；探活失败才算旧图。
+STALE_SECONDS = 60.0
 # 按住的手指多久没碰手机就自己松开（秒）：她被别的消息叫走、忘了松手时，角色不会一直跑下去。
 HOLD_MAX = 60
 MARKS = os.path.join(ROOT, "marks.json")
 MAX_MARKS = 50
 MAX_ELEMENTS = 60
-# 推摇杆的八个方向对应的角度：正上方 0°，顺时针。
+# 角度：正上方 0°，顺时针。
 _DIRECTIONS = {
     "上": 0, "右上": 45, "右": 90, "右下": 135, "下": 180, "左下": 225, "左": 270, "左上": 315,
     "up": 0, "up-right": 45, "right": 90, "down-right": 135, "down": 180, "down-left": 225,
@@ -567,14 +570,38 @@ def _snapshot(config: dict, pause: float = 0.0, prefix: str = "shot") -> tuple[s
     return _decode(data, config, prefix), epoch
 
 
+def _alive(config: dict) -> bool:
+    """手机那头还认不认得出来（2 秒超时）。流里没新包时，用它分清「静着」和「断了」。"""
+    try:
+        result = _adb(config, "get-state", timeout=2.0, check=False)
+    except Exception:
+        return False
+    return "device" in (result.stdout or "")
+
+
+def _freshness(config: dict) -> dict:
+    """最后一帧是多久以前的、流还连着吗；静太久了就探一眼手机那头还在不在。
+
+    WHY: 掉线时 `_gop` 里还留着最后一帧，`_snapshot` 会把它当成「此刻」交出去，
+    看着像游戏卡住（10-24 20:33 草籽清后台把 tailscale 关了，连着几轮都是同一帧弹窗）。
+    反过来也不能光看时间：这台手机画面不动时编码器一个包都不发，静着是常态（dsh 10-24
+    22:15 的 review 指出的主要问题），所以超过 STALE_SECONDS 才去探活，结果放 alive。
+    """
+    with _state:
+        age = time.time() - _last_packet if _last_packet else None
+        connected, error = _connected, _error
+    alive = None
+    if connected and age is not None and age > STALE_SECONDS:
+        alive = _alive(config)
+    return {"age": age, "connected": connected, "error": error, "alive": alive}
+
+
 def _measure(path: str) -> tuple[int, int, float]:
     """图的宽、高，和平均亮度（0–255）。"""
     from PIL import Image, ImageStat
 
     with Image.open(path) as picture:
         return (*picture.size, ImageStat.Stat(picture.convert("L")).mean[0])
-
-
 def screenshot(wait: float = 0.0, marks: bool = False, elements: bool = False, shown: bool = True) -> dict:
     """截当前画面，返回 `{"uri", "width", "height"}`。
 
@@ -599,11 +626,31 @@ def screenshot(wait: float = 0.0, marks: bool = False, elements: bool = False, s
         os.remove(path)
         path, epoch = _snapshot(config, WAKE_SETTLE, prefix)
         width, height, level = _measure(path)
+    fresh = _freshness(config)
+    # 流已经报错、或者静了很久又探不通：这一张是旧的，得明说，别让她把旧画面当成现在。
+    # 只是静着（探活还通）也标一下，但分支认 kind、不认文案（dsh 10-24 22:15 review）。
+    stale = None
+    if not fresh["connected"]:
+        stale = {"kind": "dropped",
+                 "seconds": round(fresh["age"], 1) if fresh["age"] is not None else None,
+                 "reason": fresh["error"] or "屏幕流断了"}
+    elif fresh["age"] is not None and fresh["age"] > STALE_SECONDS:
+        if fresh["alive"]:
+            stale = {"kind": "still", "seconds": round(fresh["age"], 1),
+                     "reason": "画面一直没有变化"}
+        else:
+            stale = {"kind": "dropped", "seconds": round(fresh["age"], 1),
+                     "reason": "adb 探活没通过，手机多半掉线了"}
     if not shown:
-        return {"uri": "file://" + path, "width": width, "height": height}
+        shot = {"uri": "file://" + path, "width": width, "height": height}
+        if stale:
+            shot["stale"] = stale
+        return shot
     _shown, _shown_epoch, _listed, _shown_path = (width, height), epoch, [], path
     _touched = time.time()
     shot = {"uri": "file://" + path, "width": width, "height": height}
+    if stale:
+        shot["stale"] = stale
     places = []
     if marks:
         for name, value in _marks().items():
@@ -862,6 +909,7 @@ def waves(count: int = 20, interval: float = WATCH_MIN, threshold: float = 5.0, 
     previous = None
     moved = None
     latest = ""
+    stale = shot.get("stale")
     with _state:
         seen = _packets
     try:
@@ -871,7 +919,9 @@ def waves(count: int = 20, interval: float = WATCH_MIN, threshold: float = 5.0, 
                 packets = _packets
             if packets != seen:
                 seen = packets
-                path = screenshot(shown=False)["uri"].removeprefix("file://")
+                frame = screenshot(shown=False)
+                path = frame["uri"].removeprefix("file://")
+                stale = frame.get("stale")
                 gray = _gray(path, WATCH_WIDTH)[0]
                 _drop(latest)
                 latest = ""
@@ -881,7 +931,7 @@ def waves(count: int = 20, interval: float = WATCH_MIN, threshold: float = 5.0, 
                 else:
                     latest = path
             if len(kept) >= count:
-                yield _wave(kept, previous, False, "")
+                yield _wave(kept, previous, False, "", stale)
                 previous, kept = kept[-1][1], []
                 continue
             if moved is None and now - max(began, _touched) >= WATCH_START:
@@ -892,13 +942,17 @@ def waves(count: int = 20, interval: float = WATCH_MIN, threshold: float = 5.0, 
                 reason = f"{IDLE // 60} 分钟没碰手机"
             else:
                 continue
+            if stale and stale.get("kind") == "dropped":
+                # 静下来也可能是断线了：别让她以为游戏停了（dsh 10-24 review 指出的）。
+                reason += f"；不过最后一次采样就是旧画面（{stale.get('reason')}），多半是手机掉线了"
             if latest:
                 kept.append((latest, now))
                 latest = ""
             if kept:
-                yield _wave(kept, previous, True, reason)
+                yield _wave(kept, previous, True, reason, stale)
             else:
-                yield {"uri": "", "count": 0, "began": now, "seconds": 0.0, "last": True, "reason": reason}
+                yield {"uri": "", "count": 0, "began": now, "seconds": 0.0, "last": True,
+                       "reason": reason, "stale": stale}
             kept = []
             return
     finally:
@@ -909,14 +963,14 @@ def waves(count: int = 20, interval: float = WATCH_MIN, threshold: float = 5.0, 
 
 
 def _drop(path: str) -> None:
+    """删掉一张图，删不掉就算了。"""
     if path:
         try:
             os.remove(path)
         except OSError:
             pass
-
-
-def _wave(kept: list[tuple[str, float]], previous: float | None, last: bool, reason: str) -> dict:
+def _wave(kept: list[tuple[str, float]], previous: float | None, last: bool, reason: str,
+          stale: dict | None = None) -> dict:
     """把这一波的单帧拼成一张、删掉单帧；格子标 `#n 几秒 (+离上一张几秒)`。"""
     first = kept[0][1]
     labels = []
@@ -928,10 +982,12 @@ def _wave(kept: list[tuple[str, float]], previous: float | None, last: bool, rea
     finally:
         for path, _moment in kept:
             _drop(path)
-    return {"uri": uri, "count": len(kept), "began": first, "seconds": round(kept[-1][1] - first, 1),
+    wave = {"uri": uri, "count": len(kept), "began": first, "seconds": round(kept[-1][1] - first, 1),
             "last": last, "reason": reason}
-
-
+    if stale:
+        # 连拍这条路也得带上：掉线时画面不动，她会以为游戏停了（dsh 10-24 review）。
+        wave["stale"] = stale
+    return wave
 # --------------------------------------------------------------------------- 动
 
 
