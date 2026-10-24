@@ -1,4 +1,4 @@
-"""她自己的安卓手机：常驻一条 scrcpy 画面流用来截图，点按、滑动、按键、打字走 adb。
+"""她自己的安卓手机：常驻一条 scrcpy 画面流用来截图，点、滑、按住走这条流的控制连接，按键、打字走 adb。
 
 WHY: 维护者 2026-10-24：这是专门给她的备用机，登的是她自己的 QQ，支付宝没绑卡也没余额；
 她自己想动就动，不设 op 门槛，维护者相信她不会被别人随便骗。手机因此和代码、shell 工具
@@ -18,23 +18,35 @@ WHY: 这台手机画面不动时编码器什么都不发（scrcpy 设的"100ms �
 的包交给 ffmpeg，留下最后一帧。开着游戏时画面一直在动，关键帧 10 秒一个，一次要解几十到
 上百帧；嫌慢再考虑缩短关键帧间隔或换成进程内解码。
 
+## 为什么点、滑、按住走控制连接
+
+WHY: `input swipe` 从按下到抬起是一条命令，按着的时候什么都干不了，也只有一根手指；维护者
+2026-10-24 提出让她在游戏里推着摇杆走、边走边连拍看。scrcpy 的控制连接把触摸事件直接交给已经在跑
+的 server：按下、移动、抬起各是一条消息，中间可以截图，另一根手指可以去点。点和滑也走它：server
+只把经它按下的手指算成同一组，按着摇杆时点别处要从这里发才是第二根手指，混着 `input tap` 就不是了。
+代价是点之前流得开着、她看的那张图得是当前这个方向的（见 `_fresh`）。按键、打字仍走 adb：不常用，
+中文也只有 ADB Keyboard 打得出来。
+
 ## 协议：scrcpy 1.25，版本写死
 
-server 是配置里给的那份 1.25 的 jar（它会核对这边报的版本，不对就退出）。参数里关掉控制
-连接（`control=false`）和开头那个探测字节（`send_dummy_byte=false`）：接上先是 68 字节设备
-信息（64 字节名字，大端 2 字节宽、2 字节高），之后每包 12 字节头（8 字节 pts，最高位表示
-SPS/PPS，次高位表示关键帧；4 字节长度）加 H.264 数据。2.x 的格式不一样，换版本要改这里。
+server 是配置里给的那份 1.25 的 jar（它会核对这边报的版本，不对就退出）。`tunnel_forward` 下
+先后接两条连接：第一条收画面，server 接下它先发一个探测字节（`send_dummy_byte=true`），第二条
+是控制连接。两条都接上后，画面那条先来 68 字节设备信息（64 字节名字，大端 2 字节宽、2 字节高），
+之后每包 12 字节头（8 字节 pts，最高位表示 SPS/PPS，次高位表示关键帧；4 字节长度）加 H.264
+数据。控制连接这边只写 28 字节的触摸消息（`TOUCH`），坐标按画面尺寸算，server 自己换算到屏幕上。
+2.x 的格式不一样，换版本要改这里。
 
 ## 配置
 
 `data/device/phone.json`：`serial`（adb 序列号，走网络的写 `地址:端口`）、`server`（本机上
 1.25 的 scrcpy-server 文件），可选 `adb`、`ffmpeg`、`max_size`、`bit_rate`、`max_fps`。设备
-地址是私有部署值，只放这里。
+地址是私有部署值，只放这里。她定的键位在 `data/phone/marks.json`，维护者也可以直接改。
 """
 
 from __future__ import annotations
 
 import base64
+import itertools
 import json
 import math
 import os
@@ -78,6 +90,26 @@ WAKE_SETTLE = 1.2
 GOP_MAX = 16 << 20
 META_LENGTH = 68
 HEADER = struct.Struct(">QI")
+# 控制连接上的触摸消息：类型 2、动作、手指编号、x、y、画面宽、高、压力（16 位定点）、鼠标键。
+TOUCH = struct.Struct(">BBqiiHHHI")
+DOWN, UP, MOVE = 0, 1, 2
+# 点一下按多久、按住以后推到位用多久（秒）。
+TAP_PRESS = 0.05
+GLIDE = 0.15
+# 触摸之后等多久再截动作后的画面（秒），见 `_see`。估的，没在手机上量过。
+TOUCH_SETTLE = 0.15
+# 按住的手指多久没碰手机就自己松开（秒）：她被别的消息叫走、忘了松手时，角色不会一直跑下去。
+HOLD_MAX = 60
+MARKS = os.path.join(ROOT, "marks.json")
+MAX_MARKS = 50
+MAX_ELEMENTS = 60
+# 推摇杆的八个方向对应的角度：正上方 0°，顺时针。
+_DIRECTIONS = {
+    "上": 0, "右上": 45, "右": 90, "右下": 135, "下": 180, "左下": 225, "左": 270, "左上": 315,
+    "up": 0, "up-right": 45, "right": 90, "down-right": 135, "down": 180, "down-left": 225,
+    "left": 270, "up-left": 315,
+}
+_POINT = re.compile(r"\(?\s*(-?\d+(?:\.\d+)?)\s*[,，\s]\s*(-?\d+(?:\.\d+)?)\s*\)?")
 KEYBOARD = "com.android.adbkeyboard/.AdbIME"
 # keyboard() 切换的两个输入法：设置页上的名字、默认输入法里认它的那段。
 _KEYBOARDS = {"adb": ("ADB Keyboard", "adbkeyboard"), "sogou": ("搜狗", "sogou")}
@@ -119,6 +151,18 @@ _used = 0.0
 # 最近一次给她看的那张图有多大：她给的坐标都照这张图。
 _shown: tuple[int, int] | None = None
 _screen: tuple[int, int] | None = None
+_control: socket.socket | None = None
+# 写控制连接、改 _held 时拿；拿着它不睡，读流线程也要拿它来松手。
+_touching = threading.Lock()
+# 按着没抬的手指：名字（键位名、#n 或 x,y）→ {"id": 手指编号, "at": 现在在图上的位置}。
+_held: dict[str, dict] = {}
+_fingers = itertools.count(1)
+# 收到过几份编码参数（转屏、流重连都会换一份）；攒着的那段、她看的那张各是哪一份。
+_epoch = 0
+_gop_epoch = 0
+_shown_epoch = -1
+# 最近一次 look 列出的控件，"#3" 指第 3 个。
+_listed: list[dict] = []
 
 
 # --------------------------------------------------------------------------- 配置与 adb
@@ -221,8 +265,11 @@ def _session() -> None:
     _adb(config, "forward", f"tcp:{PORT}", "localabstract:scrcpy")
     # WHY: 息屏时新起的 server 拿不到画面、起不来（dsh 实测）。
     _shell(config, "input keyevent KEYCODE_WAKEUP")
+    # power_on=false：亮屏归上面这条 WAKEUP 管，server 自己按的是 POWER，那是开关键。
+    # clipboard_autosync=false：不然手机剪贴板一变，server 就把内容推到控制连接上，这边不读它。
     command = (f"CLASSPATH={REMOTE_JAR} app_process / {SERVER_CLASS} 1.25 log_level=warn "
-               f"tunnel_forward=true control=false send_dummy_byte=false "
+               f"tunnel_forward=true control=true send_dummy_byte=true "
+               f"clipboard_autosync=false power_on=false "
                f"max_size={int(config.get('max_size') or MAX_SIZE)} "
                f"max_fps={int(config.get('max_fps') or MAX_FPS)} "
                f"bit_rate={int(config.get('bit_rate') or BIT_RATE)}")
@@ -232,15 +279,17 @@ def _session() -> None:
             [config.get("adb") or "adb", "-s", config["serial"], "shell", command],
             stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
     _server = server
-    connection = None
+    connections = ()
     try:
-        connection = _connect(server, config["serial"])
-        _read(connection)
+        connections = _connect(server, config["serial"])
+        _read(connections[0])
     finally:
         with _state:
             _connected = False
             _state.notify_all()
-        _close(connection)
+        _lift("画面流断了")
+        for connection in connections:
+            _close(connection)
         _server = None
         _terminate(server)
         try:
@@ -251,45 +300,47 @@ def _session() -> None:
             pass
 
 
-def _connect(server: subprocess.Popen, serial: str) -> socket.socket:
-    """一直试到真读到设备信息为止。
+def _connect(server: subprocess.Popen, serial: str) -> tuple[socket.socket, socket.socket]:
+    """接上画面、控制两条连接，一直试到真读到设备信息为止；返回 (画面, 控制)。
 
     WHY: 手机那头的 server 还没 bind 时，adb forward 也会先接下 TCP 再立刻关掉，所以重试
-    要包住"连上 + 读 68 字节"整段，只重试连接没用（dsh 踩过）。
+    要包住"连上 + 读到东西"整段，只重试连接没用（dsh 踩过）。读到探测字节才接第二条：不然第一条
+    刚好被这样关掉、第二条却接上了，server 会把第二条当成画面连接。
     """
-    global _socket, _connected, _error, _device, _parameters, _gop, _gop_frames
+    global _socket, _control, _connected, _error, _device, _parameters, _gop, _gop_frames
     deadline = time.monotonic() + CONNECT_TIMEOUT
     last: Exception | None = None
     while time.monotonic() < deadline and not _stop.is_set():
         if server.poll() is not None:
             raise RuntimeError(f"scrcpy-server 退出了（{server.returncode}）：{_tail(SERVER_LOG, serial)}")
+        video = control = meta = None
         try:
-            connection = socket.create_connection(("127.0.0.1", PORT), timeout=2.0)
-        except OSError as error:
-            last = error
-            time.sleep(0.25)
-            continue
-        try:
-            meta = _exact(connection, META_LENGTH, deadline=time.monotonic() + 6.0)
+            video = socket.create_connection(("127.0.0.1", PORT), timeout=2.0)
+            if _exact(video, 1, deadline=time.monotonic() + 6.0) is not None:
+                control = socket.create_connection(("127.0.0.1", PORT), timeout=2.0)
+                meta = _exact(video, META_LENGTH, deadline=time.monotonic() + 6.0)
         except (OSError, EOFError, TimeoutError) as error:
-            _close(connection)
+            _close(video)
+            _close(control)
             last = error
             time.sleep(0.25)
             continue
         if meta is None:
-            _close(connection)
+            _close(video)
+            _close(control)
             break
         width, height = struct.unpack(">HH", meta[64:68])
         name = meta[:64].split(b"\0", 1)[0].decode("utf-8", "replace")
-        connection.settimeout(2.0)
-        _socket = connection
+        video.settimeout(2.0)
+        control.settimeout(5.0)
+        _socket, _control = video, control
         with _state:
             _connected, _error = True, ""
             _device = f"{name} {width}x{height}"
             _parameters, _gop, _gop_frames = b"", bytearray(), 0
             _state.notify_all()
         _stream.info("手机画面流已连上：%s", _device)
-        return connection
+        return video, control
     raise TimeoutError(f"等了 {CONNECT_TIMEOUT} 秒没接上 scrcpy-server（{last}）：{_tail(SERVER_LOG, serial)}")
 
 
@@ -306,6 +357,8 @@ def _exact(connection: socket.socket, size: int, deadline: float = 0.0, between:
         try:
             chunk = connection.recv(size - len(data))
         except socket.timeout:
+            if between and not data:
+                _expire()
             if _stop.is_set() or (between and not data and _idle()):
                 return None
             if deadline and time.monotonic() >= deadline:
@@ -318,7 +371,7 @@ def _exact(connection: socket.socket, size: int, deadline: float = 0.0, between:
 
 
 def _read(connection: socket.socket) -> None:
-    global _parameters, _gop, _gop_frames, _packets, _bytes, _last_packet, _tap_frames
+    global _parameters, _gop, _gop_frames, _packets, _bytes, _last_packet, _tap_frames, _epoch, _gop_epoch
     while True:
         header = _exact(connection, HEADER.size, between=True)
         if header is None:
@@ -332,8 +385,9 @@ def _read(connection: socket.socket) -> None:
         with _state:
             if pts >> 63:
                 _parameters = payload
+                _epoch += 1
             elif pts >> 62 & 1:
-                _gop, _gop_frames = bytearray(_parameters + payload), 1
+                _gop, _gop_frames, _gop_epoch = bytearray(_parameters + payload), 1, _epoch
             elif _gop:
                 # 关键帧丢了（刚连上、或攒太多被清掉）时后面的帧解不出来，不攒，等下一个关键帧。
                 _gop += payload
@@ -347,14 +401,17 @@ def _read(connection: socket.socket) -> None:
             _bytes += size
             _last_packet = time.time()
             _state.notify_all()
+        _expire()
 
 
 def _close(connection: socket.socket | None) -> None:
-    global _socket
+    global _socket, _control
     if connection is None:
         return
     if _socket is connection:
         _socket = None
+    if _control is connection:
+        _control = None
     try:
         connection.shutdown(socket.SHUT_RDWR)
     except OSError:
@@ -410,12 +467,14 @@ def warm() -> str:
 
 
 def stop(reason: str = "") -> str:
-    """关掉画面流（下次看时再起）。"""
+    """关掉画面流（下次看时再起），先松开按着的手指。"""
     with _lock:
         thread = _thread
         if thread is None:
             return "手机画面流本来就没在跑"
         _stop.set()
+    # 先松手再拆连接：下面马上要杀 server，等读流线程收尾时再发抬起就来不及了。
+    _lift("关流")
     _close(_socket)
     if _server is not None:
         _terminate(_server)
@@ -479,15 +538,15 @@ def _ready() -> dict:
     return config
 
 
-def _snapshot(config: dict, pause: float = 0.0) -> str:
-    """解出此刻的最新一帧，返回 jpg 路径。"""
+def _snapshot(config: dict, pause: float = 0.0) -> tuple[str, int]:
+    """解出此刻的最新一帧，返回 (jpg 路径, 它是第几份编码参数下的)。"""
     if pause:
         time.sleep(pause)
     with _state:
-        data = bytes(_gop)
+        data, epoch = bytes(_gop), _gop_epoch
     if not data:
         raise RuntimeError("攒的画面刚被清掉，等下一个关键帧再看")
-    return _decode(data, config)
+    return _decode(data, config), epoch
 
 
 def _measure(path: str) -> tuple[int, int, float]:
@@ -498,22 +557,132 @@ def _measure(path: str) -> tuple[int, int, float]:
         return (*picture.size, ImageStat.Stat(picture.convert("L")).mean[0])
 
 
-def screenshot(wait: float = 0.0) -> dict:
+def screenshot(wait: float = 0.0, marks: bool = False, elements: bool = False) -> dict:
     """截当前画面，返回 `{"uri", "width", "height"}`。
+
+    *marks* 在图上画坐标线和这个方向的键位，结果多一项 `marks`；*elements* 读一遍界面，
+    把控件框出来编号，结果多一项 `elements`（读不出来时是 `elements_error`）。
 
     WHY: 以前每张图都先 `dumpsys power` 问亮没亮，那一次往返 0.15 秒（dsh 实测），比解码还
     贵。现在先解，图整张黑才去点亮：灭屏时流里只有黑帧，正常界面再暗也没那么黑。
     """
-    global _shown
+    global _shown, _shown_epoch, _listed
     config = _ready()
-    path = _snapshot(config, min(max(wait, 0.0), 10.0))
+    path, epoch = _snapshot(config, min(max(wait, 0.0), 10.0))
     width, height, level = _measure(path)
     if level < DARK:
         _shell(config, "input keyevent KEYCODE_WAKEUP", check=False)
-        path = _snapshot(config, WAKE_SETTLE)
+        path, epoch = _snapshot(config, WAKE_SETTLE)
         width, height, level = _measure(path)
-    _shown = (width, height)
-    return {"uri": "file://" + path, "width": width, "height": height}
+    _shown, _shown_epoch, _listed = (width, height), epoch, []
+    shot = {"uri": "file://" + path, "width": width, "height": height}
+    places = []
+    if marks:
+        for name, value in _marks().items():
+            try:
+                x, y, radius = _place(name, value)
+            except ValueError:
+                continue
+            places.append({"name": name, "x": x, "y": y, "radius": radius})
+        shot["marks"] = places
+    if elements:
+        try:
+            _listed = _controls(config, width, height)
+            shot["elements"] = _listed
+        except Exception as error:
+            shot["elements_error"] = f"{type(error).__name__}: {error}"
+    if marks or _listed:
+        _overlay(path, marks, places, _listed)
+    return shot
+
+
+def _font(size: int):
+    from PIL import ImageFont
+
+    try:
+        return ImageFont.load_default(size=size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def _overlay(path: str, grid: bool, places: list[dict], items: list[dict]) -> None:
+    """在截图上画坐标线、键位（K1、K2……，摇杆画出圈和八个方向）和控件框（#1、#2……），原地覆盖。
+
+    默认字体没有中文，所以图上只写编号，名字在工具结果的列表里。
+    """
+    from PIL import Image, ImageDraw
+
+    with Image.open(path) as picture:
+        canvas = picture.convert("RGBA")
+    layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+    font, small = _font(18), _font(14)
+    outline = {"stroke_width": 2, "stroke_fill": (0, 0, 0, 255)}
+    width, height = canvas.size
+    if grid:
+        for x in range(100, width, 100):
+            draw.line([(x, 0), (x, height)], fill=(255, 255, 255, 90))
+            draw.text((x + 2, 2), str(x), fill=(255, 255, 255, 255), font=small, **outline)
+        for y in range(100, height, 100):
+            draw.line([(0, y), (width, y)], fill=(255, 255, 255, 90))
+            draw.text((2, y + 2), str(y), fill=(255, 255, 255, 255), font=small, **outline)
+    yellow, cyan = (255, 220, 0, 255), (0, 230, 255, 255)
+    for index, place in enumerate(places, 1):
+        x, y, radius = place["x"], place["y"], place["radius"]
+        if radius:
+            draw.ellipse([x - radius, y - radius, x + radius, y + radius], outline=yellow, width=2)
+            for angle in range(0, 360, 45):
+                dx, dy = math.sin(math.radians(angle)), -math.cos(math.radians(angle))
+                draw.line([(x, y), (x + dx * radius, y + dy * radius)], fill=yellow, width=1)
+                draw.ellipse([x + dx * radius - 4, y + dy * radius - 4, x + dx * radius + 4, y + dy * radius + 4],
+                             fill=yellow)
+        draw.ellipse([x - 5, y - 5, x + 5, y + 5], fill=yellow, outline=(0, 0, 0, 255))
+        draw.text((x + 8, y + 6), f"K{index}", fill=yellow, font=font, **outline)
+    for index, item in enumerate(items, 1):
+        left, top, right, bottom = item["box"]
+        draw.rectangle([left, top, right, bottom], outline=cyan, width=2)
+        draw.text((left + 3, top + 2), f"#{index}", fill=cyan, font=small, **outline)
+    Image.alpha_composite(canvas, layer).convert("RGB").save(path, format="JPEG", quality=85)
+
+
+def _controls(config: dict, width: int, height: int) -> list[dict]:
+    """界面上有字或能点的控件，坐标换成 width×height 那张图上的，从上到下排。
+
+    能点的控件用它里面的字当名字，里面那些字就不再单列；铺满大半个屏幕的是容器，不列。
+    游戏画面整个是一块，读不出东西，所以只试一次。
+    """
+    from xml.etree import ElementTree
+
+    xml = _dump(config, tries=1)
+    end = "</hierarchy>"
+    root = ElementTree.fromstring(xml[xml.index("<hierarchy"):xml.rindex(end) + len(end)])
+    short, long = _size(config)
+    across, down = (long, short) if width > height else (short, long)
+    found, taken = [], set()
+    for node in root.iter("node"):
+        if id(node) in taken:
+            continue
+        bounds = re.fullmatch(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]", node.get("bounds", ""))
+        if not bounds:
+            continue
+        left, top, right, bottom = (int(value) for value in bounds.groups())
+        left, top, right, bottom = max(left, 0), max(top, 0), min(right, across), min(bottom, down)
+        if right <= left or bottom <= top or (right - left) * (bottom - top) > across * down * 0.6:
+            continue
+        clickable = node.get("clickable") == "true"
+        label = node.get("text") or node.get("content-desc") or ""
+        if clickable:
+            inner = [child for child in node.iter("node") if child is not node and child.get("clickable") != "true"]
+            taken.update(id(child) for child in inner)
+            label = label or " ".join(child.get("text") or child.get("content-desc") or "" for child in inner)
+        label = " ".join(label.split())
+        if not label and not clickable:
+            continue
+        box = (left * width / across, top * height / down, right * width / across, bottom * height / down)
+        found.append({"label": label[:24] or "（没有字）", "clickable": clickable, "box": box,
+                      "x": round((box[0] + box[2]) / 2), "y": round((box[1] + box[3]) / 2)})
+    found.sort(key=lambda item: (item["box"][1], item["box"][0]))
+    return found[:MAX_ELEMENTS]
 
 
 def _frames(data: bytes, wanted: list[int], config: dict, folder: str) -> list[str]:
@@ -534,7 +703,7 @@ def _frames(data: bytes, wanted: list[int], config: dict, folder: str) -> list[s
 
 def _grid(pictures: list, path: str) -> tuple[int, int]:
     """按时间顺序排成一张图，格子左上角标 #1、#2……；返回 (列, 行)。"""
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw
 
     ratio = CELL / max(pictures[0].size)
     width, height = round(pictures[0].width * ratio), round(pictures[0].height * ratio)
@@ -544,10 +713,7 @@ def _grid(pictures: list, path: str) -> tuple[int, int]:
     gap, header = 6, 26
     canvas = Image.new("RGB", (cols * (width + gap) + gap, rows * (height + gap + header) + gap), "white")
     draw = ImageDraw.Draw(canvas)
-    try:
-        font = ImageFont.load_default(size=20)
-    except Exception:
-        font = ImageFont.load_default()
+    font = _font(20)
     for index, picture in enumerate(pictures):
         x = gap + index % cols * (width + gap)
         y = gap + index // cols * (height + gap + header)
@@ -627,24 +793,99 @@ def _size(config: dict) -> tuple[int, int]:
     return _screen
 
 
-def _point(config: dict, x: float, y: float) -> tuple[int, int]:
-    """把最近那张图上的坐标换成手机上的；横屏看图宽大于高。"""
+def _marks() -> dict:
+    try:
+        with open(MARKS, encoding="utf-8") as handle:
+            value = json.load(handle)
+    except FileNotFoundError:
+        return {}
+    if not isinstance(value, dict):
+        raise TypeError(f"{MARKS} 必须是对象")
+    return value
+
+
+def _place(name: str, value: dict) -> tuple[float, float, float]:
+    """键位在最近那张图上的 (x, y, 半径)；它是另一个方向定的就报错。"""
+    width, height = _shown
+    try:
+        saved_width, saved_height = value["size"]
+        x, y, radius = float(value["x"]), float(value["y"]), float(value.get("radius") or 0)
+    except (KeyError, TypeError, ValueError):
+        raise ValueError(f"键位「{name}」的格式不对（要有 x、y、size）") from None
+    if (saved_width > saved_height) != (width > height):
+        raise ValueError(f"键位「{name}」是{'横' if saved_width > saved_height else '竖'}屏时定的，"
+                         f"现在是{'横' if width > height else '竖'}屏")
+    return x * width / saved_width, y * height / saved_height, radius * width / saved_width
+
+
+def _name(at: str) -> str:
+    """手指的名字：坐标统一写成 `x,y`，其余取第一段（键位名或 #n）。"""
+    text = at.strip()
+    found = _POINT.fullmatch(text)
+    if found:
+        return ",".join(f"{float(value):g}" for value in found.groups())
+    return text.split()[0] if text else ""
+
+
+def _spot(at: str) -> dict:
+    """把她写的位置换成最近那张图上的点。
+
+    `"320,480"` 图上这一点；`"#3"` 最近一次 look 列出的第 3 个控件；`"跳"` 键位；`"摇杆 上"`
+    把摇杆往上推到边。返回 `{"key", "label", "x", "y", "from"}`：`key` 是按住时手指的名字，
+    `from` 是起手按下的点（推摇杆时是它的中心）。
+
+    WHY: 维护者 2026-10-24 觉得这就是安卓模拟器的键位映射，应该设计得简单点：所以摇杆只有八个
+    方向、一推到边，没有格数和角度。
+    """
     if _shown is None:
         raise RuntimeError("还没看过手机画面：先 look 一眼，坐标照那张图写")
     width, height = _shown
-    if not (0 <= x <= width and 0 <= y <= height):
-        raise ValueError(f"({x:g}, {y:g}) 在画面外：最近那张图是 {width}×{height}")
-    short, long = _size(config)
-    across, down = (long, short) if width > height else (short, long)
-    return round(x * across / width), round(y * down / height)
+    text, key = at.strip(), _name(at)
+    if _POINT.fullmatch(text):
+        x, y = (float(value) for value in key.split(","))
+        if not (0 <= x <= width and 0 <= y <= height):
+            raise ValueError(f"({x:g}, {y:g}) 在画面外：最近那张图是 {width}×{height}")
+        x, y = round(x), round(y)
+        return {"key": key, "label": "", "x": x, "y": y, "from": (x, y)}
+    if re.fullmatch(r"#\d+", text):
+        index = int(text[1:])
+        if not _listed:
+            raise ValueError("最近一次 look 没有列控件：要用 #n 先 look(elements=True)")
+        if not 1 <= index <= len(_listed):
+            raise ValueError(f"最近一次 look 只列了 {len(_listed)} 个控件")
+        item = _listed[index - 1]
+        return {"key": text, "label": f"{text} {item['label']}", "x": item["x"], "y": item["y"],
+                "from": (item["x"], item["y"])}
+    if not key:
+        raise ValueError("没写位置")
+    marks = _marks()
+    if key not in marks:
+        raise ValueError(f"没有叫「{key}」的键位（{'有：' + '、'.join(marks) if marks else '还一个都没有'}）；"
+                         "坐标写成 \"x,y\"，或者先用 mark 定一个")
+    x, y, radius = _place(key, marks[key])
+    rest = text.split()[1:]
+    center = (round(x), round(y))
+    if not rest:
+        return {"key": key, "label": key, "x": center[0], "y": center[1], "from": center}
+    angle = _DIRECTIONS.get(rest[0].lower()) if len(rest) == 1 else None
+    if angle is None:
+        raise ValueError(f"看不懂「{text}」：推摇杆写「摇杆 上」，方向是上、下、左、右、左上、右上、左下、右下")
+    if radius <= 0:
+        raise ValueError(f"「{key}」是按钮不是摇杆，不能推；当摇杆用要在 mark 时给 radius")
+    x = min(max(x + math.sin(math.radians(angle)) * radius, 0), width - 1)
+    y = min(max(y - math.cos(math.radians(angle)) * radius, 0), height - 1)
+    return {"key": key, "label": f"{key} {rest[0]}", "x": round(x), "y": round(y), "from": center}
 
 
-def _see(result: dict) -> dict:
+def _see(result: dict, settle: float = 0.0) -> dict:
     """动作之后顺手把这一刻的画面并进结果；看不成也不让动作本身失败。
 
     WHY: 动作一返回画面就是最新的（dsh 实测：下拉通知栏那 7 帧在命令返回时已经全到了），
-    所以这里不用等；动作和看合成一次调用，省掉"做完再 look 一眼"的那一轮模型往返。
+    所以这里不用等；动作和看合成一次调用，省掉"做完再 look 一眼"的那一轮模型往返。那是照
+    `input` 量的，它等应用处理完才返回；走控制连接的触摸是异步注入，先等 *settle* 秒。
     """
+    if settle:
+        time.sleep(settle)
     try:
         shot = screenshot()
     except Exception as error:
@@ -654,20 +895,171 @@ def _see(result: dict) -> dict:
     return result
 
 
-def tap(x: float, y: float) -> dict:
-    config = _config()
-    left, top = _point(config, x, y)
-    _shell(config, f"input tap {left} {top}")
-    return _see({"at": (left, top)})
+def _fresh() -> None:
+    """点之前确认：看过、流开着、看过以后画面尺寸没变。
+
+    WHY: server 只认按当前画面尺寸算的坐标，尺寸对不上就把事件丢掉，只在它自己的日志里记一句
+    （1.25 的 Device.getPhysicalPoint）。转屏、流断了重连都会重发编码参数，这之后她手里那张图
+    的尺寸就不一定对了；与其点了没反应还不知道，不如让她先看一眼。
+    """
+    global _used
+    if _shown is None:
+        raise RuntimeError("还没看过手机画面：先 look 一眼，坐标照那张图写")
+    if _control is None:
+        raise RuntimeError(f"手机画面流没开着（{IDLE // 60} 分钟没用会自己关）：先 look 一眼再点")
+    if _epoch != _shown_epoch:
+        raise RuntimeError("看过以后屏幕转过方向、或者画面流重连过：先 look 一眼再点")
+    _used = time.time()
 
 
-def swipe(x1: float, y1: float, x2: float, y2: float, duration: int = 300) -> dict:
-    config = _config()
-    start, end = _point(config, x1, y1), _point(config, x2, y2)
+def _touch(action: int, finger: int, x: float, y: float) -> bytes:
+    width, height = _shown
+    x, y = min(max(round(x), 0), width - 1), min(max(round(y), 0), height - 1)
+    return TOUCH.pack(2, action, finger, x, y, width, height, 0 if action == UP else 0xFFFF, 0)
+
+
+def _send(message: bytes) -> None:
+    with _touching:
+        connection = _control
+        if connection is None:
+            raise RuntimeError("手机画面流断了：先 look 一眼再点")
+        connection.sendall(message)
+
+
+def _glide(finger: int, start: tuple, end: tuple, seconds: float) -> None:
+    """按着的手指从 *start* 一路移到 *end*，大约每 16 毫秒一步。"""
+    steps = max(2, min(100, int(seconds / 0.016)))
+    for step in range(1, steps + 1):
+        time.sleep(seconds / steps)
+        _send(_touch(MOVE, finger, start[0] + (end[0] - start[0]) * step / steps,
+                     start[1] + (end[1] - start[1]) * step / steps))
+
+
+def _lift(reason: str) -> None:
+    """抬起所有按着的手指；连接已经断了就只清掉记录。"""
+    with _touching:
+        fingers = dict(_held)
+        _held.clear()
+        connection = _control
+        if fingers and connection is not None and _shown is not None:
+            try:
+                connection.sendall(b"".join(_touch(UP, finger["id"], *finger["at"]) for finger in fingers.values()))
+            except OSError:
+                pass
+    if fingers:
+        _stream.info("松开了 %s：%s", "、".join(fingers), reason)
+
+
+def _expire() -> None:
+    """读流线程调：按着的手指没人管太久就松开；连拍还在拍时不算没人管。"""
+    if _held and _tap is None and time.time() - _used > HOLD_MAX:
+        _lift(f"{HOLD_MAX} 秒没碰手机")
+
+
+def tap(at: str) -> dict:
+    """点一下 *at*（写法见 `_spot`），返回那个点。按着的手指不受影响：这一下用的是另一根。"""
+    _fresh()
+    spot = _spot(at)
+    finger = next(_fingers)
+    _send(_touch(DOWN, finger, spot["x"], spot["y"]))
+    time.sleep(TAP_PRESS)
+    _send(_touch(UP, finger, spot["x"], spot["y"]))
+    return _see(spot, TOUCH_SETTLE)
+
+
+def swipe(start: str, end: str, duration: int = 300) -> dict:
+    """从 *start* 滑到 *end*，用 *duration* 毫秒；两点一样就是长按。"""
+    _fresh()
+    begin, finish = _spot(start), _spot(end)
     duration = max(1, min(int(duration), 60_000))
-    _shell(config, f"input swipe {start[0]} {start[1]} {end[0]} {end[1]} {duration}",
-           timeout=duration / 1000 + 20)
-    return _see({"from": start, "to": end, "duration": duration})
+    finger = next(_fingers)
+    origin, target = (begin["x"], begin["y"]), (finish["x"], finish["y"])
+    _send(_touch(DOWN, finger, *origin))
+    try:
+        if origin == target:
+            time.sleep(duration / 1000)
+        else:
+            _glide(finger, origin, target, duration / 1000)
+    finally:
+        _send(_touch(UP, finger, *target))
+    return _see({"from": begin, "to": finish, "duration": duration}, TOUCH_SETTLE)
+
+
+def hold(at: str, seconds: float = 0.0) -> dict:
+    """按住 *at* 不放就返回；同名的手指已经按着，就不抬手、滑到新位置。
+
+    *seconds* 大于 0 时按这么久（最多 30 秒）再松开。返回 `_spot` 那个点外加 `kept`（还按着没有）
+    和动作后的画面。
+
+    WHY: 摇杆要先按住再推：直接在推到的位置按下，浮动摇杆会把那里当成新的中心，角色不动。所以
+    新按下的手指先落在摇杆中心，再用 `GLIDE` 秒推过去。
+    """
+    _fresh()
+    spot = _spot(at)
+    end = (spot["x"], spot["y"])
+    with _touching:
+        finger = _held.get(spot["key"])
+    if finger is None:
+        finger = {"id": next(_fingers), "at": spot["from"]}
+        _send(_touch(DOWN, finger["id"], *finger["at"]))
+        with _touching:
+            _held[spot["key"]] = finger
+        time.sleep(TAP_PRESS)
+    if finger["at"] != end:
+        _glide(finger["id"], finger["at"], end, GLIDE)
+        finger["at"] = end
+    if seconds > 0:
+        time.sleep(min(seconds, 30.0))
+        _up(spot["key"])
+    return _see({**spot, "kept": seconds <= 0}, TOUCH_SETTLE)
+
+
+def release(at: str = "") -> dict:
+    """抬起按着的手指：*at* 写哪个抬哪个，不写全抬；返回 `{"released": 抬起的名字}` 和动作后的画面。"""
+    released = _up(at)
+    return _see({"released": released}, TOUCH_SETTLE) if released else {"released": []}
+
+
+def _up(at: str) -> list[str]:
+    global _used
+    name = _name(at)
+    with _touching:
+        if name and name not in _held:
+            raise ValueError(f"「{name}」没按着" + (f"（按着的有：{'、'.join(_held)}）" if _held else ""))
+        fingers = {name: _held.pop(name)} if name else dict(_held)
+        if not name:
+            _held.clear()
+    for finger in fingers.values():
+        _send(_touch(UP, finger["id"], *finger["at"]))
+    _used = time.time()
+    return list(fingers)
+
+
+def mark(name: str, at: str = "", radius: float = 0.0, remove: bool = False) -> dict:
+    """定一个键位：给了 *radius* 是摇杆，不给是按钮（位置写法见 `_spot`，存最近那张图上的坐标和
+    图的尺寸），或者删掉；返回全部键位。"""
+    name = name.strip()
+    if not re.fullmatch(r"[^\s,，#][^\s,，]{0,19}", name):
+        raise ValueError("键位名字写 1~20 个字，不带空格和逗号，不以 # 开头")
+    marks = _marks()
+    if remove:
+        if marks.pop(name, None) is None:
+            raise ValueError(f"没有叫「{name}」的键位")
+    else:
+        if not at.strip():
+            raise ValueError("要给位置，例如 mark(\"摇杆\", \"180,430\", radius=120)")
+        spot = _spot(at)
+        if not 0 <= radius <= max(_shown):
+            raise ValueError(f"半径写 0~{max(_shown)}")
+        if name not in marks and len(marks) >= MAX_MARKS:
+            raise ValueError(f"键位最多 {MAX_MARKS} 个，先删掉用不着的")
+        marks[name] = {"x": spot["x"], "y": spot["y"], "radius": round(radius), "size": list(_shown)}
+    os.makedirs(ROOT, exist_ok=True)
+    temporary = MARKS + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(marks, handle, ensure_ascii=False, indent=1)
+    os.replace(temporary, MARKS)
+    return marks
 
 
 def key(name: str) -> dict:
@@ -704,15 +1096,16 @@ def type_text(text: str, clear: bool = False, enter: bool = False) -> dict:
     return _see({"count": len(text)})
 
 
-def _dump(config: dict) -> str:
+def _dump(config: dict, tries: int = 3) -> str:
     """当前界面的 uiautomator XML。先删旧文件：dump 偶尔失败，直接 cat 会读到上一次的。"""
-    for _ in range(3):
+    for attempt in range(tries):
+        if attempt:
+            time.sleep(1)
         xml = _shell(config, f"rm -f {_DUMP}; uiautomator dump {_DUMP} >/dev/null 2>&1; cat {_DUMP} 2>/dev/null",
                      timeout=40, check=False)
-        if "<hierarchy" in xml:
+        if "<hierarchy" in xml and "</hierarchy>" in xml:
             return xml
-        time.sleep(1)
-    raise RuntimeError("uiautomator dump 连着三次没读到界面")
+    raise RuntimeError(f"uiautomator dump 试了 {tries} 次都没读到界面")
 
 
 def _center(tag: str) -> tuple[int, int] | None:
@@ -803,14 +1196,18 @@ def status() -> dict:
             "bytes": _bytes,
             "since_packet": round(time.time() - _last_packet, 1) if _last_packet else None,
             "since_look": round(time.time() - _used, 1) if _used else None,
+            "held": list(_held),
             "error": _error,
         }
 
 
 __all__ = [
     "burst",
+    "hold",
     "key",
     "keyboard",
+    "mark",
+    "release",
     "screenshot",
     "shell",
     "status",
