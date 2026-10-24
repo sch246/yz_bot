@@ -451,22 +451,34 @@ def _prune() -> None:
             pass
 
 
-def screenshot(wait: float = 0.0) -> dict:
-    """点亮屏幕、确保流在跑，截当前画面，返回 `{"uri", "width", "height"}`。"""
-    global _used, _shown
+def _ready() -> dict:
+    """点亮屏幕、确保流在跑、等到有画面，返回配置。"""
+    global _used
     _used = time.time()
     config = _config()
     woke = _awake(config)
     _ensure()
-    pause = max(WAKE_SETTLE if woke else 0.0, min(max(wait, 0.0), 10.0))
-    if pause:
-        time.sleep(pause)
+    if woke:
+        time.sleep(WAKE_SETTLE)
     with _state:
-        # 刚连上时第一个关键帧还要几百毫秒才到。
-        _state.wait_for(lambda: bool(_gop) or not _connected, timeout=5.0)
+        # WHY: server 先发设备信息、再去配编码器，所以连上以后第一个关键帧还要等。平时几百毫秒，
+        # 游戏满载时能拖很久：dsh 实测原先等 5 秒时撞上过"还没收到关键帧"。所以等得和连接一样久。
+        _state.wait_for(lambda: bool(_gop) or not _connected, timeout=CONNECT_TIMEOUT)
+        if not _gop:
+            raise RuntimeError(f"还没有画面：{_error or '流连上了但还没收到关键帧'}")
+    return config
+
+
+def screenshot(wait: float = 0.0) -> dict:
+    """点亮屏幕、确保流在跑，截当前画面，返回 `{"uri", "width", "height"}`。"""
+    global _shown
+    config = _ready()
+    if wait > 0:
+        time.sleep(min(wait, 10.0))
+    with _state:
         data = bytes(_gop)
     if not data:
-        raise RuntimeError(f"还没有画面：{_error or '流连上了但还没收到关键帧'}")
+        raise RuntimeError("攒的画面刚被清掉，等下一个关键帧再看")
     path = _decode(data, config)
     from PIL import Image
 
@@ -529,17 +541,11 @@ def burst(count: int = 20, interval: float = 0.4) -> dict:
     """
     global _used, _tap, _tap_frames
     count, interval = max(2, min(int(count), 30)), max(0.2, min(float(interval), 5.0))
-    _used = time.time()
-    config = _config()
-    woke = _awake(config)
-    _ensure()
-    if woke:
-        time.sleep(WAKE_SETTLE)
+    config = _ready()
     with _state:
-        _state.wait_for(lambda: bool(_gop) or not _connected, timeout=5.0)
-        if not _gop:
-            raise RuntimeError(f"还没有画面：{_error or '流连上了但还没收到关键帧'}")
         start, base = bytes(_gop), _gop_frames
+        if not start:
+            raise RuntimeError("攒的画面刚被清掉，等下一个关键帧再看")
         _tap, _tap_frames = [], 0
     marks = []
     began = time.monotonic()
