@@ -116,7 +116,7 @@ _DIRECTIONS = {
     "up": 0, "up-right": 45, "right": 90, "down-right": 135, "down": 180, "down-left": 225,
     "left": 270, "up-left": 315,
 }
-_POINT = re.compile(r"\(?\s*(-?\d+(?:\.\d+)?)\s*[,，\s]\s*(-?\d+(?:\.\d+)?)\s*\)?")
+_POINT = re.compile(r"\(?\s*([-+]?\d+(?:\.\d+)?)\s*[,，\s]\s*([-+]?\d+(?:\.\d+)?)\s*\)?")
 KEYBOARD = "com.android.adbkeyboard/.AdbIME"
 # keyboard() 切换的两个输入法：设置页上的名字、默认输入法里认它的那段。
 _KEYBOARDS = {"adb": ("ADB Keyboard", "adbkeyboard"), "sogou": ("搜狗", "sogou")}
@@ -124,6 +124,13 @@ _DUMP = "/sdcard/yuzu-ui.xml"
 MAX_TEXT = 2000
 # 连拍拼图里每一格的长边（像素）。
 CELL = 400
+# 自动连拍（`waves`）：最快几秒看一次；比画面变了多少时把图缩到多宽、一个像素的灰度差过多少才算它
+# 变了；变过以后静下来几秒算停了；开了以后一直没动，等她多久。都是估的。
+WATCH_MIN = 0.5
+WATCH_WIDTH = 160
+WATCH_PIXEL = 24
+WATCH_SETTLE = 2.0
+WATCH_START = 60.0
 MAX_OUTPUT = 4000
 
 _KEYS = {
@@ -815,6 +822,116 @@ def burst(count: int = 20, interval: float = 0.4) -> dict:
     return {"uri": "file://" + path, "count": len(pictures), "seconds": seconds, "cols": cols, "rows": rows}
 
 
+def _change(before, after) -> float:
+    """两张缩小的灰度图之间，百分之几的像素变了。"""
+    import numpy
+
+    if before.shape != after.shape:
+        return 100.0
+    return float((numpy.abs(before - after) > WATCH_PIXEL).mean() * 100)
+
+
+def waves(count: int = 20, interval: float = WATCH_MIN, threshold: float = 5.0, stop: threading.Event | None = None):
+    """自动连拍：每 *interval* 秒（最快 `WATCH_MIN`）看一眼，比上一张留下的变了 *threshold*% 以上就留下，
+    攒满 *count* 张拼成一张交出来；变过以后静下来 `WATCH_SETTLE` 秒，交出最后一波就结束。*stop* 被
+    设上时不交剩下的、直接结束。
+
+    每一波是 `{"uri", "count", "began", "seconds", "last", "reason"}`：`began` 是第一张的时刻，
+    `last` 为真的那波是最后一波，`reason` 说为什么停。格子上标着离这一波第一张几秒、离上一张几秒。
+    第一波的第一张是开始时的样子；最后一波的最后一张是静下来以后的样子。
+
+    WHY: 维护者 2026-10-24：一组组定时连拍太笨，要"画面变了就截、攒够一波就发、静下来就停"，治她
+    截图不积极。画面不动时这台手机的编码器什么都不发（见文件头），没收到新包就不解码：静着的时候
+    几乎不花什么，动着的时候每看一眼都要把关键帧以来的包解一遍（游戏满载时零点几到一两秒）。
+
+    WHY: 开了以后要等她：开连拍、推摇杆是两次工具调用，中间隔着她想的那几秒，那时画面还没动，按
+    `WATCH_SETTLE` 算就提前停了。所以动过之前等到 `WATCH_START`；静下来的时间也从她最后一次碰手机
+    算起，点了按钮、界面还没反应过来时不会停。
+    """
+    global _touched
+    count = max(2, min(int(count), 30))
+    interval = max(WATCH_MIN, min(float(interval), 5.0))
+    threshold = max(0.1, min(float(threshold), 100.0))
+    stop = stop or threading.Event()
+    _touched = time.time()
+    shot = screenshot(shown=False)
+    # 从第一张截到算起：流刚起的时候这一张可能要等几十秒。
+    began = time.time()
+    kept = [(shot["uri"].removeprefix("file://"), began)]
+    reference = _gray(kept[0][0], WATCH_WIDTH)[0]
+    previous = None
+    moved = None
+    latest = ""
+    with _state:
+        seen = _packets
+    try:
+        while not stop.wait(interval):
+            now = time.time()
+            with _state:
+                packets = _packets
+            if packets != seen:
+                seen = packets
+                path = screenshot(shown=False)["uri"].removeprefix("file://")
+                gray = _gray(path, WATCH_WIDTH)[0]
+                _drop(latest)
+                latest = ""
+                if _change(reference, gray) >= threshold:
+                    kept.append((path, now))
+                    reference, moved = gray, now
+                else:
+                    latest = path
+            if len(kept) >= count:
+                yield _wave(kept, previous, False, "")
+                previous, kept = kept[-1][1], []
+                continue
+            if moved is None and now - max(began, _touched) >= WATCH_START:
+                reason = f"开了以后 {WATCH_START:g} 秒画面都没怎么动"
+            elif moved is not None and now - max(moved, _touched) >= WATCH_SETTLE:
+                reason = f"画面静下来了（{WATCH_SETTLE:g} 秒里变动都不到 {threshold:g}%）"
+            elif now - _touched >= IDLE:
+                reason = f"{IDLE // 60} 分钟没碰手机"
+            else:
+                continue
+            if latest:
+                kept.append((latest, now))
+                latest = ""
+            if kept:
+                yield _wave(kept, previous, True, reason)
+            else:
+                yield {"uri": "", "count": 0, "began": now, "seconds": 0.0, "last": True, "reason": reason}
+            kept = []
+            return
+    finally:
+        # 被叫停、出了错、或者调用方不再往下取：没交出去的单帧都删掉。
+        for path, _moment in kept:
+            _drop(path)
+        _drop(latest)
+
+
+def _drop(path: str) -> None:
+    if path:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _wave(kept: list[tuple[str, float]], previous: float | None, last: bool, reason: str) -> dict:
+    """把这一波的单帧拼成一张、删掉单帧；格子标 `#n 几秒 (+离上一张几秒)`。"""
+    first = kept[0][1]
+    labels = []
+    for index, (_path, moment) in enumerate(kept):
+        before = kept[index - 1][1] if index else previous
+        labels.append(f"#{index + 1} {moment - first:.1f}s" + (f" (+{moment - before:.1f})" if before else ""))
+    try:
+        uri = stitch([path for path, _moment in kept], labels)
+    finally:
+        for path, _moment in kept:
+            _drop(path)
+    return {"uri": uri, "count": len(kept), "began": first, "seconds": round(kept[-1][1] - first, 1),
+            "last": last, "reason": reason}
+
+
 # --------------------------------------------------------------------------- 动
 
 
@@ -870,8 +987,8 @@ def _spot(at: str) -> dict:
     把摇杆往上推到边。返回 `{"key", "label", "x", "y", "from"}`：`key` 是按住时手指的名字，
     `from` 是起手按下的点（推摇杆时是它的中心）。
 
-    WHY: 维护者 2026-10-24 觉得这就是安卓模拟器的键位映射，应该设计得简单点：所以摇杆只有八个
-    方向、一推到边，没有格数和角度。
+    WHY: 维护者 2026-10-24 觉得这就是安卓模拟器的键位映射，应该设计得简单点：所以方向只有八个、
+    一推到边，没有格数和角度。推到中间某一点、点控件旁边一点，另给偏移，见 `_moved`。
     """
     if _shown is None:
         raise RuntimeError("还没看过手机画面：先 look 一眼，坐标照那张图写")
@@ -911,6 +1028,26 @@ def _spot(at: str) -> dict:
     x = min(max(x + math.sin(math.radians(angle)) * radius, 0), width - 1)
     y = min(max(y - math.cos(math.radians(angle)) * radius, 0), height - 1)
     return {"key": key, "label": f"{key} {rest[0]}", "x": round(x), "y": round(y), "from": center}
+
+
+def _moved(spot: dict, offset: str) -> dict:
+    """*spot* 再挪 *offset*（`"dx,dy"`，图上的像素，右、下为正）；起手按下的点不变。
+
+    WHY: 维护者 2026-10-24：八个方向太粗，摇杆要能推到相对中心的任意一点，点击也要能在控件、键位
+    旁边偏一点。起手点留在原处：推摇杆仍从中心按下再滑过去（见 `hold`），按住技能键再拖就是拖着瞄准。
+    """
+    if not offset.strip():
+        return spot
+    found = _POINT.fullmatch(offset.strip())
+    if not found:
+        raise ValueError(f"偏移写成 \"dx,dy\"，右、下为正，例如 \"40,-90\"；你写的是「{offset}」")
+    dx, dy = (float(value) for value in found.groups())
+    x, y = spot["x"] + dx, spot["y"] + dy
+    width, height = _shown
+    if not (0 <= x <= width and 0 <= y <= height):
+        raise ValueError(f"挪到 ({x:g}, {y:g}) 就出了画面：最近那张图是 {width}×{height}")
+    label = f"{spot['label']} 偏 {dx:+g},{dy:+g}" if spot["label"] else ""
+    return {**spot, "label": label, "x": round(x), "y": round(y)}
 
 
 def _fresh() -> None:
@@ -978,15 +1115,15 @@ def _expire() -> None:
         _lift(f"{HOLD_MAX} 秒没碰手机")
 
 
-def tap(at: str) -> dict:
-    """点一下 *at*（写法见 `_spot`），返回那个点。按着的手指不受影响：这一下用的是另一根。
+def tap(at: str, offset: str = "") -> dict:
+    """点一下 *at*（写法见 `_spot`，*offset* 见 `_moved`），返回那个点。按着的手指不受影响：这一下用的是另一根。
 
     WHY: 维护者 2026-10-24：截图和操作分开更好。动作顺手带回的那张图是在固定时刻截的，常常太早
     或太晚；有了它她也就不主动去看了。所以动作只管做，要看由她自己挑时候 look（界面在动给 wait），
     想一直看着就开后台连拍。下面几个动作同。
     """
     _fresh()
-    spot = _spot(at)
+    spot = _moved(_spot(at), offset)
     finger = next(_fingers)
     _send(_touch(DOWN, finger, spot["x"], spot["y"]))
     time.sleep(TAP_PRESS)
@@ -1012,8 +1149,8 @@ def swipe(start: str, end: str, duration: int = 300) -> dict:
     return {"from": begin, "to": finish, "duration": duration}
 
 
-def hold(at: str, seconds: float = 0.0) -> dict:
-    """按住 *at* 不放就返回；同名的手指已经按着，就不抬手、滑到新位置。
+def hold(at: str, seconds: float = 0.0, offset: str = "") -> dict:
+    """按住 *at*（再挪 *offset*，见 `_moved`）不放就返回；同名的手指已经按着，就不抬手、滑到新位置。
 
     *seconds* 大于 0 时按这么久（最多 30 秒）再松开。返回 `_spot` 那个点外加 `kept`（还按着没有）。
 
@@ -1021,7 +1158,7 @@ def hold(at: str, seconds: float = 0.0) -> dict:
     新按下的手指先落在摇杆中心，再用 `GLIDE` 秒推过去。
     """
     _fresh()
-    spot = _spot(at)
+    spot = _moved(_spot(at), offset)
     end = (spot["x"], spot["y"])
     with _touching:
         finger = _held.get(spot["key"])
@@ -1407,4 +1544,5 @@ __all__ = [
     "tap",
     "type_text",
     "warm",
+    "waves",
 ]
