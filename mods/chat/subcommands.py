@@ -34,6 +34,16 @@ _SUBCOMMAND_HELP = (
 先把手上这一段上下文交接掉（笔记、日记确认到位后归档到 data/context/archive/），月末、年末各汇总一次日记；然后她用新的一段反思：像人排查一样从症状出发，读归档的上下文、聊天记录、行动记录和笔记的历史版本找原因，必要时改策略或写提案；不对外说话。什么时候自动跑由 awaker 规则决定，默认 daily 04:00 reflect。
 #reflect          显示上次反思时间
 #reflect now      现在就跑一次（中心 agent 正忙时不执行）"""),
+    ("subconscious [on|off]", """查看或开关她的潜意识（开关要管理员），默认关。
+
+潜意识有自己的一条上下文（data/context/subconscious.json），只往后接。她每忙完一阵（没有别的召唤在等），这阵的经过接到它末尾，它决定她那条的末尾怎么办：
+收起 <时刻> <记号>  从这次唤醒起换成一句记号，原样另存成归档段（名字带 -folded），记号里写着怎么读回来
+放下 <时刻>         同她自己的 dismiss：从这次唤醒起清掉，消息回到没读
+留着                什么都不动
+怎么判断写在 data/notes/policy/subconscious.md，没有这个文件时用默认说明；它的理由只留在它自己那条里，她看不到。它那条过了 10 万 token 就自己交接：写下地图，旧的归档（名字带 -subconscious），新的一条从地图开始。
+#subconscious       显示开关、它这一条多长、上次的决定
+#subconscious on    打开
+#subconscious off   关掉"""),
     ("awaker [set <规则>]", """查看或改写她的闹钟规则（改写要管理员）。
 
 规则就是笔记 awaker（data/notes/awaker.md），她自己也能改，每行一条：
@@ -72,7 +82,7 @@ _SUBCOMMAND_NAMES = {pattern.partition(" ")[0] for pattern, _description in _SUB
 def requires_op(value: str) -> bool:
     name, _, tail = value.strip().partition(" ")
     return (name == "hint" or name == "use_model"
-            or name in {"image", "reasoning", "limit", "reflect", "awaker", "prompt"} and bool(tail.strip()))
+            or name in {"image", "reasoning", "limit", "reflect", "awaker", "prompt", "subconscious"} and bool(tail.strip()))
 
 
 def _subcommand_help(name: str = "") -> str:
@@ -373,6 +383,14 @@ def _subcommand(value: str):
         return _limit_set(tail)
     if name == "reflect":
         return _reflect_subcommand(tail.strip())
+    if name == "subconscious" and not tail:
+        return _chat_root._subconscious.report()
+    if name == "subconscious" and tail:
+        if tail.lower() not in ("on", "off"):
+            return "subconscious 只能是 on 或 off"
+        data["subconscious"] = tail.lower() == "on"
+        storage.save()
+        return f"subconscious: {tail.lower()}"
     if name == "awaker":
         return _awaker_subcommand(raw)
     if name == "hint":

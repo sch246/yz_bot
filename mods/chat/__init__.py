@@ -901,6 +901,7 @@ def on_load(ctx) -> None:
 
     threading.Thread(target=start_awaker, name="chat-awaker-start", daemon=True).start()
 from . import view as _view, reader as _reader, agent as _agent, roles as _roles, subcommands as _subcommands, notes as _notes, awaker as _awaker
+from . import subconscious as _subconscious
 from .view import has_at, msg_split
 from .reader import parse_target, mark_window_read
 from . import windows as _windows

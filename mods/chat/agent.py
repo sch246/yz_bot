@@ -23,6 +23,7 @@ from mods import context, identity, image, llm, oplog, py, storage
 
 import mods.chat as _chat_root
 from . import notes as _notes, reader as _reader, roles as _roles, screen as _screen, segment as _segment, view as _view, windows as _windows
+from . import subconscious as _subconscious
 
 _SEEN_KEY = "seen"
 # WHY: 什么时候交接是可以改的策略（2026-10-22 维护者："唤醒条件本身也配置化"）。
@@ -450,6 +451,7 @@ def _begin(turn, window: tuple | None, kind: str) -> None:
     turn.handoff_note = ""
     turn.handoff_failed = False
     turn.handoffs = 0
+    turn.settling = False
     # 输入框（type_word）跟着这次唤醒走：中途交接换了会话也还在，唤醒结束就没了。
     turn.boxes = {}
     turn.log = {"kind": kind, "start": time.time(), "peak": 0}
@@ -469,7 +471,8 @@ def _keep_typing(turn, window: tuple | None, stop: threading.Event) -> None:
         try:
             targets = {window} if window is not None and window[0] == "private" else set()
             targets.update(_reader.parse_target(label) for label in tuple(turn.screens) if label.startswith("u"))
-            for target in targets:
+            # 潜意识整理时她已经忙完了，对方看到"正在输入"会以为她还有话。
+            for target in (() if turn.settling else targets):
                 reply = connect.call_api("set_input_status", user_id=str(target[1]), event_type=1)
                 if reply.get("retcode") not in (0, None) and not failed:
                     failed = True
@@ -513,6 +516,12 @@ def _drive_agent(model: str | None, window: tuple | None) -> bool:
                 return True
             turn.associated_windows.intersection_update(
                 {window for window, _count, active in oplog.pending_summary() if active})
+            if _subconscious.on() and not oplog.has_unnotified():
+                # 她这阵忙完了才轮到潜意识，不挡她的路。它占着同一个 turn，不和她抢这一段；
+                # 期间来的召唤照常登记，下面 finish_turn 看到了就接着处理。
+                turn.settling = True
+                _subconscious.settle(model, turn)
+                turn.settling = False
             if not context.finish_turn(_chat_root.AGENT_WINDOW, turn, oplog.has_unnotified):
                 return True
     finally:
@@ -709,11 +718,8 @@ def _dismiss_problem(session, mark: dict) -> str:
     return ""
 
 
-def _drop_since(segment: dict, mark: dict) -> None:
-    """Put the segment back as it was before *mark*'s wake; what was shown since comes back on the next screen."""
-    shown = _shown_since(segment, mark)
-    segment["messages"] = segment["messages"][:mark["index"]]
-    for key in _MARKED:
+def _restore(segment: dict, mark: dict, keys) -> None:
+    for key in keys:
         if key not in mark:
             continue  # 早先记的记号没有 scopes
         if mark[key] is None:
@@ -721,6 +727,13 @@ def _drop_since(segment: dict, mark: dict) -> None:
         else:
             segment[key] = mark[key]
     segment["marks"] = [kept for kept in segment.get("marks", []) if kept["time"] < mark["time"]]
+
+
+def _drop_since(segment: dict, mark: dict) -> None:
+    """Put the segment back as it was before *mark*'s wake; what was shown since comes back on the next screen."""
+    shown = _shown_since(segment, mark)
+    segment["messages"] = segment["messages"][:mark["index"]]
+    _restore(segment, mark, _MARKED)
     _segment.save(segment)
     # 画面上的"看到哪"也退回去：清掉的消息下次排在"以下是上次之后的新消息"下面，当没读过的给。
     # oplog 的已读不退（日志里没有"标回未读"这种行），画面外那个窗口的未读条数因此不算它们。
@@ -732,6 +745,24 @@ def _drop_since(segment: dict, mark: dict) -> None:
             seen[label] = mark["seen"][label]
     storage.save()
     _chat_root._awaker.dismissed(_windows.parse_all(shown))
+
+
+def _fold_since(segment: dict, mark: dict, label: str) -> str:
+    """Replace the stretch since *mark* with one line naming where it was archived whole; returns that name.
+
+    Unlike a dismiss, what was shown stays read: the screen position does not move back.
+    """
+    shown = _shown_since(segment, mark)
+    name = _segment.archive({"started": mark["time"], "windows": shown, "reason": label,
+                             "messages": segment["messages"][mark["index"]:]}, "folded")
+    where = f"{'、'.join(shown)} 的画面和" if shown else ""
+    segment["messages"] = [*segment["messages"][:mark["index"]], {"role": "system", "content": (
+        f"【收起】{label}\n（{mark['at'][5:]} 至 {_screen.clock()[5:]}，{where}你那时的想法、调用，后台整理时收成了上面这一句；"
+        f"原样存在归档段 {name}，加载 memory_system 用 read_context(\"{name}\") 读，search 也搜得到）")}]
+    # 画面位置不退。第一次给的笔记、中途的工具状态跟着收走了，这几项退回去，下次照样给。
+    _restore(segment, mark, ("scopes", "told", "tokens", "notice"))
+    _segment.save(segment)
+    return name
 
 
 def _body(session: llm.Chat) -> list[dict]:
@@ -893,7 +924,9 @@ def reflect(model: str | None = None) -> bool:
             _handoff(turn, "夜里了", model)
             _roll_up(diary_day(turn.log["start"]))
             segments = _segment.archived(last if isinstance(last, (int, float)) else 0)
-            segments = [item for item in segments if not item["name"].endswith("-reflect")]
+            # 收起时另存的片段和潜意识自己的那条不算她的段：片段在她的段里有记号指着。
+            segments = [item for item in segments
+                        if not any(f"-{kind}" in item["name"] for kind in ("reflect", "folded", "subconscious"))]
             if segments:
                 _run_reflection(model, turn, segments)
         finally:
