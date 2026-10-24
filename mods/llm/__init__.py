@@ -93,6 +93,20 @@ FILE_MARGIN = 24 * 3600
 FILE_RETRY = 300
 
 
+def _files_client(client: OpenAI) -> OpenAI:
+    """上传文件用的客户端：DeepSeek 的 `/beta` 底下没有 `/files`，那一段要去掉。
+
+    WHY: 2026-10-24 实测——`POST https://api.deepseek.com/beta/files` 是 404，
+    `POST https://api.deepseek.com/files` 才收（同一张图、同一个 key）。聊天那条路继续走 /beta，
+    只有上传换一个客户端；别的供应商 base 不以 /beta 结尾，原样返回。
+    """
+    base = str(getattr(client, "base_url", "") or "").rstrip("/")
+    if not base.endswith("/beta"):
+        return client
+    return OpenAI(api_key=client.api_key, base_url=base[: -len("/beta")], timeout=client.timeout)
+
+
+
 def _unavailable_message(name: str, available: list[str], problem: str | None = None) -> str:
     """一次没能执行的工具调用要回给模型什么，见 UnavailableTool。
 
@@ -426,12 +440,13 @@ class LLMClient:
             data_uri = f"data:{mime};base64," + base64.b64encode(stream.read()).decode("ascii")
         slices, split = image.split_long_image_data_uri(data_uri)
         ids = []
+        uploader = _files_client(client)
         try:
             for index, value in enumerate(slices):
                 header, _, payload = value.partition(",")
                 kind = header[5:].split(";")[0]
                 name = f"{digest[:16]}-{index}.{kind.rpartition('/')[2] or 'img'}"
-                uploaded = client.files.create(file=(name, base64.b64decode(payload), kind), purpose="user_data",
+                uploaded = uploader.files.create(file=(name, base64.b64decode(payload), kind), purpose="user_data",
                                                expires_after={"anchor": "created_at", "seconds": FILE_SECONDS})
                 ids.append(str(uploaded.id))
         except Exception as error:
