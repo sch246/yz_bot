@@ -38,7 +38,7 @@ DEFAULT_TIDY = """# 什么时候交接。每次子请求结束（stage == "round
 _LEAD_IN = 3
 _FRESH_MAX = 200
 # dismiss 能清回的记号：每次唤醒追加之前，这一段里会被这次唤醒改动的那几项；最多留最近这么多个。
-_MARKED = ("last_shown", "windows", "told", "tokens", "notice")
+_MARKED = ("last_shown", "windows", "scopes", "told", "tokens", "notice")
 _MARKS = 40
 _KNOWN_PEOPLE = 6
 _TYPING_EVERY = 5
@@ -130,14 +130,13 @@ def _head(woken: list[tuple], segment: dict) -> list[dict]:
     return messages
 
 
-def _people(windows: list[tuple], authors: list[int], segment: dict) -> list[dict]:
-    """Notes for windows and people appearing in this segment for the first time."""
+def _people(windows: list[tuple], authors: list[int], segment: dict) -> tuple[list[dict], list[str]]:
+    """Notes for windows and people appearing in this segment for the first time, and their scopes."""
     scopes = [_notes.scope_of(window) for window in windows if window[0] in _windows.QQ]
     scopes.extend(f"person:{author}" for author in authors[:_KNOWN_PEOPLE])
     new = [scope for scope in dict.fromkeys(scopes) if scope not in segment["scopes"]]
-    segment["scopes"].extend(new)
     block = _note_block(new, "这一段里第一次出现的人或群，你的笔记：")
-    return [block] if block else []
+    return ([block] if block else []), new
 
 
 def _offline_calls(window: tuple, shown: list[dict]) -> list[dict]:
@@ -560,7 +559,9 @@ def _run_agent(model: str | None, turn) -> bool:
         material.extend(_head(woken, segment))
     # 交接后续做时没有新唤醒，沿用刚才看着的窗口。
     focus = woken or _windows.parse_all(turn.screens)
-    material.extend(_people(focus, turn.authors, segment))
+    # 记成"这一段出现过"要等第一次输出，和画面位置一样：dismiss 退回去时笔记也跟着回来。
+    people, met = _people(focus, turn.authors, segment)
+    material.extend(people)
     screens: dict[str, str] = {}
     newest: dict[tuple, tuple] = {}
     shown_last: dict[str, str] = {}
@@ -600,6 +601,7 @@ def _run_agent(model: str | None, turn) -> bool:
         _mark_seen(newest)
         turn.screens.update(screens)
         segment["windows"] = list(dict.fromkeys([*segment["windows"], *screens]))
+        segment["scopes"].extend(met)
         segment["last_shown"].update(shown_last)
         segment.pop("notice", None)
 
@@ -712,6 +714,8 @@ def _drop_since(segment: dict, mark: dict) -> None:
     shown = _shown_since(segment, mark)
     segment["messages"] = segment["messages"][:mark["index"]]
     for key in _MARKED:
+        if key not in mark:
+            continue  # 早先记的记号没有 scopes
         if mark[key] is None:
             segment.pop(key, None)
         else:
