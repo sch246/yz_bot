@@ -290,7 +290,10 @@ def _activate_chat(
     binding.restore_schema()
     session.tool_binding = binding
     session.add_hint(lambda: _agent_hint())
-    session.add_hint("对外说话要先 type_word 打进输入框、下一步再 send；回复正文只是自言自语，不会发送到聊天窗口。")
+    # WHY: 口吻那半句放在末尾而不是只写在 self 里：2026-10-24 的诊断里，她的上下文有 24 万 token，
+    # self 在最前面、离生成最远，她私聊每条中位 49 字（对方 7 字）。末尾这里每个子请求都离生成最近。
+    session.add_hint("对外说话要先 type_word 打进输入框、下一步再 send；回复正文只是自言自语，不会发送到聊天窗口。"
+                     "说话像聊天：一条一个意思，多数十几个字；话多就用空行分成几条。")
     # WHY: 工具恢复可能持久化 ttl 回收；它必须先于其余全局设置读取，避免无关的配置异常
     # 改变这一轮是否完成回收。
     session.do_process_image = get_image_mode() != "off"

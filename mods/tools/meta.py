@@ -146,6 +146,7 @@ from __future__ import annotations
 
 import contextvars
 import io
+import re
 import time
 from typing import Mapping
 
@@ -329,12 +330,40 @@ def _this_output() -> str | None:
     return action.split("#")[0] if isinstance(action, str) else None
 
 
+# 一次 send 最多拆成几条，多出来的段并进最后一条；拆开的几条之间隔多少秒。
+_MAX_PARTS = 4
+_PART_GAP = 1.0
+_PARAGRAPH = re.compile(r"\n[ \t]*\n")
+_LEAD_ONLY = re.compile(r"^(?:\[CQ:(?:reply|at),[^\]]*\]\s*)+$")
+
+
+def _parts(text: str) -> list[str]:
+    """Split typed text at blank lines into at most ``_MAX_PARTS`` messages; one part is the text unchanged."""
+    parts, lead = [], ""
+    for part in (piece.strip() for piece in _PARAGRAPH.split(text)):
+        if not part:
+            continue
+        if _LEAD_ONLY.match(part):
+            # 单独一段只有 reply／at：它属于下一段，自己发出去就是一条空引用。
+            lead += part
+            continue
+        parts.append(lead + part)
+        lead = ""
+    if lead:
+        parts.append(lead)
+    if len(parts) <= 1:
+        return [text]
+    if len(parts) > _MAX_PARTS:
+        parts = parts[:_MAX_PARTS - 1] + ["\n\n".join(parts[_MAX_PARTS - 1:])]
+    return parts
+
+
 def type_word(target: str, text: str) -> str:
     """把要说的话打进 target 的输入框，覆盖原来的内容；不发送，下一步看过新消息再 send。
 
     @param
     target: g<群号>、u<私聊对端号>，或画面里出现过的能回话的 种类:目标
-    text: 输入框里的完整内容。QQ 里 CQ 码原样写，at、reply、图片都照常生效；空串清空输入框
+    text: 输入框里的完整内容。QQ 里 CQ 码原样写，at、reply、图片都照常生效；空行隔开的几段，send 时在 QQ 里拆成几条发（最多 4 条）；空串清空输入框
 
     WHY: 维护者 2026-10-23：说话先打字、再发送，参照 Cortico 的起草-确认门，但用"输入框"
     的说法——她打出来的字自己看得见。打字和发送之间至少隔一次请求（见 send），于是这期间
@@ -359,7 +388,7 @@ def type_word(target: str, text: str) -> str:
 
 
 def send(target: str, final_call: bool = True) -> str:
-    """把 target 输入框里打好的字发出去，返回 message_id；默认发完这一轮就结束。
+    """把 target 输入框里打好的字发出去，返回 message_id（QQ 里按空行拆成几条时返回每一条的）；默认发完这一轮就结束。
 
     @param
     target: 要和 type_word 用的一样
@@ -383,6 +412,11 @@ def send(target: str, final_call: bool = True) -> str:
     （事件反查和覆盖工具也管上下文），它实际是那组不可卸载的基础能力，`type_word`/`send`
     属于这一组。改成支持多个基础模块也行，代价是那条"基础模块的导出不加模块名前缀"的
     规则会多出命名冲突的可能，眼下不值得。
+
+    WHY: 2026-10-24 的诊断以后，QQ 里按空行拆成几条发：她私聊一半的消息分了段（对方 3%），
+    几段话塞在一个气泡里，真人会分几条发。拆在这里而不是让她多调几次 send：每多发一条就要多一轮
+    请求。只拆 QQ：B 站评论拆开就成了刷屏。几条之间隔 `_PART_GAP` 秒，每条照样等发送结果；中途
+    失败就停下，没发的留在输入框里。
 
     WHY?: 子代理（`tools/agents.py`）因此也拿得到 `type_word`/`send`（2026-10-23 以前是 `say`），于是它能直接往窗口里说话——这是
     工具化带来的**新**能力，以前子代理的正文只回给主模型。没有给它加门控，因为"子代理该
@@ -410,19 +444,31 @@ def send(target: str, final_call: bool = True) -> str:
     unconfirmed = (
         "先在下一轮的聊天记录里看它在不在，再决定要不要重发——不要直接重发。"
     )
-    try:
-        message_id = windows.sender(window)(window, box["text"])
-    except windows.Unconfirmed as error:
-        boxes.pop(label, None)
-        _spoke(window)
-        return f"未确认：{error}输入框已清空。" + unconfirmed
-    except Exception as error:
-        return f"发送失败（{type(error).__name__}）：{error}。这句话没有发出去，还在输入框里。"
+    parts = _parts(box["text"]) if window[0] in windows.QQ else [box["text"]]
+    sent: list[str] = []
+    for number, part in enumerate(parts):
+        if number:
+            time.sleep(_PART_GAP)
+        done = f"前 {len(sent)} 条发出去了（{'、'.join(sent)}）；" if sent else ""
+        try:
+            sent.append(str(windows.sender(window)(window, part)))
+        except windows.Unconfirmed as error:
+            # 这一条在不在都不知道，后面的不再发：接着发，顺序可能就乱了。
+            boxes.pop(label, None)
+            _spoke(window)
+            rest = "后面的没再发，" if number + 1 < len(parts) else ""
+            return f"{done}未确认：{error}{rest}输入框已清空。" + unconfirmed
+        except Exception as error:
+            if not sent:
+                return f"发送失败（{type(error).__name__}）：{error}。这句话没有发出去，还在输入框里。"
+            box["text"] = "\n\n".join(parts[number:])
+            _spoke(window)
+            return f"{done}从这条起发送失败（{type(error).__name__}）：{error}。没发的还在输入框里。"
     boxes.pop(label, None)
     _spoke(window)
     if final_call:
         current_binding().session.turn_done = lambda: True
-    return str(message_id)
+    return sent[0] if len(sent) == 1 else f"分 {len(sent)} 条发出：{'、'.join(sent)}"
 
 
 def _spoke(window: tuple) -> None:

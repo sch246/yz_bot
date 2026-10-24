@@ -80,7 +80,7 @@
 7. **夜间交接与反思**（`chat.agent.reflect`）：占住 `AGENT_WINDOW`。
     1. 先交接手上这一段（原因"夜里了"）。
     2. 若这天是月末，`roles.summarize` 把当月日记改写成 `diary:YYYY-MM`；年末再把月记改写成 `diary:YYYY`。
-    3. 反思像人排查一样：材料是 global 与 recent 笔记、上次反思以来归档的段（段名、起止时刻、消息数、窗口）、`changes` 最近 40 行与 `proposals` 最近 20 行，以及一段说明（`agent._REFLECT_PROMPT`）：从症状出发，用 `read_context` 读当时那一段的原样，用 `search`／`read_log`／`read_actions`／`note_history` 查原始记录（日记和交接说明只当线索），分清问题属于哪一类（记忆、不知道去哪找、反复的失误、判断、说明过时或冲突、花销、环境坏了；各类该改哪里写在 `memory_system` 里），找到原因再改，优先改已有的规则，一次性的失误不写成长期规则；提案按证据、原因、最小改动、代价、验证方法写。会话用新的一段，加载 `memory_system`，`type_word`／`send` 拒绝发言；材料之后新长出来的上下文超过整理阈值就结束；没有新归档的段时跳过模型调用。反思这一段也归档，名字带 `-reflect`。
+    3. 反思像人排查一样：材料是 global 与 recent 笔记、上次反思以来归档的段（段名、起止时刻、消息数、窗口）、`changes` 最近 40 行与 `proposals` 最近 20 行，以及一段说明（`agent._REFLECT_PROMPT`）：从症状出发，用 `read_context` 读当时那一段的原样，用 `search`／`read_log`／`read_actions`／`note_history` 查原始记录（日记和交接说明只当线索）；2026-10-24 起也看话说得像不像她：挑说话多的窗口用 `read_log` 读别人接下来的反应，对照 self；分清问题属于哪一类（记忆、不知道去哪找、反复的失误、判断、话说得不像她、说明过时或冲突、花销、环境坏了；各类该改哪里写在 `memory_system` 里），找到原因再改，优先改已有的规则，一次性的失误不写成长期规则；最后把这一天有感受的小事添一两句进 `diary:<日期>`；提案按证据、原因、最小改动、代价、验证方法写。会话用新的一段，加载 `memory_system`，`type_word`／`send` 拒绝发言；材料之后新长出来的上下文超过整理阈值就结束；没有新归档的段时跳过模型调用。反思这一段也归档，名字带 `-reflect`。
     4. 结束后 `agent.pick_up_pending` 接上期间登记的召唤。
 
 窗口第一次有输出时确认这次的通知，记下画面中每个窗口的看到时间，并调用 `reader.mark_window_read` 把未读登记标为已读。
@@ -145,7 +145,7 @@
 | `reload_tools` | 按模块名从磁盘显式应用、更新或删除模块；逐项返回成功和带完整 traceback 的失败结果，失败保留旧 last-good。 |
 | `load_tools` | 将 last-good 模块激活到当前 Chat；中心名单存全局 `agent`，不读取磁盘。 |
 
-`meta` 还导出 `type_word`／`send`（唯一的发言方式：先打进那个窗口的输入框，下一步再发；同一次输出里刚打的字不发，必须写明 `target`）、`wake_me`（给自己埋唤醒规则，写进笔记 awaker）、`search`／`read_log`／`read_actions`／`read_note`（召回画面以外的聊天记录、笔记、日记、归档的上下文与自己的行动记录）、`write_note`（改任何一份笔记，包括待办 todo 和闹钟 awaker）、`tidy`（这一轮结束后交接）、`dismiss`（没什么要做的，这一轮结束后把这次唤醒从这一段里清掉）、`loop`（总开关 `#loop` 默认开时每次唤醒结束后自动起一串，她用它写上在做什么或 `stop=True` 结束这一串；关着时由她开：每次唤醒结束后 `agent._next_loop` 隔 `_LOOP_GAP` 秒往 `me` 窗口 `chat.push` 一条带唤醒的“循环第几轮”，直到她 `loop(stop=True)`、维护者叫停那一轮、或者 `agent.reflect` 开头把它关掉；状态只在内存里）、`wait`（循环开着时这一轮马上结束、过多少秒再来下一轮，不阻塞也不关循环；没开循环时拒绝并指向 `wake_me`）和 `attach_image`。
+`meta` 还导出 `type_word`／`send`（唯一的发言方式：先打进那个窗口的输入框，下一步再发；同一次输出里刚打的字不发，必须写明 `target`；QQ 里框中空行隔开的几段由 `send` 拆成最多 `_MAX_PARTS` 条、隔 `_PART_GAP` 秒依次发出，每条都等发送结果，中途失败就停、没发的留在框里，返回每条的 message_id；末尾 hint 里跟着一句口吻提醒）、`wake_me`（给自己埋唤醒规则，写进笔记 awaker）、`search`／`read_log`／`read_actions`／`read_note`（召回画面以外的聊天记录、笔记、日记、归档的上下文与自己的行动记录）、`write_note`（改任何一份笔记，包括待办 todo 和闹钟 awaker）、`tidy`（这一轮结束后交接）、`dismiss`（没什么要做的，这一轮结束后把这次唤醒从这一段里清掉）、`loop`（总开关 `#loop` 默认开时每次唤醒结束后自动起一串，她用它写上在做什么或 `stop=True` 结束这一串；关着时由她开：每次唤醒结束后 `agent._next_loop` 隔 `_LOOP_GAP` 秒往 `me` 窗口 `chat.push` 一条带唤醒的“循环第几轮”，直到她 `loop(stop=True)`、维护者叫停那一轮、或者 `agent.reflect` 开头把它关掉；状态只在内存里）、`wait`（循环开着时这一轮马上结束、过多少秒再来下一轮，不阻塞也不关循环；没开循环时拒绝并指向 `wake_me`）和 `attach_image`。
 
 仓库当前提供以下按需模块；函数只在对应模块激活后出现：
 
