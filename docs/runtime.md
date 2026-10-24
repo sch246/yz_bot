@@ -72,7 +72,8 @@ uv run --frozen python run.py --smoke
 |---|---|---|---|
 | `chatlog/` | QQ 上发生了什么 | 没进模型画面的消息、通知、发送回声 | 一直留 |
 | `data/event_stream/`（`oplog`） | 她做了什么、消息怎么登记 | 到达、激活、通知确认、已读、行动号与结果的对应；`read_actions` 读它 | 一直留；启动时整份重放，只留未读、未确认通知和她的输出与结果（不含思考） |
-| `data/context/current.json` 与 `archive/` | 她当时看到了什么、想了什么 | 实际进上下文的材料和顺序、段边界、思考（默认 `keep` 时） | 一直留，按段归档 |
+| `data/context/current.json` 与 `archive/` | 她当时看到了什么、想了什么 | 实际进上下文的材料和顺序、段边界、思考（默认 `keep` 时）；潜意识收起的片段原样在 `archive/*-folded.json` | 一直留，按段归档 |
+| `data/context/subconscious.json` 与 `archive/*-subconscious.json` | 潜意识为什么那样整理 | 它看到的经过、它的理由和决定、交接时写的地图 | 一直留，它自己交接时归档 |
 | `log/llm.log`（`yz.llm.request`） | 每次请求发了什么 | 每次请求末尾的临时提示（待办、未读数、时间）；同一段里已经记过的前缀不再重复打印，只写"前 N 条已经记过" | 7 天 |
 | `data/notes/.history/` | 笔记改写或删除前是什么样 | 每个旧版本 | 一直留 |
 | `data/bili/credential.json` | B 站登录凭证 | 柚子 B 站号的 cookie（权限 600）；已读位置、昵称和"评论属于哪一楼"在 storage `bili/state` | 一直留，失效后重新 `.bili login` |
@@ -150,6 +151,8 @@ op 工具集的 `send_command` 是第三条同类入口，但它不走 `bot.recv
 
 模型工具不把“谁触发了这一轮”当作安全边界：混合上下文里任何人的文字本来都可能影响模型，按触发者切换权限挡不住这条路径，反而会让同一串工作随消息顺序掉权限。这里明确选择 Bot 的固定权限。代行仍是独立路径：`cmds__run_command(sender=X)` 把事件作者写成 X，下游命令按 X 的 `ops` 成员关系判定；Bot 自身没有 op 权限时，模型不能代行人类 op。`recvmsg(sender_id=X)` 是可编程环境中的函数，不直接作为模型工具暴露。
 
+
+`mods.phone` 操作的是一台真手机：`data/device/phone.json` 指向它，点按、打字、`shell` 都会落在那台手机上。临时 smoke 不带这份配置，phone 模块照常加载，只是用不了。不要拿真实配置在测试实例或脚本里调它；而且一台手机同一时刻只能有一条 scrcpy 流——新起的一条会先 `pkill` 手机上的旧 server，正在运行的 Bot 的画面流会被打断。
 
 ## `!` 命令行入口
 

@@ -145,6 +145,7 @@ Skill 也是可编辑的长期笔记：把可重复使用的经验、做法、�
 from __future__ import annotations
 
 import io
+import time
 from typing import Mapping
 
 from mods.tools import current_binding
@@ -400,13 +401,23 @@ def send(target: str, final_call: bool = True) -> str:
         message_id = windows.sender(window)(window, box["text"])
     except windows.Unconfirmed as error:
         boxes.pop(label, None)
+        _spoke(window)
         return f"未确认：{error}输入框已清空。" + unconfirmed
     except Exception as error:
         return f"发送失败（{type(error).__name__}）：{error}。这句话没有发出去，还在输入框里。"
     boxes.pop(label, None)
+    _spoke(window)
     if final_call:
         current_binding().session.turn_done = lambda: True
     return str(message_id)
+
+
+def _spoke(window: tuple) -> None:
+    """She said something: that group is listened to for a while (awaker), and dismiss cannot clear past it."""
+    from mods.chat import awaker
+
+    awaker.spoke(window)
+    current_binding().session.last_sent = time.time()
 
 
 def write_note(scope: str, text: str) -> str:
@@ -435,6 +446,7 @@ def wake_me(when: str, reason: str) -> str:
 
     每个窗口有默认的叫醒条件（私聊每条都叫，群里是 @、叫名字、戳一戳，B 站是回复和 @）。覆盖层盖着的时候由它说了算：follow 每条都叫，mute 都不叫；消息照样记成未读，你醒着时照样看得见，你自己埋的 on、wait 照样响。盖了覆盖层的窗口在画面头和未读提示里会标出来，比如"mute 到 2026-10-24 08:00"。
     follow 是你自己选的聚焦：感兴趣、正在聊的群可以先跟上一阵。每条都叫醒不等于每条都要回，大家多半不是在对你说话；聊完了、插不上话了就 off。
+    你在群里说完话的 5 分钟里，那个群自动算 follow（标成"说完话自动听"），连着两次 dismiss 掉看过它的唤醒就停；不想听可以 "follow g123 off"。被叫醒了没什么要做的，用 dismiss 把这次从眼前清掉。
     要按自己的条件决定某个窗口叫不叫，在 exec_code 里 `from mods.chat import awaker` 再调 `awaker.override(目标, 函数, until=时间戳)`：函数收到这条事件（B 站这类是 None），返回叫不叫，显示为 other，重启就没了。
 
     @param
@@ -462,6 +474,24 @@ def wake_me(when: str, reason: str) -> str:
         return f"已写进 awaker：{line}（同一目标再写一次就替换，揭掉写 {kind} {line.split()[1]} off）"
     once = kind in ("at", "on", "wait", "when")
     return f"已写进 awaker：{line}" + ("（响过就划掉；不要了用 write_note 改 awaker）" if once else "（不要了用 write_note 改 awaker）")
+
+
+def dismiss(since: str = "") -> str:
+    """看了一眼、没什么要做的：这次唤醒结束后，把从「这次唤醒你的是（时刻）」那一行起的画面、插话、你的思考、工具调用和结果都从眼前清掉，不留痕迹，就像没被叫醒过。
+
+    被清掉的消息不会丢：它们回到没读，下次画面从清掉之前接着给，和新消息一起排在"以下是上次之后的新消息"下面；follow 期间到的全给，不截。笔记、文件这些做过的事撤不回，行动记录里也还查得到。从那以后你发过话，或者输入框里有那以后打的、改过的字，就不能清；跟着的窗口 follow 期间攒了超过 200 条也不能再清，得把它们看完。
+
+    @param
+    since: 从哪一次唤醒清起，写那行「这次唤醒你的是（…）」括号里的时刻（只写 时:分:秒 也行），中间又叫醒你的几次一起清；不写就是最近那一次
+    """
+    from mods import chat
+
+    session = current_binding().session
+    problem = chat.agent.request_dismiss(session, since)
+    if problem:
+        return problem
+    session.turn_done = lambda: True
+    return "这一轮结束后清掉"
 
 
 def tidy(note: str = "") -> str:
@@ -513,6 +543,7 @@ __all__ = [
     "read_note",
     "write_note",
     "tidy",
+    "dismiss",
     "wake_me",
     "exec_code",
     "list_tools",

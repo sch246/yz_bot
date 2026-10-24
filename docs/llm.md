@@ -12,7 +12,11 @@
 - 戳一戳 Bot；
 - `#...` 控制命令。
 
-此外，她用 `wake_me` 在笔记 awaker 里埋下的 `on`／`wait` 规则在消息到达时由 `capture_chat` 认领（`awaker.take_waiting`）：这个窗口（或窗口里这个人）来了消息就叫醒她，唤醒原因写"等到了（规则原文）"，规则划掉。在这些默认判据之上，窗口可以盖一层限时的覆盖层（`awaker.triggered`）：笔记里的 `follow`（每条消息都叫）、`mute`（都不叫），或者代码用 `awaker.override` 设的 `other`（一个函数决定）。它决定 `activation_signal` 的结果算不算数，也决定 `chat.push` 的 `wake=` 算不算数；`on`／`wait` 和显式的 `chat.wake` 不经过它，`me` 不能盖，master 的话 mute 压不住。被 mute 压住的点名照样由 `capture_chat` 吃掉，免得后面的 `capture_addressed_fallback` 直接调 `chat()`。盖着的窗口在画面框头和未读提示里带上 `awaker.badges`，被它叫醒时唤醒原因写"覆盖层 follow 到 …：理由"。
+此外，她用 `wake_me` 在笔记 awaker 里埋下的 `on`／`wait` 规则在消息到达时由 `capture_chat` 认领（`awaker.take_waiting`）：这个窗口（或窗口里这个人）来了消息就叫醒她，唤醒原因写"等到了（规则原文）"，规则划掉。在这些默认判据之上，窗口可以盖一层限时的覆盖层（`awaker.triggered`）：笔记里的 `follow`（每条消息都叫）、`mute`（都不叫），或者代码用 `awaker.override` 设的 `other`（一个函数决定）。它决定 `activation_signal` 的结果算不算数，也决定 `chat.push` 的 `wake=` 算不算数；`on`／`wait` 和显式的 `chat.wake` 不经过它，`me` 不能盖，master 的话 mute 压不住。被 mute 压住的点名照样由 `capture_chat` 吃掉，免得后面的 `capture_addressed_fallback` 直接调 `chat()`。盖着的窗口在画面框头和未读提示里带上 `awaker.badges`，被它叫醒时唤醒原因写"覆盖层 follow 到 …：理由"。她用 `send` 发出去以后（`awaker.spoke`），这个群 5 分钟内没有别的覆盖层时自动算 `follow`，她连着两次 `dismiss` 掉看过它的唤醒就停。
+
+被叫醒了没什么要做的，她调 `dismiss(since)`（`agent.request_dismiss`）：这一轮结束后，这一段退回到 `since` 那行“这次唤醒你的是（时刻）”之前（不写就是最近一行），画面、插话、思考、工具调用和结果都不留。每次唤醒追加之前，`_run_agent` 在这一段里记一个记号（`marks`：消息条数、`last_shown`、`windows`、`scopes`（这一段给过哪些人和群的笔记）、`told`、`tokens`、`notice` 和当时输入框里的字），清的时候照它恢复，清掉的唤醒里第一次给的笔记下次跟着画面再给；`last_shown` 和画面"看到哪"的标记（`agent._seen`，记号里存着当时的值）退回去，所以清掉的消息回到没读，下次画面接着给，排在“以下是上次之后的新消息”下面；oplog 的已读标记和唤醒确认不退（日志里没有"标回未读"），画面外的未读条数因此不算它们。oplog 和 llm.log 不清。从那以后她发过话（`last_sent`），或者输入框里有那以后打的、改过的字，就不让清；跟着的窗口里清了会退回去的 follow 期间消息超过 `_FRESH_MAX`（200）条也不让清（`agent._piled`），因为这些消息画面不截，一直清会越攒越多；记号跟着这一段，交接后重新算。
+
+`#subconscious on`（storage `agent.subconscious`，默认关）时有潜意识（`chat.subconscious`）。`agent._drive_agent` 每次 `_run_agent` 之后、`finish_turn` 之前，没有别的召唤在等就在同一个 turn 里调 `subconscious.settle`：它占着 turn，不和她抢这一段，期间来的召唤照常登记，`finish_turn` 看到了接着处理；这期间私聊不再续“正在输入”（`turn.settling`），她已经忙完了。它自己的一条存在 `data/context/subconscious.json`：系统提示是 `data/notes/policy/subconscious.md`（没有就用 `DEFAULT_GUIDANCE`）加上固定的决定格式和她的 self，之后是上一条交接留下的地图，再往后只追加。每次接上她那条里它还没看过的部分（按 `segment.render` 渲染，工具结果截到 1000 字，整段从后往前留 3 万字）、还能从哪些唤醒起动手（最近 10 个记号），以及上次决定做没做成；不带工具，回复的最后一行是决定：`收起 <时刻> <记号>` 由 `agent._fold_since` 把她那条从这个记号起换成一条 system 记号，原样另存为 `archive/<时刻>-folded.json`，`scopes`、`told`、`tokens`、`notice` 退回记号时的值（笔记和工具状态下次照样给），`last_shown` 和看到哪不退；`放下 <时刻>` 走 `_drop_since`，follow 期间攒过 `_FRESH_MAX` 条的不做；`留着` 或者没有决定什么都不动。它记着读到她那条的第几条（`her.index`）；她自己 `dismiss` 回了那之前时，从它上次之后的第一个记号接着读，并告诉它。上一次请求超过 10 万 token 时它先写地图，旧的一条归档为 `archive/<开始时刻>-subconscious.json`，新的一条从地图开始。请求失败或被打断时什么都不存，下次接着给。夜间反思列归档段时不列 `-folded` 和 `-subconscious`。
 
 这些判据判定要叫醒她时都走 `chat.wake(event, kind)`：在 oplog 里把这条到达标为激活，再驱动中心 agent；她正忙时激活留着，这一轮收尾时接上。它是唤醒方式的函数入口，link 节点、`.py` 或其它模块也可以在**这条消息的派发过程中**调用（到达号只在派发期间可查，事后调用会报错）；`kind` 原样出现在她看到的"这次唤醒你的是"里。不带消息时写 `chat.wake(reason=..., kind=...)`，随时能调（awaker 规则到点、`when` 条件成立、她用 `exec_code` 包在某个函数上的钩子）：等于 `chat.push(me, kind, reason, wake=kind)`，理由作为一条记录写进她自己的 `me` 窗口，见下一段。夜间反思走 `agent.reflect`。
 
@@ -50,7 +54,7 @@
    末尾 hint 是待办（笔记 todo）、发言提醒、其它窗口的未读数与当前时间，只挂在发出去的那一份上。请求失败、没有任何输出时这段文件不变，同样的材料不会追加两次；每轮结束后文件跟着更新。读回时，一批工具调用缺结果的（被打断）补一条"被打断"的结果；`#reasoning drop` 时以前几次唤醒的思考不再带回。
 3. **窗口画面**（`chat.screen`）：直接读 `chatlog/` 普通日志文件里的记录，保留原文格式。
    - 每个窗口和日期补一行 `# g群号 YYYY-MM-DD`，`agent.seen` 记下的看到时间之后标出"以下是上次之后的新消息"。
-   - 新消息超过 200 条时只展示最新的 200 条，画面开头写明跳过了多少条、用什么 `read_log` 参数往前翻，看到位置照样推进到最新。
+   - 新消息超过 200 条时只展示最新的 200 条，画面开头写明跳过了多少条、用什么 `read_log` 参数往前翻，看到位置照样推进到最新。`follow` 期间（包括说完话自动听）到的消息不截：上限加上 follow 起点之后的条数，起点由 `awaker` 记在内存里（`_since`，说完话自动听用她说话的时刻），重启后或她直接改笔记写的 follow 不知道起点，照旧截。
    - 第一次输出时只把读画面那一刻之前到达的未读标为已读；生成期间同窗口新到的由插话追加进这一段，那次请求有了输出再标已读。
    - 正文是 OneBot 原始串，图片 CQ 码按 `msg_split` 拆成图片 part，再按图片档位处理。
    - 名字是 chatlog 写入时的 QQ 侧名字，`.setname` 自定义称呼改为出现在这个人的笔记里。
@@ -141,7 +145,7 @@
 | `reload_tools` | 按模块名从磁盘显式应用、更新或删除模块；逐项返回成功和带完整 traceback 的失败结果，失败保留旧 last-good。 |
 | `load_tools` | 将 last-good 模块激活到当前 Chat；中心名单存全局 `agent`，不读取磁盘。 |
 
-`meta` 还导出 `type_word`／`send`（唯一的发言方式：先打进那个窗口的输入框，下一步再发；同一次输出里刚打的字不发，必须写明 `target`）、`wake_me`（给自己埋唤醒规则，写进笔记 awaker）、`search`／`read_log`／`read_actions`／`read_note`（召回画面以外的聊天记录、笔记、日记、归档的上下文与自己的行动记录）、`write_note`（改任何一份笔记，包括待办 todo 和闹钟 awaker）、`tidy`（这一轮结束后交接）和 `attach_image`。
+`meta` 还导出 `type_word`／`send`（唯一的发言方式：先打进那个窗口的输入框，下一步再发；同一次输出里刚打的字不发，必须写明 `target`）、`wake_me`（给自己埋唤醒规则，写进笔记 awaker）、`search`／`read_log`／`read_actions`／`read_note`（召回画面以外的聊天记录、笔记、日记、归档的上下文与自己的行动记录）、`write_note`（改任何一份笔记，包括待办 todo 和闹钟 awaker）、`tidy`（这一轮结束后交接）、`dismiss`（没什么要做的，这一轮结束后把这次唤醒从这一段里清掉）和 `attach_image`。
 
 仓库当前提供以下按需模块；函数只在对应模块激活后出现：
 
