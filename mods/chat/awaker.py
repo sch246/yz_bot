@@ -83,6 +83,9 @@ _WHEN = re.compile(r"^\s*(?:[-*]\s+)?when\s+(.+?)\s+->\s+(.+?)\s*$")
 _edit = threading.Lock()
 # 代码设的覆盖层（other），目标原文 → {"decide": 函数, "moment": 到期时刻或 None, "reason": …}。
 _custom: dict[str, dict] = {}
+# follow 从什么时候盖上的，目标原文 → 时刻：画面据此把 follow 期间到的消息给全（agent._screen_text）。
+# 只在内存里；重启后、或者她直接用 write_note 写的 follow 不知道起点，画面照旧截。
+_since: dict[str, float] = {}
 # 说完话自动听多久（秒），见模块说明最后一段。
 LISTEN = 5 * 60
 # 窗口 → {"spoke": 她上次在这说话的时刻, "dismissed": 那之后 dismiss 掉看过它的唤醒几次}
@@ -294,6 +297,7 @@ def check(now: float | None = None) -> None:
         if rule["kind"] == "layer":
             if now >= rule["moment"]:
                 _claim([rule["key"]])
+                _since.pop(rule["target"], None)
             continue
         if rule["kind"] == "on":
             continue
@@ -349,8 +353,9 @@ def take_waiting(window: tuple, author) -> list[dict]:
 
 def _layers(now: float) -> list[dict]:
     found, _skipped = rules()
-    layers = [dict(rule, decide=rule["state"] == "follow") for rule in found
-              if rule["kind"] == "layer" and now < rule["moment"]]
+    layers = [dict(rule, decide=rule["state"] == "follow",
+                   since=_since.get(rule["target"]) if rule["state"] == "follow" else None)
+              for rule in found if rule["kind"] == "layer" and now < rule["moment"]]
     for target, custom in list(_custom.items()):
         if custom["moment"] is not None and now >= custom["moment"]:
             _custom.pop(target, None)
@@ -384,7 +389,7 @@ def _listening(window: tuple, now: float) -> dict | None:
     moment = heard["spoke"] + LISTEN
     return {"state": "follow", "target": _windows.label(window), "scope": ("window", window, None),
             "moment": moment, "until": datetime.fromtimestamp(moment).strftime("%Y-%m-%d %H:%M"),
-            "reason": "你刚在这说过话，听听接下来的", "decide": True, "auto": True}
+            "reason": "你刚在这说过话，听听接下来的", "decide": True, "auto": True, "since": heard["spoke"]}
 
 
 def layer(window: tuple, author=None, now: float | None = None) -> dict | None:
@@ -455,6 +460,7 @@ def lift(target: str) -> bool:
         with _hearing:
             _heard.pop(window, None)
     found = _custom.pop(target, None) is not None or found
+    _since.pop(target, None)
     with _edit:
         text = _notes.read("awaker")
         kept = _strip_layer(text, target)
@@ -485,6 +491,7 @@ def override(target: str, decide, until: float | None = None, reason: str = "") 
         if kept != text:
             _notes.write("awaker", kept.strip("\n") + "\n" if kept.strip() else "")
     _custom[target] = {"decide": decide, "moment": until, "reason": str(reason)}
+    _since.pop(target, None)
     item = next(item for item in _layers(time.time()) if item["state"] == "other" and item["target"] == target)
     return f"{target}：{describe(item)}"
 
@@ -536,6 +543,12 @@ def plant(when: str, reason: str, now: float | None = None) -> str:
             base = _strip_layer(base, found[0]["target"])
             _custom.pop(found[0]["target"], None)
         _notes.write("awaker", base.rstrip("\n") + "\n" + line + "\n")
+    if found[0]["kind"] == "layer":
+        # 续期不改起点；换成 mute 就没有起点了。
+        if found[0]["state"] == "follow":
+            _since.setdefault(found[0]["target"], now)
+        else:
+            _since.pop(found[0]["target"], None)
     return line
 
 

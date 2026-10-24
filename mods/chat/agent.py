@@ -182,18 +182,27 @@ def _screen_text(window: tuple, count: int, last: str | None) -> tuple[str, tupl
     # 再来的 at 会在第一次输出时一起被标掉，收尾不再接续）。chatlog 写入与登记到达
     # 在同一把窗口锁里、先写后登记，所以先取边界再读文件，边界内的都在画面能读到的文件里。
     through = oplog.latest_pending_arrival(window)
-    items = _screen.records(window, max(count, 1) + _FRESH_MAX)
+    # WHY: 维护者 2026-10-24：follow 期间（包括说完话自动听）到的消息不截，之前的照旧最多 _FRESH_MAX
+    # 条。她选了要跟上，dismiss 掉又回来的那批要原样给全，不靠 read_log 往前翻；一个群一天的消息放得下。
+    # 只按"现在盖着 follow"不行：follow 一个很久没看的群，第一屏会把几周的积压全倒出来。
+    layer = _chat_root._awaker.layer(window)
+    since = layer.get("since") if layer is not None and layer["state"] == "follow" else None
+    # 记录时间只到秒：起点取整，同一秒里到的也算 follow 期间。
+    during = (sum(1 for item in _screen.records(window, 1_000_000, since=since)
+                  if item["time"] is not None and item["time"] >= int(since)) if since is not None else 0)
+    cap = _FRESH_MAX + during
+    items = _screen.records(window, max(count, 1) + cap)
     texts = [item["text"] for item in items]
     if last is not None and last in texts:
         # WHY: 这一段里已经给过这个窗口：按"上次给到哪一条"接着给，不按看到时间——看到
         # 时间只精确到秒，同一秒里后到的那条按时间会被当成看过。
         after = items[len(texts) - texts[::-1].index(last):]
-        shown = after[-_FRESH_MAX:]
+        shown = after[-cap:]
         calls = _offline_calls(window, shown)
         if not shown:
             return _with_calls(window, calls, ""), (None, through), last
         text = _screen.render(window, shown, mark)
-        if len(after) > _FRESH_MAX:
+        if len(after) > cap:
             text = (f"（{_screen.label(window)} 又有 {len(after)} 条新消息，这里只展示最新的 {len(shown)} 条；"
                     f"更早的用 read_log(\"{_screen.label(window)}\", before=\"{_screen.clock(shown[0]['time'])}\") 往前翻）\n" + text)
         return _with_calls(window, calls, text), (_screen.latest_time(shown), through), shown[-1]["text"]
@@ -203,12 +212,12 @@ def _screen_text(window: tuple, count: int, last: str | None) -> tuple[str, tupl
     older = [item for item in items if item not in fresh][-max(count - len(fresh), _LEAD_IN):]
     shown = older + fresh if mark is not None else items[-max(count, _LEAD_IN):]
     skipped = 0
-    if len(fresh) > _FRESH_MAX:
+    if len(fresh) > cap:
         # WHY: 维护者 2026-10-22 定：新消息太多（比如离线一晚）只展示最新的 _FRESH_MAX 条，
         # 但要明说跳过了多少、从哪里接着翻，看到位置照样推进；不静默丢，也不撑爆上下文。
         total = sum(1 for item in _screen.records(window, 1_000_000, since=mark)
                     if item["time"] is not None and item["time"] > mark)
-        shown = fresh[-_FRESH_MAX:]
+        shown = fresh[-cap:]
         skipped = total - len(shown)
     if not shown:
         return "", (None, through), last
@@ -578,7 +587,8 @@ def _run_agent(model: str | None, turn) -> bool:
         return True
     mark = ({"at": now, "time": time.time(), "index": len(segment["messages"]),
              **{key: json.loads(json.dumps(segment.get(key), ensure_ascii=False)) for key in _MARKED},
-             "boxes": {label: box["text"] for label, box in turn.boxes.items() if box.get("text")}}
+             "boxes": {label: box["text"] for label, box in turn.boxes.items() if box.get("text")},
+             "seen": dict(_seen())}
             if notice is not None else None)
 
     def first_output() -> None:
@@ -682,6 +692,15 @@ def _drop_since(segment: dict, mark: dict) -> None:
             segment[key] = mark[key]
     segment["marks"] = [kept for kept in segment.get("marks", []) if kept["time"] < mark["time"]]
     _segment.save(segment)
+    # 画面上的"看到哪"也退回去：清掉的消息下次排在"以下是上次之后的新消息"下面，当没读过的给。
+    # oplog 的已读不退（日志里没有"标回未读"这种行），画面外那个窗口的未读条数因此不算它们。
+    seen = _seen()
+    for label in shown:
+        if mark["seen"].get(label) is None:
+            seen.pop(label, None)
+        else:
+            seen[label] = mark["seen"][label]
+    storage.save()
     _chat_root._awaker.dismissed(_windows.parse_all(shown))
 
 
