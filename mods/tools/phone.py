@@ -11,11 +11,11 @@
   多花两三秒；游戏画面里读不出东西，别用。
 - `look(marks=True)` 再给一张画了每 100 像素一条坐标线和你定的键位（K1、K2……）的图，估坐标、
   定键位时用。标注会挡东西，看内容以干净的那张为准。
-- **动作自己会把做完之后的画面带回来**，不用再补一次 `look`——点一下就能看见点完的样子，
-  接着决定下一步就行。只有一种情况才用 `look(wait=3)`：你确知界面还在加载、要看它加载完
-  的样子。会动的东西（视频、动画、走路）用 `frames(count, interval)`：隔一会儿取一帧，拼成
-  一张图，#1 最早，按行往右。拼图上的坐标不能拿去点。要一边推摇杆一边看，先
-  `frames(continuous=True)` 把后台连拍开起来，之后每次调用交回一组，看完 `frames(stop=True)`。
+- **点、滑、按键这些动作只管做，不带图**。要看结果自己 `look`：界面还在动、在加载，就给
+  `wait`（秒），等它停下来再截；不确定就多看一眼，看得勤没关系。会动的东西（视频、动画、走路）
+  用 `frames(count, interval)`：隔一会儿取一帧，拼成一张图，#1 最早，按行往右。拼图上的坐标
+  不能拿去点。要一边推摇杆一边看，先 `frames(continuous=True)` 把后台连拍开起来，之后每次调用
+  交回一组，看完 `frames(stop=True)`。
 
 ## 动
 
@@ -53,17 +53,20 @@
 from mods import phone
 from mods.tools._vision import attach
 phone.screenshot()
-shots = [phone.swipe("900,300", "1100,300", 300)["uri"] for _ in range(8)]
+shots = []
+for _ in range(8):
+    phone.swipe("900,300", "1100,300", 300)
+    shots.append(phone.screenshot(wait=0.3)["uri"])
 print(attach(phone.stitch(shots, [f"第{i + 1}下" for i in range(8)]), "原地往右转，一下一格"))
 ```
 
 - `phone` 里的函数和这些工具同名同参，`look` 对应 `phone.screenshot`、`frames` 对应
-  `phone.burst`；返回的是字典，动作后的画面在 `uri`。连着做几步时传 `see=False` 省掉中间的截图。
+  `phone.burst`；返回的是字典。动作不截图，要图就在你想要的时候调 `phone.screenshot()`。
 - `phone.find("x,y", target)`：最近看的那张图上这一块，在 target 那张图里跑到了哪（`score`
   低于 0.5 多半没找到）；`phone.stitch(uris, labels)` 把几张图拼成一张。
 - 图要交给自己看：`print(attach(uri, "说明"))`。
-- 要边拖边连拍，开个线程拖：`threading.Thread(target=phone.swipe, args=(...), kwargs={"see": False})`，
-  `start()` 以后接着 `phone.burst(...)`。
+- 要边拖边连拍，开个线程拖：`threading.Thread(target=phone.swipe, args=(...))`，`start()` 以后
+  接着 `phone.burst(...)`。
 
 ## 要知道的
 
@@ -112,15 +115,6 @@ def _attach_image(uri: str, note: str) -> str:
         return f"⚠️ 附加图片出错（{type(error).__name__}: {error}）"
 
 
-def _after(outcome: dict, prefix: str) -> str:
-    """动作的回执：动作后的画面一起交上去，省掉"再 look 一眼"那一轮。"""
-    if not outcome.get("uri"):
-        return f"{prefix}（动作后的画面没拿到：{outcome.get('shot_error')}）"
-    size = f"{outcome['width']}×{outcome['height']}"
-    outcome_text = _attach_image(outcome["uri"], f"这是你动作之后手机的画面（{size}，点的时候坐标照这张图）。")
-    return f"{prefix}，这是动作后的画面（{size}）\n{outcome_text}"
-
-
 def _lists(shot: dict) -> str:
     """look 结果后面跟的键位、控件列表。"""
     lines = []
@@ -144,7 +138,7 @@ def look(prompt: str = "", wait: float = 0.0, marks: bool = False, elements: boo
 
     @param
     prompt: 你想在图里确认什么，例如"有没有弹窗"、"搜索框在哪"；留空就是看看屏幕上有什么
-    wait: 界面还在加载、要看它出来之后的样子时才给几秒；平常不用给——动作已经把画面带回来了；最多 10
+    wait: 截图前先等几秒：刚点完、界面还在动或在加载时给，等它停下来再截；最多 10
     marks: 在图上画坐标线和键位，估坐标、定键位时用
     elements: 读一遍界面，列出控件和文字的坐标（多两三秒，游戏里读不出）
     """
@@ -187,7 +181,9 @@ class _Recorder:
 
     def __init__(self, backend, count: int, interval: float):
         self.backend, self.count, self.interval = backend, count, interval
-        self.groups = collections.deque()
+        # 没人来取时只留最近两组，再早的连拼图一起删：她要的是现在的样子。
+        self.groups = collections.deque(maxlen=2)
+        self.lock = threading.Lock()
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True, name="phone-recorder")
         self.thread.start()
@@ -203,24 +199,46 @@ class _Recorder:
                 if self.stop.is_set():
                     break
                 try:
-                    shot = self.backend.screenshot()
+                    # shown=False：后台截的不算她看过的那张，不动她的坐标和 #n 列表，也不挤掉她上下文里
+                    # 引用着的截图。
+                    shot = self.backend.screenshot(shown=False)
                 except Exception:
                     continue
                 shots.append(str(shot["uri"]).removeprefix("file://"))
+            # WHY: 攒满就拼。单帧不归截图目录的保留数管，拼好就删；以前留着单帧等取的时候再拼，
+            # 一组二十张、目录只留三十张，没取走的那组先被清理删掉了。
+            group = None
             if shots and not self.stop.is_set():
-                self.groups.append(shots)
+                uri, cols, rows = _stitch(shots)
+                if uri:
+                    group = {"uri": uri, "count": len(shots), "cols": cols, "rows": rows}
+            for item in shots:
+                _remove(item)
+            if group:
+                with self.lock:
+                    if len(self.groups) == self.groups.maxlen:
+                        _remove(self.groups[0]["uri"])
+                    self.groups.append(group)
 
-    def take(self, wait_seconds: float) -> list:
+    def take(self, wait_seconds: float) -> dict | None:
         deadline = time.monotonic() + wait_seconds
         while not self.groups and time.monotonic() < deadline and not self.stop.is_set():
             time.sleep(0.05)
-        return self.groups.popleft() if self.groups else []
+        with self.lock:
+            return self.groups.popleft() if self.groups else None
 
     def close(self) -> None:
         self.stop.set()
 
 
 _recorder = None
+
+
+def _remove(path: str) -> None:
+    try:
+        os.remove(path.removeprefix("file://"))
+    except OSError:
+        pass
 
 
 def _stop_recorder() -> str:
@@ -298,14 +316,12 @@ def frames(count: int = 20, interval: float = 0.4, prompt: str = "",
     if _recorder is None or (_recorder.count, _recorder.interval) != (count, interval):
         _stop_recorder()
         _recorder = _Recorder(backend, count, interval)
-    paths = _recorder.take(max(8.0, count * interval + 8.0))
-    if not paths:
+    group = _recorder.take(max(8.0, count * interval + 8.0))
+    if not group:
         return (f"后台连拍开着（每 {interval:g} 秒一张，一组 {count} 张），这一组还没攒满；"
                 "过一会儿再取，或者 frames(stop=True) 停掉")
-    uri, cols, rows = _stitch(paths)
-    if not uri:
-        return "连拍失败：截下来的图一张也读不出来"
-    return _burst_reply(uri, len(paths), round(len(paths) * interval, 1), cols, rows, prompt)
+    return _burst_reply(group["uri"], group["count"], round(group["count"] * interval, 1),
+                        group["cols"], group["rows"], prompt)
 
 
 def _where(spot: dict) -> str:
@@ -326,7 +342,7 @@ def tap(at: str) -> str:
         spot = backend.tap(at)
     except Exception as error:
         return _failed("点击", error)
-    return _after(spot, f"已点击 {_where(spot)}")
+    return f"已点击 {_where(spot)}"
 
 
 def swipe(start: str, end: str, duration: int = 300) -> str:
@@ -344,7 +360,7 @@ def swipe(start: str, end: str, duration: int = 300) -> str:
         outcome = backend.swipe(start, end, duration)
     except Exception as error:
         return _failed("滑动", error)
-    return _after(outcome, f"已从 {_where(outcome['from'])} 滑到 {_where(outcome['to'])}，用时 {outcome['duration']} 毫秒")
+    return f"已从 {_where(outcome['from'])} 滑到 {_where(outcome['to'])}，用时 {outcome['duration']} 毫秒"
 
 
 def hold(at: str, seconds: float = 0.0) -> str:
@@ -362,8 +378,8 @@ def hold(at: str, seconds: float = 0.0) -> str:
     except Exception as error:
         return _failed("按住", error)
     if not spot["kept"]:
-        return _after(spot, f"在 {_where(spot)} 按了 {min(seconds, 30):g} 秒，已松开")
-    return _after(spot, f"按着 {_where(spot)} 没松；release(\"{spot['key']}\") 松开，一分钟没碰手机会自己松开")
+        return f"在 {_where(spot)} 按了 {min(seconds, 30):g} 秒，已松开"
+    return f"按着 {_where(spot)} 没松；release(\"{spot['key']}\") 松开，一分钟没碰手机会自己松开"
 
 
 def release(at: str = "") -> str:
@@ -381,7 +397,7 @@ def release(at: str = "") -> str:
         return _failed("松开", error)
     if not outcome["released"]:
         return "本来就没有按着的"
-    return _after(outcome, f"已松开：{'、'.join(outcome['released'])}")
+    return f"已松开：{'、'.join(outcome['released'])}"
 
 
 def mark(name: str, at: str = "", radius: float = 0.0, remove: bool = False) -> str:
@@ -427,7 +443,7 @@ def aim(area: str, at: str, to: str = "") -> str:
     else:
         head = f"还差 {outcome['error']} 像素：{where}，拖了 {outcome['steps']} 下"
     ratio = outcome["ratio"]
-    return _after(outcome, f"{head}；拖 1 像素画面横着挪 {ratio[0]:g}、竖着挪 {ratio[1]:g} 像素（0 是还没量）")
+    return f"{head}；拖 1 像素画面横着挪 {ratio[0]:g}、竖着挪 {ratio[1]:g} 像素（0 是还没量）"
 
 
 def key(name: str) -> str:
@@ -443,7 +459,7 @@ def key(name: str) -> str:
         outcome = backend.key(name)
     except Exception as error:
         return _failed("按键", error)
-    return _after(outcome, f"已按 {outcome['code']}")
+    return f"已按 {outcome['code']}"
 
 
 def type_text(text: str, clear: bool = False, enter: bool = False) -> str:
@@ -462,7 +478,7 @@ def type_text(text: str, clear: bool = False, enter: bool = False) -> str:
     except Exception as error:
         return _failed("打字", error)
     note = f"已打 {outcome['count']} 个字" + ("（先清空了）" if clear else "") + ("，并回车" if enter else "")
-    return _after(outcome, note)
+    return note
 
 
 def keyboard(name: str = "adb") -> str:
