@@ -146,6 +146,8 @@ from __future__ import annotations
 
 import contextvars
 import io
+import random
+import re
 import time
 from typing import Mapping
 
@@ -157,8 +159,6 @@ def _tool_window():
 
     session = current_binding().session
     return chat.AGENT_WINDOW if getattr(session, "reads_window_mail", False) and context.agent_mode() else history.window(context.current() or {})
-
-
 def exec_code(expr: str, code: str, timeout: float) -> str:
     """在 Bot 进程的共享 Python 环境中先执行 code、再求值 expr，返回 repr 结果和被捕获的 print 输出；需要管理员权限。
 
@@ -358,6 +358,24 @@ def type_word(target: str, text: str) -> str:
             f"（还没发。下一步看过新到的消息再 send(\"{label}\")；不想说了就不发，这次唤醒结束时会清空）")
 
 
+MAX_BUBBLES = 4
+BUBBLE_GAP = (1.0, 2.0)
+
+
+def _split_turns(text: str) -> list[str]:
+    """按空行把一段话拆成几个气泡，最多 MAX_BUBBLES 个。
+
+    WHY: 维护者 2026-10-24 让 Claude 看过 7 天记录：私聊里柚子一半的消息分了段，对方只有 3%，
+    真人是一条一条发。拆开之后每段自己是一个气泡，中间隔一秒到两秒（BUBBLE_GAP）。
+    """
+    blocks = [block.strip() for block in re.split(r"\n\s*\n", text) if block.strip()]
+    if len(blocks) <= 1:
+        return [text]
+    if len(blocks) > MAX_BUBBLES:
+        blocks = blocks[:MAX_BUBBLES - 1] + ["\n\n".join(blocks[MAX_BUBBLES - 1:])]
+    return blocks
+
+
 def send(target: str, final_call: bool = True) -> str:
     """把 target 输入框里打好的字发出去，返回 message_id；默认发完这一轮就结束。
 
@@ -410,21 +428,30 @@ def send(target: str, final_call: bool = True) -> str:
     unconfirmed = (
         "先在下一轮的聊天记录里看它在不在，再决定要不要重发——不要直接重发。"
     )
+    parts = _split_turns(box["text"])
+    sent = []
     try:
-        message_id = windows.sender(window)(window, box["text"])
+        for index, part in enumerate(parts):
+            sent.append(windows.sender(window)(window, part))
+            if index < len(parts) - 1:
+                # 人打下一句要时间：随机停一秒到两秒，别像机器连着吐（维护者 2026-10-24）。
+                time.sleep(random.uniform(*BUBBLE_GAP))
     except windows.Unconfirmed as error:
         boxes.pop(label, None)
         _spoke(window)
         return f"未确认：{error}输入框已清空。" + unconfirmed
     except Exception as error:
+        if sent:
+            boxes.pop(label, None)
+            _spoke(window)
+            return (f"发送失败（{type(error).__name__}）：{error}。"
+                    f"前 {len(sent)} 条已经发出去了，剩下的没发，别再重发前面那些。")
         return f"发送失败（{type(error).__name__}）：{error}。这句话没有发出去，还在输入框里。"
     boxes.pop(label, None)
     _spoke(window)
     if final_call:
         current_binding().session.turn_done = lambda: True
-    return str(message_id)
-
-
+    return "、".join(str(item) for item in sent) if len(sent) > 1 else str(sent[0])
 def _spoke(window: tuple) -> None:
     """She said something: that group is listened to for a while (awaker), and dismiss cannot clear past it."""
     from mods.chat import awaker
