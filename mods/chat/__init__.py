@@ -374,8 +374,9 @@ def _agent_hint() -> str:
         del data[_AGENT_HINT_KEY]
         storage.save()
     value = _notes.read("todo").strip()
-    return f"待办（笔记 todo，用 write_note 改）：\n{value}" if value else ""
-
+    # 人设在上下文最前面，聊十几轮就被冲淡了；这一句每轮都挂在末尾（维护者 2026-10-24 提案 2）。
+    tone = "说话：短，一句一条，像聊天不像汇报。"
+    return f"待办（笔记 todo，用 write_note 改）：\n{value}\n\n{tone}" if value else tone
 
 # 会话主体持久激活的工具模块名，以及各自最后一次被调用的时刻。
 _ACTIVE_MODULES_KEY = "active_tools"
