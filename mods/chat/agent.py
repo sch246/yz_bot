@@ -765,6 +765,56 @@ def _fold_since(segment: dict, mark: dict, label: str) -> str:
     return name
 
 
+def _fold_between(segment: dict, mark: dict, after: dict, label: str) -> str:
+    """Replace the wakes from *mark* up to (not including) *after* with one line; what follows stays as it was.
+
+    WHY: 维护者 2026-10-24：潜意识动不了段中间不太好，本以为是像操作数据一样操作上下文。中间收掉一块，
+    那之后她那条下一次请求要按原价重读（缓存只认前面一样的部分），偶尔一次只是几分钱，贵的是每轮都改
+    中间；所以潜意识看得到每处之后有多少 token，值不值由它按说明判断，代码不设门槛。
+
+    和收到最后不同，后面的唤醒还在：它们的记号下标往前挪，区间里第一次给的笔记从这一段和后面的记号里
+    一起退掉（下次再给），工具状态退回区间开头那时的（下次把变化重新说一遍，重复无妨）。区间不含这一段
+    第一次唤醒，开头那条交接留下的 notice 不会在里面。
+    """
+    start, end = mark["index"], after["index"]
+    removed = segment["messages"][start:end]
+    shown = [window for window, last in after["last_shown"].items() if mark["last_shown"].get(window) != last]
+    name = _segment.archive({"started": mark["time"], "windows": shown, "reason": label, "messages": removed}, "folded")
+    where = f"{'、'.join(shown)} 的画面和" if shown else ""
+    line = {"role": "system", "content": (
+        f"【收起】{label}\n（{mark['at'][5:]} 起到 {after['at'][5:]} 之前，{where}你那时的想法、调用，后台整理时收成了"
+        f"上面这一句；原样存在归档段 {name}，加载 memory_system 用 read_context(\"{name}\") 读，search 也搜得到）")}
+    segment["messages"] = [*segment["messages"][:start], line, *segment["messages"][end:]]
+    shift = 1 - len(removed)
+    saved = _text_tokens(removed) - _text_tokens([line])
+    given = [scope for scope in after.get("scopes") or [] if scope not in (mark.get("scopes") or [])]
+
+    def moved(reported):
+        # 接口报的数若是在这一块之后报的，扣掉这一块的估算；报在这一块里面的已经对不上了，改回按字数估。
+        if not (isinstance(reported, list) and len(reported) == 2) or reported[1] <= start:
+            return reported
+        return [reported[0] - saved, reported[1] + shift] if reported[1] >= end else None
+
+    segment["scopes"] = [scope for scope in segment.get("scopes") or [] if scope not in given]
+    segment["tokens"] = moved(segment.get("tokens"))
+    if "told" in mark:
+        segment["told"] = mark["told"]
+    marks = []
+    for other in segment.get("marks", []):
+        if other["time"] < mark["time"]:
+            marks.append(other)
+        elif other["time"] >= after["time"]:
+            other = {**other, "index": other["index"] + shift, "tokens": moved(other.get("tokens"))}
+            if "scopes" in other:
+                other["scopes"] = [scope for scope in other["scopes"] or [] if scope not in given]
+            if "told" in mark:
+                other["told"] = mark["told"]
+            marks.append(other)
+    segment["marks"] = marks
+    _segment.save(segment)
+    return name
+
+
 def _body(session: llm.Chat) -> list[dict]:
     """Everything after the system prompt, which is rebuilt on every wake."""
     return session.messages[_system_count(session):]

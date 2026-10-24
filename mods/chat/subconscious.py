@@ -6,9 +6,14 @@ WHY: 维护者 2026-10-24（提案 attention-and-subconscious）：显意识留�
 不动就是留着。它的理由只在它这条里，她只看到结果。它记得自己做过什么，所以可以等几轮再从
 第一轮起一起收：只动她那条的末尾，她的前缀照样命中。这条长了它自己交接：写下地图，换新的一条。
 
+WHY: 维护者 2026-10-24：动不了段中间不太好，本以为是像操作数据一样操作上下文。所以收起也能只收
+中间几次唤醒（`收起 <从>~<到> <记号>`），代价是她那条从那里往后下一次按原价重读；列给它的每次唤醒
+后面写着那之后约多少 token，值不值由它判断。放下仍只到最后：中间退一块回"没读"，后面几次已经接着
+往下看过了，顺序就乱了。
+
 WHY: 怎么判断写在 data/notes/policy/subconscious.md，不写成代码里的规则——维护者说固定规则
 改起来不方便；文件不存在时用 DEFAULT_GUIDANCE。代码只管格式和机制本身：只认最后一行决定、
-只动她那条的末尾、记号跟着她那一段（不跨交接）、这一段第一次唤醒连着开头的笔记不收起、
+放下只到最后、记号跟着她那一段（不跨交接）、这一段第一次唤醒连着开头的笔记不收起、
 follow 期间攒过 _FRESH_MAX 条的不放下（和她自己 dismiss 的兜底是同一条，维护者定的）。
 """
 
@@ -40,19 +45,23 @@ DEFAULT_GUIDANCE = """你是她的潜意识：同一个脑子的另一条思路�
 - 没什么要她记着的（看了一眼、没她的事、也没想出什么），就放下：消息回到没读，下次和新的一起给她。
 - 看过、想过，但不必每个字都在眼前的，就收起。记号写清楚是什么事、到哪一步、她还要不要管，让她看记号就够用。
 - 几轮都是同一件事，可以先留着，等这件事告一段落再从第一轮起一起收。
+- 中间的也能收：前面几轮的事已经了结、后面又有别的，就只收那几轮。收中间那一块，她那条从那里往后下一次都要按原价重读（缓存价的五十倍，列表里写着约多少 token），所以攒够了、值得时再收，别每轮都动中间。
 - 她在那以后说过话、答应过什么、在等谁的回复，工具报了错或者结果和预期不符，有人点了她的名：这些留着，她得记得。
 - 拿不准就留着。"""
 
 _FORMAT = """每次最后单独写一行决定，只写一件：
 收起 <时刻> <记号>　把她那条从这次唤醒起到最后换成一句记号，原样另存，她要看能读回来
-放下 <时刻>　　　　 把她那条从这次唤醒起清掉，消息回到没读，下次和新的一起给她
+收起 <时刻>~<时刻> <记号>　只收中间这几次唤醒（含后一个时刻那次），后面的原样留着
+放下 <时刻>　　　　 把她那条从这次唤醒起清掉，消息回到没读，下次和新的一起给她（只能放到最后）
 留着　　　　　　　　什么都不动
-时刻照"还能从这些唤醒起"后面列的写。决定之前可以先写几句理由，它们只留在你这条里。"""
+时刻照"还能从这些唤醒起"后面列的写，括号里是那次唤醒之后约多少 token。决定之前可以先写几句理由，它们只留在你这条里。"""
 
 _HANDOFF = ("这一条要换新的了。写下新一条开头要用的地图：她眼前现在有哪几摊事、各是什么、到哪一步；"
             "你收起过哪些（记号原文）；彼此什么关系；还要盯着什么。直接写正文，不写决定。")
 
-_DECISION = re.compile(r"(收起|放下)\s*[（(「]?\s*((?:\d{4}-\d{2}-\d{2}\s+)?\d{1,2}:\d{2}:\d{2})\s*[）)」]?\s*[:：，,]?\s*(.*)")
+# 时刻后面列表里那个"（之后约 N token）"它可能照抄过来，认得出来、不算进记号。
+_TIME = r"((?:\d{4}-\d{2}-\d{2}\s+)?\d{1,2}:\d{2}:\d{2})(?:\s*[（(]之后约[^）)]*[）)])?"
+_DECISION = re.compile(rf"(收起|放下)\s*[（(「]?\s*{_TIME}(?:\s*(?:~|～|到|至)\s*{_TIME})?\s*[）)」]?\s*[:：，,]?\s*(.*)")
 
 
 def on() -> bool:
@@ -102,8 +111,11 @@ def _shown(messages: list[dict]) -> str:
     return text
 
 
-def _decision(reply: str) -> tuple[str, str, str] | None:
-    """The last decision line: ``(kind, at, label)``, ``("?", line, "")`` when it cannot be read, None for 留着."""
+def _decision(reply: str) -> tuple[str, str, str, str] | None:
+    """The last decision line: ``(kind, at, until, label)``, ``("?", line, "", "")`` when it cannot be read, None for 留着.
+
+    *until* is empty unless it named a range.
+    """
     for line in reversed(reply.strip().splitlines()):
         stripped = line.strip().strip("*`>#-· ").strip()
         if stripped.startswith("留着"):
@@ -111,23 +123,40 @@ def _decision(reply: str) -> tuple[str, str, str] | None:
         if stripped.startswith(("收起", "放下")):
             found = _DECISION.match(stripped)
             if not found:
-                return "?", stripped, ""
-            return found.group(1), " ".join(found.group(2).split()), found.group(3).strip().strip("*` ")
+                return "?", stripped, "", ""
+            return (found.group(1), " ".join(found.group(2).split()), " ".join((found.group(3) or "").split()),
+                    found.group(4).strip().strip("*` "))
     return None
 
 
-def _apply(her: dict, decision: tuple[str, str, str] | None) -> str:
+def _amount(tokens: int) -> str:
+    return f"{tokens / 10000:.1f} 万" if tokens >= 10000 else str(tokens)
+
+
+def _apply(her: dict, decision: tuple[str, str, str, str] | None) -> str:
     """Carry out one decision on her segment; returns what to tell it next time."""
     agent = _chat_root._agent
     if decision is None:
         return ""
-    kind, at, label = decision
+    kind, at, until, label = decision
     if kind == "?":
         return f"上次最后那行「{at}」没看懂，什么都没动。"
-    found = [mark for mark in her.get("marks") or [] if at in (mark["at"], mark["at"][11:])]
+    marks = her.get("marks") or []
+    found = [mark for mark in marks if at in (mark["at"], mark["at"][11:])]
     if not found:
         return f"上次说的「{kind} {at}」没做：她那条里找不到这次唤醒（可能已经被清掉，或者她交接了）。"
     mark = found[-1]
+    after = None
+    if until:
+        ends = [index for index, other in enumerate(marks) if until in (other["at"], other["at"][11:])]
+        if not ends:
+            return f"上次说的「{kind} {at}~{until}」没做：她那条里找不到 {until} 那次唤醒。"
+        if marks[ends[-1]]["time"] < mark["time"]:
+            return f"上次说的「{kind} {at}~{until}」没做：后一个时刻比前一个早。"
+        after = marks[ends[-1] + 1] if ends[-1] + 1 < len(marks) else None
+        if kind == "放下" and after is not None:
+            return f"上次说的「放下 {at}~{until}」没做：放下只能放到最后，中间的可以收起。"
+        at = f"{at}~{until}"
     if kind == "放下":
         for window in _chat_root._windows.parse_all(agent._shown_since(her, mark)):
             piled = agent._piled(window, mark)
@@ -140,6 +169,9 @@ def _apply(her: dict, decision: tuple[str, str, str] | None) -> str:
         return f"上次说的「收起 {at}」没做：收起要写记号。"
     if mark["index"] == 0:
         return f"上次说的「收起 {at}」没做：那是这一段第一次唤醒，连着开头的笔记，不能收起（可以放下）。"
+    if after is not None:
+        name = agent._fold_between(her, mark, after, label)
+        return f"上次说的「收起 {at}」做了：她那条里这几次唤醒换成了你写的记号，后面的没动，原样存成归档段 {name}。"
     name = agent._fold_since(her, mark, label)
     return f"上次说的「收起 {at}」做了：她那条从 {at} 起换成了你写的记号，原样存成归档段 {name}。"
 
@@ -178,7 +210,9 @@ def _settle(model: str | None, turn) -> None:
             state["result"] = "\n".join(notes)
             _save(state)
         return
-    offered = "、".join(mark["at"] for mark in (her.get("marks") or [])[-_OFFERED:]) or "（没有）"
+    size = _chat_root._agent._text_tokens
+    offered = "、".join(f"{mark['at']}（之后约 {_amount(size(her['messages'][mark['index']:]))} token）"
+                        for mark in (her.get("marks") or [])[-_OFFERED:]) or "（没有）"
     added = []
     if notes:
         added.append({"role": "system", "content": "\n".join(notes)})
