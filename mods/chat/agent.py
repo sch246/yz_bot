@@ -19,7 +19,7 @@ import json
 import threading
 import time
 
-from mods import context, identity, image, llm, oplog, py, storage
+from mods import context, identity, image, llm, oplog, py, shell, storage
 
 import mods.chat as _chat_root
 from . import notes as _notes, reader as _reader, roles as _roles, screen as _screen, segment as _segment, view as _view, windows as _windows
@@ -759,7 +759,8 @@ def _run_agent(model: str | None, turn) -> bool:
 
     session = _run_session(model, turn, segment, [*segment["messages"], *material], first_output, stop_when,
                            providers=[late],
-                           hints=[lambda: _unread_hint(set(newest)), lambda: _subconscious.nudge(segment)],
+                           hints=[lambda: _unread_hint(set(newest)), lambda: _subconscious.nudge(segment),
+                                  lambda: shell.running_hint()],
                            known=len(segment["messages"]), each_output=seen_late)
     if getattr(session, "dismiss", None) is not None:
         # 工具里查过一次；同一次输出里排在它后面的 send、type_word 可能又改了情况，这里再查。

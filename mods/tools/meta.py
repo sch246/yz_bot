@@ -4,9 +4,9 @@
 
 ## 直接执行 Python
 
-`exec_code(expr, code, timeout)` 用的是 `.py` 命令那份共享环境：先 `exec(code)`，再 `eval(expr)`，返回 `repr(结果)`。`code` 里的 `print` 输出会被捕获后一起回传，不会发进聊天。环境跨调用持久，上一次定义的变量和函数下一次仍然在。
+`exec_code(expr, code, timeout=15, back="wait")` 用的是 `.py` 命令那份共享环境：先 `exec(code)`，再 `eval(expr)`，返回 `repr(结果)`。`code` 里的 `print` 输出会被捕获后一起回传，不会发进聊天。环境跨调用持久，上一次定义的变量和函数下一次仍然在。
 
-`timeout` 是必填的秒数上限，`0` 表示不限。代码在一个可以被终止的子线程里执行：到点会 kill 掉这次调用启动的子进程、并给那个线程注入中断，然后照常把已经捕获的 print 输出交回来。时限由调用方负责，所以哪怕代码卡在一个打断不了的系统调用里，你也会在时限内拿回控制权——但那个线程可能还留着，**下一次仍然能看见它留下的痕迹**。默认给一个够用的值，别用 `0` 图省事：这条路的代价是线程和子进程，不是耐心。
+`timeout` 默认 15 秒。代码在一个可以被终止的子线程里执行：到点会 kill 掉这次调用启动的子进程、并给那个线程注入中断，然后照常把已经捕获的 print 输出交回来。时限由调用方负责，所以哪怕代码卡在一个打断不了的系统调用里，你也会在时限内拿回控制权——但那个线程可能还留着，**下一次仍然能看见它留下的痕迹**。`timeout=0` 表示不限，但只在 `back="wake"`/`"quiet"` 的后台模式下允许；同步模式传 0 会被拒绝，因为那会把这一轮整个挂住。要顺序做的事（例如推摇杆）把顺序写进代码、每一步等结果，不要用 0 停掉整个循环。后台模式立刻回执，跑完把结果推进 `me` 窗口；`quiet` 不叫醒。
 
 只有 Bot 自身拥有 op 权限时可用，否则返回"权限不足"。
 
@@ -159,33 +159,44 @@ def _tool_window():
 
     session = current_binding().session
     return chat.AGENT_WINDOW if getattr(session, "reads_window_mail", False) and context.agent_mode() else history.window(context.current() or {})
-def exec_code(expr: str, code: str, timeout: float) -> str:
+# WHY: `back` 显式写进签名，不用函数属性 `.back`：同步模式要在启动前拒绝 timeout=0，
+# 这个判断需要拿到调用方传的 back；属性版只把它交给绑定层，函数自己看不到。
+def exec_code(expr: str, code: str, timeout: float = 15, back: str = "wait") -> str:
     """在 Bot 进程的共享 Python 环境中先执行 code、再求值 expr，返回 repr 结果和被捕获的 print 输出；需要管理员权限。
 
     @param
     expr: 在 code 之后求值并返回的单个表达式；只想执行 code、不关心返回值时传字符串 None
     code: 先执行的 Python 语句，可以多行；不需要时传空字符串
-    timeout: 秒数上限，必填；0 表示不限，到点会终止这次调用启动的子进程并中断执行线程
+    timeout: 秒数上限，默认 15；0 表示不限，但只在 back 为 wake/quiet 时允许
+    back: 结果怎么回来：wait 等做完再返回；wake/quiet 立刻回执，跑完把结果推进 me 窗口（quiet 不叫醒）
     """
     from mods import context, op, py, watchdog
 
     if not op.bot_is_op():
         return "权限不足"
+    if back not in ("wait", "wake", "quiet"):
+        return "back 只能是 wait、wake、quiet"
+    if timeout < 0:
+        return "timeout 不能是负数"
+    if back == "wait" and timeout == 0:
+        return (
+            '同步执行不能 timeout=0：改用 back="wake" 或 "quiet" 放到后台，'
+            "或者把顺序写进代码、每一步等结果"
+        )
     # WHY: 代码现在跑在一个子线程里（见 watchdog.run），所以它在代码里改
     # `context.set_current` 再也影响不到本线程。工具本身仍然可能改，所以照旧进来先快照、
     # 出去无条件还原：工具可以读路由，但不该在自己脚下把它换掉——2026-09-17 就因此把私聊的
     # 回复发进了群。
     original_event = context.current()
     buffer = io.StringIO()
-    missing = object()
-    original = py.loc.get("print", missing)
-    py.loc["print"] = lambda *values, sep=" ", end="\n": buffer.write(
-        sep.join(map(str, values)) + end
-    )
 
+    # WHY: print 的捕获必须跟着被执行的那段上下文走。watchdog.run 起的是新线程，
+    # `py.loc["print"]` 这种进程级改写会把并发调用的输出混在一起，所以改成 py.py 里的
+    # ContextVar，由这里在局部上下文中进入捕获。
     def run():
-        exec(code, py.loc)
-        return eval(expr, py.loc)
+        with py.capture_print(buffer):
+            exec(code, py.loc)
+            return eval(expr, py.loc)
 
     # WHY: watchdog.run 起的是新线程，ContextVar 不会跟过去，代码里调 `_vision.attach` 就拿不到
     # 这次的会话、交不出图。脚本操作手机时要把截图交给她看（维护者 2026-10-24：让她用 exec_code
@@ -195,25 +206,24 @@ def exec_code(expr: str, code: str, timeout: float) -> str:
     def perform():
         return scope.run(run)
 
-    try:
+    def task() -> str:
         try:
-            result = repr(watchdog.run(perform, timeout))
-        except TimeoutError as error:
-            result = f"超时：{error}"
-        except watchdog.Interrupted:
-            result = "已被 ^C 中断"
-    finally:
-        context.set_current(original_event)
-        if original is missing:
-            py.loc.pop("print", None)
-        else:
-            py.loc["print"] = original
-    printed = buffer.getvalue().rstrip()
-    return f"[print输出]\n{printed}\n[结果] {result}" if printed else result
+            try:
+                result = repr(watchdog.run(perform, timeout))
+            except TimeoutError as error:
+                result = f"超时：{error}"
+            except watchdog.Interrupted:
+                result = "已被 ^C 中断"
+        finally:
+            context.set_current(original_event)
+        printed = buffer.getvalue().rstrip()
+        return f"[print输出]\n{printed}\n[结果] {result}" if printed else result
 
+    if back != "wait":
+        from mods.tools import _tasks
 
-# 脚本可以放到后台跑：exec_code(..., back="wake") 立刻回执，跑完结果推到 me 窗口叫醒她（见 mods/tools/_tasks.py）。
-exec_code.back = "wait"
+        return _tasks.submit("exec_code", contextvars.copy_context(), task, back)
+    return task()
 
 
 def list_tools() -> str:

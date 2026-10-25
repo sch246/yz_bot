@@ -23,6 +23,8 @@ def rd(n, sides):
 
 它既是 REPL，也是现场修复和扩展入口。`^C` 会通过共享 continuation 机制唤醒并取消 `.py input()`，与 yield 命令使用同一条逃生路径。
 
+同一套环境也被模型工具 `exec_code` 复用：它的 `print` 会被捕获成返回值、不会发进聊天；`timeout` 默认 15 秒，同步调用不允许 `0` 无限等，长脚本要用 `back="wake"`/`"quiet"` 放到后台。
+
 `data/pyload.py` 是未受版本控制、通过 `exec` 注入的设备级输入。长期复用能力属于普通 `mods`，确有动态消费者的平铺名字由 `mods.py::DYNAMIC_EXPORTS` 显式维护。pyload 在候选环境中完整成功后才安装；失败不会留下半套名称。新增长期能力时不要继续堆进 pyload，详见[运行架构](architecture.md#pypyloadpy-与动态名称)。
 
 ### 其它语言环境

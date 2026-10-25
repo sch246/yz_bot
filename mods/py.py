@@ -2,6 +2,8 @@
 
 import base64
 import builtins
+import contextlib
+import contextvars
 import datetime
 import json
 import math
@@ -252,9 +254,30 @@ def chat_print(*values, sep=" ", end="\n", file=None, flush=False):
     if file is not None:
         builtins.print(*values, sep=sep, end=end, file=file, flush=flush)
         return
+    capture = _CAPTURE.get()
+    if capture is not None:
+        if values and not (len(values) == 1 and values[0] is None):
+            capture.write(sep.join(map(str, values)) + end)
+        return
     if not values or (len(values) == 1 and values[0] is None):
         return
     return message.sendmsg(sep.join(map(str, values)))
+
+
+# WHY: `print` 的捕获必须跟着正在执行的那段上下文走。以前 exec_code 改写 `py.loc["print"]`，
+# 那是进程级共享的：两个并发调用会互相截走输出，watchdog 起的新线程也看不到调用方的局部状态。
+# ContextVar 会随 contextvars.copy_context() 一起进到执行线程，出了作用域自动还原。
+_CAPTURE = contextvars.ContextVar("py_print_capture", default=None)
+
+
+@contextlib.contextmanager
+def capture_print(stream):
+    """在 with 块里把 ``print`` 的输出写进 *stream*，不再发进聊天。"""
+    token = _CAPTURE.set(stream)
+    try:
+        yield
+    finally:
+        _CAPTURE.reset(token)
 
 
 def find(iterable, predicate):

@@ -38,6 +38,8 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import os
+import signal
 import subprocess
 import threading
 from contextlib import contextmanager
@@ -266,8 +268,28 @@ def _async_raise(ident: int, error: type[BaseException]) -> bool:
 
 def _kill(process: Any) -> None:
     try:
-        if process.poll() is None:
+        if process.poll() is not None:
+            return
+        pid = process.pid
+        try:
+            pgid = os.getpgid(pid)
+        except ProcessLookupError:
+            return
+        # WHY: 命令若用 start_new_session 自成一个进程组，只杀父进程会把 shell 的子进程
+        # 留成孤儿（`sh -c 'sleep 20 & wait'` 就是这种形状）。只有它确实是组长时才 killpg，
+        # 否则可能打到 Bot 自己的进程组。
+        if pgid != pid:
             process.kill()
+            return
+        os.killpg(pgid, signal.SIGTERM)
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
     except Exception:
         _log.debug("watchdog 杀进程失败", exc_info=True)
 

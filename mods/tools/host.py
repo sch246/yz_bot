@@ -35,8 +35,11 @@ header，照着重来一次即可，不要凭猜测重试。
 ## run_command
 
 一次性的 shell，不是常驻会话：每次调用都是新进程，`cd` 不会留到下一次，要换目录用
-`cwd` 参数，默认是 Bot 的工作目录。返回带退出码，非 0 就是失败，不要只看 stdout 有没
-有内容。需要长期驻留的进程交给 `screen`。
+`cwd` 参数，默认是 Bot 的工作目录。默认等 15 秒：跑完照旧返回退出码和输出；没跑完就
+转后台，不杀它，返回任务号、`data/commands/<任务号>.log` 和已有的输出，这一轮可以接着
+干别的。`back="wake"`/`"quiet"` 可以一开始就转后台，跑完把结果推进 `me` 窗口（quiet 不
+叫醒）。后台命令各自一个进程，不排 `tools._tasks` 的队列。还在跑的命令会出现在每次请求
+末尾的提示里；按任务号停用 `stop_command`。需要长期驻留的进程交给 `screen`。
 
 ## 边界
 
@@ -52,7 +55,6 @@ import difflib
 import hashlib
 import os
 import re
-import subprocess
 
 from mods import file, op
 
@@ -114,17 +116,6 @@ def _missing(path: str) -> str:
 
 def _lines(path: str) -> list[str]:
     return file.read(path).splitlines()
-
-
-def _truncate(value: str, limit: int) -> str:
-    """Drop the middle: errors sit at the end, context sits at the start."""
-    data = value.encode("utf-8")
-    if len(data) <= limit:
-        return value
-    half = limit // 2
-    head = data[:half].decode("utf-8", "ignore")
-    tail = data[-half:].decode("utf-8", "ignore")
-    return f"{head}\n...（省略 {_human(len(data) - limit)}）...\n{tail}"
 
 
 def read_file(path: str, start: int = 0, size: int = 0, max_bytes: int = MAX_READ_BYTES) -> str:
@@ -241,48 +232,46 @@ def _confirm(path: str, start: int, count: int) -> str:
     return f"已写入 {path}\n" + _render(path, lines, start, min(len(lines), start + max(count, 1)))
 
 
+# WHY: `back` 是显式参数，不用函数属性 `.back`。工具绑定层看到 `.back` 会把 wake/quiet
+# 排进 `_tasks` 的单 worker 队列，一条跑十分钟的 shell 会把后面所有工具调用堵住；这里的
+# 后台由 `shell.run` 自己登记、自己起 watcher。
 def run_command(
-    command: str, cwd: str = "", timeout: int = 60, max_bytes: int = MAX_OUTPUT_BYTES
+    command: str,
+    cwd: str = "",
+    timeout: float = 15,
+    back: str = "wait",
+    max_bytes: int = MAX_OUTPUT_BYTES,
 ) -> str:
-    """在宿主机上执行一条 shell 命令，返回工作目录、退出码和被截断的 stdout/stderr。需要管理员权限。
+    """在宿主机上执行一条 shell 命令；默认等 15 秒，没跑完转后台。需要管理员权限。
 
     @param
     command: 交给 shell 的完整命令，可以用管道、重定向和通配符
     cwd: 工作目录，默认是 Bot 的工作目录；每次调用都是新进程，cd 不会保留到下一次
-    timeout: 超时秒数，默认 60；超时会终止进程并回传已有输出
-    max_bytes: stdout 和 stderr 各自的字节上限，默认 8192；超出时省略中间部分
+    timeout: 等多少秒，默认 15；到点没跑完就转后台，不杀它；0 表示立刻转后台
+    back: 结果怎么回来：wait 先等 timeout；wake 立刻转后台、跑完推进 me 窗口叫醒你；quiet 转后台但不叫醒
+    max_bytes: 返回里最多保留多少字节的已有输出，默认 8192；后台输出文件本身不受此限
     """
     if not op.bot_is_op():
         return "权限不足"
     workdir = os.path.abspath(cwd) if cwd else os.getcwd()
     if not os.path.isdir(workdir):
         return f"工作目录不存在: {workdir}"
-    try:
-        process = subprocess.Popen(
-            command,
-            shell=True,
-            cwd=workdir,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-    except OSError as exc:
-        return f"启动失败: {exc}"
-    try:
-        output, error = process.communicate(timeout=timeout)
-        status = f"exit: {process.returncode}"
-    except subprocess.TimeoutExpired:
-        process.kill()
-        output, error = process.communicate()
-        status = f"超时 {timeout}s，已终止"
-    sections = [f"cwd: {workdir} | {status}"]
-    for label, value in (("stdout", output), ("stderr", error)):
-        value = _truncate(value.strip(), max_bytes)
-        if value:
-            sections.append(f"--- {label} ---\n{value}")
-    if len(sections) == 1:
-        sections.append("(无输出)")
-    return "\n".join(sections)
+    from mods import shell
+
+    return shell.run(command, workdir, timeout=timeout, back=back, max_bytes=max_bytes)
 
 
-__all__ = ["read_file", "write_file", "run_command"]
+def stop_command(task: str) -> str:
+    """按任务号停掉转后台的 shell 命令，连同它启动的子进程；需要管理员权限。
+
+    @param
+    task: run_command 返回的任务号，可以带 #，例如 "3"
+    """
+    if not op.bot_is_op():
+        return "权限不足"
+    from mods import shell
+
+    return shell.stop(task)
+
+
+__all__ = ["read_file", "write_file", "run_command", "stop_command"]

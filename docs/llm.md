@@ -140,7 +140,7 @@
 
 | 工具 | 当前效果与边界 |
 |---|---|
-| `exec_code` | 在 `.py` 的共享 `loc` 中先 `exec(code)`、再 `eval(expr)`；`timeout` 必填（秒，`0` 表示不限），代码跑在一个可终止的子线程里，到点终止它启动的子进程并中断该线程。调用时仍检查 op，拥有与 `.py` 接近的进程和宿主机能力。 |
+| `exec_code` | 在 `.py` 的共享 `loc` 中先 `exec(code)`、再 `eval(expr)`；`timeout` 默认 15 秒（`0` 表示不限，但只在后台模式允许），代码跑在一个可终止的子线程里，到点终止它启动的子进程并中断该线程；`back="wake"`/`"quiet"` 立刻回执，跑完把结果推进 `me` 窗口。`print` 的捕获跟着这次执行的上下文走，不改写共享 `loc`。调用时仍检查 op，拥有与 `.py` 接近的进程和宿主机能力。 |
 | `list_tools` | 列出 last-good 模块、当前会话激活状态、空闲回收规则、最近加载失败及磁盘差异。 |
 | `reload_tools` | 按模块名从磁盘显式应用、更新或删除模块；逐项返回成功和带完整 traceback 的失败结果，失败保留旧 last-good。 |
 | `load_tools` | 将 last-good 模块激活到当前 Chat；中心名单存全局 `agent`，不读取磁盘。 |
@@ -157,13 +157,15 @@
 | `user_data` | `user_data__get_user_data`、`user_data__set_user_data` |
 | `agents` | `agents__assign_tasks` |
 | `amap` | `amap__login`、`amap__search`、`amap__around` 等地点与路线查询 |
-| `host` | `host__read_file`、`host__write_file`、`host__run_command` |
+| `host` | `host__read_file`、`host__write_file`、`host__run_command`、`host__stop_command` |
 | `minecraft` | `minecraft__search_mc_mod`、`minecraft__check_mod` |
 | `meme` | 表情柜子：`meme__collect` 把聊天里或网上的图下载进 `data/memes/<sha256>.<扩展名>`（同一张只存一份），连同她起的心情和一句话记进 storage `meme/index`；`meme__pick` 按心情或关键词随机挑一张（优先最久没发的），返回带 `sub_type=1` 的 `[CQ:image,file=file://…]`，她再经 `type_word`／`send` 发；`meme__browse` 看总览、`meme__edit` 改或扔 |
 | `tts` | `tts__speak`：用 edge-tts（微软 Edge 在线朗读，非官方、免账号）把文字念成 mp3，默认音色晓伊 `zh-CN-XiaoyiNeural`，存进 `data/tmp_files` 返回 `file://` 路径；她再用 `[CQ:record,file=…]` 经 `type_word`／`send` 发语音 |
 | `weather` | `weather__search_city`、`weather__get_realtime_weather`、`weather__get_daily_forecast`、`weather__get_hourly_forecast` |
 
 `host` 是 `exec_code` 之外的常用出口：文件读写和 shell 都不必再绕一次任意代码执行。读取按本次实际截取的窗口计字节，超过 `max_bytes` 时只回大小和后续建议（缩小区间、先 `grep -n` 定位、或用 `assign_tasks` 开子会话通读后带回摘要），不做分页会话。改写靠 `read_file` 首行 header 里的 `line`/`size`/`v` 定位与对账：位置与新内容的写法无关，`v` 只在该区间自读取后被改动过时失配，失配的返回自带现状和新 header。渲染格式与 `.edit` 同源，所以手动编辑和模型改写看到的是同一种东西；它没有目录白名单，`data/`、`config.json`、`.env` 和聊天记录都在可及范围内。
+
+`run_command` 默认等 15 秒：跑完直接返回退出码和输出；没跑完不杀，转后台并回任务号、`data/commands/<任务号>.log` 和已有的输出。`back="wake"`/`"quiet"` 可以一开始就转后台，跑完把退出码和最后几十行推进 `me` 窗口（quiet 不叫醒）；`stop_command` 按任务号停掉它，连同子进程。后台命令各自一个进程，不排 `tools._tasks` 的队列；还在跑的命令会出现在每轮请求末尾的提示里，每次重新算、不存。
 
 除 `weather` 继续投影可用的 `mods.weather` 函数（其 schema 描述来自 `mods.weather` 函数自身的 docstring，与命令的 `-h` 帮助同源）外，这些文件持有各自工具的真实实现，不再从 `mods.chat` re-export。图片和子任务模块只惰性复用 `mods.chat` 的 usage/cost 入口，计费状态仍只有一份。
 
