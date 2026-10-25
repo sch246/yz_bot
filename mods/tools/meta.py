@@ -548,6 +548,27 @@ def tidy(note: str = "") -> str:
     return "这一轮结束后交接，之后从新的一段接着做"
 
 
+def compress(from_time: str, to_time: str = "", summary: str = "") -> str:
+    """收掉一段已经了结的唤醒：把它们换成你写的一句摘要，原文归档，这一段随之变短；这次调用和它的结果也会一起从眼前消失。
+
+    摘要要不看原文也接得上：
+    - 什么事、和谁、到哪一步、结果怎样；
+    - 要引别人的原话就带 mid，没有 mid 就写"大意"；
+    - 答应了谁、还没做的，单独一行"还欠着：……"；
+    - 还在进行中的不收：在等谁回话、刚有人点你的名、工具报错还没弄清。
+
+    @param
+    from_time: 从哪一次唤醒起收，写 07:12:03 或完整时刻
+    @param
+    to_time: 收到哪里为止（不含那一次）；留空就是收到现在，最近一次唤醒不收
+    @param
+    summary: 摘要，可以写多行；不写就不收
+    """
+    from mods import chat
+
+    return chat.agent.request_compress(current_binding().session, from_time, to_time, summary)
+
+
 def loop(note: str = "", stop: bool = False) -> str:
     """循环：每次唤醒结束后自动再叫醒你，一轮接一轮接着做手上的事（玩游戏、一步步操作手机这类要连着做很多轮的事）。
 

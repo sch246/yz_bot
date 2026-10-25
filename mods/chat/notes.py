@@ -127,9 +127,10 @@ def read_version(scope: str, version: str) -> str:
 
 # WHY: 策略文件是她在反思里能改的那一层（2026-10-22）：handoff 是她给交接写的附加说明，
 # tidy 是什么时候交接的 Python 条件，changes 是每次改动的原因、预期和事后评估，
-# proposals 是要维护者动手的改动（代码、醒来时带什么）。subconscious 是潜意识怎么判断（2026-10-24），
-# 现在只有维护者改：她还不知道有潜意识，edit_policy 不列它。
-POLICIES = ("handoff", "tidy", "changes", "proposals", "subconscious")
+# proposals 是要维护者动手的改动（代码、醒来时带什么）。旧的 subconscious 策略文件（潜意识怎么
+# 判断，2026-10-24）2026-10-25 起不再读：潜意识只剩一条提醒，收不收由她自己调 compress 决定；
+# 盘上的文件留着，不再经过这里。
+POLICIES = ("handoff", "tidy", "changes", "proposals")
 
 
 def _policy_path(name: str) -> Path:

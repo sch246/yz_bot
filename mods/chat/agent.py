@@ -15,7 +15,6 @@ WHY: 交接由她自己在同一段里做，不另起一个只看到摘要的"�
 
 from __future__ import annotations
 
-import copy
 import json
 import threading
 import time
@@ -458,7 +457,6 @@ def _begin(turn, window: tuple | None, kind: str) -> None:
     turn.handoff_note = ""
     turn.handoff_failed = False
     turn.handoffs = 0
-    turn.settling = False
     # 输入框（type_word）跟着这次唤醒走：中途交接换了会话也还在，唤醒结束就没了。
     turn.boxes = {}
     turn.log = {"kind": kind, "start": time.time(), "peak": 0, "acts": 0}
@@ -480,8 +478,7 @@ def _keep_typing(turn, window: tuple | None, stop: threading.Event) -> None:
         try:
             targets = {window} if window is not None and window[0] == "private" else set()
             targets.update(_reader.parse_target(label) for label in tuple(turn.screens) if label.startswith("u"))
-            # 潜意识整理时她已经忙完了，对方看到"正在输入"会以为她还有话。
-            for target in (() if turn.settling else targets):
+            for target in targets:
                 reply = connect.call_api("set_input_status", user_id=str(target[1]), event_type=1)
                 if reply.get("retcode") not in (0, None) and not failed:
                     failed = True
@@ -525,15 +522,8 @@ def _drive_agent(model: str | None, window: tuple | None) -> bool:
                 return True
             turn.associated_windows.intersection_update(
                 {window for window, _count, active in oplog.pending_summary() if active})
-            # 先排下一轮循环：它隔几秒才到，潜意识照样先整理一遍（维护者 2026-10-24：长时间运行
-            # 恰恰不能停了整理），整理期间到的那一轮由下面 finish_turn 接上。
+            # 先排下一轮循环：它隔几秒才到，期间来的召唤由下面 finish_turn 接上。
             _next_loop(turn)
-            if _subconscious.on() and not oplog.has_unnotified():
-                # 她这阵忙完了才轮到潜意识，不挡她的路。它占着同一个 turn，不和她抢这一段；
-                # 期间来的召唤照常登记，下面 finish_turn 看到了就接着处理。
-                turn.settling = True
-                _subconscious.settle(model, turn)
-                turn.settling = False
             if not context.finish_turn(_chat_root.AGENT_WINDOW, turn, oplog.has_unnotified):
                 return True
     finally:
@@ -768,7 +758,8 @@ def _run_agent(model: str | None, turn) -> bool:
             unconfirmed.clear()
 
     session = _run_session(model, turn, segment, [*segment["messages"], *material], first_output, stop_when,
-                           providers=[late], hints=[lambda: _unread_hint(set(newest))],
+                           providers=[late],
+                           hints=[lambda: _unread_hint(set(newest)), lambda: _subconscious.nudge(segment)],
                            known=len(segment["messages"]), each_output=seen_late)
     if getattr(session, "dismiss", None) is not None:
         # 工具里查过一次；同一次输出里排在它后面的 send、type_word 可能又改了情况，这里再查。
@@ -811,6 +802,89 @@ def request_dismiss(session, since: str = "") -> str:
         return problem
     session.dismiss = found[-1]
     return ""
+
+
+def _mark_at(marks: list[dict], at: str) -> dict | None:
+    at = " ".join(str(at or "").split())
+    found = [mark for mark in marks if at and at in (mark["at"], mark["at"][11:])]
+    return found[-1] if found else None
+
+
+def request_compress(session, from_time: str = "", to_time: str = "", summary: str = "") -> str:
+    """Called by the `compress` tool: fold and archive wakes (this call included); returns what happened.
+
+    WHY: 维护者 2026-10-25：收哪段、摘要怎么写由她定。折叠放到这批工具结果都进了 messages
+    之后（`_finish_compress`），`from_time` 到现在的那次调用和它的结果也在被收的范围里，收完
+    一起从上下文里消失；中间块（给了 to_time）收不到末尾，调用本身在同批只有它时也一起抹掉。
+    """
+    segment = getattr(session, "segment", None)
+    if getattr(session, "quiet", False) or segment is None:
+        return "只有醒着处理消息的时候能用；交接、反思和子代理里没有可收的"
+    summary = str(summary or "").strip()
+    if not summary:
+        return "先写摘要：收掉以后原文就归档了，摘要要不看原文也接得上（什么事、到哪一步、还欠着什么）"
+    if getattr(session, "pending_compress", None) is not None:
+        return "同一批工具调用里只能收一次"
+    marks = segment.get("marks") or []
+    usable = "、".join(mark["at"][11:] for mark in _subconscious._offered(segment)) or "没有"
+    mark = _mark_at(marks, from_time)
+    if mark is None:
+        return f"这一段里找不到从 {from_time} 起的唤醒；能收的是：{usable}"
+    if mark.get("index", 0) == 0:
+        return "这一段第一次唤醒连着交接留下的笔记，不能收"
+    latest = max((other["time"] for other in marks), default=None)
+    if mark["time"] == latest:
+        return f"最近一次唤醒不收：刚做完的事，下次多半还要接着做。能收的是：{usable}"
+    after = None
+    if str(to_time or "").strip():
+        after = _mark_at(marks, to_time)
+        if after is None:
+            return f"找不到到 {to_time} 为止的唤醒；能收的是：{usable}"
+        if after["time"] <= mark["time"]:
+            return "to_time 要比 from_time 晚；那个时刻的唤醒本身不收"
+    session.pending_compress = {"mark": mark, "after": after, "summary": summary}
+    removed = segment["messages"][mark["index"]:after["index"] if after is not None else None]
+    saved = _text_tokens(removed) - _text_tokens([{"role": "system", "content": summary}])
+    where = f"{mark['at'][11:]} 到 {after['at'][11:]}" if after is not None else f"{mark['at'][11:]} 到现在"
+    return f"收了 {where}，这一段少了约 {_subconscious._amount(max(0, saved))} token。"
+
+
+def _finish_compress(session, results) -> None:
+    """Fold once this batch's results are in, so the call and its result go together."""
+    pending = session.pending_compress
+    session.pending_compress = None
+    segment = session.segment
+    segment["messages"] = _body(session)
+    if pending["after"] is None:
+        _fold_since(segment, pending["mark"], pending["summary"])
+    else:
+        _fold_between(segment, pending["mark"], pending["after"], pending["summary"])
+        _drop_compress_call(segment, results)
+    session.messages[_system_count(session):] = segment["messages"]
+
+
+def _drop_compress_call(segment: dict, results) -> None:
+    """Drop this compress call and its result when the middle fold left them behind.
+
+    WHY: 同一批里还有别的工具调用时，删掉这条 assistant 会让它们的 tool 结果变成孤儿；那种情况
+    留着，协议正确优先。
+    """
+    ids = {result.tool_call_id for result in results if result.name == "compress"}
+    if not ids:
+        return
+    body = segment["messages"]
+    for index in range(len(body) - 1, -1, -1):
+        message = body[index]
+        if message.get("role") != "assistant" or not message.get("tool_calls"):
+            continue
+        if not any(call.get("id") in ids for call in message["tool_calls"]):
+            continue
+        if len(message["tool_calls"]) != 1:
+            return
+        del body[index]
+        break
+    segment["messages"] = [message for message in body
+                           if not (message.get("role") == "tool" and message.get("tool_call_id") in ids)]
 
 
 def _shown_since(segment: dict, mark: dict) -> list[str]:
@@ -948,24 +1022,15 @@ def _body(session: llm.Chat) -> list[dict]:
     return session.messages[_system_count(session):]
 
 
-def _inert(tool):
-    """The same tool schema with a call that does nothing.
+def _run_session(model: str | None, turn, segment: dict, messages: list[dict], first_output, stop_when,
+                 *, providers=(), hints=(), load: tuple[str, ...] = (), quiet: bool = False, persist: bool = True,
+                 fail_fast: bool = False, known: int = 0, each_output=None) -> llm.Chat:
+    """One model session over the segment plus this wake's material; outputs and results go to the oplog.
 
-    WHY: 分叉要把她那一整段原样再发一次，工具定义也得一字不差，否则前缀缓存不中；但那是
-    后台整理，它要是调了工具绝不能真的发消息、点手机。定义不动，只把执行换掉。
-    """
-    stub = copy.copy(tool)
-    stub.call = lambda **_arguments: "（后台整理不执行工具；决定只按文字里写的算。）"
-    return stub
-
-
-def _open_session(model: str | None, turn, segment: dict, messages: list[dict], *,
-                  quiet: bool = False, fail_fast: bool = False):
-    """Assemble one Chat exactly as she sees it: same prompt, tools, message shape.
-
-    WHY: 维护者 2026-10-25：潜意识分叉就是把同一份请求再发一次，拼装这几行必须和她平常的
-    请求共用——系统提示、工具定义、消息前缀一字不差，缓存才命中；各拼各的，迟早会悄悄分叉。
-    分叉拿到 session 后自己发一次，不走 `_run_session`：那条路会记 oplog、执行工具、存这一段。
+    With *persist*, the segment file follows the session after every round, but only
+    once she has produced output: a request that fails before that leaves the file
+    as it was, so the same material is not appended twice.  The first *known* of
+    *messages* are already in the segment, so the request log skips them.
     """
     session = llm.Chat(model=model or _chat_root.get_model(), chat_client=llm.get_client())
     session.requested_reads = turn.requested_reads
@@ -987,20 +1052,6 @@ def _open_session(model: str | None, turn, segment: dict, messages: list[dict], 
     # 并随这一段一起存下：下次唤醒看到的就是这一路下来的原样。
     session.preserve_native = True
     session.keep_reasoning = True
-    return session, binding
-
-
-def _run_session(model: str | None, turn, segment: dict, messages: list[dict], first_output, stop_when,
-                 *, providers=(), hints=(), load: tuple[str, ...] = (), quiet: bool = False, persist: bool = True,
-                 fail_fast: bool = False, known: int = 0, each_output=None) -> llm.Chat:
-    """One model session over the segment plus this wake's material; outputs and results go to the oplog.
-
-    With *persist*, the segment file follows the session after every round, but only
-    once she has produced output: a request that fails before that leaves the file
-    as it was, so the same material is not appended twice.  The first *known* of
-    *messages* are already in the segment, so the request log skips them.
-    """
-    session, binding = _open_session(model, turn, segment, messages, quiet=quiet, fail_fast=fail_fast)
     if load:
         binding.load(list(load))
     binding.sync_registry()
@@ -1064,6 +1115,8 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
                 {"position": position, "name": result.name, "arguments": result.arguments,
                  "content": result.content, "tool_call_id": result.tool_call_id}
                 for position, result in enumerate(results)], "")
+        if getattr(session, "pending_compress", None) is not None:
+            _finish_compress(session, results)
 
     def turn_done() -> bool:
         used = _context_size(reported[0], _body(session))
