@@ -10,6 +10,7 @@ import math
 import os
 import random
 import re
+import threading
 import time
 import traceback
 
@@ -256,8 +257,7 @@ def chat_print(*values, sep=" ", end="\n", file=None, flush=False):
         return
     capture = _CAPTURE.get()
     if capture is not None:
-        if values and not (len(values) == 1 and values[0] is None):
-            capture.write(sep.join(map(str, values)) + end)
+        capture.write(sep.join(map(str, values)) + end)
         return
     if not values or (len(values) == 1 and values[0] is None):
         return
@@ -278,6 +278,33 @@ def capture_print(stream):
         yield
     finally:
         _CAPTURE.reset(token)
+
+
+# WHY: Python 3.12 的新线程不继承 contextvars。用户代码在 exec_code 里起线程再 print 时，
+# 新线程看不到捕获流，会经 sendmsg 直接发进聊天；旧的进程级 `py.loc["print"]` 反而能捕获。
+# 只在当前线程确实有捕获时包一层 `self.run`，把同一个 capture 带进新线程（嵌套线程也会继续
+# 传播）；没有捕获的线程原样走，不改变普通线程的行为。退出捕获后，还在跑的线程写的是已经
+# 取走内容的 StringIO，不会漏进聊天。
+_original_thread_start = threading.Thread.start
+
+
+def _start_thread_with_capture(self):
+    capture = _CAPTURE.get()
+    if capture is not None:
+        original_run = self.run
+
+        def run():
+            token = _CAPTURE.set(capture)
+            try:
+                original_run()
+            finally:
+                _CAPTURE.reset(token)
+
+        self.run = run
+    return _original_thread_start(self)
+
+
+threading.Thread.start = _start_thread_with_capture
 
 
 def find(iterable, predicate):

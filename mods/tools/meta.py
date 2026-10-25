@@ -160,7 +160,9 @@ def _tool_window():
     session = current_binding().session
     return chat.AGENT_WINDOW if getattr(session, "reads_window_mail", False) and context.agent_mode() else history.window(context.current() or {})
 # WHY: `back` 显式写进签名，不用函数属性 `.back`：同步模式要在启动前拒绝 timeout=0，
-# 这个判断需要拿到调用方传的 back；属性版只把它交给绑定层，函数自己看不到。
+# 这个判断需要拿到调用方传的 back；属性版只把它交给绑定层，函数自己看不到。后台
+# exec_code 也不走 `_tasks` 的那条单队列：timeout=0 可能真的无限等，排进去会把后面的
+# 后台工具永远堵住，所以用独立线程。
 def exec_code(expr: str, code: str, timeout: float = 15, back: str = "wait") -> str:
     """在 Bot 进程的共享 Python 环境中先执行 code、再求值 expr，返回 repr 结果和被捕获的 print 输出；需要管理员权限。
 
@@ -188,11 +190,13 @@ def exec_code(expr: str, code: str, timeout: float = 15, back: str = "wait") -> 
     # 出去无条件还原：工具可以读路由，但不该在自己脚下把它换掉——2026-09-17 就因此把私聊的
     # 回复发进了群。
     original_event = context.current()
+    original_agent_mode = context.agent_mode()
     buffer = io.StringIO()
 
     # WHY: print 的捕获必须跟着被执行的那段上下文走。watchdog.run 起的是新线程，
     # `py.loc["print"]` 这种进程级改写会把并发调用的输出混在一起，所以改成 py.py 里的
-    # ContextVar，由这里在局部上下文中进入捕获。
+    # ContextVar，由这里在局部上下文中进入捕获；用户代码自己再起线程时，py.py 会把
+    # 捕获流随线程创建带过去。
     def run():
         with py.capture_print(buffer):
             exec(code, py.loc)
@@ -207,6 +211,14 @@ def exec_code(expr: str, code: str, timeout: float = 15, back: str = "wait") -> 
         return scope.run(run)
 
     def task() -> str:
+        # WHY: wake/quiet 会把这个 task 交给后台线程。后台线程可能被复用，路由器又是
+        # thread-local 的；进来先装回调用方的事件和 agent_mode，结束后还原后台线程原来
+        # 的状态。只还原成 original_event 会把调用方窗口永久写进常驻 worker，下一个后台
+        # 任务（以及 ^C 的 owner_key）就认错窗口。
+        previous_event = context.current()
+        previous_agent_mode = context.agent_mode()
+        context.set_current(original_event)
+        context.set_agent_mode(original_agent_mode)
         try:
             try:
                 result = repr(watchdog.run(perform, timeout))
@@ -215,14 +227,15 @@ def exec_code(expr: str, code: str, timeout: float = 15, back: str = "wait") -> 
             except watchdog.Interrupted:
                 result = "已被 ^C 中断"
         finally:
-            context.set_current(original_event)
+            context.set_current(previous_event)
+            context.set_agent_mode(previous_agent_mode)
         printed = buffer.getvalue().rstrip()
         return f"[print输出]\n{printed}\n[结果] {result}" if printed else result
 
     if back != "wait":
         from mods.tools import _tasks
 
-        return _tasks.submit("exec_code", contextvars.copy_context(), task, back)
+        return _tasks.submit("exec_code", contextvars.copy_context(), task, back, detached=True)
     return task()
 
 

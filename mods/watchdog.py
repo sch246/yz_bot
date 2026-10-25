@@ -52,6 +52,10 @@ LOAD_AFTER = ("context", "history")
 
 _log = logging.getLogger(__name__)
 
+# 和 mods/shell.py 的 GRACE_SECONDS 对齐：组里的进程收到 SIGTERM 后有 3 秒自己收尾，
+# 之后才补 SIGKILL。这里只在后台等，不阻塞调用方。
+_KILL_GRACE = 3.0
+
 
 class Interrupted(Exception):
     """注入到被强制终止的执行线程里的异常。
@@ -266,30 +270,77 @@ def _async_raise(ident: int, error: type[BaseException]) -> bool:
     return affected == 1
 
 
+def _group_alive(pgid: int) -> bool:
+    """进程组里还有没有非僵尸成员；/proc 读不到时退回 killpg(pgid, 0)。"""
+    if pgid <= 1:
+        return False
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        try:
+            os.killpg(pgid, 0)
+        except OSError:
+            return False
+        return True
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat", encoding="utf-8", errors="replace") as handle:
+                stat = handle.read()
+        except OSError:
+            continue
+        try:
+            end = stat.rindex(")")
+            fields = stat[end + 2 :].split()
+            # state 之后是 ppid、pgrp；僵尸不算还活着。
+            if fields[0] == "Z":
+                continue
+            if int(fields[2]) == pgid:
+                return True
+        except (ValueError, IndexError):
+            continue
+    return False
+
+
+def _escalate(pgid: int) -> None:
+    """SIGTERM 宽限期过后补 SIGKILL；在后台线程里等，不挡 Job.stop 的调用方。"""
+    threading.Event().wait(_KILL_GRACE)
+    if not _group_alive(pgid):
+        return
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        _log.debug("watchdog 补 SIGKILL 失败", exc_info=True)
+
+
 def _kill(process: Any) -> None:
     try:
-        if process.poll() is not None:
-            return
         pid = process.pid
-        try:
-            pgid = os.getpgid(pid)
-        except ProcessLookupError:
-            return
+        # Popen 包装时记下的 pgid；组长已经被回收时 os.getpgid(pid) 会失败，
+        # 但组里的子进程可能还活着，仍需按记下的 pgid 收尾。
+        pgid = getattr(process, "_yuzu_pgid", 0)
+        if not pgid:
+            try:
+                pgid = os.getpgid(pid)
+            except ProcessLookupError:
+                pgid = 0
         # WHY: 命令若用 start_new_session 自成一个进程组，只杀父进程会把 shell 的子进程
         # 留成孤儿（`sh -c 'sleep 20 & wait'` 就是这种形状）。只有它确实是组长时才 killpg，
         # 否则可能打到 Bot 自己的进程组。
-        if pgid != pid:
-            process.kill()
+        if pgid == pid and _group_alive(pgid):
+            os.killpg(pgid, signal.SIGTERM)
+            # WHY: 不能在这里 wait(2)：Job.stop 会逐个杀，^C 和超时路径只想尽快拿回控制权；
+            # 宽限和补刀交给后台线程。调用方拿到的是“已发信号”，不是“进程已消失”。
+            threading.Thread(
+                target=_escalate,
+                args=(pgid,),
+                name=f"watchdog-kill-{pgid}",
+                daemon=True,
+            ).start()
             return
-        os.killpg(pgid, signal.SIGTERM)
-        try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            pass
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        if process.poll() is None:
+            process.kill()
     except Exception:
         _log.debug("watchdog 杀进程失败", exc_info=True)
 
@@ -302,6 +353,12 @@ def _watch_processes() -> None:
 
     def __init__(self, *args, **kwargs):
         original(self, *args, **kwargs)
+        # 记住 spawn 时的进程组。组长先退出时 pid 可能已被回收，但组里的子进程还挂着；
+        # 只靠 os.getpgid(pid) 到那时候就找不到组了。
+        try:
+            self._yuzu_pgid = os.getpgid(self.pid)
+        except OSError:
+            self._yuzu_pgid = 0
         job = current_job()
         if job is not None:
             job.add_process(self)

@@ -140,7 +140,7 @@
 
 | 工具 | 当前效果与边界 |
 |---|---|
-| `exec_code` | 在 `.py` 的共享 `loc` 中先 `exec(code)`、再 `eval(expr)`；`timeout` 默认 15 秒（`0` 表示不限，但只在后台模式允许），代码跑在一个可终止的子线程里，到点终止它启动的子进程并中断该线程；`back="wake"`/`"quiet"` 立刻回执，跑完把结果推进 `me` 窗口。`print` 的捕获跟着这次执行的上下文走，不改写共享 `loc`。调用时仍检查 op，拥有与 `.py` 接近的进程和宿主机能力。 |
+| `exec_code` | 在 `.py` 的共享 `loc` 中先 `exec(code)`、再 `eval(expr)`；`timeout` 默认 15 秒（`0` 表示不限，但只在后台模式允许），代码跑在一个可终止的子线程里，到点终止它启动的子进程并中断该线程；`back="wake"`/`"quiet"` 立刻回执，跑完把结果推进 `me` 窗口，后台跑在独立线程、不占 `_tasks` 的单队列（`timeout=0` 可能无限等）。`print` 的捕获用 ContextVar 跟着这次执行走，用户代码自己起的线程也会带上同一捕获流；不改写共享 `loc`。调用时仍检查 op，拥有与 `.py` 接近的进程和宿主机能力。 |
 | `list_tools` | 列出 last-good 模块、当前会话激活状态、空闲回收规则、最近加载失败及磁盘差异。 |
 | `reload_tools` | 按模块名从磁盘显式应用、更新或删除模块；逐项返回成功和带完整 traceback 的失败结果，失败保留旧 last-good。 |
 | `load_tools` | 将 last-good 模块激活到当前 Chat；中心名单存全局 `agent`，不读取磁盘。 |
@@ -165,7 +165,7 @@
 
 `host` 是 `exec_code` 之外的常用出口：文件读写和 shell 都不必再绕一次任意代码执行。读取按本次实际截取的窗口计字节，超过 `max_bytes` 时只回大小和后续建议（缩小区间、先 `grep -n` 定位、或用 `assign_tasks` 开子会话通读后带回摘要），不做分页会话。改写靠 `read_file` 首行 header 里的 `line`/`size`/`v` 定位与对账：位置与新内容的写法无关，`v` 只在该区间自读取后被改动过时失配，失配的返回自带现状和新 header。渲染格式与 `.edit` 同源，所以手动编辑和模型改写看到的是同一种东西；它没有目录白名单，`data/`、`config.json`、`.env` 和聊天记录都在可及范围内。
 
-`run_command` 默认等 15 秒：跑完直接返回退出码和输出；没跑完不杀，转后台并回任务号、`data/commands/<任务号>.log` 和已有的输出。`back="wake"`/`"quiet"` 可以一开始就转后台，跑完把退出码和最后几十行推进 `me` 窗口（quiet 不叫醒）；`stop_command` 按任务号停掉它，连同子进程。后台命令各自一个进程，不排 `tools._tasks` 的队列；还在跑的命令会出现在每轮请求末尾的提示里，每次重新算、不存。
+`run_command` 默认等 15 秒：跑完直接返回退出码和输出；没跑完不杀，转后台并回任务号、`data/commands/<任务号>.log` 的绝对路径和已有的输出。后台进程的 stdin 是 `/dev/null`，stdout 和 stderr 合流进同一个文件；默认 wait 等到 15 秒转后台时会叫醒她（等同 wake），`timeout=0` 表示立刻转后台，不是无限等。`back="wake"`/`"quiet"` 可以一开始就转后台，跑完把退出码和最后几十行推进 `me` 窗口（quiet 不叫醒）；`stop_command` 按任务号停掉整个进程组，连同子进程。后台命令各自一个进程，不排 `tools._tasks` 的队列；还在跑的命令会出现在每轮请求末尾的提示里，每次重新算、不存。`data/commands/` 下每个任务还有一份 `<任务号>.json` 记录进程组，正常退出时收掉，崩溃重启后按它接管还活着的组。
 
 除 `weather` 继续投影可用的 `mods.weather` 函数（其 schema 描述来自 `mods.weather` 函数自身的 docstring，与命令的 `-h` 帮助同源）外，这些文件持有各自工具的真实实现，不再从 `mods.chat` re-export。图片和子任务模块只惰性复用 `mods.chat` 的 usage/cost 入口，计费状态仍只有一份。
 
@@ -333,7 +333,7 @@ Chat.chat
 这使以下能力处于同一条提示注入路径上：
 
 - `exec_code` 可访问 `.py loc`，本质上接近任意代码执行；
-- `host` 的三个函数可以读、改、删宿主机任意路径的文件并执行任意 shell 命令，与 `exec_code` 同级；读取会把文件内容发送给模型供应商，写入和命令都不可撤销；
+- `host` 的四个函数可以读、改、删宿主机任意路径的文件并执行任意 shell 命令，与 `exec_code` 同级；读取会把文件内容发送给模型供应商，写入和命令都不可撤销；
 - `reload_tools` 可以在进程内执行并应用 `mods/tools` 中的受信任 Python；候选顶层代码在校验期间就会执行；`load_tools` 可以把任意 last-good 模块交给当前模型；
 - `set_user_data` 可读取模型生成的 Python 字面量并修改任意用户 storage；
 - `get_user_data` 可把任意用户数据发送给模型供应商；

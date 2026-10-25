@@ -116,7 +116,7 @@ HTTP 200 只表示事件已被本地监听器接收，不表示命令或回复�
 
 ### 命令超时转后台
 
-模型工具的 shell 命令不再在超时时被杀。`host__run_command` 默认等 15 秒；到点没跑完就交给 `mods/shell.py` 的后台登记，输出留在 `data/commands/<任务号>.log`，返回任务号、文件路径和已有输出。后台线程等它退出，把退出码和最后几十行推进她的 `me` 窗口；`host__stop_command` 按任务号对进程组发 SIGTERM，宽限 3 秒再 SIGKILL。`watchdog` 的 `^C` 终止也先看它是不是自己的进程组组长：组长就整组收，普通子进程只杀它本身，避免打到 Bot 的进程组。还在跑的命令列在每轮请求末尾的提示里，每次重新算、不存。`exec_code` 的 `timeout` 同样默认 15 秒，`0` 只允许后台模式；它的 `print` 捕获改成了 `ContextVar`，不再写共享的 `py.loc`。
+模型工具的 shell 命令不再在超时时被杀。`host__run_command` 默认等 15 秒；到点没跑完就交给 `mods/shell.py` 的后台登记，输出留在 `data/commands/<任务号>.log`（回执给绝对路径），返回任务号、文件路径和已有输出。后台进程的 stdin 是 `/dev/null`，stdout 和 stderr 合流进同一个文件。后台线程等它退出，把退出码和最后几十行推进她的 `me` 窗口；默认 wait 转后台时也会叫醒（等同 wake），`timeout=0` 只是立刻转后台，不是无限等。`host__stop_command` 按任务号对进程组发 SIGTERM，宽限 3 秒再 SIGKILL；组长先退出时仍按登记里的 pgid 收剩下的子进程。每个后台任务在 `data/commands/` 下还有一份 `<任务号>.json`；正常退出时 `shell` 在 atexit 里收掉所有组，崩溃重启后按这份记录接管还活着的组，`stop_command` 仍能停，不会把“日志存在”误判成“早就结束了”。`watchdog` 的 `^C` 终止也先看它是不是自己的进程组组长：组长就整组收，普通子进程只杀它本身，避免打到 Bot 的进程组；它现在记录 spawn 时的 pgid，SIGTERM 后把 3 秒宽限和 SIGKILL 交给后台线程，不再让 `Job.stop` 逐个等，^C 和超时路径能尽快拿回控制权。还在跑的命令列在每轮请求末尾的提示里，每次重新算、不存。`exec_code` 的 `timeout` 同样默认 15 秒，`0` 只允许后台模式；后台跑在独立线程、不排 `_tasks` 的单队列（0 可能无限等），`print` 捕获改成 `ContextVar`，用户代码自己起的线程也会继承同一捕获流，不再写共享的 `py.loc`。
 
 `data/commands/` 是运行数据，不会被自动清理；每天整理时按需归档或删除。`mods/shell.py` 是普通核心模块（默认 FEATURE 阶段），改它要重启，不能靠 `reload_tools`。
 
