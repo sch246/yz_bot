@@ -885,7 +885,7 @@ def _fold_since(segment: dict, mark: dict, label: str) -> str:
                              "messages": segment["messages"][mark["index"]:]}, "folded")
     where = f"{'、'.join(shown)} 的画面和" if shown else ""
     segment["messages"] = [*segment["messages"][:mark["index"]], {"role": "system", "content": (
-        f"【收起】{label}\n（{mark['at'][5:]} 至 {_screen.clock()[5:]}，{where}你那时的想法、调用，后台整理时收成了上面这一句；"
+        f"【收起】{label}\n（{mark['at'][5:]} 至 {_screen.clock()[5:]}，{where}你那时的想法、调用，后台整理时收成了上面这段；"
         f"原样存在归档段 {name}，加载 memory_system 用 read_context(\"{name}\") 读，search 也搜得到）")}]
     # 画面位置不退。第一次给的笔记、中途的工具状态跟着收走了，这几项退回去，下次照样给。
     _restore(segment, mark, ("scopes", "told", "tokens", "notice"))
@@ -911,7 +911,7 @@ def _fold_between(segment: dict, mark: dict, after: dict, label: str) -> str:
     where = f"{'、'.join(shown)} 的画面和" if shown else ""
     line = {"role": "system", "content": (
         f"【收起】{label}\n（{mark['at'][5:]} 起到 {after['at'][5:]} 之前，{where}你那时的想法、调用，后台整理时收成了"
-        f"上面这一句；原样存在归档段 {name}，加载 memory_system 用 read_context(\"{name}\") 读，search 也搜得到）")}
+        f"上面这段；原样存在归档段 {name}，加载 memory_system 用 read_context(\"{name}\") 读，search 也搜得到）")}
     segment["messages"] = [*segment["messages"][:start], line, *segment["messages"][end:]]
     shift = 1 - len(removed)
     saved = _text_tokens(removed) - _text_tokens([line])
@@ -959,22 +959,13 @@ def _inert(tool):
     return stub
 
 
-def _run_session(model: str | None, turn, segment: dict, messages: list[dict], first_output, stop_when,
-                 *, providers=(), hints=(), load: tuple[str, ...] = (), quiet: bool = False, persist: bool = True,
-                 fail_fast: bool = False, known: int = 0, each_output=None, record: bool = True,
-                 execute_tools: bool = True, echo: bool = True) -> llm.Chat:
-    """One model session over the segment plus this wake's material; outputs and results go to the oplog.
+def _open_session(model: str | None, turn, segment: dict, messages: list[dict], *,
+                  quiet: bool = False, fail_fast: bool = False):
+    """Assemble one Chat exactly as she sees it: same prompt, tools, message shape.
 
-    With *persist*, the segment file follows the session after every round, but only
-    once she has produced output: a request that fails before that leaves the file
-    as it was, so the same material is not appended twice.  The first *known* of
-    *messages* are already in the segment, so the request log skips them.
-
-    *record=False* and *execute_tools=False* are for the subconscious: it re-sends her
-    whole context as a fork, and neither its output nor the tools it may call may have
-    effects.  *echo=False* keeps that reply out of the self-talk stream too: it is not
-    her voice.  The request itself is the same because the prompt, the tool schemas and
-    the messages are built by this same path.
+    WHY: 维护者 2026-10-25：潜意识分叉就是把同一份请求再发一次，拼装这几行必须和她平常的
+    请求共用——系统提示、工具定义、消息前缀一字不差，缓存才命中；各拼各的，迟早会悄悄分叉。
+    分叉拿到 session 后自己发一次，不走 `_run_session`：那条路会记 oplog、执行工具、存这一段。
     """
     session = llm.Chat(model=model or _chat_root.get_model(), chat_client=llm.get_client())
     session.requested_reads = turn.requested_reads
@@ -992,13 +983,27 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
     # （仓库外的脚本）对话中间的 system 在思考模式、带工具、前面的思考被删掉时都被接受，四个
     # 行为任务上不比合成框差。
     session.hint_role = "system"
+    # WHY: 原生 assistant/tool 配对原样留在 messages（含思考，DeepSeek 带工具时要求回传），
+    # 并随这一段一起存下：下次唤醒看到的就是这一路下来的原样。
+    session.preserve_native = True
+    session.keep_reasoning = True
+    return session, binding
+
+
+def _run_session(model: str | None, turn, segment: dict, messages: list[dict], first_output, stop_when,
+                 *, providers=(), hints=(), load: tuple[str, ...] = (), quiet: bool = False, persist: bool = True,
+                 fail_fast: bool = False, known: int = 0, each_output=None) -> llm.Chat:
+    """One model session over the segment plus this wake's material; outputs and results go to the oplog.
+
+    With *persist*, the segment file follows the session after every round, but only
+    once she has produced output: a request that fails before that leaves the file
+    as it was, so the same material is not appended twice.  The first *known* of
+    *messages* are already in the segment, so the request log skips them.
+    """
+    session, binding = _open_session(model, turn, segment, messages, quiet=quiet, fail_fast=fail_fast)
     if load:
         binding.load(list(load))
     binding.sync_registry()
-    if not execute_tools:
-        # 每轮重新取一次快照：binding 可能在两轮之间换了工具，定义要跟她那条一样新。
-        make_tools = session.get_tools
-        session.get_tools = lambda: [_inert(tool) for tool in make_tools()]
     told = [segment.get("told")]
     if told[0] is None:
         # 新的一段：完整工具状态放在系统提示之后，这一段里不再变。
@@ -1019,10 +1024,6 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
         text = binding.state_text(told[0])
         told[0] = current
         return [{"role": "system", "content": text}] if text else []
-    # WHY: 原生 assistant/tool 配对原样留在 messages（含思考，DeepSeek 带工具时要求回传），
-    # 并随这一段一起存下：下次唤醒看到的就是这一路下来的原样。
-    session.preserve_native = True
-    session.keep_reasoning = True
     session.output_recorded = False
     session.last_usage = None
     reported = [segment.get("tokens")]
@@ -1071,9 +1072,8 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
         save()
         return stop_when(used, initial)
 
-    if record:
-        session.on_output = record_output
-        session.on_results = record_results
+    session.on_output = record_output
+    session.on_results = record_results
     session.turn_done = turn_done
     session.add_context_provider(tool_changes)
     for provider in providers:
@@ -1082,9 +1082,7 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
         session.add_hint(hint)
     session.add_hint(lambda: f"现在是 {_screen.clock()}。")
     session.should_stop = lambda: turn.cancelled
-    # echo=False（潜意识分叉）：回复不是她说的，别在终端和 yz.msg 里挂成她的自言自语；只记费用。
-    session.chat(recall_func=_chat_root.get_handler(session) if echo else _roles._charge(session),
-                 description_cache=_chat_root.description_cache)
+    session.chat(recall_func=_chat_root.get_handler(session), description_cache=_chat_root.description_cache)
     save()
     return session
 

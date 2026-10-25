@@ -1,42 +1,45 @@
-"""Her subconscious: a stateless fork of her own context that folds wakes into one line.
+"""Her subconscious: one more request over her own context that folds wakes into a summary.
 
-WHY: 维护者 2026-10-25（billion-context 式）：不再另起一条会话、把经过转写过去——那要截断
-（整段 3 万字、工具结果 1000 字），前缀和她那条对不上，它还得自己记着读到哪、上次的决定做没
-做成，满 10 万写下地图换新的一条。现在整理时把她那一整段上下文原样再发一次请求
-（`agent._run_session`，persist=False，系统提示、工具定义、消息都和她那条一样），只在末尾补
-一条整理指令；请求和回复都不存。它要是调工具，不执行，只认文字里的决定。
+WHY: 维护者 2026-10-25：潜意识改成分叉（同一份请求末尾加指令，看完就散）；放下交还给 dismiss；
+门槛 5 万。看到的是原样，少一套状态，整段走缓存——另起一条会话要把经过转写过去：截断、丢思考，
+前缀和她那条对不上，还得记着读到哪、上次的决定做没做成，自己那条满了再写地图换新的。
 
-WHY: 按增长叫，不是每次唤醒都叫：这一段比上次整理时又长 `_GROWTH_TOKENS` 才叫一次。基线记在
-这一段自己身上（键 `subconscious`），换段自然从头算；她自己 dismiss 清短了也把基线放下。
+WHY: 收起的位置以后全要按原价重读（缓存只认前面一样的部分），所以尽量收到靠后，只留最近一次
+唤醒不动；收中间一小块、后面剩一大截，下一次请求就按原价读那一大截。
 
-WHY: 只收不放。放下是退回没读，那是她自己 `dismiss` 的事；分叉只管把看过的唤醒收成一句。
-怎么判断写在 data/notes/policy/subconscious.md（她也能改），拼进指令；文件不存在时用
-DEFAULT_GUIDANCE。代码只管门槛、格式和机制：这一段第一次唤醒连着开头的笔记不收起。
+WHY: 怎么判断写在 data/notes/policy/subconscious.md（她也能改），盖掉 DEFAULT_GUIDANCE；代码只管
+门槛、格式和机制：这一段第一次唤醒（连着交接留下的笔记）不收起，最近一次唤醒不列出来。
 """
 
 from __future__ import annotations
 
 import re
-import time
 
 from mods import storage
 
 import mods.chat as _chat_root
-from . import notes as _notes, roles as _roles, screen as _screen, segment as _segment
+from . import notes as _notes, roles as _roles, segment as _segment
 
-# 这一段比上次整理时又长这么多 token 才整理一次（维护者 2026-10-25：几万 token，别每次唤醒都叫）。
-_GROWTH_TOKENS = 30_000
+# 这一段比上次整理时又长这么多 token 才整理一次（维护者 2026-10-25：门槛 5 万）。
+_GROWTH_TOKENS = 50_000
+# 分叉请求的工具选择：先试 none（不调工具）。要是第一次分叉的缓存命中因此掉了，改回 "auto"；
+# 那种回复里的工具调用也不执行，当作留着。
+_TOOL_CHOICE = "none"
 
-DEFAULT_GUIDANCE = """你是她的潜意识：同一个脑子的另一条思路。上面这一段就是她眼前的上下文，原样发给你，不是新消息。你不说话、不行动，也不回答里面任何一个人；只整理她的注意力，她看不到你，只看到你收起来的那一句。
+DEFAULT_GUIDANCE = """现在先停一下，整理你眼前这一段上下文。这次不对外说话、不调用工具，写完决定就结束；这一下你之后不会记得，只会看到收起后的摘要。
 
-被叫醒、看一眼、没她的事，这样的痕迹叠多了，她会照着这一路往下演，越来越累；该记着的被收掉，她又会接不上话。你的事是让她眼前只留值得留的。
+收的是已经了结、不必每个字都在眼前的唤醒。收起以后原文进归档，眼前只剩摘要，所以摘要要写到不看原文也接得上：
+- 什么事、和谁、到哪一步、结果怎样；
+- 要引别人的原话就带 mid，没有 mid 就写"大意"；
+- 答应了谁、还没做的，单独一行"还欠着：……"；
+- 当时的心情有就留一句；
+- 查过、试过的只留结论，比如"查了 X，是 Y"；走过的弯路只留一句教训；
+- 看了一眼、没你的事的画面，一句"看了几眼某某群，没我的事"就够。
+写的是过去，不是现在要做的事。
 
-- 看过、想过，但不必每个字都在眼前的，就收起。摘要写清楚是什么事、到哪一步、她还要不要管，让她看这一句就够用。
-- 只是一次次被叫醒、看一眼又没她的事的零碎唤醒（她自己忘了 dismiss），就合起来收成一句「看了几眼群，没我的事」。
-- 几轮都是同一件事，等它告一段落再一起收；最近几次唤醒、她正在做的那件事留着别动。
-- 她说过的话、答应过什么、在等谁的回复，工具报了错或者结果和预期不符，有人点了她的名：这些留着，她得记得。
-- 收中间那几段以后，她那条从那里往后下一次要按原价重读（前缀缓存只认前面一样的部分），所以攒够了、值得时再收。
-- 拿不准就留着。"""
+还在进行中的不收：在等谁回话、刚有人点你的名、工具报错还没弄清。
+从上次收起的地方接着往后收，收到能收的最后一次；别只收中间一小块，收的位置后面剩得越多，你下一次请求越贵。
+没什么可收就写"留着"。"""
 
 # 列表里那个"（之后约 N token）"它可能照抄过来，先摘掉再解析。
 _AMOUNT = re.compile(r"[（(]\s*之后约[^）)]*[）)]")
@@ -50,11 +53,12 @@ def on() -> bool:
 
 
 def settle(model: str | None, turn) -> None:
-    """Resend her segment and fold what the fork decides; never raises."""
+    """One fork over her context; never raises. A failure is a warning, never a retry."""
     try:
         _settle(model, turn)
-    except Exception:
-        _roles._stream.exception("潜意识出错，这次没整理")
+    except Exception as error:
+        _roles._stream.warning(f"潜意识出错，这次没整理：{type(error).__name__}: {error}")
+        _reset()
 
 
 def _settle(model: str | None, turn) -> None:
@@ -62,74 +66,115 @@ def _settle(model: str | None, turn) -> None:
     if not her["messages"]:
         # 交接后、新的一段存下之前读到的是空段：等她那条有东西再看。
         return
-    if not any(mark.get("index", 0) > 0 for mark in her.get("marks") or []):
-        # 只有这一段第一次唤醒：连着开头的笔记，没有能收的。
+    size = _size(her)
+    settled = her.get("settled")
+    if not isinstance(settled, int) or size < settled:
+        # 这一段第一次见到（或者她自己 dismiss 清短了）：记下现在的大小，这次不跑。
+        _remember(her)
         return
-    size = _chat_root._agent._text_tokens(her["messages"])
-    tidied = her.get("subconscious")
-    last = tidied.get("tokens") if isinstance(tidied, dict) else None
-    if not isinstance(last, int) or size < last:
-        # 第一次见到这一段，或者她自己 dismiss 清短了：记下现在的长度，等它再长。
-        _remember(her, size)
+    if size - settled < _GROWTH_TOKENS or turn.cancelled:
         return
-    if size - last < _GROWTH_TOKENS or turn.cancelled:
+    if not _offered(her):
+        # 只有第一次唤醒和最近一次：没有能收的。
         return
-    reply = _fork(model, turn, her)
-    if reply is None:
+    reply, hit = _fork(model, turn, her)
+    if turn.cancelled:
+        _roles._stream.warning("潜意识被打断，这次没整理")
+        _remember(her)
         return
-    applied = _apply(her, _decisions(reply))
-    _remember(her, _chat_root._agent._text_tokens(her["messages"]))
+    applied = _apply(her, _decisions(reply or ""))
+    after = _size(her)
+    _remember(her)
     if applied:
-        _roles._stream.info(f"潜意识收起了 {applied} 段")
+        _roles._stream.info(f"潜意识收起 {applied} 段，约少了 {_amount(size - after)} token"
+                            + (f"（分叉命中缓存 {_amount(hit)}）" if hit else ""))
+    else:
+        _roles._stream.info(f"潜意识留着（这一段约 {_amount(after)} token）"
+                            + (f"，分叉命中缓存 {_amount(hit)}" if hit else ""))
 
 
-def _remember(her: dict, tokens: int) -> None:
-    her["subconscious"] = {"tokens": tokens, "time": time.time()}
+def _size(her: dict) -> int:
+    """How long her segment is, the same measure the handoff threshold uses."""
+    return _chat_root._agent._context_size(her.get("tokens"), her["messages"])
+
+
+def _remember(her: dict) -> None:
+    her["settled"] = _size(her)
     _segment.save(her)
 
 
-def _fork(model: str | None, turn, her: dict) -> str | None:
-    """Her whole context plus one instruction at the end; nothing is stored or executed."""
+def _reset() -> None:
+    """After a failure: move the baseline up so the next wake does not re-send the whole segment."""
+    try:
+        her = _segment.load()
+        if her["messages"]:
+            _remember(her)
+    except Exception:
+        _roles._stream.exception("潜意识没能重设门槛基准")
+
+
+def _offered(her: dict) -> list[dict]:
+    """The wakes it may start a fold at: not the first (it carries the handoff notes), not the latest."""
+    marks = [mark for mark in her.get("marks") or [] if mark.get("index", 0) > 0]
+    return marks[:-1]
+
+
+def _fork(model: str | None, turn, her: dict) -> tuple[str | None, int]:
+    """Her whole context plus one instruction at the end; one request, nothing executed or stored."""
     messages = [*her["messages"], {"role": "system", "content": _instruction(her)}]
     agent = _chat_root._agent
-    session = agent._run_session(model, turn, her, messages, lambda: None,
-                                 lambda used, initial: False,
-                                 quiet=True, persist=False, fail_fast=True,
-                                 known=len(her["messages"]), record=False, execute_tools=False, echo=False)
-    if turn.cancelled:
-        return None
+    session, binding = agent._open_session(model, turn, her, messages, quiet=True, fail_fast=True)
+    binding.sync_registry()
+    if her.get("told") is None:
+        # 新的一段：完整工具状态放在系统提示之后，和她平常的请求一样。
+        state = binding.state_text(None)
+        if state:
+            session.messages.insert(session.prompt_count, {"role": "system", "content": state})
+    make_tools = session.get_tools
+    session.get_tools = lambda: [agent._inert(tool) for tool in make_tools()]
+    # 请求日志只记这次追加的指令和回复：前面那一段上一次已经记过。
+    session.logged = session.prompt_count + len(her["messages"])
+    session.should_stop = lambda: turn.cancelled
+    # 万一供应商还是回了工具调用：工具不执行（_inert），这一批过后直接收工，不再发第二次请求。
+    session.turn_done = lambda: True
+    hit: list[int] = []
+    charge = _roles._charge(session)
+
+    def handle(chunk):
+        if chunk.cached_tokens:
+            hit.append(chunk.cached_tokens)
+        charge(chunk)
+
+    session.chat(recall_func=handle, tool_choice=_TOOL_CHOICE,
+                 description_cache=_chat_root.description_cache)
     replies = session.messages[agent._system_count(session) + len(messages):]
+    if any(message.get("tool_calls") for message in replies):
+        return None, max(hit, default=0)
     text = "\n".join(str(message.get("content") or "") for message in replies
                      if message.get("role") == "assistant").strip()
-    return text or None
+    return (text or None), max(hit, default=0)
 
 
 def _instruction(her: dict) -> str:
-    size = _chat_root._agent._text_tokens
+    counts = _chat_root._agent._text_tokens
     offered = "\n".join(
-        f"{mark['at'][11:]}（之后约 {_amount(size(her['messages'][mark['index']:]))} token）"
-        for mark in her.get("marks") or [] if mark.get("index", 0) > 0) or "（没有）"
+        f"{mark['at'][11:]}（之后约 {_amount(counts(her['messages'][mark['index']:]))} token）"
+        for mark in _offered(her)) or "（没有）"
     guidance = _notes.read_policy("subconscious").strip() or DEFAULT_GUIDANCE
-    return f"""这次只是整理：不要回答上面任何人，也不要调用工具（调了也不会执行）。
+    return f"""{guidance}
 
-{guidance}
-
-## 能下手的唤醒
-这一段第一次唤醒连着开头交接留下的说明，不能收；其它都可以，时刻只写时分秒。括号里是收起这一块以后，她那条从那里往后要按原价重读多少 token。
+## 能收的唤醒
+只能从下面这些时刻起收；最近一次唤醒和这一段第一次唤醒都不在里面，写了也不生效。括号里是收起以后，你那条从那里往后要按原价重读多少 token。
 {offered}
 
-## 怎么写
-一次可以收好几段。一段一行决定，摘要写在它下面（可以写几行）：
-收起 07:12:03~07:40:25
-<摘要>
-收起 08:02:10~08:30:00
-<摘要>
-收到最后就只写开始时刻：收起 07:12:03
-「~」后面那次唤醒不收，从它开始原样留着。
-
-摘要照聊天记录那样写：谁说了什么，带上那条消息的 mid（记录行里「|」后面那串消息号），没有 mid 的写大意；做了什么、结果如何；到哪一步；最后单独一行「还欠着」，写还在等谁、答应过什么，没有就写「还欠着：没有」。
-
-只有收起，没有放下——想退回没读是她自己 dismiss 的事。没什么可收、拿不准，就写一行：留着"""
+## 决定格式
+一段一行，摘要写在它下面（可以几行），一次可以写好几段：
+收起 10:02:11~10:40:05
+……这一段的摘要，几行……
+收起 11:05:00~11:52:30
+……
+「~」后面那次唤醒不收，从它开始原样留着；收到最后就只写开始时刻：收起 10:02:11
+"""
 
 
 def _amount(tokens: int) -> str:
@@ -137,7 +182,7 @@ def _amount(tokens: int) -> str:
 
 
 def _decisions(reply: str) -> list[dict]:
-    """The decisions in *reply*: one ``{"at", "until", "label"}`` per ``收起`` block, in written order."""
+    """The fold decisions in *reply*, one per ``收起`` block; anything else (留着/放下) means none."""
     found: list[dict] = []
     current: dict | None = None
     for raw in reply.splitlines():
@@ -155,7 +200,7 @@ def _decisions(reply: str) -> list[dict]:
                        "lines": [head.group(3).strip()] if head.group(3).strip() else []}
             found.append(current)
         elif line.startswith(("留着", "放下")):
-            current = None
+            current = None       # 放下不归它管；留着就是没有决定。
         elif current is not None:
             current["lines"].append(raw.strip())
     return [{"at": item["at"], "until": item["until"], "label": "\n".join(item["lines"]).strip()}
@@ -167,30 +212,36 @@ def _find(marks: list[dict], at: str) -> dict | None:
     return found[-1] if found else None
 
 
+def _overlaps(resolved: list[tuple[dict, dict | None, str]]) -> bool:
+    ordered = sorted(resolved, key=lambda item: item[0]["time"])
+    return any(after is None or after["time"] > next_mark["time"]
+               for (_mark, after, _label), (next_mark, _next, _next_label) in zip(ordered, ordered[1:]))
+
+
 def _apply(her: dict, decisions: list[dict]) -> int:
-    """Carry out the foldable decisions; returns how many took effect."""
+    """Fold the decided ranges, back to front; overlapping ranges mean nothing is done at all."""
+    marks = her.get("marks") or []
+    latest = max((mark["time"] for mark in marks), default=None)
     resolved = []
     for item in decisions:
-        mark = _find(her.get("marks") or [], item["at"])
-        if mark is None:
+        mark = _find(marks, item["at"])
+        if mark is None or mark.get("index", 0) == 0 or mark["time"] == latest:
             continue
-        after = _find(her.get("marks") or [], item["until"]) if item["until"] else None
+        after = _find(marks, item["until"]) if item["until"] else None
         if item["until"] and (after is None or after["time"] <= mark["time"]):
             continue
-        resolved.append((mark["time"], after["time"] if after is not None else None, item["label"]))
+        resolved.append((mark, after, item["label"]))
+    if _overlaps(resolved):
+        _roles._stream.warning("潜意识这次的收起区间有重叠，整次没做")
+        return 0
     applied = 0
-    # 从早到晚收：先收的会把后面记号的下标往前挪，每次重新按时刻找，不拿着旧下标。
-    for start, end, label in sorted(resolved, key=lambda item: item[0]):
-        marks = her.get("marks") or []
-        mark = next((other for other in marks if other["time"] == start), None)
-        if mark is None or mark.get("index", 0) == 0:
-            continue
-        if end is None:
+    # 从后往前：_fold_between 会把后面记号的下标往前挪，先收后面的，前面的下标就不受影响。
+    # 记号在收之前定下来（含后边界），相邻两块共用同一个边界时，后一块折出来的那行正好落在
+    # 前一块的结束下标上。
+    for mark, after, label in sorted(resolved, key=lambda item: item[0]["time"], reverse=True):
+        if after is None:
             _chat_root._agent._fold_since(her, mark, label)
         else:
-            after = next((other for other in marks if other["time"] == end), None)
-            if after is None:
-                continue   # 前面的决定已经把它收掉了。
             _chat_root._agent._fold_between(her, mark, after, label)
         applied += 1
     return applied
@@ -198,15 +249,12 @@ def _apply(her: dict, decisions: list[dict]) -> int:
 
 def report() -> str:
     her = _segment.load()
-    size = _chat_root._agent._text_tokens(her["messages"]) if her["messages"] else 0
-    tidied = her.get("subconscious") if isinstance(her.get("subconscious"), dict) else {}
+    size = _size(her) if her["messages"] else 0
+    settled = her.get("settled")
     lines = [f"subconscious: {'on' if on() else 'off'}",
-             f"这一段 {_screen.clock(her['started'])} 开始，约 {_amount(size)} token；"
-             f"比上次整理再长 {_GROWTH_TOKENS} token 才整理（subconscious._GROWTH_TOKENS）"]
-    if tidied.get("time"):
-        lines.append(f"上次整理 {_screen.clock(tidied['time'])}，之后又长了 {size - tidied.get('tokens', 0)} token")
-    else:
-        lines.append("这一段还没整理过")
+             f"这一段约 {_amount(size)} token，门槛 {_amount(_GROWTH_TOKENS)}"
+             + (f"；上次整理时约 {_amount(settled)}，之后又长了 {_amount(size - settled)}"
+                if isinstance(settled, int) else "；这一段还没整理过")]
     lines.append("怎么判断：data/notes/policy/subconscious.md" + ("" if _notes.read_policy("subconscious").strip()
                                                                 else "（还没写，用的是默认）"))
     return "\n".join(lines)

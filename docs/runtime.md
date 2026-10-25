@@ -73,7 +73,7 @@ uv run --frozen python run.py --smoke
 | `chatlog/` | QQ 上发生了什么 | 没进模型画面的消息、通知、发送回声 | 一直留 |
 | `data/event_stream/`（`oplog`） | 她做了什么、消息怎么登记 | 到达、激活、通知确认、已读、行动号与结果的对应；`read_actions` 读它 | 一直留；启动时整份重放，只留未读、未确认通知和她的输出与结果（不含思考） |
 | `data/context/current.json` 与 `archive/` | 她当时看到了什么、想了什么 | 实际进上下文的材料和顺序、段边界、思考（默认 `keep` 时）；潜意识收起的片段原样在 `archive/*-folded.json` | 一直留，按段归档 |
-| `data/context/subconscious.json` 与 `archive/*-subconscious.json` | 潜意识为什么那样整理 | 它看到的经过、它的理由和决定、交接时写的地图 | 一直留，它自己交接时归档 |
+| `data/context/subconscious.json` 与 `archive/*-subconscious.json`（旧） | 旧版潜意识自己那条上下文 | 2026-10-25 起不再读写；盘上还留着的只作历史 | 可留可删 |
 | `log/llm.log`（`yz.llm.request`） | 每次请求发了什么 | 每次请求末尾的临时提示（待办、未读数、时间）；同一段里已经记过的前缀不再重复打印，只写"前 N 条已经记过" | 7 天 |
 | `data/notes/.history/` | 笔记改写或删除前是什么样 | 每个旧版本 | 一直留 |
 | `data/bili/credential.json` | B 站登录凭证 | 柚子 B 站号的 cookie（权限 600）；已读位置、昵称和"评论属于哪一楼"在 storage `bili/state` | 一直留，失效后重新 `.bili login` |
