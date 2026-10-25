@@ -11,7 +11,7 @@ import time
 import traceback
 from typing import Callable
 
-from mods import context, cq, history, identity, image, llm, log, message, msgs, op, oplog, py, storage, text, thread, tools as tool_modules
+from mods import context, cq, history, identity, image, llm, log, message, msgs, op, oplog, py, storage, text, thread, tools as tool_modules, usage
 from mods.capture import capture
 from mods.llm import pricing
 
@@ -338,6 +338,9 @@ def get_handler(session: llm.Chat):
             _self_talk.info(f'[{time.strftime("%H:%M:%S")}]【自言自语】{chunk.content}')
         if chunk.total_tokens:
             inc_call_cost(session.model, chunk.prompt_tokens, chunk.completion_tokens, chunk.cached_tokens, chunk.requested_at)
+            # 每次调用的真实用量另记一份，归档里那些 tokens 是估的，见 mods/usage.py。
+            usage.log_call(session.model, chunk.prompt_tokens, chunk.completion_tokens,
+                           chunk.cached_tokens, chunk.requested_at)
             # 这一段有多长以接口报的为准，见 agent._context_size。
             session.last_usage = (chunk.prompt_tokens or 0) + (chunk.completion_tokens or 0)
 
@@ -355,8 +358,6 @@ def _window_storage(window: tuple) -> dict:
         return storage.get("", "agent")
     kind, key = window
     return storage.get("groups" if kind == "group" else "users", str(key))
-
-
 _AGENT_HINT_KEY = "agent_hint"
 
 
