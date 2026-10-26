@@ -18,12 +18,29 @@ import re
 import threading
 import time
 
+from mods import storage
+
+import mods.chat as _chat_root
+from . import screen as _screen, windows as _windows
+
 ROOT = Path("data") / "context"
 _CURRENT = ROOT / "current.json"
 _ARCHIVE = ROOT / "archive"
 # 每一段交接时往这里添一行：什么时候、多长、当时为什么结束。下一段开头挂最近几行。
 _YEARS = Path("data") / "notes" / "years.md"
 _lock = threading.Lock()
+# dismiss 能清回的记号：每次唤醒追加之前，这一段里会被这次唤醒改动的那几项；最多留最近这么多个。
+MARKED = ("last_shown", "windows", "scopes", "told", "tokens", "notice")
+MARKS = 40
+# WHY: 维护者 2026-10-25 08:16 定的方向：不再自动跑一次、替她决定收哪段。每长 5 万 token 只插
+# 一条提醒（这一段多长、能收哪几段、各多大）；收不收、收哪段、摘要怎么写都由她自己调 `compress`。
+# 提醒和 hint 一样只挂在这一次请求末尾、不写进这一段（基准除外），下次收的时候自然不在；旧版那条
+# 自动整理还带着自己的一条会话、自己的账本和一套截断，看的是转写不是原样，已经删了。
+#
+# WHY: 提醒里的时刻必须是 `_fold_since` / `_fold_between` 真能用的记号：这一段第一次唤醒连着交接
+# 留下的笔记，不列；最近一次刚做完、下次多半还要接着做，也不列。`compress` 那头再校验一次。
+# 这一段比上次提醒时又长这么多 token 才提醒一次（维护者 2026-10-25：5 万）。
+GROWTH_TOKENS = 50_000
 
 
 def fresh() -> dict:
@@ -198,3 +215,396 @@ def render(messages: list[dict]) -> str:
         else:
             lines.append(f"【{role}】" + content)
     return "\n".join(lines)
+
+
+def text_tokens(messages: list[dict]) -> int:
+    def strip(value):
+        if isinstance(value, list):
+            return [strip(part) for part in value]
+        if isinstance(value, dict):
+            if value.get("type") == "image_url":
+                return "[image]"
+            return {key: strip(part) for key, part in value.items()}
+        return value
+
+    return _chat_root.count_tokens(json.dumps(strip(messages), ensure_ascii=False))
+
+
+def context_size(reported, body: list[dict]) -> int:
+    """How long *body* is: the size the API last reported for its first messages, plus an estimate of the rest.
+
+    *reported* is ``[tokens, count]``: the API counted ``tokens`` when ``body[:count]``
+    was the whole request and its answer.
+
+    WHY: 维护者 2026-10-23：以接口返回的为准。字数估算把图片当成几个字，DeepSeek 每张图
+    却最多算 1024 token（官方图像理解文档），图多的群攒上几百张也不会交接，直到撞上单个
+    请求 600 张图或 48 MiB 的上限；接口报的 prompt+completion 连系统提示、工具定义和图片都
+    算在内。报数之后才追加的（工具结果、新画面）还没人报过，先按字数估。
+    """
+    if isinstance(reported, list) and len(reported) == 2 and 0 <= reported[1] <= len(body):
+        return reported[0] + text_tokens(body[reported[1]:])
+    return text_tokens(body)
+
+
+def amount(tokens: int) -> str:
+    return f"{tokens / 10000:.1f} 万" if tokens >= 10000 else str(tokens)
+
+
+def next_number(segment: dict) -> int:
+    """下一个唤醒编号：这一段里用过的最大值 + 1。
+
+    WHY: 编号是 compress(first=…, last=…) 的地址。只看内存里的 marks 会在重启后从 1 重新
+    数——`_MARKS` 会截掉旧的，磁盘里载入的又不一定带号；`last_number` 记住用过的最大值，
+    重启也不会回绕。
+    """
+    highest = int(segment.get("last_number") or 0)
+    for one in segment.get("marks") or []:
+        highest = max(highest, int(one.get("number") or 0))
+    return highest + 1
+
+
+def numbers(segment: dict) -> list[dict]:
+    """Give every wake mark a stable number (1, 2, 3 … oldest first); old segments get one on the spot."""
+    marks = segment.get("marks") or []
+    highest = int(segment.get("last_number") or 0)
+    for one in marks:
+        highest = max(highest, int(one.get("number") or 0))
+    upcoming = highest + 1
+    previous = 0
+    for one in marks:
+        number = int(one.get("number") or 0)
+        if not number or number <= previous:
+            # 缺号，或者重启后从 1 重新数过：往回荡平，否则 compress(first=…, last=…) 会切错唤醒
+            one["number"] = upcoming
+            upcoming += 1
+        previous = max(previous, int(one["number"]))
+    segment["last_number"] = previous or highest
+    return marks
+
+
+def _mark_at(marks: list[dict], at: str) -> dict | None:
+    at = " ".join(str(at or "").split())
+    found = [mark for mark in marks if at and at in (mark["at"], mark["at"][11:])]
+    return found[-1] if found else None
+
+
+def make_mark(segment: dict, now: str, boxes: dict, seen: dict) -> dict:
+    return {
+        "at": now,
+        "time": time.time(),
+        "index": len(segment["messages"]),
+        "number": next_number(segment),
+        **{key: json.loads(json.dumps(segment.get(key), ensure_ascii=False)) for key in MARKED},
+        "boxes": {label: box["text"] for label, box in boxes.items() if box.get("text")},
+        "seen": dict(seen),
+    }
+
+
+def record_mark(segment: dict, mark: dict) -> None:
+    segment["marks"] = [*segment.get("marks", [])[-(MARKS - 1):], mark]
+    segment["last_number"] = mark["number"]
+
+
+def subconscious_on() -> bool:
+    # 维护者 2026-10-24：默认开。
+    return bool(storage.get("", "agent").get("subconscious", True))
+
+
+def _offered(segment: dict) -> list[dict]:
+    """Wakes `compress` may start at: not the first (it carries the handoff notes), not the latest."""
+    marks = [mark for mark in segment.get("marks") or [] if mark.get("index", 0) > 0]
+    return marks[:-1]
+
+
+def nudge(segment: dict) -> str | None:
+    """A one-off reminder once the segment has grown `GROWTH_TOKENS` since the last one."""
+    if not subconscious_on():
+        return None
+    messages = segment.get("messages") or []
+    if not messages:
+        return None
+    size = context_size(segment.get("tokens"), messages)
+    settled = segment.get("settled")
+    if not isinstance(settled, int) or size < settled:
+        # 第一次见到这一段（或她自己 dismiss 清短了）：记下现在的大小，这次不提醒。
+        segment["settled"] = size
+        save(segment)
+        return None
+    if size - settled < GROWTH_TOKENS:
+        return None
+    offered = _offered(segment)
+    if not offered:
+        # 只有第一次唤醒和最近一次：没有能收的，先不提醒，等它们之间多出一次来。
+        return None
+    segment["settled"] = size
+    segment["nudged_at"] = time.time()
+    save(segment)
+    listing = "\n".join(f"{mark.get('number')}. {mark['at'][11:]}（之后约 {amount(text_tokens(messages[mark['index']:]))}）"
+                        for mark in numbers(segment) if mark in offered)
+    return (f"上下文又长了，这一段现在约 {amount(size)} token。省着点用。\n"
+            f"能收的唤醒（括号里是收掉以后，后面要按原价重读多少）：\n{listing}\n"
+            f"要收就直接调用 compress 工具（不是 # 命令，别用 send_command 发）："
+            f"compress(first=1, last=3, summary=\"……\")，序号就是上面那些数字；"
+            f"要一段一段挑也可以写时刻 compress(from_time=\"{offered[0]['at'][11:]}\", to_time=\"\", summary=\"……\")\n"
+            f"不收就不用管，这条提醒到下次收的时候会一起没。")
+
+
+def subconscious_report() -> str:
+    segment = load()
+    size = context_size(segment.get("tokens"), segment["messages"]) if segment["messages"] else 0
+    settled = segment.get("settled")
+    if isinstance(settled, int):
+        grown = max(0, size - settled)
+        left = max(0, GROWTH_TOKENS - grown)
+        gap = f"离下次提醒还差约 {amount(left)} token"
+    else:
+        gap = "还没到过门槛"
+    nudged = segment.get("nudged_at")
+    lines = [f"subconscious: {'on' if subconscious_on() else 'off'}",
+             f"这一段约 {amount(size)} token；{gap}（门槛 {amount(GROWTH_TOKENS)}）",
+             "上次提醒：" + (_screen.clock(nudged) if isinstance(nudged, (int, float)) else "还没提醒过")]
+    return "\n".join(lines)
+
+
+def request_dismiss(session, since: str = "") -> str:
+    """Called by the `dismiss` tool: drop everything since a wake header once this round ends; returns why not, or "".
+
+    WHY: 维护者 2026-10-23：follow 一个群她看起来很累。这一段里一遍遍叠着"被叫醒、看一眼、
+    没我的事"，她照着这一路往下演，累的是这些痕迹，不是叫醒的次数（先试过攒一批再叫，晚了接不上话，
+    痕迹照样留着，撤了）。现在没什么要做的就清掉：从她点名的那行「这次唤醒你的是」起（不写就是
+    最近一行），画面、插话、思考、工具调用和结果都不留。赌的是她想的时候会有插话：插话照样叫醒她，
+    画面从清掉之前接着给，被清掉的消息和新的连在一起，等于她想的那段时间替她攒了一批。
+
+    WHY: 调过工具也信她：清掉的只是眼前的工作记忆，笔记是文件、行动记录和 llm.log 都还在，
+    和交接时由她决定留什么是同一种信任。只拦两种：那以后她发过话（别人多半在接她的话，她得记得
+    当时为什么这么说；清了只剩聊天记录里那句话）；输入框里有那以后打的、改过的字（本来就有的不拦，
+    维护者说框里的字可能是早先打的）。不跨交接：记号跟着这一段，交接后从新的一段算。
+
+    WHY: 维护者 2026-10-24：follow 期间到的消息画面不截，一直 dismiss 就会越攒越多。兜底是思考：
+    一个跟着的窗口里，会被退回去的 follow 期间消息超过 _FRESH_MAX 条，就不让清，她把这批看完留下，
+    画面位置跟着往前推；不想跟了就揭掉 follow。
+    """
+    if getattr(session, "quiet", False) or getattr(session, "segment", None) is None:
+        return "只有醒着处理消息的时候能用；交接、反思和子代理里没有可清的"
+    marks = session.segment.get("marks") or []
+    since = " ".join(str(since).split())
+    found = [mark for mark in marks if not since or since in (mark["at"], mark["at"][11:])]
+    if not found:
+        recent = "、".join(mark["at"] for mark in marks[-5:]) or "没有"
+        return f"这一段里找不到「这次唤醒你的是（{since}）」那一行；能清回的最近几次是：{recent}"
+    problem = _dismiss_problem(session, found[-1])
+    if problem:
+        return problem
+    session.dismiss = found[-1]
+    return ""
+
+
+def apply_dismiss(session, segment: dict) -> str:
+    """Apply a pending dismiss at the end of a round; returns why not, or "" when applied."""
+    problem = _dismiss_problem(session, session.dismiss)
+    if problem:
+        return problem
+    _drop_since(segment, session.dismiss)
+    return ""
+
+
+def request_compress(session, from_time: str = "", to_time: str = "", summary: str = "",
+                     first: int = 0, last: int = 0) -> str:
+    """Called by the `compress` tool: fold and archive wakes (this call included); returns what happened.
+
+    WHY: 维护者 2026-10-25：收哪段、摘要怎么写由她定。折叠放到这批工具结果都进了 messages
+    之后（`finish_compress`），`from_time` 到现在的那次调用和它的结果也在被收的范围里，收完
+    一起从上下文里消失；中间块（给了 to_time）收不到末尾，调用本身在同批只有它时也一起抹掉。
+    """
+    segment = getattr(session, "segment", None)
+    if getattr(session, "quiet", False) or segment is None:
+        return "只有醒着处理消息的时候能用；交接、反思和子代理里没有可收的"
+    summary = str(summary or "").strip()
+    if not summary:
+        return "先写摘要：收掉以后原文就归档了，摘要要不看原文也接得上（什么事、到哪一步、还欠着什么）"
+    if getattr(session, "pending_compress", None) is not None:
+        return "同一批工具调用里只能收一次"
+    marks = numbers(segment)
+    offered = _offered(segment)
+    usable = "、".join(f"{mark.get('number')}.{mark['at'][11:]}" for mark in offered) or "没有"
+    if first or last:
+        # 编号跟着那次唤醒走，不跟着它在清单里的位置走：收掉中间的几段，后面的编号也不变。
+        first = max(1, int(first or 1))
+        last = max(first, int(last or first))
+        chosen = [mark for mark in offered if first <= int(mark.get("number") or 0) <= last]
+        if not chosen:
+            return f"这一段里没有第 {first} 到第 {last} 次唤醒；能收的是：{usable}"
+        after = next((mark for mark in marks if int(mark.get("number") or 0) > last), None)
+        from_time = chosen[0]["at"][11:]
+        to_time = after["at"][11:] if after is not None else ""
+    mark = _mark_at(marks, from_time)
+    if mark is None:
+        return f"这一段里找不到从 {from_time} 起的唤醒；能收的是：{usable}"
+    if mark.get("index", 0) == 0:
+        return "这一段第一次唤醒连着交接留下的笔记，不能收"
+    latest = max((other["time"] for other in marks), default=None)
+    if mark["time"] == latest:
+        return f"最近一次唤醒不收：刚做完的事，下次多半还要接着做。能收的是：{usable}"
+    after = None
+    if str(to_time or "").strip():
+        after = _mark_at(marks, to_time)
+        if after is None:
+            return f"找不到到 {to_time} 为止的唤醒；能收的是：{usable}"
+        if after["time"] <= mark["time"]:
+            return "to_time 要比 from_time 晚；那个时刻的唤醒本身不收"
+    session.pending_compress = {"mark": mark, "after": after, "summary": summary}
+    removed = segment["messages"][mark["index"]:after["index"] if after is not None else None]
+    saved = text_tokens(removed) - text_tokens([{"role": "system", "content": summary}])
+    where = f"{mark['at'][11:]} 到 {after['at'][11:]}" if after is not None else f"{mark['at'][11:]} 到现在"
+    return f"收了 {where}，这一段少了约 {amount(max(0, saved))} token。"
+
+
+def finish_compress(session, results) -> None:
+    """Fold once this batch's results are in, so the call and its result go together."""
+    pending = session.pending_compress
+    session.pending_compress = None
+    segment = session.segment
+    segment["messages"] = session.messages[session.prompt_count:]
+    if pending["after"] is None:
+        _fold_since(segment, pending["mark"], pending["summary"])
+    else:
+        _fold_between(segment, pending["mark"], pending["after"], pending["summary"])
+        _drop_compress_call(segment, results)
+    session.messages[session.prompt_count:] = segment["messages"]
+
+
+def _drop_compress_call(segment: dict, results) -> None:
+    """Drop this compress call and its result when the middle fold left them behind.
+
+    WHY: 同一批里还有别的工具调用时，删掉这条 assistant 会让它们的 tool 结果变成孤儿；那种情况
+    留着，协议正确优先。
+    """
+    ids = {result.tool_call_id for result in results if result.name == "compress"}
+    if not ids:
+        return
+    body = segment["messages"]
+    for index in range(len(body) - 1, -1, -1):
+        message = body[index]
+        if message.get("role") != "assistant" or not message.get("tool_calls"):
+            continue
+        if not any(call.get("id") in ids for call in message["tool_calls"]):
+            continue
+        if len(message["tool_calls"]) != 1:
+            return
+        del body[index]
+        break
+    segment["messages"] = [message for message in body
+                           if not (message.get("role") == "tool" and message.get("tool_call_id") in ids)]
+
+
+def _shown_since(segment: dict, mark: dict) -> list[str]:
+    """Labels of the windows shown after *mark*: their screen position moved on since."""
+    return [label for label, last in segment.get("last_shown", {}).items() if mark["last_shown"].get(label) != last]
+
+
+def _dismiss_problem(session, mark: dict) -> str:
+    if (getattr(session, "last_sent", 0) or 0) >= mark["time"]:
+        return f"从 {mark['at']} 起你发过话，这段不能清：别人多半在接你的话，你得记得当时为什么这么说"
+    for window in _windows.parse_all(_shown_since(session.segment, mark)):
+        piled = _screen.piled(window, mark)
+        if piled > _screen.FRESH_MAX:
+            label = _screen.label(window)
+            return (f"{label} 从 {mark['at']} 起 follow 期间已经攒了 {piled} 条，超过 {_screen.FRESH_MAX} 条就不能再清："
+                    f"这次留着，把它们看完；不想跟了就 wake_me(\"follow {label} off\")")
+    typed = [label for label, box in session.boxes.items()
+             if box.get("text") and box["text"] != mark["boxes"].get(label)]
+    if typed:
+        return (f"{'、'.join(typed)} 的输入框里有 {mark['at']} 之后打的或改过的字，清掉以后你会不记得打过；"
+                "先 send，或者用 type_word 改回原样或清空，再 dismiss")
+    return ""
+
+
+def _restore(segment: dict, mark: dict, keys) -> None:
+    for key in keys:
+        if key not in mark:
+            continue  # 早先记的记号没有 scopes
+        if mark[key] is None:
+            segment.pop(key, None)
+        else:
+            segment[key] = mark[key]
+    segment["marks"] = [kept for kept in segment.get("marks", []) if kept["time"] < mark["time"]]
+
+
+def _drop_since(segment: dict, mark: dict) -> None:
+    """Put the segment back as it was before *mark*'s wake; what was shown since comes back on the next screen."""
+    shown = _shown_since(segment, mark)
+    segment["messages"] = segment["messages"][:mark["index"]]
+    _restore(segment, mark, MARKED)
+    save(segment)
+    # 画面上的"看到哪"也退回去：清掉的消息下次排在"以下是上次之后的新消息"下面，当没读过的给。
+    # oplog 的已读不退（日志里没有"标回未读"这种行），画面外那个窗口的未读条数因此不算它们。
+    _screen.restore_seen(shown, mark.get("seen") or {})
+    _chat_root._awaker.dismissed(_windows.parse_all(shown))
+
+
+def _fold_since(segment: dict, mark: dict, label: str) -> str:
+    """Replace the stretch since *mark* with one line naming where it was archived whole; returns that name.
+
+    Unlike a dismiss, what was shown stays read: the screen position does not move back.
+    """
+    shown = _shown_since(segment, mark)
+    name = archive({"started": mark["time"], "windows": shown, "reason": label,
+                    "messages": segment["messages"][mark["index"]:]}, "folded")
+    where = f"{'、'.join(shown)} 的画面和" if shown else ""
+    segment["messages"] = [*segment["messages"][:mark["index"]], {"role": "system", "content": (
+        f"【收起】{label}\n（{mark['at'][5:]} 至 {_screen.clock()[5:]}，{where}你那时的想法、调用，后台整理时收成了上面这段；"
+        f"原样存在归档段 {name}，加载 memory_system 用 read_context(\"{name}\") 读，search 也搜得到）")}]
+    # 画面位置不退。第一次给的笔记、中途的工具状态跟着收走了，这几项退回去，下次照样给。
+    _restore(segment, mark, ("scopes", "told", "tokens", "notice"))
+    save(segment)
+    return name
+
+
+def _fold_between(segment: dict, mark: dict, after: dict, label: str) -> str:
+    """Replace the wakes from *mark* up to (not including) *after* with one line; what follows stays as it was.
+
+    WHY: 维护者 2026-10-24：潜意识动不了段中间不太好，本以为是像操作数据一样操作上下文。中间收掉一块，
+    那之后她那条下一次请求要按原价重读（缓存只认前面一样的部分），偶尔一次只是几分钱，贵的是每轮都改
+    中间；所以潜意识看得到每处之后有多少 token，值不值由它按说明判断，代码不设门槛。
+
+    和收到最后不同，后面的唤醒还在：它们的记号下标往前挪，区间里第一次给的笔记从这一段和后面的记号里
+    一起退掉（下次再给），工具状态退回区间开头那时的（下次把变化重新说一遍，重复无妨）。区间不含这一段
+    第一次唤醒，开头那条交接留下的 notice 不会在里面。
+    """
+    start, end = mark["index"], after["index"]
+    removed = segment["messages"][start:end]
+    shown = [window for window, last in after["last_shown"].items() if mark["last_shown"].get(window) != last]
+    name = archive({"started": mark["time"], "windows": shown, "reason": label, "messages": removed}, "folded")
+    where = f"{'、'.join(shown)} 的画面和" if shown else ""
+    line = {"role": "system", "content": (
+        f"【收起】{label}\n（{mark['at'][5:]} 起到 {after['at'][5:]} 之前，{where}你那时的想法、调用，后台整理时收成了"
+        f"上面这段；原样存在归档段 {name}，加载 memory_system 用 read_context(\"{name}\") 读，search 也搜得到）")}
+    segment["messages"] = [*segment["messages"][:start], line, *segment["messages"][end:]]
+    shift = 1 - len(removed)
+    saved = text_tokens(removed) - text_tokens([line])
+    given = [scope for scope in after.get("scopes") or [] if scope not in (mark.get("scopes") or [])]
+
+    def moved(reported):
+        # 接口报的数若是在这一块之后报的，扣掉这一块的估算；报在这一块里面的已经对不上了，改回按字数估。
+        if not (isinstance(reported, list) and len(reported) == 2) or reported[1] <= start:
+            return reported
+        return [reported[0] - saved, reported[1] + shift] if reported[1] >= end else None
+
+    segment["scopes"] = [scope for scope in segment.get("scopes") or [] if scope not in given]
+    segment["tokens"] = moved(segment.get("tokens"))
+    if "told" in mark:
+        segment["told"] = mark["told"]
+    marks = []
+    for other in segment.get("marks", []):
+        if other["time"] < mark["time"]:
+            marks.append(other)
+        elif other["time"] >= after["time"]:
+            other = {**other, "index": other["index"] + shift, "tokens": moved(other.get("tokens"))}
+            if "scopes" in other:
+                other["scopes"] = [scope for scope in other["scopes"] or [] if scope not in given]
+            if "told" in mark:
+                other["told"] = mark["told"]
+            marks.append(other)
+    segment["marks"] = marks
+    save(segment)
+    return name

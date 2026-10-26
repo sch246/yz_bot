@@ -227,19 +227,10 @@ def _recent_windows(exclude: list[tuple] = (), since: float = 0) -> list[tuple[t
     return [item for item in windows if item[0] not in exclude and item[1].get("time", 0) >= since]
 
 
-def _title(window: tuple) -> str:
-    """清单里怎么称呼一个窗口：标签加名字（她起的名、群名或昵称），认不出就只写标签。"""
-    from mods.chat import windows
-
-    label = _screen.label(window)
-    name = windows.known_name(window)
-    return f"{label}（{name}）" if name else label
-
-
 def directory(woken: list[tuple]) -> str:
     """What else there is to recall, names only: other recent windows, notes, diaries."""
     lines = ["## 最近有消息的其它窗口"]
-    lines.extend(f"{_title(window)} 最后 {_screen.clock(latest.get('time'))[5:16]}"
+    lines.extend(f"{_root()._windows.title(window)} 最后 {_screen.clock(latest.get('time'))[5:16]}"
                  for window, latest in _recent_windows(woken)[:20])
     lines.append("## 笔记")
     lines.append("、".join(item["scope"] for item in _notes.listing()) or "（无）")

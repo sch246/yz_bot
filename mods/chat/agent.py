@@ -24,10 +24,8 @@ import time
 from mods import context, identity, image, llm, oplog, py, shell, storage
 
 import mods.chat as _chat_root
-from . import notes as _notes, reader as _reader, roles as _roles, screen as _screen, segment as _segment, view as _view, windows as _windows
-from . import subconscious as _subconscious
+from . import notes as _notes, roles as _roles, screen as _screen, segment as _segment, view as _view, windows as _windows
 
-_SEEN_KEY = "seen"
 # WHY: 什么时候交接是可以改的策略（2026-10-22 维护者："唤醒条件本身也配置化"）。
 # 条件是 `data/notes/policy/tidy.py` 里的 Python，用 `.py` 那份共享环境求值，末行的值为真
 # （或是一段说明原因的文字）就交接；文件不存在时用下面这份默认，和它写成文件后一模一样。
@@ -37,13 +35,6 @@ DEFAULT_TIDY = """# 什么时候交接。每次子请求结束（stage == "round
 # since_handoff（这一段开始了多少秒）、kind（唤醒／闹钟／反思）、hour。
 "上下文太长" if used > limit else None
 """
-# A window shows at least this many lines before its first unseen one.
-_LEAD_IN = 3
-# 一次最多补多少条新消息。WHY: 2026-10-26 维护者：200 条一次塞进来太肥，折到 60。
-_FRESH_MAX = 60
-# dismiss 能清回的记号：每次唤醒追加之前，这一段里会被这次唤醒改动的那几项；最多留最近这么多个。
-_MARKED = ("last_shown", "windows", "scopes", "told", "tokens", "notice")
-_MARKS = 40
 _KNOWN_PEOPLE = 6
 _TYPING_EVERY = 5
 # 循环：一轮结束后隔几秒叫醒她；她连着几轮什么都没做时间隔翻倍，最长拉到多久。
@@ -58,43 +49,6 @@ _FORCE_AFTER_FAILURES = 2
 _FORCE_OVER_THRESHOLD = 2
 # 醒来看见上下文超过整理阈值时，先提醒几次再交接；她自己也提过这个（proposals 第二条）。
 _TIDY_GRACE = 2
-
-
-def _text_tokens(messages: list[dict]) -> int:
-    def strip(value):
-        if isinstance(value, list):
-            return [strip(part) for part in value]
-        if isinstance(value, dict):
-            if value.get("type") == "image_url":
-                return "[image]"
-            return {key: strip(part) for key, part in value.items()}
-        return value
-
-    return _chat_root.count_tokens(json.dumps(strip(messages), ensure_ascii=False))
-
-
-def _context_size(reported, body: list[dict]) -> int:
-    """How long *body* is: the size the API last reported for its first messages, plus an estimate of the rest.
-
-    *reported* is ``[tokens, count]``: the API counted ``tokens`` when ``body[:count]``
-    was the whole request and its answer.
-
-    WHY: 维护者 2026-10-23：以接口返回的为准。字数估算把图片当成几个字，DeepSeek 每张图
-    却最多算 1024 token（官方图像理解文档），图多的群攒上几百张也不会交接，直到撞上单个
-    请求 600 张图或 48 MiB 的上限；接口报的 prompt+completion 连系统提示、工具定义和图片都
-    算在内。报数之后才追加的（工具结果、新画面）还没人报过，先按字数估。
-    """
-    if isinstance(reported, list) and len(reported) == 2 and 0 <= reported[1] <= len(body):
-        return reported[0] + _text_tokens(body[reported[1]:])
-    return _text_tokens(body)
-
-
-def _seen() -> dict:
-    data = storage.get("", "agent")
-    value = data.get(_SEEN_KEY)
-    if not isinstance(value, dict):
-        value = data[_SEEN_KEY] = {}
-    return value
 
 
 # 叫醒她那行后面跟一句"谁在管、改哪里"，省得她只看见"闹钟"两个字不知道是谁安排的。
@@ -179,159 +133,6 @@ def _people(windows: list[tuple], authors: list[int], segment: dict) -> tuple[li
     return ([block] if block else []), new
 
 
-def _offline_calls(window: tuple, shown: list[dict]) -> list[dict]:
-    """Unread recovered calls to her that the screen's slice leaves out, oldest first.
-
-    WHY: 补回的消息按时间插在开机后实时到的消息前面。这一段已经给过这个窗口时，画面只
-    接着"上次给到哪一条"往后给，看到时间也已经过了它们，叫她的那条就不在画面里，第一次
-    输出却会把它标成已读（2026-10-23 审查）。所以按消息号把还没读的离线呼叫找出来补上。
-    """
-    from mods import _backfill, chatlog
-
-    calls = [entry["event"] for entry in oplog.unread(window)
-             if entry.get("activation_kind") == _backfill.OFFLINE_CALL]
-    if not calls:
-        return []
-    wanted = {chatlog.recall_key(event.get("message_id")) for event in calls}
-    texts = {item["text"] for item in shown}
-    found = []
-    for item in _screen.records(window, 1_000_000, since=min(int(event["time"]) for event in calls)):
-        head = chatlog._split_head(item["text"].partition("\n")[0])
-        if (item["text"] not in texts and head is not None and head["message_id"] is not None
-                and chatlog.recall_key(head["message_id"]) in wanted):
-            found.append(item)
-    return found
-
-
-def _with_calls(window: tuple, calls: list[dict], text: str) -> str:
-    if not calls:
-        return text
-    return ("（下面是离线期间叫你的消息，补回时插在了更早的位置）\n" + _screen.render(window, calls)
-            + ("\n" + text if text else ""))
-
-
-def _screen_text(window: tuple, count: int, last: str | None) -> tuple[str, tuple, str | None]:
-    """One window's chatlog lines for this wake, the (time, arrival) to mark seen, and its last record.
-
-    *last* is the last record of this window already shown earlier in this segment;
-    then only the records after it are new.
-    """
-    mark = _seen().get(_screen.label(window))
-    # WHY: 标已读只标到读画面这一刻为止的未读（2026-10-22 审查发现：生成期间同窗口
-    # 再来的 at 会在第一次输出时一起被标掉，收尾不再接续）。chatlog 写入与登记到达
-    # 在同一把窗口锁里、先写后登记，所以先取边界再读文件，边界内的都在画面能读到的文件里。
-    through = oplog.latest_pending_arrival(window)
-    # WHY: 维护者 2026-10-24：follow 期间（包括说完话自动听）到的消息不截，之前的照旧最多 _FRESH_MAX
-    # 条。她选了要跟上，dismiss 掉又回来的那批要原样给全，不靠 read_log 往前翻；一个群一天的消息放得下。
-    # 只按"现在盖着 follow"不行：follow 一个很久没看的群，第一屏会把几周的积压全倒出来。
-    layer = _chat_root._awaker.layer(window)
-    since = layer.get("since") if layer is not None and layer["state"] == "follow" else None
-    # 记录时间只到秒：起点取整，同一秒里到的也算 follow 期间。
-    during = (sum(1 for item in _screen.records(window, 1_000_000, since=since)
-                  if item["time"] is not None and item["time"] >= int(since)) if since is not None else 0)
-    cap = _FRESH_MAX + during
-    items = _screen.records(window, max(count, 1) + cap)
-    texts = [item["text"] for item in items]
-    if last is not None and last in texts:
-        # WHY: 这一段里已经给过这个窗口：按"上次给到哪一条"接着给，不按看到时间——看到
-        # 时间只精确到秒，同一秒里后到的那条按时间会被当成看过。
-        after = items[len(texts) - texts[::-1].index(last):]
-        shown = after[-cap:]
-        calls = _offline_calls(window, shown)
-        if not shown:
-            return _with_calls(window, calls, ""), (None, through), last
-        text = _screen.render(window, shown, mark)
-        if len(after) > cap:
-            text = (f"（{_screen.label(window)} 又有 {len(after)} 条新消息，这里只展示最新的 {len(shown)} 条；"
-                    f"更早的用 read_log(\"{_screen.label(window)}\", before=\"{_screen.clock(shown[0]['time'])}\") 往前翻）\n" + text)
-        return _with_calls(window, calls, text), (_screen.latest_time(shown), through), shown[-1]["text"]
-    fresh = [item for item in items if mark is not None and item["time"] is not None and item["time"] > mark]
-    # WHY: 维护者 2026-10-25：交接后 last_shown 清空、看到位置还在，按 count 补旧消息会把
-    # 刚压缩掉的原文倒回来。有 mark 时只带几条接话，也兜住看到时间只精确到秒的边界；
-    # 从没看过的窗口才按 count 补历史，新消息仍按原来的上限给。
-    lead = _LEAD_IN if mark is not None else max(count - len(fresh), _LEAD_IN)
-    older = [item for item in items if item not in fresh][-lead:]
-    shown = older + fresh if mark is not None else items[-max(count, _LEAD_IN):]
-    skipped = 0
-    if len(fresh) > cap:
-        # WHY: 维护者 2026-10-22 定：新消息太多（比如离线一晚）只展示最新的 _FRESH_MAX 条，
-        # 但要明说跳过了多少、从哪里接着翻，看到位置照样推进；不静默丢，也不撑爆上下文。
-        total = sum(1 for item in _screen.records(window, 1_000_000, since=mark)
-                    if item["time"] is not None and item["time"] > mark)
-        shown = fresh[-cap:]
-        skipped = total - len(shown)
-    if not shown:
-        return "", (None, through), last
-    text = _screen.render(window, shown, mark)
-    if skipped:
-        text = (f"（{_screen.label(window)} 上次之后有 {skipped + len(shown)} 条新消息，这里只展示最新的 "
-                f"{len(shown)} 条；更早的 {skipped} 条要看就用 read_log(\"{_screen.label(window)}\", "
-                f"before=\"{_screen.clock(shown[0]['time'])}\") 往前翻）\n" + text)
-    return _with_calls(window, _offline_calls(window, shown), text), (_screen.latest_time(shown), through), shown[-1]["text"]
-
-
-def _window_title(window: tuple) -> str:
-    """清单里怎么称呼一个窗口：标签加名字，认不出名字就只写标签。"""
-    label = _screen.label(window)
-    name = _windows.known_name(window)
-    return f"{label}（{name}）" if name else label
-
-
-def _unread_hint(on_screen: set[tuple]) -> str:
-    rows = []
-    for detail in oplog.pending_details():
-        window = tuple(detail["window"])
-        if not _windows.known(window) or window in on_screen:
-            continue
-        rows.append(f"{_window_title(window)} {detail['unread']} 条"
-                    + (f"（@你 {detail['mentions']}）" if detail["mentions"] else "")
-                    + "".join(f"（{badge}）" for badge in _chat_root._awaker.badges(window)))
-    return ("其它窗口还有没看过的消息：" + "；".join(rows[:10])
-            + "。要看就用 read_log 读原文。") if rows else ""
-
-
-def _late_arrivals(newest: dict[tuple, tuple], last_shown: dict[str, str],
-                   count: int) -> tuple[list[dict], dict[tuple, tuple]]:
-    """Messages that reached the windows on screen since she read them, to append to this segment.
-
-    Advances *newest* and *last_shown* now; the marks it returns are applied
-    (seen time, read) only once she has produced output after seeing them.
-
-    WHY: 维护者 2026-10-23：私聊每条都叫醒她以后，人分几条发的话会在她干活时陆续到，
-    不用延迟、也不打断请求，下一次子请求之前写进这一段，由她自己决定接不接（参照 Cortico
-    在轮次边界投递）。以前挂在请求末尾的提示里，每次重算、不进这一段，收尾还要为它们再叫
-    一次。
-
-    WHY: 已读要等她看过以后有了一次输出（哪怕只是思考）才标，维护者说这样最稳：请求失败
-    时它们仍是未读，叫她的那条照样会再叫醒她。`last_shown` 却在追加时就推进，它和这一段
-    一起存盘，这一段里有了它们，下次的画面就不会再给一遍。
-
-    WHY: 只是她自己发出去的回显不单独插一条：她刚 send 的话不用再看一遍，它们留着未读，
-    下次和别的新消息一起出现。
-    """
-    added: list[dict] = []
-    marks: dict[tuple, tuple] = {}
-    bot = identity.bot_id()
-    for window, (_stamp, through) in list(newest.items()):
-        late = [entry for entry in oplog.unread(window)
-                if through is None or not oplog.arrival_before_or_at(entry["arrival"], through)]
-        if not any(entry["event"].get("user_id") != bot for entry in late):
-            continue
-        label = _screen.label(window)
-        text, mark, last = _screen_text(window, count, last_shown.get(label))
-        newest[window] = marks[window] = mark
-        if not text:
-            continue
-        last_shown[label] = last
-        calls = [f"{entry.get('activation_kind')}"
-                 + (f" 作者={entry['event']['user_id']}" if entry["event"].get("user_id") is not None else "")
-                 for entry in late if entry.get("activated")]
-        facts = ["你干活时刚到的", _screen.clock(), *([f"叫你的：{'、'.join(calls)}"] if calls else []),
-                 *_chat_root._awaker.badges(window)]
-        added.append(_view.outside(label, facts, text))
-    return added, marks
-
-
 def _box_note(boxes: dict) -> str:
     """Unsent input boxes, told once after a handoff.
 
@@ -341,15 +142,6 @@ def _box_note(boxes: dict) -> str:
     return ("交接前你在输入框里打了还没发的字：\n"
             + "\n".join(f"{label}：{box['text']}" for label, box in boxes.items())
             + "\n要发就 send，不发就不管它。")
-
-
-def _mark_seen(newest: dict[tuple, tuple]) -> None:
-    seen = _seen()
-    for window, (stamp, through) in newest.items():
-        if stamp is not None:
-            seen[_screen.label(window)] = max(stamp, seen.get(_screen.label(window), 0))
-        _reader.mark_window_read(window, through=through)
-    storage.save()
 
 
 def _did_something(messages: list[dict]) -> bool:
@@ -493,7 +285,7 @@ def _forced_reason(segment: dict, threshold: int) -> str:
     failures = segment.get("handoff_failures", 0)
     if failures >= _FORCE_AFTER_FAILURES:
         return f"交接连着失败了 {failures} 次"
-    used = _context_size(segment.get("tokens"), segment["messages"])
+    used = _segment.context_size(segment.get("tokens"), segment["messages"])
     if used > threshold * _FORCE_OVER_THRESHOLD:
         return f"已经长到 {used} token，超过整理阈值的 {_FORCE_OVER_THRESHOLD} 倍"
     return ""
@@ -547,7 +339,7 @@ def _keep_typing(turn, window: tuple | None, stop: threading.Event) -> None:
     while not stop.is_set():
         try:
             targets = {window} if window is not None and window[0] == "private" else set()
-            targets.update(_reader.parse_target(label) for label in tuple(turn.screens) if label.startswith("u"))
+            targets.update(_windows.parse_target(label) for label in tuple(turn.screens) if label.startswith("u"))
             for target in targets:
                 reply = connect.call_api("set_input_status", user_id=str(target[1]), event_type=1)
                 if reply.get("retcode") not in (0, None) and not failed:
@@ -754,12 +546,47 @@ def _loop_round(loop: dict, token: int) -> None:
         stop_loop("叫醒失败")
 
 
-def _span(seconds: float) -> str:
+def span(seconds: float) -> str:
     if seconds >= 3600:
         return f"{seconds / 3600:g} 小时"
     if seconds >= 60:
         return f"{seconds / 60:g} 分钟"
     return f"{seconds:g} 秒"
+
+
+_span = span
+
+
+def loop_status() -> str:
+    current = _loop
+    state = (f"，这一串转到第 {current['round']} 轮"
+             + (f"：{current['note']}" if current.get("note") else "") if current else "")
+    return f"loop: {'on' if loop_on() else 'off'}{state}"
+
+
+def loop_history(last: int = 10) -> str:
+    try:
+        rows = [json.loads(line) for line in _LOOP_LOG.read_text(encoding="utf-8").splitlines() if line.strip()]
+    except (OSError, ValueError):
+        return "还没有改过循环备注"
+    if not rows:
+        return "还没有改过循环备注"
+    picked = rows[-max(1, min(50, int(last))):]
+    lines = []
+    for row in picked:
+        when = time.strftime("%m-%d %H:%M", time.localtime(float(row.get("t") or 0)))
+        lines.append(f"- 第 {row.get('round', '?')} 轮 {when}：{row.get('note', '')}")
+    return f"你最近 {len(picked)} 次写下的循环备注（一共 {len(rows)} 条）：\n" + "\n".join(lines)
+
+
+def clear_loop_history(confirm: bool = False) -> str:
+    if not confirm:
+        return "这会清掉全部备注历史，确定就再调一次 clear_loop_note(confirm=True)"
+    try:
+        _LOOP_LOG.unlink(missing_ok=True)
+    except OSError as error:
+        return f"没清掉：{error}"
+    return "循环备注历史清空了"
 
 
 def request_tidy(note: str) -> bool:
@@ -781,7 +608,7 @@ def _run_agent(model: str | None, turn) -> bool:
         return True
     segment = _segment.load()
     if _did_something(segment["messages"]) and not turn.handoff_failed:
-        used = _context_size(segment.get("tokens"), segment["messages"])
+        used = _segment.context_size(segment.get("tokens"), segment["messages"])
         reason = _grace(turn, segment, _tidy_reason(turn, segment, "assemble", used), used)
         if reason:
             if _handoff(turn, reason, model):
@@ -806,7 +633,7 @@ def _run_agent(model: str | None, turn) -> bool:
     shown_last: dict[str, str] = {}
     for window in focus:
         label = _screen.label(window)
-        text, mark, last = _screen_text(window, max_events, segment.setdefault("last_shown", {}).get(label))
+        text, mark, last = _screen.slice_window(window, max_events, segment.setdefault("last_shown", {}).get(label))
         newest[window] = mark
         if text:
             screens[label] = text
@@ -825,11 +652,7 @@ def _run_agent(model: str | None, turn) -> bool:
         turn.handed_off = ""
     if not material:
         return True
-    mark = ({"at": now, "time": time.time(), "index": len(segment["messages"]),
-             "number": _next_number(segment),
-             **{key: json.loads(json.dumps(segment.get(key), ensure_ascii=False)) for key in _MARKED},
-             "boxes": {label: box["text"] for label, box in turn.boxes.items() if box.get("text")},
-             "seen": dict(_seen())}
+    mark = (_segment.make_mark(segment, now, turn.boxes, _screen.seen_snapshot())
             if notice is not None else None)
 
     def first_output() -> None:
@@ -837,9 +660,8 @@ def _run_agent(model: str | None, turn) -> bool:
         if notice is not None:
             oplog.acknowledge_notification(notice["id"])
         if mark is not None:
-            segment["marks"] = [*segment.get("marks", [])[-(_MARKS - 1):], mark]
-            segment["last_number"] = mark["number"]
-        _mark_seen(newest)
+            _segment.record_mark(segment, mark)
+        _screen.mark_seen(newest)
         turn.screens.update(screens)
         segment["windows"] = list(dict.fromkeys([*segment["windows"], *screens]))
         segment["scopes"].extend(met)
@@ -862,323 +684,35 @@ def _run_agent(model: str | None, turn) -> bool:
         # 第一次输出之前画面还没标已读，刚到的留给下一次请求一起给。
         if not started:
             return []
-        added, marks = _late_arrivals(newest, segment["last_shown"], max_events)
+        added, marks = _screen.late_arrivals(newest, segment["last_shown"], max_events)
         unconfirmed.update(marks)
         return added
 
     def seen_late() -> None:
         if unconfirmed:
-            _mark_seen(dict(unconfirmed))
+            _screen.mark_seen(dict(unconfirmed))
             unconfirmed.clear()
 
     session = _run_session(model, turn, segment, [*segment["messages"], *material], first_output, stop_when,
                            providers=[late],
-                           hints=[lambda: _unread_hint(set(newest)), lambda: _subconscious.nudge(segment),
+                           hints=[lambda: _screen.unread_hint(set(newest)), lambda: _segment.nudge(segment),
                                   lambda: shell.running_hint(), lambda: turn.tidy_hint],
                            known=len(segment["messages"]), each_output=seen_late)
     if (getattr(session, "dismiss", None) is None and not turn.log.get("acts")
             and getattr(session, "segment", None) and session.segment.get("marks")):
         # 这一轮一个工具都没调（dismiss 不算动作）：只是被叫醒看了一眼，痕迹不用留。
         # WHY: 2026-10-26 维护者：她常常想完就算了，忘了自己调 dismiss，白醒的那次就挂在上下文里。
-        request_dismiss(session)
+        _segment.request_dismiss(session)
     if getattr(session, "dismiss", None) is not None:
         # 工具里查过一次；同一次输出里排在它后面的 send、type_word 可能又改了情况，这里再查。
-        problem = _dismiss_problem(session, session.dismiss)
+        problem = _segment.apply_dismiss(session, segment)
         if problem:
             _roles._stream.warning(f"dismiss 没有生效：{problem}")
-        else:
-            _drop_since(segment, session.dismiss)
     return session.output_recorded
 
 
-def request_dismiss(session, since: str = "") -> str:
-    """Called by the `dismiss` tool: drop everything since a wake header once this round ends; returns why not, or "".
-
-    WHY: 维护者 2026-10-23：follow 一个群她看起来很累。这一段里一遍遍叠着"被叫醒、看一眼、
-    没我的事"，她照着这一路往下演，累的是这些痕迹，不是叫醒的次数（先试过攒一批再叫，晚了接不上话，
-    痕迹照样留着，撤了）。现在没什么要做的就清掉：从她点名的那行「这次唤醒你的是」起（不写就是
-    最近一行），画面、插话、思考、工具调用和结果都不留。赌的是她想的时候会有插话：插话照样叫醒她，
-    画面从清掉之前接着给，被清掉的消息和新的连在一起，等于她想的那段时间替她攒了一批。
-
-    WHY: 调过工具也信她：清掉的只是眼前的工作记忆，笔记是文件、行动记录和 llm.log 都还在，
-    和交接时由她决定留什么是同一种信任。只拦两种：那以后她发过话（别人多半在接她的话，她得记得
-    当时为什么这么说；清了只剩聊天记录里那句话）；输入框里有那以后打的、改过的字（本来就有的不拦，
-    维护者说框里的字可能是早先打的）。不跨交接：记号跟着这一段，交接后从新的一段算。
-
-    WHY: 维护者 2026-10-24：follow 期间到的消息画面不截，一直 dismiss 就会越攒越多。兜底是思考：
-    一个跟着的窗口里，会被退回去的 follow 期间消息超过 _FRESH_MAX 条，就不让清，她把这批看完留下，
-    画面位置跟着往前推；不想跟了就揭掉 follow。
-    """
-    if getattr(session, "quiet", False) or getattr(session, "segment", None) is None:
-        return "只有醒着处理消息的时候能用；交接、反思和子代理里没有可清的"
-    marks = session.segment.get("marks") or []
-    since = " ".join(str(since).split())
-    found = [mark for mark in marks if not since or since in (mark["at"], mark["at"][11:])]
-    if not found:
-        recent = "、".join(mark["at"] for mark in marks[-5:]) or "没有"
-        return f"这一段里找不到「这次唤醒你的是（{since}）」那一行；能清回的最近几次是：{recent}"
-    problem = _dismiss_problem(session, found[-1])
-    if problem:
-        return problem
-    session.dismiss = found[-1]
-    return ""
-
-
-def _next_number(segment: dict) -> int:
-    """下一个唤醒编号：这一段里用过的最大值 + 1。
-
-    WHY: 编号是 compress(first=…, last=…) 的地址。只看内存里的 marks 会在重启后从 1 重新
-    数——`_MARKS` 会截掉旧的，磁盘里载入的又不一定带号；`last_number` 记住用过的最大值，
-    重启也不会回绕。
-    """
-    highest = int(segment.get("last_number") or 0)
-    for one in segment.get("marks") or []:
-        highest = max(highest, int(one.get("number") or 0))
-    return highest + 1
-
-
-def _numbers(segment: dict) -> list[dict]:
-    """Give every wake mark a stable number (1, 2, 3 … oldest first); old segments get one on the spot."""
-    marks = segment.get("marks") or []
-    highest = int(segment.get("last_number") or 0)
-    for one in marks:
-        highest = max(highest, int(one.get("number") or 0))
-    next_number = highest + 1
-    previous = 0
-    for one in marks:
-        number = int(one.get("number") or 0)
-        if not number or number <= previous:
-            # 缺号，或者重启后从 1 重新数过：往回荡平，否则 compress(first=…, last=…) 会切错唤醒
-            one["number"] = next_number
-            next_number += 1
-        previous = max(previous, int(one["number"]))
-    segment["last_number"] = previous or highest
-    return marks
-
-
-def _mark_at(marks: list[dict], at: str) -> dict | None:
-    at = " ".join(str(at or "").split())
-    found = [mark for mark in marks if at and at in (mark["at"], mark["at"][11:])]
-    return found[-1] if found else None
-
-
-def request_compress(session, from_time: str = "", to_time: str = "", summary: str = "",
-                    first: int = 0, last: int = 0) -> str:
-    """Called by the `compress` tool: fold and archive wakes (this call included); returns what happened.
-
-    WHY: 维护者 2026-10-25：收哪段、摘要怎么写由她定。折叠放到这批工具结果都进了 messages
-    之后（`_finish_compress`），`from_time` 到现在的那次调用和它的结果也在被收的范围里，收完
-    一起从上下文里消失；中间块（给了 to_time）收不到末尾，调用本身在同批只有它时也一起抹掉。
-    """
-    segment = getattr(session, "segment", None)
-    if getattr(session, "quiet", False) or segment is None:
-        return "只有醒着处理消息的时候能用；交接、反思和子代理里没有可收的"
-    summary = str(summary or "").strip()
-    if not summary:
-        return "先写摘要：收掉以后原文就归档了，摘要要不看原文也接得上（什么事、到哪一步、还欠着什么）"
-    if getattr(session, "pending_compress", None) is not None:
-        return "同一批工具调用里只能收一次"
-    marks = _numbers(segment)
-    offered = _subconscious._offered(segment)
-    usable = "、".join(f"{mark.get('number')}.{mark['at'][11:]}" for mark in offered) or "没有"
-    if first or last:
-        # 编号跟着那次唤醒走，不跟着它在清单里的位置走：收掉中间的几段，后面的编号也不变。
-        first = max(1, int(first or 1))
-        last = max(first, int(last or first))
-        chosen = [mark for mark in offered if first <= int(mark.get("number") or 0) <= last]
-        if not chosen:
-            return f"这一段里没有第 {first} 到第 {last} 次唤醒；能收的是：{usable}"
-        after = next((mark for mark in marks if int(mark.get("number") or 0) > last), None)
-        from_time = chosen[0]["at"][11:]
-        to_time = after["at"][11:] if after is not None else ""
-    mark = _mark_at(marks, from_time)
-    if mark is None:
-        return f"这一段里找不到从 {from_time} 起的唤醒；能收的是：{usable}"
-    if mark.get("index", 0) == 0:
-        return "这一段第一次唤醒连着交接留下的笔记，不能收"
-    latest = max((other["time"] for other in marks), default=None)
-    if mark["time"] == latest:
-        return f"最近一次唤醒不收：刚做完的事，下次多半还要接着做。能收的是：{usable}"
-    after = None
-    if str(to_time or "").strip():
-        after = _mark_at(marks, to_time)
-        if after is None:
-            return f"找不到到 {to_time} 为止的唤醒；能收的是：{usable}"
-        if after["time"] <= mark["time"]:
-            return "to_time 要比 from_time 晚；那个时刻的唤醒本身不收"
-    session.pending_compress = {"mark": mark, "after": after, "summary": summary}
-    removed = segment["messages"][mark["index"]:after["index"] if after is not None else None]
-    saved = _text_tokens(removed) - _text_tokens([{"role": "system", "content": summary}])
-    where = f"{mark['at'][11:]} 到 {after['at'][11:]}" if after is not None else f"{mark['at'][11:]} 到现在"
-    return f"收了 {where}，这一段少了约 {_subconscious._amount(max(0, saved))} token。"
-
-
-def _finish_compress(session, results) -> None:
-    """Fold once this batch's results are in, so the call and its result go together."""
-    pending = session.pending_compress
-    session.pending_compress = None
-    segment = session.segment
-    segment["messages"] = _body(session)
-    if pending["after"] is None:
-        _fold_since(segment, pending["mark"], pending["summary"])
-    else:
-        _fold_between(segment, pending["mark"], pending["after"], pending["summary"])
-        _drop_compress_call(segment, results)
-    session.messages[_system_count(session):] = segment["messages"]
-
-
-def _drop_compress_call(segment: dict, results) -> None:
-    """Drop this compress call and its result when the middle fold left them behind.
-
-    WHY: 同一批里还有别的工具调用时，删掉这条 assistant 会让它们的 tool 结果变成孤儿；那种情况
-    留着，协议正确优先。
-    """
-    ids = {result.tool_call_id for result in results if result.name == "compress"}
-    if not ids:
-        return
-    body = segment["messages"]
-    for index in range(len(body) - 1, -1, -1):
-        message = body[index]
-        if message.get("role") != "assistant" or not message.get("tool_calls"):
-            continue
-        if not any(call.get("id") in ids for call in message["tool_calls"]):
-            continue
-        if len(message["tool_calls"]) != 1:
-            return
-        del body[index]
-        break
-    segment["messages"] = [message for message in body
-                           if not (message.get("role") == "tool" and message.get("tool_call_id") in ids)]
-
-
-def _shown_since(segment: dict, mark: dict) -> list[str]:
-    """Labels of the windows shown after *mark*: their screen position moved on since."""
-    return [label for label, last in segment.get("last_shown", {}).items() if mark["last_shown"].get(label) != last]
-
-
-def _piled(window: tuple, mark: dict) -> int:
-    """Follow-time lines of *window* that would come back unread if the stretch since *mark* went."""
-    layer = _chat_root._awaker.layer(window)
-    since = layer.get("since") if layer is not None and layer["state"] == "follow" else None
-    if since is None:
-        return 0
-    seen = mark.get("seen", {}).get(_screen.label(window))
-    return sum(1 for item in _screen.records(window, 1_000_000, since=since)
-               if item["time"] is not None and item["time"] >= int(since) and (seen is None or item["time"] > seen))
-
-
-def _dismiss_problem(session, mark: dict) -> str:
-    if (getattr(session, "last_sent", 0) or 0) >= mark["time"]:
-        return f"从 {mark['at']} 起你发过话，这段不能清：别人多半在接你的话，你得记得当时为什么这么说"
-    for window in _windows.parse_all(_shown_since(session.segment, mark)):
-        piled = _piled(window, mark)
-        if piled > _FRESH_MAX:
-            label = _screen.label(window)
-            return (f"{label} 从 {mark['at']} 起 follow 期间已经攒了 {piled} 条，超过 {_FRESH_MAX} 条就不能再清："
-                    f"这次留着，把它们看完；不想跟了就 wake_me(\"follow {label} off\")")
-    typed = [label for label, box in session.boxes.items()
-             if box.get("text") and box["text"] != mark["boxes"].get(label)]
-    if typed:
-        return (f"{'、'.join(typed)} 的输入框里有 {mark['at']} 之后打的或改过的字，清掉以后你会不记得打过；"
-                "先 send，或者用 type_word 改回原样或清空，再 dismiss")
-    return ""
-
-
-def _restore(segment: dict, mark: dict, keys) -> None:
-    for key in keys:
-        if key not in mark:
-            continue  # 早先记的记号没有 scopes
-        if mark[key] is None:
-            segment.pop(key, None)
-        else:
-            segment[key] = mark[key]
-    segment["marks"] = [kept for kept in segment.get("marks", []) if kept["time"] < mark["time"]]
-
-
-def _drop_since(segment: dict, mark: dict) -> None:
-    """Put the segment back as it was before *mark*'s wake; what was shown since comes back on the next screen."""
-    shown = _shown_since(segment, mark)
-    segment["messages"] = segment["messages"][:mark["index"]]
-    _restore(segment, mark, _MARKED)
-    _segment.save(segment)
-    # 画面上的"看到哪"也退回去：清掉的消息下次排在"以下是上次之后的新消息"下面，当没读过的给。
-    # oplog 的已读不退（日志里没有"标回未读"这种行），画面外那个窗口的未读条数因此不算它们。
-    seen = _seen()
-    for label in shown:
-        if mark["seen"].get(label) is None:
-            seen.pop(label, None)
-        else:
-            seen[label] = mark["seen"][label]
-    storage.save()
-    _chat_root._awaker.dismissed(_windows.parse_all(shown))
-
-
-def _fold_since(segment: dict, mark: dict, label: str) -> str:
-    """Replace the stretch since *mark* with one line naming where it was archived whole; returns that name.
-
-    Unlike a dismiss, what was shown stays read: the screen position does not move back.
-    """
-    shown = _shown_since(segment, mark)
-    name = _segment.archive({"started": mark["time"], "windows": shown, "reason": label,
-                             "messages": segment["messages"][mark["index"]:]}, "folded")
-    where = f"{'、'.join(shown)} 的画面和" if shown else ""
-    segment["messages"] = [*segment["messages"][:mark["index"]], {"role": "system", "content": (
-        f"【收起】{label}\n（{mark['at'][5:]} 至 {_screen.clock()[5:]}，{where}你那时的想法、调用，后台整理时收成了上面这段；"
-        f"原样存在归档段 {name}，加载 memory_system 用 read_context(\"{name}\") 读，search 也搜得到）")}]
-    # 画面位置不退。第一次给的笔记、中途的工具状态跟着收走了，这几项退回去，下次照样给。
-    _restore(segment, mark, ("scopes", "told", "tokens", "notice"))
-    _segment.save(segment)
-    return name
-
-
-def _fold_between(segment: dict, mark: dict, after: dict, label: str) -> str:
-    """Replace the wakes from *mark* up to (not including) *after* with one line; what follows stays as it was.
-
-    WHY: 维护者 2026-10-24：潜意识动不了段中间不太好，本以为是像操作数据一样操作上下文。中间收掉一块，
-    那之后她那条下一次请求要按原价重读（缓存只认前面一样的部分），偶尔一次只是几分钱，贵的是每轮都改
-    中间；所以潜意识看得到每处之后有多少 token，值不值由它按说明判断，代码不设门槛。
-
-    和收到最后不同，后面的唤醒还在：它们的记号下标往前挪，区间里第一次给的笔记从这一段和后面的记号里
-    一起退掉（下次再给），工具状态退回区间开头那时的（下次把变化重新说一遍，重复无妨）。区间不含这一段
-    第一次唤醒，开头那条交接留下的 notice 不会在里面。
-    """
-    start, end = mark["index"], after["index"]
-    removed = segment["messages"][start:end]
-    shown = [window for window, last in after["last_shown"].items() if mark["last_shown"].get(window) != last]
-    name = _segment.archive({"started": mark["time"], "windows": shown, "reason": label, "messages": removed}, "folded")
-    where = f"{'、'.join(shown)} 的画面和" if shown else ""
-    line = {"role": "system", "content": (
-        f"【收起】{label}\n（{mark['at'][5:]} 起到 {after['at'][5:]} 之前，{where}你那时的想法、调用，后台整理时收成了"
-        f"上面这段；原样存在归档段 {name}，加载 memory_system 用 read_context(\"{name}\") 读，search 也搜得到）")}
-    segment["messages"] = [*segment["messages"][:start], line, *segment["messages"][end:]]
-    shift = 1 - len(removed)
-    saved = _text_tokens(removed) - _text_tokens([line])
-    given = [scope for scope in after.get("scopes") or [] if scope not in (mark.get("scopes") or [])]
-
-    def moved(reported):
-        # 接口报的数若是在这一块之后报的，扣掉这一块的估算；报在这一块里面的已经对不上了，改回按字数估。
-        if not (isinstance(reported, list) and len(reported) == 2) or reported[1] <= start:
-            return reported
-        return [reported[0] - saved, reported[1] + shift] if reported[1] >= end else None
-
-    segment["scopes"] = [scope for scope in segment.get("scopes") or [] if scope not in given]
-    segment["tokens"] = moved(segment.get("tokens"))
-    if "told" in mark:
-        segment["told"] = mark["told"]
-    marks = []
-    for other in segment.get("marks", []):
-        if other["time"] < mark["time"]:
-            marks.append(other)
-        elif other["time"] >= after["time"]:
-            other = {**other, "index": other["index"] + shift, "tokens": moved(other.get("tokens"))}
-            if "scopes" in other:
-                other["scopes"] = [scope for scope in other["scopes"] or [] if scope not in given]
-            if "told" in mark:
-                other["told"] = mark["told"]
-            marks.append(other)
-    segment["marks"] = marks
-    _segment.save(segment)
-    return name
+request_dismiss = _segment.request_dismiss
+request_compress = _segment.request_compress
 
 
 def _body(session: llm.Chat) -> list[dict]:
@@ -1256,7 +790,7 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
     session.output_recorded = False
     session.last_usage = None
     reported = [segment.get("tokens")]
-    initial = _context_size(reported[0], _body(session))
+    initial = _segment.context_size(reported[0], _body(session))
     turn._chat_usage_tokens = initial
     turn.log["peak"] = max(turn.log["peak"], initial)
 
@@ -1294,10 +828,10 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
                  "content": result.content, "tool_call_id": result.tool_call_id}
                 for position, result in enumerate(results)], "")
         if getattr(session, "pending_compress", None) is not None:
-            _finish_compress(session, results)
+            _segment.finish_compress(session, results)
 
     def turn_done() -> bool:
-        used = _context_size(reported[0], _body(session))
+        used = _segment.context_size(reported[0], _body(session))
         turn._chat_usage_tokens = used
         turn.log["peak"] = max(turn.log["peak"], used)
         save()

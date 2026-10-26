@@ -558,7 +558,7 @@ def dismiss(since: str = "") -> str:
     from mods import chat
 
     session = current_binding().session
-    problem = chat.agent.request_dismiss(session, since)
+    problem = chat.segment.request_dismiss(session, since)
     if problem:
         return problem
     session.turn_done = lambda: True
@@ -594,7 +594,7 @@ def compress(from_time: str = "", to_time: str = "", summary: str = "",
     """
     from mods import chat
 
-    return chat.agent.request_compress(current_binding().session, from_time, to_time, summary, first, last)
+    return chat.segment.request_compress(current_binding().session, from_time, to_time, summary, first, last)
 
 
 def loop(note: str = "", stop: bool = False) -> str:
@@ -634,7 +634,7 @@ def wait(seconds: float) -> str:
     if chat.agent.wait_loop(seconds) is None:
         return "循环关着（#loop off），wait 是循环里用的；只是想过一会儿再醒，用 wake_me(\"10m\", 原因)"
     current_binding().session.turn_done = lambda: True
-    return f"好，这一轮到此为止，{chat.agent._span(seconds)}后再叫你；期间有消息照样叫你"
+    return f"好，这一轮到此为止，{chat.agent.span(seconds)}后再叫你；期间有消息照样叫你"
 
 
 def _format_results(results: Mapping) -> str:
@@ -709,22 +709,9 @@ def loop_note_history(last: int = 10) -> str:
     @param
     last: 最近几条，1 到 50
     """
-    import json
-    from pathlib import Path
+    from mods import chat
 
-    path = Path("data") / "context" / "loop.jsonl"
-    try:
-        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    except (OSError, ValueError):
-        return "还没有改过循环备注"
-    if not rows:
-        return "还没有改过循环备注"
-    picked = rows[-max(1, min(50, int(last))):]
-    lines = []
-    for row in picked:
-        when = time.strftime("%m-%d %H:%M", time.localtime(float(row.get("t") or 0)))
-        lines.append(f"- 第 {row.get('round', '?')} 轮 {when}：{row.get('note', '')}")
-    return f"你最近 {len(picked)} 次写下的循环备注（一共 {len(rows)} 条）：\n" + "\n".join(lines)
+    return chat.agent.loop_history(last)
 
 
 def clear_loop_note(confirm: bool = False) -> str:
@@ -733,13 +720,6 @@ def clear_loop_note(confirm: bool = False) -> str:
     @param
     confirm: 传 True 才真的清，防手滑
     """
-    from pathlib import Path
+    from mods import chat
 
-    path = Path("data") / "context" / "loop.jsonl"
-    if not confirm:
-        return "这会清掉全部备注历史，确定就再调一次 clear_loop_note(confirm=True)"
-    try:
-        path.unlink(missing_ok=True)
-    except OSError as error:
-        return f"没清掉：{error}"
-    return "循环备注历史清空了"
+    return chat.agent.clear_loop_history(confirm)

@@ -36,7 +36,7 @@ _SUBCOMMAND_HELP = (
 #reflect now      现在就跑一次（中心 agent 正忙时不执行）"""),
     ("loop [on|off]", """查看或开关循环总开关（开关要管理员），默认开。
 
-开着时循环是常态：她每次唤醒结束后隔两秒再叫醒她，一轮接一轮；她用 wait(秒数) 隔一会儿再来，用 loop(stop=True) 结束这一串（下次被别的叫醒又照常转）。她一个动作都没做的那几轮，间隔翻倍、最长半小时。夜里 4 点整理时停，维护者叫停她那一轮也停。关着时只有她自己 loop("在做什么") 才转。
+循环必须由她自己调用 loop("在做什么") 显式开启一串，外部唤醒不再自动挂起空循环。总开关开着时，开启后每次唤醒结束后隔两秒再叫醒她，一轮接一轮；她用 wait(秒数) 隔一会儿再来，用 loop(stop=True) 结束这一串。她一个动作都没做的那几轮，间隔翻倍、最长半小时。夜里整理时停，维护者叫停她那一轮也停。关着时关闭循环功能并停止正在转的这串。
 #loop        显示开关和现在这一串转到第几轮
 #loop on     打开
 #loop off    关掉（正在转的这一串也停）"""),
@@ -388,7 +388,7 @@ def _subcommand(value: str):
     if name == "reflect":
         return _reflect_subcommand(tail.strip())
     if name == "subconscious" and not tail:
-        return _chat_root._subconscious.report()
+        return _chat_root._segment.subconscious_report()
     if name == "subconscious" and tail:
         if tail.lower() not in ("on", "off"):
             return "subconscious 只能是 on 或 off"
@@ -396,16 +396,14 @@ def _subcommand(value: str):
         storage.save()
         return f"subconscious: {tail.lower()}"
     if name == "loop" and not tail:
-        current = _chat_root.agent._loop
-        state = f"，这一串转到第 {current['round']} 轮" + (f"：{current['note']}" if current["note"] else "") if current else ""
-        return f"loop: {'on' if _chat_root.agent.loop_on() else 'off'}{state}"
+        return _chat_root._agent.loop_status()
     if name == "loop" and tail:
         if tail.lower() not in ("on", "off"):
             return "loop 只能是 on 或 off"
         data["loop"] = tail.lower() == "on"
         storage.save()
         if not data["loop"]:
-            _chat_root.agent.stop_loop("#loop off")
+            _chat_root._agent.stop_loop("#loop off")
         return f"loop: {tail.lower()}"
     if name == "awaker":
         return _awaker_subcommand(raw)

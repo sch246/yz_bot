@@ -133,6 +133,21 @@ def label(window: tuple) -> str:
     return f"{window[0]}:{window[1]}"
 
 
+def title(window: tuple) -> str:
+    """清单里怎么称呼一个窗口：标签加名字（她起的名、群名或昵称），认不出就只写标签。"""
+    text = label(window)
+    name = known_name(window)
+    return f"{text}（{name}）" if name else text
+
+
+def parse_target(target: str) -> tuple[str, int]:
+    """Accept only an explicit QQ group or private-peer destination."""
+    matched = re.fullmatch(r"([gu])([1-9][0-9]*)", str(target).strip())
+    if matched is None:
+        raise ValueError("目标必须是 g<群号> 或 u<私聊对端号>")
+    return ("group" if matched[1] == "g" else "private"), int(matched[2])
+
+
 def parse(text: str) -> tuple:
     """The window a label names; ValueError for anything unregistered or malformed."""
     value = str(text).strip()

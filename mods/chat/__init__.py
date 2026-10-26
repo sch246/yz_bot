@@ -613,6 +613,19 @@ def record_event(event: dict, write: Callable[[], object]) -> object:
         return result
 
 
+def _addressed(event: dict, value: str) -> bool:
+    r"""这条消息是冲着 Bot 说的吗：at、以她的某个名字开头且后面跟逗号或空白、或者 `柚子，`。
+
+    WHY: 名字的认法和 `chat.capture_addressed_fallback` 一样（`{名字}[,，\s]+`）。以前这里只认
+    全角逗号，「柚子,在吗」「柚子 在吗」从 capture_chat 漏过去，落到那个兜底里直接调 `chat()`，
+    照样叫醒她，却绕开了覆盖层，mute 压不住（2026-10-23 临时脚本试出来的）。
+    """
+    names = "|".join(re.escape(name) for name in identity.names or (identity.bot_name(),))
+    return (_view.has_at(identity.bot_id())(event)
+            or value.startswith("柚子，")
+            or re.match(rf"(?:{names})[,，\s]", cq.unescape(value)) is not None)
+
+
 def activation_signal(event: dict) -> bool:
     """这条事件该不该把柚子叫醒——**只问这一件事**，不回答「它进不进上下文」。
 
@@ -632,7 +645,7 @@ def activation_signal(event: dict) -> bool:
         return False
     if msgs.is_msg(event):
         value = msgs.body(event)
-        if _reader._addressed(event, value):
+        if _addressed(event, value):
             return True
         if value.startswith("#"):
             if value == "#poke":
@@ -664,7 +677,7 @@ def _subcommand_call(event: dict) -> Callable | None:
     if not _in_chat_scope(event) or not msgs.is_msg(event):
         return None
     value = msgs.body(event)
-    if _reader._addressed(event, value) or not value.startswith("#") or value == "#poke":
+    if _addressed(event, value) or not value.startswith("#") or value == "#poke":
         return None
     subcommand = value[1:].strip().partition(" ")[0]
     if subcommand not in _subcommands._SUBCOMMAND_NAMES:
@@ -731,7 +744,7 @@ def capture_chat(event: dict) -> bool:
         # WHY: 被 mute 压住的点名照样返回 True、吃掉这条：放它往下走，后面的
         # capture_addressed_fallback 认出「柚子，」会直接调 chat()，静音就漏了。
         return matched
-    kind = ("mention" if msgs.is_msg(event) and _reader._addressed(event, msgs.body(event))
+    kind = ("mention" if msgs.is_msg(event) and _addressed(event, msgs.body(event))
             else "poke" if msgs.is_poke(event)
             else "private" if msgs.is_msg(event) and _private_from_peer(event)
             else "wake" if matched else "")
@@ -920,9 +933,8 @@ def on_load(ctx) -> None:
             _awaker.schedule()
 
     threading.Thread(target=start_awaker, name="chat-awaker-start", daemon=True).start()
-from . import view as _view, reader as _reader, agent as _agent, roles as _roles, subcommands as _subcommands, notes as _notes, awaker as _awaker
-from . import subconscious as _subconscious
+from . import view as _view, segment as _segment, screen as _screen, agent as _agent, roles as _roles, subcommands as _subcommands, notes as _notes, awaker as _awaker
 from .view import has_at, msg_split
-from .reader import parse_target, mark_window_read
+from .windows import kind, parse_target
+from .screen import mark_window_read
 from . import windows as _windows
-from .windows import kind
