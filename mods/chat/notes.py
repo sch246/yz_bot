@@ -30,12 +30,22 @@ from mods import storage
 
 ROOT = Path("data") / "notes"
 _lock = threading.RLock()
-_SCOPE = re.compile(r"^(self|global|recent|todo|awaker|person:\d+|group:\d+|diary:\d{4}(-\d{2}(-\d{2})?)?)$")
+# WHY: 2026-10-26 维护者指出：以前 _SCOPE 只许写死的那几种名字，她没法随手建专题笔记，只好把什么都往
+# global 里塞。现在放开任意名字或「分类:名字」（如 消消乐、topic:线代），同时守住 person:/group: 必须用
+# 号码、diary: 必须用日期、years 与 policy 不走普通笔记。
+_NAME = r"[0-9A-Za-z_\u4e00-\u9fff-]+"
+_SCOPE = re.compile(
+    rf"^(?:(?!years$|policy$){_NAME}|person:\d+|group:\d+|diary:\d{{4}}(?:-\d{{2}}(?:-\d{{2}})?)?"
+    rf"|(?!person:|group:|diary:|policy:|years:){_NAME}:{_NAME})$"
+)
 
 
 def _path(scope: str) -> Path:
     if not _SCOPE.fullmatch(scope):
-        raise ValueError("scope 只能是 self、global、recent、todo、awaker、person:<QQ号>、group:<群号> 或 diary:<日期>")
+        raise ValueError(
+            "scope 可以是 global、recent、todo、awaker、person:<QQ号>、group:<群号>、diary:<日期>，"
+            "或你自己起的专题笔记名（如 消消乐、topic:线代；person/group 冒号后写号码，policy 用 edit_policy）"
+        )
     if ":" not in scope:
         return ROOT / f"{scope}.md"
     kind, number = scope.split(":")
@@ -192,7 +202,7 @@ def listing(limit: int = 60) -> list[dict]:
     found = []
     for path in ROOT.rglob("*.md"):
         relative = path.relative_to(ROOT)
-        if relative.parts[0] in (".history", "diary", "policy"):
+        if len(relative.parts) > 2 or relative.parts[0] in (".history", "diary", "policy"):
             continue
         scope = path.stem if len(relative.parts) == 1 else f"{relative.parts[0]}:{path.stem}"
         # self 总在系统提示最前面，不用列进"可以召回的东西"。

@@ -214,7 +214,7 @@ def read_note(scope: str) -> str:
     """读一份笔记全文。
 
     @param
-    scope: self、global、recent、person:<QQ号> 或 group:<群号>
+    scope: self、global、recent、todo、awaker、person:<QQ号>、group:<群号>、diary:<日期> 或你自己建的专题笔记名（如 消消乐、topic:线代）
     """
     return _notes.render(scope) or f"（{scope} 还没有笔记）"
 
@@ -251,11 +251,13 @@ def directory(woken: list[tuple]) -> str:
     return "\n".join(lines)
 
 
+# WHY: 2026-10-26 审查发现：交接若也要求改写 global，她会在每次交接时把偶发小事和实操坐标往 global 里堆，
+# 并在 04:00 的交接里把反思的活提前干完，紧接着进入 _run_reflection 时看见刚改过的 global 和 recent 误以为
+# 系统重复触发了两次反思。因此交接只负责封存当前现场（recent、人和群、todo、日记），global 留给夜里反思统一打理。
 _HANDOFF = """这段上下文要被移除了（原因：{reason}）。移除之前确认交接做好：对照这段上下文，逐类确认每种信息都已经在它该在的地方。
 
 - 眼下在进行的事、还没回的话、刚看过的材料的结论与出处 → recent：改写成交接时的样子，做完的、和眼下无关的拿掉，不超过二十行。
 - 关于某个人、某个群的认识和经历 → person:<QQ号>／group:<群号>："## 认识"写知道什么，变了就写成"某日起改为……"；"## 经历"一行一件事，带日期和出处（窗口和时刻，或行动号）。
-- 做事的教训、被纠正的地方 → global：只留会改变你做法的条目。
 - 答应了还没做的事 → todo。
 - 今天发生了什么 → diary:{day}：改写成到目前为止的这一天——第一行一句话概括，之后按时间写发生了什么、做了什么决定、答应了什么，每条带出处。已经写过的保留，不要往后追加重复的段落。
 

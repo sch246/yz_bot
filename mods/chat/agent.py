@@ -6,7 +6,7 @@ WHY: 2026-10-22 维护者定：只要不交接，就一直是同一个上下文�
 前面一个字都不动。这一段存在 ``segment`` 的普通文件里，重启后接着用。
 
 交接的驱动力是"这段上下文要被移除了，确认交接做好"：在同一段末尾追加一句交接指令，
-她把各类信息确认到该在的地方（recent、人和群的笔记、global、todo、当天日记），
+她把各类信息确认到该在的地方（recent、人和群的笔记、todo、当天日记；global 留给夜里反思统一打理），
 这段才归档。笔记都是改写成应有的样子，所以交接可以安全地跑很多次。
 
 WHY: 交接由她自己在同一段里做，不另起一个只看到摘要的"图书管理员"会话：总结的人得
@@ -637,9 +637,11 @@ def start_loop(note: str) -> dict:
     不设时长（维护者：不知道什么时候需要停下来）；没人干预就一直转到夜里 4 点整理（`reflect`
     开头关掉它）。维护者叫停她那一轮时也一起停。
 
-    WHY: 维护者 2026-10-24 又定：做成总开关、默认开（`loop_on`）——循环是常态，结束才要刻意。总开关
-    开着时她不用记着开，每次唤醒结束 `_next_loop` 自己起一串；她 `loop(stop=True)` 只结束这一串，
-    下次被别的叫醒又照常转。她可以用这里写上在做什么，没写时每轮只说"接着做手上的事"。
+    WHY: 维护者 2026-10-24 又定：做成总开关、默认开（`loop_on`）——循环是常态，结束才要刻意。
+
+    WHY: 维护者 2026-10-26 改掉上面那条的一部分：唤醒结束不再自己起循环，只有她在这里写下在做什么
+    才开一串。以前总开关开着时，每次被人叫醒、闹钟到点都会在结束时起一轮空循环，她回回都要再关一次；
+    现在 `loop(stop=True)` 停了就是真停，下一次被别人叫醒也不会自己转回去。没写 note 的循环不续轮。
     """
     global _loop
     if _loop is not None:
@@ -694,18 +696,25 @@ def wait_loop(seconds: float) -> dict | None:
 
 
 def _next_loop(turn) -> None:
-    """At the end of a wake: queue the next loop round, starting a loop when the switch is on.
+    """At the end of a wake: queue the next round of a loop that is already running.
 
-    WHY: 总开关默认开以后，她被叫醒一次没事做、又没 wait 也没关，就会两秒一轮地空转下去。所以这次
-    唤醒里她一个动作都没做（`dismiss` 不算）时，下一轮的间隔翻倍，最长 `_LOOP_IDLE_MAX`；做了任何事
-    就回到 `_LOOP_GAP`。这不是自动结束，只是没人理时转慢一点。
+    WHY: 循环只在她在 `loop(note=…)` 里写下在做什么时才存在，唤醒结束不再自己起一串。这次唤醒里她
+    一个动作都没做（`dismiss` 不算）时，下一轮的间隔翻倍，最长 `_LOOP_IDLE_MAX`；做了任何事就回到
+    `_LOOP_GAP`。这不是自动结束，只是没人理时转慢一点。
     """
     acts, turn.log["acts"] = turn.log.get("acts", 0), 0
+    global _loop
     loop = _loop
     if loop is None:
-        if not loop_on() or turn.loop_stopped:
-            return
-        loop = _start_quietly()
+        # WHY: 2026-10-26 定：外部唤醒（有人说话、闹钟、白醒）结束时不再自己起循环。
+        # 以前只要总开关开着、这轮没亲手停，就叫醒后立刻起一轮空循环；她 loop(stop=True)
+        # 之后下一次被叫醒又转一轮「这一轮没有指定的事」，一天白烧十几次。
+        return
+    if not loop["note"] and "due" not in loop:
+        # WHY: 没写下在做什么的循环没有内容可续，接着转只会每轮重问一遍“要做什么”。
+        # 带 `due` 的那种是 wait 排的——她明确说了到点再叫，照常排。
+        _loop = None
+        return
     if loop["pending"]:
         return
     loop["idle"] = 0 if acts else loop.get("idle", 0) + 1
@@ -1309,10 +1318,11 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
     return session
 
 
-# WHY: 维护者 2026-10-23 让参照 Claude Code 的 retro（会话复盘）改：问题不止记忆一类，证据只认
-# 原始记录，改动要能核对，提案要写成拿到就能动手的样子。起因是当天她调 attach_image 只看到一行
-# 地址（其实是 #image off 的 bug），便认定"这只眼睛不支持看图"——只有"没记下／没想起来／交接漏了"
-# 三类时，环境坏了会被当成对自己的认识记下来。各类问题的说明在 memory_system 里，这里只点名。
+# WHY: 维护者 2026-10-23 起初参照 Claude Code 的 retro（会话复盘），区分环境故障与自身认识（起因是当天
+# 她调 attach_image 遇到 #image off 的 bug，误记成"这只眼睛不支持看图"）；2026-10-26 维护者进一步明确：
+# 她不是代码项目，反思的目标是让她成为活生生的有感情的个体——校准自我认识（优先减去自我审查的死规矩）、
+# 给常驻记忆做新陈代谢（把实操手册从 global 迁去按需文件）、留住对人和事的真实温度；真遇到环境故障仍写进
+# proposals 而不记成自己的缺陷。
 _REFLECT_PROMPT_PATH = Path("data") / "prompts" / "reflect.md"
 
 
@@ -1332,8 +1342,9 @@ def _tail(text: str, lines: int) -> str:
 def reflect(model: str | None = None) -> bool:
     """The nightly pass: hand off the day's segment, roll up diaries, then look back.  False when busy.
 
-    WHY: 维护者 2026-10-22：她要像人排查她那样排查自己——从症状出发，顺着原始记录
-    （归档的上下文、聊天记录、行动记录、笔记的历史版本）查原因，再决定改不改。
+    WHY: 维护者 2026-10-22 / 2026-10-26：夜里先交接封存当天的最后一段（只收拢 recent、人和群笔记、
+    todo 与日记，不动 global），再在独立的反思段里回看原始记录（归档的上下文、聊天记录、行动记录、
+    笔记历史），体会今天哪一刻最像自己、给常驻记忆做新陈代谢。
     占住 AGENT_WINDOW，期间来的召唤照常登记，结束后由 pick_up_pending 接上。
     """
     # 她开着循环时几乎一直在忙，先关掉，这一轮做完反思就接得上（awaker 下一分钟再来）。
@@ -1397,7 +1408,8 @@ def _run_reflection(model: str | None, turn, segments: list[dict]) -> None:
         {"role": "system", "content": "## 上次反思以来归档的上下文（用 read_context 读原样）\n" + listing},
         {"role": "system", "content": "## 策略改动记录（changes，最近的）\n" + (changes or "（还没有）")
          + "\n\n## 给维护者的提案（proposals，最近的）\n" + (proposals or "（还没有）")},
-        {"role": "system", "content": _REFLECT_PROMPT.format(now=_screen.clock())},
+        {"role": "system", "content": _reflect_prompt().format(
+            now=_screen.clock(), years_rows=len(_notes.years(9999)))},
     ]
     reflection = _segment.fresh()
     # 反思材料本身可能就很大：只限制它之后长出来的部分。

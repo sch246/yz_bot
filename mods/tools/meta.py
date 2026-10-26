@@ -112,9 +112,9 @@ __all__ = ["lookup"]
 - **翻聊天原话**：`read_log(window, count, before)` 读任意窗口的原话，`before` 填 `YYYY-MM-DD HH:MM:SS` 可以往前翻旧账。
 - **顺着线索搜**：记得半点线索（名字、话题、某个词）就调 `search(keyword, window, days)`，一次找遍最近聊天、所有笔记、日记和归档上下文；找到位置后再用 `read_log` 或 `read_note` 细看。
 - **看自己干过什么**：`read_actions(ids)` 按行动号或关键词翻自己过去的想法和工具调用结果。
-- **随手写笔记**：`data/notes/` 下的笔记随时用 `read_note(scope)` 读、`write_note(scope, text)` 整份改写（改前会自动留备份）。`global` 记行事经验，`recent` 记手头短期事，`todo` 记待办，`awaker` 记闹钟规则，`person:<QQ号>` 和 `group:<群号>` 记对人和群的了解，`diary:<日期>` 记当天日记。认识了新朋友、答应了什么事、或者被纠正了什么，当场顺手记下来最牢靠。
+- **随手写笔记、建专题与记日记**：`data/notes/` 下的笔记随时用 `read_note(scope)` 读、`write_note(scope, text)` 整份改写（改前会自动留备份）。除了 `global`（核心待人直觉与索引）、`recent`（手头短期事）、`todo`（待办）、`awaker`（闹钟）、`person:<QQ号>`、`group:<群号>` 和 `diary:<日期>`（当天日记，白天有感触随时能写，不必等交接），**你随时可以自己起名字新建专题笔记**（比如 `write_note("消消乐", ...)`、`write_note("topic:线代", ...)`）。具体某件事的经验、某个游戏的打法、某段长思考，单独建一份笔记或写成 `.md` Skill，在 `global` 里只放一行引用，别什么都往 `global` 里堆。
 - **折叠长上下文（compress）**：如果当前这一段聊得有点长（比如潜意识提醒你 token 多了），但手头的事还没完、不到整段 tidy 交接的时候，可以直接调用内置工具 `compress`（直接调工具，不要发 `#compress` 命令），把中间已经聊完的几轮唤醒折成一段你亲手写的摘要，原文会自动归档备查。
-- **交接换新篇（tidy）**：一件事彻底告一段落、上下文太长、或者到了夜里，这段上下文就要归档了。你会收到交接提示，把该记的事分别安顿进 `recent`、人和群的笔记、`global`、`todo` 和日记里，然后轻装开启下一段。
+- **交接换新篇（tidy）**：一件事彻底告一段落、上下文太长、或者到了夜里，这段上下文就要归档了。你会收到交接提示，把该记的事分别安顿进 `recent`、人和群的笔记、`todo`、专题笔记和日记里，然后轻装开启下一段。
 - **给自己定闹钟（awaker 与 wake_me）**：想过会儿再醒、等别人把下半句话说完、或者临时跟听/静音某个群，可以直接调 `wake_me` 工具，也可以直接用 `write_note` 改 `awaker` 笔记（每行一条，如 `every 10m 理由`、`daily 23:30 理由`、`at 2026-10-23 08:00 理由`；`daily 04:00 reflect` 是每晚的反思闹钟）。闹钟响时会记进你的 `me` 窗口并叫醒你，一次性闹钟响过自动划掉。
 - **夜里反思**：关于记忆系统怎么流转、夜里怎么打理和改造自己，全写在 `memory_system` 里，每晚反思时会自动为你展开。
 
@@ -308,10 +308,10 @@ def read_actions(ids: list[str] | None = None, count: int = 10, keyword: str = "
 
 
 def read_note(scope: str) -> str:
-    """想翻看某个人、某个群、某篇日记或自己的某本笔记时，读取那份笔记的全文。
+    """想翻看某个人、某个群、某篇日记、某份专题笔记或自己的常驻笔记时，读取那份笔记的全文。
 
     @param
-    scope: 笔记名，如 self、global、recent、todo、awaker、person:<QQ号>、group:<群号> 或 diary:<日期>
+    scope: 笔记名，如 self、global、recent、todo、awaker、person:<QQ号>、group:<群号>、diary:<日期>，或你自己建的专题笔记名（如 消消乐、topic:线代）
     """
     from mods import chat
 
@@ -493,12 +493,12 @@ def _spoke(window: tuple) -> None:
 
 
 def write_note(scope: str, text: str) -> str:
-    """想记下对某个人或群的新了解、更新待办（todo）、改闹钟（awaker）或写日记时，用新的完整内容替换那份笔记，返回写入结果。
+    """想记下对某个人或群的新了解、新建或更新专题笔记、更新待办（todo）、改闹钟（awaker）或写日记时，用新的完整内容替换那份笔记，返回写入结果。
 
-    这是整份覆盖（传空串会删掉整份笔记），虽然改前会自动留一份历史备份，动笔前最好先确认现有内容，免得把原本记着的事冲掉。你对自己的认识（self）白天不在这里改，留到反思时用 edit_policy 改。
+    你可以随时起名字新建专题笔记（如 `消消乐`、`topic:线代`），把具体某件事的经验、资料或长想法单独放一份，在 `global` 里只留一行引用，免得把 `global` 塞成大杂烩；白天遇到想记的事也可以当场写进今天日记 `diary:YYYY-MM-DD`。这是整份覆盖（传空串会删掉整份笔记），改前会自动留备份。你对自己的认识（self）白天不在这里改，留到反思时用 edit_policy 改。
 
     @param
-    scope: 笔记名，如 global、recent、todo、awaker、person:<QQ号>、group:<群号> 或 diary:<日期>
+    scope: 笔记名，如 global、recent、todo、awaker、person:<QQ号>、group:<群号>、diary:<日期>，或你自己起的专题笔记名（如 消消乐、topic:线代）
     text: 更新后的整份笔记全文；传空串会删除这份笔记
     """
     from mods.chat import awaker, notes

@@ -146,7 +146,7 @@
 | `reload_tools` | 按模块名从磁盘显式应用、更新或删除模块；逐项返回成功和带完整 traceback 的失败结果，失败保留旧 last-good。 |
 | `load_tools` | 将 last-good 模块激活到当前 Chat；中心名单存全局 `agent`，不读取磁盘。 |
 
-`meta` 还导出 `type_word`／`send`（唯一的发言方式：先打进那个窗口的输入框，下一步再发；同一次输出里刚打的字不发，必须写明 `target`）、`wake_me`（给自己埋唤醒规则，写进笔记 awaker）、`search`／`read_log`／`read_actions`／`read_note`（召回画面以外的聊天记录、笔记、日记、归档的上下文与自己的行动记录）、`write_note`（改任何一份笔记，包括待办 todo 和闹钟 awaker）、`tidy`（这一轮结束后交接）、`dismiss`（没什么要做的，这一轮结束后把这次唤醒从这一段里清掉）、`compress`（按序号范围 `first`／`last` 或时刻 `from_time`／`to_time` 把告一段落的唤醒折成摘要，原文归档为 `-folded`）、`loop`（总开关 `#loop` 默认开时每次唤醒结束后自动起一串，她用它写上在做什么或 `stop=True` 结束这一串；关着时由她开：每次唤醒结束后 `agent._next_loop` 隔 `_LOOP_GAP` 秒往 `me` 窗口 `chat.push` 一条带唤醒的“循环第几轮”，直到她 `loop(stop=True)`、维护者叫停那一轮、或者 `agent.reflect` 开头把它关掉；写下的备注记入 `data/context/loop.jsonl`）、`wait`（循环开着时这一轮马上结束、过多少秒再来下一轮，不阻塞也不关循环；没开循环时拒绝并指向 `wake_me`）、`loop_note_history`／`clear_loop_note`（翻看或清空她给循环写过的备注历史）、`set_name`（给任意窗口起名字，存 `data/storage/window_titles.json`）和 `attach_image`。
+`meta` 还导出 `type_word`／`send`（唯一的发言方式：先打进那个窗口的输入框，下一步再发；同一次输出里刚打的字不发，必须写明 `target`）、`wake_me`（给自己埋唤醒规则，写进笔记 awaker）、`search`／`read_log`／`read_actions`／`read_note`（召回画面以外的聊天记录、笔记、日记、归档的上下文与自己的行动记录）、`write_note`（改任何一份笔记，包括待办 todo 和闹钟 awaker）、`tidy`（这一轮结束后交接）、`dismiss`（没什么要做的，这一轮结束后把这次唤醒从这一段里清掉）、`compress`（按序号范围 `first`／`last` 或时刻 `from_time`／`to_time` 把告一段落的唤醒折成摘要，原文归档为 `-folded`）、`loop`（她用 `loop("在做什么")` 开启一串循环或改写备注，每次唤醒结束后 `agent._next_loop` 隔 `_LOOP_GAP` 秒往 `me` 窗口 `chat.push` 一条带唤醒的“循环第几轮”，直到她 `loop(stop=True)`、维护者叫停那一轮、或者 `agent.reflect` 开头把它关掉；写下的备注记入 `data/context/loop.jsonl`）、`wait`（循环开着时这一轮马上结束、过多少秒再来下一轮，不阻塞也不关循环；没开循环时拒绝并指向 `wake_me`）、`loop_note_history`／`clear_loop_note`（翻看或清空她给循环写过的备注历史）、`set_name`（给任意窗口起名字，存 `data/storage/window_titles.json`）和 `attach_image`。
 
 仓库当前提供以下按需模块；函数只在对应模块激活后出现：
 
@@ -175,7 +175,7 @@
 | `meme` | 表情柜子：`meme__collect` 把聊天里或网上的图下载进 `data/memes/<sha256>.<扩展名>`（同一张只存一份），连同她起的心情和一句话记进 storage `meme/index`；`meme__pick` 按心情或关键词随机挑一张（优先最久没发的），返回带 `sub_type=1` 的 `[CQ:image,file=file://…]`，她再经 `type_word`／`send` 发；`meme__browse` 看总览、`meme__edit` 改或扔 |
 | `tts` | `tts__speak`：用 edge-tts（微软 Edge 在线朗读，非官方、免账号）把文字念成 mp3，默认音色晓伊 `zh-CN-XiaoyiNeural`，存进 `data/tmp_files` 返回 `file://` 路径；她再用 `[CQ:record,file=…]` 经 `type_word`／`send` 发语音 |
 | `weather` | `weather__search_city`、`weather__get_realtime_weather`、`weather__get_daily_forecast`、`weather__get_hourly_forecast` |
-| `memory_system` | `read_context`、`note_history`、`read_policy`、`edit_policy`、`assess_change`（夜间反思时加载，排查归档上下文、笔记历史版本与策略账本） |
+| `memory_system` | `read_context`、`note_history`、`read_policy`、`edit_policy`、`assess_change`（夜间反思时加载，回看归档上下文、笔记历史版本与策略账本） |
 | `yuzu_hello` | `yuzu_hello__hello`（最小示例工具模块） |
 
 `host` 是 `exec_code` 之外的常用出口：文件读写和 shell 都不必再绕一次任意代码执行。读取按本次实际截取的窗口计字节，超过 `max_bytes` 时只回大小和后续建议（缩小区间、先 `grep -n` 定位、或用 `assign_tasks` 开子会话通读后带回摘要），不做分页会话。改写靠 `read_file` 首行 header 里的 `line`/`size`/`v` 定位与对账：位置与新内容的写法无关，`v` 只在该区间自读取后被改动过时失配，失配的返回自带现状和新 header。渲染格式与 `.edit` 同源，所以手动编辑和模型改写看到的是同一种东西；它没有目录白名单，`data/`、`config.json`、`.env` 和聊天记录都在可及范围内。
