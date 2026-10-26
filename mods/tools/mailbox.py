@@ -1,25 +1,20 @@
-"""读写一个或多个邮箱账号的信件：存账号、看未读、列邮件、读正文、列文件夹。
+"""打理你的邮箱小信箱：存账号、看未读、翻信件列表、读信件正文。
 
-凭据只落在宿主机 data/yuzu_mail.json（权限 600），不回显明文、不写进聊天。这里的"授权码"
-是各家邮箱设置里生成的应用密码/授权码，不是登录密码；多数服务商在 IMAP 上会拒绝登录密码。
-支持多账号：一个文件里放多个地址，用 account 参数按地址、标签或地址片段指定，留空则用默认账号。
+账号和授权码都锁在宿主机的 `data/yuzu_mail.json`（权限 600）里，不会明文回显，也不会漏进聊天记录。
+注意：这里存的 `authcode` 是各家邮箱后台生成的**客户端专用密码/授权码**，不是平时的网页登录密码（大多数邮箱的 IMAP 接口都不认直接拿登录密码去连）。你可以同时管好几个邮箱，用 `account` 参数挑用哪一个，留空就用默认邮箱。
 
-## 用法
+## 平时怎么查信
 
-1. `save_account(address, authcode, label, host, port, make_default)` 存账号；host 留空按域名
-   自动猜；同地址重复存即覆盖授权码，第一个账号自动成为默认。
-2. `list_accounts()` 看存了哪些账号、谁是默认、各自授权码指纹。
-3. `set_default(address)` / `remove_account(address)` 换默认、删账号。
-4. `status(account)` 连一次服务器，确认能不能登、收件箱几封、几封未读。
-5. `list_messages(limit, folder, unseen_only, keyword, account)` 列邮件，给出的是**序号**（1 开始，
-   与文件夹内顺序一致），不是 uid；读正文时把这个序号传给 `read_message`。
-6. `read_message(number, folder, max_chars, account)` 读某封的完整头部与正文纯文本。
-7. `list_folders(account)` 看文件夹（INBOX、Sent Messages 等）。
+1. **把邮箱存进来**：`save_account(address, authcode, label, host, port, make_default)`。`host` 留空会自动按邮箱后缀猜；存第一个邮箱时它会自动变成默认邮箱；同一个地址再存一次就是更新授权码。
+2. **看看存了哪些邮箱**：`list_accounts()` 能看到邮箱地址、哪个是默认的、以及授权码指纹；用 `set_default` 或 `remove_account` 可以换默认或删掉它。
+3. **探探收件箱动静**：`status(account)` 去连一下邮局服务器，看看能不能登上去、收件箱里一共几封信、有几封还没拆（未读）。
+4. **翻看信件列表与拆信**：
+   - 先用 `list_messages(limit, folder, unseen_only, keyword, account)` 把信列出来。注意它给你的编号是**当前文件夹里的顺序号**（从 1 开始数），不是邮件底层的 uid。
+   - 想拆开哪一封，就把刚才看到的那个顺序号传给 `read_message(number, folder, max_chars, account)` 读正文。
+   - 想翻收件箱以外的地方（比如已发送 Sent Messages、垃圾箱），用 `list_folders(account)` 看看都有哪些文件夹。
 
-常见 IMAP 主机：QQ/Foxmail 是 imap.qq.com，163 是 imap.163.com，126 是 imap.126.com，
-Gmail 是 imap.gmail.com（须用应用专用密码），Outlook 是 outlook.office365.com。
-只读不改：不删信、不发信、不改已读状态。
-"""
+常见邮局地址备忘：QQ/Foxmail 是 `imap.qq.com`，163 是 `imap.163.com`，126 是 `imap.126.com`，Gmail 是 `imap.gmail.com`，Outlook 是 `outlook.office365.com`。
+这个小信箱是**只读**的：只帮你看信，不会删信、发信，也不会把未读信件标成已读，放心翻看。"""
 
 from __future__ import annotations
 
