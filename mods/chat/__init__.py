@@ -241,6 +241,18 @@ def inc_usage_cost(price: float) -> None:
             entry[1] += price
 
 
+def _account_side_call(model: str, prompt_tokens: int, completion_tokens: int, cached_tokens: int) -> None:
+    """把图片描述这类旁路调用记进月账；日账由 llm 层在调用处写好。"""
+    inc_call_count()
+    try:
+        inc_call_cost(model, prompt_tokens, completion_tokens, cached_tokens)
+    except Exception:  # 模型不在配置里时只算调用次数，记账失败不能打断取图
+        pass
+
+
+llm.on_usage(_account_side_call)
+
+
 def init_chat(
     session: llm.Chat,
     messages: list | None = None,
@@ -290,7 +302,6 @@ def _activate_chat(
     binding.restore_schema()
     session.tool_binding = binding
     session.add_hint(lambda: _agent_hint())
-    session.add_hint("对外说话要先 type_word 打进输入框、下一步再 send；回复正文只是自言自语，不会发送到聊天窗口。")
     # WHY: 工具恢复可能持久化 ttl 回收；它必须先于其余全局设置读取，避免无关的配置异常
     # 改变这一轮是否完成回收。
     session.do_process_image = get_image_mode() != "off"
@@ -375,9 +386,7 @@ def _agent_hint() -> str:
         del data[_AGENT_HINT_KEY]
         storage.save()
     value = _notes.read("todo").strip()
-    # 人设在上下文最前面，聊十几轮就被冲淡了；这一句每轮都挂在末尾（维护者 2026-10-24 提案 2）。
-    tone = "说话：短，一句一条，像聊天不像汇报。"
-    return f"待办（笔记 todo，用 write_note 改）：\n{value}\n\n{tone}" if value else tone
+    return f"待办（笔记 todo，用 write_note 改）：\n{value}" if value else ""
 
 # 会话主体持久激活的工具模块名，以及各自最后一次被调用的时刻。
 _ACTIVE_MODULES_KEY = "active_tools"
@@ -659,6 +668,10 @@ def _subcommand_call(event: dict) -> Callable | None:
         return None
     subcommand = value[1:].strip().partition(" ")[0]
     if subcommand not in _subcommands._SUBCOMMAND_NAMES:
+        # WHY: 她自己用 op.send_command 敲错命令时不能静默——`#` 开头的输出默认不回她的
+        # 上下文（见 call），失败就这样消失了。普通群友仍不回，免得刷屏。
+        if event.get("user_id") == identity.bot_id() or op.is_op(event):
+            return lambda name=subcommand: f"没有 #{name} 这个命令，用 #help 看全部"
         return None
     if _subcommands.requires_op(value[1:]) and not op.require_op(
             event, pattern=r"^#\s*(hint|use_model|prompt|image|reasoning|limit|reflect|awaker)"):
@@ -681,8 +694,13 @@ def cond() -> Callable | bool:
 
 def call(data: Callable | bool):
     if callable(data):
+        text = str(data())
+        if (context.current() or {}).get("user_id") == identity.bot_id():
+            # WHY: 这条是她自己发的命令（op.send_command），结果要回到她的上下文里；加 `#`
+            # 会被当成命令回显挡掉，命令失败时她永远看不见原因。
+            return cq.escape(text)
         # `#` 前缀让子命令的输出不回流进 LLM 上下文，见 chat.screen.records。
-        return "#" + cq.escape(str(data()))
+        return "#" + cq.escape(text)
     return chat()
 
 

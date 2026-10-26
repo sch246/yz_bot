@@ -21,6 +21,8 @@ import time
 ROOT = Path("data") / "context"
 _CURRENT = ROOT / "current.json"
 _ARCHIVE = ROOT / "archive"
+# 每一段交接时往这里添一行：什么时候、多长、当时为什么结束。下一段开头挂最近几行。
+_YEARS = Path("data") / "notes" / "years.md"
 _lock = threading.Lock()
 
 
@@ -89,9 +91,33 @@ def archive(segment: dict, kind: str = "") -> str:
             target = _ARCHIVE / f"{name}-{number}.json"
         segment = {**segment, "ended": time.time()}
         target.write_text(json.dumps(segment, ensure_ascii=False), encoding="utf-8")
+        _append_year(segment)
         if kind == "" and _CURRENT.is_file():
             _CURRENT.unlink()
         return target.stem
+
+
+def _year_line(segment: dict) -> str:
+    """One line for ``years.md``: when, how long, and why that segment ended."""
+    started, ended = segment.get("started", 0), segment.get("ended") or time.time()
+    if time.strftime("%m-%d", time.localtime(started)) == time.strftime("%m-%d", time.localtime(ended)):
+        span = f"{time.strftime('%m-%d %H:%M', time.localtime(started))}–{time.strftime('%H:%M', time.localtime(ended))}"
+    else:
+        span = f"{time.strftime('%m-%d %H:%M', time.localtime(started))}–{time.strftime('%m-%d %H:%M', time.localtime(ended))}"
+    # 交接时她自己写的 reason 是最好的摘要；强制归档没有 reason，就只记窗口。
+    reason = (segment.get("reason") or "").strip().split("\n")[0].strip()
+    tail = reason[:80] if reason else "窗口 " + "、".join(segment.get("windows") or ["无"])
+    return f"- {span}（{len(segment.get('messages') or [])} 条）{tail}"
+
+
+def _append_year(segment: dict) -> None:
+    try:
+        _YEARS.parent.mkdir(parents=True, exist_ok=True)
+        with _YEARS.open("a", encoding="utf-8") as handle:
+            handle.write(_year_line(segment) + "\n")
+    except OSError:
+        # 年鉴只是索引，写不进去不能妨碍归档本身。
+        pass
 
 
 def each_archived(since: float = 0, newest_first: bool = False):

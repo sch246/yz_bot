@@ -47,7 +47,7 @@
    - 目录（`roles.directory`），只列名字：其它最近有消息的窗口、笔记、日记。
 2. **每次唤醒追加的材料**（`agent._run_agent`），前面的消息一个字都不动：
    - 这一段里第一次出现的窗口和作者（最多 6 人）的笔记（`agent._people`）；
-   - 叫醒她的窗口画面（2026-10-23 起学 Cortico 分开别人的话和系统的话）：每个窗口一条 user 消息（`view.outside`），第一行是框头（`窗口 g123 · 画面 · 时刻`，插话时写"你干活时刚到的"和其中叫她的激活），下面是 chatlog 原文，图片在原处。user 消息只装外面来的记录；系统自己说的话——笔记块、目录、工具状态、"这次唤醒你的是"、交接说明和交接指令、输入框提示、反思材料、末尾 hint（`Chat.hint_role`）——都是对话中间的 system 消息。DeepSeek 文档说 Chat Completions 支持在对话中间插 system、不支持插工具调用；当天先做过一版合成 `incoming` 工具调用的框，随即换成这样，那时存下的框（`view.is_incoming`）仍不算她做过的事，`search` 的归档部分不搜，`read_context` 显示成【incoming】。系统提示有几条由 `agent._system_count` 记的 `prompt_count` 决定，不再按角色找边界。这一段里第一次出现的窗口给 `max_events` 条，已经出现过的从这一段里上次给到的那条记录之后接着给（记在这一段的 `last_shown`，不按看到时间，因为它只精确到秒）；交接后续做时沿用刚才看着的窗口；
+   - 叫醒她的窗口画面（2026-10-23 起学 Cortico 分开别人的话和系统的话）：每个窗口一条 user 消息（`view.outside`），第一行是框头（`窗口 g123 · 画面 · 时刻`，插话时写"你干活时刚到的"和其中叫她的激活），下面是 chatlog 原文，图片在原处。user 消息只装外面来的记录；系统自己说的话——笔记块、目录、工具状态、"这次唤醒你的是"、交接说明和交接指令、输入框提示、反思材料、末尾 hint（`Chat.hint_role`）——都是对话中间的 system 消息。DeepSeek 文档说 Chat Completions 支持在对话中间插 system、不支持插工具调用；当天先做过一版合成 `incoming` 工具调用的框，随即换成这样，那时存下的框（`view.is_incoming`）仍不算她做过的事，`search` 的归档部分不搜，`read_context` 显示成【incoming】。系统提示有几条由 `agent._system_count` 记的 `prompt_count` 决定，不再按角色找边界。这一段里第一次出现的窗口，有全局看到位置时只给新消息和前面 3 条旧记录接话，没有看到位置时才按 `max_events` 补历史（至少 3 条）；已经出现过的从这一段里上次给到的那条记录之后接着给（记在这一段的 `last_shown`，不按看到时间，因为它只精确到秒）；交接后续做时沿用刚才看着的窗口；
    - "这次唤醒你的是（时刻）"、闹钟理由，或"你刚把上一段上下文交接掉了"；
    - 第一次输出之后，每次子请求之前 `agent._late_arrivals` 把画面里的窗口新到的未读按画面同样的规则（从 `last_shown` 接着给，最多 200 条）追加进这一段，标题写窗口、时刻和其中的激活。`last_shown` 在追加时推进（它和这一段一起存盘）；看到时间和已读等那次请求产生输出（哪怕只有思考）才记，所以收尾不再为它们多叫一次，请求失败时它们仍是未读、照样再叫醒她，画面也不会再给一遍。只有她自己发出去的回显时不插。
 
@@ -235,7 +235,7 @@ hint 与追加式上下文是两层，判据是一句话：**频繁变化、且�
 `image`（图片档位）、`reasoning`、`max_events`、`tidy_token` 共用 `mods.chat.AGENT_SETTINGS` 的全局归一化规则。中心主会话只读全局 `agent` storage；op 用 `#use_model`、`#image`、`#reasoning`、`#limit` 等命令修改它。旧窗口聊天配置不自动迁移，也不再读取；`#hint` 的窗口配置是独立例外。
 
 - **缺省值写死在代码里**（`DEFAULT_MAX_EVENTS` / `DEFAULT_TIDY_TOKEN` 与各归一化函数的兜底分支），不再读 `llm_system/config.json`。中心运行期覆盖只有全局 `agent` storage 一份；`#limit` 是唯一预算命令入口。
-- **两个预算**：`max_events`（默认 80，存储键沿用旧名）是窗口画面的默认条数；`tidy_token`（默认 500000，维护者 2026-10-23 定，约是模型上下文的一半，给交接留出余量）是整理阈值，即整理条件里的 `limit`：默认条件下这一段上下文超过它就交接；反思只限制材料之后新长出来的部分不超过它。2026-10-22 以前是 `max_token × pressure_percent` 两个数，那是按每次重组上下文定的预算，第一次读到时删掉旧键、用默认。旧窗口覆盖不自动迁入全局主体。每晚反思的时刻在笔记 awaker 里，`agent.reflected_at` 记上次反思的时间。旧的 `agent.librarian_model`、`agent.tidied_at` 不再读取。
+- **两个预算**：`max_events`（默认 80，存储键沿用旧名）是从没看过的窗口的首屏条数；交接后已有看到位置的窗口只补 3 条旧记录接话，新消息仍按前述画面规则给；`tidy_token`（默认 500000，维护者 2026-10-23 定，约是模型上下文的一半，给交接留出余量）是整理阈值，即整理条件里的 `limit`：默认条件下这一段上下文超过它就交接；反思只限制材料之后新长出来的部分不超过它。2026-10-22 以前是 `max_token × pressure_percent` 两个数，那是按每次重组上下文定的预算，第一次读到时删掉旧键、用默认。旧窗口覆盖不自动迁入全局主体。每晚反思的时刻在笔记 awaker 里，`agent.reflected_at` 记上次反思的时间。旧的 `agent.librarian_model`、`agent.tidied_at` 不再读取。
 - **`hint` 与 `prompt` 不在表里**：窗口结束提示的 `#hint` 是 `data/hint/` 下的文件，独立合并全局默认与窗口覆盖；她对自己的认识是笔记 self（`data/notes/self.md`）。它们不是单值档位，不使用 `AGENT_SETTINGS` 的归一化。
 - 已退役的窗口聊天设置仍可能留在生产 storage，但运行代码不再读取；其清理需先获维护者授权，见[第二轮调查](working/round2-legacy-and-backfill-audit.md)。
 

@@ -43,6 +43,7 @@ _SUBCOMMAND_HELP = (
     ("subconscious [on|off]", """查看或开关潜意识提醒（开关要管理员），默认开。
 
 不再自动整理：这一段比上次提醒时又长 5 万 token，就在下一轮请求末尾插一条 system 提醒（这一段多长、能收哪几段、各多大）。收不收、收哪段、摘要怎么写都由你自己调 compress；提醒不写进这一段，收掉以后自然不在。
+（compress 和 tidy 都是工具，直接调用，不要用 # 号发）
 compress(from_time, to_time="", summary="")：把从 from_time 起、到 to_time 之前（留空就是到现在）的唤醒换成 summary，原文另存成归档段（名字带 -folded）；这次调用和结果也会一起从眼前消失。最近一次唤醒和这一段第一次唤醒不收；一次可以收好几段，分几次调。
 #subconscious       显示开关、这一段多长、离下次提醒还差多少、上次提醒
 #subconscious on    打开

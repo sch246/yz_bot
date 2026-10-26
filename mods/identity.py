@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import random
+import time
 from typing import Any
 
 from mods import INFRA
@@ -94,6 +95,25 @@ def get_user_name(user_id: int) -> str:
         update_user_name(user_id, value)
         return value
     return "[unknown]"
+
+
+_group_titles: dict[int, tuple[str, float]] = {}
+_GROUP_TITLE_TTL = 86400.0  # 一天一次就够：群名很少改，问得太勤只是白跑接口
+
+
+def get_group_name(group_id: int) -> str:
+    """A group's title, cached for a day; empty when the lookup fails and there is no cache."""
+    group_id = int(group_id)
+    cached = _group_titles.get(group_id)
+    if cached and time.time() - cached[1] < _GROUP_TITLE_TTL:
+        return cached[0]
+    reply = connect.call_api("get_group_info", group_id=group_id)
+    if reply.get("retcode") == 0 and isinstance(reply.get("data"), dict):
+        value = str(reply["data"].get("group_name") or "").strip()
+        if value:
+            _group_titles[group_id] = (value, time.time())
+            return value
+    return cached[0] if cached else ""
 
 
 def refresh_group_member_list(group_id: int) -> list[int]:

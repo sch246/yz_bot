@@ -49,11 +49,13 @@ def nudge(segment: dict) -> str | None:
     segment["nudged_at"] = time.time()
     _segment.save(segment)
     counts = _chat_root._agent._text_tokens
-    listing = "\n".join(f"{mark['at'][11:]}（之后约 {_amount(counts(messages[mark['index']:]))}）"
-                        for mark in offered)
+    listing = "\n".join(f"{mark.get('number')}. {mark['at'][11:]}（之后约 {_amount(counts(messages[mark['index']:]))}）"
+                        for mark in _chat_root._agent._numbers(segment) if mark in offered)
     return (f"上下文又长了，这一段现在约 {_amount(size)} token。省着点用。\n"
             f"能收的唤醒（括号里是收掉以后，后面要按原价重读多少）：\n{listing}\n"
-            f"要收就用 compress：compress(from_time=\"{offered[0]['at'][11:]}\", to_time=\"\", summary=\"……\")\n"
+            f"要收就直接调用 compress 工具（不是 # 命令，别用 send_command 发）："
+            f"compress(first=1, last=3, summary=\"……\")，序号就是上面那些数字；"
+            f"要一段一段挑也可以写时刻 compress(from_time=\"{offered[0]['at'][11:]}\", to_time=\"\", summary=\"……\")\n"
             f"不收就不用管，这条提醒到下次收的时候会一起没。")
 
 

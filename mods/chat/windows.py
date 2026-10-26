@@ -12,14 +12,61 @@ MC 服务器聊天同样是她要看、要回的地方，用同一个模型，�
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import re
 from typing import Callable
+
+from mods import identity
 
 QQ = ("group", "private")
 ME = ("me", "")
 _NAME = re.compile(r"[a-z][a-z0-9_]*")
 _SAY_TIMEOUT = 30.0
+
+
+_TITLES = Path("data") / "storage" / "window_titles.json"
+
+
+def _titles() -> dict:
+    try:
+        loaded = json.loads(_TITLES.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def set_title(window: tuple, name: str) -> str:
+    """给一个窗口起个名字（空字符串是删掉），存盘，重启还在。
+
+    WHY: 2026-10-26 维护者：“给窗口号换名字的工具，这个比现有的还通用”——
+    群、私聊、B 站评论区、手机都该能起名，不只 QQ 昵称。
+    """
+    key = f"{window[0]}:{window[1]}"
+    loaded = _titles()
+    if name.strip():
+        loaded[key] = name.strip()
+    else:
+        loaded.pop(key, None)
+    _TITLES.parent.mkdir(parents=True, exist_ok=True)
+    _TITLES.write_text(json.dumps(loaded, ensure_ascii=False, indent=1), encoding="utf-8")
+    return loaded.get(key, "")
+
+
+def known_name(window: tuple) -> str:
+    """她起的名 > 群名 > 昵称；都没有就空字符串。"""
+    custom = _titles().get(f"{window[0]}:{window[1]}")
+    if custom:
+        return str(custom)
+    kind, target = window
+    try:
+        if kind == "group":
+            return identity.get_group_name(int(target))
+        if kind == "private":
+            return identity.get_user_name(int(target))
+    except (TypeError, ValueError):
+        return ""
+    return ""
 
 
 class Unconfirmed(Exception):

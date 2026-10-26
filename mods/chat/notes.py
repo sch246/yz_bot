@@ -59,13 +59,26 @@ def read(scope: str) -> str:
     return path.read_text(encoding="utf-8") if path.is_file() else ""
 
 
+def years(last: int = 8) -> list[str]:
+    """The newest lines of the year index: one line per archived segment, oldest first."""
+    try:
+        lines = [line.rstrip() for line in (ROOT / "years.md").read_text(encoding="utf-8").splitlines()
+                 if line.startswith("- ")]
+    except OSError:
+        return []
+    return lines[-last:]
+
+
 def render(scope: str) -> str:
-    """One note as the model sees it, or empty when there is nothing to show."""
+    """One note as the model sees it, or empty when there is nothing to show.
+
+    WHY: 2026-10-26 维护者：每一段上下文开头都写明它来自哪个文件，她一眼就能看到改哪里。
+    """
     body = read(scope).strip()
     name = custom_name(scope)
     if name:
         body = f"维护者设定的称呼：{name}\n{body}".strip()
-    return f"## 笔记 {scope}\n{body}" if body else ""
+    return f"## 笔记 {scope}（{_path(scope).as_posix()}）\n{body}" if body else ""
 
 
 def _backup(path: Path) -> None:
@@ -127,7 +140,7 @@ def read_version(scope: str, version: str) -> str:
 
 # WHY: 策略文件是她在反思里能改的那一层（2026-10-22）：handoff 是她给交接写的附加说明，
 # tidy 是什么时候交接的 Python 条件，changes 是每次改动的原因、预期和事后评估，
-# proposals 是要维护者动手的改动（代码、醒来时带什么）。旧的 subconscious 策略文件（潜意识怎么
+# proposals 是要维护者动手的改动（醒来时带什么、她改不动的）。旧的 subconscious 策略文件（潜意识怎么
 # 判断，2026-10-24）2026-10-25 起不再读：潜意识只剩一条提醒，收不收由她自己调 compress 决定；
 # 盘上的文件留着，不再经过这里。
 POLICIES = ("handoff", "tidy", "changes", "proposals")
