@@ -14,15 +14,15 @@
 
 此外，她用 `wake_me` 在笔记 awaker 里埋下的 `on`／`wait` 规则在消息到达时由 `capture_chat` 认领（`awaker.take_waiting`）：这个窗口（或窗口里这个人）来了消息就叫醒她，唤醒原因写"等到了（规则原文）"，规则划掉。在这些默认判据之上，窗口可以盖一层限时的覆盖层（`awaker.triggered`）：笔记里的 `follow`（每条消息都叫）、`mute`（都不叫），或者代码用 `awaker.override` 设的 `other`（一个函数决定）。它决定 `activation_signal` 的结果算不算数，也决定 `chat.push` 的 `wake=` 算不算数；`on`／`wait` 和显式的 `chat.wake` 不经过它，`me` 不能盖，master 的话 mute 压不住。被 mute 压住的点名照样由 `capture_chat` 吃掉，免得后面的 `capture_addressed_fallback` 直接调 `chat()`。盖着的窗口在画面框头和未读提示里带上 `awaker.badges`，被它叫醒时唤醒原因写"覆盖层 follow 到 …：理由"。她用 `send` 发出去以后（`awaker.spoke`），这个群 5 分钟内没有别的覆盖层时自动算 `follow`，她连着两次 `dismiss` 掉看过它的唤醒就停。
 
-被叫醒了没什么要做的，她调 `dismiss(since)`（`agent.request_dismiss`）：这一轮结束后，这一段退回到 `since` 那行“这次唤醒你的是（时刻）”之前（不写就是最近一行），画面、插话、思考、工具调用和结果都不留。每次唤醒追加之前，`_run_agent` 在这一段里记一个记号（`marks`：消息条数、`last_shown`、`windows`、`scopes`（这一段给过哪些人和群的笔记）、`told`、`tokens`、`notice` 和当时输入框里的字），清的时候照它恢复，清掉的唤醒里第一次给的笔记下次跟着画面再给；`last_shown` 和画面"看到哪"的标记（`agent._seen`，记号里存着当时的值）退回去，所以清掉的消息回到没读，下次画面接着给，排在“以下是上次之后的新消息”下面；oplog 的已读标记和唤醒确认不退（日志里没有"标回未读"），画面外的未读条数因此不算它们。oplog 和 llm.log 不清。从那以后她发过话（`last_sent`），或者输入框里有那以后打的、改过的字，就不让清；跟着的窗口里清了会退回去的 follow 期间消息超过 `_FRESH_MAX`（200）条也不让清（`agent._piled`），因为这些消息画面不截，一直清会越攒越多；记号跟着这一段，交接后重新算。
+被叫醒了没什么要做的，她调 `dismiss(since)`（`agent.request_dismiss`；或者整轮唤醒一个工具都没调、只是看了一眼时收尾自动触发）：这一轮结束后，这一段退回到 `since` 那行“这次唤醒你的是（时刻）”之前（不写就是最近一行），画面、插话、思考、工具调用和结果都不留。每次唤醒追加之前，`_run_agent` 在这一段里记一个记号（`marks`：消息条数、固定递增序号 `number`、`last_shown`、`windows`、`scopes`（这一段给过哪些人和群的笔记）、`told`、`tokens`、`notice` 和当时输入框里的字），清的时候照它恢复，清掉的唤醒里第一次给的笔记下次跟着画面再给；`last_shown` 和画面"看到哪"的标记（`agent._seen`，记号里存着当时的值）退回去，所以清掉的消息回到没读，下次画面接着给，排在“以下是上次之后的新消息”下面；oplog 的已读标记和唤醒确认不退（日志里没有"标回未读"），画面外的未读条数因此不算它们。oplog 和 llm.log 不清。从那以后她发过话（`last_sent`），或者输入框里有那以后打的、改过的字，就不让清；跟着的窗口里清了会退回去的 follow 期间消息超过 `_FRESH_MAX`（60）条也不让清（`agent._piled`），因为这些消息画面不截，一直清会越攒越多；记号跟着这一段，交接后重新算。
 
-`#subconscious`（storage `agent.subconscious`，默认开）现在只剩一条提醒：`agent._drive_agent` 每轮组装请求时把 `subconscious.nudge(segment)` 挂在 hint 末尾（`_run_session` 的 `hints`，和“现在是几点”一样只进这一份请求、不进这一段），这一段比 `segment["settled"]` 上次提醒时又长 5 万 token（用 `_context_size` 量）就返回一条 system 消息：这一段多长、能收哪几段（`marks` 里 `index > 0`、去掉最近一次，各带那之后约多少 token）、`compress` 怎么调；同时把 `settled` 和 `nudged_at` 写回 `current.json`。第一次见到这一段、或她 dismiss 把这段清短了，只记基准、不提醒。收不收、收哪段、摘要怎么写都由她自己调 `compress`（`mods/tools/meta.py`，和 `tidy`／`dismiss` 一起注册）：`compress(from_time, to_time="", summary="")` 把起点记号之后的唤醒交给 `agent.request_compress`，`request_compress` 只校验并记下待收范围，真正的折叠在 `record_results` 里、这批工具结果都进了 messages 之后由 `_finish_compress` 做：`to_time` 留空走 `agent._fold_since`，一次收到现在（包括这次 compress 的调用和结果，收完一起从上下文消失）；给了 `to_time` 走 `agent._fold_between`，只收中间，同批只有这个调用时它和结果也一并删掉。`_fold_since` 把从记号起到最后换成一条 system 摘要，原样另存为 `archive/<时刻>-folded.json`，`scopes`、`told`、`tokens`、`notice` 退回记号时的值，`last_shown` 和看到哪不退；`_fold_between` 收中间那几次唤醒，后面记号的下标往前挪，区间里第一次给的 `scopes` 从这一段和后面的记号里退掉，`told` 退回区间开头的值，`tokens` 扣掉这一块的估算。这一段第一次唤醒（连着交接留下的笔记）和最近一次唤醒都收不了。提醒不进 oplog，请求日志里照常是这次请求的一部分；动作记录里能看到 `compress` 这次调用。`#subconscious` 显示开关、这一段多长、离下次提醒还差多少和上次提醒的时刻。
+`#subconscious`（storage `agent.subconscious`，默认开）现在只剩一条提醒：`agent._drive_agent` 每轮组装请求时把 `subconscious.nudge(segment)` 挂在 hint 末尾（`_run_session` 的 `hints`，和“现在是几点”一样只进这一份请求、不进这一段），这一段比 `segment["settled"]` 上次提醒时又长 5 万 token（用 `_context_size` 量）就返回一条 system 消息：这一段多长、能收哪几段（`marks` 里 `index > 0`、去掉最近一次，带固定序号及各带那之后约多少 token）、`compress` 怎么调；同时把 `settled` 和 `nudged_at` 写回 `current.json`。第一次见到这一段、或她 dismiss 把这段清短了，只记基准、不提醒。收不收、收哪段、摘要怎么写都由她自己调 `compress`（`mods/tools/meta.py`，和 `tidy`／`dismiss` 一起注册）：支持按序号范围 `compress(first=1, last=3, summary="")` 或按时刻 `compress(from_time, to_time="", summary="")` 把起点记号之后的唤醒交给 `agent.request_compress`，`request_compress` 只校验并记下待收范围，真正的折叠在 `record_results` 里、这批工具结果都进了 messages 之后由 `_finish_compress` 做：`to_time` 留空走 `agent._fold_since`，一次收到现在（包括这次 compress 的调用和结果，收完一起从上下文消失）；给了 `to_time` 走 `agent._fold_between`，只收中间，同批只有这个调用时它和结果也一并删掉。`_fold_since` 把从记号起到最后换成一条 system 摘要，原样另存为 `archive/<时刻>-folded.json`，`scopes`、`told`、`tokens`、`notice` 退回记号时的值，`last_shown` 和看到哪不退；`_fold_between` 收中间那几次唤醒，后面记号的下标往前挪（但记号的固定序号 `number` 不变），区间里第一次给的 `scopes` 从这一段和后面的记号里退掉，`told` 退回区间开头的值，`tokens` 扣掉这一块的估算。这一段第一次唤醒（连着交接留下的笔记）和最近一次唤醒都收不了。提醒不进 oplog，请求日志里照常是这次请求的一部分；动作记录里能看到 `compress` 这次调用。`#subconscious` 显示开关、这一段多长、离下次提醒还差多少和上次提醒的时刻。
 
 这些判据判定要叫醒她时都走 `chat.wake(event, kind)`：在 oplog 里把这条到达标为激活，再驱动中心 agent；她正忙时激活留着，这一轮收尾时接上。它是唤醒方式的函数入口，link 节点、`.py` 或其它模块也可以在**这条消息的派发过程中**调用（到达号只在派发期间可查，事后调用会报错）；`kind` 原样出现在她看到的"这次唤醒你的是"里。不带消息时写 `chat.wake(reason=..., kind=...)`，随时能调（awaker 规则到点、`when` 条件成立、她用 `exec_code` 包在某个函数上的钩子）：等于 `chat.push(me, kind, reason, wake=kind)`，理由作为一条记录写进她自己的 `me` 窗口，见下一段。夜间反思走 `agent.reflect`。
 
 **窗口种类**（`chat.windows`，2026-10-23 起）：窗口是 `(种类, 目标)`。QQ 的群和私聊是两种，标签 `g123`／`u456`；`me` 是她自己的窗口；别的来源用 `chat.kind(名字, send=发送函数)` 登记一种，标签写 `名字:目标`。所有窗口的记录都在 `chatlog/<种类>/<目标>/` 下、格式相同，所以画面、`read_log`、`search`、未读与唤醒不分种类。QQ 以外的窗口由 `chat.push(window, author, text, wake="原因")` 写入：在窗口锁里先追加 chatlog，再登记 oplog 到达；`wake` 非空就激活，原因出现在"这次唤醒你的是"里，另开线程驱动她，她正忙时这一轮收尾接上；`push` 写完就返回，报错只表示记录或到达没写成。到达在 oplog 里，重启不丢。`type_word`／`send` 按种类调登记的发送函数；发送函数返回记录号表示发出去了，抛 `windows.Unconfirmed` 表示可能发出去了，抛别的表示没发出去。没有发送函数的种类（包括 `me`）只能看。`push` 可以带 `record_id`（来源自己的编号，比如 B 站评论号），不带就编一个 8 位十六进制号。
 
-**B 站**（`mods/bili.py`，2026-10-23 起）：柚子自己的 B 站号，种类 `bili`。一个评论区是一个窗口：视频写 `bili:BV…`，动态、图文、专栏写 `bili:t<评论区类型>-<oid>`。每两分钟轮询一次"回复我的"和"@ 我的"，新的一条以评论号为记录号 `push` 进对应窗口并叫醒她，原因写"B 站有人回复你：《标题》"或"B 站有人 @ 你"；第一次轮询只记位置，不把账号以前的通知倒进来。每次只看第一页（约 20 条）；两分钟里来了一页以上，不往前翻、不全记在本地，而是在她的 `me` 窗口留一句并叫醒她，让她用 `bili__inbox` 去 B 站消息中心翻。通知里只有文字，表情是 `[doge]` 这样的文字，只有图片的那条正文换成一句占位；某一条数据不对就记日志跳过，写盘这类错误停在那一条、下次重试。她用 `type_word`／`send` 发评论，只能发文字（表情照 B 站写法写在正文里），正文开头 `[CQ:reply,id=评论号]` 表示回复那条，别的 CQ 码会被拒绝；评论工具把评论带的图片列成 `[图片] 地址`，她用 `attach_image` 看。楼中楼的楼主号由模块记着（通知、评论工具和她自己的回复都会记）。她发出去的评论只写进 chatlog、不登记到达（B 站没有回声）。刷首页、热门、搜索、视频详情、字幕原文、评论和楼中楼，以及直接读 B 站消息中心的 `inbox`（回复、@、赞、系统通知、私信会话，带未读数和翻页）和读私信的 `dm`，是工具模块 `bili`（`mods/tools/bili.py`），不进窗口；私信还不能回。登录是 `.bili login`，二维码只发到管理员私聊：管理员自己发，或者她用 `cmds__run_command(".bili login", target="u<管理员>")` 在管理员私聊里发起（谁扫码谁的号就成了她的号，所以不能发进群或发给别人）。私聊里只发二维码这一张图，扫码的说明由她自己说；登好了、过期了或出错写进她的 `me` 窗口并叫醒她；另一条路是她在自己的浏览器里登 B 站，用 `browser__get_cookies` 取出 Cookie（含 httpOnly 的 SESSDATA）交给 `bili__use_cookie`；两条路存凭证后都要用它查到自己的 uid 才算登好；凭证在 `data/bili/credential.json`，每天检查一次要不要刷新。
+**B 站**（`mods/bili.py`，2026-10-23 起）：柚子自己的 B 站号，种类 `bili`。一个评论区是一个窗口：视频写 `bili:BV…`，动态、图文、专栏写 `bili:t<评论区类型>-<oid>`。每两分钟轮询一次"回复我的"和"@ 我的"，新的一条以评论号为记录号 `push` 进对应窗口并叫醒她，原因写"B 站有人回复你：《标题》"或"B 站有人 @ 你"；第一次轮询只记位置，不把账号以前的通知倒进来。每次只看第一页（约 20 条）；两分钟里来了一页以上，不往前翻、不全记在本地，而是在她的 `me` 窗口留一句并叫醒她，让她用 `bili__inbox` 去 B 站消息中心翻。通知里只有文字，表情是 `[doge]` 这样的文字，只有图片的那条正文换成一句占位；某一条数据不对就记日志跳过，写盘这类错误停在那一条、下次重试。她用 `type_word`／`send` 发评论，只能发文字（表情照 B 站写法写在正文里），正文开头 `[CQ:reply,id=评论号]` 表示回复那条，别的 CQ 码会被拒绝；评论工具把评论带的图片列成 `[图片] 地址`，她用 `attach_image` 看。楼中楼的楼主号由模块记着（通知、评论工具和她自己的回复都会记）。她发出去的评论只写进 chatlog、不登记到达（B 站没有回声）。刷首页、热门、搜索、视频详情、字幕原文、评论和楼中楼、评论点赞点踩与删除、视频点赞投币与收藏夹管理、个人主页与资料修改、动态查看与删除、关注与粉丝管理，以及直接读 B 站消息中心的 `inbox`（回复、@、赞、系统通知、私信会话，带未读数和翻页）和读私信的 `dm`，是工具模块 `bili`（`mods/tools/bili.py`），不进窗口；私信还不能回。登录是 `.bili login`，二维码只发到管理员私聊：管理员自己发，或者她用 `cmds__run_command(".bili login", target="u<管理员>")` 在管理员私聊里发起（谁扫码谁的号就成了她的号，所以不能发进群或发给别人）。私聊里只发二维码这一张图，扫码的说明由她自己说；登好了、过期了或出错写进她的 `me` 窗口并叫醒她；另一条路是她在自己的浏览器里登 B 站，用 `browser__get_cookies` 取出 Cookie（含 httpOnly 的 SESSDATA）交给 `bili__use_cookie`；两条路存凭证后都要用它查到自己的 uid 才算登好；凭证在 `data/bili/credential.json`，每天检查一次要不要刷新。
 
 群聊只有群号位于 `chat_groups` 时才进入这条路径；私聊没有这层群白名单。普通 `#` 命令先由本地子命令解析，返回的 callable 直接执行而不请求模型；`#poke` 和不能解析成控制命令的普通触发才会进入聊天。`.chat` 命令已删除，`.chattop` 月账命令仍保留。
 
@@ -41,29 +41,30 @@
 2026-10-22 起中心 agent 只要不交接，就一直在同一段上下文里（取舍见[无状态主循环提案](working/proposals/stateless-agent-loop.md) §7.2）。这一段存在 `data/context/current.json`（`chat.segment`），重启后接着用；系统提示每次重建，在交接之间不变，其余消息原样保存，包括原生 assistant/tool 配对与思考。
 
 1. **新一段的开头**（交接后第一次被叫醒，`agent._head`），按顺序：
-   - 系统提示：笔记 self、`_base_prompt`（含 `tools/memory_system.py` 开头"你的记忆怎么运作"那一节，每次从文件读）、中心身份说明；
-   - 当前完整工具状态，这一段里不再重发，变化由 context provider 追加；
-   - 笔记：global、recent（上次交接留下的）、最近一篇日记；
-   - 目录（`roles.directory`），只列名字：其它最近有消息的窗口、笔记、日记。
+   - 系统提示：笔记 self、`_base_prompt`（每次从 `data/storage/llm_system/prompts.json` 读 `base` 预设并动态替换昵称和 QQ 号，末尾附 `tools/memory_system.py` 开头"你的记忆"一节）、中心身份说明；
+   - 笔记：global、recent（上次交接留下的）、最近一篇日记（每篇标题后标出文件相对路径）；
+   - 年鉴索引（`data/notes/years.md` 最近 8 段交接归档的摘要）；
+   - 目录（`roles.directory`），只列名字：其它最近有消息的窗口（带名字：她起的名 > 群名 > 昵称）、笔记、日记；
+   - 当前完整工具状态（放在笔记和第一次出现的相关人笔记之后、第一条窗口画面之前），这一段里不再重发，变化由 context provider 追加。
 2. **每次唤醒追加的材料**（`agent._run_agent`），前面的消息一个字都不动：
    - 这一段里第一次出现的窗口和作者（最多 6 人）的笔记（`agent._people`）；
    - 叫醒她的窗口画面（2026-10-23 起学 Cortico 分开别人的话和系统的话）：每个窗口一条 user 消息（`view.outside`），第一行是框头（`窗口 g123 · 画面 · 时刻`，插话时写"你干活时刚到的"和其中叫她的激活），下面是 chatlog 原文，图片在原处。user 消息只装外面来的记录；系统自己说的话——笔记块、目录、工具状态、"这次唤醒你的是"、交接说明和交接指令、输入框提示、反思材料、末尾 hint（`Chat.hint_role`）——都是对话中间的 system 消息。DeepSeek 文档说 Chat Completions 支持在对话中间插 system、不支持插工具调用；当天先做过一版合成 `incoming` 工具调用的框，随即换成这样，那时存下的框（`view.is_incoming`）仍不算她做过的事，`search` 的归档部分不搜，`read_context` 显示成【incoming】。系统提示有几条由 `agent._system_count` 记的 `prompt_count` 决定，不再按角色找边界。这一段里第一次出现的窗口，有全局看到位置时只给新消息和前面 3 条旧记录接话，没有看到位置时才按 `max_events` 补历史（至少 3 条）；已经出现过的从这一段里上次给到的那条记录之后接着给（记在这一段的 `last_shown`，不按看到时间，因为它只精确到秒）；交接后续做时沿用刚才看着的窗口；
-   - "这次唤醒你的是（时刻）"、闹钟理由，或"你刚把上一段上下文交接掉了"；
-   - 第一次输出之后，每次子请求之前 `agent._late_arrivals` 把画面里的窗口新到的未读按画面同样的规则（从 `last_shown` 接着给，最多 200 条）追加进这一段，标题写窗口、时刻和其中的激活。`last_shown` 在追加时推进（它和这一段一起存盘）；看到时间和已读等那次请求产生输出（哪怕只有思考）才记，所以收尾不再为它们多叫一次，请求失败时它们仍是未读、照样再叫醒她，画面也不会再给一遍。只有她自己发出去的回显时不插。
+   - "这次唤醒你的是（时刻）"、闹钟理由（末尾附一句是谁在管、改哪里），或"你刚把上一段上下文交接掉了"；
+   - 第一次输出之后，每次子请求之前 `agent._late_arrivals` 把画面里的窗口新到的未读按画面同样的规则（从 `last_shown` 接着给，最多 60 条）追加进这一段，标题写窗口、时刻和其中的激活。`last_shown` 在追加时推进（它和这一段一起存盘）；看到时间和已读等那次请求产生输出（哪怕只有思考）才记，所以收尾不再为它们多叫一次，请求失败时它们仍是未读、照样再叫醒她，画面也不会再给一遍。只有她自己发出去的回显时不插。
 
-   末尾 hint 是待办（笔记 todo）、发言提醒、其它窗口的未读数与当前时间，只挂在发出去的那一份上。请求失败、没有任何输出时这段文件不变，同样的材料不会追加两次；每轮结束后文件跟着更新。读回时，一批工具调用缺结果的（被打断）补一条"被打断"的结果；`#reasoning drop` 时以前几次唤醒的思考不再带回。
+   末尾 hint 是待办（笔记 todo）、其它窗口的未读数、潜意识/交接宽限/后台命令提示与当前时间，只挂在发出去的那一份上。请求失败、没有任何输出时这段文件不变，同样的材料不会追加两次；每轮结束后文件跟着更新。读回时，一批工具调用缺结果的（被打断）补一条"被打断"的结果；`#reasoning drop` 时以前几次唤醒的思考不再带回。
 3. **窗口画面**（`chat.screen`）：直接读 `chatlog/` 普通日志文件里的记录，保留原文格式。
    - 每个窗口和日期补一行 `# g群号 YYYY-MM-DD`，`agent.seen` 记下的看到时间之后标出"以下是上次之后的新消息"。
-   - 新消息超过 200 条时只展示最新的 200 条，画面开头写明跳过了多少条、用什么 `read_log` 参数往前翻，看到位置照样推进到最新。`follow` 期间（包括说完话自动听）到的消息不截：上限加上 follow 起点之后的条数，起点由 `awaker` 记在内存里（`_since`，说完话自动听用她说话的时刻），重启后或她直接改笔记写的 follow 不知道起点，照旧截。
+   - 新消息超过 60 条时只展示最新的 60 条，画面开头写明跳过了多少条、用什么 `read_log` 参数往前翻，看到位置照样推进到最新。`follow` 期间（包括说完话自动听）到的消息不截：上限加上 follow 起点之后的条数，起点由 `awaker` 记在内存里（`_since`，说完话自动听用她说话的时刻），重启后或她直接改笔记写的 follow 不知道起点，照旧截。
    - 第一次输出时只把读画面那一刻之前到达的未读标为已读；生成期间同窗口新到的由插话追加进这一段，那次请求有了输出再标已读。
    - 正文是 OneBot 原始串，图片 CQ 码按 `msg_split` 拆成图片 part，再按图片档位处理。
    - 名字是 chatlog 写入时的 QQ 侧名字，`.setname` 自定义称呼改为出现在这个人的笔记里。
    - 开机补回的离线消息已按时间插在日档里，和别的记录一样渲染；以前写在 sidecar 里的不渲染。
 4. **交接**（`agent._handoff`）：驱动力是"这段上下文要被移除了，确认交接做好"。
    - 触发：她调用 `tidy(note)`；交接条件成立；夜里 awaker 的 `reflect` 规则到点。
-   - 交接条件是 `data/notes/policy/tidy.py` 里的一段普通 Python，用 `.py` 的共享环境副本经 `py.eval_last` 求值，每次子请求结束（`stage="round"`）和每次唤醒往这一段追加之前（`stage="assemble"`）各一次，末行为真就交接，是字符串时就是原因。可用的名字有 `used`（这一段的 token 数：接口上次报的 prompt+completion，加上报数之后追加的部分的字数估算，见 `agent._context_size`；记在这一段的 `tokens`，图片、系统提示和工具定义都由接口算进去）、`grown`（这次唤醒长了多少）、`limit`（`#limit` 的整理阈值，`agent.tidy_token`）、`since_handoff`、`kind`、`hour`。文件不存在时用 `agent.DEFAULT_TIDY`：`used > limit`。写坏时按默认判断，终端留下 traceback。这一段里她还没有任何输出时不交接，免得开头材料本身就大时空转。她在反思里用 `edit_policy("tidy", …)` 改它，要 Bot 自身有 op 权限，写入前检查语法。
+   - 交接条件是 `data/notes/policy/tidy.py` 里的一段普通 Python，用 `.py` 的共享环境副本经 `py.eval_last` 求值，每次子请求结束（`stage="round"`）和每次唤醒往这一段追加之前（`stage="assemble"`）各一次，末行为真就交接，是字符串时就是原因。可用的名字有 `used`（这一段的 token 数：接口上次报的 prompt+completion，加上报数之后追加的部分的字数估算，见 `agent._context_size`；记在这一段的 `tokens`，图片、系统提示和工具定义都由接口算进去）、`grown`（这次唤醒长了多少）、`limit`（`#limit` 的整理阈值，`agent.tidy_token`）、`since_handoff`、`kind`、`hour`。文件不存在时用 `agent.DEFAULT_TIDY`：`used > limit`。写坏时按默认判断，终端留下 traceback。这一段里她还没有任何输出时不交接，免得开头材料本身就大时空转；超过阈值但尚未发言（`not segment.get("typed")`）时有 `_TIDY_GRACE = 2` 次唤醒宽限，先通过末尾 `turn.tidy_hint` 提醒她自己挑时机调用 `tidy`，连续逾期才强制交接。她在反思里用 `edit_policy("tidy", …)` 改它，要 Bot 自身有 op 权限，写入前检查语法。
    - 做法：在同一段末尾追加交接指令（`roles.handoff_prompt`），用她平常的工具和同一段上下文跑一次，前缀缓存几乎全中。指令要她逐类确认：眼下的事在 recent，关于人和群的在 `person:`／`group:` 笔记，做法的教训在 global，答应的事在 todo，今天发生的事在 `diary:<日期>`（日期是此刻往前 6 小时的那天，改写成到目前为止的这一天，不往后追加）。每份先读，已经在了就不重写；`data/notes/policy/handoff.md` 是她在反思里给交接写的附加说明，附在指令后面。交接时 `type_word`／`send` 拒绝发言。
-   - 交接完成后这一段连同交接的往来归档到 `data/context/archive/<开始时刻>.json`，`current.json` 删掉，下一次唤醒从新的一段开始；一次唤醒中途交接的，随即用新的一段接着做这次的事。笔记都是改写成应有的样子、内容没变就不写，所以交接可以安全地重复。
+   - 交接完成后这一段连同交接的往来归档到 `data/context/archive/<开始时刻>.json`，往 `data/notes/years.md` 追加一行年鉴摘要，`current.json` 删掉，下一次唤醒从新的一段开始；一次唤醒中途交接的，随即用新的一段接着做这次的事。笔记都是改写成应有的样子、内容没变就不写，所以交接可以安全地重复。
    - "完成"指交接会话正常跑完：没有出错（交接会话 `fail_fast`，异常不再被吞成一句聊天错误）、没被打断、没因为交接时又长了超过整理阈值被停下、有过正文或工具调用，并且最后一次回复不再调用工具。否则不归档，这一段原样留着下次再交接，这次唤醒里不再重试；`yz.agent` 流记一条 warning（原因、这一段的开始时刻、连着失败了几次），这一段记下 `handoff_failures`。被打断不计入失败次数。成功的交接记一行"原因 → 归档名"；一次唤醒交接满 3 次也记 warning。
    - 强制归档：这一段交接连着失败 2 次，或者长到整理阈值的 2 倍（连交接请求本身都可能超过模型上下文），就不再等她确认，原样归档，原因写"未交接，强制归档（…）"。新的一段先存下一句提醒（`notice`）：段名，以及需要时加载 `memory_system` 用 `read_context` 读回来补笔记；它在新的一段第一次被叫醒时给她，她第一次输出后才消掉，所以那次请求失败也不会丢。强制归档同样算一次交接，占一次唤醒的 3 次额度。默认阈值约是模型上下文的一半，正常使用里不会走到这里。
 5. **笔记**（`chat.notes`）：`data/notes/` 下的普通 Markdown 文件，改写和删除前把旧文件复制到 `.history/`，`notes.versions`／`read_version` 读回历史版本。
@@ -80,12 +81,12 @@
 7. **夜间交接与反思**（`chat.agent.reflect`）：占住 `AGENT_WINDOW`。
     1. 先交接手上这一段（原因"夜里了"）。
     2. 若这天是月末，`roles.summarize` 把当月日记改写成 `diary:YYYY-MM`；年末再把月记改写成 `diary:YYYY`。
-    3. 反思像人排查一样：材料是 global 与 recent 笔记、上次反思以来归档的段（段名、起止时刻、消息数、窗口）、`changes` 最近 40 行与 `proposals` 最近 20 行，以及一段说明（`agent._REFLECT_PROMPT`）：从症状出发，用 `read_context` 读当时那一段的原样，用 `search`／`read_log`／`read_actions`／`note_history` 查原始记录（日记和交接说明只当线索），分清问题属于哪一类（记忆、不知道去哪找、反复的失误、判断、说明过时或冲突、花销、环境坏了；各类该改哪里写在 `memory_system` 里），找到原因再改，优先改已有的规则，一次性的失误不写成长期规则；提案按证据、原因、最小改动、代价、验证方法写。会话用新的一段，加载 `memory_system`，`type_word`／`send` 拒绝发言；材料之后新长出来的上下文超过整理阈值就结束；没有新归档的段时跳过模型调用。反思这一段也归档，名字带 `-reflect`。
+    3. 反思像人排查一样：材料是 global 与 recent 笔记、上次反思以来归档的段（段名、起止时刻、消息数、窗口）、`changes` 最近 40 行与 `proposals` 最近 20 行，以及一段说明（`agent._reflect_prompt()`，从 `data/prompts/reflect.md` 读取）：从症状出发，用 `read_context` 读当时那一段的原样，用 `search`／`read_log`／`read_actions`／`note_history` 查原始记录（日记和交接说明只当线索），分清问题属于哪一类（记忆、不知道去哪找、反复的失误、判断、说明过时或冲突、花销、环境坏了；各类该改哪里写在 `memory_system` 里），找到原因再改，优先改已有的规则，一次性的失误不写成长期规则；提案按证据、原因、最小改动、代价、验证方法写。会话用新的一段，加载 `memory_system`，`type_word`／`send` 拒绝发言；材料之后新长出来的上下文超过整理阈值就结束；没有新归档的段时跳过模型调用。反思这一段也归档，名字带 `-reflect`。
     4. 结束后 `agent.pick_up_pending` 接上期间登记的召唤。
 
 窗口第一次有输出时确认这次的通知，记下画面中每个窗口的看到时间，并调用 `reader.mark_window_read` 把未读登记标为已读。
 
-`#` 是一条跨模块约定：LLM 失败信息（`llm.Chat.chat`）、`.py` 与 link action 的 traceback、`#` 子命令的输出都以它开头。画面渲染跳过正文以 `#` 开头的记录，使调试输出不回流进模型——它们占 token，还会让模型看到自己的错误堆栈。过滤对所有发送者一视同仁，Bot 自己发的与用户发的 `#help` 一样不进上下文。改任何一个生产端的前缀都会让那类输出开始回流，且不会报错。chatlog 里的通知行（戳一戳、撤回、管理变动等）原样出现在画面里。"聊天开始""聊天结束"是普通消息。
+`#` 是一条跨模块约定：LLM 失败信息（`llm.Chat.chat`）、`.py` 与 link action 的 traceback、普通用户触发的 `#` 子命令输出都以它开头。画面渲染跳过正文以 `#` 开头的记录，使调试输出不回流进模型——它们占 token，还会让模型看到自己的错误堆栈。例外是她自己用 `op__send_command` 发起的 `#` 子命令（`call` 在事件作者是 Bot 自身时不加 `#` 前缀，敲错子命令名也会返回提示），以便命令结果能回到她的上下文里。改任何一个生产端的前缀都会让那类输出开始回流，且不会报错。chatlog 里的通知行（戳一戳、撤回、管理变动等）原样出现在画面里。"聊天开始""聊天结束"是普通消息。
 
 `init_chat()` 装配提示词与身份说明，`_activate_chat()` 计数并从全局 `agent.active_tools` 恢复实际加载状态。离线回放入口已删除，见[运行架构](architecture.md)。
 
@@ -145,7 +146,7 @@
 | `reload_tools` | 按模块名从磁盘显式应用、更新或删除模块；逐项返回成功和带完整 traceback 的失败结果，失败保留旧 last-good。 |
 | `load_tools` | 将 last-good 模块激活到当前 Chat；中心名单存全局 `agent`，不读取磁盘。 |
 
-`meta` 还导出 `type_word`／`send`（唯一的发言方式：先打进那个窗口的输入框，下一步再发；同一次输出里刚打的字不发，必须写明 `target`）、`wake_me`（给自己埋唤醒规则，写进笔记 awaker）、`search`／`read_log`／`read_actions`／`read_note`（召回画面以外的聊天记录、笔记、日记、归档的上下文与自己的行动记录）、`write_note`（改任何一份笔记，包括待办 todo 和闹钟 awaker）、`tidy`（这一轮结束后交接）、`dismiss`（没什么要做的，这一轮结束后把这次唤醒从这一段里清掉）、`loop`（总开关 `#loop` 默认开时每次唤醒结束后自动起一串，她用它写上在做什么或 `stop=True` 结束这一串；关着时由她开：每次唤醒结束后 `agent._next_loop` 隔 `_LOOP_GAP` 秒往 `me` 窗口 `chat.push` 一条带唤醒的“循环第几轮”，直到她 `loop(stop=True)`、维护者叫停那一轮、或者 `agent.reflect` 开头把它关掉；状态只在内存里）、`wait`（循环开着时这一轮马上结束、过多少秒再来下一轮，不阻塞也不关循环；没开循环时拒绝并指向 `wake_me`）和 `attach_image`。
+`meta` 还导出 `type_word`／`send`（唯一的发言方式：先打进那个窗口的输入框，下一步再发；同一次输出里刚打的字不发，必须写明 `target`）、`wake_me`（给自己埋唤醒规则，写进笔记 awaker）、`search`／`read_log`／`read_actions`／`read_note`（召回画面以外的聊天记录、笔记、日记、归档的上下文与自己的行动记录）、`write_note`（改任何一份笔记，包括待办 todo 和闹钟 awaker）、`tidy`（这一轮结束后交接）、`dismiss`（没什么要做的，这一轮结束后把这次唤醒从这一段里清掉）、`compress`（按序号范围 `first`／`last` 或时刻 `from_time`／`to_time` 把告一段落的唤醒折成摘要，原文归档为 `-folded`）、`loop`（总开关 `#loop` 默认开时每次唤醒结束后自动起一串，她用它写上在做什么或 `stop=True` 结束这一串；关着时由她开：每次唤醒结束后 `agent._next_loop` 隔 `_LOOP_GAP` 秒往 `me` 窗口 `chat.push` 一条带唤醒的“循环第几轮”，直到她 `loop(stop=True)`、维护者叫停那一轮、或者 `agent.reflect` 开头把它关掉；写下的备注记入 `data/context/loop.jsonl`）、`wait`（循环开着时这一轮马上结束、过多少秒再来下一轮，不阻塞也不关循环；没开循环时拒绝并指向 `wake_me`）、`loop_note_history`／`clear_loop_note`（翻看或清空她给循环写过的备注历史）、`set_name`（给任意窗口起名字，存 `data/storage/window_titles.json`）和 `attach_image`。
 
 仓库当前提供以下按需模块；函数只在对应模块激活后出现：
 
@@ -153,15 +154,29 @@
 |---|---|
 | `common` | `common__get_time`、`common__poke` |
 | `image` | `image__recognize_image`、`image__create_image`、`image__create_image_from_references` |
+| `vision` | `vision__ask`、`vision__models`、`vision__stitch`（多图拼成网格或把图交给外部视觉模型认字比对） |
 | `later` | `later__later_add`、`later__later_del` |
 | `user_data` | `user_data__get_user_data`、`user_data__set_user_data` |
 | `agents` | `agents__assign_tasks` |
 | `amap` | `amap__login`、`amap__search`、`amap__around` 等地点与路线查询 |
+| `websearch` | `websearch__search`（调用 DeepSeek 服务端 `web_search` 检索互联网网页） |
+| `bili` | B 站视频推荐/热门/搜索/详情/字幕原文、评论区与楼中楼、评论赞踩与删除、视频点赞投币与收藏夹管理、个人主页与资料修改、动态与关注列表、消息中心 `inbox`、私信 `dm` 与 `use_cookie` |
+| `browser` | 自管常驻 Chromium（按窗口独立标签页）：`open_page`、`read_page`、`page_links`、`run_js`、`look`、`screenshot`、`frames`、CDP 真实输入（`click`、`type_text`、`drag`、`press_key`、`scroll`）与 Cookie 读写 |
+| `phone` | 安卓备用机控制（scrcpy 视频流与控制通道 + adb）：`look`、`frames`、`tap`、`swipe`、`hold`、`release`、`mark`、`aim`、`key`、`type_text`、`keyboard`、`shell` |
+| `mailbox` | IMAP 邮箱账号保存、文件夹与邮件列表查看、邮件正文读取 |
+| `totp` | TOTP 两步验证码密钥管理与实时动态口令生成 |
 | `host` | `host__read_file`、`host__write_file`、`host__run_command`、`host__stop_command` |
+| `cmds` | `cmds__list_commands`、`cmds__run_command`（查询或代行普通点命令） |
+| `op` | `op__send_command`（`BOT_OP_ONLY`，以 Bot 自身身份向主事件队列投递命令，含 `.reboot`） |
+| `forward` | `forward__read_forward`、`forward__send_forward`（读取或构造合并转发聊天记录） |
+| `sendfile` | `sendfile__send_file`、`sendfile__send_text`（在聊天窗口直接发送本地文件或长文本文件） |
+| `avatar` | `avatar__avatar_url`、`avatar__group_avatar_url`（取 QQ 用户或群头像地址） |
 | `minecraft` | `minecraft__search_mc_mod`、`minecraft__check_mod` |
 | `meme` | 表情柜子：`meme__collect` 把聊天里或网上的图下载进 `data/memes/<sha256>.<扩展名>`（同一张只存一份），连同她起的心情和一句话记进 storage `meme/index`；`meme__pick` 按心情或关键词随机挑一张（优先最久没发的），返回带 `sub_type=1` 的 `[CQ:image,file=file://…]`，她再经 `type_word`／`send` 发；`meme__browse` 看总览、`meme__edit` 改或扔 |
 | `tts` | `tts__speak`：用 edge-tts（微软 Edge 在线朗读，非官方、免账号）把文字念成 mp3，默认音色晓伊 `zh-CN-XiaoyiNeural`，存进 `data/tmp_files` 返回 `file://` 路径；她再用 `[CQ:record,file=…]` 经 `type_word`／`send` 发语音 |
 | `weather` | `weather__search_city`、`weather__get_realtime_weather`、`weather__get_daily_forecast`、`weather__get_hourly_forecast` |
+| `memory_system` | `read_context`、`note_history`、`read_policy`、`edit_policy`、`assess_change`（夜间反思时加载，排查归档上下文、笔记历史版本与策略账本） |
+| `yuzu_hello` | `yuzu_hello__hello`（最小示例工具模块） |
 
 `host` 是 `exec_code` 之外的常用出口：文件读写和 shell 都不必再绕一次任意代码执行。读取按本次实际截取的窗口计字节，超过 `max_bytes` 时只回大小和后续建议（缩小区间、先 `grep -n` 定位、或用 `assign_tasks` 开子会话通读后带回摘要），不做分页会话。改写靠 `read_file` 首行 header 里的 `line`/`size`/`v` 定位与对账：位置与新内容的写法无关，`v` 只在该区间自读取后被改动过时失配，失配的返回自带现状和新 header。渲染格式与 `.edit` 同源，所以手动编辑和模型改写看到的是同一种东西；它没有目录白名单，`data/`、`config.json`、`.env` 和聊天记录都在可及范围内。
 
@@ -204,7 +219,7 @@ Python 候选作为正常模块执行，可以 import 第三方依赖、其它 `
 
 ### 追加式上下文
 
-`Chat.add_context_provider` 的产物在每次模型子请求前追加进 `Chat.messages`，前面的消息不改。中心会话用它追加一次唤醒内的工具状态变化：组装时先 `sync_registry` 并把完整状态（`state_text(None)`）放在系统提示之后，之后每次子请求前对比快照，只把变化追加。子代理的状态只在开头显示，其后变化由本会话 provider 追加。
+`Chat.add_context_provider` 的产物在每次模型子请求前追加进 `Chat.messages`，前面的消息不改。中心会话用它追加一次唤醒内的工具状态变化：新的一段首次组装时先 `sync_registry` 并把完整状态（`state_text(None)`）放在笔记之后、第一条窗口画面之前，之后每次子请求前对比快照，只把变化追加。子代理的状态只在开头显示，其后变化由本会话 provider 追加。
 
 磁盘源码差异是末尾 hint，只报告、不加载。模块正文内的 `</system-reminder>` 会转义，避免逃出系统框架。
 
@@ -224,7 +239,7 @@ hint 与追加式上下文是两层，判据是一句话：**频繁变化、且�
 
 ### 中心工具状态
 
-每次组装都给出完整工具目录与已加载模块说明书（含 `meta`），放在系统提示之后；跨唤醒不变时这一段仍是稳定前缀。一次唤醒内的变化由 provider 追加（见上）。旧版写进 oplog 的工具状态 input 与 `agent.tool_state_told` 不再使用。
+新的一段首次组装时给出完整工具目录与已加载模块说明书（含 `meta`），放在笔记之后、第一条窗口画面之前；这一段里不再重发，跨唤醒保持稳定前缀。一次唤醒内的变化由 provider 追加（见上）。旧版写进 oplog 的工具状态 input 与 `agent.tool_state_told` 不再使用。
 
 `active_tools` 只保存实际加载模块和最后使用时刻；工具调用会立即刷新并写盘。`agent.tool_schema_modules` 另存模型曾获函数定义的模块顺序：`meta` 固定最先，其它模块首次加载后追加；空闲卸载不删除定义，但下一请求中的对应函数会只返回"先 `load_tools`"，不执行已卸载代码。同批工具调用仍使用发请求时冻结的 callable。重启后按保存的模块顺序和**当前代码**重建定义，不保存旧 schema 快照。`list_tools` 可随时取完整最新状态。
 
