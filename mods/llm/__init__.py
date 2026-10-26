@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 
 from openai import OpenAI
 
-from mods import image, watchdog
+from mods import image, usage, watchdog
 from mods.oplog import PersistenceError, raise_if_failed
 from . import console
 from .models import (
@@ -81,6 +81,37 @@ def usage_cached_tokens(usage) -> int:
         return max(int(value), 0)
     except (TypeError, ValueError):
         return 0
+
+
+_usage_hooks: list = []
+
+
+def on_usage(hook) -> None:
+    """登记一个旁路调用的记账函数：图片描述这类不经过对话的调用也要进月账。
+
+    WHY: `describe_image` 花的是另一个模型的钱，响应里明明带着 usage，却不属于任何一次
+    对话调用；chat 在这里登记回调，月账和日账才收得到它们。
+    """
+    _usage_hooks.append(hook)
+
+
+def _record_usage(model: str, response) -> None:
+    """把一次旁路调用的用量写进日账，再通知登记的记账函数。
+
+    WHY: 不记的话这些调用在账本上完全不存在——日账、月账、成本图都看不见。
+    """
+    info = getattr(response, "usage", None)
+    if info is None:
+        return
+    prompt_tokens = int(getattr(info, "prompt_tokens", 0) or 0)
+    completion_tokens = int(getattr(info, "completion_tokens", 0) or 0)
+    cached_tokens = usage_cached_tokens(info)
+    usage.log_call(model, prompt_tokens, completion_tokens, cached_tokens)
+    for hook in _usage_hooks:
+        try:
+            hook(model, prompt_tokens, completion_tokens, cached_tokens)
+        except Exception:  # 记账失败不能把取图一起弄崩
+            logging.getLogger(__name__).debug("旁路调用记账失败：%s", model)
 
 
 _MAX_LISTED_TOOLS = 40
@@ -590,6 +621,7 @@ class LLMClient:
             ]}],
         )
         description = response.choices[0].message.content
+        _record_usage(selection, response)
         if description:
             console.notice(f"✅ 视觉模型调用成功：{console.format_uri(uri)}")
             console.notice(f"    {description}")
