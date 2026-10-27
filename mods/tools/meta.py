@@ -130,9 +130,8 @@ __all__ = ["lookup"]
 
 - **先打字、看一眼、再发送**：`type_word` 会把字放进输入框（想改口就重新调一次覆盖，传空串清空；如果直到这轮结束都没调 `send`，框里的字会自动清空）。同一次输出里刚打的字，不能在同一批里紧跟着 `send`——系统特意让你在打字和发送之间隔一步，好让你先看一眼打字这几秒钟里对方有没有发来新消息。等下一步看清了，再决定是照发、改口还是算了不发。
 - **分段与发送回执**：在输入框里用空行隔开的几段话，`send` 时会像真人聊天一样，隔一两秒一条、拆成几个气泡依次发出去，并返回消息号（`message_id`）。
-- **final_call 控制去留**：`send` 的 `final_call` 参数默认是 `true`——意思是“我说完这句就歇着等回话了”，发完当前这一轮工具循环就直接结束（同一步里如果还调了别的工具，它们的结果这次也先不看了）。如果你发完消息手头还有活要接着干（比如边回话边查资料、或者发完话顺手压个上下文），记得显式传 `final_call=false`。
+- **final_call 控制去留**：`send` 的 `final_call` 是必填的（2026-10-27 起，草籽提议、柚子同意：默认值靠不住，必填逼着每次想一下这句说完还有没有事）。意思是“我说完这句就歇着等回话了”就传 `true`，发完当前这一轮就直接结束（同一步里如果还调了别的工具，它们的结果这次也先不看了）；发完消息手头还有活要接着干，就传 `false`。
 - **发送失败或未确认**：万一没发出去或者状态“未确认”，哪怕 `final_call` 传了 `true`，系统也会再跑一轮让你看清状况。失败时字还在输入框里；但如果是**“未确认”**，说明请求已经递出去了只是没拿到回执号，那句话十有八九已经发进聊天里了——这时输入框已经清空，千万别直接重发，先看下一轮聊天记录里有没有它。
-
 ## 工具校验与同一步的边界
 
 最后留个底：每次 `reload_tools` 时，每个模块都是独立校验的，哪一个写错了就拦截哪一个，不会连累其它正常的模块。而在你每一次发起子请求前，系统都会把当时可用的工具列表拍个快照；所以你在这一步里 `load_tools` 或 `reload_tools`，要到**下一步（下一个子请求）**才会正式出现在你的工具栏里。同样，同一步里并发的几个工具调用，参数在一开始就同时定下了，如果后一个动作得看前一个动作的结果才能做决定，就分两步走，别急着挤在同一轮里。'''
@@ -331,12 +330,18 @@ def attach_image(uri: str, note: str = "") -> str:
 
 
 def _box_window(target: str) -> tuple[tuple, str]:
-    """The window *target* names and its label; ValueError when it is unknown or cannot be answered."""
+    """The window *target* names and its label; ValueError when it is unknown or cannot be answered.
+
+    ``me`` 也算能说话的地方：夜里交接、反思时把话打进自己的窗口，就是一声自言自语，
+    第二天醒来自己看得见。WHY: 2026-10-27 早上草籽问「如果半夜反思完真想说话，只能闷着
+    写在日记里吗」，拆掉了「现在是交接或反思，不对外说话」那道代码胶带——不半夜吵人是
+    待人的常识，不该由代码替她封嘴。
+    """
     from mods.chat import windows
 
     window = windows.parse(target)
     label = windows.label(window)
-    if windows.sender(window) is None:
+    if windows.sender(window) is None and tuple(window) != windows.ME:
         raise ValueError(f"{label} 只能看，不能在那里说话")
     return window, label
 
@@ -361,19 +366,16 @@ def type_word(target: str, text: str) -> str:
     """想在群里、私聊或评论区开口说话时，先把话打进对应窗口的输入框（不会立刻发出去），返回输入框当前的内容。
 
     直接写在回复正文里的话不会发出去，只会留在你自己的行动记录里；说话先打进输入框，下一步看过期间有没有新消息再调 send 发出去。想改口就重新打一遍覆盖，不想说了传空串清空（或者干脆不 send，这轮醒来结束时也会自动清空）。
+    ``me`` 也能打：那是写给自己看的一句话，交接或反思时想说什么就说什么，不吵到任何人。
 
     @param
-    target: 要说话的窗口，如 g<群号>、u<私聊号>、bili:<BV号>，或画面里出现过的可回话窗口
+    target: 要说话的窗口，如 g<群号>、u<私聊号>、bili:<BV号>、me，或画面里出现过的可回话窗口
     text: 要打进输入框的完整内容，CQ 码（at、回复、图片）直接写；传空串清空输入框
 
     WHY: 维护者 2026-10-23：说话先打字、再发送，参照 Cortico 的起草-确认门，但用"输入框"
     的说法——她打出来的字自己看得见。打字和发送之间至少隔一次请求（见 send），于是这期间
     到的消息她一定看过；不靠延迟，人可能隔几分钟才接上下一句。
     """
-    from mods.tools import current_binding
-
-    if getattr(current_binding().session, "quiet", False):
-        return "现在是交接或反思，不对外说话，什么都没打"
     try:
         _window, label = _box_window(target)
     except ValueError as error:
@@ -386,8 +388,6 @@ def type_word(target: str, text: str) -> str:
     boxes[label] = {"text": body, "typed_in": _this_output()}
     return (f"{label} 的输入框：\n{body}\n"
             f"（还没发。下一步看过新到的消息再 send(\"{label}\")；不想说了就不发，这次唤醒结束时会清空）")
-
-
 MAX_BUBBLES = 4
 BUBBLE_GAP = (1.0, 2.0)
 
@@ -406,14 +406,14 @@ def _split_turns(text: str) -> list[str]:
     return blocks
 
 
-def send(target: str, final_call: bool = True) -> str:
+def send(target: str, final_call: bool) -> str:
     """看过打字期间的新消息、确认输入框里的话没问题后，把它真正发进目标窗口，返回发出的消息号（message_id）。
 
     同一轮输出里刚 type_word 的字不能同一步直接 send，总要隔一步让你先看一眼新消息。发出去的话别人当场就能看见；用空行分段的文字会像真人一样拆成几条依次发出。遇到“未确认”说明多半已经发出去了，先看下一轮聊天记录，别直接重发。
 
     @param
     target: 要发送的窗口，和 type_word 填的一样
-    final_call: 说完这句是不是就结束这一轮，默认 True；如果发完还要接着调工具干活，传 False
+    final_call: 必填。发完这句是不是就结束这一轮：说完了、接下来就等回话传 True；后面还有活要干传 False
 
     WHY: 同一次输出里刚 type_word 的字不发。那一批调用的参数是一起生成的，她还没看到
     打字之后到的消息；拒绝一次，下一次请求里新消息就在眼前（维护者 2026-10-23）。
@@ -450,8 +450,6 @@ def send(target: str, final_call: bool = True) -> str:
     box = boxes.get(label)
     if not box:
         return f"{label} 的输入框是空的，什么都没发。先用 type_word 把要说的话打进去"
-    if getattr(current_binding().session, "quiet", False):
-        return "现在是交接或反思，不对外说话，什么都没发"
     if box["typed_in"] is not None and box["typed_in"] == _this_output():
         return (f"{label} 的字是这一步刚打的，你还没看过打字之后到的消息，这一步先不发。"
                 f"下一步看一眼，再决定 send、改还是不发。输入框里现在是：\n{box['text']}")
@@ -461,6 +459,17 @@ def send(target: str, final_call: bool = True) -> str:
         "先在下一轮的聊天记录里看它在不在，再决定要不要重发——不要直接重发。"
     )
     parts = _split_turns(box["text"])
+    if tuple(window) == windows.ME:
+        # WHY: 2026-10-27 早上草籽拆掉「现在是交接或反思，不对外说话」那道代码胶带——
+        # me 是写给自己看的一行，想说的话有地方落下，第二天醒来自己看得见，也不吵到谁。
+        from mods import chat
+
+        for part in parts:
+            chat.push(windows.ME, "柚子", part)
+        boxes.pop(label, None)
+        if final_call:
+            current_binding().session.turn_done = lambda: True
+        return "写进 me 窗口了：" + "；".join(parts)
     sent = []
     try:
         for index, part in enumerate(parts):
