@@ -184,6 +184,8 @@ def _route_event(event: dict) -> str | None:
             if history is not None:
                 window = history.window(event)
                 if window is not None:
+                    if chat is not None:
+                        getattr(chat, "cancel_debounce", lambda _w: None)(window)
                     central = context.get_turn(chat.AGENT_WINDOW) if chat is not None else None
                     central_work = central is not None and window in getattr(central, "associated_windows", ())
                     context.cancel_turn(chat.AGENT_WINDOW if central_work else window)

@@ -79,6 +79,14 @@ at、on、wait、when 响过就从笔记里划掉。她平时用 wake_me 写这�
 #hint default      切换全局默认的开关
 #hint default get  显示全局默认的代码与开关
 #hint default set <代码>  写入全局默认的代码并打开开关"""),
+    ("debounce [on|off|<等待秒数> [上限秒数]|reset]", """查看或设置消息防抖延迟（管理员），默认开启（等待 3s，上限 12s）。
+
+参考 MaiBot 机制：当收到唤醒消息后不立刻触发模型，而是等待数秒；期间若同窗口该说话人继续发消息，则重置计时器并合并上下文，最多延迟到设定的上限。避免用户分段打字时抢话或频繁触发。戳一戳、定时闹钟立即触发不延迟。
+#debounce             查看当前防抖配置与状态
+#debounce on          开启防抖（恢复默认 3s / 12s）
+#debounce off         关闭防抖（收到消息立即秒回）
+#debounce 3 12        设置等待 3 秒，最多延长至 12 秒
+#debounce reset       重置为默认值（3s / 12s）"""),
 )
 _SUBCOMMAND_NAMES = {pattern.partition(" ")[0] for pattern, _description in _SUBCOMMAND_HELP}
 
@@ -86,7 +94,7 @@ _SUBCOMMAND_NAMES = {pattern.partition(" ")[0] for pattern, _description in _SUB
 def requires_op(value: str) -> bool:
     name, _, tail = value.strip().partition(" ")
     return (name == "hint" or name == "use_model"
-            or name in {"image", "reasoning", "limit", "reflect", "awaker", "prompt", "subconscious", "loop"} and bool(tail.strip()))
+            or name in {"image", "reasoning", "limit", "reflect", "awaker", "prompt", "subconscious", "loop", "debounce"} and bool(tail.strip()))
 
 
 def _subcommand_help(name: str = "") -> str:
@@ -313,6 +321,54 @@ def _prompt_subcommand(raw: str) -> str:
     return "已改写 self" if text else "已清空 self"
 
 
+def _debounce_subcommand(tail: str) -> str:
+    from mods.chat import debounce as _debounce
+
+    tail = tail.strip()
+    data = storage.get("", "agent")
+    cfg = _debounce.get_config()
+    if not tail:
+        if not cfg["enabled"]:
+            return "debounce: 关"
+        return f"debounce: 开（等待 {cfg['idle']:.1f}s，上限 {cfg['max']:.1f}s）"
+    if tail.lower() in ("off", "0", "false"):
+        cfg["enabled"] = False
+        data["debounce"] = cfg
+        storage.save()
+        _debounce.cancel_all()
+        return "debounce: 关"
+    if tail.lower() in ("on", "1", "true"):
+        cfg["enabled"] = True
+        data["debounce"] = cfg
+        storage.save()
+        return f"debounce: 开（等待 {cfg['idle']:.1f}s，上限 {cfg['max']:.1f}s）"
+    if tail.lower() == "reset":
+        cfg = {"enabled": True, "idle": _debounce.DEFAULT_IDLE, "max": _debounce.DEFAULT_MAX}
+        data["debounce"] = cfg
+        storage.save()
+        return f"debounce: 已恢复默认（等待 {cfg['idle']:.1f}s，上限 {cfg['max']:.1f}s）"
+    parts = tail.split()
+    try:
+        if len(parts) == 1:
+            idle = float(parts[0])
+            max_delay = max(idle * 4.0, 12.0)
+        elif len(parts) == 2:
+            idle = float(parts[0])
+            max_delay = float(parts[1])
+        else:
+            return "debounce 参数过多，格式：#debounce [<等待秒数> [上限秒数]|on|off|reset]"
+    except ValueError:
+        return "秒数必须是数字"
+    if idle <= 0 or max_delay <= 0:
+        return "秒数必须大于 0"
+    if max_delay < idle:
+        return "上限秒数不能小于等待秒数"
+    cfg = {"enabled": True, "idle": idle, "max": max_delay}
+    data["debounce"] = cfg
+    storage.save()
+    return f"debounce: 已设置为 等待 {idle:.1f}s，上限 {max_delay:.1f}s"
+
+
 def _subcommand(value: str):
     # WHY: hint 的源码要求原样取（含缩进与换行），所以先留一份没 strip 的原文。
     raw = value
@@ -409,4 +465,6 @@ def _subcommand(value: str):
         return _awaker_subcommand(raw)
     if name == "hint":
         return _hint_subcommand(raw)
+    if name == "debounce":
+        return _debounce_subcommand(tail)
     return "子命令格式错误，可用 #help 查看"

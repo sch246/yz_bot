@@ -741,6 +741,9 @@ def capture_chat(event: dict) -> bool:
     waited = (_awaker.take_waiting(window, event.get("user_id"))
               if msgs.is_msg(event) and event.get("user_id") != identity.bot_id() else [])
     if not wanted and not waited:
+        # WHY: 在防抖等待期内，若同一说话人继续发消息（即便没有 @），重置防抖计时器并合并上下文（参考 MaiBot 机制）。
+        if msgs.is_msg(event) and _debounce.feed(window, author, event):
+            return True
         # WHY: 被 mute 压住的点名照样返回 True、吃掉这条：放它往下走，后面的
         # capture_addressed_fallback 认出「柚子，」会直接调 chat()，静音就漏了。
         return matched
@@ -769,6 +772,9 @@ def wake(event: dict | None = None, kind: str = "wake", reason: str = "") -> boo
     只能在这条消息的派发过程中调用（capture、link 节点、它触发的 `.py`）：到达号派发完就
     释放，事后调用 `event_arrival` 会报错。不带消息的唤醒（awaker 规则、她用 exec_code 包在
     某个函数上的钩子、别的模块）随时可以调。
+
+    WHY: 维护者 2026-10-27（参考 MaiBot 机制）：防抖延迟 3 秒，若同窗口同作者继续发消息则
+    重置计时，最多延至 12 秒。戳一戳、定时唤醒和非 QQ 窗口立即触发，不延迟。
     """
     if event is None:
         push(_windows.ME, kind, reason or kind, wake=kind)
@@ -776,6 +782,8 @@ def wake(event: dict | None = None, kind: str = "wake", reason: str = "") -> boo
     window = history.window(event)
     if window is None or not _mail_candidate(event):
         return False
+    is_poke = msgs.is_poke(event) or "poke" in kind
+    author = history.author(event)
     with context.window_lock(window):
         arrival = context.event_arrival(event)
         if arrival is None:
@@ -784,6 +792,10 @@ def wake(event: dict | None = None, kind: str = "wake", reason: str = "") -> boo
                         if entry["arrival"] == arrival), None)
         if pending is None or pending["activated"]:
             return False
+        if not is_poke and _debounce.is_debounceable(window) and _debounce.is_enabled():
+            return _debounce.schedule(window, author, arrival, kind, event)
+        # 戳一戳或未开启防抖：立即刷出 pending 防抖队列并就地激活
+        _debounce.flush(window, activate_only=True)
         oplog.activate(arrival, kind)
     # `chat()` 按当前事件找窗口，`#hint` 也发回当前事件的窗口；从别处调用时临时换成这条。
     previous = context.current()
@@ -933,7 +945,18 @@ def on_load(ctx) -> None:
             _awaker.schedule()
 
     threading.Thread(target=start_awaker, name="chat-awaker-start", daemon=True).start()
-from . import view as _view, segment as _segment, screen as _screen, agent as _agent, roles as _roles, subcommands as _subcommands, notes as _notes, awaker as _awaker
+
+
+def cancel_debounce(window: tuple) -> bool:
+    """Drop active debounce session for *window* (e.g. on ^C)."""
+    return _debounce.cancel(window)
+
+
+def on_exit() -> None:
+    _debounce.cancel_all()
+
+
+from . import view as _view, segment as _segment, screen as _screen, agent as _agent, roles as _roles, subcommands as _subcommands, notes as _notes, awaker as _awaker, debounce as _debounce
 from .view import has_at, msg_split
 from .windows import kind, parse_target
 from .screen import mark_window_read
