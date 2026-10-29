@@ -142,7 +142,7 @@ __all__ = ["lookup"]
 - **wait 控制后续与自主呼吸**：`send` 的 `wait` 参数决定发完这句之后你是继续活动还是挂着喘气：
   - `wait=0`：不等回复，发完直接跑下一轮，手里还有别的事情接着做；
   - `wait=-1`：发完收工，纯被动等待（相当于原 `final_call=true`），没有超时闹钟；
-  - `wait="20m"`（或 `"5m"`、`300` 等）：在当前窗口挂一个超时等待规则（由 awaker 统一调度）。等待期间如果对方（或群里）有人接话，新消息会自动认领并叫醒你；如果超时一直没人回复，awaker 会到点叫醒你，带着你设的 `reason`（例如"不来我就接着读日记"）让你自主接着活动。群聊里还可以传 `who=QQ号` 指定只等某个人接话。
+  - `wait="20m"`（或 `"5m"`、`300` 等）：在当前窗口挂一个超时等待规则（由 awaker 统一调度）。等待期间如果对方（或群里）有人接话，新消息会自动认领并叫醒你；如果超时一直没人回复，awaker 会到点叫醒你，带着你设的 `reason`（例如"不来我就接着读日记"）让你自主接着活动。群聊里还可以传 `who=QQ号` 指定只等某个人接话。等待期间叫醒你的消息要是不用接（比如别人插了一句），`dismiss` 时带上 `wait="g123:QQ号 10m"` 就能接着等——那条 wait 在叫醒你时已经用掉了，不带就不再等。
 - **发送失败或未确认**：万一没发出去或者状态“未确认”，系统也会再跑一轮让你看清状况。失败时字还在输入框里；但如果是**“未确认”**，说明请求已经递出去了只是没拿到回执号，那句话十有八九已经发进聊天里了——这时输入框已经清空，千万别直接重发，先看下一轮聊天记录里有没有它。
 - **被叫醒不等于必须开口**：大家闲聊不一定有明确的问题。别人已经答完、话题和你无关、或者你没什么想说的，就安静结束这一轮——不用 `type_word` 也不用 `send`，少说比多说好。真不想接的时候，丢张表情包或者回个问号也行。
 
@@ -642,22 +642,41 @@ def wake_me(when: str, reason: str) -> str:
     return f"已写进 awaker：{line}" + ("（响过就划掉；不要了用 write_note 改 awaker）" if once else "（不要了用 write_note 改 awaker）")
 
 
-def dismiss(since: str = "") -> str:
+def dismiss(since: str = "", wait: str = "", reason: str = "") -> str:
     """被叫醒看了一眼、发现没什么需要你插手时，把这次唤醒从当前上下文里无痕收起，并直接结束这一轮。
 
-    收起的消息不会丢，只是退回未读，下次醒来会和新消息一起接着给你看；你在这期间改过的笔记或文件也不会撤回。不过一旦你在这期间发过言、输入框里留着刚打的字、或者跟听（follow）攒了超过 200 条消息，就没法再清了。
+    收起的消息不会丢，只是退回未读，下次醒来会和新消息一起接着给你看；你在这期间改过的笔记或文件也不会撤回。不过一旦你在这期间发过言、输入框里留着刚打的字、或者跟听（follow）攒了超过 60 条消息，就没法再清了。
+    叫醒你的要是你自己挂的 wait（「这次唤醒你的是」里写着"等到了"），它这时已经用掉了；还想接着等，就带上 wait，清掉的同时重新挂上。
 
     @param
     since: 从哪次唤醒开始清，填「这次唤醒你的是（…）」括号里的时刻（只写 时:分:秒 也行），把那次到现在的唤醒一并清掉；留空只清最近这一次
+    wait: 清掉以后接着等谁、等多久，写 窗口 时长，如 "g123 10m"、"g123:30001 10m"（只等这个人）、"u456 5m"；那边来消息或者到点都会叫你。留空就不等
+    reason: 带 wait 时写给到时候的自己的理由，如"还在等他回那件事"；留空默认"接着等回复"
+
+    WHY: 2026-10-29 草籽：wait 是来消息就认领、当场划掉的。别人插一句叫醒了她，她看一眼 dismiss 掉，
+    原来那条 wait 已经没了，等的人后来接话也叫不醒她。不自动放回去，而是让 dismiss 也能设 wait：
+    还等不等、等谁、等多久，她看过那条消息以后自己定。
     """
     from mods import chat
+    from mods.chat import awaker
 
     session = current_binding().session
     problem = chat.segment.request_dismiss(session, since)
     if problem:
         return problem
+    planted = ""
+    if str(wait).strip():
+        when = " ".join(str(wait).split())
+        when = when[5:] if when.startswith("wait ") else when
+        try:
+            planted = awaker.plant(f"wait {when}", reason.strip() or "接着等回复")
+        except ValueError as error:
+            # 两件事一起成：wait 挂不上就不清，她改好以后再调一次，不会清了却没在等。
+            session.dismiss = None
+            return (f"wait 没挂上（{error}），这次也先不清。写法是 窗口 时长，如 \"g123 10m\"、"
+                    f"\"g123:30001 10m\"；改好再调一次 dismiss")
     session.turn_done = lambda: True
-    return "这一轮结束后清掉"
+    return "这一轮结束后清掉" + (f"；接着等：{planted}（来消息或到点都会叫你）" if planted else "")
 
 
 def tidy(note: str = "") -> str:

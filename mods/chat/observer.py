@@ -36,6 +36,8 @@ DEFAULT_CONFIG = {
     "context": "recent",
 }
 
+# WHY: 2026-10-29 草籽：observer 是补盲，清单里只放柚子真的容易忘的。想加一条，先确认她确实会漏；
+# 她已经不会漏的就拿掉。设备上有 data/notes/observer.md 时用那份，这里只是兜底。
 DEFAULT_OBSERVER_PROMPT = """你叫 observer，是柚子的旁观助手。
 每次她被叫醒之前，你先看一眼新到的画面和她上一轮想的、做的，把她可能顺手滑过去的东西点出来。
 
