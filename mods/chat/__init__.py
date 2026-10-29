@@ -143,18 +143,42 @@ AGENT_SETTINGS = {
 }
 
 _reflect_stream = log.stream("agent")
+_reflect_lock = threading.Lock()
+_reflect_pending = False
 
 
-def reflect_now(handoff: bool = True) -> bool:
-    """Start the reflection pass right away on its own thread; False when the agent is busy."""
-    if context.get_turn(AGENT_WINDOW) is not None:
-        return False
+def reflect_now(handoff: bool = True, wait_seconds: float = 60.0) -> bool:
+    """Start the reflection pass right away on its own thread; False when already reflecting or pending.
+
+    WHY: 2026-10-29 修复：当她在轮次中执行 send_command("#reflect keep") 时，AGENT_WINDOW 处于活动状态；
+    若直接判 busy 返回 False，她永远无法通过工具发起反思。
+    此处改为：如果已有反思在排队或当前正在反思则返回 False；若当前正在进行普通对话轮次，
+    先通知停止循环，并在后台线程中等待当前轮次结束释放 AGENT_WINDOW，再无缝接入反思。
+    """
+    global _reflect_pending
+    with _reflect_lock:
+        if _reflect_pending:
+            return False
+        current_turn = context.get_turn(AGENT_WINDOW)
+        if current_turn is not None and getattr(current_turn, "log", {}).get("kind") == "反思":
+            return False
+        _reflect_pending = True
 
     def run() -> None:
+        global _reflect_pending
         try:
+            _agent.stop_loop("准备反思")
+            deadline = time.time() + wait_seconds
+            while time.time() < deadline:
+                if context.get_turn(AGENT_WINDOW) is None:
+                    break
+                time.sleep(0.5)
             _agent.reflect(handoff=handoff)
         except Exception:
             _reflect_stream.exception("反思失败")
+        finally:
+            with _reflect_lock:
+                _reflect_pending = False
 
     threading.Thread(target=run, name="chat-reflect", daemon=True).start()
     return True

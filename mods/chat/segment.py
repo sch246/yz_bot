@@ -71,6 +71,12 @@ def load() -> dict:
                 return fresh()
     segment = {**fresh(), **data}
     segment["messages"] = _repair(segment["messages"])
+    for mark in segment.get("marks", []):
+        mark.setdefault("last_shown", {})
+        mark.setdefault("windows", [])
+        mark.setdefault("scopes", [])
+        mark.setdefault("boxes", {})
+        mark.setdefault("seen", {})
     return segment
 
 
@@ -752,7 +758,18 @@ def finish_decompress(session, results) -> None:
     archive_data = read_archived(name) or {}
     if "marks" in archive_data and isinstance(archive_data["marks"], list):
         for m in archive_data["marks"]:
-            restored_marks.append({**m, "index": target_idx + m.get("index", 0)})
+            restored_marks.append({
+                "last_shown": {},
+                "windows": [],
+                "scopes": [],
+                "told": None,
+                "tokens": None,
+                "notice": None,
+                "boxes": {},
+                "seen": {},
+                **m,
+                "index": target_idx + m.get("index", 0),
+            })
     else:
         for offset, msg in enumerate(original_messages):
             content = str(msg.get("content") or "")
@@ -765,6 +782,12 @@ def finish_decompress(session, results) -> None:
                     "at": at_time,
                     "time": time.time(),
                     "index": target_idx + offset,
+                    "last_shown": {},
+                    "windows": [],
+                    "scopes": [],
+                    "told": None,
+                    "tokens": None,
+                    "notice": None,
                     "boxes": {},
                     "seen": {},
                 })
@@ -855,7 +878,8 @@ def _truncate_compress_call(segment: dict, results, max_len: int = 60) -> None:
 
 def _shown_since(segment: dict, mark: dict) -> list[str]:
     """Labels of the windows shown after *mark*: their screen position moved on since."""
-    return [label for label, last in segment.get("last_shown", {}).items() if mark["last_shown"].get(label) != last]
+    last_shown = mark.get("last_shown") or {}
+    return [label for label, last in segment.get("last_shown", {}).items() if last_shown.get(label) != last]
 
 
 def _dismiss_problem(session, mark: dict) -> str:
@@ -867,8 +891,9 @@ def _dismiss_problem(session, mark: dict) -> str:
             label = _screen.label(window)
             return (f"{label} 从 {mark['at']} 起 follow 期间已经攒了 {piled} 条，超过 {_screen.FRESH_MAX} 条就不能再清："
                     f"这次留着，把它们看完；不想跟了就 wake_me(\"follow {label} off\")")
+    boxes = mark.get("boxes") or {}
     typed = [label for label, box in session.boxes.items()
-             if isinstance(box, dict) and box.get("text") and box["text"] != mark["boxes"].get(label)]
+             if isinstance(box, dict) and box.get("text") and box["text"] != boxes.get(label)]
     if typed:
         return (f"{'、'.join(typed)} 的输入框里有 {mark['at']} 之后打的或改过的字，清掉以后你会不记得打过；"
                 "先 send，或者用 type_word 改回原样或清空，再 dismiss")
@@ -968,7 +993,9 @@ def _fold_between(segment: dict, mark: dict, after: dict, label: str) -> str:
     removed = segment["messages"][start:end]
     level = _detect_fold_level(removed)
     level_tag = f"L{level}"
-    shown = [window for window, last in after["last_shown"].items() if mark["last_shown"].get(window) != last]
+    after_shown = after.get("last_shown") or {}
+    mark_shown = mark.get("last_shown") or {}
+    shown = [window for window, last in after_shown.items() if mark_shown.get(window) != last]
     inside_marks = [{**m, "index": m["index"] - start} for m in segment.get("marks", []) if start <= m.get("index", 0) < end]
     name = archive({"started": mark["time"], "windows": shown, "reason": label, "level": level, "messages": removed, "marks": inside_marks}, "folded")
     where = f"{'、'.join(shown)} 的画面和" if shown else ""

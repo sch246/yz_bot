@@ -380,7 +380,18 @@ def _decompress_subcommand(tail: str) -> str:
     restored_marks = []
     if "marks" in data and isinstance(data["marks"], list):
         for m in data["marks"]:
-            restored_marks.append({**m, "index": target_idx + m.get("index", 0)})
+            restored_marks.append({
+                "last_shown": {},
+                "windows": [],
+                "scopes": [],
+                "told": None,
+                "tokens": None,
+                "notice": None,
+                "boxes": {},
+                "seen": {},
+                **m,
+                "index": target_idx + m.get("index", 0),
+            })
     else:
         for offset, msg in enumerate(orig_msgs):
             content = str(msg.get("content") or "")
@@ -393,6 +404,12 @@ def _decompress_subcommand(tail: str) -> str:
                     "at": at_time,
                     "time": time.time(),
                     "index": target_idx + offset,
+                    "last_shown": {},
+                    "windows": [],
+                    "scopes": [],
+                    "told": None,
+                    "tokens": None,
+                    "notice": None,
                     "boxes": {},
                     "seen": {},
                 })
