@@ -377,6 +377,26 @@ def _decompress_subcommand(tail: str) -> str:
     body = [*body[:target_idx], *orig_msgs, *body[target_idx + 1:]]
     shift = len(orig_msgs) - 1
 
+    restored_marks = []
+    if "marks" in data and isinstance(data["marks"], list):
+        for m in data["marks"]:
+            restored_marks.append({**m, "index": target_idx + m.get("index", 0)})
+    else:
+        for offset, msg in enumerate(orig_msgs):
+            content = str(msg.get("content") or "")
+            m_wake = re.search(r"这次唤醒你的是（#(\d+)\s*·\s*([^）]+)）", content)
+            if m_wake:
+                num = int(m_wake.group(1))
+                at_time = m_wake.group(2).strip()
+                restored_marks.append({
+                    "number": num,
+                    "at": at_time,
+                    "time": time.time(),
+                    "index": target_idx + offset,
+                    "boxes": {},
+                    "seen": {},
+                })
+
     marks = []
     for mark in segment.get("marks", []):
         idx = mark.get("index", 0)
@@ -384,6 +404,8 @@ def _decompress_subcommand(tail: str) -> str:
             marks.append(mark)
         else:
             marks.append({**mark, "index": idx + shift})
+    marks.extend(restored_marks)
+    marks.sort(key=lambda m: m.get("index", 0))
     segment["marks"] = marks
     segment["messages"] = body
     _chat_root._segment.save(segment)

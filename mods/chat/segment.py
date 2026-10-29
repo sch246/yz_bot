@@ -747,7 +747,29 @@ def finish_decompress(session, results) -> None:
     body = [*body[:target_idx], *original_messages, *body[target_idx + 1:]]
     shift = len(original_messages) - 1
 
-    # 调整 marks 下标
+    # 恢复内部 marks 或从原消息中重构（确保解压后仍能按唤醒号/子步骤重新切分和压缩）
+    restored_marks = []
+    archive_data = read_archived(name) or {}
+    if "marks" in archive_data and isinstance(archive_data["marks"], list):
+        for m in archive_data["marks"]:
+            restored_marks.append({**m, "index": target_idx + m.get("index", 0)})
+    else:
+        for offset, msg in enumerate(original_messages):
+            content = str(msg.get("content") or "")
+            m_wake = re.search(r"这次唤醒你的是（#(\d+)\s*·\s*([^）]+)）", content)
+            if m_wake:
+                num = int(m_wake.group(1))
+                at_time = m_wake.group(2).strip()
+                restored_marks.append({
+                    "number": num,
+                    "at": at_time,
+                    "time": time.time(),
+                    "index": target_idx + offset,
+                    "boxes": {},
+                    "seen": {},
+                })
+
+    # 调整并合并 marks 下标
     marks = []
     for mark in segment.get("marks", []):
         idx = mark.get("index", 0)
@@ -755,6 +777,8 @@ def finish_decompress(session, results) -> None:
             marks.append(mark)
         else:
             marks.append({**mark, "index": idx + shift})
+    marks.extend(restored_marks)
+    marks.sort(key=lambda m: m.get("index", 0))
     segment["marks"] = marks
 
     # 调整 tokens
@@ -882,8 +906,9 @@ def _fold_since(segment: dict, mark: dict, label: str) -> str:
     removed = segment["messages"][mark["index"]:]
     level = _detect_fold_level(removed)
     level_tag = f"L{level}"
+    inside_marks = [{**m, "index": m["index"] - mark["index"]} for m in segment.get("marks", []) if m.get("index", 0) >= mark["index"]]
     name = archive({"started": mark["time"], "windows": shown, "reason": label, "level": level,
-                    "messages": removed}, "folded")
+                    "messages": removed, "marks": inside_marks}, "folded")
     where = f"{'、'.join(shown)} 的画面和" if shown else ""
     header_title = f"【收起 {level_tag}】" if level == 1 else f"【收起 {level_tag}·递归汇总】"
     segment["messages"] = [*segment["messages"][:mark["index"]], {"role": "system", "content": (
@@ -900,7 +925,8 @@ def _fold_slice(segment: dict, start: int, end: int, label: str, where: str) -> 
     removed = segment["messages"][start:end]
     level = _detect_fold_level(removed)
     level_tag = f"L{level}"
-    name = archive({"started": time.time(), "windows": [], "reason": label, "level": level, "messages": removed}, "folded")
+    inside_marks = [{**m, "index": m["index"] - start} for m in segment.get("marks", []) if start <= m.get("index", 0) < end]
+    name = archive({"started": time.time(), "windows": [], "reason": label, "level": level, "messages": removed, "marks": inside_marks}, "folded")
     line = {"role": "system", "content": (
         f"【步骤收起 {level_tag}】{label}\n（{where}，中间思考与调用已收成上面这段；"
         f"原样存在归档段 {name}，加载 memory_system 用 read_context(\"{name}\") 读，search 也搜得到）")}
@@ -943,7 +969,8 @@ def _fold_between(segment: dict, mark: dict, after: dict, label: str) -> str:
     level = _detect_fold_level(removed)
     level_tag = f"L{level}"
     shown = [window for window, last in after["last_shown"].items() if mark["last_shown"].get(window) != last]
-    name = archive({"started": mark["time"], "windows": shown, "reason": label, "level": level, "messages": removed}, "folded")
+    inside_marks = [{**m, "index": m["index"] - start} for m in segment.get("marks", []) if start <= m.get("index", 0) < end]
+    name = archive({"started": mark["time"], "windows": shown, "reason": label, "level": level, "messages": removed, "marks": inside_marks}, "folded")
     where = f"{'、'.join(shown)} 的画面和" if shown else ""
     header_title = f"【收起 {level_tag}】" if level == 1 else f"【收起 {level_tag}·递归汇总】"
     line = {"role": "system", "content": (
