@@ -105,21 +105,10 @@ def _memory_overview() -> str:
     return text[start:end if end > 0 else None].strip()
 
 
-_IDENTITY = ("- 你的昵称: 柚子\n"
-             "- 你的QQ号: 236288772；聊天记录里这个 QQ 号的发言就是你自己说过的话")
-
-
-def _with_identity(text: str) -> str:
-    """Rewrite the two identity lines to the values this process is actually running as."""
-    nick, qq = identity.bot_name(), identity.bot_id()
-    lines = []
-    for line in text.split("\n"):
-        if line.startswith("- 你的昵称"):
-            line = f"- 你的昵称: {nick}"
-        elif line.startswith("- 你的QQ号"):
-            line = f"- 你的QQ号: {qq}；聊天记录里这个 QQ 号的发言就是你自己说过的话"
-        lines.append(line)
-    return "\n".join(lines)
+def _identity() -> str:
+    """The two identity lines, with the nickname and QQ number this process is actually running as."""
+    return (f"- 你的昵称: {identity.bot_name()}\n"
+            f"- 你的QQ号: {identity.bot_id()}；聊天记录里这个 QQ 号的发言就是你自己说过的话")
 
 
 def _base_prompt() -> list[dict]:
@@ -132,5 +121,5 @@ def _base_prompt() -> list[dict]:
     memory = _memory_overview()
     # WHY: 沉默那两条参照 Cortico 的 "Silence is a normal action"（维护者 2026-10-23）：私聊每条
     # 都叫醒以后，话没说完就回靠这里和输入框（type_word 与 send 之间隔一次请求）压住，不靠延迟。
-    return [{"role": "system", "content": _with_identity(_IDENTITY)
+    return [{"role": "system", "content": _identity()
                 + (f"\n\n{memory}" if memory else "")}]
