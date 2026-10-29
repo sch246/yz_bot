@@ -14,9 +14,9 @@
 
 此外，她用 `wake_me` 在笔记 awaker 里埋下的 `on`／`wait` 规则在消息到达时由 `capture_chat` 认领（`awaker.take_waiting`）：这个窗口（或窗口里这个人）来了消息就叫醒她，唤醒原因写"等到了（规则原文）"，规则划掉。在这些默认判据之上，窗口可以盖一层限时的覆盖层（`awaker.triggered`）：笔记里的 `follow`（每条消息都叫）、`mute`（都不叫），或者代码用 `awaker.override` 设的 `other`（一个函数决定）。它决定 `activation_signal` 的结果算不算数，也决定 `chat.push` 的 `wake=` 算不算数；`on`／`wait` 和显式的 `chat.wake` 不经过它，`me` 不能盖，master 的话 mute 压不住。被 mute 压住的点名照样由 `capture_chat` 吃掉，免得后面的 `capture_addressed_fallback` 直接调 `chat()`。盖着的窗口在画面框头和未读提示里带上 `awaker.badges`，被它叫醒时唤醒原因写"覆盖层 follow 到 …：理由"。她用 `send` 发出去以后（`awaker.spoke`），这个群 5 分钟内没有别的覆盖层时自动算 `follow`，她连着两次 `dismiss` 掉看过它的唤醒就停。
 
-被叫醒了没什么要做的，她调 `dismiss(since)`（`agent.request_dismiss`；或者整轮唤醒一个工具都没调、只是看了一眼时收尾自动触发）：这一轮结束后，这一段退回到 `since` 那行“这次唤醒你的是（时刻）”之前（不写就是最近一行），画面、插话、思考、工具调用和结果都不留。每次唤醒追加之前，`_run_agent` 在这一段里记一个记号（`marks`：消息条数、固定递增序号 `number`、`last_shown`、`windows`、`scopes`（这一段给过哪些人和群的笔记）、`told`、`tokens`、`notice` 和当时输入框里的字），清的时候照它恢复，清掉的唤醒里第一次给的笔记下次跟着画面再给；`last_shown` 和画面"看到哪"的标记（`agent._seen`，记号里存着当时的值）退回去，所以清掉的消息回到没读，下次画面接着给，排在“以下是上次之后的新消息”下面；oplog 的已读标记和唤醒确认不退（日志里没有"标回未读"），画面外的未读条数因此不算它们。oplog 和 llm.log 不清。从那以后她发过话（`last_sent`），或者输入框里有那以后打的、改过的字，就不让清；跟着的窗口里清了会退回去的 follow 期间消息超过 `_FRESH_MAX`（60）条也不让清（`agent._piled`），因为这些消息画面不截，一直清会越攒越多；记号跟着这一段，交接后重新算。
+被叫醒了没什么要做的，她调 `dismiss(since)`（`agent.request_dismiss`；或者整轮唤醒一个工具都没调、只是看了一眼时收尾自动触发）：这一轮结束后，这一段退回到 `since` 那行“这次唤醒你的是（#序号 · 时刻）”之前（不写就是最近一行，支持按时刻或 #序号 点名），画面、插话、思考、工具调用和结果都不留。每次唤醒追加之前，`_run_agent` 在这一段里记一个记号（`marks`：消息条数、固定递增序号 `number`、`last_shown`、`windows`、`scopes`（这一段给过哪些人和群的笔记）、`told`、`tokens`、`notice` 和当时输入框里的字），清的时候照它恢复，清掉的唤醒里第一次给的笔记下次跟着画面再给；`last_shown` 和画面"看到哪"的标记（`agent._seen`，记号里存着当时的值）退回去，所以清掉的消息回到没读，下次画面接着给，排在“以下是上次之后的新消息”下面；oplog 的已读标记和唤醒确认不退（日志里没有"标回未读"），画面外的未读条数因此不算它们。oplog 和 llm.log 不清。从那以后她发过话（`last_sent`），或者输入框里有那以后打的、改过的字，就不让清；跟着的窗口里清了会退回去的 follow 期间消息超过 `_FRESH_MAX`（60）条也不让清（`agent._piled`），因为这些消息画面不截，一直清会越攒越多；记号跟着这一段，交接后重新算。
 
-`#subconscious`（storage `agent.subconscious`，默认开）现在只剩一条提醒：`agent._drive_agent` 每轮组装请求时把 `_segment.nudge(segment)` 挂在 hint 末尾（`_run_session` 的 `hints`，和“现在是几点”一样只进这一份请求、不进这一段），这一段比 `segment["settled"]` 上次提醒时又长 5 万 token（用 `_segment.context_size` 量）就返回一条 system 消息：这一段多长、能收哪几段（`marks` 里 `index > 0`、去掉最近一次，带固定序号及各带那之后约多少 token）、`compress` 怎么调；同时把 `settled` 和 `nudged_at` 写回 `current.json`。第一次见到这一段、或她 dismiss 把这段清短了，只记基准、不提醒。收不收、收哪段、摘要怎么写都由她自己调 `compress`（`mods/tools/meta.py`，和 `tidy`／`dismiss` 一起注册）：支持按序号范围 `compress(first=1, last=3, summary="")` 或按时刻 `compress(from_time, to_time="", summary="")` 把起点记号之后的唤醒交给 `segment.request_compress`，`request_compress` 只校验并记下待收范围，真正的折叠在 `record_results` 里、这批工具结果都进了 messages 之后由 `finish_compress` 做：`to_time` 留空走 `segment.fold_since`，一次收到现在（包括这次 compress 的调用和结果，收完一起从上下文消失）；给了 `to_time` 走 `segment.fold_between`，只收中间，同批只有这个调用时它和结果也一并删掉。`fold_since` 把从记号起到最后换成一条 system 摘要，原样另存为 `archive/<时刻>-folded.json`，`scopes`、`told`、`tokens`、`notice` 退回记号时的值，`last_shown` 和看到哪不退；`fold_between` 收中间那几次唤醒，后面记号的下标往前挪（但记号的固定序号 `number` 不变），区间里第一次给的 `scopes` 从这一段和后面的记号里退掉，`told` 退回区间开头的值，`tokens` 扣掉这一块的估算。这一段第一次唤醒（连着交接留下的笔记）和最近一次唤醒都收不了。提醒不进 oplog，请求日志里照常是这次请求的一部分；动作记录里能看到 `compress` 这次调用。`#subconscious` 显示开关、这一段多长、离下次提醒还差多少和上次提醒的时刻。
+`#subconscious`（storage `agent.subconscious`，默认开）现在只剩一条提醒：`agent._drive_agent` 每轮组装请求时把 `_segment.nudge(segment)` 挂在 hint 末尾（`_run_session` 的 `hints`，和“现在是几点”一样只进这一份请求、不进这一段），这一段比 `segment["settled"]` 上次提醒时又长 5 万 token（用 `_segment.context_size` 量）就返回一条 system 消息：这一段多长、能收哪几段（`marks` 里 `index > 0`、去掉最近一次，带固定序号及各带那之后约多少 token）、耗量较大的子序号（如 `28.1`、`28.2`）、`compress` 怎么调（若 `recent` 超过 2 小时未更新，`nudge` 提醒与 `compress` 回执还会附带一句顺手刷新 `recent` 的温和提示）；同时把 `settled` 和 `nudged_at` 写回 `current.json`。第一次见到这一段、或她 dismiss 把这段清短了，只记基准、不提醒。收不收、收哪段、摘要怎么写都由她自己调 `compress`（`mods/tools/meta.py`，和 `tidy`／`dismiss` 一起注册）：全面采用序号定位，支持按序号范围 `compress(first=26, last=27, summary="")`（只收一轮 `last` 留空或填 0；收至最新唤醒之前填 `last="latest"`）把待收唤醒交给 `segment.request_compress`；2026-10-27 扩充子序号粒度（参考 billion_context），支持按子步骤精确折叠 `compress(first="28.1", last="28.1", summary="")`，即使当轮失误读了大段长日志也能当场收掉中间调用，只留一条 system 摘要，原样归档为 `-folded`；2026-10-28 引入折叠层级感知（L1 一级折叠、L2 递归折叠），自动检测并标记；`request_compress` 只校验并记下待收范围，真正的折叠在 `record_results` 里、这批工具结果都进了 messages 之后由 `finish_compress` 做：`finish_compress` 走 `segment._fold_between`、`_fold_slice` 或 `_fold_since`，折叠后调用 `_truncate_compress_call` 将 assistant 消息入参中的 `summary` 截短存照，避免在上下文中造成冗余，同时完整保留工具调用与回执供后续认知衔接；回执详尽反馈折叠层级、序号范围、归档标识、节省 token 与最新上下文占用。`_fold_since` 把从记号起到最后换成一条 system 摘要，原样另存为 `archive/<时刻>-folded.json`，`scopes`、`told`、`tokens`、`notice` 退回记号时的值，`last_shown` 和看到哪不退；`_fold_between` 收中间那几次唤醒，后面记号的下标往前挪（但记号的固定序号 `number` 不变），区间里第一次给的 `scopes` 从这一段和后面的记号里退掉，`told` 退回区间开头的值，`tokens` 扣掉这一块的估算。整轮折叠时这一段第一次唤醒（连着交接留下的笔记）和最近一次唤醒都收不了；子步骤模式允许收当前轮中已完成的前序步骤。提醒不进 oplog，请求日志里照常是这次请求的一部分；动作记录里能看到 `compress` 这次调用。`#subconscious` 显示开关、这一段多长、离下次提醒还差多少和上次提醒的时刻。已载入上下文的笔记若中途被改动（`write_note` 或磁盘编辑），`_run_agent` 唤醒时自动检测并以追加方式（`【笔记更新】`）注入最新版，既不打碎历史前缀缓存、也保证早期思考依赖早期笔记版本的因果历史完整。
 
 这些判据判定要叫醒她时都走 `chat.wake(event, kind)`：在 oplog 里把这条到达标为激活，再驱动中心 agent；她正忙时激活留着，这一轮收尾时接上。它是唤醒方式的函数入口，link 节点、`.py` 或其它模块也可以在**这条消息的派发过程中**调用（到达号只在派发期间可查，事后调用会报错）；`kind` 原样出现在她看到的"这次唤醒你的是"里。不带消息时写 `chat.wake(reason=..., kind=...)`，随时能调（awaker 规则到点、`when` 条件成立、她用 `exec_code` 包在某个函数上的钩子）：等于 `chat.push(me, kind, reason, wake=kind)`，理由作为一条记录写进她自己的 `me` 窗口，见下一段。夜间反思走 `agent.reflect`。
 
@@ -28,7 +28,7 @@
 
 群内其它成员之间的戳一戳不会单独触发 LLM，但 chatlog 会记下它，之后出现在该群的窗口画面里。因此“能被模型看见”与“立即触发模型”是两个不同边界。
 
-中心设置命令直接使用 `#` 前缀，没有 `#agent` 层：`#model`、`#models`、无参 `#prompt`、`#image`、`#reasoning`、`#limit`、`#reflect`、`#awaker` 和 `#help` 可查看；`#use_model`、带参数的 `#prompt`／`#image`／`#reasoning`／`#limit`／`#reflect`／`#awaker` 修改全局设置，要求 op。`#prompt [set <全文>]` 看或改写笔记 self；旧的 `#add_prompt`、`#setting`、`#use_setting`、`#set_setting`、`#del_setting` 已删除。`#hint` 不属于这些全局聊天设置：它由 op 管理，可覆盖本窗口或全局默认，并在最初触发窗口的聊天循环停下时向 QQ 发送状态。
+中心设置命令直接使用 `#` 前缀，没有 `#agent` 层：`#model`、`#models`、无参 `#prompt`、`#image`、`#reasoning`、`#effort`、`#limit`、`#reflect`、`#subconscious`、`#loop`、`#awaker`、`#debounce`、`#observer` 和 `#help` 可查看；`#use_model`、`#model note`、带参数的 `#prompt`／`#image`／`#reasoning`／`#effort`／`#limit`／`#reflect`／`#subconscious`／`#loop`／`#awaker`／`#debounce`／`#observer` 修改全局设置，要求 op。`#models [供应商]` 可列出当前或指定供应商的模型列表与备注；`#model note <provider/model> [备注]` 可随时查看或登记模型备注与评价；`#prompt [set <全文>]` 看或改写笔记 self；旧的 `#add_prompt`、`#setting`、`#use_setting`、`#set_setting`、`#del_setting` 已删除。`#hint` 不属于这些全局聊天设置：它由 op 管理，可覆盖本窗口或全局默认，并在最初触发窗口的聊天循环停下时向 QQ 发送状态。
 
 每次中心请求都会新建一个 `Chat` 对象，但共享进程级 `LLMClient`、供应商客户端和 storage。中心 agent 在交接之前一直用同一段上下文，每次被叫醒只往后追加；交接后从笔记重新开始一段。chatlog 保存原始聊天档案，`oplog` 登记窗口到达、唤醒与模型的输出和结果。因此：
 
@@ -38,16 +38,16 @@
 
 ## 上下文如何组装
 
-2026-10-22 起中心 agent 只要不交接，就一直在同一段上下文里（取舍见[无状态主循环提案](working/proposals/stateless-agent-loop.md) §7.2）。这一段存在 `data/context/current.json`（`chat.segment`），重启后接着用；系统提示每次重建，在交接之间不变，其余消息原样保存，包括原生 assistant/tool 配对与思考。
+2026-10-22 起中心 agent 只要不交接，就一直在同一段上下文里（取舍见[无状态主循环提案](working/proposals/stateless-agent-loop.md) §7.2）。这一段存在 `data/context/current.json`（`chat.segment`），每次覆盖前会把旧文件滚动备份到 `current.bak.json`，重启或读盘遇到损坏时可自动从备份恢复；系统提示每次重建，在交接之间不变，其余消息原样保存，包括原生 assistant/tool 配对与思考。
 
 1. **新一段的开头**（交接后第一次被叫醒，`agent._head`），按顺序：
    - 系统提示：笔记 self、`_base_prompt`（每次从 `data/storage/llm_system/prompts.json` 读 `base` 预设并动态替换昵称和 QQ 号，末尾附 `tools/memory_system.py` 开头"你的记忆"一节）、中心身份说明；
-   - 笔记：global、recent（上次交接留下的）、最近一篇日记（每篇标题后标出文件相对路径）；
+   - 笔记：global、recent（眼下的短期工作台，白天阶段性进展或折叠时随时刷新，交接时亦会确认）、最近一篇日记（每篇标题后标出文件相对路径）；
    - 年鉴索引（`data/notes/years.md` 最近 8 段交接归档的摘要）；
    - 目录（`roles.directory`），只列名字：其它最近有消息的窗口（带名字：她起的名 > 群名 > 昵称）、笔记、日记；
    - 当前完整工具状态（放在笔记和第一次出现的相关人笔记之后、第一条窗口画面之前），这一段里不再重发，变化由 context provider 追加。
 2. **每次唤醒追加的材料**（`agent._run_agent`），前面的消息一个字都不动：
-   - 这一段里第一次出现的窗口和作者（最多 6 人）的笔记（`agent._people`）；
+   - 这一段里第一次出现的窗口、作者以及画面人物的笔记（`agent._people`）：不仅包含本次唤醒通知中的触发者（`turn.authors`），画面切片还会通过 `screen.extract_qqs` 从当前画面文本的消息头 `昵称(QQ号)` 以及 `@昵称(QQ号)`／`[CQ:at,qq=QQ号]`（含戳一戳）中提取本轮涉及的所有 QQ 号。本地存在对应 `person:<QQ>` 笔记（`notes.render` 非空）且在当前段尚未载入过的，自动通过 `_note_block` 拼装进材料开头（上限提升至 `_KNOWN_PEOPLE = 20` 人），并登记到 `met` 与 `segment["scopes"]` 中，使群内其他参与者或被艾特者的笔记能随画面 100% 准确地自动就位，无需依赖唤醒触发者是谁；
    - 叫醒她的窗口画面（2026-10-23 起学 Cortico 分开别人的话和系统的话）：每个窗口一条 user 消息（`view.outside`），第一行是框头（`窗口 g123 · 画面 · 时刻`，插话时写"你干活时刚到的"和其中叫她的激活），下面是 chatlog 原文，图片在原处。user 消息只装外面来的记录；系统自己说的话——笔记块、目录、工具状态、"这次唤醒你的是"、交接说明和交接指令、输入框提示、反思材料、末尾 hint（`Chat.hint_role`）——都是对话中间的 system 消息。DeepSeek 文档说 Chat Completions 支持在对话中间插 system、不支持插工具调用；当天先做过一版合成 `incoming` 工具调用的框，随即换成这样，那时存下的框（`view.is_incoming`）仍不算她做过的事，`search` 的归档部分不搜，`read_context` 显示成【incoming】。系统提示有几条由 `agent._system_count` 记的 `prompt_count` 决定，不再按角色找边界。这一段里第一次出现的窗口，有全局看到位置时只给新消息和前面 3 条旧记录接话，没有看到位置时才按 `max_events` 补历史（至少 3 条）；已经出现过的从这一段里上次给到的那条记录之后接着给（记在这一段的 `last_shown`，不按看到时间，因为它只精确到秒）；交接后续做时沿用刚才看着的窗口；
    - "这次唤醒你的是（时刻）"、闹钟理由（末尾附一句是谁在管、改哪里），或"你刚把上一段上下文交接掉了"；
    - 第一次输出之后，每次子请求之前 `agent._late_arrivals` 把画面里的窗口新到的未读按画面同样的规则（从 `last_shown` 接着给，最多 60 条）追加进这一段，标题写窗口、时刻和其中的激活。`last_shown` 在追加时推进（它和这一段一起存盘）；看到时间和已读等那次请求产生输出（哪怕只有思考）才记，所以收尾不再为它们多叫一次，请求失败时它们仍是未读、照样再叫醒她，画面也不会再给一遍。只有她自己发出去的回显时不插。
@@ -90,9 +90,22 @@
 
 `init_chat()` 装配提示词与身份说明，`_activate_chat()` 计数并从全局 `agent.active_tools` 恢复实际加载状态。离线回放入口已删除，见[运行架构](architecture.md)。
 
+## 多媒体与提示词笔记（图片、语音与音乐）
+
+中心主聊天的多媒体档位由 op 用 `#image <mode>` 与 `#audio <mode>` 全局设置。名称与数字别名分别为 `off/0`、`lazy/1`、`eager/2`。
+- **图片档位（#image）**：`off` 会把历史消息中的图片 part 降级为 `[图片(URI)]` 文本；`lazy` 只在 LLM 实际触发时处理图片；`eager` 在图片消息到达时后台预取并按需预生成描述。
+- **语音档位（#audio）**：`off` 时聊天画面呈现 `[语音: 5秒]`（无时长时为 `[语音]`），不触发下载；`lazy` 时调用 NapCat `get_record` 转码或直链下载到 `data/tmp_files/<sha256>.mp3`（复用 15 天闲置清理），画面呈现 `[语音: 5秒, file:///...]` 供柚子需要时调用 `audio__listen` 倾听；`eager` 时后台拉取并通过多模态模型自动转录，画面直接呈现 `[语音: 5秒: {转录与语气描述}]`。
+- **音乐卡片（music CQ）**：聊天中的音乐分享（`[CQ:music,...]`）在进入画面时被自动解析转换为结构化的 `[音乐卡片: 《歌名》- 歌手 (平台)]`，便于模型准确理解歌曲信息。
+
+### 提示词笔记与缓存自动失效
+
+图片与音频的默认描述提示词分别存放在普通笔记 `data/notes/vision.md` 与 `data/notes/audio.md` 中（若文件不存在则平滑回退到模块内默认常量）。提示词采用**动态哈希版本**（`auto-v1:<hash>` 与 `audio-v1:<hash>`）：
+- 只要维护者或柚子修改了 `vision.md` 或 `audio.md` 的内容，提示词 SHA256 哈希值改变，系统在读取描述缓存时判定版本不匹配，旧缓存自动被淘汰并重新请求多模态大模型，无需人工清理缓存。
+- 图片描述缓存保存在 `llm_system/description_cache`，音频描述缓存保存在 `llm_system/audio_cache`，两套缓存物理隔离，避免相互误清。
+
 中心主聊天的图片档位由 op 用 `#image <mode>` 全局设置。名称与数字别名分别为 `off/0`、`lazy/1`、`eager/2`；历史布尔值兼容为 `False → off`、`True → lazy`。`off` 会把历史消息中的图片 part 降级为 `[图片(URI)]` 文本：避免把 `image_url` 发给纯文本模型；没设过 `#image` 时就是 `off`。例外是工具结果里的图：模型登记了 `vision` 和 `tool_images` 时，她用 `attach_image` 要看的图在 `off` 下照样展开（2026-10-23 起），所以 `off` 只管聊天里别人发来的图。中心 agent 可按需加载 `image` 模块：`recognize_image` 不依赖窗口，生图返回临时文件 URI，由模型再用带显式目标的 `type_word`／`send` 发送。`lazy` 只在 LLM 聊天实际触发时处理本轮上下文中的图片；**一次对话内同一张图只解析一次**——这里的“一次对话”指 `chat.chat()` 的一次持有（多轮工具调用与插话续写都算同一轮，直到它的 `finally`），解析失败的不再逐轮重试（腾讯 `rkey` 过期后只会拿到 HTML），成功的也直接复用，对话结束后重新聊会重新检查；不会自己好的失败（下回来的不是图、本地文件没了）跨对话记一小时，网络不通的不记。成功的图不再每次打日志，只有下载、上传和失败才说一句。模型登记了 `files_api` 时（DeepSeek 的 Files API），每张图第一次发给模型时上传一次（7 天有效，对端每个账号最多存 10000 个文件），之后请求里只放 `{"type": "file", "file_id": ...}`：file_id 按内容摘要记在 storage 的 `llm_system/image_files`，还在用、离过期不到一天的才重传，不用的到期就没了；传过的本地图另记路径，文件删了也照样引用；上传出错时这张图改成内联，5 分钟内先都内联。这项检查台账挂在线程局部，eager 预取另在线程记账。`eager` 在图片消息到达时立即启动后台下载：中心聊天模型能直接读图时只缓存原图，纯文本模型才会同时预生成文字描述。同一来源若恰好同时被 eager 和聊天请求，描述生成会等待同一个进行中任务，避免重复计费。纯文本模型的识别结果统一压成一个 `[图片(URI)识别结果：描述]` 文本 part，明确 URL 与描述属于同一张图片；视觉模型收到的实际图片 part 前会保留一段“下方图片的原始链接”文本。图片加载失败或没有可用视觉模型时也使用同一个带 URI 的单段格式。
 
-画面每次组装都重新读取，图片随请求按当前档位处理：纯文本模型的描述走描述缓存，缓存失效时会重新描述或给出失败占位；视觉模型直看图片时也可能因原图缓存过期而看到不同内容。`attach_image` 在不支持工具结果带图的模型上只把附图保留于当前子请求，不进 oplog。
+画面每次组装都重新读取，图片随请求按当前档位处理：纯文本模型的描述走描述缓存，缓存失效时会重新描述或给出失败占位；视觉模型直看图片时也可能因原图缓存过期而看到不同内容。`attach_image(uri, note="", model=None)` 支持传参指定外部视觉模型（如 `azure/gpt-5.6-luna`、`cheap` 等）直接转述；若未指定且当前主模型无视觉能力，会自动回退调用默认视觉模型（`get_vision_model`）转述图中内容；在不支持工具结果带图的视觉模型上只把附图保留于当前子请求，不进 oplog。
 
 自动描述使用固定 prompt，要求直接概括可见内容、转录重要文字、标明不确定项，并禁止“如果你愿意我还可以……”一类元话术。自动聊天图片处理、eager 预取、`recognize_image` 和参考图生图共用图片解析入口：`http://`、`https://` 和本机绝对 `file://` URI 都解析为 SHA-256 内容身份；网络图片按摘要缓存在 `data/tmp_files`，本地文件只计算摘要而不复制。所有入口都执行图片格式和 20 MiB 上限校验。需要把图片交给视觉模型时，再统一由 `image_uri_to_data_uri` 编码。`recognize_image` 支持自定义识别 prompt，不设置输出 token 上限，也不读写自动描述缓存，避免长文本识别被截断以及不同识别任务互相串用答案。
 
@@ -146,7 +159,7 @@
 | `reload_tools` | 按模块名从磁盘显式应用、更新或删除模块；逐项返回成功和带完整 traceback 的失败结果，失败保留旧 last-good。 |
 | `load_tools` | 将 last-good 模块激活到当前 Chat；中心名单存全局 `agent`，不读取磁盘。 |
 
-`meta` 还导出 `type_word`／`send`（唯一的发言方式：先打进那个窗口的输入框，下一步再发；同一次输出里刚打的字不发，必须写明 `target`）、`wake_me`（给自己埋唤醒规则，写进笔记 awaker）、`search`／`read_log`／`read_actions`／`read_note`（召回画面以外的聊天记录、笔记、日记、归档的上下文与自己的行动记录）、`write_note`（改任何一份笔记，包括待办 todo 和闹钟 awaker）、`tidy`（这一轮结束后交接）、`dismiss`（没什么要做的，这一轮结束后把这次唤醒从这一段里清掉）、`compress`（按序号范围 `first`／`last` 或时刻 `from_time`／`to_time` 把告一段落的唤醒折成摘要，原文归档为 `-folded`）、`loop`（她用 `loop("在做什么")` 开启一串循环或改写备注，每次唤醒结束后 `agent._next_loop` 隔 `_LOOP_GAP` 秒往 `me` 窗口 `chat.push` 一条带唤醒的“循环第几轮”，直到她 `loop(stop=True)`、维护者叫停那一轮、或者 `agent.reflect` 开头把它关掉；写下的备注记入 `data/context/loop.jsonl`）、`wait`（循环开着时这一轮马上结束、过多少秒再来下一轮，不阻塞也不关循环；没开循环时拒绝并指向 `wake_me`）、`loop_note_history`／`clear_loop_note`（翻看或清空她给循环写过的备注历史）、`set_name`（给任意窗口起名字，存 `data/storage/window_titles.json`）和 `attach_image`。
+`meta` 还导出 `type_word`／`send`（唯一的发言方式：先打进那个窗口的输入框，下一步再发；同一次输出里刚打的字不发，必须写明 `target`）、`wake_me`（给自己埋唤醒规则，写进笔记 awaker）、`search`／`read_log`／`read_actions`／`read_note`（召回画面以外的聊天记录、笔记、日记、归档的上下文与自己的行动记录）、`write_note`（改任何一份笔记，包括待办 todo 和闹钟 awaker）、`tidy`（这一轮结束后交接）、`dismiss`（没什么要做的，这一轮结束后把这次唤醒从这一段里清掉）、`compress`（按整轮序号范围 `first`／`last` 或具体子步骤 `first="2.1"`／`last="2.2"` 把告一段落的唤醒或大调用步骤折成摘要，支持折叠层级识别并截短入参，原文归档为 `-folded`）、`loop`（她用 `loop("在做什么")` 开启一串循环或改写备注，每次唤醒结束后 `agent._next_loop` 隔 `_LOOP_GAP` 秒往 `me` 窗口 `chat.push` 一条带唤醒的“循环第几轮”，直到她 `loop(stop=True)`、维护者叫停那一轮、或者 `agent.reflect` 开头把它关掉；写下的备注记入 `data/context/loop.jsonl`）、`wait`（循环开着时这一轮马上结束、过多少秒再来下一轮，不阻塞也不关循环；没开循环时拒绝并指向 `wake_me`）、`loop_note_history`／`clear_loop_note`（翻看或清空她给循环写过的备注历史）、`set_name`（给任意窗口起名字，存 `data/storage/window_titles.json`）和 `attach_image`。
 
 仓库当前提供以下按需模块；函数只在对应模块激活后出现：
 
@@ -155,6 +168,7 @@
 | `common` | `common__get_time`、`common__poke` |
 | `image` | `image__recognize_image`、`image__create_image`、`image__create_image_from_references` |
 | `vision` | `vision__ask`、`vision__models`、`vision__stitch`（多图拼成网格或把图交给外部视觉模型认字比对） |
+| `audio` | `audio__listen`（听取语音条或音频文件，转录内容并分析说话者口吻、语气情绪与背景杂音） |
 | `later` | `later__later_add`、`later__later_del` |
 | `user_data` | `user_data__get_user_data`、`user_data__set_user_data` |
 | `agents` | `agents__assign_tasks` |
@@ -247,7 +261,7 @@ hint 与追加式上下文是两层，判据是一句话：**频繁变化、且�
 
 ### 中心设置与旧窗口配置
 
-`image`（图片档位）、`reasoning`、`max_events`、`tidy_token` 共用 `mods.chat.AGENT_SETTINGS` 的全局归一化规则。中心主会话只读全局 `agent` storage；op 用 `#use_model`、`#image`、`#reasoning`、`#limit` 等命令修改它。旧窗口聊天配置不自动迁移，也不再读取；`#hint` 的窗口配置是独立例外。
+`image`（图片档位）、`reasoning`、`reasoning_effort`（思考等级）、`max_events`、`tidy_token` 共用 `mods.chat.AGENT_SETTINGS` 的全局归一化规则。中心主会话只读全局 `agent` storage；op 用 `#use_model`、`#image`、`#reasoning`、`#effort`、`#limit`、`#observer` 等命令修改它。旧窗口聊天配置不自动迁移，也不再读取；`#hint` 的窗口配置是独立例外。
 
 - **缺省值写死在代码里**（`DEFAULT_MAX_EVENTS` / `DEFAULT_TIDY_TOKEN` 与各归一化函数的兜底分支），不再读 `llm_system/config.json`。中心运行期覆盖只有全局 `agent` storage 一份；`#limit` 是唯一预算命令入口。
 - **两个预算**：`max_events`（默认 80，存储键沿用旧名）是从没看过的窗口的首屏条数；交接后已有看到位置的窗口只补 3 条旧记录接话，新消息仍按前述画面规则给；`tidy_token`（默认 500000，维护者 2026-10-23 定，约是模型上下文的一半，给交接留出余量）是整理阈值，即整理条件里的 `limit`：默认条件下这一段上下文超过它就交接；反思只限制材料之后新长出来的部分不超过它。2026-10-22 以前是 `max_token × pressure_percent` 两个数，那是按每次重组上下文定的预算，第一次读到时删掉旧键、用默认。旧窗口覆盖不自动迁入全局主体。每晚反思的时刻在笔记 awaker 里，`agent.reflected_at` 记上次反思的时间。旧的 `agent.librarian_model`、`agent.tidied_at` 不再读取。
@@ -266,9 +280,15 @@ hint 与追加式上下文是两层，判据是一句话：**频繁变化、且�
 
 DeepSeek 在带 `tools` 的 thinking 请求中要求最后一条 `user` 后的每条 `assistant` 携带 `reasoning_content`；每次唤醒追加的材料以 user 消息结尾，原生思考原样保存在这一段里（`#reasoning drop` 时以前几次唤醒的思考不再带回），所以旧的 `_closing_hint` 已删除。
 
-### 思考内容开关
+### 思考内容开关与思考等级（Reasoning Effort）
 
 原生 assistant 消息（含 `reasoning_content`）随这一段上下文一起保存在 `data/context/current.json`，交接后随段归档；oplog 仍不写思考。`#reasoning keep`（默认）时以前几次唤醒的思考照样带回；`drop` 时每次唤醒读回这一段时去掉以前的思考，这次唤醒之内照旧保留（DeepSeek 带工具请求要求回传）。2026-10-19 的裁定是"思考只在一次唤醒之内保留"；改成同一段上下文之后，维护者 2026-10-23 定默认保持 `keep`。子代理的工具循环里 `drop` 仍会把思考字段换成空字符串。
+
+**思考等级（Reasoning Effort）。** 除了历史思考是否带回上下文，底层 `mods/llm/` 级别原生支持控制模型生成思考的深度与开关（`reasoning_effort` 参数）：
+- **可选档位**：`default`、`none`（别名 `off`/`0`）、`low`、`medium`、`high`、`max`。
+- **API 映射逻辑**：`generate_response` 与 `Chat` 在组装向供应商 API 发送的请求参数时，若 `reasoning_effort` 为 `"off"` 则自动归一化为 `"none"`；若属于 `"none"`、`"low"`、`"medium"`、`"high"`、`"max"`，写入请求参数 `params["reasoning_effort"] = effort`；若为 `default` 或 `None`，不向 API 注入该字段，完全保持模型自身的默认行为。
+- **原生关闭深度思考**：针对 DeepSeek 系列模型（如 DeepSeek-R1、DeepSeek-Flash 等），下发 `reasoning_effort="none"` 可原生彻底关闭深度思考输出，实现秒回；在轻量旁观任务中尤为有效。
+- **`#effort` 管理子命令**：中心主模型的思考等级保存在全局 storage `agent.json` 的 `reasoning_effort` 键中，默认 `"default"`。管理员可通过 `#effort [default|off|none|low|medium|high|max]` 命令查看或设置；`_activate_chat` 在初始化主会话时将其赋予 `session.reasoning_effort`。
 
 
 ### 窗口的结束提示（`#hint`）
@@ -340,6 +360,59 @@ Chat.chat
 子会话清除当前消息 context，不继承隐式 QQ 窗口；需要发消息或建任务的工具必须接收显式目标。它仍不拥有父会话的提示词和历史消息。
 
 每次顶层 `_activate_chat()` 增加一次调用计数并从全局 `agent` 恢复中心主体的持久工具名单。子会话不经过顶层激活，响应 usage 仍会累加费用；中心主模型与辅助调用都记到 Bot。当前费用只在供应商返回 usage 时按输入未命中／缓存命中／输出三段入账；供应商不返回 usage 时尚无发送 token 兜底。单价来自模型元数据，峰谷取请求发起时刻；缓存命中价单独计，两边都不报命中数时保守按未命中算。`.chattop` 按自然月记账，中心费用以 Bot QQ 号显示；“调用次数”并不等于所有底层 HTTP 子请求数。
+
+## 旁观助手（Observer Subagent）
+
+中心 agent 在中心会话循环中运行时存在固有认知与交互盲区：顺畅接话惯性导致对未登记黑话与未知指代习惯性望文生义盲猜、行动碰壁或死板规则冲突时顺手敷衍过去未及时暴露冲突留作反思、以及对方分段打字未完时抢话。为此，系统在 `mods/chat/observer.py` 中实现了单轮旁观助手（Observer）。
+
+### 运行机制与严格单轮执行
+
+Observer 在中心 agent（柚子）被唤醒之后、正式启动主模型推理（`_run_session`）之前介入执行：
+- **严格单轮运行**：设置 `session.turn_done = lambda: True`，在单轮会话中同时输出判断提醒并调用检索或挂载工具，绝不进行多轮空转。
+- **独立模型与思考等级**：配置保存在 storage `agent.json` 的 `observer` 字典中（`{"on": True, "model": "deepseek/deepseek-flash", "effort": "none", "context": "recent"}`）。默认开启，默认使用轻量模型 `deepseek/deepseek-flash`，且默认设置思考等级为 `effort="none"`，彻底关闭深度思考链实现亚秒级极速旁观。
+- **可切换上下文模式（`context`）**：支持 `recent`（默认）与 `full` 两种模式。在 `recent` 模式下，Observer 仅摄入当前段中上一轮唤醒的画面、柚子的思考/自语/工具调用结果，以及当轮新画面，相比摄入全段历史大幅削减 ~90% 的 token 开销与请求延迟；在 `full` 模式下遍历全段历史消息并维持前缀缓存。可通过 `#observer context [recent|full]` 随时切换。
+- **定位与绝对原则**：Observer 是帮柚子发现盲区的贴心助手，绝不是监工。绝对禁止进行代码审查、操作审计、反黑话审查或文风说教，绝不限制柚子的自主行动与发言自由。
+
+### Checklist 检查清单与惊奇检测职责
+
+Observer 的提示词与检查清单统一保存在普通笔记 `data/notes/observer.md`（文件不存在或为空时回退模块内置 `DEFAULT_OBSERVER_PROMPT`）。Checklist 严格聚焦于**唤醒笔记本、点出存疑词与惊奇检测**：
+1. **唤醒笔记本与点出存疑词**：
+   - 若画面中聊到的人物、群组或话题在「当前未挂载的本地笔记」中有对应项，调用 `load_notes` 将笔记挂载进柚子的上下文；
+   - 检查新到达画面中是否有存疑的未登记黑话、圈内梗、英文缩写或未注明来源的特殊指代；若有，直接在提醒里把注意到的词语点出来，提醒柚子切勿望文生义（交由柚子自己检索或询问，Observer 不替她搜聊天记录，免得一搜一大片塞满上下文）。
+2. **行动与感受惊奇（冲突与反思暴露）**：
+   - 审视柚子上轮的思考、行动与工具返回结果；
+   - 若出现非预期情况（如工具或命令报错、碰壁、绕远路、或因死板规则/过时笔记感到别扭与不顺畅），在提醒中简短指出冲突点与可能相关的笔记/规则（如 self、global 等），提醒当场审视或记入 `recent`/`todo` 留作反思。
+3. **对话节奏控制**：
+   - 观察对方发言状态；若对方明显话未说完（半句话、连接词结尾、分段打字发送中、表示找图中），提醒柚子可先调用 `wait` 等待数秒，避免抢话。
+4. **静默原则**：
+   - 若经检查没有发现任何需要注意的词语、行动惊奇或节奏问题，直接回复 `【无】`，彻底保持静默，不向主模型注入额外提示块。
+
+### 前缀缓存机制（第二个缓存头）
+
+为了避免每次唤醒 Observer 时重复计算完整历史的 prompt token，`observer.py` 严格复用会话历史构造了稳定的消息流：
+1. **System 消息**：稳定的 `get_prompt()`（`observer.md` 提示词全文）；
+2. **规范引用消息流**：遍历 `segment["messages"]`（或 `recent` 模式下的上一轮切片），通过 `quote_message` 将系统说明、画面、柚子思考、柚子自语、柚子调用工具与工具返回逐条格式化为规范的 `user` 文本块；
+3. **末尾新材料与未挂载笔记目录**：附加当前未挂载的本地笔记列表（自动排除当前段已挂载或已读过的笔记）与本次唤醒新到达的 `material`（新画面与通知）。
+
+由于前面两部分在段内多轮唤醒中完全保持稳定，服务端前缀缓存命中率极高（与主模型会话形成互补的第二个稳定缓存头），单次唤醒调用费用极低。
+
+### 笔记去重挂载与直通 Hint
+
+Observer 仅配备 `load_notes(scopes: list[str])` 一项挂载工具：
+- **自动查重与防重复挂载**：通过 `_seen_scopes` 汇总当前段 `segment["scopes"]`、本轮 `met`、常驻笔记（`self`、`todo`）以及段内历史消息与 `material` 中已出现过的 `## 笔记 <scope>（` 标题；已载入过的笔记既不会出现在给 Observer 的未挂载候选列表中，调用 `load_notes` 时也会自动跳过重复项。
+- **结果直通 Hint**：新挂载的笔记直接并入当轮 `material` 并登记到 `met`；若 Observer 正文输出了有效提醒（非空且非 `【无】`），则拼装为 `【旁观助手 observer】` 提示块通过 `hints` 回调直通注入柚子当轮子请求末尾（只进当前发出的请求，不写进 `messages` 历史）。
+
+### `#observer` 管理子命令
+
+管理员可通过 `#observer` 系列子命令随时查看或调整旁观助手：
+- `#observer`：查看当前状态（开/关）、模型、思考等级、上下文模式与提示词概况；
+- `#observer on|off`：开启或关闭旁观助手（需管理员）；
+- `#observer model [selection]`：查看或切换旁观助手模型（需管理员，留空查看）；
+- `#observer effort [level]`：查看或设置旁观助手思考等级（需管理员，支持 `default|off|none|low|medium|high|max`）；
+- `#observer context [recent|full]`：查看或切换上下文模式（`recent` 仅上一轮省 token，`full` 全段历史，需管理员）；
+- `#observer prompt`：查看当前提示词与 Checklist 全文；
+- `#observer set <全文>`：整份替换 `data/notes/observer.md`（需管理员，留空清空回退默认）；
+- `#observer reset`：恢复默认配置与模型（开，`deepseek/deepseek-flash`，`effort=none`，`context=recent`，需管理员）。
 
 ## 当前信任边界与维护取舍
 

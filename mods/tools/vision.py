@@ -6,19 +6,13 @@
 
 - 遇到你自己**看不真切、拿不准**的图（糊掉的小字、密密麻麻的表格、图里套着小图），或者要在**好几帧画面之间找不同**时，用 `ask` 把图递给另一个专门看图的模型，让它帮你看清楚再把结论写成字告诉你。
 - 手里有**好几张图**（连拍的录屏帧、多张截图、几张同类对比图）时，`ask` 会先把它们拼成**一张网格大图**再送过去：一次请求就能看全，比一张张单独问省钱得多，而且方便横向比对（比如看哪两格最像、哪一帧数字变了）。
-- `models` 可以列出手头能叫哪些视觉模型、各自怎么收费，方便你掂量"叫个便宜的就够用"还是"得请个贵的看仔细点"。
+- `models` 可以列出手头能叫哪些视觉模型、各自怎么收费。
 
-## 怎么挑模型（省钱小账本）
+## 怎么挑模型
 
-- **同名模型优先走便宜的通道**：比如同样是 `claude-sonnet-5`，走 `kiro/`（0.2x）比走 `claude/`（1.35x）便宜 6.75 倍；`gpt-5.5` 走 `bytecat/`（codex 0.25x）比走 `gpt/`（codex-pro 0.4x）便宜 1.6 倍。点名写 `供应商/模型` 时留意一下前缀。
-- **新接进来的两条路**（密钥都在 `.env` 里）：
-  - `azure/` 走 gpt-azure 分组（2.2x，**`gpt-5.6-luna` 只有这一条路走得通**，实测约 3.6s，且没有固定前缀开销；它在 promax 那边虽挂了名但没号可用）。
-  - `promax/` 走 codex-pro-max 分组（0.55x，24h 成功率 96.1%，比普通 codex 的 79.8% 稳当，但贵一倍——比如 `gpt-5.6-terra` 在这是 ¥0.55/¥3.3，在 `bytecat/` 是 ¥0.25/¥1.5）。注意：gpt-5.6 系列走 codex 渠道时，**每次请求都会自带约 4000 token 的固定前缀**，按量算钱时得把这个底消算进去。
-- **平时怎么填 `model` 参数**：
-  - 留空或写 `cheap`：走默认档。目前默认链的**排头兵是 `azure/gpt-5.6-luna`**（2026-09-19 草籽测过验证码后定的：认字比 `kiro/claude-haiku-4-5` 准，虽然单价是 4.4 倍但值当）；后面的备选按"速度 × 价格 × 24h 成功率"排好了队（实测认 6 位验证码耗时：`promax/gpt-5.6-terra` ≈2.3s、`azure/gpt-5.6-luna` ≈3.6s、`kiro/claude-haiku-4-5` ≈4s、`guochan/glm-5.3-flash` ≈5~6s、`gemini-3.7/3.8-flash` ≈6s、`grok/grok-4.6` ≈7~10s）。想极致省钱也可以直接点名 `kiro/claude-haiku-4-5`（¥0.2/¥1）或 `bytecat/gpt-5.6-luna`（¥0.11/¥0.66）。
-  - 写 `strong`：直接叫最顶配也最贵的那一档。
-  - 普通认字看图**先紧着便宜的用**——便宜的实在认不出，再拿同一张图去问贵的。
-  - 如果哪个模型刚好忙不过来或通道断了，`ask` 会顺着 `FALLBACKS` 名单**自动帮你换下一个**，并在结果里告诉你是谁答上来的。
+- 留空或写 `cheap`：走便宜快速档（`kiro/claude-haiku-4-5-20251001`）。
+- 写 `luna`：走 `azure/gpt-5.6-luna`（认字比 haiku 更准）。
+- 点名 `供应商/模型`（如 `gemini/gemini-3.8-flash`）：直接调用指定模型，失败时原样报错，不隐式回退。
 
 ## 留个心眼
 
@@ -43,43 +37,19 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 OUTPUT_DIR = os.path.join(ROOT, "data", "tmp_files")
 
 CHEAP = "kiro/claude-haiku-4-5-20251001"
-STRONG = "bytecat/gpt-6-astra"
+LUNA = "azure/gpt-5.6-luna"
 
-ALIASES = {"": CHEAP, "cheap": CHEAP, "fast": CHEAP, "小": CHEAP, "便宜": CHEAP,
-           "strong": STRONG, "big": STRONG, "最强": STRONG, "贵": STRONG}
+ALIASES = {
+    "": CHEAP,
+    "cheap": CHEAP,
+    "fast": CHEAP,
+    "小": CHEAP,
+    "便宜": CHEAP,
+    "luna": LUNA,
+    "haiku": CHEAP,
+}
 
-#: 站点标价 = 标准价 × 该模型**最便宜那个分组**的倍率；而我们的每家供应商绑的是**固定一把密钥**，
-#: 密钥落在哪个分组是死的。这里按"我们所用分组 ÷ 标价分组"折算，让比价贴近真实账单。
-#: 对照表（实测，bytecat 面板：密钥名 → 分组倍率）：
-#:     deepseek  → 官方直连，不走面板
-#:     bytecat   → 密钥 `gpt`      → codex 0.25x
-#:     gpt       → 密钥 `gpt-pro`  → codex-pro 0.4x   （同一模型比 bytecat 贵 1.6 倍）
-#:     grok      → 密钥 `grok`     → grok 0.2x
-#:     gemini    → 密钥 `gemini`   → gemini 0.8x
-#:     claude    → 密钥 `claudeMax`→ max 1.35x        （同一模型比 kiro 贵 6.75 倍）
-#:     kiro      → 密钥 `claude`   → kiro 0.2x
-#:     guochan   → 密钥 `cn`       → 国产模型 0.6x
-#:     foli      → 密钥 `福利`     → 福利分组 0.1x     （该组目前只有 stealth/union-alpha，$0）
 PROVIDER_FACTOR = {}   # 价格已按各自分组的实价填好，无需再折算
-
-#: 一个模型不应答（过载、没有可用通道、超时）时依次顶上的顺序；末位是最强的那档，兜底用。
-#: 顺序按"响应速度 × 单价"排：luna → haiku → gemini → glm → grok → gpt，最后用最强的 astra 兜底。
-#: 2026-09-19 应草籽要求把 azure/gpt-5.6-luna 提到首位：同一批验证码图上它认字明显比 haiku 准
-#: （实测 ¥0.88/¥3.96，是 haiku ¥0.2/¥1 的 4.4 倍；原先放第二位是怕贵，现在按"先准"优先）。
-#: 不再把 deepseek 列进来：Bot 自己的默认模型就是 deepseek，同一家没必要在外面再问一遍。
-#: gemini-3.7-flash 与默认档同价（¥0.6/¥3）而 24h 成功率 99.5%，需要时点名用即可。
-FALLBACKS = ["azure/gpt-5.6-luna", CHEAP, "gemini/gemini-3.8-flash",
-             "guochan/glm-5.3-flash", "grok/grok-4.6", "bytecat/gpt-5.6-terra",
-             "gpt/gpt-5.6-terra", STRONG]
-
-
-def _candidates(selection: str) -> list:
-    """把"想用的模型"铺成一条备选链：先它，再依次退到便宜档和兜底档。"""
-    chain = [selection] if "/" in selection and selection not in (CHEAP, STRONG) else []
-    for name in FALLBACKS:
-        if name not in chain:
-            chain.append(name)
-    return chain
 
 
 def _split(text: str) -> list[str]:
@@ -253,17 +223,19 @@ def models(keyword: str = "", limit: int = 30) -> str:
                 continue
             factor = PROVIDER_FACTOR.get(provider, 1.0)
             prices = pricing.unit_prices(block, info, priced_at)
+            note = str(info.get("note") or "").strip()
             rows.append((prices["prompt_price"] * factor, full,
-                         prices["completion_price"] * factor))
+                         prices["completion_price"] * factor, note))
     rows.sort(key=lambda row: (row[0] <= 0, row[0]))   # 没标价的排最后，别占着前排
     if not rows:
         return f"没有名字含「{keyword}」的视觉模型"
     lines = [f"当前默认视觉模型：{now or '（未设置）'}",
              "当前单价：元 / 百万 token（输入未命中, 输出）；已按所用分组的倍率折算"]
-    for prompt, full, completion in rows[:limit]:
-        mark = " ←便宜" if full == CHEAP else (" ←最强" if full == STRONG else "")
+    for prompt, full, completion, note in rows[:limit]:
+        mark = " ←默认" if full == now else (" ←准" if full == LUNA else "")
         price = "未知" if not prompt and not completion else f"¥{prompt:g}, ¥{completion:g}"
-        lines.append(f"- {full}：{price}{mark}")
+        note_str = f"（{note}）" if note else ""
+        lines.append(f"- {full}：{price}{mark}{note_str}")
     if len(rows) > limit:
         lines.append(f"……共 {len(rows)} 个，只列了前 {limit} 个")
     return "\n".join(lines)
@@ -278,8 +250,8 @@ def ask(images: str, prompt: str = "", model: str = "cheap") -> str:
     @param
     images: 图片地址，每行一个（file://、http(s)://、data:image/ 都行）；多张会拼成网格
     prompt: 让它做什么，写具体一点，例如"把图里每格的文字一字不差抄出来"、"哪格的形状和 #1 最像"
-    model: `cheap`（默认，便宜）／`strong`（最强最贵）／`供应商/模型`（如 `gemini/gemini-3.5-flash`，名字见 models）；
-           它不应答（过载、无通道）时会自动依次换到别的模型，返回值里会说明换成了哪个
+    model: `cheap`（默认，便宜）／`luna`（认字准）／`供应商/模型`（如 `gemini/gemini-3.8-flash`，名字见 models）；
+           调用失败时直接返回报错说明，不走隐式备选链
     """
     uris = _split(images)
     if not uris:
@@ -296,23 +268,13 @@ def ask(images: str, prompt: str = "", model: str = "cheap") -> str:
         note = "\n".join(["", stitched.splitlines()[1] if len(stitched.splitlines()) > 1 else "",
                            "请把整张网格当作一组连续画面来理解，回答时用 #格号 指认位置。"])
     task = prompt.strip() or "如实描述图中内容；有文字就逐字抄出，有表格就按行列说清。"
-    skipped = []
-    for candidate in _candidates(selection)[:4]:
-        try:
-            answer = llm.get_client().describe_image(target, f"{task}{note}", model=candidate)
-        except Exception as error:
-            skipped.append(f"{candidate}：{type(error).__name__}: {str(error)[:70]}")
-            continue
+    try:
+        answer = llm.get_client().describe_image(target, f"{task}{note}", model=selection)
         if not answer:
-            skipped.append(f"{candidate}：返回了空内容")
-            continue
-        head = f"【{candidate} 看到】"
-        if candidate != selection:
-            head += f"（原定 {selection} 没应答，依次换到它）"
-        if skipped:
-            head += "\n" + "\n".join(f"- 跳过 {item}" for item in skipped)
-        return f"{head}\n{answer}"
-    return "外援失败：备选都没应答\n" + "\n".join(f"- {item}" for item in skipped)
+            return f"外援失败：{selection} 返回了空内容"
+        return f"【{selection} 看到】\n{answer}"
+    except Exception as error:
+        return f"外援识图失败（{selection}）：{type(error).__name__}: {error}"
 
 
 __all__ = ["ask", "models", "stitch"]

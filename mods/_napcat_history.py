@@ -66,7 +66,8 @@ def crawl_history(
 
     action = "get_group_msg_history" if kind == "group" else "get_friend_msg_history"
     target_field = "group_id" if kind == "group" else "user_id"
-    cursor = None if start_seq is None else _number(start_seq, "start_seq")
+    cursor = None if start_seq is None else _number(start_seq, "start_seq", signed=True)
+    cursor_time: int | None = None
     requests = 0
     saved = 0
 
@@ -79,9 +80,9 @@ def crawl_history(
         params: dict[str, Any] = {target_field: target, "count": count + (cursor is not None),
                                   "disable_get_url": True, "parse_mult_msg": False}
         if cursor is not None:
-            # WHY: NapCat 4.18.28 pages by message_seq, not message_id, and may
-            # include the requested row. reverse_order is needed to go older.
-            params.update(message_seq=str(cursor), reverse_order=True)
+            # WHY: NapCat 4.18.28+ 按 message_seq 向前分页（NTQQ 中 message_seq 等于
+            # message_id），带 reverse_order=True 与 reverseOrder=True 倒序向前翻页。
+            params.update(message_seq=str(cursor), reverse_order=True, reverseOrder=True)
         requests += 1
         try:
             response = call_api(action, **params)
@@ -90,7 +91,14 @@ def crawl_history(
         if not isinstance(response, dict):
             raise gap("API response is not an object")
         if response.get("retcode") != 0:
-            raise gap(f"API retcode={response.get('retcode')!r}")
+            msg = str(response.get("message") or response.get("wording") or "")
+            if response.get("retcode") == 200 and "undefined" in msg:
+                # WHY: NapCat 4.18+ 在会话本地无历史或无漫游记录时，返回 retcode=200 且
+                # message="消息undefined不存在"，而非空列表。此时远端确实无历史，视为已穷尽。
+                return {"stop_reason": "exhausted", "anchor_found": False,
+                        "requests": requests, "saved": saved,
+                        "oldest_seq": None if cursor is None else str(cursor)}
+            raise gap(f"API retcode={response.get('retcode')!r}" + (f" ({msg})" if msg else ""))
         data = response.get("data")
         rows = data.get("messages") if isinstance(data, dict) else None
         if not isinstance(rows, list):
@@ -106,31 +114,38 @@ def crawl_history(
             for row in rows:
                 if not isinstance(row, dict):
                     raise ValueError("message is not an object")
-                sequence = _number(row.get("message_seq"), "message_seq")
+                sequence = _number(row.get("message_seq"), "message_seq", signed=True)
                 message_id = _number(row.get("message_id"), "message_id", signed=True)
+                msg_time = row.get("time")
+                if msg_time is not None and (isinstance(msg_time, bool) or not isinstance(msg_time, int)):
+                    raise ValueError("time is not an integer")
                 if sequence in seen_seqs:
                     raise ValueError("page repeats a message_seq")
-                if cursor is not None and sequence > cursor:
-                    raise ValueError("page returned a newer message_seq than its cursor")
                 seen_seqs.add(sequence)
-                numbered.append((sequence, message_id, row))
+                numbered.append((sequence, message_id, msg_time, row))
         except ValueError as error:
             raise gap(str(error)) from error
 
-        numbered.sort(key=lambda item: item[0])
+        # WHY: NTQQ / NapCat 中 message_seq 不再是单调递增序号，而是伪随机 32 位 ID
+        # （与 message_id 相同），不能按 sequence 排序或做大小比较。列表按原生时间戳升序排序。
+        numbered.sort(key=lambda item: item[2] if item[2] is not None else 0)
         if cursor is not None:
-            numbered = [item for item in numbered if item[0] != cursor]
+            numbered = [item for item in numbered if item[0] != cursor and item[1] != cursor]
+            if cursor_time is not None:
+                numbered = [item for item in numbered if item[2] is None or item[2] <= cursor_time]
         if not numbered:
-            raise gap("page contains no message older than its cursor")
+            return {"stop_reason": "exhausted", "anchor_found": False,
+                    "requests": requests, "saved": saved,
+                    "oldest_seq": None if cursor is None else str(cursor)}
 
         matches = [index for index, item in enumerate(numbered)
-                   if item[1] == anchor and (anchor_time is None or item[2].get("time") == anchor_time)]
+                   if item[1] == anchor and (anchor_time is None or item[2] == anchor_time)]
         if len(matches) > 1:
             raise gap("anchor message_id occurs more than once on a page")
         if matches:
             anchor_seq = numbered[matches[0]][0]
             numbered = numbered[matches[0] + 1:]
-        page = [item[2] for item in numbered]
+        page = [item[3] for item in numbered]
         if page:
             save_page(page)
             saved += len(page)
@@ -139,3 +154,4 @@ def crawl_history(
                     "requests": requests, "saved": saved,
                     "oldest_seq": str(anchor_seq)}
         cursor = numbered[0][0]
+        cursor_time = numbered[0][2]

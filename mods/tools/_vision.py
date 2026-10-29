@@ -111,31 +111,58 @@ def _queue_of(session) -> list:
     return queue
 
 
-def attach(uri: str, note: str = "") -> str:
-    """把一张图交给当前模型自己看，返回一句以 ✅ 或 ⚠️ 开头的结果说明。
+def attach(uri: str, note: str = "", model: str | None = None) -> str:
+    """把一张图交给当前模型自己看，或者在当前模型无视觉/指定了视觉模型时转述，返回一句以 ✅ 或 ⚠️ 开头的结果说明。
 
     @param
     uri: 图片地址，`file://`、`http(s)://` 或已经是 `data:` 都行
     note: 附在图前面的一句话，例如"这是浏览器当前页面的截图"
+    model: 可选。指定调用外部视觉模型转述（如 `azure/gpt-5.6-luna`、`cheap` 等）；若指定则由该模型转述并返回文字结果
     """
     selection = str(uri or "").strip()
     if not selection:
         return "⚠️ 没有给出图片地址"
+
+    explicit_model = str(model or "").strip()
+    if explicit_model:
+        from mods import llm
+        from mods.tools import vision as vision_tool
+
+        target = vision_tool.ALIASES.get(explicit_model.lower(), explicit_model)
+        prompt = str(note or "").strip() or "如实描述图中内容；有文字就逐字抄出，有表格就按行列说清。"
+        try:
+            client = llm.get_client()
+            desc = client.describe_image(selection, prompt=prompt, model=target)
+            if desc:
+                return f"✅ 已由指定视觉模型（{target}）转述：\n{desc}"
+            return f"⚠️ 指定视觉模型（{target}）未返回有效内容"
+        except Exception as error:
+            return f"⚠️ 调用指定视觉模型（{target}）失败（{type(error).__name__}: {error}）"
+
     try:
         from mods.tools import current_binding
 
         session = current_binding().session
     except Exception as error:
         return f"⚠️ 这次调用拿不到会话（{type(error).__name__}: {error}），附加不了图片"
-    model = str(getattr(session, "model", "") or "")
+    current_model = str(getattr(session, "model", "") or "")
     try:
         from mods import llm
 
-        capabilities = llm.get_client().get_model_capabilities(model)
+        client = llm.get_client()
+        capabilities = client.get_model_capabilities(current_model)
     except Exception as error:
         return f"⚠️ 取不到模型能力（{type(error).__name__}: {error}），附加不了图片"
     if not capabilities.vision:
-        return f"⚠️ 当前模型 {model or '(未知)'} 不支持视觉，请改用视觉模型转述"
+        fallback_model = client.get_vision_model() or "bytecat/gpt-5.4-mini"
+        prompt = str(note or "").strip() or "如实描述图中内容；有文字就逐字抄出，有表格就按行列说清。"
+        try:
+            desc = client.describe_image(selection, prompt=prompt, model=fallback_model)
+            if desc:
+                return f"✅ 当前模型不支持视觉，已自动由默认视觉模型（{fallback_model}）转述：\n{desc}"
+            return f"⚠️ 当前模型不支持视觉，自动调用视觉模型（{fallback_model}）未返回有效内容"
+        except Exception as error:
+            return f"⚠️ 当前模型不支持视觉，自动调用视觉模型失败（{type(error).__name__}: {error}）"
     text = str(note or "").strip()
     if capabilities.tool_images:
         reference = _file_uri(selection)

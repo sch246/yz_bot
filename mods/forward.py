@@ -88,12 +88,15 @@ def code_id(code: str) -> str:
     """一个 CQ 串里的转发 id；不是转发、或者没有 id 时返回空串。"""
     try:
         parsed = cq.load(code)
+        if parsed.get("type") == "forward":
+            return str(parsed["data"].get("id") or "")
+        if parsed.get("type") == "json":
+            return _json_id(parsed)
     except (KeyError, TypeError, ValueError):
-        return ""
-    if parsed.get("type") == "forward":
-        return str(parsed["data"].get("id") or "")
-    if parsed.get("type") == "json":
-        return _json_id(parsed)
+        pass
+    match = re.search(r'\[CQ:forward,[^\]]*\bid=["\']?([^,"\'\]\s]+)', str(code or ""))
+    if match:
+        return match.group(1)
     return ""
 
 
@@ -121,9 +124,9 @@ def fetch(forward_id: str) -> list[dict] | None:
 def _segments(value) -> str:
     """把 OneBot 的数组消息拼回 CQ 文本；本来就是字符串就清掉噪声后返回。
 
-    只保留长期用得上的字段：转发段只留 id——它的 data["content"] 是一层嵌套的段数组，
-    照原样 dump 会变成一串 [object Object]，把内层正文整段吃掉；图片只留 file/url
-    （带 rkey 的 url 几天就失效）；其余段丢掉字典、列表这类深字段，免得又串出噪声。
+    只保留长期用得上的字段：转发段留 id，其内嵌的 content 节点顺手落盘为独立记录；
+    图片只留 file/url（带 rkey 的 url 几天就失效）；其余段丢掉字典、列表这类深字段，
+    免得又串出噪声。
     """
     if isinstance(value, str):
         return _clean_cq_text(value)
@@ -137,6 +140,25 @@ def _segments(value) -> str:
             parts.append(str(data.get("text", "")))
         elif kind == "forward":
             inner = str(data.get("id") or "")
+            content = data.get("content")
+            if isinstance(content, str):
+                try:
+                    content = json.loads(content)
+                except (ValueError, TypeError):
+                    content = None
+            if not inner and isinstance(content, list) and content:
+                inner = f"inner_{abs(hash(json.dumps(content[:2], default=str)))}"
+            if inner and isinstance(content, list) and content:
+                # WHY: NapCat / NTQQ 嵌套内层转发不能通过 get_forward_msg 按 id 独立取回
+                # （服务端会报「消息已过期或者为内层消息」），其真实节点内容直接内嵌在 segment data 的
+                # content 列表中。将内层节点解析后直接落盘为对应 id 的记录，供 render 展开和
+                # read_forward(inner_id) 读取。
+                inner_record = {
+                    "id": inner,
+                    "time": int(time.time()),
+                    "nodes": [_node(item) for item in content if isinstance(item, dict)],
+                }
+                _write(inner_record)
             if inner:
                 parts.append(f"[CQ:forward,id={inner}]")
         elif kind == "image":
@@ -156,6 +178,17 @@ def _segments(value) -> str:
 
 def _node(value: dict) -> dict:
     """一个 OneBot 节点 → 本模块记录的节点。"""
+    if value.get("type") == "node" and isinstance(value.get("data"), dict):
+        d = value["data"]
+        qq = d.get("uin") or d.get("user_id")
+        content = d.get("content")
+        text = _segments(content) if isinstance(content, list) else _clean_cq_text(str(content or ""))
+        return {
+            "name": str(d.get("name") or qq or "未知"),
+            "qq": int(qq) if qq and str(qq).isdigit() else qq,
+            "time": d.get("time"),
+            "text": cq.save_pic(text),
+        }
     sender = value.get("sender") if isinstance(value.get("sender"), dict) else {}
     # WHY: 先拼数组 message，再拿 raw_message 兜底。数组那条能逐段筛字段（转发段只留
     # id、图片只留 file），raw_message 只能整串收下；两者都有时优先前者。

@@ -107,6 +107,14 @@ DESCRIPTION_CACHE_MAX_AGE_DAYS = 15
 # 同一份缓存里——get_cached_description 只删版本号不匹配的条目，版本号没动就一条都不删，
 # 不报错、不提示，只是模型读到的图片描述一半是旧的。
 AUTO_IMAGE_DESCRIPTION_VERSION = "auto-v1"
+
+
+def description_version(prompt: str | None = None) -> str:
+    """结合 prompt 计算缓存版本，实现提示词修改后旧缓存自动失效。"""
+    if not prompt or not isinstance(prompt, str):
+        return AUTO_IMAGE_DESCRIPTION_VERSION
+    digest = hashlib.sha256(prompt.strip().encode("utf-8")).hexdigest()[:8]
+    return f"{AUTO_IMAGE_DESCRIPTION_VERSION}:{digest}"
 MAX_LOCAL_IMAGE_BYTES = 20 * 1024 * 1024
 
 PIL_FORMAT_TO_MIME = {
@@ -470,14 +478,14 @@ def image_uri_to_data_uri(uri: str, target_dir: str = TEMP_PATH, max_bytes: int 
     return f"data:{mime};base64,{encoded}"
 
 
-def get_cached_description(cache: dict, identity: str, today: date | None = None) -> str | None:
+def get_cached_description(cache: dict, identity: str, today: date | None = None, prompt_version: str = AUTO_IMAGE_DESCRIPTION_VERSION) -> str | None:
     if not valid_description_identity(identity):
         return None
     today = today or date.today()
     entry = cache.get(identity)
     if not isinstance(entry, dict) or not isinstance(entry.get("description"), str):
         return None
-    if entry.get("prompt_version") != AUTO_IMAGE_DESCRIPTION_VERSION:
+    if entry.get("prompt_version") != prompt_version:
         del cache[identity]
         return None
     cached_at = _parse_cache_date(entry.get("cached_at")) or today
@@ -488,7 +496,7 @@ def get_cached_description(cache: dict, identity: str, today: date | None = None
     return entry["description"]
 
 
-def prune_description_cache(cache: dict, today: date | None = None, max_age_days: int = DESCRIPTION_CACHE_MAX_AGE_DAYS) -> int:
+def prune_description_cache(cache: dict, today: date | None = None, max_age_days: int = DESCRIPTION_CACHE_MAX_AGE_DAYS, prompt_version: str = AUTO_IMAGE_DESCRIPTION_VERSION) -> int:
     today = today or date.today()
     cutoff = today - timedelta(days=max_age_days)
     removed = 0
@@ -497,7 +505,7 @@ def prune_description_cache(cache: dict, today: date | None = None, max_age_days
             valid_description_identity(identity)
             and isinstance(entry, dict)
             and isinstance(entry.get("description"), str)
-            and entry.get("prompt_version") == AUTO_IMAGE_DESCRIPTION_VERSION
+            and entry.get("prompt_version") == prompt_version
         )
         if not valid:
             del cache[identity]
@@ -512,28 +520,28 @@ def prune_description_cache(cache: dict, today: date | None = None, max_age_days
     return removed
 
 
-def maybe_prune_description_cache(cache: dict, today: date | None = None) -> int:
+def maybe_prune_description_cache(cache: dict, today: date | None = None, prompt_version: str = AUTO_IMAGE_DESCRIPTION_VERSION) -> int:
     today = today or date.today()
     cache_id = id(cache)
     with _description_prune_lock:
         previous = _last_description_prune.get(cache_id)
-        if previous is not None and previous[0] is cache and previous[1] == today:
+        if previous is not None and previous[0] is cache and previous[1] == today and len(previous) > 2 and previous[2] == prompt_version:
             return 0
-        removed = prune_description_cache(cache, today)
-        _last_description_prune[cache_id] = (cache, today)
+        removed = prune_description_cache(cache, today, prompt_version=prompt_version)
+        _last_description_prune[cache_id] = (cache, today, prompt_version)
         return removed
 
 
-def cache_description(cache: dict, identity: str, description: str, today: date | None = None) -> int:
+def cache_description(cache: dict, identity: str, description: str, today: date | None = None, prompt_version: str = AUTO_IMAGE_DESCRIPTION_VERSION) -> int:
     if not valid_description_identity(identity):
         raise ValueError("图片描述键必须是受支持的内容摘要")
     today = today or date.today()
     cache[identity] = {
         "description": description,
         "cached_at": today.isoformat(),
-        "prompt_version": AUTO_IMAGE_DESCRIPTION_VERSION,
+        "prompt_version": prompt_version,
     }
-    return prune_description_cache(cache, today)
+    return prune_description_cache(cache, today, prompt_version=prompt_version)
 
 
 def on_load(ctx) -> None:

@@ -86,8 +86,9 @@ _custom: dict[str, dict] = {}
 # follow 从什么时候盖上的，目标原文 → 时刻：画面据此把 follow 期间到的消息给全（agent._screen_text）。
 # 只在内存里；重启后、或者她直接用 write_note 写的 follow 不知道起点，画面照旧截。
 _since: dict[str, float] = {}
-# 说完话自动听多久（秒），见模块说明最后一段。
-LISTEN = 5 * 60
+# WHY: 2026-10-29 草籽与柚子商定：发言后死板的 5 分钟自动跟听并入 send 的 wait 参数，
+# 由她自己在发言时决定等多久（wait="5m"、"20m"）或不等（wait=-1、0），统一走 awaker 调度。
+LISTEN = 0
 # 窗口 → {"spoke": 她上次在这说话的时刻, "dismissed": 那之后 dismiss 掉看过它的唤醒几次}
 _heard: dict[tuple, dict] = {}
 _hearing = threading.Lock()
@@ -96,6 +97,9 @@ _UNIT = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
 def _interval(text: str) -> int | None:
+    text = str(text).strip()
+    if text.isdigit():
+        return int(text)
     parts = re.findall(r"(\d+)([smhd])", text)
     if not parts or "".join(f"{number}{unit}" for number, unit in parts) != text:
         return None
@@ -442,6 +446,11 @@ def badges(window: tuple) -> list[str]:
     found = [describe(item) for item in _layers(now)
              if item["scope"][0] == "kind" and window[0] == item["scope"][1]
              or item["scope"][0] == "window" and tuple(item["scope"][1]) == window]
+    all_rules, _ = rules()
+    for rule in all_rules:
+        if rule["kind"] == "wait" and rule["window"] == window and now < rule["moment"]:
+            target_desc = f"只看 {rule['author']}" if rule.get("author") is not None else "等回复"
+            found.append(f"{target_desc}到 {rule['until']}")
     auto = layer(window, None, now)
     return found + ([describe(auto)] if auto is not None and auto.get("auto") else [])
 
@@ -449,6 +458,54 @@ def badges(window: tuple) -> list[str]:
 def _strip_layer(text: str, target: str) -> str:
     return "\n".join(line for line in text.split("\n")
                      if not ((match := _LAYER.match(line)) and match[2] == target))
+
+
+def _strip_wait(text: str, target: str) -> str:
+    """Strip waiting rules for the same window as target (keep only the newest wait)."""
+    try:
+        target_window = _target(target)[0]
+    except Exception:
+        return text
+    kept = []
+    for line in text.split("\n"):
+        match = _WAIT.match(line)
+        if match:
+            try:
+                if _target(match[1])[0] == target_window:
+                    continue
+            except Exception:
+                pass
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def lift_wait(target: str) -> bool:
+    """Take any waiting rule off *target*'s window; True if any was removed."""
+    try:
+        scope = _scope(target)
+        if scope is None or scope[0] != "window":
+            return False
+        window = tuple(scope[1])
+    except Exception:
+        return False
+    with _edit:
+        text = _notes.read("awaker")
+        lines = text.split("\n")
+        kept = []
+        found = False
+        for line in lines:
+            match = _WAIT.match(line)
+            if match:
+                try:
+                    if _target(match[1])[0] == window:
+                        found = True
+                        continue
+                except Exception:
+                    pass
+            kept.append(line)
+        if found:
+            _notes.write("awaker", "\n".join(kept).strip("\n") + "\n" if any(x.strip() for x in kept) else "")
+    return found
 
 
 def lift(target: str) -> bool:
@@ -542,6 +599,9 @@ def plant(when: str, reason: str, now: float | None = None) -> str:
             # 同一目标只留一层，以这次为准：续期，或者 follow 换成 mute。
             base = _strip_layer(base, found[0]["target"])
             _custom.pop(found[0]["target"], None)
+        elif found[0]["kind"] == "wait":
+            # 同一窗口只留一条 wait：续期或更新等待目标/理由
+            base = _strip_wait(base, found[0]["target"])
         _notes.write("awaker", base.rstrip("\n") + "\n" + line + "\n")
     if found[0]["kind"] == "layer":
         # 续期不改起点；换成 mute 就没有起点了。

@@ -21,10 +21,11 @@ import time
 from mods import storage
 
 import mods.chat as _chat_root
-from . import screen as _screen, windows as _windows
+from . import notes as _notes, screen as _screen, windows as _windows
 
 ROOT = Path("data") / "context"
 _CURRENT = ROOT / "current.json"
+_BACKUP = ROOT / "current.bak.json"
 _ARCHIVE = ROOT / "archive"
 # 每一段交接时往这里添一行：什么时候、多长、当时为什么结束。下一段开头挂最近几行。
 _YEARS = Path("data") / "notes" / "years.md"
@@ -41,6 +42,7 @@ MARKS = 40
 # 留下的笔记，不列；最近一次刚做完、下次多半还要接着做，也不列。`compress` 那头再校验一次。
 # 这一段比上次提醒时又长这么多 token 才提醒一次（维护者 2026-10-25：5 万）。
 GROWTH_TOKENS = 50_000
+RECENT_STALE_SECONDS = 2 * 3600
 
 
 def fresh() -> dict:
@@ -55,10 +57,17 @@ def load() -> dict:
         try:
             data = json.loads(_CURRENT.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            # 文件坏了：挪到一边留着排查，从新的一段开始，不让一次写坏卡住她。
+            # 文件坏了：挪到一边留着排查；若有最近备份则从备份恢复，不让一次写坏丢掉整段上下文。
             broken = _CURRENT.with_name(f"current.broken-{time.strftime('%Y%m%d-%H%M%S')}.json")
             os.replace(_CURRENT, broken)
-            return fresh()
+            if _BACKUP.is_file():
+                try:
+                    data = json.loads(_BACKUP.read_text(encoding="utf-8"))
+                    _CURRENT.write_bytes(_BACKUP.read_bytes())
+                except (OSError, ValueError):
+                    return fresh()
+            else:
+                return fresh()
     segment = {**fresh(), **data}
     segment["messages"] = _repair(segment["messages"])
     return segment
@@ -91,6 +100,16 @@ def _repair(messages: list[dict]) -> list[dict]:
 def save(segment: dict) -> None:
     with _lock:
         ROOT.mkdir(parents=True, exist_ok=True)
+        if _CURRENT.is_file():
+            try:
+                need = not _BACKUP.is_file() or (time.time() - _BACKUP.stat().st_mtime >= 300)
+                if not need:
+                    old = json.loads(_CURRENT.read_text(encoding="utf-8"))
+                    need = len(segment.get("messages") or []) < len(old.get("messages") or [])
+                if need:
+                    _BACKUP.write_bytes(_CURRENT.read_bytes())
+            except (OSError, ValueError):
+                pass
         temporary = _CURRENT.with_name("current.json.tmp")
         temporary.write_text(json.dumps(segment, ensure_ascii=False), encoding="utf-8")
         os.replace(temporary, _CURRENT)
@@ -295,7 +314,8 @@ def make_mark(segment: dict, now: str, boxes: dict, seen: dict) -> dict:
         "index": len(segment["messages"]),
         "number": next_number(segment),
         **{key: json.loads(json.dumps(segment.get(key), ensure_ascii=False)) for key in MARKED},
-        "boxes": {label: box["text"] for label, box in boxes.items() if box.get("text")},
+        "boxes": {label: box["text"] for label, box in boxes.items()
+                  if isinstance(box, dict) and box.get("text")},
         "seen": dict(seen),
     }
 
@@ -303,6 +323,62 @@ def make_mark(segment: dict, now: str, boxes: dict, seen: dict) -> dict:
 def record_mark(segment: dict, mark: dict) -> None:
     segment["marks"] = [*segment.get("marks", [])[-(MARKS - 1):], mark]
     segment["last_number"] = mark["number"]
+
+
+def get_steps(segment: dict, messages: list[dict] | None = None) -> list[dict]:
+    """Find all fine-grained action steps (assistant tool call + tool responses) across wakes.
+
+    Each step has:
+    - id: "2.1", "2.2" (wake_number.step_number)
+    - wake: wake_number
+    - sub: step_number
+    - start: message index where assistant message starts
+    - end: message index right after the last matching tool message
+    - tools: list of tool names called in this step
+    - tokens: estimated tokens taken by this step
+    - at: timestamp of the wake
+    - mark: the wake mark dict
+    """
+    msgs = segment.get("messages", []) if messages is None else messages
+    marks = numbers(segment)
+    if not marks:
+        return []
+    steps = []
+    for i, mark in enumerate(marks):
+        wake_num = int(mark.get("number") or (i + 1))
+        start_idx = mark.get("index", 0)
+        end_idx = marks[i + 1]["index"] if i + 1 < len(marks) else len(msgs)
+        if start_idx >= len(msgs):
+            continue
+        sub_idx = 1
+        pos = start_idx
+        while pos < min(end_idx, len(msgs)):
+            msg = msgs[pos]
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                tool_start = pos
+                pos += 1
+                while pos < min(end_idx, len(msgs)) and msgs[pos].get("role") == "tool":
+                    pos += 1
+                tool_end = pos
+                tool_names = [
+                    call.get("function", {}).get("name") or "tool"
+                    for call in msg.get("tool_calls", [])
+                ]
+                steps.append({
+                    "id": f"{wake_num}.{sub_idx}",
+                    "wake": wake_num,
+                    "sub": sub_idx,
+                    "start": tool_start,
+                    "end": tool_end,
+                    "tools": tool_names,
+                    "tokens": text_tokens(msgs[tool_start:tool_end]),
+                    "at": mark.get("at", ""),
+                    "mark": mark,
+                })
+                sub_idx += 1
+            else:
+                pos += 1
+    return steps
 
 
 def subconscious_on() -> bool:
@@ -314,6 +390,15 @@ def _offered(segment: dict) -> list[dict]:
     """Wakes `compress` may start at: not the first (it carries the handoff notes), not the latest."""
     marks = [mark for mark in segment.get("marks") or [] if mark.get("index", 0) > 0]
     return marks[:-1]
+
+
+def _recent_hint() -> str:
+    mtime = _notes.mtime("recent")
+    age = (time.time() - mtime) if mtime > 0 else 0.0
+    if age >= RECENT_STALE_SECONDS:
+        hours = int(age // 3600)
+        return f"（顺便看一眼：recent 已约 {hours} 小时未更新，若眼下手头的事或进展变了，可顺手调 write_note(\"recent\", ...) 刷新）"
+    return ""
 
 
 def nudge(segment: dict) -> str | None:
@@ -339,13 +424,25 @@ def nudge(segment: dict) -> str | None:
     segment["settled"] = size
     segment["nudged_at"] = time.time()
     save(segment)
-    listing = "\n".join(f"{mark.get('number')}. {mark['at'][11:]}（之后约 {amount(text_tokens(messages[mark['index']:]))}）"
+    listing = "\n".join(f"- #{mark.get('number')}（{mark['at'][11:]} 醒来，之后约 {amount(text_tokens(messages[mark['index']:]))} token）"
                         for mark in numbers(segment) if mark in offered)
-    return (f"上下文又长了，这一段现在约 {amount(size)} token。省着点用。\n"
-            f"能收的唤醒（括号里是收掉以后，后面要按原价重读多少）：\n{listing}\n"
-            f"要收就直接调用 compress 工具（不是 # 命令，别用 send_command 发）："
-            f"compress(first=1, last=3, summary=\"……\")，序号就是上面那些数字；"
-            f"要一段一段挑也可以写时刻 compress(from_time=\"{offered[0]['at'][11:]}\", to_time=\"\", summary=\"……\")\n"
+    steps = get_steps(segment, messages)
+    heavy_steps = [s for s in steps if s["tokens"] >= 10_000]
+    heavy_str = ""
+    if heavy_steps:
+        heavy_str = "\n耗量较大的具体步骤（子序号）：\n" + "\n".join(
+            f"- {s['id']}: 调用了 {','.join(s['tools'])}（约 {amount(s['tokens'])} token）"
+            for s in heavy_steps[:5]
+        ) + "\n"
+    recent_line = (_recent_hint() + "\n") if _recent_hint() else "收起旧轮次时，若眼下手头的事有进展或变动，也可顺手 write_note(\"recent\", ...) 刷新近况。\n"
+    first_ex = offered[0].get("number", 1)
+    last_ex = offered[-1].get("number", 1)
+    return (f"上下文又长了，这一段现在约 {amount(size)} token。已经了结的事可以顺手收一收，腾点地方。\n"
+            f"能收的唤醒（整轮）：\n{listing}\n"
+            + heavy_str +
+            f"要收整轮直接调 compress(first={first_ex}, last={last_ex}, summary=\"……\")；\n"
+            f"要收具体某个步骤（如读错了一大堆日志）调子序号 compress(first=\"{first_ex}.1\", last=\"{first_ex}.1\", summary=\"……\")；\n"
+            + recent_line +
             f"不收就不用管，这条提醒到下次收的时候会一起没。")
 
 
@@ -388,9 +485,12 @@ def request_dismiss(session, since: str = "") -> str:
         return "只有醒着处理消息的时候能用；交接、反思和子代理里没有可清的"
     marks = session.segment.get("marks") or []
     since = " ".join(str(since).split())
-    found = [mark for mark in marks if not since or since in (mark["at"], mark["at"][11:])]
+    since_clean = since.lstrip("#")
+    found = [mark for mark in marks if not since or since in (
+        mark["at"], mark["at"][11:], str(mark.get("number")), f"#{mark.get('number')}"
+    ) or since_clean == str(mark.get("number"))]
     if not found:
-        recent = "、".join(mark["at"] for mark in marks[-5:]) or "没有"
+        recent = "、".join(f"#{mark.get('number', '?')}（{mark['at'][11:]}）" for mark in marks[-5:]) or "没有"
         return f"这一段里找不到「这次唤醒你的是（{since}）」那一行；能清回的最近几次是：{recent}"
     problem = _dismiss_problem(session, found[-1])
     if problem:
@@ -408,55 +508,128 @@ def apply_dismiss(session, segment: dict) -> str:
     return ""
 
 
-def request_compress(session, from_time: str = "", to_time: str = "", summary: str = "",
-                     first: int = 0, last: int = 0) -> str:
-    """Called by the `compress` tool: fold and archive wakes (this call included); returns what happened.
+def _detect_fold_level(messages: list[dict]) -> int:
+    """Determine the compression level for a slice of messages.
+    If the slice contains only raw messages/tools, level is 1 (L1).
+    If it already contains a previous folded message (e.g. 【收起 L1】 or 【步骤收起】),
+    its level is max(existing_levels) + 1 (L2, L3, ...).
+    """
+    max_level = 0
+    for msg in messages:
+        content = str(msg.get("content") or "")
+        if "【收起 L" in content or "【步骤收起 L" in content:
+            for m in re.finditer(r"【(?:步骤)?收起 L(\d+)", content):
+                try:
+                    max_level = max(max_level, int(m.group(1)))
+                except ValueError:
+                    pass
+        elif "【收起】" in content or "【步骤收起】" in content:
+            max_level = max(max_level, 1)
+    return max_level + 1
 
-    WHY: 维护者 2026-10-25：收哪段、摘要怎么写由她定。折叠放到这批工具结果都进了 messages
-    之后（`finish_compress`），`from_time` 到现在的那次调用和它的结果也在被收的范围里，收完
-    一起从上下文里消失；中间块（给了 to_time）收不到末尾，调用本身在同批只有它时也一起抹掉。
+
+def request_compress(session, first: int | str = 0, last: int | str = 0, summary: str = "",
+                     from_time: str = "", to_time: str = "", **kwargs) -> str:
+    """Called by the `compress` tool: fold and archive wakes or sub-steps (this call included); returns what happened.
+
+    WHY: 维护者 2026-10-25：收哪段、摘要怎么写由她定。2026-10-27 扩充子序号粒度（参考 billion_context）：
+    支持按唤醒整轮收（first=1），也支持收具体某个动作步骤（first="2.1", last="2.2"）。
+    2026-10-28 维护者：废除时刻参数（避免与实际消息时间混淆），全面改为纯序号；自动识别折叠层级（L1/L2）；
+    保留调用记录与回执，只截短入参 summary 避免冗余。
     """
     segment = getattr(session, "segment", None)
     if getattr(session, "quiet", False) or segment is None:
         return "只有醒着处理消息的时候能用；交接、反思和子代理里没有可收的"
+
+    # 如果还带着时间参数调用，给出明确指引
+    if from_time or to_time or (isinstance(first, str) and ":" in first):
+        offered = _offered(segment)
+        usable = "、".join(f"#{mark.get('number')}（{mark['at'][11:]}）" for mark in offered) or "暂无"
+        return f"compress 现已升级为按【序号】折叠，不再使用时刻传参（避免与截图/消息时间打架）。请传唤醒序号（如 first=26, last=27；只收一轮 last 填 0）或子步骤（如 first=\"28.1\", last=\"28.1\"）；当前可收的唤醒序号有：{usable}"
+
     summary = str(summary or "").strip()
     if not summary:
         return "先写摘要：收掉以后原文就归档了，摘要要不看原文也接得上（什么事、到哪一步、还欠着什么）"
     if getattr(session, "pending_compress", None) is not None:
         return "同一批工具调用里只能收一次"
+
+    first_raw = str(first).strip() if first is not None else ""
+    last_raw = str(last).strip() if last is not None else ""
+    is_substep = ("." in first_raw) or ("." in last_raw)
+
+    msgs = session.messages[session.prompt_count:] if hasattr(session, "messages") else segment.get("messages", [])
+
+    if is_substep:
+        steps = get_steps(segment, msgs)
+        # 排除当前正在调用的 compress 这一步自身
+        steps = [s for s in steps if not ("compress" in s["tools"] and s["end"] >= len(msgs) - 1)]
+        usable_steps = "、".join(f"{s['id']}（{','.join(s['tools'])}）" for s in steps) or "暂无"
+        if not last_raw or last_raw == "0":
+            last_raw = first_raw
+        s_first = next((s for s in steps if s["id"] == first_raw), None)
+        s_last = next((s for s in steps if s["id"] == last_raw), None)
+        if s_first is None:
+            return f"找不到子步骤 {first_raw}；当前可收的子步骤有：{usable_steps}"
+        if s_last is None:
+            return f"找不到子步骤 {last_raw}；当前可收的子步骤有：{usable_steps}"
+        if s_first["start"] > s_last["start"]:
+            return "last 步骤必须在 first 步骤之后或相同"
+        start, end = s_first["start"], s_last["end"]
+        removed = msgs[start:end]
+        level = _detect_fold_level(removed)
+        level_tag = f"L{level}"
+        saved = text_tokens(removed) - text_tokens([{"role": "system", "content": summary}])
+        current_size = context_size(segment.get("tokens"), msgs) - saved
+        tools_summary = ", ".join(dict.fromkeys([t for s in steps if s_first["start"] <= s["start"] <= s_last["start"] for t in s["tools"]]))
+        where = f"第 {first_raw} 到 {last_raw} 步" if first_raw != last_raw else f"第 {first_raw} 步（{tools_summary}）"
+        session.pending_compress = {"mode": "substep", "start": start, "end": end, "summary": summary, "where": where}
+        range_desc = f"子步骤 {first_raw}～{last_raw}" if first_raw != last_raw else f"子步骤 {first_raw}（{tools_summary}）"
+        return f"🎉 成功完成 {level_tag} 折叠（{range_desc}）：已在上下文中收拢为【步骤收起 {level_tag}】行，减少约 {amount(max(0, saved))} token，当前上下文剩余约 {amount(max(0, current_size))} token。{_recent_hint()}"
+
     marks = numbers(segment)
     offered = _offered(segment)
-    usable = "、".join(f"{mark.get('number')}.{mark['at'][11:]}" for mark in offered) or "没有"
-    if first or last:
-        # 编号跟着那次唤醒走，不跟着它在清单里的位置走：收掉中间的几段，后面的编号也不变。
-        first = max(1, int(first or 1))
-        last = max(first, int(last or first))
-        chosen = [mark for mark in offered if first <= int(mark.get("number") or 0) <= last]
-        if not chosen:
-            return f"这一段里没有第 {first} 到第 {last} 次唤醒；能收的是：{usable}"
-        after = next((mark for mark in marks if int(mark.get("number") or 0) > last), None)
-        from_time = chosen[0]["at"][11:]
-        to_time = after["at"][11:] if after is not None else ""
-    mark = _mark_at(marks, from_time)
-    if mark is None:
-        return f"这一段里找不到从 {from_time} 起的唤醒；能收的是：{usable}"
-    if mark.get("index", 0) == 0:
-        return "这一段第一次唤醒连着交接留下的笔记，不能收"
-    latest = max((other["time"] for other in marks), default=None)
-    if mark["time"] == latest:
-        return f"最近一次唤醒不收：刚做完的事，下次多半还要接着做。能收的是：{usable}"
-    after = None
-    if str(to_time or "").strip():
-        after = _mark_at(marks, to_time)
-        if after is None:
-            return f"找不到到 {to_time} 为止的唤醒；能收的是：{usable}"
-        if after["time"] <= mark["time"]:
-            return "to_time 要比 from_time 晚；那个时刻的唤醒本身不收"
-    session.pending_compress = {"mark": mark, "after": after, "summary": summary}
-    removed = segment["messages"][mark["index"]:after["index"] if after is not None else None]
+    usable = "、".join(f"#{mark.get('number')}（{mark['at'][11:]}）" for mark in offered) or "暂无"
+
+    if not offered:
+        return f"当前没有可收的历史唤醒（第一次唤醒连着交接笔记，最近一次刚做完不收）。能收的唤醒：{usable}"
+
+    first_str = first_raw.lstrip("#")
+    if not first_str or not first_str.isdigit() or int(first_str) == 0:
+        return f"请指定有效的起始唤醒序号（如 first=26）；当前可收的唤醒序号有：{usable}"
+    first_num = int(first_str)
+
+    last_str = last_raw.lstrip("#").lower()
+    if last_str in ("latest", "-1", "max", "all"):
+        last_num = int(offered[-1].get("number") or first_num)
+    elif not last_str or last_str == "0":
+        last_num = first_num
+    elif last_str.isdigit():
+        last_num = int(last_str)
+    else:
+        return f"last 序号格式不认识（{last_raw}）；支持指定数字或填 0 / 'latest'"
+
+    if first_num > last_num:
+        return f"last 序号（#{last_num}）必须大于等于 first 序号（#{first_num}）"
+
+    chosen = [mark for mark in offered if first_num <= int(mark.get("number") or 0) <= last_num]
+    if not chosen:
+        return f"在可收的唤醒里找不到 #{first_num} 到 #{last_num}；当前能收的是：{usable}"
+
+    mark = chosen[0]
+    after = next((m for m in marks if int(m.get("number") or 0) > last_num), None)
+
+    start = mark["index"]
+    end = after["index"] if after is not None else len(segment["messages"])
+    removed = segment["messages"][start:end]
+    level = _detect_fold_level(removed)
+    level_tag = f"L{level}"
     saved = text_tokens(removed) - text_tokens([{"role": "system", "content": summary}])
-    where = f"{mark['at'][11:]} 到 {after['at'][11:]}" if after is not None else f"{mark['at'][11:]} 到现在"
-    return f"收了 {where}，这一段少了约 {amount(max(0, saved))} token。"
+    current_size = context_size(segment.get("tokens"), segment["messages"]) - saved
+    lo, hi = int(chosen[0].get("number") or 0), int(chosen[-1].get("number") or 0)
+    range_desc = f"唤醒 #{lo}～#{hi}" if lo != hi else f"唤醒 #{lo}"
+
+    session.pending_compress = {"mode": "wake", "mark": mark, "after": after, "summary": summary}
+    return f"🎉 成功完成 {level_tag} 折叠（{range_desc}）：已在上下文中收拢为【收起 {level_tag}】行，减少约 {amount(max(0, saved))} token，当前上下文剩余约 {amount(max(0, current_size))} token。{_recent_hint()}"
 
 
 def finish_compress(session, results) -> None:
@@ -465,36 +638,49 @@ def finish_compress(session, results) -> None:
     session.pending_compress = None
     segment = session.segment
     segment["messages"] = session.messages[session.prompt_count:]
-    if pending["after"] is None:
+    if pending.get("mode") == "substep":
+        _fold_slice(segment, pending["start"], pending["end"], pending["summary"], pending.get("where", "子步骤"))
+        _truncate_compress_call(segment, results)
+    elif pending["after"] is None:
         _fold_since(segment, pending["mark"], pending["summary"])
+        _truncate_compress_call(segment, results)
     else:
         _fold_between(segment, pending["mark"], pending["after"], pending["summary"])
-        _drop_compress_call(segment, results)
+        _truncate_compress_call(segment, results)
     session.messages[session.prompt_count:] = segment["messages"]
 
 
-def _drop_compress_call(segment: dict, results) -> None:
-    """Drop this compress call and its result when the middle fold left them behind.
+def _truncate_compress_call(segment: dict, results, max_len: int = 60) -> None:
+    """Keep the compress call and tool response in context, but truncate the summary
+    argument in the assistant call so it does not redundantly balloon the context.
 
-    WHY: 同一批里还有别的工具调用时，删掉这条 assistant 会让它们的 tool 结果变成孤儿；那种情况
-    留着，协议正确优先。
+    WHY: 2026-10-28 维护者：不要从上下文直接抹掉 compress 调用；抹掉会让模型在后续轮次
+    发生认知断层（不知道上一轮刚压缩成功、重复调用或不知道自己做了什么）。
+    保留调用和回执，只把入参里的 summary 截短到前 N 个字存照，完整的已由【收起】行承载。
     """
     ids = {result.tool_call_id for result in results if result.name == "compress"}
     if not ids:
         return
     body = segment["messages"]
-    for index in range(len(body) - 1, -1, -1):
-        message = body[index]
+    for message in reversed(body):
         if message.get("role") != "assistant" or not message.get("tool_calls"):
             continue
-        if not any(call.get("id") in ids for call in message["tool_calls"]):
-            continue
-        if len(message["tool_calls"]) != 1:
-            return
-        del body[index]
-        break
-    segment["messages"] = [message for message in body
-                           if not (message.get("role") == "tool" and message.get("tool_call_id") in ids)]
+        modified = False
+        for call in message["tool_calls"]:
+            if call.get("id") in ids and call.get("function", {}).get("name") == "compress":
+                raw_args = call["function"].get("arguments", "")
+                try:
+                    args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
+                    summary = args.get("summary", "")
+                    if len(summary) > max_len:
+                        args["summary"] = summary[:max_len] + f"……（共 {len(summary)} 字，完整见收起行）"
+                        call["function"]["arguments"] = json.dumps(args, ensure_ascii=False)
+                        modified = True
+                except Exception:
+                    pass
+        if modified:
+            save(segment)
+            break
 
 
 def _shown_since(segment: dict, mark: dict) -> list[str]:
@@ -512,7 +698,7 @@ def _dismiss_problem(session, mark: dict) -> str:
             return (f"{label} 从 {mark['at']} 起 follow 期间已经攒了 {piled} 条，超过 {_screen.FRESH_MAX} 条就不能再清："
                     f"这次留着，把它们看完；不想跟了就 wake_me(\"follow {label} off\")")
     typed = [label for label, box in session.boxes.items()
-             if box.get("text") and box["text"] != mark["boxes"].get(label)]
+             if isinstance(box, dict) and box.get("text") and box["text"] != mark["boxes"].get(label)]
     if typed:
         return (f"{'、'.join(typed)} 的输入框里有 {mark['at']} 之后打的或改过的字，清掉以后你会不记得打过；"
                 "先 send，或者用 type_word 改回原样或清空，再 dismiss")
@@ -548,14 +734,50 @@ def _fold_since(segment: dict, mark: dict, label: str) -> str:
     Unlike a dismiss, what was shown stays read: the screen position does not move back.
     """
     shown = _shown_since(segment, mark)
-    name = archive({"started": mark["time"], "windows": shown, "reason": label,
-                    "messages": segment["messages"][mark["index"]:]}, "folded")
+    removed = segment["messages"][mark["index"]:]
+    level = _detect_fold_level(removed)
+    level_tag = f"L{level}"
+    name = archive({"started": mark["time"], "windows": shown, "reason": label, "level": level,
+                    "messages": removed}, "folded")
     where = f"{'、'.join(shown)} 的画面和" if shown else ""
+    header_title = f"【收起 {level_tag}】" if level == 1 else f"【收起 {level_tag}·递归汇总】"
     segment["messages"] = [*segment["messages"][:mark["index"]], {"role": "system", "content": (
-        f"【收起】{label}\n（{mark['at'][5:]} 至 {_screen.clock()[5:]}，{where}你那时的想法、调用，后台整理时收成了上面这段；"
+        f"{header_title}{label}\n（{mark['at'][5:]} 至 {_screen.clock()[5:]}，{where}你那时的想法、调用，后台整理时收成了上面这段；"
         f"原样存在归档段 {name}，加载 memory_system 用 read_context(\"{name}\") 读，search 也搜得到）")}]
     # 画面位置不退。第一次给的笔记、中途的工具状态跟着收走了，这几项退回去，下次照样给。
     _restore(segment, mark, ("scopes", "told", "tokens", "notice"))
+    save(segment)
+    return name
+
+
+def _fold_slice(segment: dict, start: int, end: int, label: str, where: str) -> str:
+    """Replace an arbitrary message slice (e.g. sub-steps) with one system line."""
+    removed = segment["messages"][start:end]
+    level = _detect_fold_level(removed)
+    level_tag = f"L{level}"
+    name = archive({"started": time.time(), "windows": [], "reason": label, "level": level, "messages": removed}, "folded")
+    line = {"role": "system", "content": (
+        f"【步骤收起 {level_tag}】{label}\n（{where}，中间思考与调用已收成上面这段；"
+        f"原样存在归档段 {name}，加载 memory_system 用 read_context(\"{name}\") 读，search 也搜得到）")}
+    segment["messages"] = [*segment["messages"][:start], line, *segment["messages"][end:]]
+    shift = 1 - len(removed)
+    saved = text_tokens(removed) - text_tokens([line])
+
+    def moved(reported):
+        if not (isinstance(reported, list) and len(reported) == 2) or reported[1] <= start:
+            return reported
+        return [reported[0] - saved, reported[1] + shift] if reported[1] >= end else None
+
+    segment["tokens"] = moved(segment.get("tokens"))
+    marks = []
+    for other in segment.get("marks", []):
+        idx = other.get("index", 0)
+        if idx < start:
+            marks.append(other)
+        elif idx >= end:
+            other = {**other, "index": idx + shift, "tokens": moved(other.get("tokens"))}
+            marks.append(other)
+    segment["marks"] = marks
     save(segment)
     return name
 
@@ -573,11 +795,14 @@ def _fold_between(segment: dict, mark: dict, after: dict, label: str) -> str:
     """
     start, end = mark["index"], after["index"]
     removed = segment["messages"][start:end]
+    level = _detect_fold_level(removed)
+    level_tag = f"L{level}"
     shown = [window for window, last in after["last_shown"].items() if mark["last_shown"].get(window) != last]
-    name = archive({"started": mark["time"], "windows": shown, "reason": label, "messages": removed}, "folded")
+    name = archive({"started": mark["time"], "windows": shown, "reason": label, "level": level, "messages": removed}, "folded")
     where = f"{'、'.join(shown)} 的画面和" if shown else ""
+    header_title = f"【收起 {level_tag}】" if level == 1 else f"【收起 {level_tag}·递归汇总】"
     line = {"role": "system", "content": (
-        f"【收起】{label}\n（{mark['at'][5:]} 起到 {after['at'][5:]} 之前，{where}你那时的想法、调用，后台整理时收成了"
+        f"{header_title}{label}\n（{mark['at'][5:]} 起到 {after['at'][5:]} 之前，{where}你那时的想法、调用，后台整理时收成了"
         f"上面这段；原样存在归档段 {name}，加载 memory_system 用 read_context(\"{name}\") 读，search 也搜得到）")}
     segment["messages"] = [*segment["messages"][:start], line, *segment["messages"][end:]]
     shift = 1 - len(removed)

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import re
 
-from mods import context, cq, history, llm, storage, text
+from mods import context, cq, history, llm, op, storage, text
 from mods.llm import pricing
 
 import mods.chat as _chat_root
@@ -11,9 +11,16 @@ import mods.chat as _chat_root
 
 _SUBCOMMAND_HELP = (
     ("help [name]", "显示子命令目录或某条子命令的完整说明。\n格式：#help | #help <名称>"),
-    ("model", "查看当前模型"),
-    ("model <selection>", "查看指定模型信息"),
-    ("models", "列出当前供应商的模型（优先在线列表）"),
+    ("status", "查看当前所有核心开关与运行状态（模型、思考、防抖、旁观助手、容量等）。"),
+    ("model [<selection>|note <provider/model> [备注]]", """查看当前或指定模型信息与备注（修改备注需管理员）。
+#model                        查看当前中心 agent 的模型
+#model deepseek/deepseek-flash 查看该模型的单价、视觉与工具支持及备注
+#model note bytecat/gpt-6-sol 查看该模型的备注
+#model note bytecat/gpt-6-sol 极速1.4s 设置该模型的备注"""),
+    ("models [供应商]", """列出当前或指定供应商的模型列表与价格、能力及备注。
+#models            列出当前主模型所属供应商的模型
+#models bytecat    列出 bytecat 的所有模型与备注
+#models gemini     列出 gemini 的所有模型与备注"""),
     ("use_model [selection]", "设置或重置当前模型"),
     ("prompt [set <全文>]", """查看或改写她对自己的认识（改写要管理员）。
 
@@ -21,7 +28,9 @@ _SUBCOMMAND_HELP = (
 #prompt              显示全文
 #prompt set <全文>   整份替换；set 之后第一个换行起是全文，留空表示清空"""),
     ("image [off|lazy|eager]", "查看或设置图片读取档位"),
+    ("audio [off|lazy|eager]", "查看或设置语音条读取档位（off: 仅提示语音; lazy: 附本地音频路径; eager: 自动转录语音内容）"),
     ("reasoning [keep|drop]", "查看或设置以前几次唤醒的思考是否随这一段上下文带回"),
+    ("effort [default|off|none|low|medium|high|max]", "查看或设置主模型思考等级（管理员），默认 default（按模型自身默认）。"),
     ("limit [<画面条数> <整理阈值>|reset]", """查看或设置中心 agent 的窗口画面条数与整理阈值（管理员）。
 
 格式：#limit | #limit <画面条数> <整理阈值> | #limit reset
@@ -44,7 +53,7 @@ _SUBCOMMAND_HELP = (
 
 不再自动整理：这一段比上次提醒时又长 5 万 token，就在下一轮请求末尾插一条 system 提醒（这一段多长、能收哪几段、各多大）。收不收、收哪段、摘要怎么写都由你自己调 compress；提醒不写进这一段，收掉以后自然不在。
 （compress 和 tidy 都是工具，直接调用，不要用 # 号发）
-compress(from_time, to_time="", summary="")：把从 from_time 起、到 to_time 之前（留空就是到现在）的唤醒换成 summary，原文另存成归档段（名字带 -folded）；这次调用和结果也会一起从眼前消失。最近一次唤醒和这一段第一次唤醒不收；一次可以收好几段，分几次调。
+compress(first, last=0, summary="")：按序号折叠唤醒（如 first=26, last=27；只收一轮 last 留空或填 0；收至最新之前 last="latest"）或具体子步骤（如 first="28.1", last="28.1"），换成 summary，原文另存成归档段（名字带 -folded）。入参 summary 自动截短保留调用存照，返回折叠层级（L1/L2）、节省 token 与最新占用。最近一次唤醒和这一段第一次唤醒不收。
 #subconscious       显示开关、这一段多长、离下次提醒还差多少、上次提醒
 #subconscious on    打开
 #subconscious off   关掉"""),
@@ -87,14 +96,32 @@ at、on、wait、when 响过就从笔记里划掉。她平时用 wake_me 写这�
 #debounce off         关闭防抖（收到消息立即秒回）
 #debounce 3 12        设置等待 3 秒，最多延长至 12 秒
 #debounce reset       重置为默认值（3s / 12s）"""),
+    ("observer [on|off|model [selection]|effort [level]|context [recent|full]|prompt|set <全文>|reset]", """查看或设置旁观助手（Observer，修改需管理员）。
+
+在中心会话被唤醒时执行单轮旁观，检测未登记黑话与存疑指代并检索、暴露做事的非预期情况与规则冲突、提醒对话节奏与 wait。无盲区时静默不打扰。
+#observer                    查看当前状态、模型、思考等级、上下文模式与提示词概况
+#observer on|off             开启或关闭旁观助手
+#observer model [selection]  查看或设置旁观助手模型（留空查看）
+#observer effort [level]     查看或设置旁观助手思考等级（default/off/none/low/medium/high/max）
+#observer context [recent|full] 查看或设置上下文模式（recent 仅上一轮省 token，full 全段历史）
+#observer prompt             查看当前提示词与 Checklist 全文
+#observer set <全文>         整份替换 data/notes/observer.md；留空清空并回落默认
+#observer reset              恢复默认配置与模型"""),
 )
 _SUBCOMMAND_NAMES = {pattern.partition(" ")[0] for pattern, _description in _SUBCOMMAND_HELP}
 
 
 def requires_op(value: str) -> bool:
     name, _, tail = value.strip().partition(" ")
+    if name == "observer":
+        first, _, remaining = tail.strip().partition(" ")
+        if first in ("on", "off", "set", "reset"):
+            return True
+        if first in ("model", "effort") and bool(remaining.strip()):
+            return True
+        return False
     return (name == "hint" or name == "use_model"
-            or name in {"image", "reasoning", "limit", "reflect", "awaker", "prompt", "subconscious", "loop", "debounce"} and bool(tail.strip()))
+            or name in {"image", "reasoning", "effort", "limit", "reflect", "awaker", "prompt", "subconscious", "loop", "debounce"} and bool(tail.strip()))
 
 
 def _subcommand_help(name: str = "") -> str:
@@ -127,16 +154,26 @@ def _format_model(selection: str, attributes: dict, when: datetime | None = None
     else:
         # 本地没有这条模型的元数据，不替对端猜价格（见 UNKNOWN_MODEL_CAPABILITIES）。
         prices = " / ".join("-" for _ in pricing.PRICE_KEYS)
-    return f"{selection}\n    {prices} {'👀' if attributes.get('vision') else ''} {'⚙️' if attributes.get('function_calling') else ''}"
+    note = str(attributes.get("note") or "").strip()
+    note_str = f"\n    备注: {note}" if note else ""
+    return f"{selection}\n    {prices} {'👀' if attributes.get('vision') else ''} {'⚙️' if attributes.get('function_calling') else ''}{note_str}"
 
 
-def _models_report(data: dict) -> str:
-    """当前 provider 的模型列表：先问对端，取不到就用本地配置。
+def _models_report(data: dict, provider_arg: str = "") -> str:
+    """指定 provider（或当前 provider）的模型列表：先问对端，取不到就用本地配置。
 
     WHY: 清单的权威在对端，本地 models 只是价格与能力元数据。对端列出而本地没有元数据的
     行只显示名字（价格为 ``-``、无能力标记），不替对端猜能力。
     """
-    provider = llm.resolve_model(_chat_root.llm_config, _chat_root.get_model(data))[0]
+    provider_arg = provider_arg.strip().rstrip("/")
+    if provider_arg:
+        providers = _chat_root.llm_config.get("providers", {})
+        if provider_arg not in providers:
+            available = "、".join(providers.keys())
+            return f"未知供应商 {provider_arg}，当前配置的供应商有：{available}"
+        provider = provider_arg
+    else:
+        provider = llm.resolve_model(_chat_root.llm_config, _chat_root.get_model(data))[0]
     local = _chat_root.llm_config.get("providers", {}).get(provider, {}).get("models", {})
     online = llm.get_client().list_models(provider)
     if online is None:
@@ -369,6 +406,160 @@ def _debounce_subcommand(tail: str) -> str:
     return f"debounce: 已设置为 等待 {idle:.1f}s，上限 {max_delay:.1f}s"
 
 
+def _observer_report() -> str:
+    cfg = _chat_root._observer.get_config()
+    state = "开" if cfg.get("on", True) else "关"
+    model = cfg.get("model", "deepseek/deepseek-flash")
+    effort = cfg.get("effort", "none")
+    context_mode = cfg.get("context", "recent")
+    note_text = _chat_root._notes.read("observer").strip()
+    prompt_status = f"自定义（{len(note_text)} 字）" if note_text else "默认"
+    return f"observer: {state}\nmodel: {model}\neffort: {effort}\ncontext: {context_mode}\nprompt: {prompt_status}（data/notes/observer.md）"
+
+
+def _observer_subcommand(raw: str, tail: str) -> str:
+    cfg = _chat_root._observer.get_config()
+    if not tail:
+        return _observer_report()
+    action, _, arg = tail.partition(" ")
+    action = action.lower()
+    arg = arg.strip()
+
+    if action in ("on", "off"):
+        if arg:
+            return f"observer {action} 参数过多"
+        cfg["on"] = (action == "on")
+        _chat_root._observer.save_config(cfg)
+        return f"observer: {'开' if cfg['on'] else '关'}"
+
+    if action == "model":
+        if not arg:
+            return f"observer model: {cfg.get('model', 'deepseek/deepseek-flash')}"
+        selection, remaining = _first_argument(arg)
+        if remaining.strip():
+            return "observer model 参数过多"
+        try:
+            llm.resolve_model(_chat_root.llm_config, selection)
+        except ValueError as error:
+            return str(error)
+        cfg["model"] = selection
+        _chat_root._observer.save_config(cfg)
+        return f"observer model: {selection}"
+
+    if action == "effort":
+        if not arg:
+            return f"observer effort: {cfg.get('effort', 'none')}"
+        level, remaining = _first_argument(arg)
+        if remaining.strip():
+            return "observer effort 参数过多"
+        raw_level = level.lower()
+        normalized = _chat_root.REASONING_EFFORT_ALIASES.get(raw_level, raw_level)
+        if normalized not in _chat_root.REASONING_EFFORTS:
+            return "observer effort 必须是 default、off/none、low、medium、high 或 max"
+        cfg["effort"] = normalized
+        _chat_root._observer.save_config(cfg)
+        return f"observer effort: {normalized}"
+
+    if action == "context":
+        if not arg:
+            return f"observer context: {cfg.get('context', 'recent')}"
+        mode, remaining = _first_argument(arg)
+        if remaining.strip():
+            return "observer context 参数过多"
+        mode = mode.lower()
+        if mode not in ("recent", "full"):
+            return "observer context 必须是 recent（仅上一轮，省 token）或 full（全段历史）"
+        cfg["context"] = mode
+        _chat_root._observer.save_config(cfg)
+        return f"observer context: {mode}"
+
+    if action == "prompt":
+        if arg:
+            return "observer prompt 参数过多"
+        text = _chat_root._notes.read("observer").strip()
+        origin = "data/notes/observer.md"
+        if text:
+            return f"{text}\n({origin})"
+        return f"{_chat_root._observer.DEFAULT_OBSERVER_PROMPT}\n(内置兜底，尚未创建 {origin})"
+
+    if action == "set":
+        body = raw.lstrip()
+        set_idx = body.find("set")
+        if set_idx >= 0:
+            content = body[set_idx + len("set"):].lstrip(" \t")
+            if content.startswith("\n"):
+                content = content[1:]
+        else:
+            content = arg
+        text = cq.unescape(content.strip())
+        _chat_root._observer.set_prompt(text)
+        return "已改写 observer 提示词" if text else "已清空 observer 提示词，回落到默认"
+
+    if action == "reset":
+        if arg:
+            return "observer reset 参数过多"
+        cfg = {"on": True, "model": "deepseek/deepseek-flash", "effort": "none", "context": "recent"}
+        _chat_root._observer.save_config(cfg)
+        return "observer 已恢复默认配置（开，deepseek/deepseek-flash，effort=none，context=recent）"
+
+    return "observer 参数错误，可用 #help observer 查看"
+
+
+def _status_report(data: dict) -> str:
+    """汇总当前所有核心状态与开关（无 emoji，每行以可编辑命令开头）。"""
+    model = _chat_root.get_model(data)
+    effort = _chat_root.get_reasoning_effort(data)
+    reasoning = _chat_root.get_reasoning_mode(data)
+    image = _chat_root.get_image_mode(data)
+    audio = _chat_root.get_audio_mode(data)
+
+    max_events, threshold = _chat_root.limit()
+    segment = _chat_root._segment.load()
+    used = _chat_root._segment.context_size(segment.get("tokens"), segment.get("messages", []))
+
+    from mods.chat import debounce as _debounce
+    deb_cfg = _debounce.get_config()
+    deb_mode = "on" if deb_cfg.get("enabled") else "off"
+    deb_detail = f"等待 {deb_cfg['idle']:.1f}s，上限 {deb_cfg['max']:.1f}s" if deb_cfg.get("enabled") else "已关闭"
+    loop_switch = "on" if _chat_root._agent.loop_on() else "off"
+    loop_detail = _chat_root._agent.loop_status().replace("loop: on", "").replace("loop: off", "").strip("，")
+    if not loop_detail:
+        loop_detail = "未运行"
+    subconscious_switch = "on" if data.get("subconscious", True) else "off"
+
+    obs_cfg = _chat_root._observer.get_config()
+    obs_switch = "on" if obs_cfg.get("on", True) else "off"
+    obs_model = obs_cfg.get("model", "deepseek/deepseek-flash")
+    obs_effort = obs_cfg.get("effort", "none")
+    obs_context = obs_cfg.get("context", "recent")
+    obs_custom = "自定义" if _chat_root._notes.read("observer").strip() else "默认"
+
+    last_reflect = data.get("reflected_at")
+    reflect_str = datetime.fromtimestamp(last_reflect).strftime("%Y-%m-%d %H:%M") if isinstance(last_reflect, (int, float)) else "还没有"
+    awaker_rules = [line for line in _chat_root._notes.read("awaker").splitlines() if line.strip() and not line.strip().startswith("#")]
+    awaker_str = f"{len(awaker_rules)} 条规则" if awaker_rules else "默认 04:00 reflect"
+
+    lines = [
+        # WHY: 每行自带 `#`，用户可以直接照抄；`call()` 又会给整条消息补一个 `#`，
+        # 所以首行以 `status` 开头，`call()` 补完正好是 `#status`，且第一行就是 `    #`
+        # 绝不回流进模型上下文（见 screen.records）。
+        "status 状态面板（复制每行开头命令即可修改）：",
+        f"#use_model {model}（当前模型，改用 #use_model <名称>）",
+        f"#effort {effort}（思考等级：default/off/none/low/medium/high/max）",
+        f"#reasoning {reasoning}（历史思考保留：keep/drop）",
+        f"#image {image}（图像读取：off/lazy/eager）",
+        f"#audio {audio}（语音读取：off/lazy/eager）",
+        f"#limit {max_events} {threshold}（画面 {max_events} 条，整理阈值 {threshold}；当前段约 {used}/{threshold} token）",
+        f"#debounce {deb_mode}（防抖延迟：{deb_detail}；改用 #debounce on/off/<等待秒数> [上限秒数]）",
+        f"#loop {loop_switch}（循环总开关；状态：{loop_detail}）",
+        f"#subconscious {subconscious_switch}（潜意识增长提醒；开关：on/off）",
+        f"#observer {obs_switch}（旁观助手；模型: {obs_model}，effort: {obs_effort}，context: {obs_context}，prompt: {obs_custom}）",
+        f"#reflect（上次反思：{reflect_str}；立即执行：#reflect now）",
+        f"#awaker（闹钟：{awaker_str}；改写：#awaker set <规则>）",
+    ]
+    return "\n".join(lines)
+
+
 def _subcommand(value: str):
     # WHY: hint 的源码要求原样取（含缩进与换行），所以先留一份没 strip 的原文。
     raw = value
@@ -376,6 +567,10 @@ def _subcommand(value: str):
     name, _, tail = value.partition(" ")
     tail = tail.strip()
     data = storage.get("", "agent")
+    if name == "status" and not tail:
+        return _status_report(data)
+    if name == "status" and tail:
+        return "status 不需要参数，直接发 #status 即可"
     if name == "help" and not tail:
         return _subcommand_help()
     if name == "help" and tail:
@@ -386,7 +581,31 @@ def _subcommand(value: str):
     if name == "model" and not tail:
         return _chat_root.get_model(data)
     if name == "model" and tail:
-        selection, remaining = _first_argument(tail)
+        first, remaining = _first_argument(tail)
+        if first == "note":
+            target_model, note_text = _first_argument(remaining)
+            if not target_model:
+                return "格式：#model note <provider/model> [备注内容]（留空查看，写 clear 清空）"
+            try:
+                provider, api_model, attributes = llm.resolve_model(_chat_root.llm_config, target_model)
+            except ValueError as error:
+                return str(error)
+            local_models = _chat_root.llm_config.setdefault("providers", {}).setdefault(provider, {}).setdefault("models", {})
+            model_info = local_models.setdefault(api_model, attributes)
+            if not note_text.strip():
+                current_note = model_info.get("note", "")
+                return f"{provider}/{api_model} 备注：{current_note or '（无）'}"
+            if not op.bot_is_op():
+                return "修改模型备注需要管理员权限"
+            note_content = note_text.strip()
+            if note_content.lower() in ("clear", "none", "空", "清空"):
+                model_info.pop("note", None)
+                storage.save()
+                return f"已清空 {provider}/{api_model} 的备注"
+            model_info["note"] = note_content
+            storage.save()
+            return f"已更新 {provider}/{api_model} 备注：{note_content}"
+        selection = first
         if remaining.strip():
             return "model 参数过多"
         try:
@@ -394,8 +613,8 @@ def _subcommand(value: str):
         except ValueError as error:
             return str(error)
         return "\n".join((_MODEL_TABLE_HEADER, _format_model(selection, attributes)))
-    if name == "models" and not tail:
-        return _models_report(data)
+    if name == "models":
+        return _models_report(data, tail)
     if name == "use_model" and tail:
         selection, remaining = _first_argument(tail)
         if remaining.strip():
@@ -423,6 +642,18 @@ def _subcommand(value: str):
         data["image"] = mode
         storage.save()
         return f"image: {mode}"
+    if name == "audio" and not tail:
+        return f"audio: {_chat_root.get_audio_mode(data)}"
+    if name == "audio" and tail:
+        mode, remaining = _first_argument(tail)
+        if remaining.strip():
+            return "audio 参数过多"
+        mode = _chat_root.AUDIO_MODE_ALIASES.get(mode.lower(), mode.lower())
+        if mode not in _chat_root.AUDIO_MODES:
+            return "语音读取档位必须是 off/0、lazy/1 或 eager/2"
+        data["audio"] = mode
+        storage.save()
+        return f"audio: {mode}"
     if name == "reasoning" and not tail:
         return f"reasoning: {_chat_root.get_reasoning_mode(data)}"
     if name == "reasoning" and tail:
@@ -435,6 +666,19 @@ def _subcommand(value: str):
         data["reasoning"] = mode
         storage.save()
         return f"reasoning: {mode}"
+    if name == "effort" and not tail:
+        return f"effort: {_chat_root.get_reasoning_effort(data)}"
+    if name == "effort" and tail:
+        level, remaining = _first_argument(tail)
+        if remaining.strip():
+            return "effort 参数过多"
+        raw_level = level.lower()
+        normalized = _chat_root.REASONING_EFFORT_ALIASES.get(raw_level, raw_level)
+        if normalized not in _chat_root.REASONING_EFFORTS:
+            return "effort 必须是 default、off/none、low、medium、high 或 max"
+        data["reasoning_effort"] = normalized
+        storage.save()
+        return f"effort: {normalized}"
     if name == "prompt":
         return _prompt_subcommand(raw)
     if name == "limit" and not tail:
@@ -467,4 +711,6 @@ def _subcommand(value: str):
         return _hint_subcommand(raw)
     if name == "debounce":
         return _debounce_subcommand(tail)
+    if name == "observer":
+        return _observer_subcommand(raw, tail)
     return "子命令格式错误，可用 #help 查看"

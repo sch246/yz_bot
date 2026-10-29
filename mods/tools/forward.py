@@ -3,7 +3,10 @@
 ## 怎么拆开看（read_forward）
 
 聊天里看到 `[CQ:forward,id=…]`（或者你自己以前发出去的 `[CQ:json,…]` 转发卡片）时，画面上只有一个外壳，里面的长篇聊天记录得调 `read_forward(message_id)` 才能拆开看到。
-拆出来的内容和里面的图片都会顺手存进宿主机的 `data/forward/` 里，下次再翻同一个 id 直接读本地就行，不用重新联网。（顺带一提：如果要用 `.cave add` 把一条合并转发收进回声洞，直接丢给它就行，它自己会去拆，不用你先手动读一遍。）
+拆出来的内容和里面的图片都会顺手存进宿主机的 `data/forward/` 和 `data/images/` 里，下次再翻同一个 id 直接读本地就行，不用重新联网。（顺带一提：如果要用 `.cave add` 把一条合并转发收进回声洞，直接丢给它就行，它自己会去拆，不用你先手动读一遍。）
+
+- **看转发里的图片**：节点里的图片会自动本地化并显示为 `[图片: file:///root/bot/data/images/...]`（或 url）。想看哪张图，直接拿这个路径调 `attach_image(path)` 挂进对话或者用 `vision.ask(path, "问图内容")` 识图即可。
+- **看嵌套合并转发**：如果转发里嵌套了另一层转发，外层会自动递归缩进展开；你也可以把内层卡片上显示的 id 单独传给 `read_forward(inner_id)`，单独翻看那一段。
 
 如果遇到特别久远的旧转发，QQ 服务器可能会回"消息已过期或者为内层消息"或者给个空包，这时候再怎么重试也是拿不到的，如实告诉对方太久远打不开就好。
 
@@ -32,6 +35,9 @@ def read_forward(message_id: str, limit: int = 30) -> str:
     value = str(message_id or "").strip()
     if not value:
         return "没有给出转发 id"
+    value = value.strip("\"'")
+    if value.lower().startswith("id="):
+        value = value[3:].strip("\"' ")
     key = forward.code_id(value) or value
     found = forward.record(key)
     if found is None:

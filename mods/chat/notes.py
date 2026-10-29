@@ -69,6 +69,15 @@ def read(scope: str) -> str:
     return path.read_text(encoding="utf-8") if path.is_file() else ""
 
 
+def mtime(scope: str) -> float:
+    """Last modification time of one note file, or 0.0 when it does not exist."""
+    path = _path(scope)
+    try:
+        return path.stat().st_mtime if path.is_file() else 0.0
+    except OSError:
+        return 0.0
+
+
 def years(last: int = 8) -> list[str]:
     """The newest lines of the year index: one line per archived segment, oldest first."""
     try:
@@ -89,6 +98,14 @@ def render(scope: str) -> str:
     if name:
         body = f"维护者设定的称呼：{name}\n{body}".strip()
     return f"## 笔记 {scope}（{_path(scope).as_posix()}）\n{body}" if body else ""
+
+
+def note_hash(scope: str) -> str:
+    """A compact fingerprint of one note's rendered body to detect mid-segment edits."""
+    import hashlib
+
+    text = render(scope).strip()
+    return hashlib.md5(text.encode("utf-8")).hexdigest() if text else ""
 
 
 def _backup(path: Path) -> None:

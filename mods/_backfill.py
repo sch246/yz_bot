@@ -61,10 +61,19 @@ def recover(window: tuple, call_api) -> int:
             kind, int(target), call_api=call_api, save_page=save_page,
             anchor_message_id=anchor, anchor_time=anchor_time, count=PAGE_SIZE)
         if not result["anchor_found"]:
-            logger.warning("离线补回 %s：远端历史到尽头也没遇到本地锚点，补回了 %d 条，再往前可能有缺口",
-                           window, written)
+            # WHY: 若一条都没补回（written==0），说明该窗口在 NTQQ 本地无新漫游记录（静默窗口或新启动无缓存），
+            # 并非真正发生丢失，记 debug；若补回了部分（written>0）但没到锚点，说明记录可能存在缺口，才报警。
+            if written:
+                logger.warning("离线补回 %s：远端历史到尽头也没遇到本地锚点，补回了 %d 条，再往前可能有缺口",
+                               window, written)
+            else:
+                logger.debug("离线补回 %s：远端无新记录（未遇到本地锚点）", window)
     except _napcat_history.HistoryGap as error:
-        logger.warning("离线补回 %s 中断（%s），补回了 %d 条，再往前可能有缺口", window, error.reason, written)
+        # WHY: 若一条都没补回（written==0）且仅是窗口不可达或跳过，记 debug，避免冷窗口在启动时警告轰炸。
+        if written:
+            logger.warning("离线补回 %s 中断（%s），补回了 %d 条，再往前可能有缺口", window, error.reason, written)
+        else:
+            logger.debug("离线补回 %s 未拉取新消息（%s）", window, error.reason)
     if calls:
         from mods import chat
 
@@ -97,6 +106,25 @@ def _register_calls(window: tuple, events: list[dict]) -> int:
 def start(call_api) -> None:
     """Recover every frozen window, two at a time, in the background."""
     tasks = list(_anchors)
+    # WHY: 已经退出的群聊和非好友私聊在 NapCat NTQQ 中无法拉取历史（接口报 200 消息undefined不存在），
+    # 在发起后台补回前比对好友和群列表过滤掉无用窗口，避免数十次无效网络请求与误报。若获取列表失败则保留原任务。
+    active_windows = None
+    try:
+        friends_res = call_api("get_friend_list")
+        groups_res = call_api("get_group_list")
+        if (isinstance(friends_res, dict) and friends_res.get("retcode") == 0
+                and isinstance(groups_res, dict) and groups_res.get("retcode") == 0):
+            active_windows = set()
+            for f in friends_res.get("data") or []:
+                if isinstance(f, dict) and "user_id" in f:
+                    active_windows.add(("private", int(f["user_id"])))
+            for g in groups_res.get("data") or []:
+                if isinstance(g, dict) and "group_id" in g:
+                    active_windows.add(("group", int(g["group_id"])))
+    except Exception:
+        logger.debug("获取当前好友/群列表失败，回退到全量补回", exc_info=True)
+    if active_windows is not None:
+        tasks = [w for w in tasks if w in active_windows]
     task_lock = threading.Lock()
 
     def work() -> None:

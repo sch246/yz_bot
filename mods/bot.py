@@ -166,7 +166,10 @@ def _route_event(event: dict) -> str | None:
 
     if msgs.is_msg(event):
         if chat is not None:
+            # 只读 CQ 的 file 字段，三档都做；第二、三级才分档，见 recognize.py。
+            chat.recognize_images(event)
             chat.eager_cache_images(event)
+            chat.process_incoming_voice(event)
         key = context.interaction_key(event)
         # ``message`` stays exactly what NapCat sent, all the way into the chat
         # log and history; the entry-point form -- reply and leading ats off --

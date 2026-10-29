@@ -21,10 +21,16 @@ LOAD_AFTER = ("chatlog", "history", "identity", "image", "llm", "oplog", "storag
 IMAGE_MODES = ("off", "lazy", "eager")
 IMAGE_MODE_ALIASES = {"0": "off", "1": "lazy", "2": "eager"}
 
+AUDIO_MODES = ("off", "lazy", "eager")
+AUDIO_MODE_ALIASES = {"0": "off", "1": "lazy", "2": "eager"}
+
 # WHY: 历史选项。2026-10-19 起思考只在一次唤醒之内保留，跨唤醒一律不保留（维护者裁定），
 # 这个设置暂时不再影响中心会话，等清理时一并决定去留。
 REASONING_MODES = ("keep", "drop")
 REASONING_ALIASES = {"on": "keep", "off": "drop", "1": "keep", "0": "drop"}
+
+REASONING_EFFORTS = ("default", "none", "low", "medium", "high", "max")
+REASONING_EFFORT_ALIASES = {"off": "none", "0": "none", "auto": "default", "unset": "default", "reset": "default"}
 
 settings: list = []
 prompts: dict = {}
@@ -59,6 +65,15 @@ def normalize_image_mode(value) -> str:
     return normalized if normalized in IMAGE_MODES else "off"
 
 
+def normalize_audio_mode(value) -> str:
+    if value is True:
+        return "lazy"
+    if value is False or value is None:
+        return "off"
+    normalized = AUDIO_MODE_ALIASES.get(str(value).lower(), str(value).lower())
+    return normalized if normalized in AUDIO_MODES else "off"
+
+
 def agent_setting(name: str, data: dict | None = None):
     key, normalize = AGENT_SETTINGS[name]
     return normalize((storage.get("", "agent") if data is None else data).get(key))
@@ -79,6 +94,10 @@ def get_image_mode(data: dict | None = None) -> str:
     return agent_setting("image", data)
 
 
+def get_audio_mode(data: dict | None = None) -> str:
+    return agent_setting("audio", data)
+
+
 # WHY: 归一化负责把存坏的值拉回默认，读取端永远拿得到合法值。
 def normalize_reasoning_mode(value) -> str:
     normalized = REASONING_ALIASES.get(str(value).lower(), str(value).lower())
@@ -87,6 +106,17 @@ def normalize_reasoning_mode(value) -> str:
 
 def get_reasoning_mode(data: dict | None = None) -> str:
     return agent_setting("reasoning", data)
+
+
+def normalize_reasoning_effort(value) -> str:
+    if value is None or value == "":
+        return "default"
+    normalized = REASONING_EFFORT_ALIASES.get(str(value).lower(), str(value).lower())
+    return normalized if normalized in REASONING_EFFORTS else "default"
+
+
+def get_reasoning_effort(data: dict | None = None) -> str:
+    return agent_setting("reasoning_effort", data)
 
 
 def _bounded_int(minimum: int, fallback: int, maximum: int | None = None):
@@ -105,7 +135,9 @@ def _bounded_int(minimum: int, fallback: int, maximum: int | None = None):
 # 单值全局 agent 配置：storage 键与归一化。
 AGENT_SETTINGS = {
     "image": ("image", normalize_image_mode),
+    "audio": ("audio", normalize_audio_mode),
     "reasoning": ("reasoning", normalize_reasoning_mode),
+    "reasoning_effort": ("reasoning_effort", normalize_reasoning_effort),
     "max_events": ("max_events", _bounded_int(1, DEFAULT_MAX_EVENTS)),
     "tidy_token": ("tidy_token", _bounded_int(1, DEFAULT_TIDY_TOKEN)),
 }
@@ -306,6 +338,8 @@ def _activate_chat(
     # 改变这一轮是否完成回收。
     session.do_process_image = get_image_mode() != "off"
     session.keep_reasoning = get_reasoning_mode() == "keep"
+    effort = get_reasoning_effort()
+    session.reasoning_effort = None if effort == "default" else effort
     return binding
 
 
@@ -377,6 +411,7 @@ def _agent_hint() -> str:
 
     WHY: 待办以前存在 storage 的 `agent_hint` 键里，2026-10-22 维护者让它退化成普通文件
     （笔记 `todo`）。第一次读到旧键时搬过去并删掉旧键，之后只认文件。
+    WHY: 末尾附上结束标记，避免模型误将后续渲染的动态提示（如其它窗口未读）当成 todo 内容误写进文件。
     """
     data = storage.get("", "agent")
     legacy = data.get(_AGENT_HINT_KEY)
@@ -386,7 +421,7 @@ def _agent_hint() -> str:
         del data[_AGENT_HINT_KEY]
         storage.save()
     value = _notes.read("todo").strip()
-    return f"待办（笔记 todo，用 write_note 改）：\n{value}" if value else ""
+    return f"待办（笔记 todo，用 write_note 改）：\n{value}\n（以上是笔记 todo 全文）" if value else ""
 
 # 会话主体持久激活的工具模块名，以及各自最后一次被调用的时刻。
 _ACTIVE_MODULES_KEY = "active_tools"
@@ -903,6 +938,32 @@ def eager_cache_images(event: dict) -> None:
             _eager_cache_images(event.copy(), model)
 
 
+def recognize_images(event: dict) -> None:
+    """到达时把柜里已有的表情认出来，结论钉死；只读 CQ 的 file 字段，不下载、不调模型。
+
+    WHY: 三档都做。这一级不碰图片字节，`#image off` 也能认出原样重发的图，不违背那一档
+    “不在任何群里到处下载图片”的约定；第二、三级才按 eager/lazy/off 分开。
+    """
+    message = event.get("message")
+    if not isinstance(message, str) or "[CQ:image" not in message:
+        return
+    window = history.window(event)
+    if window is None:
+        return
+    try:
+        _recognize.pin(window, event.get("message_id"), message)
+    except Exception:
+        _image_stream.exception("再认柜中表情失败")
+
+
+def process_incoming_voice(event: dict) -> None:
+    if msgs.is_msg(event) and "[CQ:record" in event.get("message", ""):
+        data = storage.get("", "agent")
+        mode = get_audio_mode(data)
+        if mode != "off":
+            _voice.cache_event_voice(event, eager=(mode == "eager"))
+
+
 def on_load(ctx) -> None:
     global settings, prompts, chat_groups, description_cache, llm_config
     from mods import is_available
@@ -956,7 +1017,7 @@ def on_exit() -> None:
     _debounce.cancel_all()
 
 
-from . import view as _view, segment as _segment, screen as _screen, agent as _agent, roles as _roles, subcommands as _subcommands, notes as _notes, awaker as _awaker, debounce as _debounce
+from . import recognize as _recognize, view as _view, segment as _segment, screen as _screen, agent as _agent, roles as _roles, subcommands as _subcommands, notes as _notes, awaker as _awaker, debounce as _debounce, observer as _observer, voice as _voice, face as _face
 from .view import has_at, msg_split
 from .windows import kind, parse_target
 from .screen import mark_window_read

@@ -9,9 +9,11 @@ import json
 import logging
 import os
 import re
+import requests
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 from openai import OpenAI
 
@@ -51,10 +53,50 @@ DEFAULT_IMAGE_DESCRIPTION_PROMPT = """请详细描述图片内容，作为无视
 
 直接输出客观描述结果，不要添加前言、总结或后续建议。"""
 
+DEFAULT_AUDIO_DESCRIPTION_PROMPT = """请详细转录并理解音频内容，作为大模型的上下文替代：
+
+- 语音转录：完整、准确地转录音频中说话人的每句台词/发言，不要遗漏关键信息与专有名词。
+- 语气与情绪：指出说话人的语气（如欢快、急促、低沉、疑问、调侃等）、情绪状态与声调特点。
+- 背景声音与音效：如果有背景音乐、环境杂音（如键盘声、风声、笑声、呼喊声），请简要指出。
+- 意图与概要：若说话较长或含义含蓄，总结其核心意图。
+
+直接输出客观转录与分析结果，不要添加前言、总结或元话术。"""
+
+
+def get_image_description_template() -> str:
+    """读取 data/notes/vision.md，不存在或空时回退到默认常量。"""
+    try:
+        from mods.chat import notes
+        custom = notes.read("vision").strip()
+        if custom:
+            return custom
+    except Exception:
+        pass
+    return DEFAULT_IMAGE_DESCRIPTION_PROMPT
+
+
+def get_audio_description_template() -> str:
+    """读取 data/notes/audio.md，不存在或空时回退到默认常量。"""
+    try:
+        from mods.chat import notes
+        custom = notes.read("audio").strip()
+        if custom:
+            return custom
+    except Exception:
+        pass
+    return DEFAULT_AUDIO_DESCRIPTION_PROMPT
+
+
 def build_image_description_prompt(prompt: str = "") -> str:
     if not isinstance(prompt, str) or not prompt.strip():
-        return DEFAULT_IMAGE_DESCRIPTION_PROMPT
+        return get_image_description_template()
     return f"请按以下任务识别图片：\n{prompt.strip()}\n\n只输出任务要求的图片识别结果，不要添加元话术。"
+
+
+def build_audio_description_prompt(prompt: str = "") -> str:
+    if not isinstance(prompt, str) or not prompt.strip():
+        return get_audio_description_template()
+    return f"请按以下任务理解并转录音频：\n{prompt.strip()}\n\n只输出任务要求的音频识别结果，不要添加元话术。"
 
 
 def format_image_reference(uri: str, label: str = "图片") -> str:
@@ -364,6 +406,27 @@ class LLMClient:
             return None
         return selection if capabilities.get("vision") else None
 
+    def get_model_note(self, model: str) -> str:
+        try:
+            capabilities = resolve_model(self.config, model)[2]
+            return str(capabilities.get("note") or "").strip()
+        except ValueError:
+            return ""
+
+    def set_model_note(self, model: str, note: str) -> None:
+        from mods import storage
+
+        provider, api_model, capabilities = resolve_model(self.config, model)
+        provider_cfg = self.config.setdefault("providers", {}).setdefault(provider, {})
+        models_cfg = provider_cfg.setdefault("models", {})
+        info = models_cfg.setdefault(api_model, capabilities)
+        clean = str(note or "").strip()
+        if clean:
+            info["note"] = clean
+        else:
+            info.pop("note", None)
+        storage.save()
+
     def list_models(self, provider: str) -> list[str] | None:
         """问 provider 要它当前提供的模型 id 列表；取不到返回 None。
 
@@ -497,6 +560,8 @@ class LLMClient:
         return ids, split
 
     def _get_image_description(self, uri: str, vision_model: str, description_cache: dict) -> str | None:
+        template = get_image_description_template()
+        prompt_version = image.description_version(template)
         identities = []
         digest = image.get_cached_image_digest(uri)
         if digest:
@@ -505,11 +570,11 @@ class LLMClient:
         if intrinsic and intrinsic not in identities:
             identities.append(intrinsic)
         with self._description_lock:
-            removed = image.maybe_prune_description_cache(description_cache)
+            removed = image.maybe_prune_description_cache(description_cache, prompt_version=prompt_version)
             if removed:
                 console.notice(f"🧹 已清理 {removed} 条过期图片描述缓存")
             for identity in identities:
-                cached = image.get_cached_description(description_cache, identity)
+                cached = image.get_cached_description(description_cache, identity, prompt_version=prompt_version)
                 if cached is not None:
                     algorithm = identity.partition(":")[0] if ":" in identity else "sha256"
                     console.notice(f"✅ 图片描述缓存命中：{algorithm}")
@@ -527,10 +592,10 @@ class LLMClient:
         # 这里选的是更直接的路：既然键里不再区分缓存，去重就跨聊天空间生效——同一张图
         # 在两个群同时出现只调一次视觉模型。代价是等待方的缓存里没有这一条，所以结果由
         # _DescriptionTask 持有，等待方拿到后各自写进自己的缓存，而不是回读。
-        key = (digest, image.AUTO_IMAGE_DESCRIPTION_VERSION)
+        key = (digest, prompt_version)
         with self._description_lock:
             for identity in identities:
-                cached = image.get_cached_description(description_cache, identity)
+                cached = image.get_cached_description(description_cache, identity, prompt_version=prompt_version)
                 if cached is not None:
                     algorithm = identity.partition(":")[0] if ":" in identity else "sha256"
                     console.notice(f"✅ 图片描述缓存命中：{algorithm}")
@@ -548,7 +613,7 @@ class LLMClient:
             if description is None:
                 return None
             with self._description_lock:
-                removed = image.cache_description(description_cache, digest, description)
+                removed = image.cache_description(description_cache, digest, description, prompt_version=prompt_version)
             console.notice(f"✅ 等待中的图片描述已缓存：sha256:{digest[:12]}")
             console.notice(f"    {description}")
             if removed:
@@ -556,10 +621,10 @@ class LLMClient:
             return description
         try:
             console.notice(f"👁️ 使用 {vision_model} 生成图片描述…")
-            description = self.describe_image(uri, model=vision_model)
+            description = self.describe_image(uri, prompt=template, model=vision_model)
             if description:
                 with self._description_lock:
-                    removed = image.cache_description(description_cache, digest, description)
+                    removed = image.cache_description(description_cache, digest, description, prompt_version=prompt_version)
                 console.notice(f"✅ 图片描述已缓存：sha256:{digest[:12]}")
                 if removed:
                     console.notice(f"🧹 已清理 {removed} 条过期图片描述缓存")
@@ -627,7 +692,61 @@ class LLMClient:
             console.notice(f"    {description}")
         return description
 
-    def generate_response(self, messages: list[dict], tools: list[Tool] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None, logged: int = 0):
+    def describe_audio(self, uri: str, prompt: str = "", model: str | None = None) -> str | None:
+        selection = model or self.get_vision_model()
+        if not selection:
+            return None
+        provider, api_model, _ = resolve_model(self.config, selection)
+        client = self.clients.get(provider)
+        if client is None:
+            raise ValueError(f"Provider {provider} not configured")
+
+        if uri.startswith("file://"):
+            from mods.image import file_uri_to_path
+            path = file_uri_to_path(uri)
+            data_bytes = Path(path).read_bytes()
+        elif os.path.isfile(uri):
+            data_bytes = Path(uri).read_bytes()
+        elif uri.startswith("http://") or uri.startswith("https://"):
+            resp = requests.get(uri, timeout=30)
+            resp.raise_for_status()
+            data_bytes = resp.content
+        elif uri.startswith("data:audio/"):
+            data_bytes = base64.b64decode(uri.split(",", 1)[1])
+        else:
+            raise ValueError(f"不支持的音频 URI: {uri}")
+
+        b64 = base64.b64encode(data_bytes).decode("ascii")
+        audio_format = "mp3"
+        lower = uri.lower()
+        if lower.endswith(".wav"):
+            audio_format = "wav"
+        elif lower.endswith(".ogg"):
+            audio_format = "ogg"
+        elif lower.endswith(".m4a"):
+            audio_format = "m4a"
+
+        text = build_audio_description_prompt(prompt)
+        console.notice(f"等待 {selection} 的音频识别响应…")
+        try:
+            response = client.chat.completions.create(
+                model=api_model,
+                messages=[{"role": "user", "content": [
+                    {"type": "text", "text": text},
+                    {"type": "input_audio", "input_audio": {"data": b64, "format": audio_format}},
+                ]}],
+            )
+            description = response.choices[0].message.content
+            _record_usage(selection, response)
+            if description:
+                console.notice(f"✅ 多模态模型音频分析成功：{console.format_uri(uri)}")
+                console.notice(f"    {description}")
+            return description
+        except Exception as error:
+            console.error(f"❌ 音频识别失败：{error}")
+            raise
+
+    def generate_response(self, messages: list[dict], tools: list[Tool] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None, logged: int = 0, reasoning_effort: str | None = None):
         selection = model or self.config["default_model"]
         provider, api_model, raw_capabilities = resolve_model(self.config, selection)
         client = self.clients.get(provider)
@@ -650,10 +769,22 @@ class LLMClient:
                         for message in messages]
         else:
             messages = self._replace_images_with_text(messages)
+        # DeepSeek and OpenAI require every tool call in assistant messages to have type="function".
+        for message in messages:
+            if message.get("role") == "assistant" and "tool_calls" in message:
+                for call in message.get("tool_calls") or []:
+                    if isinstance(call, dict) and "type" not in call:
+                        call["type"] = "function"
         # Image conversion is one output message per input message, so the
         # caller's count still lines up with what is about to be sent.
         console.print_request(selection, messages, logged)
         params = {"model": api_model, "messages": messages, "stream": stream}
+        if reasoning_effort:
+            effort = str(reasoning_effort).strip().lower()
+            if effort in ("off", "none"):
+                effort = "none"
+            if effort in ("none", "low", "medium", "high", "max"):
+                params["reasoning_effort"] = effort
         if capabilities.function_calling and tools:
             params["tools"] = [tool.description for tool in tools]
             if tool_choice:
@@ -787,7 +918,7 @@ class LLMClient:
             reasoning_content=reasoning_content,
         )
 
-    def chat(self, messages: list[dict], tools: list[Tool] | Callable[[], list[Tool]] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None, on_round: Callable[[], list[dict]] | None = None, should_stop: Callable[[], bool] | None = None, hints: Callable[[], list[dict]] | None = None, keep_reasoning: bool = True, on_output: Callable[[dict, list[dict]], str | tuple[str, dict] | None] | None = None, on_results: Callable[[str, list[ToolCallResult], list[dict]], None] | None = None, turn_done: Callable[[], bool] | None = None, on_action: Callable[[str | None], None] | None = None, preserve_native: bool = False, logged: int = 0) -> Generator[LLMResponse, None, None]:
+    def chat(self, messages: list[dict], tools: list[Tool] | Callable[[], list[Tool]] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None, on_round: Callable[[], list[dict]] | None = None, should_stop: Callable[[], bool] | None = None, hints: Callable[[], list[dict]] | None = None, keep_reasoning: bool = True, on_output: Callable[[dict, list[dict]], str | tuple[str, dict] | None] | None = None, on_results: Callable[[str, list[ToolCallResult], list[dict]], None] | None = None, turn_done: Callable[[], bool] | None = None, on_action: Callable[[str | None], None] | None = None, preserve_native: bool = False, logged: int = 0, reasoning_effort: str | None = None) -> Generator[LLMResponse, None, None]:
         # Every message appended below is printed live as it happens, so each
         # further round only logs what it has not shown yet -- usually nothing.
         # *logged* starts past whatever the caller already logged before.
@@ -817,7 +948,7 @@ class LLMClient:
             # 在上下文里堆出几代互相矛盾的副本。因此 hint 里只放随时可重算的东西，不放
             # 任何"只此一次、错过就没有"的信息——那种必须走 on_round。
             outgoing = (messages + hints()) if hints is not None else messages
-            response = iter(self.generate_response(outgoing, tools_snapshot, tool_choice, model, stream, description_cache, do_process_image, logged))
+            response = iter(self.generate_response(outgoing, tools_snapshot, tool_choice, model, stream, description_cache, do_process_image, logged, reasoning_effort=reasoning_effort))
             mapping = {tool.description["function"]["name"]: tool for tool in tools_snapshot}
             pending_calls = []
             # Yielded chunks remain the live display/tool stream.  The return
@@ -960,12 +1091,13 @@ class LLMClient:
 
 
 class Chat:
-    def __init__(self, model: str | None = None, messages: list | None = None, functions: dict | list | None = None, chat_client: LLMClient | None = None, recall_func: Callable | None = None, description_cache: dict | None = None, do_process_image: bool | None = None) -> None:
+    def __init__(self, model: str | None = None, messages: list | None = None, functions: dict | list | None = None, chat_client: LLMClient | None = None, recall_func: Callable | None = None, description_cache: dict | None = None, do_process_image: bool | None = None, reasoning_effort: str | None = None) -> None:
         self.chat_client = chat_client
         self.model = model or (chat_client.config["default_model"] if chat_client else None)
         self.recall_func = recall_func
         self.description_cache = description_cache
         self.do_process_image = do_process_image
+        self.reasoning_effort: str | None = reasoning_effort
         self.messages: list[dict] = []
         self.functions: dict[str, Tool] = {}
         # WHY: 追加式上下文。每个 provider 在每次模型子请求前被调用一次，返回要追加到
@@ -1115,6 +1247,7 @@ class Chat:
                 lambda reference: setattr(self, "active_action", reference),
                 self.preserve_native,
                 self.logged,
+                reasoning_effort=self.reasoning_effort,
             )
             results = []
             for chunk in response:
@@ -1146,6 +1279,14 @@ def get_client() -> LLMClient:
     if client is None:
         raise RuntimeError("LLM client 尚未加载")
     return client
+
+
+def get_model_note(model: str) -> str:
+    return get_client().get_model_note(model)
+
+
+def set_model_note(model: str, note: str) -> None:
+    get_client().set_model_note(model, note)
 
 
 def on_load(ctx) -> None:

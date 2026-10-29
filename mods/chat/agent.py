@@ -18,6 +18,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import json
+import re
 import threading
 import time
 
@@ -35,7 +36,7 @@ DEFAULT_TIDY = """# 什么时候交接。每次子请求结束（stage == "round
 # since_handoff（这一段开始了多少秒）、kind（唤醒／闹钟／反思）、hour。
 "上下文太长" if used > limit else None
 """
-_KNOWN_PEOPLE = 6
+_KNOWN_PEOPLE = 20
 _TYPING_EVERY = 5
 # 循环：一轮结束后隔几秒叫醒她；她连着几轮什么都没做时间隔翻倍，最长拉到多久。
 _LOOP_GAP = 2.0
@@ -103,13 +104,25 @@ def _note_block(scopes: list[str], title: str) -> dict | None:
 def _head(woken: list[tuple], segment: dict) -> list[dict]:
     """What a new segment starts with: her standing notes and a directory of the rest.
 
-    WHY: 做法（global）、交接下来的 recent 和最近一篇日记在每一段开头；叫醒她的窗口和
+    WHY: 做法（global）、交接下来的 recent、昨天的日记和当天的日记在每一段开头；叫醒她的窗口和
     叫她的人的笔记跟着画面一起出现（见 `_people`）。待办每个子请求都挂在末尾。别的都由
     她自己召回，目录只列名字。
     """
     days = [key for key in _notes.diaries() if len(key) == 10]
-    scopes = ["global", "recent", *(f"diary:{days[-1]}" for _ in days[-1:])]
+    today = _screen.clock()[:10]
+    past_days = [d for d in days if d != today]
+    # WHY: 2026-10-29 草籽：每天都默认能看到当天的日记（中途写了或跨天也自动载入）；
+    # 昨天的日记（若有）作为前置背景一起带上，白天随时能看到最新的今天日记。
+    scopes = ["global", "recent"]
+    # WHY: 2026-10-29 草籽：两天的日记太少，先放到 7 天（要在眼前才叫记得住）。
+    for day in past_days[-6:]:
+        scopes.append(f"diary:{day}")
+    if today in days or _notes.render(f"diary:{today}"):
+        scopes.append(f"diary:{today}")
     segment["scopes"] = list(scopes)
+    hashes = segment.setdefault("note_hashes", {})
+    for s in scopes:
+        hashes[s] = _notes.note_hash(s)
     messages = []
     block = _note_block(scopes, "以下是你的笔记（普通文件，你随时能改，可能不完整）：")
     if block:
@@ -127,8 +140,12 @@ def _head(woken: list[tuple], segment: dict) -> list[dict]:
 def _people(windows: list[tuple], authors: list[int], segment: dict) -> tuple[list[dict], list[str]]:
     """Notes for windows and people appearing in this segment for the first time, and their scopes."""
     scopes = [_notes.scope_of(window) for window in windows if window[0] in _windows.QQ]
-    scopes.extend(f"person:{author}" for author in authors[:_KNOWN_PEOPLE])
-    new = [scope for scope in dict.fromkeys(scopes) if scope not in segment["scopes"]]
+    scopes.extend(f"person:{author}" for author in authors)
+    seen = set(segment.get("scopes", ()))
+    new = [scope for scope in dict.fromkeys(scopes) if scope not in seen and _notes.render(scope)][:_KNOWN_PEOPLE]
+    hashes = segment.setdefault("note_hashes", {})
+    for s in new:
+        hashes[s] = _notes.note_hash(s)
     block = _note_block(new, "这一段里第一次出现的人或群，你的笔记：")
     return ([block] if block else []), new
 
@@ -137,10 +154,15 @@ def _box_note(boxes: dict) -> str:
     """Unsent input boxes, told once after a handoff.
 
     WHY: 维护者 2026-10-23：type_word 的返回已经在上下文里，每次请求末尾再列一遍是重复。
-    只有交接后要说：输入框跟着唤醒走还在，打字那次的返回却随上一段归档了。
+    只有交接后要说：输入框存入 storage 跨唤醒与交接都在，打字那次的返回却随上一段归档了。
     """
+    unsent = [f"{label}：{box['text'] if isinstance(box, dict) else box}"
+              for label, box in boxes.items()
+              if (box.get("text") if isinstance(box, dict) else str(box).strip())]
+    if not unsent:
+        return ""
     return ("交接前你在输入框里打了还没发的字：\n"
-            + "\n".join(f"{label}：{box['text']}" for label, box in boxes.items())
+            + "\n".join(unsent)
             + "\n要发就 send，不发就不管它。")
 
 
@@ -319,8 +341,9 @@ def _begin(turn, window: tuple | None, kind: str) -> None:
     turn.handoff_failed = False
     turn.handoffs = 0
     turn.tidy_hint = ""
-    # 输入框（type_word）跟着这次唤醒走：中途交接换了会话也还在，唤醒结束就没了。
-    turn.boxes = {}
+    # WHY: 维护者 2026-10-28：输入框草稿像真实 QQ 一样保留在各个窗口里，发了才消失；
+    # 存入 storage（内存权威+延迟刷盘），平时纯内存读写无 IO 开销，关机重启也不丢草稿。
+    turn.boxes = storage.get("", "boxes")
     turn.log = {"kind": kind, "start": time.time(), "peak": 0, "acts": 0}
     # 她这次唤醒里自己关了循环：总开关开着也不在这次唤醒结束时再起一串。
     turn.loop_stopped = False
@@ -625,35 +648,76 @@ def _run_agent(model: str | None, turn) -> bool:
         material.extend(_head(woken, segment))
     # 交接后续做时没有新唤醒，沿用刚才看着的窗口。
     focus = woken or _windows.parse_all(turn.screens)
-    # 记成"这一段出现过"要等第一次输出，和画面位置一样：dismiss 退回去时笔记也跟着回来。
-    people, met = _people(focus, turn.authors, segment)
-    material.extend(people)
     screens: dict[str, str] = {}
     newest: dict[tuple, tuple] = {}
     shown_last: dict[str, str] = {}
+    screen_blocks: list[dict] = []
     for window in focus:
         label = _screen.label(window)
         text, mark, last = _screen.slice_window(window, max_events, segment.setdefault("last_shown", {}).get(label))
         newest[window] = mark
+        box = turn.boxes.get(label)
+        box_text = box.get("text") if isinstance(box, dict) else (box if isinstance(box, str) else "")
+        if box_text:
+            box_render = f"\n\n【当前输入框】{box_text}"
+            text = (text + box_render) if text else f"（{label} 暂无新消息）{box_render}"
         if text:
             screens[label] = text
             shown_last[label] = last
-            material.append(_view.outside(label, ["画面", _screen.clock(), *_chat_root._awaker.badges(window)], text))
+            screen_blocks.append(_view.outside(label, ["画面", _screen.clock(), *_chat_root._awaker.badges(window)], text))
+    related_authors = list(dict.fromkeys([*turn.authors, *_screen.extract_qqs(screens.values())]))
+    # 记成"这一段出现过"要等第一次输出，和画面位置一样：dismiss 退回去时笔记也跟着回来。
+    people, met = _people(focus, related_authors, segment)
+    material.extend(people)
+
+    # 检查已载入笔记的变动：若中途笔记被改动（柚子 write_note 或磁盘修改），追加最新版。
+    # 既不破坏历史前缀缓存，也保证早期思考依赖早期版本的因果历史完整。
+    note_updates: list[str] = []
+    hashes = segment.setdefault("note_hashes", {})
+
+    # WHY: 2026-10-29 草籽：每天默认能看到当天的日记。若当天日记中途建起或跨过零点，自动载入。
+    today_scope = f"diary:{_screen.clock()[:10]}"
+    if today_scope not in segment.setdefault("scopes", []):
+        rendered_today = _notes.render(today_scope)
+        if rendered_today:
+            segment["scopes"].append(today_scope)
+            hashes[today_scope] = _notes.note_hash(today_scope)
+            note_updates.append(rendered_today)
+
+    for s in segment.get("scopes", []):
+        if s in ("self", "todo", "observer"):
+            continue
+        old_h = hashes.get(s)
+        curr_h = _notes.note_hash(s)
+        if old_h is not None and curr_h and curr_h != old_h:
+            rendered = _notes.render(s)
+            if rendered:
+                note_updates.append(rendered)
+                hashes[s] = curr_h
+        elif old_h is None and curr_h:
+            hashes[s] = curr_h
+    if note_updates:
+        material.append({"role": "system", "content": "【笔记更新】以下笔记有更新（以最新内容为准）：\n\n" + "\n\n".join(note_updates)})
+
+    material.extend(screen_blocks)
     now = _screen.clock()
+    mark = (_segment.make_mark(segment, now, turn.boxes, _screen.seen_snapshot())
+            if notice is not None else None)
     if notice is not None:
-        material.append({"role": "system", "content": f"这次唤醒你的是（{now}）：\n" + "\n".join(activation_lines)})
+        wake_tag = f"#{mark['number']} · " if mark and mark.get("number") else ""
+        material.append({"role": "system", "content": f"这次唤醒你的是（{wake_tag}{now}）：\n" + "\n".join(activation_lines)})
     if segment.get("notice"):
         material.append({"role": "system", "content": segment["notice"]})
     if continuing:
         if turn.handoff_note:
             material.append({"role": "system", "content": turn.handoff_note})
         if turn.boxes:
-            material.append({"role": "system", "content": _box_note(turn.boxes)})
+            box_note = _box_note(turn.boxes)
+            if box_note:
+                material.append({"role": "system", "content": box_note})
         turn.handed_off = ""
     if not material:
         return True
-    mark = (_segment.make_mark(segment, now, turn.boxes, _screen.seen_snapshot())
-            if notice is not None else None)
 
     def first_output() -> None:
         started.append(True)
@@ -664,7 +728,7 @@ def _run_agent(model: str | None, turn) -> bool:
         _screen.mark_seen(newest)
         turn.screens.update(screens)
         segment["windows"] = list(dict.fromkeys([*segment["windows"], *screens]))
-        segment["scopes"].extend(met)
+        segment["scopes"] = list(dict.fromkeys([*segment["scopes"], *met]))
         segment["last_shown"].update(shown_last)
         segment.pop("notice", None)
 
@@ -693,10 +757,15 @@ def _run_agent(model: str | None, turn) -> bool:
             _screen.mark_seen(dict(unconfirmed))
             unconfirmed.clear()
 
+    observer_hint = ""
+    if _chat_root._observer.is_enabled():
+        observer_hint = _chat_root._observer.observe(segment, material, met, should_stop=lambda: turn.cancelled)
+
     session = _run_session(model, turn, segment, [*segment["messages"], *material], first_output, stop_when,
                            providers=[late],
                            hints=[lambda: _screen.unread_hint(set(newest)), lambda: _segment.nudge(segment),
-                                  lambda: shell.running_hint(), lambda: turn.tidy_hint],
+                                  lambda: shell.running_hint(), lambda: turn.tidy_hint,
+                                  lambda: observer_hint],
                            known=len(segment["messages"]), each_output=seen_late)
     if (getattr(session, "dismiss", None) is None and not turn.log.get("acts")
             and getattr(session, "segment", None) and session.segment.get("marks")):
@@ -898,8 +967,29 @@ def reflect(model: str | None = None) -> bool:
             _roll_up(diary_day(turn.log["start"]))
             segments = _segment.archived(last if isinstance(last, (int, float)) else 0)
             # 收起时另存的片段和潜意识自己的那条不算她的段：片段在她的段里有记号指着。
-            segments = [item for item in segments
-                        if not any(f"-{kind}" in item["name"] for kind in ("reflect", "folded", "subconscious"))]
+            main_segments = [item for item in segments
+                             if not any(f"-{kind}" in item["name"] for kind in ("reflect", "folded", "subconscious"))]
+            # 容灾兜底：正常情况下片段在主段里有记号指着。若因崩溃或意外没生成主段、或有片段未被
+            # 任何现存主段收纳（孤儿段），也补进反思列表，避免当天的经历彻底失忆。
+            referenced_folds = set()
+            for main in main_segments:
+                seg_data = _segment.read_archived(main["name"])
+                if seg_data and isinstance(seg_data.get("messages"), list):
+                    for msg in seg_data["messages"]:
+                        text = str(msg.get("content") or "")
+                        if "-folded" in text:
+                            for fold_name in re.findall(r"\b\d{8}-\d{6}-folded(?:-\d+)?\b", text):
+                                referenced_folds.add(fold_name)
+            current_seg = _segment.load()
+            if current_seg and isinstance(current_seg.get("messages"), list):
+                for msg in current_seg["messages"]:
+                    text = str(msg.get("content") or "")
+                    if "-folded" in text:
+                        for fold_name in re.findall(r"\b\d{8}-\d{6}-folded(?:-\d+)?\b", text):
+                            referenced_folds.add(fold_name)
+            orphan_folds = [item for item in segments
+                            if "-folded" in item["name"] and item["name"] not in referenced_folds]
+            segments = sorted([*main_segments, *orphan_folds], key=lambda item: item.get("started", 0))
             if segments:
                 _run_reflection(model, turn, segments)
         finally:

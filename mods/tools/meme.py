@@ -20,6 +20,7 @@
 - 觉得哪张图标签贴错了，用 `meme__edit(meme_id, mood, note)` 改；看腻了不想要了，传 `forget=True` 就能把它从柜子里清出去。"""
 
 from datetime import datetime
+import hashlib
 import os
 from pathlib import Path
 import random
@@ -34,6 +35,7 @@ from mods import cq, image as image_mod, op, storage
 DIRECTORY = "data/memes"
 _MAX_BYTES = 10 * 1024 * 1024
 _IMAGE_CQ = re.compile(r"\[CQ:image(?:,[^\]]*)?\]")
+_MD5 = re.compile(r"^[0-9A-Fa-f]{32}$")
 
 
 def _index() -> dict:
@@ -41,12 +43,20 @@ def _index() -> dict:
     return storage.get("meme", "index")
 
 
-def _uri_of(image: str) -> str:
+def _arg_parts(image: str) -> tuple[str, str]:
+    """把 image 参数拆成 (地址, md5)。md5 只在 CQ:image 的 file 字段是 32 位十六进制时才有值，
+    它就是 QQ 那边这份文件的标识，同一张图重发不变（2026-10-28 实测：柜里 71/73 能和
+    event_stream 里的 file 字段对上，另 2 张是别处导进来的）。花括号临时名不是 md5，跳过。"""
     value = str(image or "").strip()
+    md5 = ""
     if match := _IMAGE_CQ.search(value):
         data = cq.load(match[0])["data"]
-        value = str(data.get("url") or data.get("file") or "")
-    return cq.unescape(value).strip()
+        raw = str(data.get("file") or "")
+        stem = raw.rsplit(".", 1)[0].strip("{}")
+        if _MD5.match(stem):
+            md5 = stem.upper()
+        value = str(data.get("url") or raw or "")
+    return cq.unescape(value).strip(), md5
 
 
 def _cq_of(entry: dict) -> str:
@@ -57,7 +67,10 @@ def _cq_of(entry: dict) -> str:
 
 
 def _line(meme_id: str, entry: dict) -> str:
-    return f"{meme_id}【{entry['mood']}】{entry.get('note') or '（没写）'}"
+    line = f"{meme_id}【{entry['mood']}】{entry.get('note') or '（没写）'}"
+    if entry.get("character"):
+        line += f"·角色:{entry['character']}"
+    return line
 
 
 def collect(image: str, mood: str, note: str = "") -> str:
@@ -73,7 +86,7 @@ def collect(image: str, mood: str, note: str = "") -> str:
         return "没收：mood 不能空，给这张图记个心情"
     if len(mood) > 12:
         return "没收：mood 写个短词就行（12 个字以内），细节写进 note"
-    uri = _uri_of(image)
+    uri, md5 = _arg_parts(image)
     if not re.match(r"^(?:https?|file)://", uri, re.I):
         return "没收：image 要是 http://、https:// 或 file:// 开头的图片地址，或者整段 [CQ:image,…]"
     if uri.lower().startswith("file://") and not op.bot_is_op():
@@ -93,12 +106,18 @@ def collect(image: str, mood: str, note: str = "") -> str:
         entry["mood"] = mood
         if note:
             entry["note"] = note
+        if md5:
+            entry["md5"] = md5
         storage.save()
         return f"这张早就收着了，改成：{_line(meme_id, entry)}（原来是 {old}）"
     name = digest + (os.path.splitext(path)[1] or image_mod.MIME_TO_EXTENSION.get(mime, ".img"))
     os.makedirs(DIRECTORY, exist_ok=True)
     shutil.copyfile(path, Path(DIRECTORY, name))
-    index[meme_id] = {"file": name, "mood": mood, "note": note,
+    if not md5:
+        # 不是从 CQ:image 收的（直接从网址/文件收），拿本地内容的 md5 顶上；
+        # QQ 的 file 字段本身就是内容 md5，所以这两条路算出来的是同一个值。
+        md5 = hashlib.md5(Path(path).read_bytes()).hexdigest().upper()
+    index[meme_id] = {"file": name, "md5": md5, "mood": mood, "note": note,
                       "added": datetime.now().strftime("%Y-%m-%d %H:%M"), "last_sent": 0}
     storage.save()
     same = sum(1 for item in index.values() if item["mood"] == mood)
@@ -157,13 +176,15 @@ def browse(mood: str = "") -> str:
     return f"「{mood}」共 {len(rows)} 张：\n" + "\n".join(rows[:100])
 
 
-def edit(meme_id: str, mood: str = "", note: str = "", forget: bool = False) -> str:
-    """改柜子里一张表情的心情或那句话，或者把它扔掉。
+def edit(meme_id: str, mood: str = "", note: str = "", character: str = "",
+         forget: bool = False) -> str:
+    """改柜子里一张表情的心情、那句话或角色，或者把它扔掉。
 
     @param
     meme_id: 表情编号（8 位，browse 和 pick 里都有）
     mood: 新的心情；留空不改
     note: 新的那句话；留空不改
+    character: 图里认得出的角色名（比如"鲸鱼娘"）；认不准就写"疑似 A/B"，别硬猜成事实；留空不改
     forget: 传 true 把这张从柜子里扔掉
     """
     index = _index()
@@ -181,14 +202,17 @@ def edit(meme_id: str, mood: str = "", note: str = "", forget: bool = False) -> 
         return f"扔掉了：{_line(meme_id, entry)}"
     mood = " ".join(str(mood or "").split())
     note = " ".join(str(note or "").split())
-    if not mood and not note:
-        return "没改：mood 和 note 至少给一个"
+    character = " ".join(str(character or "").split())
+    if not mood and not note and not character:
+        return "没改：mood、note、character 至少给一个"
     if len(mood) > 12:
         return "没改：mood 写个短词就行（12 个字以内）"
     if mood:
         entry["mood"] = mood
     if note:
         entry["note"] = note
+    if character:
+        entry["character"] = character
     storage.save()
     return f"改好了：{_line(meme_id, entry)}"
 

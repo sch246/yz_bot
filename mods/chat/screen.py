@@ -13,12 +13,14 @@ is written back as ordinary lines.
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import time
+from typing import Iterable
 
 from mods import chatlog, context, identity, oplog, storage
 
 import mods.chat as _chat_root
-from . import view as _view, windows as _windows
+from . import recognize as _recognize, view as _view, windows as _windows
 from .windows import label
 
 # A window shows at least this many lines before its first unseen one.
@@ -127,16 +129,17 @@ def records(window: tuple, count: int, before: int | None = None, since: float |
 def render(window: tuple, items: list[dict], seen: int | None = None) -> str:
     """Join records under day headers; mark where unseen records begin."""
     lines: list[str] = []
+    texts = _recognize.annotate(window, [item["text"] for item in items])
     current = None
     divided = seen is None
-    for item in items:
+    for index, item in enumerate(items):
         if item["day"] != current:
             current = item["day"]
             lines.append(f"# {label(window)} {current[0]:04d}-{current[1]:02d}-{current[2]:02d}")
         if not divided and item["time"] is not None and item["time"] > seen:
             lines.append("—— 以下是上次之后的新消息 ——")
             divided = True
-        lines.append(item["text"])
+        lines.append(texts[index])
     return "\n".join(lines)
 
 
@@ -147,6 +150,62 @@ def latest_time(items: list[dict]) -> int | None:
 
 def clock(stamp: float | None = None) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() if stamp is None else stamp))
+
+
+_HEADER_QQ = re.compile(
+    r"^(?:.*)\(([1-9]\d{4,11})\)\s+(?:(?:\d{4}-\d{2}-\d{2}\s+)?\d{2}:\d{2}:\d{2}|\d{4}-\d{2}-\d{2})(?:\.\d+)?(?:\s*(?:\|.*|\.\.\..*))?\s*$"
+)
+_POKE_QQ = re.compile(
+    r"^:?\s*(?:.*?)\(([1-9]\d{4,11})\)戳了戳(?:.*?)\(([1-9]\d{4,11})\)"
+)
+_CQ_AT = re.compile(r"\[CQ:at,[^\]]*?\bqq=([1-9]\d{4,11})\b[^\]]*?\]")
+_TEXT_AT = re.compile(r"@(?:[^\s()@]+)?\(([1-9]\d{4,11})\)")
+
+
+def extract_qqs(texts: Iterable[str]) -> list[int]:
+    """Extract valid user QQ numbers from message headers and mentions, oldest first.
+
+    WHY: 自动挂载人设笔记需要知道当前画面里有哪些人发言或被提及。画面文本为
+    chatlog 原生格式，消息头形如 昵称(QQ号) 时刻 或 (QQ号) 日期 ...，消息体内为
+    [CQ:at,qq=...] 或 @昵称(QQ号)；过滤 Bot 自身 QQ，保留首次出现顺序去重。
+    """
+    try:
+        bot = identity.bot_id()
+    except RuntimeError:
+        bot = None
+    result: list[int] = []
+    seen: set[int] = set()
+
+    def add(qq: int) -> None:
+        if bot is not None and qq == bot:
+            return
+        if qq not in seen:
+            seen.add(qq)
+            result.append(qq)
+
+    for text in texts:
+        for line in text.splitlines():
+            line_str = line.rstrip()
+            if not line_str or line_str.startswith("#") or line_str.startswith("——"):
+                continue
+            poke_match = _POKE_QQ.match(line_str)
+            if poke_match:
+                add(int(poke_match.group(1)))
+                add(int(poke_match.group(2)))
+                continue
+            matches: list[tuple[int, int]] = []
+            if not line.startswith("    "):
+                header_match = _HEADER_QQ.match(line_str)
+                if header_match:
+                    matches.append((header_match.start(1), int(header_match.group(1))))
+            for m in _CQ_AT.finditer(line_str):
+                matches.append((m.start(1), int(m.group(1))))
+            for m in _TEXT_AT.finditer(line_str):
+                matches.append((m.start(1), int(m.group(1))))
+            matches.sort(key=lambda x: x[0])
+            for _, qq in matches:
+                add(qq)
+    return result
 
 
 def _offline_calls(window: tuple, shown: list[dict]) -> list[dict]:
@@ -242,14 +301,28 @@ def slice_window(window: tuple, count: int, last: str | None) -> tuple[str, tupl
 
 def unread_hint(on_screen: set[tuple]) -> str:
     rows = []
+    try:
+        bot = identity.bot_id()
+    except RuntimeError:
+        bot = None
     for detail in oplog.pending_details():
         window = tuple(detail["window"])
         if not _windows.known(window) or window in on_screen:
             continue
-        rows.append(f"{_windows.title(window)} {detail['unread']} 条"
-                    + (f"（@你 {detail['mentions']}）" if detail["mentions"] else "")
+        # WHY: 2026-10-28 维护者：排除 Bot 自身发言回显，只统计他人发来的未读消息。
+        # 避免她自己刚 send 完几条消息就被当成对方有新消息催她，害她虚惊一场。
+        entries = oplog.unread(window)
+        others = [e for e in entries if bot is None or (
+            e.get("event", {}).get("user_id") != bot and
+            str(e.get("event", {}).get("author")) != str(bot)
+        )]
+        if not others:
+            continue
+        mentions = sum(1 for e in others if e.get("activated") and e.get("activation_kind") == "mention")
+        rows.append(f"{_windows.title(window)} {len(others)} 条"
+                    + (f"（@你 {mentions}）" if mentions else "")
                     + "".join(f"（{badge}）" for badge in _chat_root._awaker.badges(window)))
-    return ("其它窗口还有没看过的消息：" + "；".join(rows[:10])
+    return ("【其它窗口】还有没看过的消息：" + "；".join(rows[:10])
             + "。要看就用 read_log 读原文。") if rows else ""
 
 

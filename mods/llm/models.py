@@ -4,7 +4,7 @@ from copy import deepcopy
 
 
 DEFAULT_MODEL = "deepseek/deepseek-flash"
-DEFAULT_VISION_MODEL = "bytecat/gpt-5.4-mini"
+DEFAULT_VISION_MODEL = "gemini/gemini-3.7-flash"
 
 # WHY: OpenAI SDK 不给超时就是 600 秒，对聊天来说等于挂死——一次卡住的视觉识别会让
 # 那条 link 线程一直占着，而它在 get_msgs -> 请求的同步路径上。这个值是 httpx 的
@@ -33,14 +33,12 @@ BYTECAT_PROVIDER_CONFIG = {
     "base_url": "BYTECAT_BASE_URL",
     "api_key": "BYTECAT_API_KEY",
     "models": {
-        "gpt-5.4-mini": {"vision": True, "function_calling": True, "prompt_price": 0.075, "completion_price": 0.45},
-        "gpt-5.4-openai-compact": {"vision": True, "function_calling": True, "prompt_price": 0.5, "completion_price": 3},
-        "gpt-5.5": {"vision": True, "function_calling": True, "prompt_price": 0.5, "completion_price": 3},
-        "gpt-5.5-openai-compact": {"vision": True, "function_calling": True, "prompt_price": 1, "completion_price": 8},
-        "gpt-5.6-luna": {"vision": True, "function_calling": True, "prompt_price": 0.1, "completion_price": 0.6},
-        "gpt-5.6-sol": {"vision": True, "function_calling": True, "prompt_price": 1, "completion_price": 6},
-        "gpt-5.6-terra": {"vision": True, "function_calling": True, "prompt_price": 0.25, "completion_price": 1.5},
-        "gpt-5.3-codex-spark": {"vision": True, "function_calling": True, "prompt_price": 0.7, "completion_price": 5.6},
+        "gpt-5.6-sol": {"vision": True, "function_calling": True, "prompt_price": 1.25, "completion_price": 7.5, "note": "文本1.7s/识图5.3s，综合均衡"},
+        "gpt-5.6-terra": {"vision": True, "function_calling": True, "prompt_price": 0.5, "completion_price": 3.0, "note": "codex稳定档"},
+        "gpt-6-sol": {"vision": True, "function_calling": True, "note": "文本1.4s极速，新上线"},
+        "gpt-6.1-sol": {"vision": True, "function_calling": True, "note": "大参数版，新上线"},
+        "gpt-6-astra": {"vision": True, "function_calling": True, "prompt_price": 2.5, "completion_price": 12.5, "note": "顶配强档"},
+        "codex-auto-review": {"vision": True, "function_calling": True, "prompt_price": 0.625, "completion_price": 3.75, "note": "代码与审查专栏"},
     },
 }
 

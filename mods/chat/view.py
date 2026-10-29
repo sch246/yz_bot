@@ -58,6 +58,9 @@ def outside(label: str, facts: list[str], text: str) -> dict:
     角色里；框头放得下元信息。先前装在合成的 incoming 工具调用里，DeepSeek 文档说 Chat
     Completions 不支持在对话中间插工具调用，就换成了这样，图片也随之回到原文里。
     """
+    from mods.chat import get_audio_mode, voice, face
+    text = voice.transform_screen_text(text, get_audio_mode())
+    text = face.enrich_text_faces(text)
     return {"role": "user", "content": msg_split(" · ".join([f"窗口 {label}", *facts]) + "\n" + text)}
 
 
@@ -80,7 +83,6 @@ def _is_context_poke(event: dict, in_group: bool) -> bool:
 
 
 _MEMORY_SOURCE = Path(__file__).resolve().parents[1] / "tools" / "memory_system.py"
-_BASE_SOURCE = Path(__file__).resolve().parents[2] / "data" / "storage" / "llm_system" / "prompts.json"
 
 
 def _memory_overview() -> str:
@@ -103,24 +105,8 @@ def _memory_overview() -> str:
     return text[start:end if end > 0 else None].strip()
 
 
-def _base_text() -> str:
-    """The ``base`` preset from ``prompts.json``, read on every wake.
-
-    WHY: 2026-10-26 维护者：base 以前写死在这里，改一条提示词要改代码、改完还得重启；它现在
-    和 self 一样是文件，改了下一次唤醒就生效。读盘失败（手改坏了 JSON）时退回启动时载入的
-    那份，不让一次手误把整段注意事项弄空。
-    """
-    try:
-        data = json.loads(_BASE_SOURCE.read_text(encoding="utf-8"))
-        text = data["base"][0]["content"]
-        if isinstance(text, str) and text.strip():
-            return text
-    except (OSError, ValueError, KeyError, IndexError, TypeError):
-        pass
-    from mods import storage
-    prompts = storage.get("llm_system", "prompts") or {}
-    base = prompts.get("base") or []
-    return base[0].get("content", "") if base else ""
+_IDENTITY = ("- 你的昵称: 柚子\n"
+             "- 你的QQ号: 236288772；聊天记录里这个 QQ 号的发言就是你自己说过的话")
 
 
 def _with_identity(text: str) -> str:
@@ -137,8 +123,14 @@ def _with_identity(text: str) -> str:
 
 
 def _base_prompt() -> list[dict]:
+    """Identity lines and the memory overview; the old ``base`` preset is no longer read.
+
+    WHY: 2026-10-28 草籽：base 这个 json 不该再被读——同一个意思在 base 和 meta 里各写一遍，
+    两边容易走岔；里面还有价值的话（消息头怎么读、被叫醒不等于必须开口）拆进了 meta 的说明。
+    身份两行仍在这里生成：昵称和 QQ 号跟着进程实际跑的号走，写死在文件里会过期。
+    """
     memory = _memory_overview()
     # WHY: 沉默那两条参照 Cortico 的 "Silence is a normal action"（维护者 2026-10-23）：私聊每条
     # 都叫醒以后，话没说完就回靠这里和输入框（type_word 与 send 之间隔一次请求）压住，不靠延迟。
-    return [{"role": "system", "content": _with_identity(_base_text())
+    return [{"role": "system", "content": _with_identity(_IDENTITY)
                 + (f"\n\n{memory}" if memory else "")}]
