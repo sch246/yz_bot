@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import re
+import threading
 
 from mods import llm, storage
 
@@ -187,64 +188,94 @@ def _annotate(text: str) -> str:
     return _WORD.sub(mark, text)
 
 
-def observe(
+def _do_observe(
     segment: dict,
     material: list[dict],
     should_stop: Callable[[], bool] | None = None,
 ) -> str:
-    """在柚子被唤醒前执行严格单轮旁观，点出陌生的说法、矛盾、自我限制、被跳过的情绪和行动里的意外。"""
+    # 组装消息流（支持 recent 极简上一轮模式与 full 完整历史前缀缓存模式）
+    messages = [{"role": "system", "content": get_prompt()}]
+    context_mode = get_context_mode()
+    raw_msgs = segment.get("messages", [])
+    if context_mode == "full":
+        for m in raw_msgs:
+            messages.append({"role": "user", "content": quote_message(m)})
+    else:
+        # "recent" 模式：只保留上一轮唤醒中柚子的行动、自语与工具调用，极大节省 token
+        if raw_msgs:
+            last_wake_idx = 0
+            for i in range(len(raw_msgs) - 1, -1, -1):
+                if raw_msgs[i].get("role") == "user":
+                    last_wake_idx = i
+                    break
+            for m in raw_msgs[last_wake_idx:]:
+                messages.append({"role": "user", "content": quote_message(m)})
+    final_wake = (
+        "=== 本次唤醒新到达的画面与通知（把注意到的陌生说法、矛盾、自我限制、情绪或意外说出来；什么都没有就只回【无】） ===\n\n"
+        + "\n\n".join(quote_message(m) for m in material)
+    )
+    messages.append({"role": "user", "content": final_wake})
+
+    session = llm.Chat(
+        model=get_model(),
+        chat_client=llm.get_client(),
+        reasoning_effort=get_effort(),
+    )
+    session.fail_fast = True
+    session.turn_done = lambda: True
+    if should_stop is not None:
+        session.should_stop = should_stop
+    session.set_messages(messages)
+
+    # WHY: stream=False 避免将 observer 内部助手的自语混入终端控制台的 live 输出流中
+    results = session.chat(recall_func=_roles._charge(session), stream=False)
+
+    content = ""
+    for msg in reversed(session.messages):
+        if msg.get("role") == "assistant":
+            content = _extract_text(msg.get("content")).strip()
+            break
+    if not content and results:
+        content = "".join(r.content for r in results if r.role == "assistant").strip()
+
+    clean_content = content.strip()
+    if clean_content in ("", "【无】", "无"):
+        return ""
+
+    return f"【旁观助手 observer】\n{_annotate(clean_content)}"
+
+
+def observe(
+    segment: dict,
+    material: list[dict],
+    should_stop: Callable[[], bool] | None = None,
+    timeout: float = 15.0,
+) -> str:
+    """在柚子被唤醒前执行严格单轮旁观，点出陌生的说法、矛盾、自我限制、被跳过的情绪和行动里的意外。
+
+    WHY: 2026-10-29 修复：observer 是前置旁观辅助，绝不能因为上游 API 卡流或网络挂起而阻塞
+    中心 agent 的唤醒。因此设置严格硬超时（默认 15s）；超时则跳过旁观直接放行唤醒。
+    """
     if not is_enabled() or not material:
         return ""
-    try:
-        # 组装消息流（支持 recent 极简上一轮模式与 full 完整历史前缀缓存模式）
-        messages = [{"role": "system", "content": get_prompt()}]
-        context_mode = get_context_mode()
-        raw_msgs = segment.get("messages", [])
-        if context_mode == "full":
-            for m in raw_msgs:
-                messages.append({"role": "user", "content": quote_message(m)})
-        else:
-            # "recent" 模式：只保留上一轮唤醒中柚子的行动、自语与工具调用，极大节省 token
-            if raw_msgs:
-                last_wake_idx = 0
-                for i in range(len(raw_msgs) - 1, -1, -1):
-                    if raw_msgs[i].get("role") == "user":
-                        last_wake_idx = i
-                        break
-                for m in raw_msgs[last_wake_idx:]:
-                    messages.append({"role": "user", "content": quote_message(m)})
-        final_wake = (
-            "=== 本次唤醒新到达的画面与通知（把注意到的陌生说法、矛盾、自我限制、情绪或意外说出来；什么都没有就只回【无】） ===\n\n"
-            + "\n\n".join(quote_message(m) for m in material)
-        )
-        messages.append({"role": "user", "content": final_wake})
 
-        session = llm.Chat(
-            model=get_model(),
-            chat_client=llm.get_client(),
-            reasoning_effort=get_effort(),
-        )
-        session.fail_fast = True
-        session.turn_done = lambda: True
-        if should_stop is not None:
-            session.should_stop = should_stop
-        session.set_messages(messages)
+    result = ""
+    error = None
 
-        results = session.chat(recall_func=_roles._charge(session))
+    def worker():
+        nonlocal result, error
+        try:
+            result = _do_observe(segment, material, should_stop)
+        except Exception as e:
+            error = e
 
-        content = ""
-        for msg in reversed(session.messages):
-            if msg.get("role") == "assistant":
-                content = _extract_text(msg.get("content")).strip()
-                break
-        if not content and results:
-            content = "".join(r.content for r in results if r.role == "assistant").strip()
-
-        clean_content = content.strip()
-        if clean_content in ("", "【无】", "无"):
-            return ""
-
-        return f"【旁观助手 observer】\n{_annotate(clean_content)}"
-    except Exception:
+    t = threading.Thread(target=worker, name="chat-observer", daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        _roles._stream.warning(f"observer 运行超时（>{timeout}s），跳过本次旁观直接唤醒")
+        return ""
+    if error is not None:
         _roles._stream.exception("observer 运行出错")
         return ""
+    return result
