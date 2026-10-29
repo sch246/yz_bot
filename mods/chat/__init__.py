@@ -145,14 +145,14 @@ AGENT_SETTINGS = {
 _reflect_stream = log.stream("agent")
 
 
-def reflect_now() -> bool:
-    """Start the nightly pass right away on its own thread; False when the agent is busy."""
+def reflect_now(handoff: bool = True) -> bool:
+    """Start the reflection pass right away on its own thread; False when the agent is busy."""
     if context.get_turn(AGENT_WINDOW) is not None:
         return False
 
     def run() -> None:
         try:
-            _agent.reflect()
+            _agent.reflect(handoff=handoff)
         except Exception:
             _reflect_stream.exception("反思失败")
 

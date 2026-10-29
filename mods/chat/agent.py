@@ -998,13 +998,14 @@ def _tail(text: str, lines: int) -> str:
     return "\n".join(text.strip().split("\n")[-lines:]) if text.strip() else ""
 
 
-def reflect(model: str | None = None) -> bool:
+def reflect(model: str | None = None, handoff: bool = True) -> bool:
     """The nightly pass: hand off the day's segment, roll up diaries, then look back.  False when busy.
 
     WHY: 维护者 2026-10-22 / 2026-10-26：夜里先交接封存当天的最后一段（只收拢 recent、人和群笔记、
     todo 与日记，不动 global），再在独立的反思段里回看原始记录（归档的上下文、聊天记录、行动记录、
     笔记历史），体会今天哪一刻最像自己、给常驻记忆做新陈代谢。
     占住 AGENT_WINDOW，期间来的召唤照常登记，结束后由 pick_up_pending 接上。
+    WHY: 2026-10-29 草籽需求：白天想要反思修改 self 等策略，但不希望重置交接当前活跃上下文时传 handoff=False。
     """
     # 她开着循环时几乎一直在忙，先关掉，这一轮做完反思就接得上（awaker 下一分钟再来）。
     stop_loop("夜里整理")
@@ -1019,8 +1020,9 @@ def reflect(model: str | None = None) -> bool:
         context.set_current(None)
         context.set_agent_mode(True)
         try:
-            _handoff(turn, "夜里了", model)
-            _roll_up(diary_day(turn.log["start"]))
+            if handoff:
+                _handoff(turn, "夜里了", model)
+                _roll_up(diary_day(turn.log["start"]))
             segments = _segment.archived(last if isinstance(last, (int, float)) else 0)
             # 收起时另存的片段和潜意识自己的那条不算她的段：片段在她的段里有记号指着。
             main_segments = [item for item in segments
@@ -1046,7 +1048,7 @@ def reflect(model: str | None = None) -> bool:
             orphan_folds = [item for item in segments
                             if "-folded" in item["name"] and item["name"] not in referenced_folds]
             segments = sorted([*main_segments, *orphan_folds], key=lambda item: item.get("started", 0))
-            if segments:
+            if segments or not handoff:
                 _run_reflection(model, turn, segments)
         finally:
             context.set_agent_mode(False)
@@ -1077,10 +1079,17 @@ def _roll_up(day: str) -> None:
 def _run_reflection(model: str | None, turn, segments: list[dict]) -> None:
     _max_events, threshold = _chat_root.limit()
     notes = [text for scope in ("global", "recent") if (text := _notes.render(scope))]
-    listing = "\n".join(
+    listing_items = [
         f"{item['name']}  {_screen.clock(item['started'])[5:16]} 至 {_screen.clock(item['ended'])[5:16]}  "
         f"{item['messages']} 条消息  窗口 {'、'.join(item['windows']) or '无'}"
-        + (f"  {item['reason']}" if item.get("reason") else "") for item in segments)
+        + (f"  {item['reason']}" if item.get("reason") else "") for item in segments
+    ]
+    curr = _segment.load()
+    if curr and curr.get("messages"):
+        listing_items.append(
+            f"current（当前活跃上下文，未归档，共 {len(curr.get('messages', []))} 条消息，用 read_context('current') 可读）"
+        )
+    listing = "\n".join(listing_items)
     changes = _tail(_notes.read_policy("changes"), 40)
     proposals = _tail(_notes.read_policy("proposals"), 20)
     messages = [

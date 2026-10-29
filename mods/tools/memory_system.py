@@ -89,10 +89,10 @@ def _find_all(haystack: str, needle: str, limit: int = 20) -> list[int]:
 
 
 def read_context(name: str = "", start: int = 0, match: str = "", around: int = 300) -> str:
-    """翻看归档的旧上下文：不给 name 列出最近的段；给 name 读那一段的原貌，一次最多 8000 字。
+    """翻看归档的旧上下文或当前活跃上下文：不给 name 列出最近的段；给 name 读那一段的原貌，一次最多 8000 字。
 
     @param
-    name: 段名，如 20261022-153000（read_context() 列出的）；留空列出最近 30 段
+    name: 段名，如 20261022-153000（read_context() 列出的），或 "current"（当前活跃未归档的上下文）；留空列出最近 30 段
     start: 从第几个字开始读，用上一次结尾提示的位置接着读
     match: 只看这一段里含这个词的地方（不区分大小写，前后各留 around 字），比从头翻页快
     around: 配 match 用，前后各留多少字，200~2000
@@ -110,11 +110,18 @@ def read_context(name: str = "", start: int = 0, match: str = "", around: int = 
                          f"{item['messages']} 条消息  窗口 {'、'.join(item['windows']) or '无'}"
                          + (f"  · {why}" if why else ""))
         return "\n".join(lines)
-    data = segment.read_archived(name.strip())
-    if data is None:
-        return f"（没有叫 {name} 的段；不给 name 可以列出最近的段）"
-    text = (f"# {name}（交接原因：{data.get('reason', '无')}）\n" if data.get("reason") else f"# {name}\n") \
-        + segment.render(data.get("messages", []))
+    target = name.strip()
+    if target == "current":
+        data = segment.load()
+        if not data or not data.get("messages"):
+            return "（当前活跃上下文还是空的）"
+        text = "# current（当前活跃上下文，未归档）\n" + segment.render(data.get("messages", []))
+    else:
+        data = segment.read_archived(target)
+        if data is None:
+            return f"（没有叫 {name} 的段；不给 name 可以列出最近的段）"
+        text = (f"# {name}（交接原因：{data.get('reason', '无')}）\n" if data.get("reason") else f"# {name}\n") \
+            + segment.render(data.get("messages", []))
     needle = match.strip()
     if needle:
         hits = _find_all(text.casefold(), needle.casefold())
@@ -185,7 +192,7 @@ def edit_policy(name: str, text: str, reason: str, expect: str) -> str:
 
         turn = context.get_turn(chat.AGENT_WINDOW)
         if turn is None or getattr(turn, "log", {}).get("kind") != "反思":
-            return "self 牵动全局，留到静下心反思时再改吧；现在的念头可以先记进 recent 或 todo。要是此刻非改不可，跑一下 send_command(\"#reflect now\") 先交接进入反思就能改了"
+            return "self 牵动全局，留到静下心反思时再改吧；现在的念头可以先记进 recent 或 todo。要是此刻非改不可，跑一下 send_command(\"#reflect keep\") 保留当前上下文进入反思就能改了"
     if name == "tidy":
         from mods import op
 

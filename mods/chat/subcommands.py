@@ -38,11 +38,12 @@ _SUBCOMMAND_HELP = (
 #limit                      显示两个值，并标出来自全局覆盖还是默认
 #limit <画面条数> <整理阈值>  写入全局设置
 #limit reset                清掉全局设置，回落到默认"""),
-    ("reflect [now]", """查看上次反思时间，或现在就跑一次夜间交接与反思（管理员）。
+    ("reflect [now|keep]", """查看上次反思时间，或现在就跑一次反思（管理员）。
 
-先把手上这一段上下文交接掉（笔记、日记确认到位后归档到 data/context/archive/），月末、年末各汇总一次日记；然后她用新的一段反思：像人排查一样从症状出发，读归档的上下文、聊天记录、行动记录和笔记的历史版本找原因，必要时改策略或写提案；想说的话可以打进 me 窗口或记到明天早上说。什么时候自动跑由 awaker 规则决定，默认 daily 04:00 reflect。
+默认会先把手上这一段上下文交接掉（归档到 data/context/archive/）；如果加 keep（如 #reflect keep 或 #reflect now keep），则保留当前活跃上下文不交接/不重置，直接进入反思（适合白天调整 self 人设又不希望丢失当前聊天上下文）。
 #reflect          显示上次反思时间
-#reflect now      现在就跑一次（中心 agent 正忙时不执行）"""),
+#reflect now      现在就跑一次完整夜间交接与反思（会交接重置上下文）
+#reflect keep     立即进入反思，保留当前活跃上下文不交接/不重置"""),
     ("loop [on|off]", """查看或开关循环总开关（开关要管理员），默认开。
 
 循环必须由她自己调用 loop("在做什么") 显式开启一串，外部唤醒不再自动挂起空循环。总开关开着时，开启后每次唤醒结束后隔两秒再叫醒她，一轮接一轮；她用 wait(秒数) 隔一会儿再来，用 loop(stop=True) 结束这一串。她一个动作都没做的那几轮，间隔翻倍、最长半小时。夜里整理时停，维护者叫停她那一轮也停。关着时关闭循环功能并停止正在转的这串。
@@ -329,6 +330,8 @@ def _reflect_subcommand(tail: str) -> str:
         return f"上次反思：{shown}；什么时候自动跑见 #awaker"
     if tail == "now":
         return "开始夜间交接与反思，反思这一段归档在 data/context/archive/" if _chat_root.reflect_now() else "中心 agent 正忙，稍后再试"
+    if tail in ("keep", "now keep", "keep now", "now --keep-context"):
+        return "开始反思（保留当前上下文不交接/不重置，反思这一段归档在 data/context/archive/）" if _chat_root.reflect_now(handoff=False) else "中心 agent 正忙，稍后再试"
     return "reflect 参数错误，可用 #help reflect 查看"
 
 
@@ -553,7 +556,7 @@ def _status_report(data: dict) -> str:
         f"#loop {loop_switch}（循环总开关；状态：{loop_detail}）",
         f"#subconscious {subconscious_switch}（潜意识增长提醒；开关：on/off）",
         f"#observer {obs_switch}（旁观助手；模型: {obs_model}，effort: {obs_effort}，context: {obs_context}，prompt: {obs_custom}）",
-        f"#reflect（上次反思：{reflect_str}；立即执行：#reflect now）",
+        f"#reflect（上次反思：{reflect_str}；立即执行：#reflect now / #reflect keep）",
         f"#awaker（闹钟：{awaker_str}；改写：#awaker set <规则>）",
     ]
     return "\n".join(lines)
