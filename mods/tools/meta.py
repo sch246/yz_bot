@@ -580,10 +580,7 @@ def send(
 
     return "、".join(str(item) for item in sent) if len(sent) > 1 else str(sent[0])
 def _spoke(window: tuple) -> None:
-    """She said something: that group is listened to for a while (awaker), and dismiss cannot clear past it."""
-    from mods.chat import awaker
-
-    awaker.spoke(window)
+    """She said something: dismiss cannot clear past it."""
     current_binding().session.last_sent = time.time()
 
 
@@ -613,7 +610,7 @@ def write_note(scope: str, text: str) -> str:
 def wake_me(when: str, reason: str) -> str:
     """想让自己过一会儿再醒、等某个人把话说完、或者临时盯紧/静音某个窗口时，给自己埋一个唤醒条件或窗口覆盖层，写入 awaker 笔记并返回生效的规则。
 
-    平时群里只有 @、叫名字、戳一戳才叫醒你（你说完话后的 5 分钟也会自动跟听）。如果你对正在聊的话题感兴趣，可以用 follow 临时跟听每一条（被叫醒不代表每条都要接话，聊完或插不上话了用 off 关掉）；嫌吵就用 mute 暂时静音，期间消息照常记未读，你自己定的 on、wait 闹钟也照常响。
+    平时群里只有 @、叫名字、戳一戳才叫醒你（说完话想听别人接不接，用 send 的 wait）。如果你对正在聊的话题感兴趣，可以用 follow 临时跟听每一条（被叫醒不代表每条都要接话，聊完或插不上话了用 off 关掉）；嫌吵就用 mute 暂时静音，期间消息照常记未读，你自己定的 on、wait 闹钟也照常响。
 
     @param
     when: 触发写法——延时如 "10m"/"2h"；定点如 "2026-10-23 08:00"；周期如 "every 30m"/"daily 23:30"；等下一条消息如 "on g123" 或 "on g123:30001"；等某人后续（来了或超时都叫一次）如 "wait g123:30001 10m"；条件成立如 "when <Python表达式>"；临时聚焦或静音如 "follow g123 30m"、"mute g123 2h"（默认 30m，目标支持窗口、g群号:QQ号 或 group/private/bili 整类，传 "follow g123 off" 揭掉）

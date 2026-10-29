@@ -742,7 +742,6 @@ def _drop_since(segment: dict, mark: dict) -> None:
     # 画面上的"看到哪"也退回去：清掉的消息下次排在"以下是上次之后的新消息"下面，当没读过的给。
     # oplog 的已读不退（日志里没有"标回未读"这种行），画面外那个窗口的未读条数因此不算它们。
     _screen.restore_seen(shown, mark.get("seen") or {})
-    _chat_root._awaker.dismissed(_windows.parse_all(shown))
 
 
 def _fold_since(segment: dict, mark: dict, label: str) -> str:

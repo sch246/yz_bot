@@ -44,9 +44,9 @@ follow/mute 是写进笔记的两种语法糖，``wake_me("follow g123 30m", ...
 other 只在内存里，重启就没了，和她用 exec_code 包的钩子一样。
 
 WHY: 2026-10-23 她在群里说完话，别人不 @ 她接话，她看不见（维护者认可的缺口，参照群友讲的麦麦
-（MaiBot）回复后观察一会儿）。所以她在群里 send 之后的 5 分钟里，这个群算 follow（显示为"说完话自动听"，
-``spoke``）；连着两次 dismiss 掉看过它的唤醒就不听了，再说话重新算。她自己盖的任何一层（包括整类的）
-都比它优先，``follow g123 off`` 也能提前揭掉。只在内存里，重启就没了。
+（MaiBot）回复后观察一会儿）。当时的补法是 send 之后这个群自动 follow 5 分钟，连着两次 dismiss 就停。
+2026-10-29 草籽与柚子商定换成 send 的 ``wait``：等不等、等多久由她发言时自己定，等到的消息不用接就
+dismiss，还想接着等就在 dismiss 里带上 wait；自动跟听的代码同一天删掉了。
 同一天试过把覆盖层叫醒的消息攒一批、她不开口就退避，维护者觉得不好（晚了接不上话，痕迹照样留着）：
 follow 一个群让她看起来很累，累的是这一段里叠了一遍遍"被叫醒、看一眼、没我的事"，不是叫醒的次数。
 现在每条照样当场叫醒，没什么要做的就 dismiss，那几次从上下文里清掉，见 ``agent.request_dismiss``。
@@ -86,12 +86,6 @@ _custom: dict[str, dict] = {}
 # follow 从什么时候盖上的，目标原文 → 时刻：画面据此把 follow 期间到的消息给全（agent._screen_text）。
 # 只在内存里；重启后、或者她直接用 write_note 写的 follow 不知道起点，画面照旧截。
 _since: dict[str, float] = {}
-# WHY: 2026-10-29 草籽与柚子商定：发言后死板的 5 分钟自动跟听并入 send 的 wait 参数，
-# 由她自己在发言时决定等多久（wait="5m"、"20m"）或不等（wait=-1、0），统一走 awaker 调度。
-LISTEN = 0
-# 窗口 → {"spoke": 她上次在这说话的时刻, "dismissed": 那之后 dismiss 掉看过它的唤醒几次}
-_heard: dict[tuple, dict] = {}
-_hearing = threading.Lock()
 _broken: set[str] = set()
 _UNIT = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
@@ -371,31 +365,6 @@ def _layers(now: float) -> list[dict]:
     return layers
 
 
-def spoke(window: tuple) -> None:
-    """She just sent something into *window*: listen to it for a while."""
-    with _hearing:
-        _heard[tuple(window)] = {"spoke": time.time(), "dismissed": 0}
-
-
-def dismissed(windows: list[tuple]) -> None:
-    """She dismissed a stretch that showed these windows; two in a row end listening there."""
-    with _hearing:
-        for window in windows:
-            if tuple(window) in _heard:
-                _heard[tuple(window)]["dismissed"] += 1
-
-
-def _listening(window: tuple, now: float) -> dict | None:
-    """The automatic follow on a group she has just spoken in, shaped like a layer; None when it is over."""
-    heard = _heard.get(window)
-    if window[0] != "group" or heard is None or now >= heard["spoke"] + LISTEN or heard["dismissed"] >= 2:
-        return None
-    moment = heard["spoke"] + LISTEN
-    return {"state": "follow", "target": _windows.label(window), "scope": ("window", window, None),
-            "moment": moment, "until": datetime.fromtimestamp(moment).strftime("%Y-%m-%d %H:%M"),
-            "reason": "你刚在这说过话，听听接下来的", "decide": True, "auto": True, "since": heard["spoke"]}
-
-
 def layer(window: tuple, author=None, now: float | None = None) -> dict | None:
     """The layer over *window* for something by *author*, the most specific one; None when there is none."""
     window = tuple(window)
@@ -410,7 +379,7 @@ def layer(window: tuple, author=None, now: float | None = None) -> dict | None:
                 ranked.append((0, item))
         elif tuple(scope[1]) == window and (scope[2] is None or scope[2] == author):
             ranked.append((1 if scope[2] is None else 2, item))
-    return max(ranked, key=lambda pair: pair[0])[1] if ranked else _listening(window, now)
+    return max(ranked, key=lambda pair: pair[0])[1] if ranked else None
 
 
 def triggered(window: tuple, event: dict | None, author, default: bool) -> tuple[bool, dict | None]:
@@ -434,7 +403,7 @@ def triggered(window: tuple, event: dict | None, author, default: bool) -> tuple
 def describe(item: dict) -> str:
     """``mute 到 2026-10-24 08:00`` / ``follow（只看 30001）到 …`` / ``other（整类 bili）到重启为止``."""
     scope = item["scope"]
-    where = ("（说完话自动听）" if item.get("auto") else f"（整类 {scope[1]}）" if scope[0] == "kind"
+    where = (f"（整类 {scope[1]}）" if scope[0] == "kind"
              else f"（只看 {scope[2]}）" if scope[2] is not None else "")
     return f"{item['state']}{where}" + (f" 到 {item['until']}" if item["until"] else " 到重启为止")
 
@@ -451,8 +420,7 @@ def badges(window: tuple) -> list[str]:
         if rule["kind"] == "wait" and rule["window"] == window and now < rule["moment"]:
             target_desc = f"只看 {rule['author']}" if rule.get("author") is not None else "等回复"
             found.append(f"{target_desc}到 {rule['until']}")
-    auto = layer(window, None, now)
-    return found + ([describe(auto)] if auto is not None and auto.get("auto") else [])
+    return found
 
 
 def _strip_layer(text: str, target: str) -> str:
@@ -509,14 +477,8 @@ def lift_wait(target: str) -> bool:
 
 
 def lift(target: str) -> bool:
-    """Take every layer off *target*, written or set by code, and stop listening there; False when there was none."""
-    scope = _scope(target)
-    window = tuple(scope[1]) if scope is not None and scope[0] == "window" and scope[2] is None else None
-    found = window is not None and _listening(window, time.time()) is not None
-    if window is not None:
-        with _hearing:
-            _heard.pop(window, None)
-    found = _custom.pop(target, None) is not None or found
+    """Take every layer off *target*, written or set by code; False when there was none."""
+    found = _custom.pop(target, None) is not None
     _since.pop(target, None)
     with _edit:
         text = _notes.read("awaker")
@@ -628,8 +590,6 @@ def report() -> str:
         lines.append(f"{rule['key']}  ← 上次 {shown}")
     lines.extend(f"{item['target']} 覆盖层 {describe(item)}  ← 代码设的，重启就没了"
                  for item in _layers(time.time()) if item["state"] == "other")
-    lines.extend(f"{item['target']} 覆盖层 {describe(item)}  ← 她刚在这说过话，连着两次 dismiss 就停"
-                 for window in list(_heard) if (item := layer(window)) is not None and item.get("auto"))
     lines.extend(f"不认识：{line}" for line in skipped)
     return "\n".join(lines)
 
