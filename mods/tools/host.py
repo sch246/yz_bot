@@ -169,8 +169,8 @@ def write_file(
     @param
     path: 目标文件路径，相对路径按 Bot 工作目录解析
     content: 替换后的新内容；若行首带行号（如 40│）或头尾带 header/EOF/rest 标记，工具会自动剥离干净
-    start: 闭区间起始行号，修改从本行开始（包含本行）。从 0 起算；传负数表示从末尾倒数；留空默认 0
-    end: 开区间结束行号，修改止于此行之前（不包含本行）。留空或超出则修改止于文件末尾（EOF）
+    start: 闭区间起始行号，修改从本行开始（包含本行）。从 0 起算；传负数表示从末尾倒数。配 old_string 时留空默认 0；不配 old_string 整段改写时必填
+    end: 开区间结束行号，修改止于此行之前（不包含本行）。超出总行数按文件末尾（EOF）算。配 old_string 时留空就查到末尾；不配 old_string 整段改写时必填
     old_string: 待替换的原始文本。传入时，唯一性匹配仅在指定的 [start, end) 区间内进行（不传 start/end 时在全文件进行）。若该范围内找不到或出现超过 1 次，则拒绝修改并报错，确保绝不误伤
     """
     if not op.bot_is_op():
@@ -224,7 +224,13 @@ def write_file(
         return _confirm(path, c_start, len(replaced_sub_text.splitlines()))
 
     if start is not None or end is not None:
-        c_start, c_end = _clamp(lines, start or 0, end)
+        # WHY: 2026-10-29 审查：没有 old_string 时，区间就是要删掉的范围。只给 start 曾一路删到文件末尾，
+        # 只给 end 则从第 0 行删起，而本意多半只是改几行。所以整段改写两头都得写明；真要改到末尾，
+        # end 写一个比总行数大的数（超出照旧按 EOF 算）。
+        if start is None or end is None:
+            return (f"没有 old_string 时按 [start, end) 整段改写，start 和 end 都要给（只给了 "
+                    f"{'start' if start is not None else 'end'}，什么都没写）；只想改一处就用 old_string")
+        c_start, c_end = _clamp(lines, start, end)
         try:
             file.overwrite(path, clean_text, c_start, c_end)
         except OSError as exc:

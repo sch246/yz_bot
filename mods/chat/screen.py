@@ -250,7 +250,7 @@ def slice_window(window: tuple, count: int, last: str | None) -> tuple[str, tupl
     # 再来的 at 会在第一次输出时一起被标掉，收尾不再接续）。chatlog 写入与登记到达
     # 在同一把窗口锁里、先写后登记，所以先取边界再读文件，边界内的都在画面能读到的文件里。
     through = oplog.latest_pending_arrival(window)
-    # WHY: 维护者 2026-10-24：follow 期间（包括说完话自动听）到的消息不截，之前的照旧最多 _FRESH_MAX
+    # WHY: 维护者 2026-10-24：follow 期间到的消息不截，之前的照旧最多 _FRESH_MAX
     # 条。她选了要跟上，dismiss 掉又回来的那批要原样给全，不靠 read_log 往前翻；一个群一天的消息放得下。
     # 只按"现在盖着 follow"不行：follow 一个很久没看的群，第一屏会把几周的积压全倒出来。
     layer = _chat_root._awaker.layer(window)

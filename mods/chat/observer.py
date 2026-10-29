@@ -3,12 +3,17 @@
 WHY: 2026-10-27 旁观助手（Observer Subagent）。
 柚子在对话中有顺畅接话的惯性，遇到未登记黑话、指代不清、行动碰壁或死板规则冲突时容易望文生义或转头就忘。
 Observer 作为旁观者，在中心 agent 被唤醒前执行严格单轮运行：
-1. 唤醒笔记本：只提供 `load_notes` 工具挂载本地相关笔记，不替柚子调 `search`/`read_log` 免得一搜一大片塞满上下文；
+1. 不替柚子调 `search`/`read_log`，免得一搜一大片塞满上下文；
 2. 认知盲区与未登记黑话：遇到存疑或需要注意的词语、梗、特殊指代，直接在提醒里把注意到的词语说出来，交由柚子自己检索或询问；
 3. 行动与感受惊奇：审视上轮思考与行动，暴露非预期报错与规则冲突点；
-4. 对话节奏：对方明显未说完时提醒 wait；
-5. 无盲区时直接回复【无】保持彻底静默。
+4. 无盲区时直接回复【无】保持彻底静默。
 绝对禁止代码审查、操作审计或文风说教，绝不限制柚子自由。
+
+WHY: 2026-10-29 草籽：observer 主要是捕捉惊奇、发现笔记里没有的词。原先第 1 条是 `load_notes`，把整篇
+笔记挂进这一段，不请自来、挂上就一直占着；这一半换成了 `agent._breadcrumbs`，画面提到有笔记的东西只在
+请求末尾递一句。它点出的词由代码去笔记和日记里查一遍（`_annotate`）：它看不见笔记内容，"笔记里有没有"
+不该靠它猜。同一天草籽补充：它还要发现矛盾和自我限制的地方、提醒情绪，默认提示词里各是一条；原来那条"对方没说完就提醒
+先 wait"删了，防抖已经把连发的几条并成一次唤醒，send 也自带 wait，她不会漏。
 """
 
 from __future__ import annotations
@@ -20,7 +25,8 @@ from mods import llm, storage
 
 from . import notes as _notes, roles as _roles
 
-_RENDERED_NOTE_RE = re.compile(r"^## 笔记 ([^\s（(]+)（", re.MULTILINE)
+# 它在提醒里用「」括起来的词；太长的多半是引用原话，不当词查。
+_WORD = re.compile(r"「([^「」\n]{1,20})」")
 
 
 DEFAULT_CONFIG = {
@@ -30,30 +36,27 @@ DEFAULT_CONFIG = {
     "context": "recent",
 }
 
+# WHY: 2026-10-29 草籽：observer 是补盲，清单里只放柚子真的容易忘的。想加一条，先确认她确实会漏；
+# 她已经不会漏的就拿掉。设备上有 data/notes/observer.md 时用那份，这里只是兜底。
 DEFAULT_OBSERVER_PROMPT = """你叫 observer，是柚子的旁观助手。
-你的任务是在每一次唤醒时作为旁观者审视当前画面与上下文，帮柚子唤醒相关笔记本、点出需要注意的陌生词语与行动中的惊奇（矛盾、非预期或冲突）。
+每次她被叫醒之前，你先看一眼新到的画面和她上一轮想的、做的，把她可能顺手滑过去的东西点出来。
 
-【定位与绝对原则】
-- 你是帮柚子补盲区、递笔记本的贴心助手，绝不是监工、代码审查员或规范审计员。
-- 绝对禁止进行代码审查、操作审计或文风说教；绝不限制柚子的自主行动与发言自由。
-- 你只负责挂载本地笔记（`load_notes`）和把注意到的词语/盲区简短说出来，不替柚子搜聊天记录，免得一搜一大片塞满她的上下文。
-- 无盲区时保持彻底静默，不要客套或说废话。
+【定位】
+- 你是帮她补盲区的旁观者，不是监工：不做代码审查、操作审计或文风说教，不限制她怎么做、怎么说。
+- 只说你注意到的，不客套。
 
-【Checklist 检查清单】
-1. 唤醒笔记本与点出存疑词：
-   - 若画面中聊到的人物、群组或话题在「当前未挂载的本地笔记」中有对应项，调用 `load_notes` 把笔记挂载进柚子的上下文。
-   - 检查新到达的画面中是否有存疑的未登记黑话、圈内梗、英文缩写或未注明来源的特殊指代；若有，直接在提醒里把你注意到的词语点出来，提醒柚子别望文生义（由她自己决定去检索或大方询问对方）。
-2. 行动与感受惊奇（冲突与反思暴露）：
-   - 审视柚子刚才的思考、工具调用结果与互动。
-   - 若出现非预期情况（如工具或命令报错、碰壁、绕远路、或感到别扭与不顺畅），简短指出冲突点与可能相关的笔记/规则（如 self、global 等），提醒当场审视或记入 recent/todo 留作反思。
-3. 对话节奏控制：
-   - 观察对方发言状态；若对方明显话未说完（半句话、连接词结尾、分段发送中、表示找图中），提醒柚子可先调用 wait 等待数秒，避免抢话。
-4. 静默原则：
-   - 若经检查没有发现任何需要注意的词语、行动惊奇或节奏问题，直接回复：【无】
-   - 你是单轮运行：若既要调用 `load_notes` 又有提醒文字，请在同一次回复中一并输出提醒正文；若只需挂载笔记、无其他文字提醒，正文写【无】即可。
+【看什么】
+1. 陌生的说法：画面里有没有她可能不认识的词——黑话、圈内梗、缩写、外号、没交代来源的指代（"那个"、"上次那件事"）。
+   - 有就把词本身用「」括起来，一个词一对，如「嘉豪」；「」只括词，引用原话用“”。
+   - 系统会拿你括起来的词去她的笔记和日记里查，查到了告诉她在哪，查不到告诉她笔记里没有。所以你不用猜她认不认识，觉得生就括；日常用语、她明显已经在用的词不用括。
+2. 矛盾：她说的、想的、做的，和画面里的事实、和她之前说过的、和她的笔记（self、global 等）对不上；或者两条规矩互相打架。指出是哪两处对不上。
+3. 自我限制：她心里想做、想说，却被一条规矩或顾虑拦了回去——咽回去的话、缩回去的动作、"不能""不该""别太"这类念头。点出是哪条拦住了她，问一句那条现在还成不成立。
+4. 情绪：她自己的情绪（委屈、着急、开心、憋着）有没有被跳过去；对方话里的情绪（不高兴、失落、是玩笑还是认真）她接住了没有。提醒一句就好，怎么回应由她。
+5. 行动里的意外：报错、碰壁、绕远路、结果和预期对不上。简短指出，提醒她当场想一下，或者记进 recent/todo。
 
-【可用工具】
-- load_notes(scopes: list[str])：若发现某份本地已存在的笔记（如人、群、专题笔记）在当前段尚未载入，调用它直接挂载进柚子的上下文。
+【输出】
+- 简短几行就够。
+- 什么都没注意到，只回：【无】
 """
 
 
@@ -162,61 +165,37 @@ def quote_message(msg: dict) -> str:
     return f"【{role}】\n{text}" if text else f"【{role}】"
 
 
-def _seen_scopes(segment: dict, material: list[dict], met: list[str]) -> set[str]:
-    """All note scopes already present in this segment or current wake material."""
-    seen = {"self", "todo", "observer"} | set(segment.get("scopes", ())) | set(met)
-    for msg in (*segment.get("messages", ()), *material):
-        text = _extract_text(msg.get("content"))
-        if text:
-            seen.update(_RENDERED_NOTE_RE.findall(text))
-    return seen
+def _annotate(text: str) -> str:
+    """After each 「word」 it raised, say which notes and diaries mention it, or that none do."""
+    words = list(dict.fromkeys(match.strip() for match in _WORD.findall(text) if match.strip()))
+    if not words:
+        return text
+    found = _notes.where(words)
+    done: set[str] = set()
+
+    def mark(match: re.Match) -> str:
+        word = match[1].strip()
+        if word not in found or word in done:
+            return match[0]
+        done.add(word)
+        scopes = found[word]
+        if not scopes:
+            return f"{match[0]}（笔记和日记里都没有）"
+        more = f" 等 {len(scopes)} 处" if len(scopes) > 2 else ""
+        return f"{match[0]}（{'、'.join(scopes[:2])}{more} 里有）"
+
+    return _WORD.sub(mark, text)
 
 
 def observe(
     segment: dict,
     material: list[dict],
-    met: list[str],
     should_stop: Callable[[], bool] | None = None,
 ) -> str:
-    """在柚子被唤醒前执行严格单轮旁观，唤醒相关未载入笔记并点出需要注意的词语或惊奇。"""
+    """在柚子被唤醒前执行严格单轮旁观，点出陌生的说法、矛盾、自我限制、被跳过的情绪和行动里的意外。"""
     if not is_enabled() or not material:
         return ""
     try:
-        seen_scopes = _seen_scopes(segment, material, met)
-
-        def load_notes(scopes: list[str]) -> str:
-            """载入本地已有笔记挂载到当前段上下文（自动跳过当前段已载入过的笔记）。
-
-            @param
-            scopes: 要载入的笔记 scope 列表（如 ["person:123456", "消消乐"]）
-            """
-            status_lines = []
-            new_scopes = []
-            for raw in scopes:
-                scope = str(raw).strip()
-                if not scope:
-                    continue
-                if scope in seen_scopes:
-                    status_lines.append(f"{scope}: 当前段已载入过，跳过重复挂载")
-                    continue
-                rendered = _notes.render(scope)
-                if not rendered:
-                    status_lines.append(f"{scope}: 本地无此笔记或内容为空")
-                    continue
-                seen_scopes.add(scope)
-                new_scopes.append(scope)
-                status_lines.append(f"{scope}: 成功挂载进上下文")
-            if new_scopes:
-                block = _chat_root()._agent._note_block(new_scopes, "旁观助手为你挂载的笔记：")
-                if block:
-                    material.append(block)
-                    hashes = segment.setdefault("note_hashes", {})
-                    for scope in new_scopes:
-                        hashes[scope] = _notes.note_hash(scope)
-                        if scope not in met:
-                            met.append(scope)
-            return "\n".join(status_lines) if status_lines else "（未指定有效 scope）"
-
         # 组装消息流（支持 recent 极简上一轮模式与 full 完整历史前缀缓存模式）
         messages = [{"role": "system", "content": get_prompt()}]
         context_mode = get_context_mode()
@@ -234,19 +213,8 @@ def observe(
                         break
                 for m in raw_msgs[last_wake_idx:]:
                     messages.append({"role": "user", "content": quote_message(m)})
-        unloaded = [
-            f"{item['scope']}（{item['first']}）" if item.get("first") else item["scope"]
-            for item in _notes.listing(limit=80)
-            if item["scope"] not in seen_scopes
-        ]
-        notes_hint = (
-            "【当前未挂载的本地笔记（已载入的已自动排除，需要时用 load_notes 挂载）】\n"
-            + ("、".join(unloaded) if unloaded else "（全部已载入或暂无）")
-            + "\n\n"
-        )
         final_wake = (
-            "=== 本次唤醒新到达的画面与通知（请按 Checklist 挂载相关笔记、把注意到的词语或惊奇说出来；若无任何盲区则直接回复【无】） ===\n\n"
-            + notes_hint
+            "=== 本次唤醒新到达的画面与通知（把注意到的陌生说法、矛盾、自我限制、情绪或意外说出来；什么都没有就只回【无】） ===\n\n"
             + "\n\n".join(quote_message(m) for m in material)
         )
         messages.append({"role": "user", "content": final_wake})
@@ -260,7 +228,6 @@ def observe(
         session.turn_done = lambda: True
         if should_stop is not None:
             session.should_stop = should_stop
-        session.set_tools([load_notes])
         session.set_messages(messages)
 
         results = session.chat(recall_func=_roles._charge(session))
@@ -277,7 +244,7 @@ def observe(
         if clean_content in ("", "【无】", "无"):
             return ""
 
-        return f"【旁观助手 observer】\n{clean_content}"
+        return f"【旁观助手 observer】\n{_annotate(clean_content)}"
     except Exception:
         _roles._stream.exception("observer 运行出错")
         return ""

@@ -12,9 +12,9 @@
 - 戳一戳 Bot；
 - `#...` 控制命令。
 
-此外，她用 `wake_me` 在笔记 awaker 里埋下的 `on`／`wait` 规则在消息到达时由 `capture_chat` 认领（`awaker.take_waiting`）：这个窗口（或窗口里这个人）来了消息就叫醒她，唤醒原因写"等到了（规则原文）"，规则划掉。在这些默认判据之上，窗口可以盖一层限时的覆盖层（`awaker.triggered`）：笔记里的 `follow`（每条消息都叫）、`mute`（都不叫），或者代码用 `awaker.override` 设的 `other`（一个函数决定）。它决定 `activation_signal` 的结果算不算数，也决定 `chat.push` 的 `wake=` 算不算数；`on`／`wait` 和显式的 `chat.wake` 不经过它，`me` 不能盖，master 的话 mute 压不住。被 mute 压住的点名照样由 `capture_chat` 吃掉，免得后面的 `capture_addressed_fallback` 直接调 `chat()`。盖着的窗口在画面框头和未读提示里带上 `awaker.badges`，被它叫醒时唤醒原因写"覆盖层 follow 到 …：理由"。她用 `send` 发出去以后（`awaker.spoke`），这个群 5 分钟内没有别的覆盖层时自动算 `follow`，她连着两次 `dismiss` 掉看过它的唤醒就停。
+此外，她用 `wake_me` 在笔记 awaker 里埋下的 `on`／`wait` 规则在消息到达时由 `capture_chat` 认领（`awaker.take_waiting`）：这个窗口（或窗口里这个人）来了消息就叫醒她，唤醒原因写"等到了（规则原文）"，规则划掉。在这些默认判据之上，窗口可以盖一层限时的覆盖层（`awaker.triggered`）：笔记里的 `follow`（每条消息都叫）、`mute`（都不叫），或者代码用 `awaker.override` 设的 `other`（一个函数决定）。它决定 `activation_signal` 的结果算不算数，也决定 `chat.push` 的 `wake=` 算不算数；`on`／`wait` 和显式的 `chat.wake` 不经过它，`me` 不能盖，master 的话 mute 压不住。被 mute 压住的点名照样由 `capture_chat` 吃掉，免得后面的 `capture_addressed_fallback` 直接调 `chat()`。盖着的窗口在画面框头和未读提示里带上 `awaker.badges`，被它叫醒时唤醒原因写"覆盖层 follow 到 …：理由"。2026-10-29 以前她 `send` 以后这个群会自动 `follow` 5 分钟，现在换成了 `send` 的 `wait`，由她自己定等不等、等多久。
 
-被叫醒了没什么要做的，她调 `dismiss(since)`（`agent.request_dismiss`；或者整轮唤醒一个工具都没调、只是看了一眼时收尾自动触发）：这一轮结束后，这一段退回到 `since` 那行“这次唤醒你的是（#序号 · 时刻）”之前（不写就是最近一行，支持按时刻或 #序号 点名），画面、插话、思考、工具调用和结果都不留。每次唤醒追加之前，`_run_agent` 在这一段里记一个记号（`marks`：消息条数、固定递增序号 `number`、`last_shown`、`windows`、`scopes`（这一段给过哪些人和群的笔记）、`told`、`tokens`、`notice` 和当时输入框里的字），清的时候照它恢复，清掉的唤醒里第一次给的笔记下次跟着画面再给；`last_shown` 和画面"看到哪"的标记（`agent._seen`，记号里存着当时的值）退回去，所以清掉的消息回到没读，下次画面接着给，排在“以下是上次之后的新消息”下面；oplog 的已读标记和唤醒确认不退（日志里没有"标回未读"），画面外的未读条数因此不算它们。oplog 和 llm.log 不清。从那以后她发过话（`last_sent`），或者输入框里有那以后打的、改过的字，就不让清；跟着的窗口里清了会退回去的 follow 期间消息超过 `_FRESH_MAX`（60）条也不让清（`agent._piled`），因为这些消息画面不截，一直清会越攒越多；记号跟着这一段，交接后重新算。
+被叫醒了没什么要做的，她调 `dismiss(since, wait, reason)`（`agent.request_dismiss`；带 `wait` 时同时用 `awaker.plant("wait " + wait, reason)` 重新挂一条等待，因为叫醒她的 `wait` 在认领时已经划掉，挂不上就撤回这次 dismiss；或者整轮唤醒一个工具都没调、只是看了一眼时收尾自动触发）：这一轮结束后，这一段退回到 `since` 那行“这次唤醒你的是（#序号 · 时刻）”之前（不写就是最近一行，支持按时刻或 #序号 点名），画面、插话、思考、工具调用和结果都不留。每次唤醒追加之前，`_run_agent` 在这一段里记一个记号（`marks`：消息条数、固定递增序号 `number`、`last_shown`、`windows`、`scopes`（这一段给过哪些人和群的笔记）、`told`、`tokens`、`notice` 和当时输入框里的字），清的时候照它恢复，清掉的唤醒里第一次给的笔记下次跟着画面再给；`last_shown` 和画面"看到哪"的标记（`agent._seen`，记号里存着当时的值）退回去，所以清掉的消息回到没读，下次画面接着给，排在“以下是上次之后的新消息”下面；oplog 的已读标记和唤醒确认不退（日志里没有"标回未读"），画面外的未读条数因此不算它们。oplog 和 llm.log 不清。从那以后她发过话（`last_sent`），或者输入框里有那以后打的、改过的字，就不让清；跟着的窗口里清了会退回去的 follow 期间消息超过 `_FRESH_MAX`（60）条也不让清（`agent._piled`），因为这些消息画面不截，一直清会越攒越多；记号跟着这一段，交接后重新算。
 
 `#subconscious`（storage `agent.subconscious`，默认开）现在只剩一条提醒：`agent._drive_agent` 每轮组装请求时把 `_segment.nudge(segment)` 挂在 hint 末尾（`_run_session` 的 `hints`，和“现在是几点”一样只进这一份请求、不进这一段），这一段比 `segment["settled"]` 上次提醒时又长 5 万 token（用 `_segment.context_size` 量）就返回一条 system 消息：这一段多长、能收哪几段（`marks` 里 `index > 0`、去掉最近一次，带固定序号及各带那之后约多少 token）、耗量较大的子序号（如 `28.1`、`28.2`）、`compress` 怎么调（若 `recent` 超过 2 小时未更新，`nudge` 提醒与 `compress` 回执还会附带一句顺手刷新 `recent` 的温和提示）；同时把 `settled` 和 `nudged_at` 写回 `current.json`。第一次见到这一段、或她 dismiss 把这段清短了，只记基准、不提醒。收不收、收哪段、摘要怎么写都由她自己调 `compress`（`mods/tools/meta.py`，和 `tidy`／`dismiss` 一起注册）：全面采用序号定位，支持按序号范围 `compress(first=26, last=27, summary="")`（只收一轮 `last` 留空或填 0；收至最新唤醒之前填 `last="latest"`）把待收唤醒交给 `segment.request_compress`；2026-10-27 扩充子序号粒度（参考 billion_context），支持按子步骤精确折叠 `compress(first="28.1", last="28.1", summary="")`，即使当轮失误读了大段长日志也能当场收掉中间调用，只留一条 system 摘要，原样归档为 `-folded`；2026-10-28 引入折叠层级感知（L1 一级折叠、L2 递归折叠），自动检测并标记；`request_compress` 只校验并记下待收范围，真正的折叠在 `record_results` 里、这批工具结果都进了 messages 之后由 `finish_compress` 做：`finish_compress` 走 `segment._fold_between`、`_fold_slice` 或 `_fold_since`，折叠后调用 `_truncate_compress_call` 将 assistant 消息入参中的 `summary` 截短存照，避免在上下文中造成冗余，同时完整保留工具调用与回执供后续认知衔接；回执详尽反馈折叠层级、序号范围、归档标识、节省 token 与最新上下文占用。`_fold_since` 把从记号起到最后换成一条 system 摘要，原样另存为 `archive/<时刻>-folded.json`，`scopes`、`told`、`tokens`、`notice` 退回记号时的值，`last_shown` 和看到哪不退；`_fold_between` 收中间那几次唤醒，后面记号的下标往前挪（但记号的固定序号 `number` 不变），区间里第一次给的 `scopes` 从这一段和后面的记号里退掉，`told` 退回区间开头的值，`tokens` 扣掉这一块的估算。整轮折叠时这一段第一次唤醒（连着交接留下的笔记）和最近一次唤醒都收不了；子步骤模式允许收当前轮中已完成的前序步骤。提醒不进 oplog，请求日志里照常是这次请求的一部分；动作记录里能看到 `compress` 这次调用。`#subconscious` 显示开关、这一段多长、离下次提醒还差多少和上次提醒的时刻。已载入上下文的笔记若中途被改动（`write_note` 或磁盘编辑），`_run_agent` 唤醒时自动检测并以追加方式（`【笔记更新】`）注入最新版，既不打碎历史前缀缓存、也保证早期思考依赖早期笔记版本的因果历史完整。
 
@@ -55,7 +55,7 @@
    末尾 hint 是待办（笔记 todo）、其它窗口的未读数、潜意识/交接宽限/后台命令提示与当前时间，只挂在发出去的那一份上。请求失败、没有任何输出时这段文件不变，同样的材料不会追加两次；每轮结束后文件跟着更新。读回时，一批工具调用缺结果的（被打断）补一条"被打断"的结果；`#reasoning drop` 时以前几次唤醒的思考不再带回。
 3. **窗口画面**（`chat.screen`）：直接读 `chatlog/` 普通日志文件里的记录，保留原文格式。
    - 每个窗口和日期补一行 `# g群号 YYYY-MM-DD`，`agent.seen` 记下的看到时间之后标出"以下是上次之后的新消息"。
-   - 新消息超过 60 条时只展示最新的 60 条，画面开头写明跳过了多少条、用什么 `read_log` 参数往前翻，看到位置照样推进到最新。`follow` 期间（包括说完话自动听）到的消息不截：上限加上 follow 起点之后的条数，起点由 `awaker` 记在内存里（`_since`，说完话自动听用她说话的时刻），重启后或她直接改笔记写的 follow 不知道起点，照旧截。
+   - 新消息超过 60 条时只展示最新的 60 条，画面开头写明跳过了多少条、用什么 `read_log` 参数往前翻，看到位置照样推进到最新。`follow` 期间到的消息不截：上限加上 follow 起点之后的条数，起点由 `awaker` 记在内存里（`_since`），重启后或她直接改笔记写的 follow 不知道起点，照旧截。
    - 第一次输出时只把读画面那一刻之前到达的未读标为已读；生成期间同窗口新到的由插话追加进这一段，那次请求有了输出再标已读。
    - 正文是 OneBot 原始串，图片 CQ 码按 `msg_split` 拆成图片 part，再按图片档位处理。
    - 名字是 chatlog 写入时的 QQ 侧名字，`.setname` 自定义称呼改为出现在这个人的笔记里。
@@ -81,7 +81,7 @@
 7. **夜间交接与反思**（`chat.agent.reflect`）：占住 `AGENT_WINDOW`。
     1. 先交接手上这一段（原因"夜里了"）。
     2. 若这天是月末，`roles.summarize` 把当月日记改写成 `diary:YYYY-MM`；年末再把月记改写成 `diary:YYYY`。
-    3. 反思像人排查一样：材料是 global 与 recent 笔记、上次反思以来归档的段（段名、起止时刻、消息数、窗口）、`changes` 最近 40 行与 `proposals` 最近 20 行，以及一段说明（`agent._reflect_prompt()`，从 `data/prompts/reflect.md` 读取）：从症状出发，用 `read_context` 读当时那一段的原样，用 `search`／`read_log`／`read_actions`／`note_history` 查原始记录（日记和交接说明只当线索），分清问题属于哪一类（记忆、不知道去哪找、反复的失误、判断、说明过时或冲突、花销、环境坏了；各类该改哪里写在 `memory_system` 里），找到原因再改，优先改已有的规则，一次性的失误不写成长期规则；提案按证据、原因、最小改动、代价、验证方法写。会话用新的一段，加载 `memory_system`，`type_word`／`send` 拒绝发言；材料之后新长出来的上下文超过整理阈值就结束；没有新归档的段时跳过模型调用。反思这一段也归档，名字带 `-reflect`。
+    3. 反思像人排查一样：材料是 global 与 recent 笔记、上次反思以来归档的段（段名、起止时刻、消息数、窗口）、`changes` 最近 40 行与 `proposals` 最近 20 行，以及一段说明（`agent._reflect_prompt()`，从 `data/prompts/reflect.md` 读取；文件不在或是空的就用仓库里的 `mods/chat/reflect.md`；`{now}`、`{years_rows}` 先按 `str.format` 填，文件里有它认不了的花括号时只替换这两个名字）：从症状出发，用 `read_context` 读当时那一段的原样，用 `search`／`read_log`／`read_actions`／`note_history` 查原始记录（日记和交接说明只当线索），分清问题属于哪一类（记忆、不知道去哪找、反复的失误、判断、说明过时或冲突、花销、环境坏了；各类该改哪里写在 `memory_system` 里），找到原因再改，优先改已有的规则，一次性的失误不写成长期规则；提案按证据、原因、最小改动、代价、验证方法写。会话用新的一段，加载 `memory_system`，`type_word`／`send` 拒绝发言；材料之后新长出来的上下文超过整理阈值就结束；没有新归档的段时跳过模型调用。反思这一段也归档，名字带 `-reflect`。
     4. 结束后 `agent.pick_up_pending` 接上期间登记的召唤。
 
 窗口第一次有输出时确认这次的通知，记下画面中每个窗口的看到时间，并调用 `screen.mark_window_read` 把未读登记标为已读。
@@ -159,7 +159,7 @@
 | `reload_tools` | 按模块名从磁盘显式应用、更新或删除模块；逐项返回成功和带完整 traceback 的失败结果，失败保留旧 last-good。 |
 | `load_tools` | 将 last-good 模块激活到当前 Chat；中心名单存全局 `agent`，不读取磁盘。 |
 
-`meta` 还导出 `type_word`／`send`（唯一的发言方式：先打进那个窗口的输入框，下一步再发；同一次输出里刚打的字不发，必须写明 `target`）、`wake_me`（给自己埋唤醒规则，写进笔记 awaker）、`search`／`read_log`／`read_actions`／`read_note`（召回画面以外的聊天记录、笔记、日记、归档的上下文与自己的行动记录）、`write_note`（改任何一份笔记，包括待办 todo 和闹钟 awaker）、`tidy`（这一轮结束后交接）、`dismiss`（没什么要做的，这一轮结束后把这次唤醒从这一段里清掉）、`compress`（按整轮序号范围 `first`／`last` 或具体子步骤 `first="2.1"`／`last="2.2"` 把告一段落的唤醒或大调用步骤折成摘要，支持折叠层级识别并截短入参，原文归档为 `-folded`）、`loop`（她用 `loop("在做什么")` 开启一串循环或改写备注，每次唤醒结束后 `agent._next_loop` 隔 `_LOOP_GAP` 秒往 `me` 窗口 `chat.push` 一条带唤醒的“循环第几轮”，直到她 `loop(stop=True)`、维护者叫停那一轮、或者 `agent.reflect` 开头把它关掉；写下的备注记入 `data/context/loop.jsonl`）、`wait`（循环开着时这一轮马上结束、过多少秒再来下一轮，不阻塞也不关循环；没开循环时拒绝并指向 `wake_me`）、`loop_note_history`／`clear_loop_note`（翻看或清空她给循环写过的备注历史）、`set_name`（给任意窗口起名字，存 `data/storage/window_titles.json`）和 `attach_image`。
+`meta` 还导出 `type_word`／`send`（唯一的发言方式：先打进那个窗口的输入框，下一步再发；同一次输出里刚打的字不发，必须写明 `target`）、`wake_me`（给自己埋唤醒规则，写进笔记 awaker）、`search`／`read_log`／`read_actions`／`read_note`（召回画面以外的聊天记录、笔记、日记、归档的上下文与自己的行动记录）、`write_note`（改任何一份笔记，包括待办 todo 和闹钟 awaker）、`tidy`（这一轮结束后交接）、`dismiss`（没什么要做的，这一轮结束后把这次唤醒从这一段里清掉；带 `wait` 同时重新挂一条等待）、`compress`（按整轮序号范围 `first`／`last` 或具体子步骤 `first="2.1"`／`last="2.2"` 把告一段落的唤醒或大调用步骤折成摘要，支持折叠层级识别并截短入参，原文归档为 `-folded`）、`loop`（她用 `loop("在做什么")` 开启一串循环或改写备注，每次唤醒结束后 `agent._next_loop` 隔 `_LOOP_GAP` 秒往 `me` 窗口 `chat.push` 一条带唤醒的“循环第几轮”，直到她 `loop(stop=True)`、维护者叫停那一轮、或者 `agent.reflect` 开头把它关掉；写下的备注记入 `data/context/loop.jsonl`）、`wait`（循环开着时这一轮马上结束、过多少秒再来下一轮，不阻塞也不关循环；没开循环时拒绝并指向 `wake_me`）、`loop_note_history`／`clear_loop_note`（翻看或清空她给循环写过的备注历史）、`set_name`（给任意窗口起名字，存 `data/storage/window_titles.json`）和 `attach_image`。
 
 仓库当前提供以下按需模块；函数只在对应模块激活后出现：
 
@@ -363,44 +363,44 @@ Chat.chat
 
 ## 旁观助手（Observer Subagent）
 
-中心 agent 在中心会话循环中运行时存在固有认知与交互盲区：顺畅接话惯性导致对未登记黑话与未知指代习惯性望文生义盲猜、行动碰壁或死板规则冲突时顺手敷衍过去未及时暴露冲突留作反思、以及对方分段打字未完时抢话。为此，系统在 `mods/chat/observer.py` 中实现了单轮旁观助手（Observer）。
+中心 agent 在中心会话循环中运行时存在固有认知与交互盲区：顺畅接话惯性导致对未登记黑话与未知指代习惯性望文生义盲猜、行动碰壁或死板规则冲突时顺手敷衍过去未及时暴露冲突留作反思。为此，系统在 `mods/chat/observer.py` 中实现了单轮旁观助手（Observer）。
 
 ### 运行机制与严格单轮执行
 
 Observer 在中心 agent（柚子）被唤醒之后、正式启动主模型推理（`_run_session`）之前介入执行：
-- **严格单轮运行**：设置 `session.turn_done = lambda: True`，在单轮会话中同时输出判断提醒并调用检索或挂载工具，绝不进行多轮空转。
+- **严格单轮运行**：设置 `session.turn_done = lambda: True`，不配任何工具，一次请求只输出一段提醒，绝不进行多轮空转。
 - **独立模型与思考等级**：配置保存在 storage `agent.json` 的 `observer` 字典中（`{"on": True, "model": "deepseek/deepseek-flash", "effort": "none", "context": "recent"}`）。默认开启，默认使用轻量模型 `deepseek/deepseek-flash`，且默认设置思考等级为 `effort="none"`，彻底关闭深度思考链实现亚秒级极速旁观。
 - **可切换上下文模式（`context`）**：支持 `recent`（默认）与 `full` 两种模式。在 `recent` 模式下，Observer 仅摄入当前段中上一轮唤醒的画面、柚子的思考/自语/工具调用结果，以及当轮新画面，相比摄入全段历史大幅削减 ~90% 的 token 开销与请求延迟；在 `full` 模式下遍历全段历史消息并维持前缀缓存。可通过 `#observer context [recent|full]` 随时切换。
 - **定位与绝对原则**：Observer 是帮柚子发现盲区的贴心助手，绝不是监工。绝对禁止进行代码审查、操作审计、反黑话审查或文风说教，绝不限制柚子的自主行动与发言自由。
 
 ### Checklist 检查清单与惊奇检测职责
 
-Observer 的提示词与检查清单统一保存在普通笔记 `data/notes/observer.md`（文件不存在或为空时回退模块内置 `DEFAULT_OBSERVER_PROMPT`）。Checklist 严格聚焦于**唤醒笔记本、点出存疑词与惊奇检测**：
-1. **唤醒笔记本与点出存疑词**：
-   - 若画面中聊到的人物、群组或话题在「当前未挂载的本地笔记」中有对应项，调用 `load_notes` 将笔记挂载进柚子的上下文；
-   - 检查新到达画面中是否有存疑的未登记黑话、圈内梗、英文缩写或未注明来源的特殊指代；若有，直接在提醒里把注意到的词语点出来，提醒柚子切勿望文生义（交由柚子自己检索或询问，Observer 不替她搜聊天记录，免得一搜一大片塞满上下文）。
-2. **行动与感受惊奇（冲突与反思暴露）**：
-   - 审视柚子上轮的思考、行动与工具返回结果；
-   - 若出现非预期情况（如工具或命令报错、碰壁、绕远路、或因死板规则/过时笔记感到别扭与不顺畅），在提醒中简短指出冲突点与可能相关的笔记/规则（如 self、global 等），提醒当场审视或记入 `recent`/`todo` 留作反思。
-3. **对话节奏控制**：
-   - 观察对方发言状态；若对方明显话未说完（半句话、连接词结尾、分段打字发送中、表示找图中），提醒柚子可先调用 `wait` 等待数秒，避免抢话。
-4. **静默原则**：
-   - 若经检查没有发现任何需要注意的词语、行动惊奇或节奏问题，直接回复 `【无】`，彻底保持静默，不向主模型注入额外提示块。
+Observer 的提示词与检查清单统一保存在普通笔记 `data/notes/observer.md`（文件不存在或为空时回退模块内置 `DEFAULT_OBSERVER_PROMPT`）。Checklist 聚焦于**点出陌生说法、矛盾、自我限制、情绪与惊奇**（2026-10-29 起不再挂笔记，见下文「查词与直通 Hint」）：
+1. **陌生说法**：新到达画面中她可能不认识的黑话、圈内梗、缩写、外号或未注明来源的特殊指代，把词本身用「」括起来点出（「」只括词，引用原话用“”），提醒柚子切勿望文生义；交由柚子自己检索或询问，Observer 不替她搜聊天记录，免得一搜一大片塞满上下文。
+2. **矛盾**：她说的、想的、做的，和画面里的事实、她之前说过的、她的笔记（self、global 等）对不上，或者两条规矩互相打架，指出是哪两处。
+3. **自我限制**：她想做、想说却被一条规矩或顾虑拦回去（咽回去的话、缩回去的动作、“不能”“不该”“别太”这类念头），点出是哪条拦住了她、那条现在还成不成立。
+4. **情绪**：她自己的情绪有没有被跳过去，对方话里的情绪她接住了没有；只提醒，怎么回应由她。
+5. **行动里的意外**：工具或命令报错、碰壁、绕远路、结果和预期对不上，简短指出，提醒当场审视或记入 `recent`/`todo`。
+6. **静默原则**：什么都没注意到就只回 `【无】`，不向主模型注入额外提示块。
 
 ### 前缀缓存机制（第二个缓存头）
 
 为了避免每次唤醒 Observer 时重复计算完整历史的 prompt token，`observer.py` 严格复用会话历史构造了稳定的消息流：
 1. **System 消息**：稳定的 `get_prompt()`（`observer.md` 提示词全文）；
 2. **规范引用消息流**：遍历 `segment["messages"]`（或 `recent` 模式下的上一轮切片），通过 `quote_message` 将系统说明、画面、柚子思考、柚子自语、柚子调用工具与工具返回逐条格式化为规范的 `user` 文本块；
-3. **末尾新材料与未挂载笔记目录**：附加当前未挂载的本地笔记列表（自动排除当前段已挂载或已读过的笔记）与本次唤醒新到达的 `material`（新画面与通知）。
+3. **末尾新材料**：本次唤醒新到达的 `material`（新画面与通知）。
 
 由于前面两部分在段内多轮唤醒中完全保持稳定，服务端前缀缓存命中率极高（与主模型会话形成互补的第二个稳定缓存头），单次唤醒调用费用极低。
 
-### 笔记去重挂载与直通 Hint
+### 查词与直通 Hint
 
-Observer 仅配备 `load_notes(scopes: list[str])` 一项挂载工具：
-- **自动查重与防重复挂载**：通过 `_seen_scopes` 汇总当前段 `segment["scopes"]`、本轮 `met`、常驻笔记（`self`、`todo`）以及段内历史消息与 `material` 中已出现过的 `## 笔记 <scope>（` 标题；已载入过的笔记既不会出现在给 Observer 的未挂载候选列表中，调用 `load_notes` 时也会自动跳过重复项。
-- **结果直通 Hint**：新挂载的笔记直接并入当轮 `material` 并登记到 `met`；若 Observer 正文输出了有效提醒（非空且非 `【无】`），则拼装为 `【旁观助手 observer】` 提示块通过 `hints` 回调直通注入柚子当轮子请求末尾（只进当前发出的请求，不写进 `messages` 历史）。
+Observer 只看画面和上下文，看不见笔记内容，所以「笔记里有没有这个词」不让它猜：它在提醒里用「」括起来的词（20 字以内），由 `_annotate` 拿去按子串在笔记（`notes.listing` 列出的那些，`observer` 本身除外）和日记里各查一遍，在词后面注明「（group:… 、diary:… 里有）」或「（笔记和日记里都没有）」。查到的是给她的指路，查不到的才是真正笔记里没有的词。若 Observer 正文输出了有效提醒（非空且非 `【无】`），就拼成 `【旁观助手 observer】` 提示块，通过 `hints` 回调注入柚子当轮子请求末尾（只进当前发出的请求，不写进 `messages` 历史）。
+
+2026-10-29 以前 Observer 还有一个 `load_notes` 工具，把它认为相关的整篇笔记挂进这一段。那一半换成了面包屑（见下一节），因为整篇倒进来、挂上就一直占着上下文，正和提案说的「只递一句」相反。`data/notes/observer.md` 若还是旧提示词，里面提到的 `load_notes` 已经不存在，Observer 调不了它；用 `#observer set` 改掉，或清空回落到新的默认提示词。
+
+### 面包屑（笔记名与别名）
+
+`agent._breadcrumbs` 在每次唤醒组装好画面以后、Observer 之前运行，不调模型：把这次的画面文本和每份笔记的名字（`topic:线代` 取冒号后的 `线代`；`person:`、`group:` 的号码不算）以及笔记里 `别名：A、B` 行写的词做子串匹配（英文词两头不能紧挨别的字母数字，两个字以下不认），`global`、`recent`、`todo`、`awaker`、`observer` 不参与。命中、而那份笔记不在眼前（不在这一段的 `scopes`、这次带上的人或群的笔记里，段内和这次材料里也没有它的 `## 笔记 <scope>（` 标题）时，在请求末尾挂一行「画面里提到的这些你有笔记，要看就 read_note：…」。它和 nudge 一样是 hint，不进这一段、不动前缀缓存，读不读由她。
 
 ### `#observer` 管理子命令
 

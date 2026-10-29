@@ -18,7 +18,7 @@ import re
 import threading
 import time
 
-from mods import storage
+from mods import log, storage
 
 import mods.chat as _chat_root
 from . import notes as _notes, screen as _screen, windows as _windows
@@ -30,6 +30,7 @@ _ARCHIVE = ROOT / "archive"
 # 每一段交接时往这里添一行：什么时候、多长、当时为什么结束。下一段开头挂最近几行。
 _YEARS = Path("data") / "notes" / "years.md"
 _lock = threading.Lock()
+_stream = log.stream("agent")
 # dismiss 能清回的记号：每次唤醒追加之前，这一段里会被这次唤醒改动的那几项；最多留最近这么多个。
 MARKED = ("last_shown", "windows", "scopes", "told", "tokens", "notice")
 MARKS = 40
@@ -574,6 +575,12 @@ def request_compress(session, first: int | str = 0, last: int | str = 0, summary
             return f"找不到子步骤 {last_raw}；当前可收的子步骤有：{usable_steps}"
         if s_first["start"] > s_last["start"]:
             return "last 步骤必须在 first 步骤之后或相同"
+        if s_first["wake"] != s_last["wake"]:
+            # WHY: 2026-10-29 审查：跨唤醒的子步骤区间会把后一次唤醒开头的画面一起收走，`_fold_slice`
+            # 又把落在区间里的那个记号直接丢掉，那次唤醒从编号里消失、它第一次给的笔记也不再补。
+            # 跨唤醒本来就是整轮收的事。
+            return (f"子步骤只能在同一次唤醒里收（{first_raw} 和 {last_raw} 不在同一轮）；"
+                    f"跨唤醒请按整轮收，如 compress(first={s_first['wake']}, last={s_last['wake']}, summary=…)")
         start, end = s_first["start"], s_last["end"]
         removed = msgs[start:end]
         level = _detect_fold_level(removed)
@@ -584,7 +591,7 @@ def request_compress(session, first: int | str = 0, last: int | str = 0, summary
         where = f"第 {first_raw} 到 {last_raw} 步" if first_raw != last_raw else f"第 {first_raw} 步（{tools_summary}）"
         session.pending_compress = {"mode": "substep", "start": start, "end": end, "summary": summary, "where": where}
         range_desc = f"子步骤 {first_raw}～{last_raw}" if first_raw != last_raw else f"子步骤 {first_raw}（{tools_summary}）"
-        return f"🎉 成功完成 {level_tag} 折叠（{range_desc}）：已在上下文中收拢为【步骤收起 {level_tag}】行，减少约 {amount(max(0, saved))} token，当前上下文剩余约 {amount(max(0, current_size))} token。{_recent_hint()}"
+        return f"收下了：这批工具调用都返回以后，{range_desc} 收成一条【步骤收起 {level_tag}】，预计少约 {amount(max(0, saved))} token、剩约 {amount(max(0, current_size))} token。{_recent_hint()}"
 
     marks = numbers(segment)
     offered = _offered(segment)
@@ -629,24 +636,34 @@ def request_compress(session, first: int | str = 0, last: int | str = 0, summary
     range_desc = f"唤醒 #{lo}～#{hi}" if lo != hi else f"唤醒 #{lo}"
 
     session.pending_compress = {"mode": "wake", "mark": mark, "after": after, "summary": summary}
-    return f"🎉 成功完成 {level_tag} 折叠（{range_desc}）：已在上下文中收拢为【收起 {level_tag}】行，减少约 {amount(max(0, saved))} token，当前上下文剩余约 {amount(max(0, current_size))} token。{_recent_hint()}"
+    return f"收下了：这批工具调用都返回以后，{range_desc} 收成一条【收起 {level_tag}】，预计少约 {amount(max(0, saved))} token、剩约 {amount(max(0, current_size))} token。{_recent_hint()}"
 
 
 def finish_compress(session, results) -> None:
-    """Fold once this batch's results are in, so the call and its result go together."""
+    """Fold once this batch's results are in, so the call and its result go together.
+
+    WHY: 2026-10-29 审查：`compress` 当场只是收下，真正折叠在这里。这里出错时她已经读到"收下了"，
+    所以不能只在终端留 traceback：在这批结果后面补一句没收成，上下文照原样留着。
+    """
     pending = session.pending_compress
     session.pending_compress = None
     segment = session.segment
-    segment["messages"] = session.messages[session.prompt_count:]
-    if pending.get("mode") == "substep":
-        _fold_slice(segment, pending["start"], pending["end"], pending["summary"], pending.get("where", "子步骤"))
-        _truncate_compress_call(segment, results)
-    elif pending["after"] is None:
-        _fold_since(segment, pending["mark"], pending["summary"])
-        _truncate_compress_call(segment, results)
-    else:
-        _fold_between(segment, pending["mark"], pending["after"], pending["summary"])
-        _truncate_compress_call(segment, results)
+    body = session.messages[session.prompt_count:]
+    try:
+        segment["messages"] = list(body)
+        if pending.get("mode") == "substep":
+            _fold_slice(segment, pending["start"], pending["end"], pending["summary"], pending.get("where", "子步骤"))
+        elif pending["after"] is None:
+            _fold_since(segment, pending["mark"], pending["summary"])
+        else:
+            _fold_between(segment, pending["mark"], pending["after"], pending["summary"])
+    except Exception as error:
+        _stream.exception("compress 收下以后没能折叠")
+        segment["messages"] = body
+        session.messages.append({"role": "system", "content": (
+            f"刚才那次 compress 没收成（{type(error).__name__}: {error}），上下文原样没动；可以换个范围再收一次。")})
+        return
+    _truncate_compress_call(segment, results)
     session.messages[session.prompt_count:] = segment["messages"]
 
 
@@ -725,7 +742,6 @@ def _drop_since(segment: dict, mark: dict) -> None:
     # 画面上的"看到哪"也退回去：清掉的消息下次排在"以下是上次之后的新消息"下面，当没读过的给。
     # oplog 的已读不退（日志里没有"标回未读"这种行），画面外那个窗口的未读条数因此不算它们。
     _screen.restore_seen(shown, mark.get("seen") or {})
-    _chat_root._awaker.dismissed(_windows.parse_all(shown))
 
 
 def _fold_since(segment: dict, mark: dict, label: str) -> str:

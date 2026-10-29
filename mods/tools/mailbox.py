@@ -189,7 +189,7 @@ def save_account(address: str, authcode: str, label: str = "", host: str = "",
     """保存或覆盖一个邮箱账号，返回地址与授权码指纹（不回显授权码）。
 
     @param
-    address: 邮箱地址，例如 236288772@qq.com
+    address: 邮箱地址，例如 123456@qq.com
     authcode: 邮箱设置里生成的授权码或应用专用密码，不是登录密码
     label: 好记的别名，例如"主号""工作"，留空则只能按地址找
     host: IMAP 主机，留空则按邮箱域名自动判断，例如 qq.com 用 imap.qq.com

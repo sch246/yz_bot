@@ -68,8 +68,7 @@ wait g123:QQ号 until 2026-10-23 10:30 <理由>   等这个人的后续，来了
 follow g123 until 2026-10-23 22:30 <理由>   覆盖层：到点之前这个窗口每条消息都叫她（只认 QQ）
 mute bili until 2026-10-24 08:00 <理由>     覆盖层：到点之前都不叫她，消息照样未读
 覆盖层的目标是窗口（g123、u456、g123:QQ号、bili:BV…）或一整类（group、private、bili）；到期划掉，
-同一目标只留一层；me 不能盖，master 的话 mute 压不住。她在群里说完话，那个群自动算 follow 5 分钟
-（不写进笔记，这里能看到），她连着两次 dismiss 就停。
+同一目标只留一层；me 不能盖，master 的话 mute 压不住。
 when <Python 表达式> -> <理由>   每分钟求值，第一次为真时叫她
 at、on、wait、when 响过就从笔记里划掉。她平时用 wake_me 写这些行。
 理由写 reflect 表示夜间交接与反思；其它理由原样交给她。文件为空时只有 daily 04:00 reflect。
@@ -98,7 +97,7 @@ at、on、wait、when 响过就从笔记里划掉。她平时用 wake_me 写这�
 #debounce reset       重置为默认值（3s / 12s）"""),
     ("observer [on|off|model [selection]|effort [level]|context [recent|full]|prompt|set <全文>|reset]", """查看或设置旁观助手（Observer，修改需管理员）。
 
-在中心会话被唤醒时执行单轮旁观，检测未登记黑话与存疑指代并检索、暴露做事的非预期情况与规则冲突、提醒对话节奏与 wait。无盲区时静默不打扰。
+在中心会话被唤醒时执行单轮旁观，检测未登记黑话与存疑指代并检索、点出矛盾、自我限制和被跳过的情绪，暴露做事的非预期情况。无盲区时静默不打扰。
 #observer                    查看当前状态、模型、思考等级、上下文模式与提示词概况
 #observer on|off             开启或关闭旁观助手
 #observer model [selection]  查看或设置旁观助手模型（留空查看）

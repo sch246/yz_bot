@@ -150,6 +150,36 @@ def _people(windows: list[tuple], authors: list[int], segment: dict) -> tuple[li
     return ([block] if block else []), new
 
 
+_NOTE_HEADER = re.compile(r"^## 笔记 (\S+?)（", re.MULTILINE)
+
+
+def _plain(content) -> str:
+    if isinstance(content, list):
+        return "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
+    return str(content or "")
+
+
+def _breadcrumbs(segment: dict, material: list[dict], met: list[str]) -> str:
+    """One line naming the notes this wake's screens mention that are not in front of her; empty when none.
+
+    WHY: 2026-10-29 草籽同意（提案 concept-lifecycle-and-compartment-memory 的面包屑）：以前 observer 用
+    load_notes 把整篇笔记挂进这一段，不请自来，挂上就一直占着。现在画面提到某份笔记的名字或别名，只在
+    请求末尾递一句"有这份笔记"，和 nudge 一样是 hint、不进这一段，读不读由她。名字和别名都是她自己
+    写的字，哪份老冒出来，改名或删别名就行。
+    """
+    screens = "\n".join(_plain(message.get("content")) for message in material if message.get("role") == "user")
+    if not screens.strip():
+        return ""
+    present = {"self", *segment.get("scopes", ()), *met}
+    for message in (*segment["messages"], *material):
+        present.update(_NOTE_HEADER.findall(_plain(message.get("content"))))
+    hits = [(scope, word) for scope, word in _notes.mentioned(screens) if scope not in present]
+    if not hits:
+        return ""
+    named = "、".join(scope if scope.split(":", 1)[-1] == word else f"{scope}（「{word}」）" for scope, word in hits)
+    return f"画面里提到的这些你有笔记，要看就 read_note：{named}"
+
+
 def _box_note(boxes: dict) -> str:
     """Unsent input boxes, told once after a handoff.
 
@@ -757,15 +787,21 @@ def _run_agent(model: str | None, turn) -> bool:
             _screen.mark_seen(dict(unconfirmed))
             unconfirmed.clear()
 
+    try:
+        crumbs = _breadcrumbs(segment, material, met)
+    except Exception:
+        # 面包屑可有可无：哪份笔记读不了，不该连累这次唤醒。
+        _roles._stream.exception("面包屑没算出来")
+        crumbs = ""
     observer_hint = ""
     if _chat_root._observer.is_enabled():
-        observer_hint = _chat_root._observer.observe(segment, material, met, should_stop=lambda: turn.cancelled)
+        observer_hint = _chat_root._observer.observe(segment, material, should_stop=lambda: turn.cancelled)
 
     session = _run_session(model, turn, segment, [*segment["messages"], *material], first_output, stop_when,
                            providers=[late],
                            hints=[lambda: _screen.unread_hint(set(newest)), lambda: _segment.nudge(segment),
                                   lambda: shell.running_hint(), lambda: turn.tidy_hint,
-                                  lambda: observer_hint],
+                                  lambda: crumbs, lambda: observer_hint],
                            known=len(segment["messages"]), each_output=seen_late)
     if (getattr(session, "dismiss", None) is None and not turn.log.get("acts")
             and getattr(session, "segment", None) and session.segment.get("marks")):
@@ -927,14 +963,34 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
 # 给常驻记忆做新陈代谢（把实操手册从 global 迁去按需文件）、留住对人和事的真实温度；真遇到环境故障仍写进
 # proposals 而不记成自己的缺陷。
 _REFLECT_PROMPT_PATH = Path("data") / "prompts" / "reflect.md"
+_REFLECT_DEFAULT = Path(__file__).with_name("reflect.md")
 
 
-def _reflect_prompt() -> str:
-    """The nightly prompt lives in a file, not here.
+def _reflect_prompt(**values) -> str:
+    """The nightly prompt lives in a file, not here; *values* fill its ``{now}``-style slots.
 
     WHY: 2026-10-26 维护者：提示词跟代码分开放，改措辞不该动 Python。
+
+    WHY: 2026-10-29 审查：那个文件在 data/ 里，不进 git，新装的机器上没有它，反思就会抛
+    FileNotFoundError；所以仓库里带一份默认（同目录的 reflect.md，照那天设备上那份，人名换成了中性的说法），
+    文件不在或是空的才用。
+    她自己会改这个文件，写个 JSON 例子就会冒出成单的花括号，str.format 会因此报错、整晚的
+    反思跟着没了；这时退回只替换认得的那几个名字。
     """
-    return _REFLECT_PROMPT_PATH.read_text(encoding="utf-8")
+    try:
+        text = _REFLECT_PROMPT_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = ""
+    if not text.strip():
+        _roles._stream.warning(f"{_REFLECT_PROMPT_PATH} 不在或是空的，反思用仓库里的默认说明")
+        text = _REFLECT_DEFAULT.read_text(encoding="utf-8")
+    try:
+        return text.format(**values)
+    except (KeyError, IndexError, ValueError):
+        _roles._stream.warning(f"{_REFLECT_PROMPT_PATH} 里有 str.format 认不了的花括号，只替换 {sorted(values)}")
+        for key, value in values.items():
+            text = text.replace("{" + key + "}", str(value))
+        return text
 
 
 
@@ -1032,7 +1088,7 @@ def _run_reflection(model: str | None, turn, segments: list[dict]) -> None:
         {"role": "system", "content": "## 上次反思以来归档的上下文（用 read_context 读原样）\n" + listing},
         {"role": "system", "content": "## 策略改动记录（changes，最近的）\n" + (changes or "（还没有）")
          + "\n\n## 给维护者的提案（proposals，最近的）\n" + (proposals or "（还没有）")},
-        {"role": "system", "content": _reflect_prompt().format(
+        {"role": "system", "content": _reflect_prompt(
             now=_screen.clock(), years_rows=len(_notes.years(9999)))},
     ]
     reflection = _segment.fresh()
