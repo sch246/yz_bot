@@ -150,6 +150,36 @@ def _people(windows: list[tuple], authors: list[int], segment: dict) -> tuple[li
     return ([block] if block else []), new
 
 
+_NOTE_HEADER = re.compile(r"^## 笔记 (\S+?)（", re.MULTILINE)
+
+
+def _plain(content) -> str:
+    if isinstance(content, list):
+        return "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
+    return str(content or "")
+
+
+def _breadcrumbs(segment: dict, material: list[dict], met: list[str]) -> str:
+    """One line naming the notes this wake's screens mention that are not in front of her; empty when none.
+
+    WHY: 2026-10-29 草籽同意（提案 concept-lifecycle-and-compartment-memory 的面包屑）：以前 observer 用
+    load_notes 把整篇笔记挂进这一段，不请自来，挂上就一直占着。现在画面提到某份笔记的名字或别名，只在
+    请求末尾递一句"有这份笔记"，和 nudge 一样是 hint、不进这一段，读不读由她。名字和别名都是她自己
+    写的字，哪份老冒出来，改名或删别名就行。
+    """
+    screens = "\n".join(_plain(message.get("content")) for message in material if message.get("role") == "user")
+    if not screens.strip():
+        return ""
+    present = {"self", *segment.get("scopes", ()), *met}
+    for message in (*segment["messages"], *material):
+        present.update(_NOTE_HEADER.findall(_plain(message.get("content"))))
+    hits = [(scope, word) for scope, word in _notes.mentioned(screens) if scope not in present]
+    if not hits:
+        return ""
+    named = "、".join(scope if scope.split(":", 1)[-1] == word else f"{scope}（「{word}」）" for scope, word in hits)
+    return f"画面里提到的这些你有笔记，要看就 read_note：{named}"
+
+
 def _box_note(boxes: dict) -> str:
     """Unsent input boxes, told once after a handoff.
 
@@ -757,15 +787,21 @@ def _run_agent(model: str | None, turn) -> bool:
             _screen.mark_seen(dict(unconfirmed))
             unconfirmed.clear()
 
+    try:
+        crumbs = _breadcrumbs(segment, material, met)
+    except Exception:
+        # 面包屑可有可无：哪份笔记读不了，不该连累这次唤醒。
+        _roles._stream.exception("面包屑没算出来")
+        crumbs = ""
     observer_hint = ""
     if _chat_root._observer.is_enabled():
-        observer_hint = _chat_root._observer.observe(segment, material, met, should_stop=lambda: turn.cancelled)
+        observer_hint = _chat_root._observer.observe(segment, material, should_stop=lambda: turn.cancelled)
 
     session = _run_session(model, turn, segment, [*segment["messages"], *material], first_output, stop_when,
                            providers=[late],
                            hints=[lambda: _screen.unread_hint(set(newest)), lambda: _segment.nudge(segment),
                                   lambda: shell.running_hint(), lambda: turn.tidy_hint,
-                                  lambda: observer_hint],
+                                  lambda: crumbs, lambda: observer_hint],
                            known=len(segment["messages"]), each_output=seen_late)
     if (getattr(session, "dismiss", None) is None and not turn.log.get("acts")
             and getattr(session, "segment", None) and session.segment.get("marks")):

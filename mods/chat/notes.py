@@ -238,3 +238,59 @@ def diaries(prefix: str = "") -> list[str]:
     if not directory.is_dir():
         return []
     return sorted(path.stem for path in directory.glob("*.md") if path.stem.startswith(prefix))
+
+
+# 每段开头就摊开的、或者本来就不是话题的笔记：画面里出现这些字不用再递。
+_STANDING = {"global", "recent", "todo", "awaker", "observer"}
+_ALIAS = re.compile(r"^\s*(?:[-*]\s*)?别名\s*[:：]\s*(.+?)\s*$", re.MULTILINE)
+
+
+def aliases(scope: str) -> list[str]:
+    """The words on the note's ``别名：`` lines, such as ``别名：小明、明哥`` in someone's note."""
+    words = []
+    for line in _ALIAS.findall(read(scope)):
+        # 空格不算分隔：英文别名常是几个词（linear algebra），拆开以后单个 linear 也会命中。
+        words.extend(word.strip() for word in re.split(r"[、,，;；/\[\]【】]+", line) if word.strip())
+    return words
+
+
+def _appears(word: str, folded: str) -> bool:
+    # 英文那头不能紧挨着别的字母数字：笔记叫 mc，"mcdonald" 不算提到它。
+    pattern = re.escape(word.casefold())
+    if word[0].isascii() and word[0].isalnum():
+        pattern = r"(?<![0-9a-z])" + pattern
+    if word[-1].isascii() and word[-1].isalnum():
+        pattern += r"(?![0-9a-z])"
+    return re.search(pattern, folded) is not None
+
+
+def mentioned(text: str) -> list[tuple[str, str]]:
+    """Notes whose own name, or a word on their ``别名：`` line, appears in *text*: (scope, the word that matched).
+
+    person:/group: 的名字是号码，只认别名；号码本身出现在画面里时，`agent._people` 已经把那份笔记带上了。
+    """
+    folded = text.casefold()
+    found = []
+    for item in listing(limit=10**6):
+        scope = item["scope"]
+        if scope in _STANDING:
+            continue
+        name = scope.split(":", 1)[-1]
+        for word in ([] if name.isdigit() else [name]) + aliases(scope):
+            if len(word) >= 2 and _appears(word, folded):
+                found.append((scope, word))
+                break
+    return found
+
+
+def where(words: list[str]) -> dict[str, list[str]]:
+    """For each word, the notes and then the diaries (newest first) whose text contains it, ignoring case."""
+    scopes = [item["scope"] for item in listing(limit=10**6) if item["scope"] != "observer"]
+    scopes += [f"diary:{key}" for key in reversed(diaries())]
+    found: dict[str, list[str]] = {word: [] for word in words}
+    for scope in scopes:
+        folded = read(scope).casefold()
+        for word in words:
+            if word.casefold() in folded:
+                found[word].append(scope)
+    return found
