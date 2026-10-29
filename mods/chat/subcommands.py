@@ -58,6 +58,12 @@ compress(first, last=0, summary="")：按序号折叠唤醒（如 first=26, last
 #subconscious       显示开关、这一段多长、离下次提醒还差多少、上次提醒
 #subconscious on    打开
 #subconscious off   关掉"""),
+    ("decompress [<序号|名称|latest>]", """查看或解压还原当前上下文中被 compress 折叠收起的某段历史（管理员）。
+
+留空列出当前上下文中所有可解压的收起块；指定序号或名称还原原始消息。
+#decompress           列出当前可解压的收起块
+#decompress latest    解压最近一次收起的块
+#decompress <名称>    解压指定的收起块（如 20261029-180253-folded）"""),
     ("awaker [set <规则>]", """查看或改写她的闹钟规则（改写要管理员）。
 
 规则就是笔记 awaker（data/notes/awaker.md），她自己也能改，每行一条：
@@ -333,6 +339,55 @@ def _reflect_subcommand(tail: str) -> str:
     if tail in ("keep", "now keep", "keep now", "now --keep-context"):
         return "开始反思（保留当前上下文不交接/不重置，反思这一段归档在 data/context/archive/）" if _chat_root.reflect_now(handoff=False) else "中心 agent 正忙，稍后再试"
     return "reflect 参数错误，可用 #help reflect 查看"
+
+
+def _decompress_subcommand(tail: str) -> str:
+    segment = _chat_root._segment.load()
+    if not segment or not segment.get("messages"):
+        return "当前没有活跃的上下文"
+    body = segment["messages"]
+    blocks = _chat_root._segment.get_folded_blocks(body)
+    if not blocks:
+        return "当前上下文中没有被折叠的收起块（无需解压）"
+    tail = tail.strip()
+    if not tail:
+        usable = "\n".join(f"{i + 1}. {b['name']}（{b['preview'][:60]}）" for i, b in enumerate(blocks))
+        return f"当前上下文中共有 {len(blocks)} 处收起块可解压：\n{usable}\n\n使用 #decompress <序号|名称|latest> 执行解压"
+
+    chosen = None
+    if tail.lower() in ("latest", "-1", "last", "最新"):
+        chosen = blocks[-1]
+    elif tail.isdigit() and 1 <= int(tail) <= len(blocks):
+        chosen = blocks[int(tail) - 1]
+    else:
+        for b in blocks:
+            if tail == b["name"] or tail in b["name"]:
+                chosen = b
+                break
+    if chosen is None:
+        usable = "、".join(b["name"] for b in blocks)
+        return f"找不到指定的收起块「{tail}」；当前可解压的有：{usable}"
+
+    data = _chat_root._segment.read_archived(chosen["name"])
+    if not data or not data.get("messages"):
+        return f"找不到归档段 {chosen['name']} 的原始消息"
+
+    orig_msgs = data["messages"]
+    target_idx = chosen["index"]
+    body = [*body[:target_idx], *orig_msgs, *body[target_idx + 1:]]
+    shift = len(orig_msgs) - 1
+
+    marks = []
+    for mark in segment.get("marks", []):
+        idx = mark.get("index", 0)
+        if idx <= target_idx:
+            marks.append(mark)
+        else:
+            marks.append({**mark, "index": idx + shift})
+    segment["marks"] = marks
+    segment["messages"] = body
+    _chat_root._segment.save(segment)
+    return f"已成功解压展开收起块 {chosen['name']}：还原了 {len(orig_msgs)} 条消息到当前上下文中"
 
 
 def _awaker_subcommand(raw: str) -> str:
@@ -689,6 +744,8 @@ def _subcommand(value: str):
         return _limit_set(tail)
     if name == "reflect":
         return _reflect_subcommand(tail.strip())
+    if name == "decompress":
+        return _decompress_subcommand(tail.strip())
     if name == "subconscious" and not tail:
         return _chat_root._segment.subconscious_report()
     if name == "subconscious" and tail:

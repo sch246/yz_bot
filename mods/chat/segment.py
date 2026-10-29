@@ -639,6 +639,135 @@ def request_compress(session, first: int | str = 0, last: int | str = 0, summary
     return f"收下了：这批工具调用都返回以后，{range_desc} 收成一条【收起 {level_tag}】，预计少约 {amount(max(0, saved))} token、剩约 {amount(max(0, current_size))} token。{_recent_hint()}"
 
 
+def get_folded_blocks(messages: list[dict]) -> list[dict]:
+    """Find all folded blocks currently present in messages."""
+    blocks = []
+    for i, msg in enumerate(messages):
+        if msg.get("role") != "system":
+            continue
+        content = str(msg.get("content") or "")
+        match = re.search(r"\b(\d{8}-\d{6}-folded(?:-\d+)?)\b", content)
+        if match:
+            fold_name = match.group(1)
+            first_line = content.strip().split("\n", 1)[0]
+            blocks.append({
+                "index": i,
+                "name": fold_name,
+                "preview": first_line,
+                "content": content,
+            })
+    return blocks
+
+
+def request_decompress(session, name: str = "") -> str:
+    """Called by the `decompress` tool: unfold an archived folded block back into the active context.
+
+    WHY: 2026-10-29 草籽需求：参考 billion_context，有 compress 就要有对应的 decompress；
+    当摘要漏了关键细节或需要原话核对时，支持随时把收起块无损还原回上下文。
+    """
+    segment = getattr(session, "segment", None)
+    if getattr(session, "quiet", False) or segment is None:
+        return "只有醒着处理消息的时候能用；交接、反思和子代理里没有可解压的"
+    if getattr(session, "pending_compress", None) is not None or getattr(session, "pending_decompress", None) is not None:
+        return "同一批工具调用里只能执行一次压缩或解压操作"
+
+    body = session.messages[session.prompt_count:] if hasattr(session, "messages") else segment.get("messages", [])
+    blocks = get_folded_blocks(body)
+    if not blocks:
+        return "当前上下文中没有被折叠的收起块（无需解压）"
+
+    target = str(name or "").strip()
+    if not target:
+        usable = "\n".join(f"{i + 1}. {b['name']}（{b['preview'][:60]}）" for i, b in enumerate(blocks))
+        return (f"当前上下文中共有 {len(blocks)} 处收起块可解压：\n{usable}\n\n"
+                f"请传入 name（如 '{blocks[-1]['name']}'、序号如 {len(blocks)}、或 'latest'）指定解压哪一段。")
+
+    chosen = None
+    if target.lower() in ("latest", "-1", "last", "最新"):
+        chosen = blocks[-1]
+    elif target.isdigit() and 1 <= int(target) <= len(blocks):
+        chosen = blocks[int(target) - 1]
+    else:
+        for b in blocks:
+            if target == b["name"] or target in b["name"]:
+                chosen = b
+                break
+
+    if chosen is None:
+        usable = "、".join(b["name"] for b in blocks)
+        return f"找不到指定的收起块「{name}」；当前可解压的收起块有：{usable}"
+
+    data = read_archived(chosen["name"])
+    if not data or not data.get("messages"):
+        return f"找不到归档段 {chosen['name']} 的原始消息，可能已被清理"
+
+    original_messages = data.get("messages", [])
+    fold_msg = body[chosen["index"]]
+    saved_tokens = text_tokens([fold_msg])
+    orig_tokens = text_tokens(original_messages)
+    restored_tokens = max(0, orig_tokens - saved_tokens)
+    current_tokens = context_size(segment.get("tokens"), body)
+    new_size = current_tokens + restored_tokens
+
+    session.pending_decompress = {
+        "name": chosen["name"],
+        "index": chosen["index"],
+        "messages": original_messages,
+        "restored_tokens": restored_tokens,
+        "new_size": new_size,
+    }
+    return (f"收下了：这批工具调用都返回以后，收起块 {chosen['name']} 将被解压展开"
+            f"（共还原 {len(original_messages)} 条消息，约增加 {amount(restored_tokens)} token、当前段变为约 {amount(new_size)} token）。")
+
+
+def finish_decompress(session, results) -> None:
+    """Unfold the compressed block once this batch's results are in."""
+    pending = getattr(session, "pending_decompress", None)
+    session.pending_decompress = None
+    if not pending:
+        return
+    segment = session.segment
+    body = session.messages[session.prompt_count:]
+    name = pending["name"]
+    original_messages = pending["messages"]
+
+    # 动态定位包含该 name 的折叠系统消息
+    target_idx = None
+    for i, msg in enumerate(body):
+        if msg.get("role") == "system" and name in str(msg.get("content") or ""):
+            target_idx = i
+            break
+    if target_idx is None:
+        _stream.warning(f"decompress 展开时未在上下文中找到 {name}")
+        session.messages.append({"role": "system", "content": (
+            f"解压 {name} 失败：在上下文中未找到对应的收起行，上下文原样没动。")})
+        return
+
+    # 替换消息：把那一行【收起】替换为原来的所有消息
+    body = [*body[:target_idx], *original_messages, *body[target_idx + 1:]]
+    shift = len(original_messages) - 1
+
+    # 调整 marks 下标
+    marks = []
+    for mark in segment.get("marks", []):
+        idx = mark.get("index", 0)
+        if idx <= target_idx:
+            marks.append(mark)
+        else:
+            marks.append({**mark, "index": idx + shift})
+    segment["marks"] = marks
+
+    # 调整 tokens
+    if isinstance(segment.get("tokens"), list) and len(segment["tokens"]) == 2:
+        rep_tokens, rep_idx = segment["tokens"]
+        if rep_idx > target_idx:
+            segment["tokens"] = [rep_tokens + pending["restored_tokens"], rep_idx + shift]
+
+    segment["messages"] = list(body)
+    session.messages[session.prompt_count:] = list(body)
+    save(segment)
+
+
 def finish_compress(session, results) -> None:
     """Fold once this batch's results are in, so the call and its result go together.
 

@@ -120,7 +120,7 @@ __all__ = ["lookup"]
 - **顺着线索搜**：记得半点线索（名字、话题、某个词）就调 `search(keyword, window, days)`，一次找遍最近聊天、所有笔记、日记和归档上下文；找到位置后再用 `read_log` 或 `read_note` 细看。
 - **看自己干过什么**：`read_actions(ids)` 按行动号或关键词翻自己过去的想法和工具调用结果。
 - **随手写笔记、建专题与记日记**：`data/notes/` 下的笔记随时用 `read_note(scope)` 读、`write_note(scope, text)` 整份改写（改前会自动留备份，已载入的常驻笔记改完会在下轮自动追加 `【笔记更新】`，不破坏前缀缓存）。除了 `global`（核心待人直觉与索引）、`recent`（眼下短期工作台，20 行以内；**不只在交接时写**，白天事情有了阶段性进展、关注点转移或折叠旧唤醒时，随时用 `write_note("recent", ...)` 刷新）、`todo`（待办）、`awaker`（闹钟）、`person:<QQ号>`、`group:<群号>` 和 `diary:<日期>`（当天日记，白天有感触随时能写，不必等交接），**你随时可以自己起名字新建专题笔记**（比如 `write_note("消消乐", ...)`、`write_note("topic:线代", ...)`）。具体某件事的经验、某个游戏的打法、某段长思考，单独建一份笔记或写成 `.md` Skill，在 `global` 里只放一行引用，别什么都往 `global` 里堆。
-- **折叠长上下文（compress）**：如果当前这一段聊得有点长（比如潜意识提醒你 token 多了），但手头的事还没完、不到整段 tidy 交接的时候，可以直接调用内置工具 `compress`（直接调工具，不要发 `#compress` 命令），把中间已经聊完的几轮唤醒或大调用步骤折成一段你亲手写的摘要，原文会自动归档备查。折叠能保留当前段和前缀缓存，白天不必为了清理上下文而强行 `tidy` 交接；折叠完已了结的事时，如果 `recent` 已经过时，顺手用 `write_note("recent", ...)` 刷新一下眼下工作台。
+- **折叠与解压长上下文（compress / decompress）**：如果当前这一段聊得有点长（比如潜意识提醒你 token 多了），但手头的事还没完、不到整段 tidy 交接的时候，可以直接调用内置工具 `compress`（直接调工具，不要发 `#compress` 命令），把中间已经聊完的几轮唤醒或大调用步骤折成一段你亲手写的摘要，原文会自动归档备查；若后续发现摘要遗漏了细节需要核对，随时可以调用 `decompress` 把对应的收起块原样展开还原回当前上下文。折叠能保留当前段和前缀缓存，白天不必为了清理上下文而强行 `tidy` 交接；折叠完已了结的事时，如果 `recent` 已经过时，顺手用 `write_note("recent", ...)` 刷新一下眼下工作台。
 - **交接换新篇（tidy）**：一件事彻底告一段落、上下文太长、或者到了夜里，这段上下文就要归档了。你会收到交接提示，把该记的事分别安顿进 `recent`、人和群的笔记、`todo`、专题笔记和日记里，然后轻装开启下一段。
 - **给自己定闹钟（awaker 与 wake_me）**：想过会儿再醒、等别人把下半句话说完、或者临时跟听/静音某个群，可以直接调 `wake_me` 工具，也可以直接用 `write_note` 改 `awaker` 笔记（每行一条，如 `every 10m 理由`、`daily 23:30 理由`、`at 2026-10-23 08:00 理由`；`daily 04:00 reflect` 是每晚的反思闹钟）。闹钟响时会记进你的 `me` 窗口并叫醒你，一次性闹钟响过自动划掉。
 - **夜里反思**：关于记忆系统怎么流转、夜里怎么打理和改造自己，全写在 `memory_system` 里，每晚反思时会自动为你展开。
@@ -709,6 +709,19 @@ def compress(first: int | str = 0, last: int | str = 0, summary: str = "",
                                          from_time=from_time, to_time=to_time)
 
 
+def decompress(name: str = "") -> str:
+    """把之前用 compress 折叠收起的某段历史唤醒或子步骤解压还原回当前上下文。
+
+    当你发现摘要漏了关键细节、或者需要翻看某段被折叠对话的原始调用和原话时，用此工具把归档段重新展开到当前视野中。
+
+    @param
+    name: 要解压的收起块名字（如 "20261029-180253-folded"）、序号（如 1、2、"latest"）或留空列出当前所有可解压的块
+    """
+    from mods import chat
+
+    return chat.segment.request_decompress(current_binding().session, name=name)
+
+
 def loop(note: str = "", stop: bool = False) -> str:
     """需要一轮接一轮连续干活（比如打游戏、一步步操控手机）时，开启或更新连续循环，让这一轮结束后自动再叫醒你接着做。
 
@@ -803,6 +816,7 @@ __all__ = [
     "tidy",
     "dismiss",
     "compress",
+    "decompress",
     "loop",
     "wait",
     "wake_me",

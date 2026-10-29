@@ -934,6 +934,8 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
                 for position, result in enumerate(results)], "")
         if getattr(session, "pending_compress", None) is not None:
             _segment.finish_compress(session, results)
+        if getattr(session, "pending_decompress", None) is not None:
+            _segment.finish_decompress(session, results)
 
     def turn_done() -> bool:
         used = _segment.context_size(reported[0], _body(session))
