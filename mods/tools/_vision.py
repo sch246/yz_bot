@@ -10,7 +10,7 @@
    deepseek-flash 读对了工具结果那张图里的随机码）。所以它是按模型登记的能力，不是协议
    保证的。
 
-   这条路的收益是图**长在工具调用的位置上**：操作记录（mods/oplog）原样存下它，重建回
+   这条路的收益是图**长在工具调用的位置上**：经历日志（mods/chat/journal）原样存下它，重建回
    上下文时还带着，"哪次调用看到了哪张图"不必靠记忆。代价是留在历史里的图每轮都会重发
    （有前缀缓存兜着，image 那一层还按内容摘要去重、长图自动切片）。
 
@@ -18,8 +18,8 @@
    会跟着每一次重建一起膨胀。所以 `data:` 图先落盘再引用。
 
 2. **排进下一个子请求**（退回）。对端不支持 tool 结果带图时，把图作为一条 user 消息挂在
-   会话的队列上，下一个子请求开始前追加（mods/tools 的模块通告、mods/chat 的插话用的是
-   同一条通道）。这条消息不写 chatlog、不进历史，只活一次子请求。
+   本次运行的 images 队列上，由统一 run 在重建请求后取走。
+   这条消息不写 chatlog、不进经历日志和视图，只活一次子请求。
 
 ## 结果约定
 
@@ -28,7 +28,7 @@
 
 ## 谁可以调用
 
-交给模型看要有 binding（`mods.tools.current_binding()`，由 `SessionBinding._bind_module`
+交给模型看要有 binding（`mods.tools.current_binding()`，由工具绑定函数
 在每次工具调用期间设好）。拿不到就说明这次调用不在绑定会话里，返回 `⚠️`，不抛异常。
 '''
 
@@ -43,7 +43,6 @@ from mods import log
 
 
 _stream = log.stream("tools")
-_QUEUE_ATTR = "_tool_image_queue"
 _DATA_URI = re.compile(r"^data:image/([A-Za-z0-9.+-]+);base64,(.*)$", re.S)
 _EXTENSIONS = {"jpeg": ".jpg", "jpg": ".jpg", "png": ".png", "gif": ".gif", "webp": ".webp", "bmp": ".bmp"}
 
@@ -89,28 +88,6 @@ def _file_uri(selection: str) -> str:
     return "file://" + os.path.abspath(path)
 
 
-def _take(queue: list) -> list:
-    """取走队列里排着的消息并清空；provider 每次子请求都会被调一次，空了就返回空列表。"""
-    queued, queue[:] = list(queue), []
-    return queued
-
-
-def _queue_of(session) -> list:
-    """取这次会话的附加队列；没有就建一个并挂上 provider。
-
-    WHY: 队列挂在**会话对象**上，不做模块全局——同一进程里每个窗口一个会话，全局队列会被
-    别的窗口的下一个子请求抢先抽走。会话随这一轮结束消失，这个属性也就跟着没了，不需要
-    任何清理。provider 只加一次（挂在属性上，第二次调用直接复用队列）。
-    """
-    queue = getattr(session, _QUEUE_ATTR, None)
-    if isinstance(queue, list):
-        return queue
-    queue = []
-    setattr(session, _QUEUE_ATTR, queue)
-    session.add_context_provider(lambda: _take(queue))
-    return queue
-
-
 def attach(uri: str, note: str = "", model: str | None = None) -> str:
     """把一张图交给当前模型自己看，或者在当前模型无视觉/指定了视觉模型时转述，返回一句以 ✅ 或 ⚠️ 开头的结果说明。
 
@@ -142,7 +119,9 @@ def attach(uri: str, note: str = "", model: str | None = None) -> str:
     try:
         from mods.tools import current_binding
 
-        session = current_binding().session
+        binding = current_binding()
+        session = binding["session"]
+        state = binding["run"]
     except Exception as error:
         return f"⚠️ 这次调用拿不到会话（{type(error).__name__}: {error}），附加不了图片"
     current_model = str(getattr(session, "model", "") or "")
@@ -181,7 +160,9 @@ def attach(uri: str, note: str = "", model: str | None = None) -> str:
     if text:
         parts.append({"type": "text", "text": text})
     parts.append({"type": "image_url", "image_url": {"url": value}})
-    _queue_of(session).append({"role": "user", "content": parts})
+    # WHY: 图片只属于这次运行，不能被另一个并发请求取走；统一 run 在重建请求后
+    # 消费一次，不把一次性退回图片写进经历日志或持久视图。
+    state.setdefault("images", []).append({"role": "user", "content": parts})
     _stream.info("图片已排入下一次请求：%s", _brief(selection))
     return f"✅ 图片已附加到下一次请求（{_brief(selection)}），你马上就能看到它"
 

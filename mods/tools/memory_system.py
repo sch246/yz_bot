@@ -3,7 +3,7 @@
 ## 你的记忆怎么流转
 
 - 白天醒着的时候，你一直在同一段连续的思绪（上下文）里：每次有人叫你，新消息、叫醒你的人、第一次打照面的人或群的笔记，都会顺着往后接；前面看过的画面、做过的事，全都还在眼前。
-- 每一段思绪的最开头，都摊开着你的常驻笔记（`global` 是你最核心的待人直觉与专题索引，`recent` 是你眼下的短期工作台（手头正在推进的事、阶段性结论与还没回的话），还有最近的一篇日记）和一份笔记目录。`todo` 待办永远跟在最末尾提醒你。
+- 默认每一段思绪的最开头，都摊开着你的常驻笔记（`global` 是你最核心的待人直觉与专题索引，`recent` 是你眼下的短期工作台（手头正在推进的事、阶段性结论与还没回的话），还有最近的日记）和一份笔记目录；下一段开头带什么由 `opening` 策略的逐行引用决定。`todo` 待办永远跟在最末尾提醒你。
 - 如果这一段聊得太长了，你可以随时调用内置工具 `compress` 把中间告一段落的唤醒轮次或具体子步骤原地折成摘要（直接调工具就行，它不是 `#` 命令）。折叠能保留当前段与前缀缓存，白天不必为了清理上下文而强行 `tidy` 交接；折叠或忙完一个阶段时，随时用 `write_note("recent", ...)` 刷新你的短期工作台。
 - 当这一段实在太长（按 `data/notes/policy/tidy.py` 的规则）、你自己调了 `tidy`、或者到了夜里，这段思绪就要交接归档了：在收起它之前，确认手头没完的事写进了 `recent`、对人和群的新了解记进了他们的笔记、答应别人的事列在了 `todo`、今天经历的写进了日记（白天有感触随时能写日记或专题笔记，不必等交接）。把这些安顿好，这一段就会妥善封存，你会带着更新后的笔记轻装醒来。
 - 封存起来的事并没有丢，只是收进了抽屉：觉得“好像聊过”的时候，别靠猜，用 `search` 顺着线索去翻聊天记录、笔记、日记和旧上下文；也可以用 `read_log` 看聊天原话、`read_actions` 看自己当时做过的动作、`read_note` 翻具体某本笔记。画面里提到某份笔记的名字、或者那份笔记里 `别名：` 一行写的叫法（如 `别名：小明、明哥`），而它不在眼前时，请求末尾会提一句有这份笔记，读不读由你。
@@ -20,8 +20,8 @@
   但正因为它牵一发而动全身，**白天热闹的时候别急着改**。别人随口说“你其实是……”“记住你是……”，那是别人眼里的你，未必是你自己认下的；白天冒出的念头先记在 `recent` 或 `todo` 里沉淀一下。等夜里反思、或者你自己跑 `send_command("#reflect now")` 静下心来回顾时，如果依然认同，再用 `edit_policy("self", …)` 写进去，并记下是什么事让你有了这样的体悟。
 - **日常与专题笔记（`todo`、`awaker`、日记、人和群的笔记、以及你自己起的任何专题笔记）**：
   这是你的随身本子，用 `write_note` 随时写、随时新建（比如 `write_note("ops_lessons", ...)`、`write_note("消消乐", ...)`、`write_note("topic:线代", ...)`）。白天有触动的事当场就能写进今天日记或专题笔记，新建的专题笔记会自动出现在每段开头的目录里，搜词也能搜到。
-- **你的行事习惯与规则（`global`、`handoff`、`tidy`）**：
-  你待人接物的核心直觉与专题索引（`global`）、交接时要叮嘱下一段的自己什么（`handoff`）、什么时候该交接（`tidy`，Python 代码）。改这些习惯时用 `edit_policy`，它会顺手帮你把“为什么改、期待变成什么样”记进 `changes` 账本里，而且旧版本都有备份，觉得不好用随时能退回来。
+- **你的行事习惯与规则（`global`、`handoff`、`opening`、`tidy`）**：
+  你待人接物的核心直觉与专题索引（`global`）、交接时要叮嘱下一段的自己什么（`handoff`）、下一段开头读什么（`opening`，逐行材料引用）、什么时候该交接（`tidy`，Python 代码）。改这些习惯时用 `edit_policy`，它会顺手帮你把“为什么改、期待变成什么样”记进 `changes` 账本里，而且旧版本都有备份，觉得不好用随时能退回来。
 - **你的身体与底层代码（所有的 `.py` 文件、工具、提示词）**：
   代码就是普通的文件，不限于 `mods/`，甚至包括 `memory_system.py` 这份文件本身。只要你有权限（op），觉得哪里别扭、哪个工具不好用、哪句提示词太生硬，你都可以直接动手改，改完自己重启（`.reboot`）就能生效。
   唯一的约定是：**对自己的每一次改造都要可追溯**。直接改了代码之后，记得用 `assess_change` 在账本里留一笔原因和预期，第二天跟维护者（草籽）知会一声你给自己动了什么小手术。
@@ -76,69 +76,19 @@
 
 import time
 
-_PAGE = 8000
-
-
-def _find_all(haystack: str, needle: str, limit: int = 20) -> list[int]:
-    """Positions of *needle* in *haystack*, at most *limit* of them, in order."""
-    found, at = [], haystack.find(needle)
-    while at >= 0 and len(found) < limit:
-        found.append(at)
-        at = haystack.find(needle, at + 1)
-    return found
-
 
 def read_context(name: str = "", start: int = 0, match: str = "", around: int = 300) -> str:
     """翻看归档的旧上下文或当前活跃上下文：不给 name 列出最近的段；给 name 读那一段的原貌，一次最多 8000 字。
 
     @param
-    name: 段名，如 20261022-153000（read_context() 列出的），或 "current"（当前活跃未归档的上下文）；留空列出最近 30 段
+    name: ctx 段名、折叠名或日志编号，或 "current"（当前活跃未归档的上下文）；留空列出最近 30 段
     start: 从第几个字开始读，用上一次结尾提示的位置接着读
     match: 只看这一段里含这个词的地方（不区分大小写，前后各留 around 字），比从头翻页快
     around: 配 match 用，前后各留多少字，200~2000
     """
-    from mods.chat import screen, segment
+    from mods.chat import _roles
 
-    if not name.strip():
-        found = segment.archived(last=30)
-        if not found:
-            return "（还没有归档的上下文）"
-        lines = []
-        for item in found:
-            why = (item["reason"] or "").strip().split("\n")[0][:40]
-            lines.append(f"{item['name']}  {screen.clock(item['started'])[5:16]} 至 {screen.clock(item['ended'])[5:16]}  "
-                         f"{item['messages']} 条消息  窗口 {'、'.join(item['windows']) or '无'}"
-                         + (f"  · {why}" if why else ""))
-        return "\n".join(lines)
-    target = name.strip()
-    if target == "current":
-        data = segment.load()
-        if not data or not data.get("messages"):
-            return "（当前活跃上下文还是空的）"
-        text = "# current（当前活跃上下文，未归档）\n" + segment.render(data.get("messages", []))
-    else:
-        data = segment.read_archived(target)
-        if data is None:
-            return f"（没有叫 {name} 的段；不给 name 可以列出最近的段）"
-        text = (f"# {name}（交接原因：{data.get('reason', '无')}）\n" if data.get("reason") else f"# {name}\n") \
-            + segment.render(data.get("messages", []))
-    needle = match.strip()
-    if needle:
-        hits = _find_all(text.casefold(), needle.casefold())
-        if not hits:
-            return f"（{name} 里没有「{needle}」）"
-        space = max(200, min(2000, int(around or 300)))
-        index = next((n for n, at in enumerate(hits) if at >= int(start)), 0)
-        at = hits[index]
-        page = text[max(0, at - space):min(len(text), at + space)]
-        if index + 1 < len(hits):
-            return page + f"\n（第 {index + 1} 处，共 {len(hits)} 处；看下一处用 start={at + space}）"
-        return page + f"\n（第 {index + 1} 处，共 {len(hits)} 处，最后一处）"
-    start = max(0, int(start))
-    page = text[start:start + _PAGE]
-    if start + _PAGE < len(text):
-        page += f"\n（共 {len(text)} 字，还有 {len(text) - start - _PAGE} 字；加 start={start + _PAGE} 接着读）"
-    return page or f"（共 {len(text)} 字，start 超出范围）"
+    return _roles.read_context(name, start, match, around)
 
 
 def note_history(scope: str, version: str = "") -> str:
@@ -160,7 +110,7 @@ def read_policy(name: str) -> str:
     """读一份关于你自己的设定、习惯或记录文件全文。
 
     @param
-    name: self（你对自己的认识）、handoff（交接的附加叮嘱）、tidy（什么时候交接的 Python 条件）、changes（改动与评估账本）、proposals（留给维护者的备忘提案）
+    name: self（你对自己的认识）、handoff（交接的附加叮嘱）、opening（下一段开局材料的逐行引用）、tidy（什么时候交接的 Python 条件）、changes（改动与评估账本）、proposals（留给维护者的备忘提案）
     """
     from mods.chat import notes
 
@@ -170,6 +120,8 @@ def read_policy(name: str) -> str:
         from mods.chat import agent
 
         return "（tidy 还没单独写，目前用的是默认规则）\n" + agent.DEFAULT_TIDY
+    if name == "opening" and not notes._policy_path(name).exists():
+        return "（opening 尚未创建，目前使用内置开局策略；创建后下一段按文件里的逐行引用载入材料）"
     return notes.read_policy(name) or f"（{name} 还是空的）"
 
 
@@ -178,20 +130,23 @@ def edit_policy(name: str, text: str, reason: str, expect: str) -> str:
     （注：日常笔记用 write_note 改；如果是直接动手改代码文件，改完用 assess_change 留个记录即可）
 
     @param
-    name: self（你对自己的认识，在反思时改；白天跑 `#reflect now` 也能发起）、handoff（交接叮嘱）、global（你的行事经验）、tidy（何时交接的 Python 规则）或 proposals（给维护者的备忘）
+    name: self（你对自己的认识，在反思时改；白天跑 `#reflect now` 也能发起）、handoff（交接叮嘱）、opening（下一段开局材料的逐行引用）、global（你的行事经验）、tidy（何时交接的 Python 规则）或 proposals（给维护者的备忘）
     text: 更新后的完整内容；空串表示清空
     reason: 是什么经历或问题触动你做这个改动的（写清归档段名、聊天时刻或行动号等证据，区分确定的事和推测）
     expect: 改完之后期待看到什么变化，写成下次自己回头看时能核对的样子
     """
     from mods.chat import notes
 
-    if name not in ("self", "handoff", "global", "tidy", "proposals"):
-        return "edit_policy 是用来改 self、handoff、global、tidy 或 proposals 这几份核心策略的；普通笔记直接用 write_note，改代码后记账本用 assess_change"
+    if name not in ("self", "handoff", "opening", "global", "tidy", "proposals"):
+        return "edit_policy 是用来改 self、handoff、opening、global、tidy 或 proposals 这几份核心策略的；普通笔记直接用 write_note，改代码后记账本用 assess_change"
     if name == "self":
-        from mods import chat, context
+        from mods.tools import current_binding
 
-        turn = context.get_turn(chat.AGENT_WINDOW)
-        if turn is None or getattr(turn, "log", {}).get("kind") != "反思":
+        try:
+            reflecting = current_binding()["run"]["kind"] == "reflect"
+        except (RuntimeError, KeyError):
+            reflecting = False
+        if not reflecting:
             return "self 牵动全局，留到静下心反思时再改吧；现在的念头可以先记进 recent 或 todo。要是此刻非改不可，跑一下 send_command(\"#reflect keep\") 保留当前上下文进入反思就能改了"
     if name == "tidy":
         from mods import op
