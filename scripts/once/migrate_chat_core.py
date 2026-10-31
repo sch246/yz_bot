@@ -348,8 +348,10 @@ class Import:
                 for position, result in enumerate(returns):
                     try:
                         call_position = result["position"]
+                        if type(call_position) is not int or not 0 <= call_position < len(ids):
+                            raise ValueError()
                         call_id = result.get("tool_call_id") or ids[call_position]
-                        if call_id not in ids or call_id in answered:
+                        if call_id != ids[call_position] or call_id in answered:
                             raise ValueError()
                         if result["name"] != calls[ids.index(call_id)]["function"]["name"]:
                             raise ValueError()
