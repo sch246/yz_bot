@@ -71,19 +71,19 @@ uv run --frozen python run.py --smoke
 | 记录 | 回答什么 | 只在这里有的 | 保留 |
 |---|---|---|---|
 | `chatlog/` | QQ 上发生了什么 | 没进模型画面的消息、通知、发送回声 | 一直留 |
-| `data/event_stream/`（`oplog`） | 她做了什么、消息怎么登记 | 到达、激活、通知确认、已读、行动号与结果的对应；`read_actions` 读它 | 一直留；启动时整份重放，只留未读、未确认通知和她的输出与结果（不含思考） |
-| `data/context/current.json` 与 `archive/` | 她当时看到了什么、想了什么 | 实际进上下文的材料和顺序、段边界、思考（默认 `keep` 时）、潜意识提醒的基准（`settled`／`nudged_at`）；她 compress 收掉的片段原样在 `archive/*-folded.json` | 一直留，按段归档 |
-| `data/context/subconscious.json` 与 `archive/*-subconscious.json`（旧） | 旧版潜意识自己那条上下文 | 2026-10-25 起不再读写；盘上还留着的只作历史 | 可留可删 |
+| `data/chat/journal/YYYYMMDD.jsonl` | 她看过、想过和做过什么 | 稳定编号、原样模型消息、来源、输出与逐个工具结果；`read_actions/read_context` 读取 | 一直留，只追加；中断尾部保留证据后恢复 |
+| `data/chat/view.json`、`view.bak.json` 与 `views/<ctx>.json` | 她眼前放了什么、哪些已经归档 | 有序条目引用、fold/drop 关系与运行统计；归档冻结视图 | 一直留，按段归档 |
+| storage `agent.read` | 哪些窗口记录已被模型确认读过 | 连续位置、同秒身份、待确认与排除例外；dismiss 退回对应确认 | 持久保存；计数和展示边界为派生 |
 | `log/llm.log`（`yz.llm.request`） | 每次请求发了什么 | 每次请求末尾的临时提示（待办、未读数、时间）；同一段里已经记过的前缀不再重复打印，只写"前 N 条已经记过" | 7 天 |
 | `data/notes/.history/` | 笔记改写或删除前是什么样 | 每个旧版本 | 一直留 |
-| `data/notes/years.md` | 以前交接归档过哪些段 | 每段归档时追加一行的年鉴摘要（起止时间、条数、结束原因），新段开头展示最近 8 段 | 一直留 |
-| `data/context/loop.jsonl` | 她给连续循环写过哪些备注 | 每次写下备注的时间、轮次和原文，供 `loop_note_history` 反查 | 一直留，可由 `clear_loop_note` 清空 |
+| `data/notes/years.md` | 以前交接归档过哪些段 | 每段归档时追加一行的年鉴摘要（起止时间、条数、结束原因），默认开局展示最近 8 段 | 一直留 |
+| journal 的循环备注条目与 `me` 的实际唤醒记录 | 她给循环写过什么、何时醒过 | `loop_note_history` 查 journal；`read_log("me")` 查已发生理由 | 记录保留；loop/wait 排期只在内存 |
 | `data/storage/window_titles.json` | 她给窗口起的名字 | `set_name` 设定的窗口自定义称呼（优先于群名和昵称） | 一直留 |
 | `data/usage/YYYY-MM-DD.jsonl` | 每次模型调用（含 `describe_image` 旁路视觉调用）花了多少 token | 按天记录每次调用的时间、模型、`prompt`、`completion`、`cached` token 数 | 滚动保留 30 天 |
 | `data/bili/credential.json` | B 站登录凭证 | 柚子 B 站号的 cookie（权限 600）；已读位置、昵称和"评论属于哪一楼"在 storage `bili/state` | 一直留，失效后重新 `.bili login` |
 | `data/notes/policy/changes.md` | 策略为什么改、改了有没有用 | 原因、预期和评估；只往后追加，追加不备份 | 一直留 |
 
-"一直留"的几份都没有自动清理，会随使用增长；查体积用 `du -sh chatlog data/event_stream data/context data/notes/.history`。
+"一直留"的几份都没有自动清理，会随使用增长；查体积用 `du -sh chatlog data/chat data/notes/.history`。
 
 落盘的每行都带归属：一个 filter 在写文件前从 `context` 读当前事件，群聊补 `[g<群号> u<QQ>]`、私聊补 `[u<QQ>]`，没有当前事件就什么都不补（行的形状与之前一致）。**没有任何调用点需要传参**，现有和以后的日志调用都自动带上，这也是它做成 filter 而不是参数的原因。终端不显示归属：终端是状态面，保持产出者自己选的形状。
 
@@ -225,11 +225,24 @@ op 工具集的 `send_command` 是第三条同类入口，但它不走 `bot.recv
 - 退出前的“重启中/关闭中”会等待发送 Future 完成；下次启动的“重启完成/醒了”只排入发送队列，钩子文件随即删除，不保证 NapCat 已确认送达。
 - 反复打印连接错误通常先检查 NapCat 的 API 端口；监听端口被占用会在导入 HTTP 连接器时直接失败。
 - 某个命令导入失败会打印 traceback；若由 `.reboot` 发起且问候文件仍在，加载器还会把失败命令列表发回原窗口。
-- 重启后的“续话”：`.reboot` 仍记录发起者是否为 Bot 自己；它可在启动完成后触发一次 `chat.chat()`，但现在领取的是同一个中心 reader，不再恢复某窗口独占的主会话。启动后的未确认通知和未读成员由 `oplog` 恢复；已登记的工具结果只在普通已读历史中重建，不独自唤醒。已确认通知留下的未读不会仅因重启自动唤醒或自动拉取，已登记输出的工具也不会自动重放。人自己执行 `.reboot` 不因该命令单独续话；恢复在 `mods.wait_booted()` 后运行。
+- 重启后的“续话”：`.reboot` 仍记录发起者是否为 Bot 自己；它可在启动完成后触发一次 `chat.chat()`，但现在领取的是同一个中心 reader，不再恢复某窗口独占的主会话。启动后 attention 从 chatlog 与 `agent.read` 恢复有效未确认召唤；已登记工具结果保留在 journal，不独自唤醒，工具动作不会自动重放。人自己执行 `.reboot` 不因该命令单独续话；恢复在 `mods.wait_booted()` 后运行。
 - 离线补回（`mods/_backfill.py`）在监听新事件前冻结已有窗口的 chatlog 锚点，单个窗口准备失败只记日志、不阻止必需的实时监听。没有可靠锚点的窗口不补。启动后两个后台线程按 NapCat `message_seq` 分批往回请求，持续追到命中锚点、上游确实耗尽或请求链失败，不用请求次数或时间阈值伪造终点，短的非空响应也不是远端尽头。每一页按时间插进普通日档（会改写那一天的文件，走临时文件加 `os.replace`），已在日档里的同号同秒消息跳过，补回后再实时到达的同一条也不重写。其中实时到达会叫醒她的（at、名字开头、私聊对方发来的）登记为激活的到达，唤醒原因写「离线时叫你」，一个窗口补完叫一次；别的补回消息不算未读、不唤醒。中断或没遇到锚点只在终端日志里留一条警告，已写入的页保留；下次开机的锚点是最新的本地消息，所以不会续补这段缺口。尚未对真实停机空窗做端到端验收，不应仅凭 smoke 宣称上游历史无缺。
 
-中心 agent 已于 2026-10-22 切换到同一段追加式上下文主循环（见[无状态主循环提案](working/proposals/stateless-agent-loop.md)）；全局设置与显式目标工具、正式工具状态 input、撤回与回声、图片 Files API 及离线补回均已接线运行。旧兼容与生产数据处理的只读清单见[第二轮调查](working/round2-legacy-and-backfill-audit.md)，并未获得旧遗留数据清理授权。
+中心 agent 当前源码已切换为 journal、编号视图、单一读状态和统一 run，具体见[LLM 文档](llm.md)。本次交付在隔离临时根目录完成合成验收；生产停机、真实数据转换和启动尚未执行。旧兼容与生产数据处理的[第二轮调查](working/round2-legacy-and-backfill-audit.md)保留为历史证据。
 - 自动重启循环不等于自动修复。持续崩溃时先保存终端 traceback，避免通过高风险聊天入口继续扩大状态变化。
+
+## 聊天核心离线转换
+
+新代码启动只读取 journal/view/read 路径。部署前停止旧 Bot，以完整离线 runtime root 运行一次性转换；脚本不会替你停止进程，锁只防止两个转换器并发。详细保护、阻断条件和恢复步骤见[转换说明](../scripts/once/README.md)。
+
+```sh
+uv run --frozen python scripts/once/migrate_chat_core.py --runtime-root /absolute/offline-root
+uv run --frozen python scripts/once/migrate_chat_core.py --runtime-root /absolute/offline-root --apply
+```
+
+默认 dry-run 在临时目录重建并演练，源不写入；apply 先备份与逐文件校验，再切换。旧 owner 移入 `data/legacy/chat-core-v1/data/`，备份、准备目录与 manifest 在 `data/migrations/chat-core-v1/`。重复运行返回 already-migrated；源损坏、元数据缺口、来源不唯一或转换期间变化会阻止有损应用。中途失败按写前记录恢复；进程强退后维持停机并按说明使用 `--apply --rollback`，完整迁移不通过该命令撤销。
+
+转换保留正式编号、原消息、当前笔记版本、wake/草稿/read 快照、screen 身份与 fold 关系；无法分解的旧冻结历史明确记 legacy 来源。follow/mute/on 与全局工具 active 保留，旧 wait 删除、loop 运行态清空，schema 顺序转入视图。现场旧公开名只报告文件和行号，维护者处理引用。迁移接口的合成 dry-run/apply/重复运行验证不等于生产迁移完成。
 
 ## 图片缓存硬切迁移
 
@@ -284,7 +297,7 @@ Mods 两阶段加载已经成为当前架构。多项目共存、storage 值校�
 
 以下目录或文件属于真实运行状态，不是测试夹具：
 
-- `data/`：storage、`pyload.py`、临时文件和功能数据，包括 `data/context/`（她的上下文原样，含思考和工具结果）与 `data/notes/`；
+- `data/`：storage、`pyload.py`、临时文件和功能数据，包括 `data/chat/`（经历日志与编号视图，含思考和工具结果）、迁移 legacy/备份与 `data/notes/`；
 - `chatlog/`：真实群聊和私聊记录；
 - `log/`、`app.log*`：流日志与应用日志，`log/llm.log` 带聊天正文、提示词和工具参数；
 - `config.json`、`.env*`、密钥文件：账号、服务和模型配置；

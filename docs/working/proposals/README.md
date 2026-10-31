@@ -13,19 +13,19 @@
 - [数组消息格式迁移](array-message-format.md)（长期方向，尚未切换 NapCat 或迁移 CQ 字符串消费者）
 - [LLF 纯文本工具调用迁移](llf-tool-protocol.md)（长期方向，尚未替换原生工具调用与结果协议）
 - [可自维护的同相上下文](self-maintaining-context.md)（研究提案；中心主体与 reader 已部分落地，当前分开追问系统能力上限与可逆实践反馈；其余外显状态转移和自修改仍待证；[讨论来源与演化索引](self-maintaining-context-discussion.md)保留原话与修正链）
-- [注意力的整理：分层前缀、潜意识与分支](attention-and-subconscious.md)（讨论形成的提案；dismiss 与说完话自动听已实现，其余未实现：真正的问题是谁来整理她的注意力；按变化快慢分层，树干每晚重建、白天新增放末尾，潜意识共享前缀缓存在她每轮之后整理，分支和地图是整理者的元视角；第 10 节是最小验证与停止条件）
+- [注意力的整理：分层前缀、潜意识与分支](attention-and-subconscious.md)（历史研究与实验；当前 dismiss/fold/压力机制由[最终规格](../tasks/chat-core-rewrite/spec.md)替代，分支研究未因此实现）
 - [长期记忆离线回放实验](memory-replay-evaluation.md)（实施中；现分开验证系统是否允许运行中产生的改进被后续真实消费，以及怎样通过可逆重放形成实践反馈；固定召回指标只作诊断，所有发送与运行数据隔离）
 - [记忆估值与索引演进](memory-valuation-and-index-evolution.md)（研究提案；把 MDL、压缩进步、结构可达、实际路径和使用结果作为需要分别解释的派生观察，先离线校准，不自动晋级、淡出或删除记忆）
 - [记忆与自我演化研究地图](memory-and-self-evolution-research.md)（外部研究记录，不是运行合同；区分论文证据、本项目迁移推论和适用边界，串起长期记忆、经验 Skill、任务层学习与元层改进）
 - [QQ Bot 持久记忆实现调查](qqbot-persistent-memory-research.md)（公开源码调查；复核 SLA 收录，区分视频 QQ-agent、dsh-qqbot 与宿主机制，记录 Bili Note 的持久安装与字幕覆盖限制）
 - [记忆、预测与统一事件流：基础问题讨论](memory-foundations-discussion.md)（讨论记录，不批准实现；保留预测、编码器、二阶惊奇与可达性的工作假设；2026-10-08 第十四节记录全文补读后的变化：条件推断、表征持续、潜在情境信用与学会推断；2026-10-28 第十五节记录第一性原理对谈：认知物理类比、目的论信息论与多尺度探测算子，未替维护者决定结构）
 - [上下文、预测与通透](context-prediction-and-permeability.md)（2026-10-29 至 31 讨论记录；从预测、确信／阴与通透／阳，续至组合缓存、必要串行和范围内穷尽；新增感性表达的目的、滋养与裁剪，按洞察保留来路及对 Codex 的纠正，未决定实现）
-- [中心 agent 重写：经历日志、视图与内存里的注意力](chat-core-rewrite.md)（2026-10-31 提案，未实现；维护者要求的激进方案：给她看过的消息只写一次进日志，上下文是一串编号，dismiss/compress/decompress/交接都是改编号列表；oplog、记号与三套折叠删除；所有模型调用走一个 `run`，分身按引用组装；短期唤醒全在内存、重启即清；待拍板项见第 8 节）
+- [中心 agent 重写提案](chat-core-rewrite.md)（实施前历史；已由[最终规格](../tasks/chat-core-rewrite/spec.md)裁定并完成本轮代码交付，生产迁移另行执行）
 - [Blueprint 与 Agent Soul 调查](blueprint-and-agent-soul-research.md)（2026-10-31 公开源码研究；核对任务展开、跨节点成果发布与条件汇聚，以及原文追溯、增量索引和记忆更新的实际边界，供上下文讨论参考）
 - [多维概念记忆设计草案](concept-memory-design.md)（设计草案；针对表情包初见失忆与缺乏白盒记忆，以 Markdown 作为唯一语义真相源，建立概念交点网络；Phase 1 聚焦像素/感知哈希近似重复识别与附加式中性标注，Phase 2 拓展角色级语义再认；经草籽与柚子审阅精简）
 - [分舱隔离与概念生命周期](concept-lifecycle-and-compartment-memory.md)（设计草案；基于草籽与柚子 2026-10-29 对谈，反思外部 AI 记忆方案，确立「两次相遇」笨办法生命周期与「船体分舱」上下文硬隔离原则，协同 wait 自主呼吸闭环）
 - [记忆基础问题综述](memory-foundations-survey.md)（外部研究综述，不批准实现；按开放问题组织文献，记录 20 项预测编码题单的全文阅读版本与补充缺口；区分推断能力、条件性数学结论、神经证据和聊天记忆迁移，并提出候选证伪实验）
-- [无状态主循环：每次唤醒重建上下文](stateless-agent-loop.md)（第一版已实现、未部署；维护者已裁定方向：参照 QQ-agent、SLA 与 retro，以“每次重建上下文、召回由她自己做、放下由图书管理员做”取代重放经历流，统一 chatlog 与模型可见格式、读消息直接读文件，并列出随之移除的覆盖、反查与聊天软件式阅读机制）
+- [无状态主循环](stateless-agent-loop.md)（历史方案与维护者裁定；同段追加和交接的来路保留，当前存储/读状态/执行入口见[最终规格](../tasks/chat-core-rewrite/spec.md)）
 - [可编程经历数据](programmable-experience-data.md)（实施计划；复用现有 `exec_code`，先以磁盘惰性迭代验证模型能否自由查询和自审，不新增 world/snapshot/记忆 manager，也不把全量历史放进内存）
 - [检索索引：把子代理找过的路存下来](retrieval-index.md)（未实现；缓存子代理的检索路径而不是结论，失效判据由模型自写的校验命令给出）
 - [统一信息流：读时编号与完整输出事件](unified-event-stream.md)（已提交读时编号、受限首层覆盖和反查，最新代码尚未部署；长期退休暂缓，不要求 LLF）
@@ -43,7 +43,7 @@
 - [权限演进](permissions.md)（部分已实现；**模型工具已按 Bot 自身固定权限运行**，不因阅读消息改变；显式代行按被代行者判权，但不能借人类 op 取得 Bot 自身没有的权限；其余演进方案尚未实施）
 - [多项目共存](multicore.md)
 - [模型选择的宽松解析与在线模型列表](model-selection.md)（已实现；未登记的模型照常调用，`#models` 先问对端、取不到才用本地配置）
-- [事件流核心：所有来源都是窗口](event-stream-core.md)（提案，第 1–4 步已实现（第 3 步改成 system/user 分角色；第 4 步清理旧条目、补漏直接写进 chatlog）；第 5 步 B 站已写、待真账号验收；窗口从群和私聊放开到任意种类，记录都在 chatlog，`chat.push` 写入并叫醒，闹钟进她自己的 `me` 窗口；轮次边界插话；画面装进 Cortico 式专用框；清理旧阅读模型的条目）
+- [事件流核心：所有来源都是窗口](event-stream-core.md)（窗口与 me 的历史实施记录；oplog、读位置与调度部分由[最终规格](../tasks/chat-core-rewrite/spec.md)替代）
 - [op 工具集与事件注入](op-toolbox.md)（未实现；op 专属工具集：把事件交给唯一事件循环的注入原语，以及「开一轮聊天」的续话原语——`.reboot chat` 是后者的第一个消费者）
 - [窗口级 `#hint`](chat-hint.md)（已实现；给聊天窗口存一段可配置代码（本质是文本管理），聊天循环停止时求值并发送——用于显示已用上下文这类运行状态，也让用户看到循环停没停）
 - [浏览器、计算机使用与远程操作](browser-computer-remote.md)（未来支线备忘，不是当前提案；保存已有家底、外部调查入口和以后进入实现前需要验证的问题）

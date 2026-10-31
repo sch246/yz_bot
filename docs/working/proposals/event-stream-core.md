@@ -1,5 +1,8 @@
 # 事件流核心：所有来源都是窗口
 
+> **已被后续规格替代（2026-10-31）**：[经历日志、视图与上下文运行](../tasks/chat-core-rewrite/spec.md)。本文保留窗口种类、push、me 与角色投影的来路；其中 oplog、读位置与调度说明已被后续实现替代。 现行行为见[LLM 文档](../../llm.md)，本轮代码交付不表示生产迁移已经执行。
+
+
 > 状态：**提案，第 1、2 步已实现**（2026-10-23：窗口种类、`chat.push`、`me` 窗口，见 `mods/chat/windows.py`；轮次边界插话，见 `agent._late_arrivals`）；第 3 步已实现，改成了 system/user 分角色（`view.outside`）；第 4 步已实现（清理旧条目，见 `mods/oplog/replay.py`；补漏直接写进 chatlog，见 `mods/_backfill.py`、`chatlog.insert_recovered`）；第 5 步 B 站部分已写好、未经真账号验收（`mods/bili.py`、`mods/tools/bili.py`），手机未做。当前事实以 [运行架构](../../architecture.md)、[交互模型](../../interaction-model.md) 与 [LLM 文档](../../llm.md) 为准。
 >
 > 来源：维护者 2026-10-23 指出 [Cortico](https://github.com/Pal-AI-Lab/Cortico) 的事件流核心值得参考，希望柚子以后能"玩手机"（[phone-mcp](https://github.com/pinganbbOvO/ai-companion-kit/tree/main/packages/phone-mcp)）、刷 B 站和评论区互动、给自己埋各种唤醒。
