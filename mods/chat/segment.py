@@ -18,6 +18,8 @@ Source metadata on journal rows:
 * screen: window: str, shown: list[record identity], read_patch: opaque dict,
   follow_ids: list[identity], wake_id: str.
 * note: scope: str, version: str|float, name: str, wake_id: str.
+  Imported combined note messages instead use note_sources:
+  {scope: {version, name}}; each source maps to the same unchanged row.
 * system: tool_state: dict when it announces tools; wake_id: str.
 * assistant: wake_id: str, step: int (allocated from all tool-call acts in that wake).
 * fold: covers: list[item id], summary: str, level: int.
@@ -298,8 +300,14 @@ def derive(view):
             if label not in info["windows"]:
                 info["windows"].append(label)
     for row in visible:
-        if row["kind"] == "note":
-            info["notes"][row["scope"]] = {"id": row["id"], "version": row.get("version"), "name": row.get("name", row["scope"])}
+        if "note_sources" in row:
+            sources = row["note_sources"]
+        elif row["kind"] == "note":
+            sources = {row["scope"]: {"version": row.get("version"), "name": row.get("name", row["scope"])}}
+        else:
+            sources = {}
+        for scope, source in sources.items():
+            info["notes"][scope] = {"id": row["id"], "version": source.get("version"), "name": source.get("name", scope)}
         if "tool_state" in row:
             info["tool_state"] = row["tool_state"]
         if row["kind"] == "fold":
