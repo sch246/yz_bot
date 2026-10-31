@@ -2,6 +2,7 @@
 
 - [Spec](spec.md)
 - [Map](map.md)
+- [验收记录](acceptance.md)
 - [Decisions](decisions/)
 - [Tickets](tickets/)
 
