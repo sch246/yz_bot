@@ -18,7 +18,6 @@ from pathlib import Path
 from openai import OpenAI
 
 from mods import image, usage, watchdog
-from mods.oplog import PersistenceError, raise_if_failed
 from . import console
 from .models import (
     BYTECAT_PROVIDER_CONFIG,
@@ -918,7 +917,29 @@ class LLMClient:
             reasoning_content=reasoning_content,
         )
 
-    def chat(self, messages: list[dict], tools: list[Tool] | Callable[[], list[Tool]] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None, on_round: Callable[[], list[dict]] | None = None, should_stop: Callable[[], bool] | None = None, hints: Callable[[], list[dict]] | None = None, keep_reasoning: bool = True, on_output: Callable[[dict, list[dict]], str | tuple[str, dict] | None] | None = None, on_results: Callable[[str, list[ToolCallResult], list[dict]], None] | None = None, turn_done: Callable[[], bool] | None = None, on_action: Callable[[str | None], None] | None = None, preserve_native: bool = False, logged: int = 0, reasoning_effort: str | None = None) -> Generator[LLMResponse, None, None]:
+    def chat(
+        self,
+        messages: list[dict],
+        tools: list[Tool] | Callable[[], list[Tool]] | None = None,
+        tool_choice: str | dict | None = None,
+        model: str | None = None,
+        stream: bool = True,
+        description_cache: dict | None = None,
+        do_process_image: bool | None = None,
+        on_round: Callable[[], list[dict]] | None = None,
+        should_stop: Callable[[], bool] | None = None,
+        hints: Callable[[], list[dict]] | None = None,
+        keep_reasoning: bool = True,
+        on_output: Callable[[dict, list[dict]], str | None] | None = None,
+        on_results: Callable[[str | None, list[ToolCallResult], list[dict]], None] | None = None,
+        turn_done: Callable[[], bool] | None = None,
+        on_action: Callable[[str | None], None] | None = None,
+        preserve_native: bool = False,
+        logged: int = 0,
+        reasoning_effort: str | None = None,
+        on_tool_start: Callable[[str | None, dict], None] | None = None,
+        on_tool_result: Callable[[str | None, ToolCallResult, dict], None] | None = None,
+    ) -> Generator[LLMResponse, None, None]:
         # Every message appended below is printed live as it happens, so each
         # further round only logs what it has not shown yet -- usually nothing.
         # *logged* starts past whatever the caller already logged before.
@@ -929,9 +950,6 @@ class LLMClient:
         # WHY: 输出写入失败必须阻止工具派发，否则模型行动已经发生，却没有可反查的来源。
         # 不要退化成"到 N 轮就自动截断"：那会在结论产出之前把前提砍掉。压缩由模型在得出
         # 结论时显式发起，这正是主流 agent 用子代理绕开、而没有正面解决的那件事。
-        #
-        # WHY: 同步结果按模型输出整批登记 R；中心会话若可完整保存原生
-        # assistant/tool 配对就留在 messages，其他模型由 on_round 追加 R 的文本投影。
         while True:
             if should_stop is not None and should_stop():
                 return
@@ -958,8 +976,7 @@ class LLMClient:
                 if should_stop is not None and should_stop():
                     # WHY: 逐 chunk 检查是 ^C 能真正打断生成的地方；close() 关掉底层
                     # HTTP 流，不然请求会一直读到模型自己说完。已经 yield 出去的段落
-                    # 已经发进 QQ 了，收不回来；这里剩下的半条 assistant 消息直接丢弃，
-                    # 因为 chat.chat 每轮都从 history 重建 messages，本轮的列表是一次性的。
+                    # 已经发进 QQ 了，收不回来；未完成的 assistant 消息不进入历史。
                     # 仍有一个够不到的窗口：卡在等待第一个 chunk 时无法打断，要等它到达。
                     response.close()
                     return
@@ -1012,34 +1029,31 @@ class LLMClient:
                 assistant_message["reasoning_content"] = assistant.reasoning_content
             if pending_calls:
                 assistant_message["tool_calls"] = [call for call, _, _ in pending_calls]
-            recorded = on_output(assistant_message, assistant_message.get("tool_calls", [])) if on_output else None
-            output_id = recorded[0] if isinstance(recorded, tuple) else recorded
+            output_id = on_output(assistant_message, assistant_message.get("tool_calls", [])) if on_output else None
             if not keep_reasoning and assistant.reasoning_content is not None and not preserve_native:
                 assistant_message["reasoning_content"] = ""
-            if isinstance(recorded, str) and pending_calls and not preserve_native:
-                references = ", ".join(f"{recorded}#{position + 1}" for position in range(len(pending_calls)))
+            if isinstance(output_id, str) and pending_calls and not preserve_native:
+                references = ", ".join(f"{output_id}#{position + 1}" for position in range(len(pending_calls)))
                 assistant_message["content"] = f"{assistant_message['content']}\n行动引用：{references}"
             messages.append(assistant_message)
 
             if not pending_calls:
-                if isinstance(recorded, tuple):
-                    messages[-1:] = [recorded[1]]
-                elif preserve_native and isinstance(recorded, str) and on_results is not None:
-                    on_results(recorded, [], [])
+                if on_results is not None:
+                    on_results(output_id, [], [])
                 return
             local_output = f"local-{next(_local_outputs)}"
             results: list[ToolCallResult] = []
+            native_results: list[dict] = []
             for position, (call, tool, arguments) in enumerate(pending_calls):
-                raise_if_failed()
                 if should_stop is not None and should_stop():
-                    # WHY: 这是 ^C 够得到的最后一个检查点。工具是同步执行的，原先只在这一批
-                    # 全部跑完之后才有机会看这个标记——于是这批里只要有一个调用卡住，排在它
-                    # 后面的每一个都照跑，^C 迟迟不生效。已经补齐的 tool 消息就留在那儿：这一轮
-                    # 的 messages 随轮次结束丢弃（每轮都从 history 重建），不做半轮修补。
-                    if results and on_results is not None and output_id is not None:
-                        on_results(output_id, results, [])
+                    if on_results is not None:
+                        on_results(output_id, results, native_results)
                     return
                 function = call["function"]
+                # WHY: 每次派发先登记意图，结果一完成就登记；回调不在工具异常捕获里，
+                # 写盘失败必须停下，不能被伪装成工具结果后继续执行下一项。
+                if on_tool_start is not None:
+                    on_tool_start(output_id, call)
                 # WHY: 登记这次调用期间 spawn 的子进程，^C 才能真的把它们 kill 掉（卡住的
                 # grep 就是这一类）。有意**不**登记本线程：工具写到一半时被掀翻，换来的不是
                 # "停住了"而是"半成品"。见 mods/watchdog。
@@ -1047,51 +1061,52 @@ class LLMClient:
                 try:
                     if on_action is not None:
                         on_action(f"{output_id if output_id is not None else local_output}#{position + 1}")
-                    content = str(tool.call(**arguments))
-                except PersistenceError:
-                    raise
-                except Exception as error:
-                    if self.strict_tools:
-                        raise
-                    content = f"工具调用失败: {type(error).__name__}: {error}"
-                    console.error(f" -> {content}")
-                else:
-                    console.message(f" -> {content}", "tool")
+                    try:
+                        content = str(tool.call(**arguments))
+                    except Exception as error:
+                        if self.strict_tools:
+                            raise
+                        content = f"工具调用失败: {type(error).__name__}: {error}"
+                        console.error(f" -> {content}")
+                    else:
+                        console.message(f" -> {content}", "tool")
                 finally:
-                    if on_action is not None:
-                        on_action(None)
-                    watchdog.end(job)
+                    try:
+                        if on_action is not None:
+                            on_action(None)
+                    finally:
+                        watchdog.end(job)
                 result = ToolCallResult(call["id"], function["name"], function["arguments"], content)
+                native_result = {"role": "tool", "tool_call_id": result.tool_call_id, "content": result.content}
                 results.append(result)
-            native_results = [{"role": "tool", "tool_call_id": result.tool_call_id, "content": result.content}
-                              for result in results]
-            messages.extend(native_results)
-            if on_results is not None and output_id is not None:
+                native_results.append(native_result)
+                messages.append(native_result)
+                if on_tool_result is not None:
+                    on_tool_result(output_id, result, native_result)
+            if on_results is not None:
                 on_results(output_id, results, native_results)
-            if isinstance(recorded, tuple):
-                # WHY: A tuple means this output cannot be reconstructed as a
-                # native pair; replace its execution carrier with the text view.
-                if not any(message is assistant_message for message in messages):
-                    raise RuntimeError("执行行动期间丢失模型输出载体，拒绝后续请求")
-                native_ids = {id(message) for message in native_results}
-                messages[:] = [recorded[1] if message is assistant_message else message
-                               for message in messages if id(message) not in native_ids]
             logged = len(messages)
-            # WHY: 这是「这一轮的活干完了」的检查点，和 should_stop 是**两件事**，别合并。
-            # should_stop 是 ^C：外面要求立刻停，停下来这一轮就算被取消了；turn_done 是
-            # 工具自己说「我做的这件事就是本轮的最后一件」——轮正常结束。混用会让
-            # chat.chat 外层那句 `if turn.cancelled: return` 把正常结束误判成被取消，于是
-            # 不再去看 trigger，等着续跑的那一轮就被丢掉。
-            # WHY: 一批里一个工具声明结束，也须先把整批已完成结果交给 on_results 持久保存；
-            # 正常结束不会为了读这批结果强迫立即续轮；下次只按普通历史读取。
-            # WHY: 这一层不认识任何具体工具。谁有资格结束一轮、凭什么结束，全在调用方，
-            # 见 mods/chat 给它的那个闭包。这里只问一句「完了吗」。
+            # WHY: 调用方声明正常结束时，本批结果也必须先留下；不为了读这批结果
+            # 强迫立即续轮，下次按普通历史读取。
             if turn_done is not None and turn_done():
                 return
 
 
 class Chat:
-    def __init__(self, model: str | None = None, messages: list | None = None, functions: dict | list | None = None, chat_client: LLMClient | None = None, recall_func: Callable | None = None, description_cache: dict | None = None, do_process_image: bool | None = None, reasoning_effort: str | None = None) -> None:
+    def __init__(
+        self,
+        model: str | None = None,
+        messages: list | None = None,
+        functions: dict | list | None = None,
+        chat_client: LLMClient | None = None,
+        recall_func: Callable | None = None,
+        description_cache: dict | None = None,
+        do_process_image: bool | None = None,
+        reasoning_effort: str | None = None,
+        on_tool_start: Callable[[str | None, dict], None] | None = None,
+        on_tool_result: Callable[[str | None, ToolCallResult, dict], None] | None = None,
+        on_action: Callable[[str | None], None] | None = None,
+    ) -> None:
         self.chat_client = chat_client
         self.model = model or (chat_client.config["default_model"] if chat_client else None)
         self.recall_func = recall_func
@@ -1121,10 +1136,12 @@ class Chat:
         # keep/drop 控制本轮工具循环的思考字段。
         self.keep_reasoning: bool = True
         self.preserve_native: bool = False
-        self.on_output: Callable[[dict, list[dict]], str | tuple[str, dict] | None] | None = None
-        self.on_results: Callable[[str, list[ToolCallResult], list[dict]], None] | None = None
+        self.on_output: Callable[[dict, list[dict]], str | None] | None = None
+        self.on_results: Callable[[str | None, list[ToolCallResult], list[dict]], None] | None = None
+        self.on_tool_start = on_tool_start
+        self.on_tool_result = on_tool_result
+        self.on_action = on_action
         self.active_action: str | None = None
-        self.reads_window_mail = False
         self.fail_fast = False
         # How many leading messages an earlier request already put in the request
         # log; a caller resuming a stored conversation sets it so they are not
@@ -1199,12 +1216,19 @@ class Chat:
             except RequiredContextError:
                 raise
             except Exception:
+                if self.fail_fast:
+                    raise
                 # 一个 provider 坏掉不该让整轮聊天失败：它提供的是补充上下文，不是主体。
                 _log.exception("context provider failed")
                 continue
             for value in produced:
                 collected.append(value if isinstance(value, dict) else {"role": "user", "content": str(value)})
         return collected
+
+    def _set_action(self, reference: str | None) -> None:
+        self.active_action = reference
+        if self.on_action is not None:
+            self.on_action(reference)
 
     def get_tools(self) -> list[Tool]:
         """Build the current request's frozen tool snapshot."""
@@ -1223,8 +1247,14 @@ class Chat:
         def record_output(assistant: dict, calls: list[dict]):
             return self.on_output(assistant, calls)
 
-        def record_results(source: str, results: list[ToolCallResult], native_results: list[dict]) -> None:
+        def record_results(source: str | None, results: list[ToolCallResult], native_results: list[dict]) -> None:
             self.on_results(source, results, native_results)
+
+        def record_tool_start(source: str | None, call: dict) -> None:
+            self.on_tool_start(source, call)
+
+        def record_tool_result(source: str | None, result: ToolCallResult, native_result: dict) -> None:
+            self.on_tool_result(source, result, native_result)
 
         try:
             response = self.chat_client.chat(
@@ -1241,13 +1271,13 @@ class Chat:
                 self.keep_reasoning,
                 record_output if self.on_output is not None else None,
                 record_results if self.on_results is not None else None,
-                # WHY: 工具在这次生成器已经开始以后才会声明完成；直接传 self.turn_done 会把
-                # 开始时的 None 按值交进去，send 后来安装的回调永远到不了检查点。
                 lambda: self.turn_done() if self.turn_done is not None else False,
-                lambda reference: setattr(self, "active_action", reference),
+                self._set_action,
                 self.preserve_native,
                 self.logged,
                 reasoning_effort=self.reasoning_effort,
+                on_tool_start=record_tool_start if self.on_tool_start is not None else None,
+                on_tool_result=record_tool_result if self.on_tool_result is not None else None,
             )
             results = []
             for chunk in response:
@@ -1255,8 +1285,6 @@ class Chat:
                     callback(chunk)
                 results.append(chunk)
             return results
-        except PersistenceError:
-            raise
         except Exception as error:
             if self.fail_fast:
                 raise
