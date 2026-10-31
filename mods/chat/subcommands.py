@@ -40,24 +40,10 @@ _SUBCOMMAND_HELP = (
 #limit reset                清掉全局设置，回落到默认"""),
     ("reflect [now|keep]", """查看上次反思时间，或现在就跑一次反思（管理员）。
 
-默认会先把手上这一段上下文交接掉（归档到 data/context/archive/）；如果加 keep（如 #reflect keep 或 #reflect now keep），则保留当前活跃上下文不交接/不重置，直接进入反思（适合白天调整 self 人设又不希望丢失当前聊天上下文）。
+默认会先把手上这一段上下文交接掉（归档到 data/chat/views/）；如果加 keep（如 #reflect keep 或 #reflect now keep），则保留当前活跃上下文不交接/不重置，直接进入反思（适合白天调整 self 人设又不希望丢失当前聊天上下文）。
 #reflect          显示上次反思时间
 #reflect now      现在就跑一次完整夜间交接与反思（会交接重置上下文）
 #reflect keep     立即进入反思，保留当前活跃上下文不交接/不重置"""),
-    ("loop [on|off]", """查看或开关循环总开关（开关要管理员），默认开。
-
-循环必须由她自己调用 loop("在做什么") 显式开启一串，外部唤醒不再自动挂起空循环。总开关开着时，开启后每次唤醒结束后隔两秒再叫醒她，一轮接一轮；她用 wait(秒数) 隔一会儿再来，用 loop(stop=True) 结束这一串。她一个动作都没做的那几轮，间隔翻倍、最长半小时。夜里整理时停，维护者叫停她那一轮也停。关着时关闭循环功能并停止正在转的这串。
-#loop        显示开关和现在这一串转到第几轮
-#loop on     打开
-#loop off    关掉（正在转的这一串也停）"""),
-    ("subconscious [on|off]", """查看或开关潜意识提醒（开关要管理员），默认开。
-
-不再自动整理：这一段比上次提醒时又长 5 万 token，就在下一轮请求末尾插一条 system 提醒（这一段多长、能收哪几段、各多大）。收不收、收哪段、摘要怎么写都由你自己调 compress；提醒不写进这一段，收掉以后自然不在。
-（compress 和 tidy 都是工具，直接调用，不要用 # 号发）
-compress(first, last=0, summary="")：按序号折叠唤醒（如 first=26, last=27；只收一轮 last 留空或填 0；收至最新之前 last="latest"）或具体子步骤（如 first="28.1", last="28.1"），换成 summary，原文另存成归档段（名字带 -folded）。入参 summary 自动截短保留调用存照，返回折叠层级（L1/L2）、节省 token 与最新占用。最近一次唤醒和这一段第一次唤醒不收。
-#subconscious       显示开关、这一段多长、离下次提醒还差多少、上次提醒
-#subconscious on    打开
-#subconscious off   关掉"""),
     ("decompress [<序号|名称|latest>]", """查看或解压还原当前上下文中被 compress 折叠收起的某段历史（管理员）。
 
 留空列出当前上下文中所有可解压的收起块；指定序号或名称还原原始消息。
@@ -127,7 +113,7 @@ def requires_op(value: str) -> bool:
             return True
         return False
     return (name == "hint" or name == "use_model"
-            or name in {"image", "reasoning", "effort", "limit", "reflect", "awaker", "prompt", "subconscious", "loop", "debounce"} and bool(tail.strip()))
+            or name in {"image", "reasoning", "effort", "limit", "reflect", "awaker", "prompt", "debounce"} and bool(tail.strip()))
 
 
 def _subcommand_help(name: str = "") -> str:
@@ -335,98 +321,14 @@ def _reflect_subcommand(tail: str) -> str:
         shown = datetime.fromtimestamp(last).strftime("%Y-%m-%d %H:%M") if isinstance(last, (int, float)) else "还没有"
         return f"上次反思：{shown}；什么时候自动跑见 #awaker"
     if tail == "now":
-        return "开始夜间交接与反思，反思这一段归档在 data/context/archive/" if _chat_root.reflect_now() else "中心 agent 正忙，稍后再试"
+        return "开始夜间交接与反思，反思这一段归档在 data/chat/views/" if _chat_root.reflect_now() else "中心 agent 正忙，稍后再试"
     if tail in ("keep", "now keep", "keep now", "now --keep-context"):
-        return "开始反思（保留当前上下文不交接/不重置，反思这一段归档在 data/context/archive/）" if _chat_root.reflect_now(handoff=False) else "中心 agent 正忙，稍后再试"
+        return "开始反思（保留当前上下文不交接/不重置，反思这一段归档在 data/chat/views/）" if _chat_root.reflect_now(handoff=False) else "中心 agent 正忙，稍后再试"
     return "reflect 参数错误，可用 #help reflect 查看"
 
 
 def _decompress_subcommand(tail: str) -> str:
-    segment = _chat_root._segment.load()
-    if not segment or not segment.get("messages"):
-        return "当前没有活跃的上下文"
-    body = segment["messages"]
-    blocks = _chat_root._segment.get_folded_blocks(body)
-    if not blocks:
-        return "当前上下文中没有被折叠的收起块（无需解压）"
-    tail = tail.strip()
-    if not tail:
-        usable = "\n".join(f"{i + 1}. {b['name']}（{b['preview'][:60]}）" for i, b in enumerate(blocks))
-        return f"当前上下文中共有 {len(blocks)} 处收起块可解压：\n{usable}\n\n使用 #decompress <序号|名称|latest> 执行解压"
-
-    chosen = None
-    if tail.lower() in ("latest", "-1", "last", "最新"):
-        chosen = blocks[-1]
-    elif tail.isdigit() and 1 <= int(tail) <= len(blocks):
-        chosen = blocks[int(tail) - 1]
-    else:
-        for b in blocks:
-            if tail == b["name"] or tail in b["name"]:
-                chosen = b
-                break
-    if chosen is None:
-        usable = "、".join(b["name"] for b in blocks)
-        return f"找不到指定的收起块「{tail}」；当前可解压的有：{usable}"
-
-    data = _chat_root._segment.read_archived(chosen["name"])
-    if not data or not data.get("messages"):
-        return f"找不到归档段 {chosen['name']} 的原始消息"
-
-    orig_msgs = data["messages"]
-    target_idx = chosen["index"]
-    body = [*body[:target_idx], *orig_msgs, *body[target_idx + 1:]]
-    shift = len(orig_msgs) - 1
-
-    restored_marks = []
-    if "marks" in data and isinstance(data["marks"], list):
-        for m in data["marks"]:
-            restored_marks.append({
-                "last_shown": {},
-                "windows": [],
-                "scopes": [],
-                "told": None,
-                "tokens": None,
-                "notice": None,
-                "boxes": {},
-                "seen": {},
-                **m,
-                "index": target_idx + m.get("index", 0),
-            })
-    else:
-        for offset, msg in enumerate(orig_msgs):
-            content = str(msg.get("content") or "")
-            m_wake = re.search(r"这次唤醒你的是（#(\d+)\s*·\s*([^）]+)）", content)
-            if m_wake:
-                num = int(m_wake.group(1))
-                at_time = m_wake.group(2).strip()
-                restored_marks.append({
-                    "number": num,
-                    "at": at_time,
-                    "time": time.time(),
-                    "index": target_idx + offset,
-                    "last_shown": {},
-                    "windows": [],
-                    "scopes": [],
-                    "told": None,
-                    "tokens": None,
-                    "notice": None,
-                    "boxes": {},
-                    "seen": {},
-                })
-
-    marks = []
-    for mark in segment.get("marks", []):
-        idx = mark.get("index", 0)
-        if idx <= target_idx:
-            marks.append(mark)
-        else:
-            marks.append({**mark, "index": idx + shift})
-    marks.extend(restored_marks)
-    marks.sort(key=lambda m: m.get("index", 0))
-    segment["marks"] = marks
-    segment["messages"] = body
-    _chat_root._segment.save(segment)
-    return f"已成功解压展开收起块 {chosen['name']}：还原了 {len(orig_msgs)} 条消息到当前上下文中"
+    return _chat_root._agent.decompress(tail.strip())
 
 
 def _awaker_subcommand(raw: str) -> str:
@@ -455,7 +357,7 @@ def _prompt_subcommand(raw: str) -> str:
 
 
 def _debounce_subcommand(tail: str) -> str:
-    from mods.chat import debounce as _debounce
+    from mods.chat import attention as _debounce
 
     tail = tail.strip()
     data = storage.get("", "agent")
@@ -468,7 +370,7 @@ def _debounce_subcommand(tail: str) -> str:
         cfg["enabled"] = False
         data["debounce"] = cfg
         storage.save()
-        _debounce.cancel_all()
+        _debounce.cancel("debounce")
         return "debounce: 关"
     if tail.lower() in ("on", "1", "true"):
         cfg["enabled"] = True
@@ -611,18 +513,12 @@ def _status_report(data: dict) -> str:
 
     max_events, threshold = _chat_root.limit()
     segment = _chat_root._segment.load()
-    used = _chat_root._segment.context_size(segment.get("tokens"), segment.get("messages", []))
+    used = _chat_root._segment.context_size(segment["stats"].get("tokens"), _chat_root._segment.render(segment))
 
-    from mods.chat import debounce as _debounce
+    from mods.chat import attention as _debounce
     deb_cfg = _debounce.get_config()
     deb_mode = "on" if deb_cfg.get("enabled") else "off"
     deb_detail = f"等待 {deb_cfg['idle']:.1f}s，上限 {deb_cfg['max']:.1f}s" if deb_cfg.get("enabled") else "已关闭"
-    loop_switch = "on" if _chat_root._agent.loop_on() else "off"
-    loop_detail = _chat_root._agent.loop_status().replace("loop: on", "").replace("loop: off", "").strip("，")
-    if not loop_detail:
-        loop_detail = "未运行"
-    subconscious_switch = "on" if data.get("subconscious", True) else "off"
-
     obs_cfg = _chat_root._observer.get_config()
     obs_switch = "on" if obs_cfg.get("on", True) else "off"
     obs_model = obs_cfg.get("model", "deepseek/deepseek-flash")
@@ -647,8 +543,7 @@ def _status_report(data: dict) -> str:
         f"#audio {audio}（语音读取：off/lazy/eager）",
         f"#limit {max_events} {threshold}（画面 {max_events} 条，整理阈值 {threshold}；当前段约 {used}/{threshold} token）",
         f"#debounce {deb_mode}（防抖延迟：{deb_detail}；改用 #debounce on/off/<等待秒数> [上限秒数]）",
-        f"#loop {loop_switch}（循环总开关；状态：{loop_detail}）",
-        f"#subconscious {subconscious_switch}（潜意识增长提醒；开关：on/off）",
+        f"pressure 当前约 {used}/{threshold} token，增长提醒和交接策略在 policy/tidy；{_chat_root._agent.loop_status()}",
         f"#observer {obs_switch}（旁观助手；模型: {obs_model}，effort: {obs_effort}，context: {obs_context}，prompt: {obs_custom}）",
         f"#reflect（上次反思：{reflect_str}；立即执行：#reflect now / #reflect keep）",
         f"#awaker（闹钟：{awaker_str}；改写：#awaker set <规则>）",
@@ -785,24 +680,6 @@ def _subcommand(value: str):
         return _reflect_subcommand(tail.strip())
     if name == "decompress":
         return _decompress_subcommand(tail.strip())
-    if name == "subconscious" and not tail:
-        return _chat_root._segment.subconscious_report()
-    if name == "subconscious" and tail:
-        if tail.lower() not in ("on", "off"):
-            return "subconscious 只能是 on 或 off"
-        data["subconscious"] = tail.lower() == "on"
-        storage.save()
-        return f"subconscious: {tail.lower()}"
-    if name == "loop" and not tail:
-        return _chat_root._agent.loop_status()
-    if name == "loop" and tail:
-        if tail.lower() not in ("on", "off"):
-            return "loop 只能是 on 或 off"
-        data["loop"] = tail.lower() == "on"
-        storage.save()
-        if not data["loop"]:
-            _chat_root._agent.stop_loop("#loop off")
-        return f"loop: {tail.lower()}"
     if name == "awaker":
         return _awaker_subcommand(raw)
     if name == "hint":

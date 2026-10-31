@@ -1,10 +1,10 @@
-"""Current event, per-interaction continuations, window locks and LLM turns."""
+"""Current event, per-interaction continuations, and window locks."""
 
 from __future__ import annotations
 
 from queue import Full, Queue
 import threading
-from typing import Any, Callable
+from typing import Any
 
 
 class InteractionCancelled(Exception):
@@ -151,79 +151,6 @@ def event_arrival(event: dict) -> str | None:
             raise RuntimeError("聊天事件没有到达号；不能在 capture 中补造")
         return linked[1]
 
-
-class WindowTurn:
-    """One chat window's in-flight LLM reader and its stop flag.
-
-    WHY: 这里按**窗口**登记，而不是 interaction_key 的 (窗口, 用户)。插话和 ^C 都是
-    任何人可用的：LLM 上下文本来就整个窗口共享，只让触发者能停，群里其他人就无法制止
-    一轮跑偏的生成。这与 _waiters 的粒度不同，所以是另一份登记，不要合并。
-
-    WHY: 未读与激活事实只在 oplog。轮只保留正在执行与是否取消。
-    """
-
-    def __init__(self, key: Any) -> None:
-        self.key = key
-        self._lock = threading.RLock()
-        self._cancelled = False
-
-    def cancel(self) -> None:
-        with self._lock:
-            self._cancelled = True
-
-    @property
-    def cancelled(self) -> bool:
-        with self._lock:
-            return self._cancelled
-
-
-_turns: dict[Any, WindowTurn] = {}
-
-
-def begin_turn(key: Any) -> tuple[WindowTurn, bool]:
-    """Claim *key*'s LLM turn; the second caller joins instead of starting one.
-
-    Returns ``(turn, owner)``.  Only the owner drives the model; the event is
-    already in oplog, so a non-owner has nothing else to do.  This keeps a second
-    at-message from starting a concurrent generation in the same window.
-    """
-    with _lock:
-        turn = _turns.get(key)
-        if turn is not None:
-            return turn, False
-        turn = WindowTurn(key)
-        _turns[key] = turn
-        return turn, True
-
-
-def get_turn(key: Any) -> WindowTurn | None:
-    with _lock:
-        return _turns.get(key)
-
-
-def end_turn(key: Any, turn: WindowTurn) -> None:
-    with _lock:
-        if _turns.get(key) is turn:
-            del _turns[key]
-
-
-def finish_turn(key: Any, turn: WindowTurn, has_work: Callable[[], bool] | None = None) -> bool:
-    """Check pending work and release the turn under one registration lock."""
-    with _lock:
-        if has_work is not None and has_work():
-            return True
-        if _turns.get(key) is turn:
-            del _turns[key]
-        return False
-
-
-def cancel_turn(key: Any) -> bool:
-    """Ask *key*'s running turn to stop at its next checkpoint."""
-    turn = get_turn(key)
-    if turn is None:
-        return False
-    turn.cancel()
-    return True
 
 
 def clear_current() -> None:

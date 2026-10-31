@@ -11,7 +11,7 @@
 - **时限与后台运行**：`timeout` 默认 15 秒。代码跑在一个可中断的子线程里，到点会替你杀掉这次启动的子进程、打断线程，并把已经打印出来的东西交还给你。哪怕代码卡在死循环里，15 秒一到你也能拿回控制权——只是那个卡住的旧线程可能还留在后台，下一次你也许还能看到它留下的痕迹。
   如果你想跑一件不限时的长差事（`timeout=0`），必须配合 `back="wake"` 或 `"quiet"` 放到后台去跑（同步等待模式 `back="wait"` 传 0 会被拦住，免得把你整个卡死）。要按顺序一步步做的事（比如打游戏推摇杆、连点手机），把先后顺序直接写进一段代码里、每一步等结果就行，不用传 0。后台模式会立刻给你回执，等跑完了再把结果塞进你的 `me` 窗口（`quiet` 只塞结果不吵醒你，`wake` 会叫醒你）。
 - **权限与现成家当**：这需要你自身开着 op 权限。环境里已经替你备好了全套家当：`send`/`sendmsg` 发消息，`getname`/`setname`/`getstorage`/`getgroupstorage`/`memberlist` 读写身份与存储，`data` 是持久字典，`prompts` 是提示词集合，`run_action` 触发动作，外加 `os`、`json`、`re`、`time`、`random`、`math`、`datetime` 等常用标准库；`ctx` 字典里装着所有模块，各个 `mods` 也能直接按名字调。拿不准有什么的时候，跑一句 `exec_code("sorted(k for k in globals() if not k.startswith('_'))")` 看看就知道了。
-- **跨时间长线自查**：如果想跨很长的时间查自己的经历，可以加载 `self_inspection` 技能，用 `ctx["oplog"].iter_events(start, stop)` 逐条翻磁盘记录；别为了临时查一次就去新建专用工具，也别去调会把全部历史一口气塞进内存的内部容器。
+- **跨时间长线自查**：如果想跨很长的时间查自己的经历，可以加载 `self_inspection` 技能，用 `ctx["chat"].journal.events(after=start)` 逐条翻磁盘记录；别为了临时查一次就去新建专用工具，也别去调会把全部历史一口气塞进内存的内部容器。
 - **动手前的分寸**：这里不是隔离的沙箱，而是你真实的身体——跑代码会真的发消息、改磁盘、动运行中的状态。动手前先看看有没有现成的工具能用，代码里别写 `input(...)`（那会死等聊天回复）。报错了会给你完整的 traceback，照着改好再试就行。如果某段代码你发现自己老是反复写，就把它做成下面的工具模块留着用，别每次都手敲 `exec_code`。
 
 ## 亲眼看图（attach_image）
@@ -114,7 +114,7 @@ __all__ = ["lookup"]
 
 ## 日常记事、回忆与压缩（经历与笔记）
 
-你每次开口或调工具都会记进 oplog，带一个 `YYYYMMDD-N` 的行动号。白天没放在眼前的记忆，全都由你自己按需翻找和打理：
+你每次开口或调工具都会记进 journal，带一个 `YYYYMMDD-N` 的行动号。白天没放在眼前的记忆，全都由你自己按需翻找和打理：
 
 - **翻聊天原话**：`read_log(window, count, before)` 读任意窗口的原话，`before` 填 `YYYY-MM-DD HH:MM:SS` 可以往前翻旧账。
 - **顺着线索搜**：记得半点线索（名字、话题、某个词）就调 `search(keyword, window, days)`，一次找遍最近聊天、所有笔记、日记和归档上下文；找到位置后再用 `read_log` 或 `read_note` 细看。
@@ -137,7 +137,7 @@ __all__ = ["lookup"]
 
 这是你唯一能让别人听见你说话的方式——你直接写在模型回复正文里的文字，全是你心里的自言自语（虽然会留在你自己的行动记录里，但外面的人一个字也看不见）。每次打字和发送都要写清窗口名字，比如 `target="g<群号>"`、`target="u<私聊QQ号>"` 或 `bili:<BV号>`，别凭感觉盲猜（`me` 是你自己的内置窗口，只能看不能回）。
 
-- **先打字、看一眼、再发送**：`type_word` 会把字放进输入框（想改口就重新调一次覆盖，传空串清空；如果直到这轮结束都没调 `send`，框里的字会自动清空）。同一次输出里刚打的字，不能在同一批里紧跟着 `send`——系统特意让你在打字和发送之间隔一步，好让你先看一眼打字这几秒钟里对方有没有发来新消息。等下一步看清了，再决定是照发、改口还是算了不发。
+- **先打字、看一眼、再发送**：`type_word` 会把字放进输入框（想改口就重新调一次覆盖，传空串清空；草稿会保留到发送或主动清空）。同一次输出里刚打的字，不能在同一批里紧跟着 `send`——系统特意让你在打字和发送之间隔一步，好让你先看一眼打字这几秒钟里对方有没有发来新消息。等下一步看清了，再决定是照发、改口还是算了不发。
 - **分段与发送回执**：在输入框里用空行隔开的几段话，`send` 时会像真人聊天一样，隔一两秒一条、拆成几个气泡依次发出去，并返回消息号（`message_id`）。
 - **wait 控制后续与自主呼吸**：`send` 的 `wait` 参数决定发完这句之后你是继续活动还是挂着喘气：
   - `wait=0`：不等回复，发完直接跑下一轮，手里还有别的事情接着做；
@@ -162,11 +162,6 @@ from typing import Mapping
 from mods.tools import current_binding
 
 
-def _tool_window():
-    from mods import chat, context, history
-
-    session = current_binding().session
-    return chat.AGENT_WINDOW if getattr(session, "reads_window_mail", False) and context.agent_mode() else history.window(context.current() or {})
 # WHY: `back` 显式写进签名，不用函数属性 `.back`：同步模式要在启动前拒绝 timeout=0，
 # 这个判断需要拿到调用方传的 back；属性版只把它交给绑定层，函数自己看不到。后台
 # exec_code 也不走 `_tasks` 的那条单队列：timeout=0 可能真的无限等，排进去会把后面的
@@ -251,7 +246,9 @@ def exec_code(expr: str, code: str, timeout: float = 15, back: str = "wait") -> 
 
 def list_tools() -> str:
     """想看现在有哪些工具和 Skill 可用、哪些已经激活、或者刚改的模块有没有报错时，列出完整的工具目录与当前状态。"""
-    return current_binding().list_text()
+    from mods import tools
+
+    return tools.list_text(current_binding())
 
 
 def reload_tools(names: list[str]) -> str:
@@ -262,7 +259,9 @@ def reload_tools(names: list[str]) -> str:
     @param
     names: 要应用的模块名列表（不带 .py/.md 后缀）；删了源文件的模块也列在这里才会正式卸掉
     """
-    return _format_results(current_binding().reload(names))
+    from mods import tools
+
+    return _format_results(tools.reload(current_binding(), names))
 
 
 def load_tools(names: list[str]) -> str:
@@ -273,7 +272,9 @@ def load_tools(names: list[str]) -> str:
     @param
     names: 要装入的模块名列表（不带 .py/.md 后缀，可从可用工具目录或 list_tools 里看）
     """
-    return _format_results(current_binding().load(names))
+    from mods import tools
+
+    return _format_results(tools.load(current_binding(), names))
 
 
 def read_log(window: str, count: int = 30, before: str = "") -> str:
@@ -375,10 +376,10 @@ def _this_output() -> str | None:
     from mods.tools import current_binding
 
     try:
-        session = current_binding().session
+        state = current_binding()["run"]
     except RuntimeError:
         return None
-    action = getattr(session, "active_action", None)
+    action = state.get("action")
     return action.split("#")[0] if isinstance(action, str) else None
 
 
@@ -483,7 +484,7 @@ def send(
         return (f"{label} 的字是这一步刚打的，你还没看过打字之后到的消息，这一步先不发。"
                 f"下一步看一眼，再决定 send、改还是不发。输入框里现在是：\n{box['text']}")
     if context.agent_mode():
-        current_binding().session.associated_windows.add(window)
+        current_binding()["run"]["associated_windows"].add(window)
 
     wait_mode = "passive"  # "continue" (0), "passive" (-1), "wait" (>0)
     wait_seconds = 0
@@ -539,7 +540,7 @@ def send(
         if wait_mode == "continue":
             pass
         else:
-            current_binding().session.turn_done = lambda: True
+            current_binding()["run"]["end"] = True
         return "写进 me 窗口了：" + "；".join(parts)
     sent = []
     try:
@@ -565,10 +566,10 @@ def send(
     if wait_mode == "continue":
         pass
     elif wait_mode == "passive":
-        current_binding().session.turn_done = lambda: True
+        current_binding()["run"]["end"] = True
         awaker.lift_wait(label)
     elif wait_mode == "wait":
-        current_binding().session.turn_done = lambda: True
+        current_binding()["run"]["end"] = True
         wait_reason = reason.strip() or f"等 {wait_target} 回复"
         dur_label = f"{wait_seconds // 60}m" if wait_seconds >= 60 and wait_seconds % 60 == 0 else f"{wait_seconds}s"
         try:
@@ -581,7 +582,12 @@ def send(
     return "、".join(str(item) for item in sent) if len(sent) > 1 else str(sent[0])
 def _spoke(window: tuple) -> None:
     """She said something: dismiss cannot clear past it."""
-    current_binding().session.last_sent = time.time()
+    from mods.chat import segment
+    from mods.chat.run import write
+
+    state = current_binding()["run"]
+    state["view"]["stats"]["last_sent"] = time.time()
+    write(state, segment.append, state["view"], "speech", persist=state["persist"], sent=True, window=str(window))
 
 
 def write_note(scope: str, text: str) -> str:
@@ -657,8 +663,7 @@ def dismiss(since: str = "", wait: str = "", reason: str = "") -> str:
     from mods import chat
     from mods.chat import awaker
 
-    session = current_binding().session
-    problem = chat.segment.request_dismiss(session, since)
+    problem = chat.agent.request_dismiss(since, validate_only=True)
     if problem:
         return problem
     planted = ""
@@ -667,13 +672,14 @@ def dismiss(since: str = "", wait: str = "", reason: str = "") -> str:
         when = when[5:] if when.startswith("wait ") else when
         try:
             planted = awaker.plant(f"wait {when}", reason.strip() or "接着等回复")
-        except ValueError as error:
-            # 两件事一起成：wait 挂不上就不清，她改好以后再调一次，不会清了却没在等。
-            session.dismiss = None
-            return (f"wait 没挂上（{error}），这次也先不清。写法是 窗口 时长，如 \"g123 10m\"、"
-                    f"\"g123:30001 10m\"；改好再调一次 dismiss")
-    session.turn_done = lambda: True
-    return "这一轮结束后清掉" + (f"；接着等：{planted}（来消息或到点都会叫你）" if planted else "")
+        except (ValueError, OSError) as error:
+            # WHY: waiting and dropping are one intention. A failed wait must
+            # leave both the view and reading untouched.
+            return f"wait 没挂上（{error}），这次也先不清；改好再调 dismiss"
+    problem = chat.agent.request_dismiss(since)
+    if problem:
+        return problem + ("；已经挂好的等待保留" if planted else "")
+    return "这一轮结束后清掉" + (f"；接着等：{planted}" if planted else "")
 
 
 def tidy(note: str = "") -> str:
@@ -686,7 +692,7 @@ def tidy(note: str = "") -> str:
 
     if not chat.agent.request_tidy(note.strip()):
         return "现在没有进行中的唤醒，不需要交接"
-    current_binding().session.turn_done = lambda: True
+    current_binding()["run"]["end"] = True
     return "这一轮结束后交接，之后从新的一段接着做"
 
 
@@ -705,8 +711,7 @@ def compress(first: int | str = 0, last: int | str = 0, summary: str = "",
     """
     from mods import chat
 
-    return chat.segment.request_compress(current_binding().session, first=first, last=last, summary=summary,
-                                         from_time=from_time, to_time=to_time)
+    return chat.agent.request_compress(first, last or first, summary)
 
 
 def decompress(name: str = "") -> str:
@@ -719,13 +724,15 @@ def decompress(name: str = "") -> str:
     """
     from mods import chat
 
-    return chat.segment.request_decompress(current_binding().session, name=name)
+    if chat.current_wake() is None:
+        return "只有主唤醒能展开当前主上下文"
+    return chat.agent.decompress(name)
 
 
 def loop(note: str = "", stop: bool = False) -> str:
     """需要一轮接一轮连续干活（比如打游戏、一步步操控手机）时，开启或更新连续循环，让这一轮结束后自动再叫醒你接着做。
 
-    总开关开着时，你只需用它记下当前正在忙什么、做到哪算完，每轮醒来都会带着这句备忘；中途要等加载或等回复就调 wait(秒数) 歇一会儿，整件事彻底忙完了再传 stop=True 停下。
+    你只需用它记下当前正在忙什么、做到哪算完，每轮醒来都会带着这句备忘；中途要等加载或等回复就调 wait(秒数) 歇一会儿，整件事彻底忙完了再传 stop=True 停下。
 
     @param
     note: 记下正在做什么、做到哪一步算完，如"洛克王国里走到传送点"；随时重调更新
@@ -733,12 +740,11 @@ def loop(note: str = "", stop: bool = False) -> str:
     """
     from mods import chat
 
+    if chat.current_wake() is None:
+        return "只有主唤醒能管理连续循环"
     if stop:
         stopped = chat.agent.stop_loop("她自己关的", rest=True)
         return f"循环关了（转了 {stopped['round']} 轮）" if stopped else "循环本来就没开"
-    session = current_binding().session
-    if getattr(session, "quiet", False) or getattr(session, "segment", None) is None:
-        return "只有醒着处理事情的时候能开循环；交接、反思和子代理里不行"
     if not note.strip():
         return "要写在做什么，例如 loop(\"洛克王国里走到传送点\")"
     chat.agent.start_loop(note.strip())
@@ -757,26 +763,22 @@ def wait(seconds: float | str, reason: str = "") -> str:
     from mods import chat
     from mods.chat import awaker
 
-    dur_seconds = None
+    if chat.current_wake() is None:
+        return "只有主唤醒能安排这次运行的等待"
     if isinstance(seconds, (int, float)):
-        dur_seconds = max(2.0, min(float(seconds), 86400.0))
-        dur_str = f"{int(dur_seconds // 60)}m" if dur_seconds >= 60 and dur_seconds % 60 == 0 else f"{int(dur_seconds)}s"
+        value = float(seconds)
     else:
-        dur_str = str(seconds).strip()
-        parsed = awaker._interval(dur_str)
-        dur_seconds = max(2.0, min(float(parsed or 60.0), 86400.0))
-
-    if chat.agent.wait_loop(dur_seconds) is not None:
-        current_binding().session.turn_done = lambda: True
-        return f"好，这一轮到此为止，{chat.agent.span(dur_seconds)}后再叫你；期间有消息照样叫你"
-
-    # 不在 loop 里时，统一走 awaker 闹钟
-    try:
-        line = awaker.plant(f"{dur_str}", reason.strip() or "歇完了接着干")
-    except Exception as error:
-        return f"设闹钟失败：{error}"
-    current_binding().session.turn_done = lambda: True
-    return f"好，这一轮到此为止，已设闹钟（{line}）；期间有消息照样叫你"
+        value = awaker._interval(str(seconds).strip())
+        if value is None:
+            return "看不懂等待时长；写秒数或 10m、2h"
+    import math
+    if not math.isfinite(value):
+        return "等待时长必须是有限秒数"
+    value = max(2.0, min(value, 86400.0))
+    from mods.chat import attention
+    attention.wait(value, reason.strip() or "歇完了接着干")
+    current_binding()["run"]["end"] = True
+    return f"好，这一轮到此为止，{chat.agent.span(value)}后再叫你；期间有消息照样叫你"
 
 
 def _format_results(results: Mapping) -> str:
@@ -827,7 +829,6 @@ __all__ = [
     "attach_image",
     "set_name",
     "loop_note_history",
-    "clear_loop_note",
 ]
 
 def set_name(window: str, name: str = "") -> str:
@@ -855,14 +856,3 @@ def loop_note_history(last: int = 10) -> str:
     from mods import chat
 
     return chat.agent.loop_history(last)
-
-
-def clear_loop_note(confirm: bool = False) -> str:
-    """清空循环备注的历史记录；系统不会自动清，只有你自己决定。
-
-    @param
-    confirm: 传 True 才真的清，防手滑
-    """
-    from mods import chat
-
-    return chat.agent.clear_loop_history(confirm)

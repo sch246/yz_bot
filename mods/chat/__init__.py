@@ -11,12 +11,12 @@ import time
 import traceback
 from typing import Callable
 
-from mods import context, cq, history, identity, image, llm, log, message, msgs, op, oplog, py, storage, text, thread, tools as tool_modules, usage
+from mods import context, cq, history, identity, image, llm, log, message, msgs, op, py, storage, text, thread
 from mods.capture import capture
 from mods.llm import pricing
 
 
-LOAD_AFTER = ("chatlog", "history", "identity", "image", "llm", "oplog", "storage")
+LOAD_AFTER = ("chatlog", "history", "identity", "image", "llm", "storage")
 
 IMAGE_MODES = ("off", "lazy", "eager")
 IMAGE_MODE_ALIASES = {"0": "off", "1": "lazy", "2": "eager"}
@@ -24,8 +24,7 @@ IMAGE_MODE_ALIASES = {"0": "off", "1": "lazy", "2": "eager"}
 AUDIO_MODES = ("off", "lazy", "eager")
 AUDIO_MODE_ALIASES = {"0": "off", "1": "lazy", "2": "eager"}
 
-# WHY: 历史选项。2026-10-19 起思考只在一次唤醒之内保留，跨唤醒一律不保留（维护者裁定），
-# 这个设置暂时不再影响中心会话，等清理时一并决定去留。
+# keep/drop 只改变模型投影，原思考始终留在经历日志。
 REASONING_MODES = ("keep", "drop")
 REASONING_ALIASES = {"on": "keep", "off": "drop", "1": "keep", "0": "drop"}
 
@@ -45,12 +44,12 @@ llm_config: dict = {}
 # 要给交接本身（整段再加一句交接指令）留出余量，也让"超长卡死"在正常使用里遇不到。
 DEFAULT_MAX_EVENTS = 80
 DEFAULT_TIDY_TOKEN = 500000
-AGENT_WINDOW = oplog.AGENT_WINDOW
+AGENT_WINDOW = ("agent", 0)
 NOTICE_TOKENS = 500
 _cost_lock = threading.Lock()
 # Eager capture is image work reported on the image stream, not chat traffic.
 _image_stream = log.stream("image")
-# 自言自语走 msg 流：和收发消息的回显共用同一把行租约，见 get_handler。
+# 自言自语走 msg 流：和收发消息的回显共用同一把行租约，见 run。
 _self_talk = log.stream("msg")
 # hint 求值失败只记日志，所以它有自己的流，不混进聊天流量。
 _hint_stream = log.stream("hint")
@@ -159,18 +158,18 @@ def reflect_now(handoff: bool = True, wait_seconds: float = 60.0) -> bool:
     with _reflect_lock:
         if _reflect_pending:
             return False
-        current_turn = context.get_turn(AGENT_WINDOW)
-        if current_turn is not None and getattr(current_turn, "log", {}).get("kind") == "反思":
+        current_turn = running_wake()
+        if current_turn is not None and current_turn.get("log", {}).get("kind") == "反思":
             return False
         _reflect_pending = True
 
     def run() -> None:
         global _reflect_pending
         try:
-            _agent.stop_loop("准备反思")
+            _attention.stop_loop("准备反思")
             deadline = time.time() + wait_seconds
             while time.time() < deadline:
-                if context.get_turn(AGENT_WINDOW) is None:
+                if running_wake() is None:
                     break
                 time.sleep(0.5)
             _agent.reflect(handoff=handoff)
@@ -240,13 +239,9 @@ def count_tokens(value: str) -> int:
 
 
 def context_usage(turn=None) -> int:
-    """Estimate the last request's actual stream view when a reader owns it."""
-    if turn is None:
-        turn = context.get_turn(AGENT_WINDOW)
-    captured = getattr(turn, "_chat_usage_tokens", None)
-    if captured is not None:
-        return captured
-    return 0
+    """The last actual request size captured by its running wake."""
+    wake = running_wake() if turn is None else turn
+    return int((wake or {}).get("used", 0))
 
 
 def usage_name(when: datetime | None = None) -> str:
@@ -309,113 +304,6 @@ def _account_side_call(model: str, prompt_tokens: int, completion_tokens: int, c
 llm.on_usage(_account_side_call)
 
 
-def init_chat(
-    session: llm.Chat,
-    messages: list | None = None,
-) -> tuple[tool_modules.SessionBinding, tuple | None]:
-    """Assemble one Chat and return its tool binding and window."""
-    state = {"role": "system", "content": "你是唯一的中心 agent；窗口只是来源与明确发送目标。"}
-    window = AGENT_WINDOW
-    session.set_messages([
-        *get_prompt(),
-        *_view._base_prompt(),
-        state,
-        *(messages or []),
-    ])
-    # WHY: 激活态属于全局会话主体。每轮
-    # 都新建一个 `llm.Chat`，激活只在内存里活着的话，下一轮模型就拿着上一轮
-    # 装载过的名字去调用，而快照里没有——那个调用被丢掉、整轮直接结束，模型连自救的机会
-    # 都没有（2026-09-17 `browser__open_page`）。读写在 `_active_modules`／
-    # `_persist_modules`，理由写在那里。
-    # WHY: 装回不是无限的：超过时限没用过的模块会在 `restore` 里被收掉，并给模型一条
-    # 通告——"只进不出"会让每次 `load_tools` 都永久占着基线消息。判据用的是每个模块最后
-    # 一次被调用的时刻，所以 bind 出来的那个对象要一直拿着，供 `agent._run_agent` 的结果回调上报。
-    binding = tool_modules.bind_session(
-        session,
-        None,
-        registry=None,
-        visible=lambda name, module: (name not in {"baidumap", "dianping"}
-                                      and tool_modules.bot_op_tool_visible(name, module)),
-        persist=_persist_modules,
-        schema_modules=_schema_modules(),
-        persist_schema=_persist_schema_modules,
-    )
-    return binding, window
-
-
-def _activate_chat(
-    session: llm.Chat,
-    messages: list | None = None,
-) -> tool_modules.SessionBinding:
-    """Run the two lifecycle effects owned by one top-level activation."""
-    # WHY: 调用计数与全局工具恢复描述的是「Bot 被激活一次」，不是「有人调用了上下文装配
-    # 函数」。把两者放在同一个入口后，mail 续读与重启接续都明确经过它，单纯
-    # 构造 Chat 则不产生生命周期副作用。顺序仍与迁移前一致：先计数，再装配，再恢复工具。
-    inc_call_count()
-    binding, window = init_chat(session, messages)
-    session.reads_window_mail = True
-    _restore_agent_tools(binding)
-    binding.restore_schema()
-    session.tool_binding = binding
-    session.add_hint(lambda: _agent_hint())
-    # WHY: 工具恢复可能持久化 ttl 回收；它必须先于其余全局设置读取，避免无关的配置异常
-    # 改变这一轮是否完成回收。
-    session.do_process_image = get_image_mode() != "off"
-    session.keep_reasoning = get_reasoning_mode() == "keep"
-    effort = get_reasoning_effort()
-    session.reasoning_effort = None if effort == "default" else effort
-    return binding
-
-
-def _restore_agent_tools(binding) -> None:
-    """把全局 agent 已激活的工具模块装回本次激活；空闲回收挂在同一个动作上。
-
-    WHY: 这一步**不**再交给 `bind_session` 的 `initial_modules` 参数顺带做，虽然那样少一
-    行。装回是一个**生命周期动作**，不是装配的一部分：它发生在「顶层激活」这个时刻，而
-    空闲回收——超过 ttl 没被装入或调用过的模块在这里被收掉，见 `tools.SessionBinding.
-    restore`——挂的是同一个时刻。`_activate_chat` 是唯一调用点，`init_chat` 只负责装配。
-
-    WHY: `tools/agents.py` 那条路仍然走 `bind_session(initial_modules=...)`，不跟着改，
-    因为它传的是**名字列表**而不是 `{名字: 时刻}`：`restore` 于是把每个名字的时刻都当成
-    now，空闲回收在那条路上恒为空操作。子代理只借用「静默装回、不发通告」，没有生命周期
-    含义，把它也卷进来只会让接管时机的那一步多一个不相干的调用点。
-
-    WHY: 空映射时不调用是保留的旧边界；没有名单就不产生恢复写入。
-    """
-    modules = _active_modules()
-    if modules:
-        binding.restore(modules)
-
-
-def get_handler(session: llm.Chat):
-    """The per-chunk sink: self-talk to the terminal, cost to the ledger.
-
-    WHY: 模型写在回复正文里的内容**不发进聊天**。发言仍只能 `type_word` 再 `send`（见
-    `tools/meta.py`；2026-10-23 以前是 `say`）；正文是自己的输出轨迹，记进 oplog，之后以行动记录里的「（自语）」
-    出现。这样模型能记得刚才的计划，但不会把自言自语误当成已发送消息。
-
-    WHY: 但它要打到终端。人得看得见模型在想什么，尤其是在它**忘了发**的时候——那
-    种轮对聊天窗口是完全静默的，终端这一行是唯一的痕迹。用 msg 流而不是另开一个，是为了
-    和 `bot._route`、`message._chatlog_write` 的回显共用同一把行租约，终端顺序才不会乱。
-
-    WHY: 这里不做兜底发送。"正文非空却没发就替它发出去"会把刚删掉的那条旁路原样装
-    回来，而且是隐式的——模型会学会不调 send 照样能说话，`final_call` 那套终止语义随之失效。
-    宁可静默一轮、在终端留下证据。
-    """
-    def handle(chunk: llm.LLMResponse) -> None:
-        if chunk.role == "assistant" and chunk.content:
-            _self_talk.info(f'[{time.strftime("%H:%M:%S")}]【自言自语】{chunk.content}')
-        if chunk.total_tokens:
-            inc_call_cost(session.model, chunk.prompt_tokens, chunk.completion_tokens, chunk.cached_tokens, chunk.requested_at)
-            # 每次调用的真实用量另记一份，归档里那些 tokens 是估的，见 mods/usage.py。
-            usage.log_call(session.model, chunk.prompt_tokens, chunk.completion_tokens,
-                           chunk.cached_tokens, chunk.requested_at)
-            # 这一段有多长以接口报的为准，见 agent._context_size。
-            session.last_usage = (chunk.prompt_tokens or 0) + (chunk.completion_tokens or 0)
-
-    return handle
-
-
 def _window_storage(window: tuple) -> dict:
     """只为把旧 `#hint` 配置搬进文件取本窗口 storage，键就是 `history.window(...)`。
 
@@ -449,23 +337,12 @@ def _agent_hint() -> str:
 
 # 会话主体持久激活的工具模块名，以及各自最后一次被调用的时刻。
 _ACTIVE_MODULES_KEY = "active_tools"
-_SCHEMA_MODULES_KEY = "tool_schema_modules"
-
-
-def _schema_modules() -> list[str]:
-    value = storage.get("", "agent").get(_SCHEMA_MODULES_KEY, [])
-    return [name for name in value if isinstance(name, str)] if isinstance(value, list) else []
-
-
-def _persist_schema_modules(names: list[str]) -> None:
-    storage.get("", "agent")[_SCHEMA_MODULES_KEY] = list(names)
-    storage.save()
 
 
 def _active_modules() -> dict[str, float]:
     """本会话主体上次装着哪些工具模块、各自最后一次被调用是什么时候。
 
-    WHY: 值是使用时刻，`tools.SessionBinding.restore` 靠它决定哪些模块已经空闲太久、
+    WHY: 值是使用时刻，`tools.restore` 靠它决定哪些模块已经空闲太久、
     该在这一轮收掉。旧格式（只存名字的列表）一律当成"就是刚才用过"——那是这份格式之前
     留下的，给它一个完整时限比让它立刻消失更不容易误伤。
     """
@@ -482,7 +359,7 @@ def _active_modules() -> dict[str, float]:
 
 
 def _persist_modules(stamps: dict[str, float]) -> None:
-    """给 `SessionBinding` 的回调：把会话主体的激活集合写回 storage。
+    """给 工具绑定 的回调：把会话主体的激活集合写回 storage。
 
     WHY: 主 reader 的激活是**全局主体**状态，不是单轮状态。
     每轮都新建一个 `llm.Chat`，
@@ -604,7 +481,7 @@ def _hint_evaluate(code: str, window: tuple, turn=None):
     namespace = dict(py.loc)
     namespace["window"] = window
     namespace["usage"] = context_usage(turn)
-    namespace["peak"] = getattr(turn, "log", {}).get("peak", 0)
+    namespace["peak"] = (turn or {}).get("log", {}).get("peak", 0)
     namespace["limit"] = limit()[1]
     return py.eval_last(code, namespace)
 
@@ -621,11 +498,17 @@ def _report_hint_failure() -> None:
 
 def chat(model: str | None = None) -> None:
     event = context.current() or {}
-    window = history.window(event)
-    if window is None:
-        return
-    oplog.ensure_available()
-    _agent._drive_agent(model, window)
+    if history.window(event) is not None:
+        prior = event.get("_chat_model")
+        if model:
+            event["_chat_model"] = model
+        try:
+            wake(event, "wake")
+        finally:
+            if prior is None:
+                event.pop("_chat_model", None)
+            else:
+                event["_chat_model"] = prior
 
 
 def _in_chat_scope(event: dict) -> bool:
@@ -655,19 +538,17 @@ def record_event(event: dict, write: Callable[[], object]) -> object:
     with context.window_lock(window):
         result = write()
         if result is None:
-            return result
-        try:
-            message_id = (event.get("message_id") if event.get("post_type") in ("message", "message_sent")
-                          else None)
-            arrival = (oplog.pending_message(window, message_id, event.get("time"),
-                                             event.get("message_seq")) if message_id is not None else None)
-            if arrival is None:
-                arrival = oplog.arrive(window, event)
-        except oplog.RestoreError:
-            # WHY: The explicit maintenance routes run after chat recording.
-            # An unreadable journal disables agent mail, not .py/.reboot.
             context.remember_arrival(event, None)
             return result
+        try:
+            # Registration is history, not dispatch: commands and links decide
+            # before capture_chat is allowed to claim a summon.
+            arrival = _screen.register(window, event, kind="")
+        except Exception:
+            # WHY: unread state failure disables agent mail, not .py/.reboot;
+            # explicit maintenance routes run after chat recording.
+            _reflect_stream.exception("登记未读失败，仍继续明确命令路由")
+            arrival = None
         context.remember_arrival(event, arrival)
         return result
 
@@ -722,7 +603,7 @@ def _private_from_peer(event: dict) -> bool:
 
     WHY: 维护者 2026-10-23：私聊每次都要先叫「柚子，」太累，私聊每条都叫醒她。话没说完
     就回的问题不靠延迟解决（人可能隔几分钟才想到下一句），靠她的沉默纪律和干活时
-    插进这一段的新消息，见 view._base_prompt 与 agent._late_arrivals。
+    插进这一段的新消息，见 view._base_prompt 与 agent._prepare。
     """
     return event.get("group_id") is None and event.get("user_id") != identity.bot_id()
 
@@ -752,18 +633,6 @@ def _subcommand_call(event: dict) -> Callable | None:
     return lambda value=value: _subcommands._subcommand(value[1:])
 
 
-def cond() -> Callable | bool:
-    """老入口，保持原样返回 callable／bool。
-
-    WHY: 没有删，因为它是公开名字——`.py`、link 动作、`#hint` 里的代码都可能在运行期
-    按名字引用它，而那些引用 grep 不到。新代码请直接用 `activation_signal` 与
-    `_subcommand_call`，这两个各自只回答一个问题。
-    """
-    event = context.current() or {}
-    handler = _subcommand_call(event)
-    return handler if handler is not None else activation_signal(event)
-
-
 def call(data: Callable | bool):
     if callable(data):
         text = str(data())
@@ -780,6 +649,8 @@ def call(data: Callable | bool):
 def capture_chat(event: dict) -> bool:
     # WHY: 两个问题分两次问，不再靠一个返回值的类型来区分。顺序是承重的：子命令先问，
     # 因为它就地执行、既不激活也不进上下文；剩下的才轮到「红点亮不亮」。
+    if msgs.is_msg(event) and msgs.body(event).rstrip() in ("^C", "^c"):
+        return True
     handler = _subcommand_call(event)
     if handler is not None:
         # `#` 子命令不调模型也不进上下文，跟插话无关，照旧就地执行。
@@ -790,50 +661,20 @@ def capture_chat(event: dict) -> bool:
     window = history.window(event)
     if window is None or not _mail_candidate(event):
         return False
-    matched = activation_signal(event)
-    author = history.author(event)
-    # 默认触发器之上的覆盖层（follow／mute／other），见 awaker。它看每条消息，以及别的会叫醒她
-    # 的事件（戳她）；撤回、别人之间的戳一戳不归它管。她自己发的不算。
-    wanted, layer = (_awaker.triggered(window, event, author, matched)
-                     if author != identity.bot_id() and (msgs.is_msg(event) or matched) else (matched, None))
-    # 她给自己埋的「这个窗口来消息就叫我」「等这个人的后续」，见 awaker；覆盖层压不住它们。
-    waited = (_awaker.take_waiting(window, event.get("user_id"))
-              if msgs.is_msg(event) and event.get("user_id") != identity.bot_id() else [])
-    if not wanted and not waited:
-        # WHY: 在防抖等待期内，若同一说话人继续发消息（即便没有 @），重置防抖计时器并合并上下文（参考 MaiBot 机制）。
-        if msgs.is_msg(event) and _debounce.feed(window, author, event):
-            return True
-        # WHY: 被 mute 压住的点名照样返回 True、吃掉这条：放它往下走，后面的
-        # capture_addressed_fallback 认出「柚子，」会直接调 chat()，静音就漏了。
-        return matched
-    kind = ("mention" if msgs.is_msg(event) and _addressed(event, msgs.body(event))
-            else "poke" if msgs.is_poke(event)
-            else "private" if msgs.is_msg(event) and _private_from_peer(event)
-            else "wake" if matched else "")
-    if waited:
-        kind = "；".join(filter(None, [kind, *(f"等到了（{rule['key']}）" for rule in waited)]))
-    if wanted and layer is not None:
-        kind = "；".join(filter(None, [kind, f"覆盖层 {_awaker.describe(layer)}" + (f"：{layer['reason']}" if layer["reason"] else "")]))
-    wake(event, kind)
-    return True
+    with context.window_lock(window):
+        if context.event_arrival(event) is None:
+            return activation_signal(event)
+        notified = _attention.on_record(window, event)
+    # WHY: a muted addressed message must still be swallowed here, or the
+    # addressed fallback below would bypass its cover and wake her anyway.
+    return notified or activation_signal(event)
 
 
 def wake(event: dict | None = None, kind: str = "wake", reason: str = "") -> bool:
-    """叫醒她：带 *event* 时看那条消息所在的窗口，不带时把 *reason* 交给她；False 表示没有可叫的。
+    """Queue an explicit wake; event wakes require its current route registration.
 
-    带消息时 False 是不是聊天消息、已经读过或已经叫过。不带消息时 *kind* 写谁在叫（比如
-    「MC 版本检查」），记进她自己的 `me` 窗口（见 `push`），总是 True。
-
-    WHY: 维护者 2026-10-23：唤醒条件不做成规则文件，但要为更多唤醒方式留一个函数入口。
-    判据各管各的——`activation_signal` 的 at、名字、私聊、戳一戳，以后别的模块、link 或
-    `.py`——判定要叫醒她时都调这里。激活登记在 oplog 里，她正忙时也不丢，这一轮收尾时
-    接上。*kind* 原样出现在她看到的「这次唤醒你的是」里。
-    只能在这条消息的派发过程中调用（capture、link 节点、它触发的 `.py`）：到达号派发完就
-    释放，事后调用 `event_arrival` 会报错。不带消息的唤醒（awaker 规则、她用 exec_code 包在
-    某个函数上的钩子、别的模块）随时可以调。
-
-    WHY: 维护者 2026-10-27（参考 MaiBot 机制）：防抖延迟 3 秒，若同窗口同作者继续发消息则
-    重置计时，最多延至 12 秒。戳一戳、定时唤醒和非 QQ 窗口立即触发，不延迟。
+    WHY: links and .py may explicitly wake her after their own decision. Eventless
+    wakes leave their reason in me, like due rules and each actual loop round.
     """
     if event is None:
         push(_windows.ME, kind, reason or kind, wake=kind)
@@ -841,36 +682,21 @@ def wake(event: dict | None = None, kind: str = "wake", reason: str = "") -> boo
     window = history.window(event)
     if window is None or not _mail_candidate(event):
         return False
-    is_poke = msgs.is_poke(event) or "poke" in kind
-    author = history.author(event)
     with context.window_lock(window):
         arrival = context.event_arrival(event)
         if arrival is None:
             return False
-        pending = next((entry for entry in oplog.unread(window)
-                        if entry["arrival"] == arrival), None)
-        if pending is None or pending["activated"]:
+        pending = _screen.unread(window).get(arrival)
+        if pending is None or pending.get("kind"):
             return False
-        if not is_poke and _debounce.is_debounceable(window) and _debounce.is_enabled():
-            return _debounce.schedule(window, author, arrival, kind, event)
-        # 戳一戳或未开启防抖：立即刷出 pending 防抖队列并就地激活
-        _debounce.flush(window, activate_only=True)
-        oplog.activate(arrival, kind)
-    # `chat()` 按当前事件找窗口，`#hint` 也发回当前事件的窗口；从别处调用时临时换成这条。
-    previous = context.current()
-    context.set_current(event)
-    try:
-        chat()
-    finally:
-        context.set_current(previous)
-    return True
+        return _attention.on_record(window, dict(event, _wake_kind=kind, _wake_reason=reason))
 
 
 def push(window: tuple, author: str, text: str, *, wake: str = "", record_id: str = "") -> str:
     """Put one record into a non-QQ window and, when *wake* names a reason, wake her; returns the record id.
 
     *window* is ``(种类, 目标)`` of a kind registered with `kind`, or ``me``. The record is
-    written to chatlog first and then registered as an arrival, under the window lock,
+    written to chatlog first and then registered as unread, under the window lock,
     the same order QQ messages use; so it shows on her screen, in ``read_log`` and in
     ``search``, stays unread until she has seen it, and survives a restart. *wake* is
     what she reads in "这次唤醒你的是". When she is busy it waits for this wake to end.
@@ -886,29 +712,20 @@ def push(window: tuple, author: str, text: str, *, wake: str = "", record_id: st
     body = str(text).strip("\n")
     if not body.strip():
         raise ValueError("push 的正文不能空")
-    oplog.ensure_available()
     from uuid import uuid4
 
     from mods import chatlog
 
     now = time.time()
     record_id = " ".join(str(record_id).split()) or uuid4().hex[:8]
-    if wake and window != _windows.ME and not _awaker.triggered(window, None, None, True)[0]:
-        # 被覆盖层压住：照样记下、照样未读，只是不叫醒。
-        wake = ""
     with context.window_lock(window):
         chatlog.append_record(window[0], window[1], author, body, now, record_id)
-        arrival = oplog.arrive(window, {"post_type": "push", "time": int(now), "author": str(author),
-                                        "text": body, "id": record_id})
-        if wake:
-            oplog.activate(arrival, wake)
-    # WHY: 叫醒放到别的线程，不在调用方线程里跑完她这一轮（2026-10-23）。调用方是 B 站轮询、
-    # awaker 这类定时线程：同步跑会卡住它们几分钟，一次来几条也只能一条条分开叫醒；她那一轮
-    # 出了错还会算成 push 失败，B 站轮询就把已经写进去的那条再投一遍。现在 push 报错只表示
-    # 记录或到达没写成；激活在 oplog 里，这一轮怎么结束都不丢。
-    if wake:
-        threading.Thread(target=_agent._drive_agent, args=(None, window),
-                         name=f"push-wake-{window[0]}", daemon=True).start()
+        event = {"post_type": "push", "time": int(now), "author": str(author),
+                 "text": body, "id": record_id, "_default_wake": wake}
+        _screen.register(window, event)
+        # WHY: attention only signals a reader thread. push returns when the
+        # record is safe; model failures cannot make a producer redeliver it.
+        _attention.on_record(window, event)
     return record_id
 
 
@@ -988,6 +805,23 @@ def process_incoming_voice(event: dict) -> None:
             _voice.cache_event_voice(event, eager=(mode == "eager"))
 
 
+def migration_problem() -> str:
+    """Existence/manifest check only; old runtime files are never a read fallback."""
+    manifest = Path("data/migrations/chat-core-v1/manifest.json")
+    if manifest.exists():
+        import json
+        try:
+            complete = json.loads(manifest.read_text(encoding="utf-8")).get("status") == "complete"
+        except (OSError, ValueError, AttributeError):
+            complete = False
+        if not complete:
+            return "chat core 迁移未完成；停机后运行 scripts/once/migrate_chat_core.py --runtime-root ABS --apply --rollback 恢复，再检查并迁移"
+    old = any(Path(name).exists() for name in ("data/context", "data/event_stream"))
+    if old and not (_segment.ROOT / "view.json").exists():
+        return "旧经历数据尚未迁移；停机后对离线 runtime root 运行 scripts/once/migrate_chat_core.py --runtime-root ABS，先 dry-run 再 --apply"
+    return ""
+
+
 def on_load(ctx) -> None:
     global settings, prompts, chat_groups, description_cache, llm_config
     from mods import is_available
@@ -996,6 +830,10 @@ def on_load(ctx) -> None:
                if not is_available(name)]
     if missing:
         raise RuntimeError("chat requires available mods: " + ", ".join(missing))
+
+    problem = migration_problem()
+    if problem:
+        raise RuntimeError(problem)
 
     settings = storage.get("", "settings", list)
     prompts = storage.get("llm_system", "prompts")
@@ -1011,38 +849,38 @@ def on_load(ctx) -> None:
 
     threading.Thread(target=resume_recovery, name="napcat-backfill-start", daemon=True).start()
 
-    def resume_pending() -> None:
-        from mods import wait_booted
-
-        if not wait_booted(120):
-            return
-        try:
-            _agent.pick_up_pending()
-        except Exception:
-            traceback.print_exc()
-
-    threading.Thread(target=resume_pending, name="chat-agent-resume", daemon=True).start()
-
-    def start_awaker() -> None:
+    def resume_attention() -> None:
         from mods import wait_booted
 
         if wait_booted(120):
-            _awaker.schedule()
+            try:
+                _attention.start(_agent.notify)
+                _attention.rescan()
+            except Exception:
+                _reflect_stream.exception("恢复注意力失败")
 
-    threading.Thread(target=start_awaker, name="chat-awaker-start", daemon=True).start()
+    threading.Thread(target=resume_attention, name="chat-attention-start", daemon=True).start()
 
 
 def cancel_debounce(window: tuple) -> bool:
-    """Drop active debounce session for *window* (e.g. on ^C)."""
-    return _debounce.cancel(window)
+    return bool(_attention.cancel("debounce", window=window))
+
+
+def running_wake() -> dict | None:
+    return _agent.running_wake()
+
+
+def cancel_wake(window: tuple) -> bool:
+    return _agent.cancel_wake(window)
 
 
 def on_exit() -> None:
-    _debounce.cancel_all()
+    _attention.stop()
 
 
-from . import recognize as _recognize, view as _view, segment as _segment, screen as _screen, agent as _agent, roles as _roles, subcommands as _subcommands, notes as _notes, awaker as _awaker, debounce as _debounce, observer as _observer, voice as _voice, face as _face
+
+from . import recognize as _recognize, view as _view, segment as _segment, screen as _screen, agent as _agent, roles as _roles, subcommands as _subcommands, notes as _notes, awaker as _awaker, attention as _attention, observer as _observer, voice as _voice, face as _face
 from .view import has_at, msg_split
 from .windows import kind, parse_target
-from .screen import mark_window_read
+from .run import run, current_wake
 from . import windows as _windows

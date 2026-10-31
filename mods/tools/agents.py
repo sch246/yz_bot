@@ -21,7 +21,7 @@ _stream = log.stream("agent")
 
 
 def fork(goal: str, refs: str = "", tasks: str = "", tools: str = "",
-         model: str = "deepseek/deepseek-flash") -> str:
+         model: str = "") -> str:
     """并发处理独立任务，返回 [(任务, ctx, 结果), ...]；失败结果以 ERROR: 开头。
 
     @param

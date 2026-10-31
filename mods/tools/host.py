@@ -33,7 +33,7 @@
 
 1. **知道大概在第几行** 👉 用 `start` 和 `end` 只把那一小段切出来读；
 2. **不知道在哪儿** 👉 先用 `run_command` 跑个 `grep -n` 找到行号，再去读那一段；
-3. **非得从头到尾通读不可** 👉 用 `agents__assign_tasks` 派个子会话去替你读，让它只把整理好的摘要带回来给你。
+3. **非得从头到尾通读不可** 👉 用 `agents__fork` 派个子会话去替你读，让它只把整理好的摘要带回来给你。
 
 ## 跑终端命令（run_command）
 
@@ -151,7 +151,7 @@ def read_file(path: str, start: int = 0, end: int | None = None, max_bytes: int 
             f"file: {path} | lines: [{start}, {end}) | total: {len(lines)} | {_human(measured)}\n"
             f"超过 {_human(max_bytes)} 未展开。可以用 start/end 缩小读取区间，"
             f"用 run_command 跑 grep -n 定位后再读，"
-            f"或用 assign_tasks 开子会话通读后只带回摘要；"
+            f"或用 agents__fork 开子会话通读后只带回摘要；"
             f"确实要整段进上下文时再调高 max_bytes。"
         )
     return _render(path, lines, start, end)

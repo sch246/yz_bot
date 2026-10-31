@@ -122,14 +122,14 @@ def _backup(path: Path) -> None:
     target.write_bytes(path.read_bytes())
 
 
-def _replace(path: Path, text: str) -> str:
+def _replace(path: Path, text: str, *, keep_empty=False) -> str:
     """Back up, then write or delete one file; returns the text it replaced."""
     with _lock:
         previous = path.read_text(encoding="utf-8") if path.is_file() else ""
-        if previous.strip() == text.strip():
+        if previous.strip() == text.strip() and (not keep_empty or path.is_file()):
             return previous
         _backup(path)
-        if not text.strip():
+        if not text.strip() and not keep_empty:
             if path.is_file():
                 path.unlink()
             return previous
@@ -167,16 +167,14 @@ def read_version(scope: str, version: str) -> str:
 
 # WHY: 策略文件是她在反思里能改的那一层（2026-10-22）：handoff 是她给交接写的附加说明，
 # tidy 是什么时候交接的 Python 条件，changes 是每次改动的原因、预期和事后评估，
-# proposals 是要维护者动手的改动（醒来时带什么、她改不动的）。旧的 subconscious 策略文件（潜意识怎么
-# 判断，2026-10-24）2026-10-25 起不再读：潜意识只剩一条提醒，收不收由她自己调 compress 决定；
-# 盘上的文件留着，不再经过这里。
-POLICIES = ("handoff", "tidy", "changes", "proposals")
+# proposals 是要维护者动手的改动；开局材料由 opening 选择，长度与增长由 tidy/pressure 判断。
+POLICIES = ("handoff", "tidy", "opening", "changes", "proposals")
 
 
 def _policy_path(name: str) -> Path:
     if name not in POLICIES:
         raise ValueError("策略文件只有 " + "、".join(POLICIES))
-    path = ROOT / "policy" / (f"{name}.py" if name == "tidy" else f"{name}.md")
+    path = ROOT / "policy" / (name if name == "opening" else f"{name}.py" if name == "tidy" else f"{name}.md")
     old = ROOT / "policy" / "librarian.md"
     if name == "handoff" and not path.exists() and old.is_file():
         # 以前给图书管理员的附加说明，现在给交接；第一次读到时改名。
@@ -190,7 +188,7 @@ def read_policy(name: str) -> str:
 
 
 def write_policy(name: str, text: str) -> str:
-    return _replace(_policy_path(name), text)
+    return _replace(_policy_path(name), text, keep_empty=name == "opening")
 
 
 def append_policy(name: str, line: str) -> None:

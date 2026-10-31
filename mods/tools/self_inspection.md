@@ -1,29 +1,14 @@
-用现有 Python 按需检查自己的经历、记忆关系和聊天档案，不为临时问题增加专用工具。
+用现有 Python 按需检查自己的经历和聊天档案，不为临时问题增加专用工具。
 
-## 四种记录
+`ctx` 是“模块名 → 已加载模块”的字典。`ctx["chat"].journal` 保存不可变经历，`ctx["chatlog"]` 保存窗口实际发生的原话。上下文是这些经历的编号视图，归档在 `data/chat/views/`；加载 memory_system 后用 `read_context` 读。
 
-- `ctx` 只是“模块名 → 已加载模块”的字典，不是当前上下文。
-- `ctx["oplog"]` 的结构化记录描述你输出和行动过什么（旧记录里还有当年的正式阅读 input）。
-- `ctx["chatlog"]` 保存聊天窗口实际发生的事；`read_log` 读的就是它。
-- 每一段上下文交接后原样归档在 `data/context/archive/`，加载 `memory_system` 后用 `read_context` 读：那是你当时看到了什么、做了什么。
-- 终端运行日志只用于排查代码如何执行，不是你的经历或聊天档案。
-
-## 惰性检查经历
-
-需要跨越较长时间检查自己的行为时，用现有 `exec_code` 调磁盘迭代器，不要把全部历史装成一个 list：
+需要按时间检查行为时，可用现有 exec_code：
 
 ```python
-records = ctx["oplog"].iter_events(start="20260925-1", stop="20260926-1")
-selected = [row for row in records if row["kind"] == "output" and "关键词" in row.get("body", "")]
+rows = ctx["chat"].journal.events(kind="assistant", after=开始的Unix秒)
+selected = [row for row in rows if "关键词" in str(row.get("messages", []))]
 ```
 
-`start` 含、`stop` 不含；留空表示不限制这一端。返回的是普通 dict：
+`events` 返回普通字典列表，按日志号顺序，after 包含边界；kind 不填时包含所有类型。assistant 是模型输出，tool 是单项结果，tool_started 是派发记录，act_end 表示该批结束。缺结果的已派发项仍可辨认，查询不会重跑动作，也不会改变阅读状态。长历史先限定日期、ctx 或 kind，再筛选需要的内容，避免一次返回全部原文。
 
-- `output`、`result`、`notification` 是有正式号的经历，旧日志里还有 `input`，原样给出；
-- 输出和结果的 `references` 是正文、行动参数或返回里实际出现的正式号，包括已经断掉的引用，便于自检。
-
-迭代器逐条读磁盘，不改变未读状态或运行中的上下文。Python 扫描过一条记录不等于你在聊天中重新经历了它；只有最终返回给你的筛选结果会成为本次行动返回。
-
-检查结果不会自动成为长期记忆：它作为行动结果留在这一段上下文里，交接时由你决定写不写进笔记。真要留住某个结论，就在本次行动里把结论和依据说清楚（写明行动号或聊天记录的窗口与时间），不要只保存变量名、查询代码或“当时符合条件的集合”，因为以后重跑可能得到不同成员。
-
-聊天原话直接用 `read_log(window, count, before)` 读、用 `search(keyword)` 按线索在聊天记录、笔记、日记和归档的上下文里一起找，或用 `exec_code` 调 `ctx["chatlog"]` 按日期读文件。这个 Skill 只负责自由检查已经发生的经历，不替代改变事实的提交入口。
+只有最终返回给你的筛选结果会成为当前行动结果。要留下结论，就写明结论与依据（日志号或聊天窗口和时间），交接时再决定写进哪份笔记。聊天原话用 read_log，跨记录、笔记、日记和上下文找线索用 search。

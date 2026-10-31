@@ -624,7 +624,12 @@ def read_archived(name):
 
 
 def readable(view, *, compact=True, expand_folds=False):
-    messages = raw_messages(view, expand_folds=expand_folds)
+    messages = []
+    for row in _entries(view, deep=expand_folds):
+        if row["kind"] == "goal":
+            messages.append({"role": "system", "content":
+                             f"【{row.get('run_kind', 'run')} 目的 · {row['id']}】{row.get('goal', '')}"})
+        messages.extend(row["messages"])
     return readable_messages(messages, compact=compact)
 
 
