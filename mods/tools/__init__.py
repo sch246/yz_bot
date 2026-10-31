@@ -157,12 +157,20 @@ def _load_python(name: str, path: Path, source: bytes) -> ModuleType:
     candidate = ModuleType(candidate_name)
     candidate.__dict__.update({"__file__": str(path), "__package__": _IMPORT_PACKAGE,
                                "__builtins__": __builtins__})
-    # WHY: 清掉候选包的子模块再执行，使相对 import 的 helper 跟着 reload 读盘；结束时还原，
-    # 失败候选的半成品不得留进 sys.modules。目录只有一个，不再用对象地址构造包名。
+    # WHY: 相对 import 既查 sys.modules，也查包对象上的子模块属性。两处都要清掉，
+    # from . import _helper 才会跟 from ._helper import value 一样重新读盘。结束时两处
+    # 都还原，失败候选不能留下半成品，也不能改变旧工具持有的 helper。目录只有一个，
+    # 不再用对象地址构造包名。
     prefix = _IMPORT_PACKAGE + "."
     previous = {key: value for key, value in sys.modules.copy().items() if key.startswith(prefix)}
+    previous_attributes = {
+        key: value for key, value in vars(package).copy().items()
+        if isinstance(value, ModuleType) and value.__name__.startswith(prefix)
+    }
     for key in previous:
         sys.modules.pop(key, None)
+    for key in previous_attributes:
+        package.__dict__.pop(key, None)
     sys.modules[candidate_name] = candidate
     import_path = str(_source_dir)
     had_finder = import_path in sys.path_importer_cache
@@ -180,6 +188,10 @@ def _load_python(name: str, path: Path, source: bytes) -> ModuleType:
             if key.startswith(prefix):
                 sys.modules.pop(key, None)
         sys.modules.update(previous)
+        for key, value in vars(package).copy().items():
+            if isinstance(value, ModuleType) and value.__name__.startswith(prefix):
+                package.__dict__.pop(key, None)
+        package.__dict__.update(previous_attributes)
         if had_finder:
             sys.path_importer_cache[import_path] = previous_finder
         else:
@@ -342,7 +354,9 @@ def _catalog(binding: dict) -> dict[str, dict]:
 def _function_visible(binding: dict, name: str, tool: Tool) -> bool:
     leaf = name.rsplit("__", 1)[-1]
     granted = name in binding["grant"] or leaf in binding["grant"]
-    if binding["kind"] != "main" and leaf in {"send", "type_word"} and not granted:
+    # WHY: 这里只限制 fork 的默认暴露。交接/反思不封嘴是维护者已裁定的行为，
+    # 不能把角色名顺手扩成禁发言规则（见 meta 的 _box_window/send WHY）。
+    if binding["kind"] == "fork" and leaf in {"send", "type_word"} and not granted:
         return False
     pick = binding["function_visible"]
     return pick is None or bool(pick(name, tool))
