@@ -13,7 +13,7 @@ Only a wake owned by this view's ctx is inherited by newly appended entries.
 
 Source metadata on journal rows:
 * wake: number (allocated from all ctx wakes, even dropped ones), at: str,
-  ctx_started: float (bounds allocation to this context's lifetime),
+  ctx_started: float (bounds allocation to this context's shard days),
   boxes: {window: text}, read_snapshot: opaque screen.read_snapshot() dict.
 * screen: window: str, shown: list[record identity], read_patch: opaque dict,
   follow_ids: list[identity], wake_id: str.

@@ -19,22 +19,22 @@ def _short(value, limit: int) -> str:
 
 
 def pairs(*, ids=None, after: float | None = None) -> list[tuple[dict, dict | None]]:
-    """Outputs in order, each with the result that answered it."""
-    entries = journal.events(after=after or 0)
-    wanted = set(ids) if ids is not None else None
-    related = {}
-    for row in entries:
-        if row.get("act_id"):
-            related.setdefault(row["act_id"], []).append(row)
+    """Outputs in journal order, each with all results despite clock rollback.
+
+    after selects assistant times only. Explicit ids load just their shards.
+    """
+    if ids is None:
+        entries = journal.events(kind="assistant", after=after or 0)
+    else:
+        entries = [journal.get(one) for one in dict.fromkeys(ids)]
+        entries.sort(key=lambda row: (row["id"].split("-")[0], int(row["id"].split("-")[1])))
     found = []
     for entry in entries:
         if entry["kind"] != "assistant":
             continue
-        if wanted is not None and entry["id"] not in wanted:
-            continue
         if after is not None and entry["time"] < after:
             continue
-        rows = [entry, *related.get(entry["id"], [])]
+        rows = journal.act_entries(entry["id"])
         assistant = entry["messages"][0]
         output = {**entry, "assistant": assistant, "read_at": entry["time"]}
         returns = [message for row in rows[1:] for message in row["messages"] if message.get("role") == "tool"]

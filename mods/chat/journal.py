@@ -4,8 +4,12 @@ Rows: {id: YYYYMMDD-N, time: float, ctx: str, kind: str, messages: list[dict],
 ...source metadata}. ``item_id``/``timestamp`` on append are for offline import;
 ids are never reused, even when their references disappear from a view.
 A wake with an automatically allocated number needs ctx_started (the view's
-started time); imported wakes can provide number explicitly. Step numbering
-uses the referenced wake's time, and act lookup starts at the assistant's time.
+started time); imported wakes can provide number explicitly. Numbering and act
+lookup use stable shard days, never timestamps as causal order. Related rows
+cannot have a shard day before act_id/wake_id; wakes cannot precede ctx_started's
+day. Their time remains the actual wall clock, including clock rollback.
+Offline imports must preserve this invariant: explicit ids are validated and
+rejected rather than relocated when their day precedes a parent shard.
 
 Act rows contain exactly one original assistant message. ``tool_started`` must
 succeed before dispatch; each ``record_results`` tool message is its own row,
@@ -144,19 +148,23 @@ def _read(path):
     return rows
 
 
-def events(*, ctx=None, kind=None, after=0):
-    """Detached rows in append order within each day, oldest day first."""
+def _events_from_day(first_day=None, *, ctx=None, kind=None):
+    """Detached rows from stable shard days; no wall-clock filtering."""
     with _reading():
         found = []
-        first_day = time.strftime("%Y%m%d", time.localtime(after)) if after else None
         for path in sorted(ROOT.glob("[0-9]" * 8 + ".jsonl")):
             if first_day is not None and path.stem < first_day:
                 continue
             found.extend(row for row in _read(path)
                          if (ctx is None or row["ctx"] == ctx)
-                         and (kind is None or row["kind"] == kind)
-                         and row["time"] >= after)
+                         and (kind is None or row["kind"] == kind))
         return clone(found)
+
+
+def events(*, ctx=None, kind=None, after=0):
+    """Rows whose actual wall-clock time is >= after, in shard/id order."""
+    first_day = time.strftime("%Y%m%d", time.localtime(after)) if after else None
+    return [row for row in _events_from_day(first_day, ctx=ctx, kind=kind) if row["time"] >= after]
 
 
 def get(item_id: str) -> dict:
@@ -180,11 +188,25 @@ def _append(kind, *, ctx, messages=(), item_id=None, timestamp=None, **metadata)
         raise ValueError("reserved journal metadata")
     stamp = time.time() if timestamp is None else float(timestamp)
     day = time.strftime("%Y%m%d", time.localtime(stamp))
+    parent_days = []
+    for name in ("act_id", "wake_id"):
+        if metadata.get(name):
+            parent = get(metadata[name])
+            parent_days.append(parent["id"].split("-")[0])
+    if kind == "wake" and "ctx_started" in metadata:
+        parent_days.append(time.strftime("%Y%m%d", time.localtime(metadata["ctx_started"])))
+    earliest_day = max(parent_days, default=day)
     if item_id is not None:
         match = _ID.fullmatch(item_id)
         if match is None:
             raise ValueError("invalid imported journal id")
         day = match[1]
+        if day < earliest_day and parent_days:
+            raise ValueError("imported journal id day is before parent shard day")
+    else:
+        # WHY: wall-clock rollback must not hide a dispatch/result or reset an
+        # address counter. Shard bounds are stable; time stays truthful.
+        day = max(day, earliest_day)
     path = ROOT / (day + ".jsonl")
     existing = _read(path)
     ids = {row["id"] for row in existing}
@@ -194,12 +216,12 @@ def _append(kind, *, ctx, messages=(), item_id=None, timestamp=None, **metadata)
     if kind == "wake" and "number" not in metadata:
         if "ctx_started" not in metadata:
             raise ValueError("automatic wake numbering needs ctx_started or an explicit number")
+        first_day = time.strftime("%Y%m%d", time.localtime(metadata["ctx_started"]))
         metadata["number"] = max((row.get("number", 0) for row in
-                                  events(ctx=ctx, kind="wake", after=metadata["ctx_started"])), default=0) + 1
+                                  _events_from_day(first_day, ctx=ctx, kind="wake")), default=0) + 1
     if kind == "assistant" and any(message.get("tool_calls") for message in messages if isinstance(message, dict)) and metadata.get("wake_id") and "step" not in metadata:
-        wake = get(metadata["wake_id"])
         metadata["step"] = max((row.get("step", 0) for row in
-                                events(ctx=ctx, kind="assistant", after=wake["time"])
+                                _events_from_day(metadata["wake_id"].split("-")[0], ctx=ctx, kind="assistant")
                                 if row.get("wake_id") == metadata["wake_id"]), default=0) + 1
     row = clone({"id": item_id, "time": stamp, "ctx": ctx, "kind": kind,
                  "messages": list(messages), **metadata})
@@ -250,7 +272,8 @@ def act_entries(act_id) -> list[dict]:
     act = get(act_id)
     if act["kind"] != "assistant":
         raise ValueError("not an assistant act")
-    return [act, *(row for row in events(ctx=act["ctx"], after=act["time"]) if row.get("act_id") == act_id)]
+    return [act, *(row for row in _events_from_day(act_id.split("-")[0], ctx=act["ctx"])
+                  if row.get("act_id") == act_id)]
 
 
 def _act(act_id):
