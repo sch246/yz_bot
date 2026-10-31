@@ -551,6 +551,8 @@ class Import:
         candidates = []
         for eid in self.outputs:
             row = self.rows[eid]
+            if strict and row.get("legacy_window") != ["agent", 0]:
+                continue
             source = row["messages"][0]
             projected = compress_projection(source)
             if source.get("content") != message.get("content") or (
