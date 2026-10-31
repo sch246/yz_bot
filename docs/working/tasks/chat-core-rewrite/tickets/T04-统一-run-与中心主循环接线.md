@@ -2,15 +2,17 @@
 {
   "id": "T04",
   "kind": "implementation",
-  "status": "ready",
-  "owner": null,
+  "status": "active",
+  "owner": "bot:implement_run",
   "blocked_by": [
     "T01",
     "T02",
     "T03"
   ],
   "invalidated_by": [],
-  "title": "统一 run 与中心主循环接线"
+  "title": "统一 run 与中心主循环接线",
+  "claim_id": "acad647511d1416b8d5467cf991aae3f",
+  "claimed_at": "2026-10-31T10:16:33+00:00"
 }
 ---
 
@@ -53,3 +55,11 @@ spec补明现行边界：dismiss重挂wait失败不撤回，已消费召唤不�
 ### 2026-10-31T09:56:33+00:00 · update
 
 root核查发现行为文档过时：基线meta._box_window WHY与send me分支记载10-27维护者已拆掉交接/反思不发言代码限制，保留type_word/send及me自语。新默认禁发言只针对fork；T03已收到修正kind过滤要求。T04不要给handoff/reflect重新封嘴；这两角色current_wake仍不能借主唤醒控制状态，但工具可用自己的binding结束当前run。T06同步修正文档过时措辞。
+
+### 2026-10-31T10:16:33+00:00 · claim
+
+Owner: bot:implement_run
+
+### 2026-10-31T10:23:30+00:00 · update
+
+Parent authorized segment.py small API ownership: extract pure validate_dismiss reused by dismiss; main tool validates before wait and revalidates at final drop. No spec change.
