@@ -481,7 +481,8 @@ def unfold(view, fold_id):
         _replace(view, [*view["items"][:at], *row["covers"], *view["items"][at + 1:]])
 
 
-def dismiss(view, wake_id, *, boxes=None, last_sent=0, follow_counts=None):
+def validate_dismiss(view, wake_id, *, boxes=None, last_sent=0, follow_counts=None):
+    """Validate a prospective drop without changing the view or read state."""
     with _lock:
         wake = journal.get(wake_id)
         if wake["kind"] != "wake" or wake_id not in view["items"]:
@@ -519,10 +520,18 @@ def dismiss(view, wake_id, *, boxes=None, last_sent=0, follow_counts=None):
         # the >60 record batch in thought rather than accumulate it forever.
         if any(count > 60 for count in counts.values()):
             raise ValueError("follow 期间已经攒了超过 60 条，这次留着把它们看完")
-        drop_id = journal.append("drop", ctx=view["ctx"], covers=removed, wake_id=wake_id)
-        _replace(view, view["items"][:start])
         return {"snapshot": wake.get("read_snapshot", {}), "windows": windows,
-                "patches": patches, "removed": removed, "drop_id": drop_id}
+                "patches": patches, "removed": removed}
+
+
+def dismiss(view, wake_id, *, boxes=None, last_sent=0, follow_counts=None):
+    with _lock:
+        result = validate_dismiss(view, wake_id, boxes=boxes, last_sent=last_sent,
+                                  follow_counts=follow_counts)
+        result["drop_id"] = journal.append("drop", ctx=view["ctx"],
+                                           covers=result["removed"], wake_id=wake_id)
+        _replace(view, view["items"][:view["items"].index(wake_id)])
+        return result
 
 
 def archive(view, kind=""):
