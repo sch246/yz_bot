@@ -355,25 +355,39 @@ def prepare(window: tuple, *, shown, count, pending=()) -> dict:
         for item in rows:
             item["unread"] = is_unread(state, item["id"], item["time"])
         available = [item for item in rows if item["id"] not in shown]
-        fresh = [item for item in available if item["unread"]]
         layer = awaker.layer(window)
         since = layer.get("since") if layer and layer["state"] == "follow" else None
-        followed = [item for item in fresh if since is not None and item["time"] is not None
-                    and item["time"] >= int(since)]
-        calls = [item for item in fresh if state["pending"].get(item["id"], {}).get("recovered")]
-        # Newest 60 plus exact follow/offline-call exceptions; keep ordinary log order.
-        selected = {item["id"] for item in fresh[-FRESH_MAX:] + followed + calls}
-        skipped = len(fresh) - len(selected)
-        if shown:
-            items = [item for item in available if item["id"] in selected]
-        elif state["through"] is not None:
-            # WHY: 2026-10-25：交接后只补三条接话，不把刚压缩掉的历史重新倒回来。
-            lead = [item for item in available if not item["unread"]][-LEAD_IN:]
-            ids = selected | {item["id"] for item in lead}
-            items = [item for item in available if item["id"] in ids]
+        followed = [item for item in available if item["unread"] and since is not None
+                    and item["time"] is not None and item["time"] >= int(since)]
+        calls = [item for item in available if item["unread"]
+                 and state["pending"].get(item["id"], {}).get("recovered")]
+        exceptions = {item["id"] for item in followed + calls}
+        positions = [index for index, item in enumerate(rows) if item["id"] in shown]
+        if positions:
+            # WHY: 普通离线补回不算未读，但插在上一幅画面之后的原文仍要给她看；
+            # 展示范围由 view 的位置决定，不能拿未读身份当作展示过滤器。
+            fresh = rows[positions[-1] + 1:]
+            selected = {item["id"] for item in fresh[-FRESH_MAX:]} | exceptions
+        elif state["through"] is None:
+            # Never read: count chooses the initial history, even if every line
+            # currently has an unread arrival. Follow/offline calls remain explicit exceptions.
+            fresh = available
+            selected = {item["id"] for item in available[-max(count, LEAD_IN):]} | exceptions
         else:
-            ids = selected | {item["id"] for item in available[-max(count, LEAD_IN):]}
-            items = [item for item in available if item["id"] in ids]
+            # After handoff, display the range after the confirmed boundary and
+            # exact older unread exceptions. Excluded recovery still belongs to
+            # this visible range even though its patch correctly says unread=False.
+            through = state["through"]
+            fresh = [item for item in available if item["id"] in state["pending"]
+                     or item["time"] is not None and (item["time"] > through
+                     or item["time"] == through and item["id"] not in state["at"])]
+            selected = {item["id"] for item in fresh[-FRESH_MAX:]} | exceptions
+            # WHY: 2026-10-25：交接后只补三条接话，不把刚压缩掉的历史重新倒回来。
+            fresh_ids = {item["id"] for item in fresh}
+            older = [item for item in available if item["id"] not in fresh_ids]
+            selected.update(item["id"] for item in older[-LEAD_IN:])
+        skipped = sum(item["id"] not in selected for item in fresh)
+        items = [item for item in available if item["id"] in selected]
         by_id = {item["id"]: item for item in rows}
         metadata = {}
         for identity_ in shown | {item["id"] for item in items}:

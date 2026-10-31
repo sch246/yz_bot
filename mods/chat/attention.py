@@ -116,7 +116,12 @@ def ack(claimed) -> None:
         screen.consume(job["window"], job["record_ids"])
 
 
-def release(claimed) -> None:
+def release(claimed, *, notify=False) -> None:
+    """Release failed work without immediately driving the runner into a hot retry loop.
+
+    A later external arrival or clock signal can claim it again. ``ready`` still
+    exposes the pending work to an explicitly controlled retry.
+    """
     released = False
     with _lock:
         for item in claimed:
@@ -125,7 +130,10 @@ def release(claimed) -> None:
                 job["claim"] = None
                 released = True
     if released:
-        _signal()
+        if notify:
+            _signal()
+        else:
+            ready.set()
 
 
 def schedule(kind, due, *, window=None, reason="", **state) -> dict:
