@@ -13,16 +13,16 @@ WHY: 2026-10-22 维护者想要一个专门管"什么条件下叫醒自己"的�
 文件不存在时只有一条 ``daily 04:00 reflect``（维护者 2026-10-22 定的凌晨 4 点）。
 
 WHY: 2026-10-23 维护者要她有更强的唤醒自己的能力，于是又有四种，都是一次性的，响过就从
-笔记里划掉：
+笔记里划掉；wait 改由内存等待表保存：
 
     on g123 有人在群里说话就看一眼            （g123:30001 只等这个人，u456 是私聊）
     wait g123:30001 until 2026-10-23 10:30 他刚才话说了一半
     when mcversion.ver["release"] != "1.21.4" -> MC 出新版本了
     at 2026-10-23 08:00 叫维护者起床          （at 也是响过就划掉）
 
-``wait`` 是「等这个人的后续」：后续来了就由那条消息叫醒她，到点还没来也叫醒她，只叫一次
+``wait`` 只在内存中，重启丢弃；它是「等这个人的后续」：后续来了就由那条消息叫醒她，到点还没来也叫醒她，只叫一次
 ——死板的延迟唤醒做不到这个，人接上了话，延迟到点还会再叫一遍。``on``/``wait`` 由
-``chat.capture_chat`` 在消息到达时认领（``take_waiting``），只认开了聊天的窗口。``when`` 每分钟
+``attention.on_record`` 在消息到达时认领（``take_waiting``），只认开了聊天的窗口。``when`` 每分钟
 用 ``.py`` 那份共享环境求值一次。她用 ``wake_me`` 工具写这些行，相对时间在写的时候换成时刻。
 
 WHY: 2026-10-23 维护者要统一触发器：每种窗口有自己的默认触发器（私聊每条都算；群里是 at、
@@ -36,8 +36,8 @@ WHY: 2026-10-23 维护者要统一触发器：每种窗口有自己的默认触�
     other：代码用 ``override(目标, 函数)`` 设的，函数看这条决定叫不叫
 
 follow/mute 是写进笔记的两种语法糖，``wake_me("follow g123 30m", ...)`` 写（不写多久就是 30
-分钟，期限不设上限），同一目标再写一次就替换（follow 换成 mute 也是），``off`` 揭掉，到期由每分钟
-检查静静划掉、不叫醒她。目标是一个窗口（``g123``、``u456``、``g123:QQ号`` 只管这个人、
+分钟，期限不设上限），同一目标再写一次就替换（follow 换成 mute 也是），``off`` 揭掉，到期由 attention
+静静划掉、不叫醒她。目标是一个窗口（``g123``、``u456``、``g123:QQ号`` 只管这个人、
 ``bili:BV…``）或者一整类（``group``、``private``、``bili``）；同时有好几层时越具体的越优先。
 ``me`` 不能盖；master（``ops`` 第一位）的话 mute 压不住，管理员的可以。follow 只认 QQ：B 站
 这类窗口只收到回复和 @，本来就都叫醒她；维护者不要为 follow 一个评论区单独去轮询它，会被限流。
@@ -54,22 +54,21 @@ follow 一个群让她看起来很累，累的是这一段里叠了一遍遍"被
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime
 import re
 import threading
 import time
+from uuid import uuid4
 
 from mods import log, storage
 
 from . import notes as _notes, windows as _windows
 
 DEFAULT = "daily 04:00 reflect"
-JOB = "chat-awaker"
 _LAST_KEY = "awaker_last"
 # 定点规则错过多久之内仍补一次（比如忙着聊天、刚好重启）；再晚就等下一次。
 _GRACE = 3 * 3600
 _stream = log.stream("agent")
-_running = threading.Lock()
 _LINE = re.compile(r"^\s*(?:[-*]\s+)?(?:(every)\s+(\S+)|(daily)\s+(\d{1,2}):(\d{2})"
                    r"|(at)\s+(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2}))\s+(.+?)\s*$")
 _TARGET = r"([gu][1-9][0-9]*(?::[1-9][0-9]*)?)"
@@ -80,7 +79,9 @@ _LAYER = re.compile(r"^\s*(?:[-*]\s+)?(follow|mute)\s+(\S+)"
                     r"\s+until\s+(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})\s+(.+?)\s*$")
 _WHEN = re.compile(r"^\s*(?:[-*]\s+)?when\s+(.+?)\s+->\s+(.+?)\s*$")
 # 改笔记的地方（划掉响过的行、wake_me 追加）互相排队；她用 write_note 整份改不经过这里。
-_edit = threading.Lock()
+_edit = threading.RLock()
+# wait is deliberately process-local; follow/mute/on remain file-authoritative.
+_waiting: dict[tuple, dict] = {}
 # 代码设的覆盖层（other），目标原文 → {"decide": 函数, "moment": 到期时刻或 None, "reason": …}。
 _custom: dict[str, dict] = {}
 # follow 从什么时候盖上的，目标原文 → 时刻：画面据此把 follow 期间到的消息给全（agent._screen_text）。
@@ -219,7 +220,11 @@ def parse(text: str) -> tuple[list[dict], list[str]]:
 
 def rules() -> tuple[list[dict], list[str]]:
     text = _notes.read("awaker")
-    return parse(text if text.strip() else DEFAULT)
+    found, skipped = parse(text if text.strip() else DEFAULT)
+    # WHY: D01：wait 和 loop 重启即丢；从持久笔记重新装回 wait 会把已结束的对话复活。
+    skipped.extend(rule["key"] + "（wait 只在内存；请用 wake_me 写入）"
+                   for rule in found if rule["kind"] == "wait")
+    return [rule for rule in found if rule["kind"] != "wait"], skipped
 
 
 def _last() -> dict:
@@ -274,17 +279,16 @@ def _holds(expression: str) -> bool:
 
 
 def _ring(rule: dict, reason: str) -> bool:
-    """Write the reason into her ``me`` window and wake her; it is on disk before she is asked."""
-    import mods.chat as chat
+    """Notify the serial main runner. The timer never starts another model session."""
+    from . import attention
 
-    chat.push(chat._windows.ME, f"awaker「{rule['key']}」", reason, wake="闹钟")
+    attention.enqueue(_windows.ME, kind="reflect" if reason.strip() == "reflect" else "闹钟",
+                      reason=reason, event={"rule": rule["key"]})
     return True
 
 
-def check(now: float | None = None) -> None:
+def check(now: float | None = None, *, active=None) -> None:
     """Fire every due rule once; a rule whose wake could not run stays due."""
-    from . import agent as _agent
-
     now = time.time() if now is None else now
     found, _skipped = rules()
     last = _last()
@@ -292,26 +296,27 @@ def check(now: float | None = None) -> None:
     for key in [key for key in last if key not in live]:
         del last[key]
     for rule in found:
+        if active is not None and not active():
+            return
         if rule["kind"] == "layer":
             if now >= rule["moment"]:
-                _claim([rule["key"]])
-                _since.pop(rule["target"], None)
+                with _edit:
+                    if _claim([rule["key"]]):
+                        _since.pop(rule["target"], None)
             continue
         if rule["kind"] == "on":
             continue
-        if rule["kind"] in ("wait", "when"):
-            if rule["kind"] == "wait":
-                due = now >= rule["moment"]
-                reason = f"等到 {rule['until']}，{rule['target']} 都没有新消息。当时想的是：{rule['reason']}"
-            else:
-                try:
-                    due = _holds(rule["expression"])
-                except Exception:
-                    if rule["key"] not in _broken:
-                        _broken.add(rule["key"])
-                        _stream.exception(f"唤醒条件求值失败：{rule['key']}")
-                    continue
-                reason = rule["reason"]
+        if rule["kind"] == "when":
+            try:
+                due = _holds(rule["expression"])
+            except Exception:
+                if rule["key"] not in _broken:
+                    _broken.add(rule["key"])
+                    _stream.exception(f"唤醒条件求值失败：{rule['key']}")
+                continue
+            reason = rule["reason"]
+            if active is not None and not active():
+                return
             if due and _claim([rule["key"]]):
                 try:
                     _ring(rule, reason)
@@ -325,8 +330,7 @@ def check(now: float | None = None) -> None:
         if moment is None:
             continue
         try:
-            done = (_agent.reflect() if rule["reason"].strip() == "reflect"
-                    else _ring(rule, rule["reason"]))
+            done = _ring(rule, rule["reason"])
         except Exception:
             _stream.exception(f"唤醒规则执行失败：{rule['key']}")
             done = True
@@ -339,14 +343,27 @@ def check(now: float | None = None) -> None:
 
 
 def take_waiting(window: tuple, author) -> list[dict]:
-    """The ``on``/``wait`` rules this message satisfies, struck out of the note."""
-    found, _skipped = rules()
-    matched = [rule for rule in found if rule["kind"] in ("on", "wait") and rule["window"] == window
-               and (rule["author"] is None or rule["author"] == author)]
-    if not matched:
-        return []
-    claimed = set(_claim([rule["key"] for rule in matched]))
-    return [rule for rule in matched if rule["key"] in claimed]
+    """Claim persistent on rules and the process-local wait satisfied by a message."""
+    window = tuple(window)
+    with _edit:
+        found, _skipped = rules()
+        matched = [rule for rule in found if rule["kind"] == "on" and rule["window"] == window
+                   and (rule["author"] is None or rule["author"] == author)]
+        claimed = set(_claim([rule["key"] for rule in matched]))
+        result = [rule for rule in matched if rule["key"] in claimed]
+        waiting = _waiting.get(window)
+        if waiting and (waiting["author"] is None or waiting["author"] == author):
+            result.append(_waiting.pop(window))
+        return result
+
+
+def expire_wait(rule: dict, now: float) -> bool:
+    with _edit:
+        current = _waiting.get(tuple(rule["window"]))
+        if current is None or current["token"] != rule["token"] or current["moment"] > now:
+            return False
+        del _waiting[tuple(rule["window"])]
+    return _ring(rule, f"等到 {rule['until']}，{rule['target']} 都没有新消息。当时想的是：{rule['reason']}")
 
 
 def _layers(now: float) -> list[dict]:
@@ -415,8 +432,9 @@ def badges(window: tuple) -> list[str]:
     found = [describe(item) for item in _layers(now)
              if item["scope"][0] == "kind" and window[0] == item["scope"][1]
              or item["scope"][0] == "window" and tuple(item["scope"][1]) == window]
-    all_rules, _ = rules()
-    for rule in all_rules:
+    with _edit:
+        waiting = list(_waiting.values())
+    for rule in waiting:
         if rule["kind"] == "wait" and rule["window"] == window and now < rule["moment"]:
             target_desc = f"只看 {rule['author']}" if rule.get("author") is not None else "等回复"
             found.append(f"{target_desc}到 {rule['until']}")
@@ -428,64 +446,27 @@ def _strip_layer(text: str, target: str) -> str:
                      if not ((match := _LAYER.match(line)) and match[2] == target))
 
 
-def _strip_wait(text: str, target: str) -> str:
-    """Strip waiting rules for the same window as target (keep only the newest wait)."""
-    try:
-        target_window = _target(target)[0]
-    except Exception:
-        return text
-    kept = []
-    for line in text.split("\n"):
-        match = _WAIT.match(line)
-        if match:
-            try:
-                if _target(match[1])[0] == target_window:
-                    continue
-            except Exception:
-                pass
-        kept.append(line)
-    return "\n".join(kept)
-
-
 def lift_wait(target: str) -> bool:
-    """Take any waiting rule off *target*'s window; True if any was removed."""
-    try:
-        scope = _scope(target)
-        if scope is None or scope[0] != "window":
-            return False
-        window = tuple(scope[1])
-    except Exception:
+    """Remove only the process-local waiting rule for this window."""
+    scope = _scope(target)
+    if scope is None or scope[0] != "window":
         return False
     with _edit:
-        text = _notes.read("awaker")
-        lines = text.split("\n")
-        kept = []
-        found = False
-        for line in lines:
-            match = _WAIT.match(line)
-            if match:
-                try:
-                    if _target(match[1])[0] == window:
-                        found = True
-                        continue
-                except Exception:
-                    pass
-            kept.append(line)
-        if found:
-            _notes.write("awaker", "\n".join(kept).strip("\n") + "\n" if any(x.strip() for x in kept) else "")
-    return found
+        return _waiting.pop(tuple(scope[1]), None) is not None
 
 
 def lift(target: str) -> bool:
     """Take every layer off *target*, written or set by code; False when there was none."""
-    found = _custom.pop(target, None) is not None
-    _since.pop(target, None)
     with _edit:
+        found = _custom.pop(target, None) is not None
+        _since.pop(target, None)
         text = _notes.read("awaker")
         kept = _strip_layer(text, target)
         if kept != text:
             found = True
             _notes.write("awaker", kept.strip("\n") + "\n" if kept.strip() else "")
+    from . import attention
+    attention.sync_rules()
     return found
 
 
@@ -509,8 +490,10 @@ def override(target: str, decide, until: float | None = None, reason: str = "") 
         kept = _strip_layer(text, target)
         if kept != text:
             _notes.write("awaker", kept.strip("\n") + "\n" if kept.strip() else "")
-    _custom[target] = {"decide": decide, "moment": until, "reason": str(reason)}
-    _since.pop(target, None)
+        _custom[target] = {"decide": decide, "moment": until, "reason": str(reason)}
+        _since.pop(target, None)
+    from . import attention
+    attention.sync_rules()
     item = next(item for item in _layers(time.time()) if item["state"] == "other" and item["target"] == target)
     return f"{target}：{describe(item)}"
 
@@ -526,12 +509,14 @@ def plant(when: str, reason: str, now: float | None = None) -> str:
         # 规则只记到分钟：往后取整，宁晚不早。
         return datetime.fromtimestamp(-(-int(now + seconds) // 60) * 60).strftime("%Y-%m-%d %H:%M")
 
+    wait_seconds = None
     if (seconds := _interval(when)) is not None:
         line = f"at {stamp(seconds)} {reason}"
     elif match := re.fullmatch(r"wait\s+" + _TARGET + r"\s+(\S+)", when):
         seconds = _interval(match[2])
         if seconds is None:
             raise ValueError("wait 后面写目标和等多久，例如 wait g123:30001 10m")
+        wait_seconds = seconds
         line = f"wait {match[1]} until {stamp(seconds)} {reason}"
     elif match := re.fullmatch(r"on\s+" + _TARGET, when):
         line = f"on {match[1]} {reason}"
@@ -554,6 +539,18 @@ def plant(when: str, reason: str, now: float | None = None) -> str:
     found, skipped = parse(line)
     if not found:
         raise ValueError(f"看不懂：{skipped[0] if skipped else line}")
+    if found[0]["kind"] == "wait":
+        from . import attention
+        rule = dict(found[0], token=uuid4().hex)
+        if wait_seconds is not None:
+            rule["moment"] = now + wait_seconds
+            rule["until"] = datetime.fromtimestamp(rule["moment"]).strftime("%Y-%m-%d %H:%M:%S")
+            rule["key"] = line = f"wait {rule['target']} until {rule['until']} {reason}"
+        with _edit:
+            _waiting[tuple(rule["window"])] = rule
+        attention.schedule("wait_rule", rule["moment"], window=rule["window"],
+                           key="wait-rule:" + _windows.label(rule["window"]), rule=rule)
+        return line
     with _edit:
         text = _notes.read("awaker")
         base = text if text.strip() else DEFAULT + "\n"
@@ -561,16 +558,15 @@ def plant(when: str, reason: str, now: float | None = None) -> str:
             # 同一目标只留一层，以这次为准：续期，或者 follow 换成 mute。
             base = _strip_layer(base, found[0]["target"])
             _custom.pop(found[0]["target"], None)
-        elif found[0]["kind"] == "wait":
-            # 同一窗口只留一条 wait：续期或更新等待目标/理由
-            base = _strip_wait(base, found[0]["target"])
         _notes.write("awaker", base.rstrip("\n") + "\n" + line + "\n")
-    if found[0]["kind"] == "layer":
-        # 续期不改起点；换成 mute 就没有起点了。
-        if found[0]["state"] == "follow":
-            _since.setdefault(found[0]["target"], now)
-        else:
-            _since.pop(found[0]["target"], None)
+        if found[0]["kind"] == "layer":
+            # 续期不改起点；换成 mute 就没有起点了。与过期认领共用锁，旧回调不能清新起点。
+            if found[0]["state"] == "follow":
+                _since.setdefault(found[0]["target"], now)
+            else:
+                _since.pop(found[0]["target"], None)
+    from . import attention
+    attention.sync_rules()
     return line
 
 
@@ -590,33 +586,15 @@ def report() -> str:
         lines.append(f"{rule['key']}  ← 上次 {shown}")
     lines.extend(f"{item['target']} 覆盖层 {describe(item)}  ← 代码设的，重启就没了"
                  for item in _layers(time.time()) if item["state"] == "other")
+    with _edit:
+        lines.extend(f"{rule['key']}  ← 只在内存，重启即丢" for rule in _waiting.values())
     lines.extend(f"不认识：{line}" for line in skipped)
     return "\n".join(lines)
 
 
 def schedule() -> None:
-    """Register the once-a-minute check on the shared scheduler."""
-    from mods import scheduler
+    """The shared attention clock also checks long-term rules once a minute."""
+    from . import attention
 
-    try:
-        instance = scheduler.get_scheduler()
-    except RuntimeError:
-        return
-    instance.add_job(_tick, "interval", minutes=1, id=JOB, replace_existing=True,
-                     coalesce=True, max_instances=1, next_run_time=datetime.now() + timedelta(seconds=5))
-
-
-def _tick() -> None:
-    # 一次检查可能叫醒她很久：放到自己的线程里跑，上一次没跑完就跳过这一分钟。
-    if not _running.acquire(blocking=False):
-        return
-
-    def run() -> None:
-        try:
-            check()
-        except Exception:
-            _stream.exception("awaker 检查失败")
-        finally:
-            _running.release()
-
-    threading.Thread(target=run, name="chat-awaker", daemon=True).start()
+    attention.start()
+    attention.sync_rules()

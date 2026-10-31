@@ -8,75 +8,175 @@ step with the first.  The window and day live in the path, so a screen adds one
 Only ordinary ``.log`` day files are read.  Offline backfill sidecars
 (``.backfill.jsonl``) are not rendered yet; a recovered gap shows up only once it
 is written back as ordinary lines.
+
+``agent.read`` is the only persistent reading authority. Each window label maps
+``through`` (epoch or None), ``at`` (confirmed ids at that second), ``pending``
+(exact unread exceptions, including old-time arrivals), and ``excluded``
+(ordinary recovered ids not yet covered by the watermark). Pending values carry
+``time, event, kind, reason, recovered, unread``; only a nonempty ``kind`` means
+an unconsumed summon. ``source_kind`` preserves a consumed summon's provenance.
+A migration may set through to the latest known historical second and represent
+all genuinely unread records explicitly in pending; no timestamp rollback is
+needed for dismiss. Patches are opaque view metadata and must retain their
+per-record ``unread`` facts when passed back to restore_read.
 """
 
 from __future__ import annotations
 
+from copy import deepcopy
+import hashlib
 from pathlib import Path
+import threading
 import re
 import time
 from typing import Iterable
 
-from mods import chatlog, context, identity, oplog, storage
+from mods import chatlog, context, identity, storage
 
-import mods.chat as _chat_root
-from . import recognize as _recognize, view as _view, windows as _windows
+from . import recognize as _recognize, windows as _windows
 from .windows import label
 
 # A window shows at least this many lines before its first unseen one.
 LEAD_IN = 3
 # 一次最多补多少条新消息。WHY: 2026-10-26 维护者：200 条一次塞进来太肥，折到 60。
 FRESH_MAX = 60
-_SEEN_KEY = "seen"
+# One persistent owner, including exceptions that precede the continuous watermark.
+_READ_KEY = "read"
+_lock = threading.RLock()
 
 
-def _seen() -> dict:
-    data = storage.get("", "agent")
-    value = data.get(_SEEN_KEY)
-    if not isinstance(value, dict):
-        value = data[_SEEN_KEY] = {}
-    return value
+def _read() -> dict:
+    return storage.get("", "agent").setdefault(_READ_KEY, {})
 
 
-def seen_snapshot() -> dict:
-    return dict(_seen())
+def _state(window: tuple) -> dict:
+    return _read().setdefault(label(window), {"through": None, "at": [], "pending": {}, "excluded": {}})
 
 
-def restore_seen(labels: list[str], snapshot: dict) -> None:
-    seen = _seen()
-    for text in labels:
-        if snapshot.get(text) is None:
-            seen.pop(text, None)
+def read_snapshot() -> dict:
+    with _lock:
+        return deepcopy(_read())
+
+
+def record_id(event: dict) -> str:
+    """The same identity as the ordinary chatlog record, local to one window."""
+    value = (event.get("message_id") if event.get("post_type") in ("message", "message_sent")
+             else event.get("id") if event.get("post_type") == "push" else None)
+    if value is not None and str(value):
+        return str(value)
+    if event.get("record_id"):
+        return str(event["record_id"])
+    # Notices without message ids use their exact stored record text.
+    text = event.get("_record_text")
+    if text is not None:
+        text = str(text).rstrip("\n")
+    if text is None:
+        if event.get("sub_type") == "poke":
+            text = chatlog._notice_str(event["time"], chatlog.format_poke(event)).rstrip("\n")
         else:
-            seen[text] = snapshot[text]
-    storage.save()
+            raise ValueError("a notice without a message id needs its stored _record_text")
+    return "~" + hashlib.sha256(f"{event.get('time')}\n{text}".encode()).hexdigest()
 
 
-def mark_window_read(window: tuple, through=...) -> dict:
-    """Mark the ordered unread prefix as read without creating input events.
+def is_unread(state: dict, identity_: str, stamp) -> bool:
+    if identity_ in state.get("pending", {}):
+        return True
+    if identity_ in state.get("excluded", {}):
+        return False
+    through = state.get("through")
+    return (through is None or stamp is not None and
+            (stamp > through or stamp == through and identity_ not in state.get("at", [])))
 
-    *through* is the last arrival to mark, as ``oplog.latest_pending_arrival``
-    gave it when the screen was read; left out, it is whatever is unread now.
+
+def register(window: tuple, event: dict, *, recovered=False, kind="", reason="") -> str:
+    """Persist an arrival before attention queues it; ordinary recovery is explicitly excluded."""
+    identity_ = record_id(event)
+    with _lock:
+        state = _state(window)
+        if recovered and not kind:
+            # WHY: 普通离线补回只补历史，不能因为晚插到水位之后而在下次启动变成未读。
+            stamp, through = event.get("time"), state["through"]
+            if through is None or stamp is None or stamp >= through:
+                state["excluded"][identity_] = stamp
+        else:
+            state["excluded"].pop(identity_, None)
+            state["pending"].setdefault(identity_, {
+                "time": event.get("time"), "event": deepcopy(event), "kind": kind,
+                "reason": reason, "recovered": bool(recovered), "unread": True})
+            if kind:
+                state["pending"][identity_].update(kind=kind, reason=reason)
+        storage.save()
+    return identity_
+
+
+def unread(window: tuple) -> dict:
+    with _lock:
+        return deepcopy(_state(window)["pending"])
+
+
+def consume(window: tuple, identities) -> None:
+    """Acknowledge summons separately from reading their record bodies."""
+    with _lock:
+        pending = _state(window)["pending"]
+        for identity_ in identities:
+            if identity_ in pending:
+                if pending[identity_].get("kind"):
+                    pending[identity_]["source_kind"] = pending[identity_]["kind"]
+                pending[identity_]["kind"] = ""
+        storage.save()
+
+
+def commit_read(patches) -> None:
+    """Confirm exactly the records in a request, only after its first model output.
+
+    WHY: 2026-10-22 审查发现生成期间同窗口再来的 at 会被第一次输出一起标掉；
+    patch 因而保存确切身份，不在输出时重新求整个窗口的未读边界。失败请求不调用这里。
     """
-    with context.window_lock(window):
-        if through is ...:
-            through = oplog.latest_pending_arrival(window)
-        pending = ([entry for entry in oplog.unread(window)
-                    if oplog.arrival_before_or_at(entry["arrival"], through)]
-                   if through is not None else [])
-        marked = oplog.mark_arrivals_read(window, [entry["arrival"] for entry in pending]) if pending else 0
-        return {"marked_read": marked,
-                "mentions": sum(entry.get("activation_kind") == "mention" for entry in pending),
-                "remaining": len(oplog.unread(window))}
+    if isinstance(patches, dict):
+        patches = [patches]
+    with _lock:
+        for patch in patches:
+            state = _state(_windows.parse(patch["window"]))
+            for identity_, item in patch.get("records", {}).items():
+                state["pending"].pop(identity_, None)
+                stamp = item.get("time")
+                through = state["through"]
+                if stamp is not None and (through is None or stamp > through):
+                    state["through"], state["at"] = stamp, [identity_]
+                elif stamp is not None and stamp == through and identity_ not in state["at"]:
+                    state["at"].append(identity_)
+            through = state["through"]
+            if through is not None:
+                state["excluded"] = {i: t for i, t in state["excluded"].items()
+                                     if t is None or t >= through}
+        storage.save()
 
 
-def mark_seen(newest: dict[tuple, tuple]) -> None:
-    seen = _seen()
-    for window, (stamp, through) in newest.items():
-        if stamp is not None:
-            seen[label(window)] = max(stamp, seen.get(label(window), 0))
-        mark_window_read(window, through=through)
-    storage.save()
+def restore_read(snapshot: dict, windows: dict, *, patches=()) -> None:
+    """Undo only removed screens' confirmations; do not replace a window with an old snapshot.
+
+    ``windows`` maps labels to removed record ids. ``patches`` are those screens'
+    opaque patches, including arrivals first seen after the wake snapshot.
+    """
+    material = {}
+    for patch in patches:
+        rows = material.setdefault(patch["window"], {})
+        for identity_, item in patch.get("records", {}).items():
+            if item.get("unread"):
+                rows.setdefault(identity_, item)
+    with _lock:
+        for text, identities in windows.items():
+            state = _state(_windows.parse(text))
+            old = snapshot.get(text, {})
+            for identity_ in identities:
+                item = material.get(text, {}).get(identity_) or old.get("pending", {}).get(identity_)
+                if item is not None and item.get("unread", True):
+                    # Already handled summons must not repeat forever after a dismiss.
+                    restored = deepcopy(item)
+                    restored["source_kind"] = restored.get("kind", "")
+                    restored["kind"] = ""
+                    state["pending"].setdefault(identity_, restored)
+        storage.save()
 
 
 def _day_files(window: tuple) -> list[tuple[tuple[int, int, int], Path]]:
@@ -119,11 +219,32 @@ def records(window: tuple, count: int, before: int | None = None, since: float |
             stamp = _record_time(day, lines[start])
             if before is not None and stamp is not None and stamp >= before:
                 continue
-            day_records.append({"day": day, "time": stamp, "text": text})
+            head = chatlog._split_head(lines[start])
+            value = head.get("message_id") if head else None
+            identity_ = str(value) if value else "~" + hashlib.sha256(f"{stamp}\n{text}".encode()).hexdigest()
+            day_records.append({"id": identity_, "day": day, "time": stamp, "text": text})
         picked[:0] = day_records[-(count - len(picked)):]
         if len(picked) >= count:
             break
     return picked
+
+
+def event_for_record(window: tuple, item: dict) -> dict:
+    """Recover only protocol fields the stored record actually provides."""
+    head = chatlog._split_head(item["text"].partition("\n")[0])
+    if window[0] not in _windows.QQ:
+        body = "\n".join(line[4:] for line in item["text"].splitlines()[1:])
+        return {"post_type": "push", "time": item["time"], "author": head["name"] if head else "?",
+                "text": body, "id": item["id"]}
+    try:
+        bot = identity.bot_id()
+    except RuntimeError:
+        bot = None
+    event = chatlog.parse_log(item["text"], kind=window[0], target=window[1], day=item["day"],
+                              bot_id=bot)[0]
+    event["record_id"] = item["id"]
+    event["_record_text"] = item["text"]
+    return event
 
 
 def render(window: tuple, items: list[dict], seen: int | None = None) -> str:
@@ -136,7 +257,8 @@ def render(window: tuple, items: list[dict], seen: int | None = None) -> str:
         if item["day"] != current:
             current = item["day"]
             lines.append(f"# {label(window)} {current[0]:04d}-{current[1]:02d}-{current[2]:02d}")
-        if not divided and item["time"] is not None and item["time"] > seen:
+        if not divided and (item.get("unread") if "unread" in item else
+                            item["time"] is not None and item["time"] > seen):
             lines.append("—— 以下是上次之后的新消息 ——")
             divided = True
         lines.append(texts[index])
@@ -208,172 +330,100 @@ def extract_qqs(texts: Iterable[str]) -> list[int]:
     return result
 
 
-def _offline_calls(window: tuple, shown: list[dict]) -> list[dict]:
-    """Unread recovered calls to her that the screen's slice leaves out, oldest first.
+def prepare(window: tuple, *, shown, count, pending=()) -> dict:
+    """Render new material and return an opaque read patch without confirming it.
 
-    WHY: 补回的消息按时间插在开机后实时到的消息前面。这一段已经给过这个窗口时，画面只
-    接着"上次给到哪一条"往后给，看到时间也已经过了它们，叫她的那条就不在画面里，第一次
-    输出却会把它标成已读（2026-10-23 审查）。所以按消息号把还没读的离线呼叫找出来补上。
+    WHY: 已读等第一次输出；展示身份却来自已经保存的 view，失败重试不重复追加画面。
+    WHY: 维护者 2026-10-24：follow 期间的记录不截，之前的积压仍最多 60 条；
+    刚 follow 一个很久没看的群不能把几周旧消息全倒进来。
+    WHY: 2026-10-23：离线点名会插在上次画面之前，必须按身份补给她，不能只接时间水位。
     """
-    from mods import _backfill
+    from . import awaker
 
-    calls = [entry["event"] for entry in oplog.unread(window)
-             if entry.get("activation_kind") == _backfill.OFFLINE_CALL]
-    if not calls:
-        return []
-    wanted = {chatlog.recall_key(event.get("message_id")) for event in calls}
-    texts = {item["text"] for item in shown}
-    found = []
-    for item in records(window, 1_000_000, since=min(int(event["time"]) for event in calls)):
-        head = chatlog._split_head(item["text"].partition("\n")[0])
-        if (item["text"] not in texts and head is not None and head["message_id"] is not None
-                and chatlog.recall_key(head["message_id"]) in wanted):
-            found.append(item)
-    return found
-
-
-def _with_calls(window: tuple, calls: list[dict], text: str) -> str:
-    if not calls:
-        return text
-    return ("（下面是离线期间叫你的消息，补回时插在了更早的位置）\n" + render(window, calls)
-            + ("\n" + text if text else ""))
-
-
-def slice_window(window: tuple, count: int, last: str | None) -> tuple[str, tuple, str | None]:
-    """One window's chatlog lines for this wake, the (time, arrival) to mark seen, and its last record.
-
-    *last* is the last record of this window already shown earlier in this segment;
-    then only the records after it are new.
-    """
-    mark = _seen().get(label(window))
-    # WHY: 标已读只标到读画面这一刻为止的未读（2026-10-22 审查发现：生成期间同窗口
-    # 再来的 at 会在第一次输出时一起被标掉，收尾不再接续）。chatlog 写入与登记到达
-    # 在同一把窗口锁里、先写后登记，所以先取边界再读文件，边界内的都在画面能读到的文件里。
-    through = oplog.latest_pending_arrival(window)
-    # WHY: 维护者 2026-10-24：follow 期间到的消息不截，之前的照旧最多 _FRESH_MAX
-    # 条。她选了要跟上，dismiss 掉又回来的那批要原样给全，不靠 read_log 往前翻；一个群一天的消息放得下。
-    # 只按"现在盖着 follow"不行：follow 一个很久没看的群，第一屏会把几周的积压全倒出来。
-    layer = _chat_root._awaker.layer(window)
-    since = layer.get("since") if layer is not None and layer["state"] == "follow" else None
-    # 记录时间只到秒：起点取整，同一秒里到的也算 follow 期间。
-    during = (sum(1 for item in records(window, 1_000_000, since=since)
-                  if item["time"] is not None and item["time"] >= int(since)) if since is not None else 0)
-    cap = FRESH_MAX + during
-    items = records(window, max(count, 1) + cap)
-    texts = [item["text"] for item in items]
-    if last is not None and last in texts:
-        # WHY: 这一段里已经给过这个窗口：按"上次给到哪一条"接着给，不按看到时间——看到
-        # 时间只精确到秒，同一秒里后到的那条按时间会被当成看过。
-        after = items[len(texts) - texts[::-1].index(last):]
-        shown = after[-cap:]
-        calls = _offline_calls(window, shown)
-        if not shown:
-            return _with_calls(window, calls, ""), (None, through), last
-        text = render(window, shown, mark)
-        if len(after) > cap:
-            text = (f"（{label(window)} 又有 {len(after)} 条新消息，这里只展示最新的 {len(shown)} 条；"
-                    f"更早的用 read_log(\"{label(window)}\", before=\"{clock(shown[0]['time'])}\") 往前翻）\n" + text)
-        return _with_calls(window, calls, text), (latest_time(shown), through), shown[-1]["text"]
-    fresh = [item for item in items if mark is not None and item["time"] is not None and item["time"] > mark]
-    # WHY: 维护者 2026-10-25：交接后 last_shown 清空、看到位置还在，按 count 补旧消息会把
-    # 刚压缩掉的原文倒回来。有 mark 时只带几条接话，也兜住看到时间只精确到秒的边界；
-    # 从没看过的窗口才按 count 补历史，新消息仍按原来的上限给。
-    lead = LEAD_IN if mark is not None else max(count - len(fresh), LEAD_IN)
-    older = [item for item in items if item not in fresh][-lead:]
-    shown = older + fresh if mark is not None else items[-max(count, LEAD_IN):]
-    skipped = 0
-    if len(fresh) > cap:
-        # WHY: 维护者 2026-10-22 定：新消息太多（比如离线一晚）只展示最新的 _FRESH_MAX 条，
-        # 但要明说跳过了多少、从哪里接着翻，看到位置照样推进；不静默丢，也不撑爆上下文。
-        total = sum(1 for item in records(window, 1_000_000, since=mark)
-                    if item["time"] is not None and item["time"] > mark)
-        shown = fresh[-cap:]
-        skipped = total - len(shown)
-    if not shown:
-        return "", (None, through), last
-    text = render(window, shown, mark)
-    if skipped:
-        text = (f"（{label(window)} 上次之后有 {skipped + len(shown)} 条新消息，这里只展示最新的 "
-                f"{len(shown)} 条；更早的 {skipped} 条要看就用 read_log(\"{label(window)}\", "
-                f"before=\"{clock(shown[0]['time'])}\") 往前翻）\n" + text)
-    return _with_calls(window, _offline_calls(window, shown), text), (latest_time(shown), through), shown[-1]["text"]
+    window = tuple(window)
+    shown = set(shown)
+    with context.window_lock(window), _lock:
+        state = deepcopy(_state(window))
+        marks = [state["through"], *(item.get("time") for item in state["pending"].values())]
+        since = min((stamp for stamp in marks if stamp is not None), default=None)
+        # Ordinary requests walk only the unread range and a short tail for lead-in.
+        rows = records(window, max(count, LEAD_IN) + FRESH_MAX)
+        if since is not None:
+            fresh_rows = records(window, 1_000_000, since=since)
+            fresh_ids = {item["id"] for item in fresh_rows}
+            rows = [item for item in rows if item["id"] not in fresh_ids] + fresh_rows
+        for item in rows:
+            item["unread"] = is_unread(state, item["id"], item["time"])
+        available = [item for item in rows if item["id"] not in shown]
+        fresh = [item for item in available if item["unread"]]
+        layer = awaker.layer(window)
+        since = layer.get("since") if layer and layer["state"] == "follow" else None
+        followed = [item for item in fresh if since is not None and item["time"] is not None
+                    and item["time"] >= int(since)]
+        calls = [item for item in fresh if state["pending"].get(item["id"], {}).get("recovered")]
+        # Newest 60 plus exact follow/offline-call exceptions; keep ordinary log order.
+        selected = {item["id"] for item in fresh[-FRESH_MAX:] + followed + calls}
+        skipped = len(fresh) - len(selected)
+        if shown:
+            items = [item for item in available if item["id"] in selected]
+        elif state["through"] is not None:
+            # WHY: 2026-10-25：交接后只补三条接话，不把刚压缩掉的历史重新倒回来。
+            lead = [item for item in available if not item["unread"]][-LEAD_IN:]
+            ids = selected | {item["id"] for item in lead}
+            items = [item for item in available if item["id"] in ids]
+        else:
+            ids = selected | {item["id"] for item in available[-max(count, LEAD_IN):]}
+            items = [item for item in available if item["id"] in ids]
+        by_id = {item["id"]: item for item in rows}
+        metadata = {}
+        for identity_ in shown | {item["id"] for item in items}:
+            item = by_id.get(identity_)
+            saved = state["pending"].get(identity_)
+            if item is not None:
+                if identity_ in shown and not item["unread"]:
+                    continue
+                metadata[identity_] = dict(saved or {}, time=item["time"], unread=item["unread"])
+                if "event" not in metadata[identity_]:
+                    metadata[identity_]["event"] = event_for_record(window, item)
+            elif saved is not None:
+                metadata[identity_] = saved
+        for patch in pending:
+            if patch.get("window") == label(window):
+                for identity_, item in patch.get("records", {}).items():
+                    if identity_ in shown and is_unread(state, identity_, item.get("time")):
+                        metadata.setdefault(identity_, item)
+        text = render(window, items, state["through"])
+        if skipped and items:
+            text = (f"（{label(window)} 还有 {skipped} 条新消息未展示；更早的用 "
+                    f'read_log("{label(window)}", before="{clock(items[0]["time"])}") 往前翻）\n' + text)
+        return {"text": text, "shown": [item["id"] for item in items],
+                "patch": {"window": label(window), "records": metadata},
+                "follow_ids": [item["id"] for item in followed]}
 
 
 def unread_hint(on_screen: set[tuple]) -> str:
-    rows = []
+    from . import awaker
+
     try:
         bot = identity.bot_id()
     except RuntimeError:
         bot = None
-    for detail in oplog.pending_details():
-        window = tuple(detail["window"])
-        if not _windows.known(window) or window in on_screen:
+    rows = []
+    for text, state in read_snapshot().items():
+        try:
+            window = _windows.parse(text)
+        except ValueError:
             continue
-        # WHY: 2026-10-28 维护者：排除 Bot 自身发言回显，只统计他人发来的未读消息。
-        # 避免她自己刚 send 完几条消息就被当成对方有新消息催她，害她虚惊一场。
-        entries = oplog.unread(window)
-        others = [e for e in entries if bot is None or (
-            e.get("event", {}).get("user_id") != bot and
-            str(e.get("event", {}).get("author")) != str(bot)
-        )]
-        if not others:
+        if window in on_screen:
             continue
-        mentions = sum(1 for e in others if e.get("activated") and e.get("activation_kind") == "mention")
-        rows.append(f"{_windows.title(window)} {len(others)} 条"
-                    + (f"（@你 {mentions}）" if mentions else "")
-                    + "".join(f"（{badge}）" for badge in _chat_root._awaker.badges(window)))
+        # WHY: 2026-10-28：自己的发送回声不算“其它窗口”里别人的未读。
+        others = [item for item in state["pending"].values()
+                  if bot is None or (item.get("event", {}).get("user_id") != bot
+                                     and str(item.get("event", {}).get("author")) != str(bot))]
+        if others:
+            mentions = sum(item.get("kind") == "mention" for item in others)
+            rows.append(f"{_windows.title(window)} {len(others)} 条"
+                        + (f"（@你 {mentions}）" if mentions else "")
+                        + "".join(f"（{badge}）" for badge in awaker.badges(window)))
     return ("【其它窗口】还有没看过的消息：" + "；".join(rows[:10])
             + "。要看就用 read_log 读原文。") if rows else ""
-
-
-def late_arrivals(newest: dict[tuple, tuple], last_shown: dict[str, str],
-                  count: int) -> tuple[list[dict], dict[tuple, tuple]]:
-    """Messages that reached the windows on screen since she read them, to append to this segment.
-
-    Advances *newest* and *last_shown* now; the marks it returns are applied
-    (seen time, read) only once she has produced output after seeing them.
-
-    WHY: 维护者 2026-10-23：私聊每条都叫醒她以后，人分几条发的话会在她干活时陆续到，
-    不用延迟、也不打断请求，下一次子请求之前写进这一段，由她自己决定接不接（参照 Cortico
-    在轮次边界投递）。以前挂在请求末尾的提示里，每次重算、不进这一段，收尾还要为它们再叫
-    一次。
-
-    WHY: 已读要等她看过以后有了一次输出（哪怕只是思考）才标，维护者说这样最稳：请求失败
-    时它们仍是未读，叫她的那条照样会再叫醒她。`last_shown` 却在追加时就推进，它和这一段
-    一起存盘，这一段里有了它们，下次的画面就不会再给一遍。
-
-    WHY: 只是她自己发出去的回显不单独插一条：她刚 send 的话不用再看一遍，它们留着未读，
-    下次和别的新消息一起出现。
-    """
-    added: list[dict] = []
-    marks: dict[tuple, tuple] = {}
-    bot = identity.bot_id()
-    for window, (_stamp, through) in list(newest.items()):
-        late = [entry for entry in oplog.unread(window)
-                if through is None or not oplog.arrival_before_or_at(entry["arrival"], through)]
-        if not any(entry["event"].get("user_id") != bot for entry in late):
-            continue
-        window_label = label(window)
-        text, mark, last = slice_window(window, count, last_shown.get(window_label))
-        newest[window] = marks[window] = mark
-        if not text:
-            continue
-        last_shown[window_label] = last
-        calls = [f"{entry.get('activation_kind')}"
-                 + (f" 作者={entry['event']['user_id']}" if entry["event"].get("user_id") is not None else "")
-                 for entry in late if entry.get("activated")]
-        facts = ["你干活时刚到的", clock(), *([f"叫你的：{'、'.join(calls)}"] if calls else []),
-                 *_chat_root._awaker.badges(window)]
-        added.append(_view.outside(window_label, facts, text))
-    return added, marks
-
-
-def piled(window: tuple, mark: dict) -> int:
-    """Follow-time lines of *window* that would come back unread if the stretch since *mark* went."""
-    layer = _chat_root._awaker.layer(window)
-    since = layer.get("since") if layer is not None and layer["state"] == "follow" else None
-    if since is None:
-        return 0
-    seen = mark.get("seen", {}).get(label(window))
-    return sum(1 for item in records(window, 1_000_000, since=since)
-               if item["time"] is not None and item["time"] >= int(since) and (seen is None or item["time"] > seen))

@@ -75,31 +75,28 @@ def recover(window: tuple, call_api) -> int:
         else:
             logger.debug("离线补回 %s 未拉取新消息（%s）", window, error.reason)
     if calls:
-        from mods import chat
+        from mods.chat import attention
 
-        threading.Thread(target=chat._agent._drive_agent, args=(None, window),
-                         name="napcat-backfill-wake", daemon=True).start()
+        attention.rescan()
     return written
 
 
 def _register_calls(window: tuple, events: list[dict]) -> int:
-    """Register the recovered messages that would have woken her live as activated arrivals.
+    """Hand newly inserted identities to the single read/attention owner.
 
     WHY: 维护者 2026-10-23：补回里有人叫她就叫醒。判据和实时消息同一个
     （``chat.activation_signal``：at、名字开头、私聊对方发来的）；只有这些登记到达，
     别的补回消息不算未读，画面里照样能看到。唤醒原因写「离线时叫你」，她从时间也看得出
     是离线期间的。一个窗口补完才叫一次，其中几条叫她的合进同一次唤醒。
     """
-    from mods import chat, context, oplog
+    from mods.chat import attention
 
     found = 0
+    # Hand off every newly inserted identity, including ordinary recovery, so a
+    # later scan cannot mistake an excluded offline record for a live unread one.
     for event in events:
-        if event.get("post_type") != "message" or not chat.activation_signal(event):
-            continue
-        with context.window_lock(window):
-            arrival = oplog.arrive(window, event)
-            oplog.activate(arrival, OFFLINE_CALL)
-        found += 1
+        if attention.on_record(window, dict(event, _defer_wake=True), recovered=True):
+            found += 1
     return found
 
 
