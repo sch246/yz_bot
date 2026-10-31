@@ -990,26 +990,56 @@ def durable_tree(root):
     fsync_dir(root)
 
 
+def uncommitted_preparation(root, migration, *, retire=False):
+    """Retire only the shape preceding the first durable manifest.
+
+    No switch is possible before that manifest. Never infer an inverse rename
+    from a missing record: any backup bytes, prepared tree or switched target
+    needs manual investigation instead.
+    """
+    if ((root / "data/chat").exists() or (root / "data/legacy" / NAME).exists()
+            or not any((root / relative).exists() for relative in ("data/context", "data/event_stream"))):
+        raise Blocked("missing-migration-manifest", migration.relative_to(root))
+    for path in migration.iterdir():
+        if path.is_symlink():
+            raise Blocked("missing-migration-manifest", migration.relative_to(root))
+        if path.name == "backup" and path.is_dir() and not any(path.iterdir()):
+            continue
+        if path.is_file() and re.fullmatch(r"manifest\.json\.[0-9a-f]{32}\.tmp", path.name):
+            continue
+        raise Blocked("missing-migration-manifest", migration.relative_to(root))
+    if retire:
+        target = migration.with_name(NAME + "-uncommitted-" + uuid4().hex)
+        os.replace(migration, target)
+        fsync_dir(migration.parent)
+        return target
+    return migration
+
+
 def apply(plan, stage, *, fail_after=None):
     root = plan.root
     migration = root / "data/migrations" / NAME
     if migration.exists():
-        previous = json_read(migration / "manifest.json", {})
-        if previous.get("status") != "rolled-back":
-            raise Blocked("unfinished-migration-use-rollback", migration.relative_to(root))
-        os.replace(migration, migration.with_name(NAME + "-rolled-back-" + uuid4().hex))
-        fsync_dir(migration.parent)
+        if not (migration / "manifest.json").exists():
+            source_unchanged(plan)
+            uncommitted_preparation(root, migration, retire=True)
+        else:
+            previous = json_read(migration / "manifest.json", {})
+            if previous.get("status") != "rolled-back":
+                raise Blocked("unfinished-migration-use-rollback", migration.relative_to(root))
+            os.replace(migration, migration.with_name(NAME + "-rolled-back-" + uuid4().hex))
+            fsync_dir(migration.parent)
     source_unchanged(plan)
     backup = migration / "backup"
-    backup.mkdir(parents=True)
-    sync_parents(backup, root)
     # Only the changed owners are copied. Chatlogs and other runtime state are
     # read-only inputs, fingerprinted above, and are never rewritten or backed up.
     changes = ["data/context", "data/event_stream", "data/storage/agent.json", "data/notes/awaker.md"]
     manifest = {"version": VERSION, "status": "backing-up", "sources": plan.sources,
                 "operations": [], "issues": plan.issues, "backup": {}}
-    atomic_json(migration / "manifest.json", manifest)
     try:
+        backup.mkdir(parents=True)
+        sync_parents(backup, root)
+        atomic_json(migration / "manifest.json", manifest)
         for relative in changes:
             source = root / relative
             if not source.exists():
@@ -1069,7 +1099,8 @@ def apply(plan, stage, *, fail_after=None):
         manifest["target"] = tree_files(root / "data/chat")
         atomic_json(migration / "manifest.json", manifest)
     except BaseException:
-        rollback(root, manifest, migration)
+        if (migration / "manifest.json").is_file():
+            rollback(root, manifest, migration)
         raise
 
 
@@ -1126,6 +1157,17 @@ def run(root, *, apply_changes=False, recover=False):
         no_symlink(root, relative)
     migration = root / "data/migrations" / NAME
     marker = migration / "manifest.json"
+    orphan = migration.is_dir() and not marker.exists()
+    if orphan:
+        uncommitted_preparation(root, migration)
+        if recover:
+            if not apply_changes:
+                raise Blocked("rollback-requires-apply", migration.relative_to(root))
+            # Validate that these are still old owners before retiring even a
+            # preparation-only attempt. Nothing is restored or overwritten.
+            source_unchanged(Import(root).build())
+            target = uncommitted_preparation(root, migration, retire=True)
+            return {"status": "preparation-retired", "path": str(target)}
     existing = json_read(marker)
     if existing:
         if existing.get("version") != VERSION:

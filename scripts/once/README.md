@@ -55,3 +55,9 @@ uv run --frozen python scripts/once/migrate_chat_core.py --runtime-root /absolut
 恢复保留备份和新准备目录，不删除冲突文件；路径状态冲突时停止并报告位置。
 `rolled-back` 后可以重新 dry-run/apply；新一次 apply 将旧尝试留在同级
 `chat-core-v1-rolled-back-*` 目录。已完成的迁移不通过这个恢复命令撤销。
+
+若进程在首次 manifest 提交前退出，只接受空迁移目录，或仅含空 backup 与首次
+manifest 临时文件的目录，并要求旧 owner 仍能完整校验、没有新 chat 或 legacy 目标。
+apply 会把该准备目录留在 `chat-core-v1-uncommitted-*` 后重试；上述恢复命令则只退休
+该准备目录，返回 `preparation-retired`。只要出现备份内容、prepared 或其它残留而
+缺失 manifest，就阻断并保留现场，不猜测已经执行过哪些切换。
