@@ -20,7 +20,7 @@ def _short(value, limit: int) -> str:
 
 def pairs(*, ids=None, after: float | None = None) -> list[tuple[dict, dict | None]]:
     """Outputs in order, each with the result that answered it."""
-    entries = journal.events()
+    entries = journal.events(after=after or 0)
     wanted = set(ids) if ids is not None else None
     related = {}
     for row in entries:

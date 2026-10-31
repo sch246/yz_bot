@@ -3,12 +3,19 @@
 Rows: {id: YYYYMMDD-N, time: float, ctx: str, kind: str, messages: list[dict],
 ...source metadata}. ``item_id``/``timestamp`` on append are for offline import;
 ids are never reused, even when their references disappear from a view.
+A wake with an automatically allocated number needs ctx_started (the view's
+started time); imported wakes can provide number explicitly. Step numbering
+uses the referenced wake's time, and act lookup starts at the assistant's time.
 
 Act rows contain exactly one original assistant message. ``tool_started`` must
 succeed before dispatch; each ``record_results`` tool message is its own row,
 linked by act_id and tool_call_id. ``complete=True`` closes the act. A missing
 response is projected as interrupted/unknown/unexecuted, never retried here.
 All returns are detached JSON copies. Importing this module reads no runtime.
+Reads and writes repair an unterminated tail under the same exclusive lock:
+a complete row gets its missing newline; an incomplete row is fsynced into a
+named .tail-<offset>-<uuid>.bin evidence file before truncating only those bytes.
+A warning names the evidence without copying content. Earlier corruption fails.
 """
 
 from __future__ import annotations
@@ -16,11 +23,13 @@ from __future__ import annotations
 from contextlib import contextmanager
 import fcntl
 import json
+import logging
 import os
 from pathlib import Path
 import re
 import threading
 import time
+import uuid
 
 ROOT = Path("data/chat/journal")
 _lock = threading.RLock()
@@ -53,12 +62,63 @@ def _reading():
         if getattr(_local, "writing", False) or not ROOT.is_dir():
             yield
         else:
-            with (ROOT / ".lock").open("a") as handle:
-                fcntl.flock(handle, fcntl.LOCK_SH)
-                try:
-                    yield
-                finally:
-                    fcntl.flock(handle, fcntl.LOCK_UN)
+            # Reading may recover a crash tail, so do not upgrade a shared lock
+            # after another process has already started reading the same bytes.
+            with _writing():
+                yield
+
+
+def _row(line, path, number):
+    try:
+        row = json.loads(line)
+        if not isinstance(row, dict) or not _ID.fullmatch(row.get("id", "")):
+            raise ValueError("invalid id")
+        if row["id"].split("-")[0] != path.stem:
+            raise ValueError("id in wrong journal day")
+        if not isinstance(row.get("messages"), list):
+            raise ValueError("invalid messages")
+    except (ValueError, TypeError, UnicodeDecodeError) as error:
+        raise ValueError(f"invalid journal {path.name}:{number}") from error
+    return row
+
+
+def _recover_tail(path, data):
+    if not data or data.endswith(b"\n"):
+        return data
+    prefix, separator, tail = data.rpartition(b"\n")
+    offset = len(prefix) + len(separator)
+    try:
+        _row(tail, path, data.count(b"\n") + 1)
+    except ValueError:
+        # WHY: SIGKILL can stop a write before the newline. Preserve the exact
+        # uncommitted bytes durably before removing them from the readable log;
+        # otherwise one unfinished call would block every later wake forever.
+        evidence = path.with_name(f"{path.name}.tail-{offset}-{uuid.uuid4().hex}.bin")
+        with evidence.open("xb") as handle:
+            handle.write(tail)
+            handle.flush()
+            os.fsync(handle.fileno())
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        with path.open("r+b") as handle:
+            handle.truncate(offset)
+            handle.flush()
+            os.fsync(handle.fileno())
+        logging.getLogger("yz.agent").warning(
+            "Recovered incomplete journal tail %s at byte %d; %d bytes preserved in %s",
+            path.name, offset, len(tail), evidence.name)
+        return data[:offset]
+    # A complete imported/manual last row is still content. Never concatenate
+    # the next object to it, and never quarantine a valid original message.
+    with path.open("ab") as handle:
+        handle.write(b"\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    logging.getLogger("yz.agent").warning("Completed missing journal newline in %s", path.name)
+    return data + b"\n"
 
 
 def _read(path):
@@ -70,23 +130,16 @@ def _read(path):
     cached = _cache.get(path)
     if cached is not None and cached[0] == signature:
         return cached[1]
+    data = _recover_tail(path, path.read_bytes())
     rows, seen = [], set()
-    with path.open(encoding="utf-8") as handle:
-        for number, line in enumerate(handle, 1):
-            try:
-                row = json.loads(line)
-                if not isinstance(row, dict) or not _ID.fullmatch(row.get("id", "")):
-                    raise ValueError("invalid id")
-                if row["id"].split("-")[0] != path.stem:
-                    raise ValueError("id in wrong journal day")
-                if not isinstance(row.get("messages"), list):
-                    raise ValueError("invalid messages")
-            except (ValueError, TypeError) as error:
-                raise ValueError(f"invalid journal {path.name}:{number}") from error
-            if row["id"] in seen:
-                raise ValueError(f"duplicate journal id: {row['id']}")
-            seen.add(row["id"])
-            rows.append(row)
+    for number, line in enumerate(data.split(b"\n")[:-1], 1):
+        row = _row(line, path, number)
+        if row["id"] in seen:
+            raise ValueError(f"duplicate journal id: {row['id']}")
+        seen.add(row["id"])
+        rows.append(row)
+    stat = path.stat()
+    signature = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
     _cache[path] = (signature, rows, {row["id"]: row for row in rows})
     return rows
 
@@ -95,7 +148,10 @@ def events(*, ctx=None, kind=None, after=0):
     """Detached rows in append order within each day, oldest day first."""
     with _reading():
         found = []
+        first_day = time.strftime("%Y%m%d", time.localtime(after)) if after else None
         for path in sorted(ROOT.glob("[0-9]" * 8 + ".jsonl")):
+            if first_day is not None and path.stem < first_day:
+                continue
             found.extend(row for row in _read(path)
                          if (ctx is None or row["ctx"] == ctx)
                          and (kind is None or row["kind"] == kind)
@@ -136,9 +192,14 @@ def _append(kind, *, ctx, messages=(), item_id=None, timestamp=None, **metadata)
         raise ValueError(f"journal id already exists: {item_id}")
     item_id = item_id or f"{day}-{max((int(row['id'].split('-')[1]) for row in existing), default=0) + 1}"
     if kind == "wake" and "number" not in metadata:
-        metadata["number"] = max((row.get("number", 0) for row in events(ctx=ctx, kind="wake")), default=0) + 1
+        if "ctx_started" not in metadata:
+            raise ValueError("automatic wake numbering needs ctx_started or an explicit number")
+        metadata["number"] = max((row.get("number", 0) for row in
+                                  events(ctx=ctx, kind="wake", after=metadata["ctx_started"])), default=0) + 1
     if kind == "assistant" and any(message.get("tool_calls") for message in messages if isinstance(message, dict)) and metadata.get("wake_id") and "step" not in metadata:
-        metadata["step"] = max((row.get("step", 0) for row in events(ctx=ctx, kind="assistant")
+        wake = get(metadata["wake_id"])
+        metadata["step"] = max((row.get("step", 0) for row in
+                                events(ctx=ctx, kind="assistant", after=wake["time"])
                                 if row.get("wake_id") == metadata["wake_id"]), default=0) + 1
     row = clone({"id": item_id, "time": stamp, "ctx": ctx, "kind": kind,
                  "messages": list(messages), **metadata})
@@ -189,7 +250,7 @@ def act_entries(act_id) -> list[dict]:
     act = get(act_id)
     if act["kind"] != "assistant":
         raise ValueError("not an assistant act")
-    return [act, *(row for row in events(ctx=act["ctx"]) if row.get("act_id") == act_id)]
+    return [act, *(row for row in events(ctx=act["ctx"], after=act["time"]) if row.get("act_id") == act_id)]
 
 
 def _act(act_id):

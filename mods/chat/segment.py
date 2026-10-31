@@ -7,10 +7,13 @@ reason, ended). No messages/marks/scopes/told/last_shown mirrors are stored.
 append/begin_wake/begin_act/tool_started/record_results default to persisting
 main view.json. A fork passes persist=False, keeps its references in memory,
 and finally archive(view, "fork"); it cannot replace the main current view.
+All frozen views use views/<ctx>.json; kind is metadata, never part of identity.
+Only central handoffs and reflection enter the years.md handoff index.
 Only a wake owned by this view's ctx is inherited by newly appended entries.
 
 Source metadata on journal rows:
 * wake: number (allocated from all ctx wakes, even dropped ones), at: str,
+  ctx_started: float (bounds allocation to this context's lifetime),
   boxes: {window: text}, read_snapshot: opaque screen.read_snapshot() dict.
 * screen: window: str, shown: list[record identity], read_patch: opaque dict,
   follow_ids: list[identity], wake_id: str.
@@ -178,6 +181,7 @@ def append(view, kind, *, messages=(), persist=True, **metadata):
 
 
 def begin_wake(view, *, messages=(), boxes=None, read_snapshot=None, at=None, persist=True, **metadata):
+    metadata.setdefault("ctx_started", view["started"])
     return append(view, "wake", messages=messages, boxes=boxes or {}, read_snapshot=read_snapshot or {},
                   at=at or time.strftime("%Y-%m-%d %H:%M:%S"), persist=persist, **metadata)
 
@@ -226,6 +230,8 @@ def render(view, *, reasoning="keep"):
     if reasoning not in ("keep", "drop"):
         raise ValueError("reasoning must be keep or drop")
     rows = _entries(view)
+    latest_wake = _current_wake(view)
+    latest_wake_id = latest_wake["id"] if latest_wake else None
     by_act = {}
     for row in rows:
         if row.get("act_id"):
@@ -243,7 +249,12 @@ def render(view, *, reasoning="keep"):
             if message.get("role") == "assistant":
                 current = by_act.get(row["id"], [])
                 waiting = [call["id"] for call in message.get("tool_calls") or []]
-                if reasoning == "drop":
+                own_current_chain = row["ctx"] == view["ctx"] and (
+                    latest_wake_id is None or row.get("wake_id") == latest_wake_id)
+                # WHY: the provider's native thinking is part of the active
+                # tool chain. Drop only older material, including borrowed refs
+                # in a fork; a fork's own wake-less acts are still its live chain.
+                if reasoning == "drop" and not own_current_chain:
                     message.pop("reasoning_content", None)
                     message.pop("reasoning", None)
                 # WHY: keep the compress call and receipt to avoid repeating an
@@ -507,30 +518,50 @@ def dismiss(view, wake_id, *, boxes=None, last_sent=0, follow_counts=None):
 
 
 def archive(view, kind=""):
+    """Freeze views/<ctx>.json, idempotently finishing an interrupted archive.
+
+    Existing content must match exactly, reusing only its automatically chosen
+    ended time when the caller has none. A different view never overwrites it.
+    """
     if kind and not re.fullmatch(r"[0-9A-Za-z_-]+", kind):
         raise ValueError("invalid archive kind")
     with _lock:
         frozen = copy.deepcopy(view)
-        frozen["stats"]["ended"] = time.time()
         if kind:
             frozen["stats"]["kind"] = kind
-        _validate(frozen)
-        target = ROOT / "views" / (view["ctx"] + ("-" + kind if kind else "") + ".json")
+        target = ROOT / "views" / (view["ctx"] + ".json")
         if target.exists():
-            raise ValueError("archive already exists")
-        _atomic(target, frozen)
-        try:
-            _YEARS.parent.mkdir(parents=True, exist_ok=True)
-            with _YEARS.open("a", encoding="utf-8") as handle:
-                handle.write(_year_line(frozen) + "\n")
-        except OSError:
-            pass  # the yearbook is only an index, not the frozen view
+            existing = json.loads(target.read_text(encoding="utf-8"))
+            _validate(existing)
+            frozen["stats"].setdefault("ended", existing["stats"]["ended"])
+            if existing != frozen:
+                raise ValueError("different archive already exists for this ctx")
+            frozen = existing
+        else:
+            frozen["stats"].setdefault("ended", time.time())
+            _validate(frozen)
+            _atomic(target, frozen)
+        if frozen["stats"].get("kind", "") in ("", "reflect"):
+            _index_year(frozen)
         if not kind:
             current = ROOT / "view.json"
             if current.is_file() and json.loads(current.read_text(encoding="utf-8"))["ctx"] == view["ctx"]:
                 current.unlink()
                 (ROOT / "view.bak.json").unlink(missing_ok=True)
-        return target.stem
+        return view["ctx"]
+
+
+def _index_year(view):
+    try:
+        _YEARS.parent.mkdir(parents=True, exist_ok=True)
+        marker = f"[{view['ctx']}]"
+        if _YEARS.is_file() and any(line.rstrip().endswith(marker)
+                                  for line in _YEARS.read_text(encoding="utf-8").splitlines()):
+            return
+        with _YEARS.open("a", encoding="utf-8") as handle:
+            handle.write(_year_line(view) + "\n")
+    except OSError:
+        pass  # the yearbook is only an index, not the frozen view
 
 
 def _year_line(view):
