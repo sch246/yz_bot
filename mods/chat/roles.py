@@ -108,6 +108,51 @@ def read_actions(ids: list[str] | None = None, count: int = 10, keyword: str = "
     return page
 
 
+def read_context(name: str = "", start: int = 0, match: str = "", around: int = 300) -> str:
+    """Read current, frozen ctx, fold or original journal id; paginate full text.
+
+    Empty name lists the latest thirty archived views. ``match`` searches the
+    full original text, before compact display or page slicing.
+    """
+    target = name.strip()
+    if not target:
+        found = _segment.archived(last=30)
+        if not found:
+            return "（还没有归档的上下文）"
+        return "\n".join(f"{item['name']}  {_screen.clock(item['started'])[5:16]} 至 "
+                         f"{_screen.clock(item['ended'])[5:16]}  {item['messages']} 条消息  "
+                         f"窗口 {'、'.join(item['windows']) or '无'}  · {item['reason'][:40]}" for item in found)
+    data = _segment.load() if target == "current" else _segment.read_archived(target)
+    if data is None:
+        return f"（没有叫 {name} 的段或日志条目；不给 name 可以列出最近的段）"
+    text = f"# {target}\n" + _segment.readable(data, compact=not bool(match.strip()), expand_folds=bool(match.strip()))
+    start = max(0, int(start))
+    if match.strip():
+        needle = match.strip().casefold()
+        positions, at = [], text.casefold().find(needle)
+        while at >= 0:
+            positions.append(at)
+            at = text.casefold().find(needle, at + 1)
+        if not positions:
+            return f"（{target} 里没有「{match.strip()}」）"
+        chosen = next((i for i, at in enumerate(positions) if at >= start), None)
+        if chosen is None:
+            return f"（共 {len(positions)} 处，start 已超过最后一处）"
+        at = positions[chosen]
+        space = max(200, min(2000, int(around or 300)))
+        page = text[max(0, at - space):at + len(needle) + space]
+        tail = f"第 {chosen + 1} 处，共 {len(positions)} 处"
+        if chosen + 1 < len(positions):
+            tail += f"；看下一处用 start={at + 1}"
+        return page + f"\n（{tail}）"
+    if start >= len(text):
+        return f"（共 {len(text)} 字，start 超出范围）"
+    page = text[start:start + _READ_CHARS]
+    if start + _READ_CHARS < len(text):
+        page += f"\n（共 {len(text)} 字，还有 {len(text) - start - _READ_CHARS} 字；加 start={start + _READ_CHARS} 接着读）"
+    return page
+
+
 def _matching(lines, needle: str, most: int) -> tuple[int, list[str]]:
     """How many lines contain *needle*, and the first *most* of them, long ones cut around the hit."""
     count, picked = 0, []
@@ -194,10 +239,11 @@ def search(keyword: str, window: str = "", days: int = _SEARCH_DAYS) -> str:
             more = f"，列前 {_NOTE_HITS} 份" if len(found) > _NOTE_HITS else ""
             sections.append(f"## {title}（{len(found)} 份{more}；用 read_note 读全文）\n" + "\n".join(found[:_NOTE_HITS]))
 
-    found, total = [], 0
+    found, total, archived_ids = [], 0, set()
     # 一次只解析一段：只留要列出来的摘要，其余只计数。
     for name, data in _segment.each_archived(oldest, newest_first=True):
-        count, shown = _matching(_archive_lines(data.get("messages", [])), needle, 2)
+        archived_ids.update(_segment.source_ids(data, expand_folds=True))
+        count, shown = _matching(_archive_lines(_segment.raw_messages(data, expand_folds=True)), needle, 2)
         if count:
             total += 1
             if len(found) < _SEGMENT_HITS:
@@ -206,6 +252,20 @@ def search(keyword: str, window: str = "", days: int = _SEARCH_DAYS) -> str:
         more = f"，列最新 {_SEGMENT_HITS} 段" if total > _SEGMENT_HITS else ""
         sections.append(f"## 归档的上下文（{total} 段{more}；只找你当时想的、说的、调用和结果；"
                         "加载 memory_system 后用 read_context 读那一段）\n" + "\n".join(found))
+
+    current_hits, current_total = [], 0
+    for output, result in reversed(_actions.pairs(after=oldest)):
+        if output["id"] in archived_ids:
+            continue
+        count, shown = _matching(_archive_lines([output["assistant"], *result["returns"]]), needle, 2)
+        if count:
+            current_total += 1
+            if len(current_hits) < _SEGMENT_HITS:
+                current_hits.append(f"# {output['id']}（ctx {output['ctx']}，{count} 处）\n" + "\n".join(shown))
+    if current_hits:
+        more = f"，列最新 {_SEGMENT_HITS} 条" if current_total > _SEGMENT_HITS else ""
+        sections.append(f"## 经历日志中的其它行动（{current_total} 条行动{more}；用 read_actions 或 read_context 读原文）\n"
+                        + "\n".join(current_hits))
 
     return "\n\n".join(sections) if sections else f"（最近 {days} 天的聊天记录、笔记、日记和归档里都没有找到）"
 
@@ -264,6 +324,7 @@ def handoff_prompt(reason: str, day: str) -> str:
     return text
 
 
+# T04 replaces this session construction with the shared run entry at integration.
 def summarize(period: str) -> None:
     """Roll a month's daily diaries, or a year's monthly ones, into ``diary:<period>``.
 

@@ -1,8 +1,7 @@
 """Render the agent's own past actions as readable records.
 
-Each output and the result batch that answered it become one record shaped like
-a chatlog entry: an unindented head with time and id, an indented body.  The
-oplog stays the write authority; this is only how she reads it back.
+One assistant and its individually journaled results become one readable
+record. The journal owns the original protocol data; this module only renders.
 """
 
 from __future__ import annotations
@@ -10,7 +9,7 @@ from __future__ import annotations
 import json
 import time
 
-from mods import oplog
+from . import journal
 
 
 def _short(value, limit: int) -> str:
@@ -21,36 +20,41 @@ def _short(value, limit: int) -> str:
 
 def pairs(*, ids=None, after: float | None = None) -> list[tuple[dict, dict | None]]:
     """Outputs in order, each with the result that answered it."""
-    entries = oplog.events()
-    results = {entry["source"]: entry for entry in entries if entry["kind"] == "result"}
+    entries = journal.events()
     wanted = set(ids) if ids is not None else None
+    related = {}
+    for row in entries:
+        if row.get("act_id"):
+            related.setdefault(row["act_id"], []).append(row)
     found = []
     for entry in entries:
-        if entry["kind"] != "output":
+        if entry["kind"] != "assistant":
             continue
         if wanted is not None and entry["id"] not in wanted:
             continue
-        if after is not None and entry.get("read_at", 0) < after:
+        if after is not None and entry["time"] < after:
             continue
-        found.append((entry, results.get(entry["id"])))
+        rows = [entry, *related.get(entry["id"], [])]
+        assistant = entry["messages"][0]
+        output = {**entry, "assistant": assistant, "read_at": entry["time"]}
+        returns = [message for row in rows[1:] for message in row["messages"] if message.get("role") == "tool"]
+        # The readable record also names missing results; no raw row is changed.
+        answered = {message.get("tool_call_id") for message in returns}
+        returns.extend(journal.missing_result(call["id"], rows) for call in assistant.get("tool_calls") or []
+                       if call["id"] not in answered)
+        found.append((output, {"returns": returns}))
     return found
 
 
 def _speech(output: dict) -> tuple[str, list[dict]]:
-    """Body and calls of one output.
-
-    WHY: 旧日志翻译过来的输出可能没有 `assistant`，只有 `body` 与 `actions`
-    （name/arguments，没有调用号）；生产日志里两种都有，读回时一并认。
-    """
+    """Body and calls of one journal assistant row."""
     assistant = output.get("assistant")
     if isinstance(assistant, dict):
         calls = [{"id": call.get("id"), "name": call.get("function", {}).get("name", "?"),
                   "arguments": call.get("function", {}).get("arguments", "")}
                  for call in assistant.get("tool_calls") or []]
         return str(assistant.get("content") or ""), calls
-    calls = [{"id": None, "name": action.get("name", "?"), "arguments": action.get("arguments", "")}
-             for action in output.get("actions") or []]
-    return str(output.get("body") or ""), calls
+    return "", []
 
 
 def render(output: dict, result: dict | None, *, chars: int = 1200) -> str:
