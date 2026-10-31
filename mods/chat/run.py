@@ -7,6 +7,7 @@ one execution. Request hints and the tool binding never become a second view.
 from __future__ import annotations
 
 import contextvars
+import logging
 import threading
 import time
 
@@ -40,6 +41,9 @@ def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
     ``items`` are journal ids or original message dictionaries. A supplied main
     view is saved after each append; independent runs freeze their own view in
     finally, including input references and any results completed before failure.
+    If a timed-out worker is still blocked, closing returns without waiting for
+    its locks. ``state['finalization']`` stays ``pending`` until that worker exits
+    and background archiving finishes; timeout does not promise an immediate freeze.
     ``prepare(state)`` may append durable sources and return more source dicts
     to append after the tool announcement. It runs before every actual request.
     """
@@ -60,6 +64,7 @@ def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
     state.setdefault("associated_windows", set())
     state.setdefault("log", {"start": time.time(), "peak": 0, "acts": 0, "kind": kind})
     guard = threading.RLock()
+    finished = threading.Event()
     pieces = []
 
     def stopped():
@@ -126,9 +131,12 @@ def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
                 head = []
 
             def assemble():
+                writable(dispatch=True)
+                # WHY: preparation can wait on an observer or external source.
+                # Closing a timed-out run must not wait for that same callback.
+                sources = list(prepare(state) or ()) if prepare is not None else []
                 with guard:
                     writable(dispatch=True)
-                    sources = prepare(state) if prepare is not None else ()
                     if binding is not None:
                         tool_modules.reconcile(binding)
                         previous = segment.derive(view)["tool_state"]
@@ -221,6 +229,40 @@ def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
             context.set_agent_mode(previous_mode)
             _wake.reset(token)
 
+    def invoke():
+        try:
+            execute()
+        finally:
+            finished.set()
+
+    failure = None
+    deferred = False
+
+    def finalize():
+        with guard:
+            if failure is not None:
+                view["stats"]["failure"] = failure
+            if state["cancelled"]:
+                view["stats"]["cancelled"] = True
+            view["stats"]["kind"] = kind if own_view else view["stats"].get("kind", "")
+            if own_view:
+                segment.archive(view, kind)
+            else:
+                segment.save(view)
+        state["finalization"] = "complete"
+
+    def finalize_later():
+        # WHY: a worker may be stuck in fsync while holding both our guard and
+        # segment's lock. Only its exit makes the view safe to freeze; waiting
+        # here keeps that necessary ordering out of the timeout caller's path.
+        finished.wait()
+        try:
+            finalize()
+        except BaseException as error:
+            state["finalization"] = "failed"
+            state["finalize_error"] = error
+            logging.getLogger(__name__).exception("延后的 run 归档失败：%s", view["ctx"])
+
     try:
         messages = []
         for item in items or ():
@@ -235,23 +277,26 @@ def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
             append({"kind": "input", "messages": messages})
         append({"kind": "goal", "goal": goal, "run_kind": kind})
         if timeout is None:
-            execute()
+            invoke()
         else:
             scope = contextvars.copy_context()
-            watchdog.run(lambda: scope.run(execute), float(timeout))
+            watchdog.run(lambda: scope.run(invoke), float(timeout))
         return view["ctx"], "".join(pieces).strip()
     except BaseException as error:
-        with guard:
-            state["cancelled"] = True
-            view["stats"]["failure"] = f"{type(error).__name__}: {error}"
+        state["cancelled"] = True
+        failure = f"{type(error).__name__}: {error}"
+        deferred = timeout is not None and isinstance(error, TimeoutError) and not finished.is_set()
         raise
     finally:
-        with guard:
-            if state["cancelled"] or stop is not None and stop():
-                view["stats"]["cancelled"] = True
-            state["closed"] = True
-            view["stats"]["kind"] = kind if own_view else view["stats"].get("kind", "")
-            if own_view:
-                segment.archive(view, kind)
-            else:
-                segment.save(view)
+        state["closed"] = True
+        if stop is not None and stop():
+            state["cancelled"] = True
+        state["finalization"] = "pending"
+        if deferred:
+            threading.Thread(target=finalize_later, name="chat-run-finalize", daemon=True).start()
+        else:
+            try:
+                finalize()
+            except BaseException:
+                state["finalization"] = "failed"
+                raise

@@ -192,12 +192,13 @@ def _opening(view, windows):
                 _segment.append(view, "system", messages=[{"role": "system", "content":
                     f"opening 引用 {ref!r} 无法载入：{error}；请改 policy/opening。"}])
     else:
-        # WHY: the prior six diaries and today's diary are visible by default;
-        # today's version is also refreshed after edits and across midnight.
-        days = [key for key in _notes.diaries() if len(key) == 10]
+        # WHY: seven existing diaries remain available even before today's
+        # entry is written; today's version also refreshes after edits/midnight.
         today = _screen.clock()[:10]
-        scopes = ["global", "recent", *(f"diary:{day}" for day in [d for d in days if d < today][-6:])]
-        for scope in [*scopes, f"diary:{today}"]:
+        days = sorted(key for key in _notes.diaries() if len(key) == 10 and key <= today
+                      and _notes.render(f"diary:{key}").strip())[-7:]
+        scopes = ["global", "recent", *(f"diary:{day}" for day in days)]
+        for scope in scopes:
             if _notes.render(scope):
                 _note(view, scope, "以下是你的笔记：")
         years = _notes.years()
@@ -246,6 +247,10 @@ def _people(wake, material):
 
 def _prepare(wake):
     late = attention.claim()
+    # WHY: reflection is control work dispatched after this wake, not a screen
+    # request that an unrelated assistant output can acknowledge.
+    attention.release([job for job in late if job["kind"] == "reflect"])
+    late = [job for job in late if job["kind"] != "reflect"]
     if late:
         wake["claims"].extend(late)
         _adopt(wake, late)
