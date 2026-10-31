@@ -20,11 +20,10 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import re
-import threading
 
-from mods import llm, storage
+from mods import storage
 
-from . import notes as _notes, roles as _roles
+from . import notes as _notes, roles as _roles, segment as _segment
 
 # 它在提醒里用「」括起来的词；太长的多半是引用原话，不当词查。
 _WORD = re.compile(r"「([^「」\n]{1,20})」")
@@ -192,11 +191,12 @@ def _do_observe(
     segment: dict,
     material: list[dict],
     should_stop: Callable[[], bool] | None = None,
+    timeout: float = 15.0,
 ) -> str:
     # 组装消息流（支持 recent 极简上一轮模式与 full 完整历史前缀缓存模式）
     messages = [{"role": "system", "content": get_prompt()}]
     context_mode = get_context_mode()
-    raw_msgs = segment.get("messages", [])
+    raw_msgs = _segment.raw_messages(segment)
     if context_mode == "full":
         for m in raw_msgs:
             messages.append({"role": "user", "content": quote_message(m)})
@@ -216,27 +216,16 @@ def _do_observe(
     )
     messages.append({"role": "user", "content": final_wake})
 
-    session = llm.Chat(
+    _, content = _chat_root().run(
+        messages,
+        "把注意到的陌生说法、矛盾、自我限制、情绪或意外说出来；什么都没有就只回【无】",
+        tools=(),
         model=get_model(),
-        chat_client=llm.get_client(),
-        reasoning_effort=get_effort(),
+        kind="observer",
+        stop=should_stop,
+        timeout=timeout,
+        effort=get_effort(),
     )
-    session.fail_fast = True
-    session.turn_done = lambda: True
-    if should_stop is not None:
-        session.should_stop = should_stop
-    session.set_messages(messages)
-
-    # WHY: stream=False 避免将 observer 内部助手的自语混入终端控制台的 live 输出流中
-    results = session.chat(recall_func=_roles._charge(session), stream=False)
-
-    content = ""
-    for msg in reversed(session.messages):
-        if msg.get("role") == "assistant":
-            content = _extract_text(msg.get("content")).strip()
-            break
-    if not content and results:
-        content = "".join(r.content for r in results if r.role == "assistant").strip()
 
     clean_content = content.strip()
     if clean_content in ("", "【无】", "无"):
@@ -259,23 +248,11 @@ def observe(
     if not is_enabled() or not material:
         return ""
 
-    result = ""
-    error = None
-
-    def worker():
-        nonlocal result, error
-        try:
-            result = _do_observe(segment, material, should_stop)
-        except Exception as e:
-            error = e
-
-    t = threading.Thread(target=worker, name="chat-observer", daemon=True)
-    t.start()
-    t.join(timeout=timeout)
-    if t.is_alive():
+    try:
+        return _do_observe(segment, material, should_stop, timeout)
+    except TimeoutError:
         _roles._stream.warning(f"observer 运行超时（>{timeout}s），跳过本次旁观直接唤醒")
         return ""
-    if error is not None:
+    except Exception:
         _roles._stream.exception("observer 运行出错")
         return ""
-    return result

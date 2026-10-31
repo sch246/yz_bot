@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import time
 
-from mods import chatlog, history, llm, log
+from mods import chatlog, history, log
 
 from . import actions as _actions, notes as _notes, screen as _screen, segment as _segment, view as _view
 
@@ -35,14 +35,6 @@ def _root():
 
 def _parse_window(target: str) -> tuple:
     return _root()._windows.parse(target)
-
-
-def _charge(session: llm.Chat):
-    def handle(chunk: llm.LLMResponse) -> None:
-        if chunk.total_tokens:
-            _root().inc_call_cost(session.model, chunk.prompt_tokens, chunk.completion_tokens,
-                                  chunk.cached_tokens, chunk.requested_at)
-    return handle
 
 
 def _moment(value) -> int | None:
@@ -293,7 +285,10 @@ def directory(woken: list[tuple]) -> str:
     lines.extend(f"{_root()._windows.title(window)} 最后 {_screen.clock(latest.get('time'))[5:16]}"
                  for window, latest in _recent_windows(woken)[:20])
     lines.append("## 笔记")
-    lines.append("、".join(item["scope"] for item in _notes.listing()) or "（无）")
+    notes = _notes.listing(limit=10**6)
+    lines.append("、".join(item["scope"] for item in notes[:60]) or "（无）")
+    if len(notes) > 60:
+        lines.append(f"（另有 {len(notes) - 60} 份笔记未列出；用 search 查找，或 read_note 按名字读取）")
     diaries = _notes.diaries()
     if diaries:
         days = [key for key in diaries if len(key) == 10][-7:]
@@ -324,8 +319,7 @@ def handoff_prompt(reason: str, day: str) -> str:
     return text
 
 
-# T04 replaces this session construction with the shared run entry at integration.
-def summarize(period: str) -> None:
+def summarize(period: str) -> str:
     """Roll a month's daily diaries, or a year's monthly ones, into ``diary:<period>``.
 
     Rewritten whole each time from the diaries it covers, so running it twice changes nothing.
@@ -335,18 +329,19 @@ def summarize(period: str) -> None:
         parts = [key for key in _notes.diaries(period + "-") if len(key) == 10]
     sources = "\n\n".join(f"### {key}\n{_notes.read('diary:' + key).strip()}" for key in parts)
     if not sources.strip():
-        return
+        return ""
     chat = _root()
-    session = llm.Chat(model=chat.get_model(), chat_client=llm.get_client())
-    session.fail_fast = True
-    session.set_messages([
-        {"role": "system", "content": "你在替柚子写汇总，不和任何人说话。把下面的日记汇总成一篇"
-                                      f"{'月' if len(period) == 7 else '年'}记：第一行一句话概括，之后二十行以内，"
-                                      "按时间写要紧的事、认识的人、做过的决定和变化，每条带日期，方便以后按日期翻回日记。"
-                                      "只写日记里有的事。直接输出正文。"},
-        {"role": "user", "content": sources},
-    ])
-    replies = session.chat(recall_func=_charge(session))
-    text = "".join(chunk.content for chunk in replies if chunk.role == "assistant" and chunk.content).strip()
+    _, text = chat.run(
+        [{"role": "user", "content": sources}],
+        "你在替柚子写汇总，不和任何人说话。把下面的日记汇总成一篇"
+        f"{'月' if len(period) == 7 else '年'}记：第一行一句话概括，之后二十行以内，"
+        "按时间写要紧的事、认识的人、做过的决定和变化，每条带日期，方便以后按日期翻回日记。"
+        "只写日记里有的事。直接输出正文。",
+        tools=(),
+        model=chat.get_model(),
+        kind="summary",
+    )
+    text = text.strip()
     if text:
         _notes.write("diary:" + period, text)
+    return text
