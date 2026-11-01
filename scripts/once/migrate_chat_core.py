@@ -350,7 +350,11 @@ class Import:
                         call_position = result["position"]
                         if type(call_position) is not int or not 0 <= call_position < len(ids):
                             raise ValueError()
-                        call_id = result.get("tool_call_id") or ids[call_position]
+                        # WHY: 2026-09-25 以前的 output 只存 body 和 actions，没有原生调用 id，
+                        # result 却记了模型给的 tool_call_id；这时按记录的 position 配对，原生 id
+                        # 作为元数据留下（2026-11-01 生产 dry-run 在第一条这样的 result 上阻断）。
+                        native = result.get("tool_call_id")
+                        call_id = ids[call_position] if legacy else (native or ids[call_position])
                         if call_id != ids[call_position] or call_id in answered:
                             raise ValueError()
                         if result["name"] != calls[ids.index(call_id)]["function"]["name"]:
@@ -358,10 +362,12 @@ class Import:
                         message = {"role": "tool", "tool_call_id": call_id, "content": result["content"]}
                     except (KeyError, TypeError, IndexError, ValueError):
                         raise Blocked("unresolved-tool-result", batch["_source"]["path"], batch["_source"]["line"]) from None
+                    extra = {"legacy_tool_call_id": native} if legacy and native else {}
                     self.add("tool", "legacy-actions", [message],
                              stamp=finite(batch.get("read_at"), batch["_source"]["path"]),
                              item_id=batch_id if position == 0 else None,
-                             source=dict(batch["_source"], position=position), act_id=eid, call_id=call_id)
+                             source=dict(batch["_source"], position=position), act_id=eid, call_id=call_id,
+                             **extra)
                     answered.add(call_id)
                 if not returns:
                     self.add("legacy", "legacy-actions", stamp=finite(batch.get("read_at"), batch["_source"]["path"]),
@@ -949,16 +955,10 @@ class Import:
                 segment.record_results(view, act, [{"role": "tool", "tool_call_id": "migration-probe-call", "content": "probe"}], complete=True)
                 if segment.render(view)[:len(prefix)] != prefix:
                     raise Blocked("append-prefix-disagrees", "data/chat/view.json")
-                address = next(s["id"] for s in segment.derive(view)["steps"] if s["act_id"] == act)
-                before = segment.raw_messages(view)
-                folded = segment.fold(view, address, address, "probe")
-                segment.unfold(view, folded)
-                if segment.raw_messages(view) != before:
-                    raise Blocked("fold-roundtrip-disagrees", "data/chat/view.json")
-                restored = segment.dismiss(view, wake, boxes={})
-                screen.restore_read(restored["snapshot"], restored["windows"], patches=restored["patches"])
-                if segment.render(view) != prefix:
-                    raise Blocked("dismiss-prefix-disagrees", "data/chat/view.json")
+                if not any(s["act_id"] == act for s in segment.derive(view)["steps"]):
+                    raise Blocked("step-address-missing", "data/chat/view.json")
+                # WHY: 2026-11-01 无状态中心删掉了 fold/unfold/dismiss，这里不再演练它们；
+                # 迁移来的旧 fold 行仍然只读可见，由上面的投影比对覆盖。
                 again = segment.begin_wake(view, read_snapshot=screen.read_snapshot())
                 if journal.get(again)["number"] <= journal.get(wake)["number"]:
                     raise Blocked("wake-number-reused", "data/chat/view.json")

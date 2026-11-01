@@ -21,7 +21,7 @@ uv run --frozen python scripts/once/migrate_chat_core.py --runtime-root /absolut
 转换保留正式行动编号、原生 assistant/tool JSON、当前笔记来源和版本、唤醒编号及
 草稿/read 快照、画面记录身份、当前折叠树和步骤地址。旧 oplog 未保存的 thinking 仅从
 能唯一匹配的上下文补回；旧 compress 入参截短仅用于核对投影，journal 保存完整原文。
-无结果的调用保持未知，不写成成功或自动重跑。全局 `active_tools` 和其它 agent 设置保留；
+无结果的调用保持未知，不写成成功或自动重跑。2026-09-25 以前的旧 output 只存正文和动作、没有原生调用 id，它的结果按记录的 position 配对到 `legacy_<编号>_<序号>`，结果里记下的原生 `tool_call_id` 保存为 `legacy_tool_call_id`；新格式 output 仍要求 id 与 position 一致。全局 `active_tools` 和其它 agent 设置保留；
 schema 顺序进入 view 的 `tool_state.schemas`。`follow/mute/on` 原文保留，旧 `wait`
 行删除，`loop/subconscious` 全局运行开关清除。`boxes.json` 等其它文件原地保留。
 
