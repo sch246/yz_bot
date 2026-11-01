@@ -196,6 +196,7 @@ class Import:
         self.returns = defaultdict(list)
         self.pending = {}
         self.arrivals = {}
+        self.arrival_events = {}
         self.notified = set()
         self.notices = {}
         self.records = {}
@@ -438,11 +439,20 @@ class Import:
 
     def metadata(self, text, record, *, unread=True, kind="", recovered=False, reason=""):
         window, _ = self.window_records(text)
-        exact = [entry["event"] for entry in self.arrivals.values()
-                 if tuple(entry["window"]) == window
-                 and self.arrival_identity(windows.label(window), entry["event"])[0] == record["id"]]
-        if exact:
-            event = clone(exact[-1])
+        if window not in self.arrival_events:
+            # WHY: 2026-11-01 生产 dry-run 在 build 阶段十多分钟未完成；合成差分确认
+            # 逐画面匹配会反复复制同窗口全部 arrival。到这里 oplog 已读完，因此每个窗口
+            # 只建一次索引，重号仍取最后一个原始 event，
+            # 不能用身份恢复时补过 _record_text 的事件替换它，返回时再独立复制。
+            exact = {}
+            for entry in self.arrivals.values():
+                if tuple(entry["window"]) == window:
+                    identity_, _ = self.arrival_identity(windows.label(window), entry["event"])
+                    exact[identity_] = entry["event"]
+            self.arrival_events[window] = exact
+        exact = self.arrival_events[window]
+        if record["id"] in exact:
+            event = clone(exact[record["id"]])
         else:
             with isolated(self.root):
                 event = screen.event_for_record(window, record)
