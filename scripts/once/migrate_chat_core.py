@@ -398,11 +398,19 @@ class Import:
             self.remember(path)
         with isolated(self.root):
             records = screen.records(window, 1_000_000)
-        by_id = {}
+        # WHY: 2026-11-01 生产 dry-run 在这里阻断：一个窗口几年的记录里，同一个消息号会被
+        # 不同的 OneBot 实现重复使用，运行时本来就与此共存。重号只计数报告（分开不同天与
+        # 同一天）；按号码查找时取最新的一条，同一幅画面里出现两条同号仍由 shown_records 阻断。
+        by_id, reused, same_day = {}, set(), set()
         for record in records:
-            if record["id"] in by_id and by_id[record["id"]] != record:
-                raise Blocked("conflicting-record-identity", "chatlog")
+            earlier = by_id.get(record["id"])
+            if earlier is not None and earlier != record:
+                (same_day if earlier["day"] == record["day"] else reused).add(record["id"])
             by_id[record["id"]] = record
+        if reused:
+            self.warn("reused-record-identity", f"chatlog/{window[0]}", len(reused))
+        if same_day:
+            self.warn("same-day-record-identity", f"chatlog/{window[0]}", len(same_day))
         self.records[text] = (window, records)
         return window, records
 
@@ -728,10 +736,11 @@ class Import:
                 positions = [n for n, record in enumerate(all_records) if record["text"] == previous_text]
                 if previous_text is not None and len(positions) != 1:
                     raise Blocked("wake-screen-boundary-missing", path, index)
-                positions_by_id = {record["id"]: n for n, record in enumerate(all_records)}
+                # Position of the very record shown, not of the newest record sharing its id.
+                position_of = {id(record): n for n, record in enumerate(all_records)}
                 patch = {}
                 for record in shown:
-                    unread = (positions_by_id[record["id"]] > positions[0] if positions else
+                    unread = (position_of[id(record)] > positions[0] if positions else
                               boundary is None or record["time"] is not None and record["time"] > boundary)
                     patch[record["id"]] = self.metadata(label, record, unread=unread)
                 metadata.update(window=label, shown=[r["id"] for r in shown],
