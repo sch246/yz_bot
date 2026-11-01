@@ -54,7 +54,7 @@ uv run --frozen python run.py --smoke
 
 ### `run.py --smoke-migrated`
 
-该模式使用仓库根作为 runtime root，只把 OneBot API 换成假的。Module 仍会读取当前 config/storage/cache，并可能在 `on_exit()` 保存它们，所以它不是无副作用的临时 smoke。只有在 Bot 已停止、维护者明确授权使用当前运行状态时才能调用；日常静态检查优先使用 `--check`，核心生命周期检查使用临时 `--smoke`。
+该模式使用仓库根作为 runtime root，只把 OneBot API 换成假的。Module 仍会读取当前 config/storage/cache，并可能在 `on_exit()` 保存它们，所以它不是无副作用的临时 smoke。两种 smoke 都以 `mods.boot(start=False)` 加载：不放行 `wait_booted()`，注意力恢复、NapCat 补回、重启续话这些等启动结束才开始的工作不会运行，所以不会排上积压的召唤、调用模型或封存迁移来的 `view.json`（2026-11-01 起；此前它们会和退出抢跑）。各 Module 在 `on_load` 里直接起的调度仍会起来，只是 smoke 很快退出。只有在 Bot 已停止、维护者明确授权使用当前运行状态时才能调用；日常静态检查优先使用 `--check`，核心生命周期检查使用临时 `--smoke`。
 
 ## 源码语法检查与动态源码警告
 

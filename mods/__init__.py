@@ -214,11 +214,16 @@ def _load_all(order: list[str]) -> None:
             activate(name)
 
 
-def boot() -> None:
+def boot(start: bool = True) -> None:
     """Import every module, run the load hooks once, and verify the core.
 
     Any failure runs the exit hooks of whatever already loaded, so a half-booted
-    process never survives with unsaved state.
+    process never survives with unsaved state. ``start=False`` loads without
+    releasing :func:`wait_booted`, so work deferred to the end of boot never begins.
+
+    WHY: smoke 只验证加载，然后立刻退出。等启动结束的线程（chat 的注意力恢复、补回、
+    重启续话）在 `--smoke-migrated` 的真实数据上会排上积压的召唤、调用真实模型、封存
+    view.json，和退出抢跑（2026-11-01 部署前发现）。它们都是 daemon，等不到就随进程结束。
     """
     try:
         _import_all()
@@ -233,7 +238,8 @@ def boot() -> None:
                 + ", ".join(missing)
                 + f" (import failures: {failed_imports}; load failures: {failed_loads})"
             )
-        _booted.set()
+        if start:
+            _booted.set()
     except BaseException:
         exit()
         raise
