@@ -200,6 +200,7 @@ class Import:
         self.notified = set()
         self.notices = {}
         self.records = {}
+        self.notice_records = {}
         self.agent = {}
         self.awaker = None
         self.detailed = {}
@@ -429,9 +430,22 @@ class Import:
             return screen.record_id(event), clone(event)
         except (ValueError, KeyError):
             pass
-        _, records = self.window_records(text)
+        window, records = self.window_records(text)
+        if window not in self.notice_records:
+            # WHY: 2026-11-01 生产 dry-run 连续 4 次调用栈采样都落在这里的全窗口扫描。
+            # 无号记录按时间建一次索引，恢复身份只查同秒候选；仍用原文与唯一性规则裁定。
+            by_time = defaultdict(list)
+            for record in records:
+                if record["id"].startswith("~"):
+                    by_time[record["time"]].append(record)
+            self.notice_records[window] = by_time
+        try:
+            candidates = self.notice_records[window].get(event.get("time"), ())
+        except TypeError:
+            # JSON time may be a list/dict; preserve the old equality scan for those malformed values.
+            candidates = records
         target = event.get("message_id")
-        found = [record for record in records if record["id"].startswith("~") and record["time"] == event.get("time")
+        found = [record for record in candidates if record["id"].startswith("~") and record["time"] == event.get("time")
                  and (target is None or f"({target}) " in record["text"])]
         if len(found) != 1:
             return None, None
