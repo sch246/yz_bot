@@ -250,6 +250,7 @@ def drafts() -> str:
 
 
 def _prepare(wake, view, windows):
+    attention.flush(windows)
     late = attention.claim()
     # WHY: reflection is control work dispatched after this wake, not a screen
     # request that an unrelated assistant output can acknowledge.

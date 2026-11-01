@@ -151,6 +151,27 @@ def schedule(kind, due, *, window=None, reason="", **state) -> dict:
     return deepcopy(job)
 
 
+def flush(targets) -> int:
+    """Queue the still-debouncing summons of these windows now, without signalling the reader.
+
+    WHY: 2026-11-01 维护者：能插话的那一瞬间（行动还要发下一次请求）把窗口攒下的一次并进来，
+    并清掉防抖（设计文档第 18.1 节）。以前画面已经显示了那条消息，计时器却继续跑，到点生成
+    的召唤因已读被丢掉；这样召唤直接由当前行动认领，叫她的人也记进这次唤醒。调用方紧接着
+    claim，所以不发信号，免得把正在运行的读线程标成“有新工作”。
+    """
+    targets = {tuple(window) for window in targets}
+    with _lock:
+        keys = [key for key, session in _debouncing.items() if session["window"] in targets]
+        for key in keys:
+            session = _debouncing.pop(key)
+            _scheduled.pop(f"debounce:{key}", None)
+            _deadlines.pop(f"debounce:{key}", None)
+            _put(session["window"], kind=session["kind"], reason=session["reason"],
+                 record_ids=session["ids"], author=session["author"], event=session["event"])
+        _lock.notify_all()
+    return len(keys)
+
+
 def cancel(kind=None, *, window=None) -> int:
     cancelled = []
     with _lock:
