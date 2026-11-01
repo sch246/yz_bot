@@ -124,7 +124,7 @@
 ### 按需组装与提前准备（11-01 增补）
 
 - [GAM（General Agentic Memory）](https://arxiv.org/abs/2511.18423)（arXiv 2511.18423，2025-11，智源等；[作者仓库](https://github.com/VectorSpaceLab/general-agentic-memory)，MIT，仓库已核）把提前压成静态记忆称为 ahead-of-time，主张 just-in-time：离线的 Memorizer 为每段经历写一份简要记忆，同时把全文存进 page store；在线的 Researcher 针对请求反复检索、反思、整合。研究代码的检索器有页号索引、BM25 和稠密向量三种，示例上限 5 轮；论文报告三种组合最好，反思深度和取页数增加时效果持续上升（摘要级）。仓库现版还用模型找语义边界切块，为每块写摘要和 TLDR，按主题目录分层，支持增量加入。
-  - **本项目迁移推论**：[新的经历日志](../tasks/chat-core-rewrite/spec.md)已经是一份带稳定编号的原文库，段归档时的年鉴摘要接近 GAM 的每段简要记忆；`run(items, goal)` 和 fork 的引用可以承载“针对一个目的反复检索、再组装”的循环。GAM 是目前与这套底座形状最接近的公开实现，适合对照[召回前后的计算](context-prediction-and-permeability.md#召回前后的计算以及笔记与搜索的共同调整)。
+  - **本项目迁移推论**：[新的经历日志](../tasks/chat-core-rewrite/spec.md)已经是一份带稳定编号的原文库，段归档时的年鉴摘要接近 GAM 的每段简要记忆；`run(items, goal)` 和 fork 的引用可以承载“针对一个目的反复检索、再组装”的循环。GAM 是目前与这套底座形状最接近的公开实现，适合对照[召回前后的计算](context-prediction-and-permeability.md#召回前后的计算以及笔记与搜索的共同调整)。源码层的逐项对照见[GAM 与 Nemori 源码对照](gam-nemori-source-reading.md)。
   - **边界**：每次都有一个明确请求，答对即成功；群聊唤醒多半没有现成问题，“这次要找什么”本身需要形成。循环的停止只有轮数上限，没有回答何时材料已经足够。
 - [Sleep-time Compute](https://arxiv.org/abs/2504.13171)（arXiv 2504.13171，Letta，摘要级）让 agent 在两次交互之间预先推理，把原始上下文变成“学到的上下文”，减少交互时的计算。Letta 的实现由后台 sleep-time agent 异步改写主 agent 的记忆块（有字数上限，可在 agent 间共享），文档写明代价是更多 token。论文报告的帕累托改进是厂商自测。
   - **本项目迁移推论**：它是草籽[“无状态的当下、提前准备”](context-prediction-and-permeability.md#时间连续性与无状态的当下)最直接的工程对应。柚子的夜间反思和交接已经是空闲时的整理；差别在于 sleep-time 的目标是预期下一次需要什么，而不是回顾刚才发生了什么。
@@ -134,7 +134,7 @@
 ### 事件切分与延迟整理（11-01 增补）
 
 - [Nemori](https://arxiv.org/abs/2508.03341)（arXiv 2508.03341，2025-08，同济；[作者仓库](https://github.com/nemori-ai/nemori)，MIT，仓库已核）有两条原则。一是按事件分割理论把对话切成话题一致的情节，再改写成带时间锚点和出处的叙述；二是 predict-calibrate：先用已有语义知识预测新情节的内容，只从预测与实际的落差里提取新知识写入语义库。论文报告在 LoCoMo、LongMemEval 上优于此前系统，上下文越长差距越大。
-  - **本项目迁移推论**：这是“用预测统一写入”（[基础讨论第四节](memory-foundations-discussion.md#四用预测统一写入与读取)）目前最接近的公开工程实现，可以直接对照三件事：落差由谁来算，用什么来预测，落差之外的内容去了哪里。
+  - **本项目迁移推论**：这是“用预测统一写入”（[基础讨论第四节](memory-foundations-discussion.md#四用预测统一写入与读取)）目前最接近的公开工程实现，可以直接对照三件事：落差由谁来算，用什么来预测，落差之外的内容去了哪里。读源码后的答案见[GAM 与 Nemori 源码对照](gam-nemori-source-reading.md#nemori)：预测只以本段标题为线索，价值检验明确丢弃暂时的情绪。
   - **边界**：预测与比较都由模型在文本上完成，落差大小没有被检验为“值得记”的度量；被预测到的内容也可能需要确认和加固。评测仍是问答。仓库用 PostgreSQL 和 Qdrant 存储，不构成本项目引入向量库的理由。
 - [EM-LLM](https://arxiv.org/abs/2407.09450)（ICLR 2025；[代码](https://github.com/em-llm/EM-LLM-model)）在线用模型自身对 token 的惊奇度切事件边界，再用图论方法细化；召回分两段，相似检索之外还带回时间上相邻的事件。它报告在 LongBench、∞-Bench 上优于 InfLLM，可在千万 token 规模上检索。
   - **本项目迁移推论**：惊奇度切分要操作模型内部的 KV 缓存，API 模型用不上；“召回一条时连带前后相邻的经历”可以移植，日志的稳定编号让这件事很便宜。
