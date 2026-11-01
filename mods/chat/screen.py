@@ -194,11 +194,13 @@ def _record_time(day: tuple[int, int, int], head: str) -> int | None:
     return chatlog._epoch(day, match) if match else None
 
 
-def records(window: tuple, count: int, before: int | None = None, since: float | None = None) -> list[dict]:
+def records(window: tuple, count: int, before: int | None = None, since: float | None = None,
+            *, include_hidden: bool = False) -> list[dict]:
     """The newest *count* records of one window, oldest first.
 
     *before* is an exclusive Unix time; it pages backwards through the files.
     *since* stops at day files that end before it.
+    *include_hidden* also reads QQ control/debug records for offline source verification.
     """
     if count <= 0:
         return []
@@ -214,7 +216,7 @@ def records(window: tuple, count: int, before: int | None = None, since: float |
             # WHY: `#` 开头的消息是控制与调试输出（子命令结果、traceback、`#hint` 状态），
             # 按跨模块约定不回流进模型，见 docs/llm.md「上下文如何组装」。
             # Non-QQ windows have no # commands: CLI prompts and answers often start with Markdown headings.
-            if window[0] in _windows.QQ and end - start > 1 and lines[start + 1].startswith("    #"):
+            if not include_hidden and window[0] in _windows.QQ and end - start > 1 and lines[start + 1].startswith("    #"):
                 continue
             text = "\n".join(lines[start:end])
             stamp = _record_time(day, lines[start])

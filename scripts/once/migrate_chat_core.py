@@ -382,9 +382,10 @@ class Import:
                 self.add("legacy", "legacy-oplog", stamp=finite(entry.get("read_at", 0), entry["_source"]["path"]),
                          item_id=entry["id"], source=entry["_source"], legacy_kind=entry["kind"])
 
-    def window_records(self, text):
-        if text in self.records:
-            return self.records[text]
+    def window_records(self, text, *, include_hidden=False):
+        key = (text, include_hidden)
+        if key in self.records:
+            return self.records[key]
         if re.fullmatch(r"[gu][1-9]\d*", text):
             window = ("group" if text[0] == "g" else "private", int(text[1:]))
         elif text == "me":
@@ -396,9 +397,10 @@ class Import:
             window = (kind, target)
         directory = chatlog.window_path(*window, root=self.root / "chatlog")
         for path in directory.rglob("*.log"):
-            self.remember(path)
+            if str(path.relative_to(self.root)) not in self.sources:
+                self.remember(path)
         with isolated(self.root):
-            records = screen.records(window, 1_000_000)
+            records = screen.records(window, 1_000_000, include_hidden=include_hidden)
         # WHY: 2026-11-01 生产 dry-run 在这里阻断：一个窗口几年的记录里，同一个消息号会被
         # 不同的 OneBot 实现重复使用，运行时本来就与此共存。重号只计数报告（分开不同天与
         # 同一天）；按号码查找时取最新的一条，同一幅画面里出现两条同号仍由 shown_records 阻断。
@@ -408,11 +410,11 @@ class Import:
             if earlier is not None and earlier != record:
                 (same_day if earlier["day"] == record["day"] else reused).add(record["id"])
             by_id[record["id"]] = record
-        if reused:
+        if reused and not include_hidden:
             self.warn("reused-record-identity", f"chatlog/{window[0]}", len(reused))
-        if same_day:
+        if same_day and not include_hidden:
             self.warn("same-day-record-identity", f"chatlog/{window[0]}", len(same_day))
-        self.records[text] = (window, records)
+        self.records[key] = (window, records)
         return window, records
 
     def arrival_identity(self, text, event):
@@ -509,7 +511,16 @@ class Import:
                     continue
                 raise Blocked("unresolved-pending-identity", entry["_source"]["path"], entry["_source"]["line"])
             if not any(record["id"] == identity_ for record in records):
-                raise Blocked("pending-record-missing", entry["_source"]["path"], entry["_source"]["line"])
+                # WHY: 2026-11-01 生产 dry-run 的 pending-record-missing 实际是 QQ # 消息：
+                # 旧版先登记 arrival，画面再隐藏它。未读和召唤不能丢，也不能把它塞进画面；
+                # 仅用同号同秒的唯一原始记录证明来源，当前画面仍严格使用默认可见记录。
+                _, source_records = self.window_records(text, include_hidden=True)
+                matches = [record for record in source_records if record["id"] == identity_
+                           and record["time"] == entry["event"].get("time")]
+                if not matches:
+                    raise Blocked("pending-record-missing", entry["_source"]["path"], entry["_source"]["line"])
+                if len(matches) != 1:
+                    raise Blocked("ambiguous-pending-record", entry["_source"]["path"], entry["_source"]["line"])
             kind = entry.get("activation_kind", "wake") if entry.get("activated") else ""
             consumed = arrival in self.notified
             item = {"time": entry["event"].get("time"), "event": event,
