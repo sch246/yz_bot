@@ -23,6 +23,7 @@ import shutil
 import sys
 import tempfile
 import time
+import traceback
 from uuid import uuid4
 
 REPO = Path(__file__).resolve().parents[2]
@@ -414,10 +415,30 @@ class Import:
         self.records[text] = (window, records)
         return window, records
 
+    def arrival_identity(self, text, event):
+        """The record id of an old arrival and its event, or (None, None) when no record is unique.
+
+        WHY: 2026-11-01 生产 dry-run 抛 ValueError：旧版把撤回通知也登记成到达，它没有消息号，
+        旧 oplog 也没存记录原文，screen.record_id 认不出。按时间（撤回再加被撤回的消息号）在
+        这个窗口的无号记录里找唯一一条，事件补上 _record_text，新代码之后也算得出同一个身份。
+        """
+        try:
+            return screen.record_id(event), clone(event)
+        except (ValueError, KeyError):
+            pass
+        _, records = self.window_records(text)
+        target = event.get("message_id")
+        found = [record for record in records if record["id"].startswith("~") and record["time"] == event.get("time")
+                 and (target is None or f"({target}) " in record["text"])]
+        if len(found) != 1:
+            return None, None
+        return found[0]["id"], dict(clone(event), _record_text=found[0]["text"])
+
     def metadata(self, text, record, *, unread=True, kind="", recovered=False, reason=""):
         window, _ = self.window_records(text)
         exact = [entry["event"] for entry in self.arrivals.values()
-                 if tuple(entry["window"]) == window and screen.record_id(entry["event"]) == record["id"]]
+                 if tuple(entry["window"]) == window
+                 and self.arrival_identity(windows.label(window), entry["event"])[0] == record["id"]]
         if exact:
             event = clone(exact[-1])
         else:
@@ -467,22 +488,31 @@ class Import:
             text = windows.label(tuple(entry["window"]))
             stamp = entry["event"].get("time")
             if stamp is not None and (text not in seen or stamp > seen[text]):
-                identity_ = screen.record_id(entry["event"])
+                identity_, event = self.arrival_identity(text, entry["event"])
+                if identity_ is None:
+                    # Not a summon: an unidentifiable notice simply is not marked unread.
+                    self.warn("unidentified-notice-arrival", entry["_source"]["path"], entry["_source"]["line"])
+                    continue
                 read[text]["pending"][identity_] = {
-                    "time": stamp, "event": clone(entry["event"]), "kind": "", "reason": "",
+                    "time": stamp, "event": event, "kind": "", "reason": "",
                     "unread": True, "recovered": False}
         for arrival, entry in self.pending.items():
             text = windows.label(tuple(entry["window"]))
             _, records = self.window_records(text)
-            try:
-                identity_ = screen.record_id(entry["event"])
-            except (ValueError, KeyError):
-                raise Blocked("unresolved-pending-identity", entry["_source"]["path"], entry["_source"]["line"]) from None
+            identity_, event = self.arrival_identity(text, entry["event"])
+            if identity_ is None:
+                if not entry.get("activated"):
+                    issue = {"status": "preserved", "code": "unidentified-notice-arrival",
+                             "path": entry["_source"]["path"], "index": entry["_source"]["line"]}
+                    if issue not in self.issues:  # the arrivals pass above may have reported it
+                        self.issues.append(issue)
+                    continue
+                raise Blocked("unresolved-pending-identity", entry["_source"]["path"], entry["_source"]["line"])
             if not any(record["id"] == identity_ for record in records):
                 raise Blocked("pending-record-missing", entry["_source"]["path"], entry["_source"]["line"])
             kind = entry.get("activation_kind", "wake") if entry.get("activated") else ""
             consumed = arrival in self.notified
-            item = {"time": entry["event"].get("time"), "event": clone(entry["event"]),
+            item = {"time": entry["event"].get("time"), "event": event,
                     "kind": "" if consumed else kind, "reason": "", "unread": True,
                     "recovered": kind == "离线时叫你"}
             if consumed:
@@ -496,10 +526,12 @@ class Import:
                 if entry is None:
                     raise Blocked("notification-arrival-missing", notice["_source"]["path"], notice["_source"]["line"])
                 text = windows.label(tuple(entry["window"]))
-                identity_ = screen.record_id(entry["event"])
+                identity_, event = self.arrival_identity(text, entry["event"])
+                if identity_ is None:
+                    raise Blocked("unresolved-notification-identity", notice["_source"]["path"], notice["_source"]["line"])
                 state = read[text]
                 if identity_ not in state["pending"]:
-                    state["pending"][identity_] = {"time": entry["event"].get("time"), "event": clone(entry["event"]),
+                    state["pending"][identity_] = {"time": entry["event"].get("time"), "event": event,
                                                     "unread": True, "kind": entry.get("activation_kind", "wake"),
                                                     "reason": "", "recovered": False}
         self.agent["read"] = read
@@ -1240,7 +1272,14 @@ def main(argv=None):
     except Exception as error:
         # JSON/OSError/provider exceptions may contain private data. Report only
         # their type, never str(error), repr(error), or a traceback.
-        print(json.dumps({"status": "failed", "code": type(error).__name__, "path": str(args.runtime_root)}))
+        # WHY: code locations are not private, and without them an unexpected
+        # failure on production data cannot be located (2026-11-01).
+        repo = Path(__file__).resolve().parents[2]
+        where = [f"{Path(frame.filename).resolve().relative_to(repo)}:{frame.lineno}:{frame.name}"
+                 for frame in traceback.extract_tb(error.__traceback__)
+                 if Path(frame.filename).resolve().is_relative_to(repo)][-4:]
+        print(json.dumps({"status": "failed", "code": type(error).__name__, "path": str(args.runtime_root),
+                          "where": where}))
         return 1
     print(json.dumps(report, ensure_ascii=False))
     return 0

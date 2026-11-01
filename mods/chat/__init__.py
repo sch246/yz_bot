@@ -594,7 +594,10 @@ def record_event(event: dict, write: Callable[[], object]) -> object:
         try:
             # Registration is history, not dispatch: commands and links decide
             # before capture_chat is allowed to claim a summon.
-            arrival = _screen.register(window, event, kind="")
+            # WHY: a notice has no message id; its identity is the record text just
+            # written (screen.record_id). Without it every recall raised here (2026-11-01).
+            arrival = _screen.register(window, event if msgs.is_msg(event) else dict(event, _record_text=result),
+                                       kind="")
         except Exception:
             # WHY: unread state failure disables agent mail, not .py/.reboot;
             # explicit maintenance routes run after chat recording.
@@ -713,9 +716,11 @@ def capture_chat(event: dict) -> bool:
     if window is None or not _mail_candidate(event):
         return False
     with context.window_lock(window):
-        if context.event_arrival(event) is None:
+        arrival = context.event_arrival(event)
+        if arrival is None:
             return activation_signal(event)
-        notified = _attention.on_record(window, event)
+        # A notice is known by the record id registered above, not by a message id.
+        notified = _attention.on_record(window, event if msgs.is_msg(event) else dict(event, record_id=arrival))
     # WHY: a muted addressed message must still be swallowed here, or the
     # addressed fallback below would bypass its cover and wake her anyway.
     return notified or activation_signal(event)
