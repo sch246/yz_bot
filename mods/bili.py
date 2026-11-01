@@ -454,7 +454,8 @@ def run(body: str):
 def on_load(_ctx) -> None:
     from mods import chat, scheduler
 
-    chat.kind("bili", send=_send)
+    # WHY: 一条评论就是一条，空行是评论里的分段，不拆成几条（维护者 2026-11-01）。
+    chat.kind("bili", send=_send, whole=True)
     try:
         instance = scheduler.get_scheduler()
     except RuntimeError:
