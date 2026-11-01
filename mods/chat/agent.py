@@ -310,6 +310,30 @@ def _work(wake, model=None):
         _act(wake, spec, model)
 
 
+def adopt_last_view():
+    """Freeze a migrated ``view.json`` once and ask her to catch up on it; returns its ctx.
+
+    WHY: 2026-11-01 设计第 8 节：切换时把最后一段归档，并留一条补记提醒。迁移脚本把旧的
+    当前段写成 view.json，那一段没有经过交接，里面可能有还没写进笔记的经历；无状态代码不再
+    读 view.json，不封存它就既不在 views/ 里、也搜不到。
+    """
+    current = _segment.ROOT / "view.json"
+    if not current.exists():
+        return ""
+    view = _segment.load()
+    if not view["items"]:
+        current.unlink(missing_ok=True)
+        (_segment.ROOT / "view.bak.json").unlink(missing_ok=True)
+        return ""
+    view["stats"]["reason"] = "无状态切换前的最后一段（没有经过交接）"
+    name = _segment.archive(view)
+    _chat_root.push(_windows.ME, "系统",
+                    f"切换到“每次一个目的”之前的最后一段上下文已经封存为 {name}。它没有经过交接，里面可能有还没写进笔记的事："
+                    f"用 read_context(\"{name}\") 读一遍，把该留的补进人和群的笔记、日记和 todo，下次可能用得上的写成 recent 里的 @引用。",
+                    wake="切换前的上下文要补记")
+    return name
+
+
 def diary_day(moment):
     return _settle.diary_day(moment)
 

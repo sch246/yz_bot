@@ -20,7 +20,7 @@
 
 ## 上下文如何组装
 
-经历与眼前材料分别保存。`data/chat/journal/YYYYMMDD.jsonl` 是原始内容权威，保存稳定 `YYYYMMDD-N` 编号、时间、ctx、种类、原样模型消息和来源。每次运行有自己的编号视图，只保存有序条目引用与不能推导的统计（`stats.windows` 记行动和沉淀负责的窗口），结束时冻结到 `data/chat/views/<ctx>.json`。没有跨运行的当前视图，不再写 `view.json`（迁移来的旧文件只用于迁移检查）。2026-11-01 起不再有整段压力、折叠、dismiss 或交接（[设计与裁定](working/proposals/one-purpose-stateless-core.md)）。
+经历与眼前材料分别保存。`data/chat/journal/YYYYMMDD.jsonl` 是原始内容权威，保存稳定 `YYYYMMDD-N` 编号、时间、ctx、种类、原样模型消息和来源。每次运行有自己的编号视图，只保存有序条目引用与不能推导的统计（`stats.windows` 记行动和沉淀负责的窗口），结束时冻结到 `data/chat/views/<ctx>.json`。没有跨运行的当前视图，不再写 `view.json`；迁移脚本写出的那份（旧的当前段，没有经过交接）在第一次启动时由 `agent.adopt_last_view` 封存进 `views/` 和年鉴，并在 `me` 留一条叫醒她补记的记录。2026-11-01 起不再有整段压力、折叠、dismiss 或交接（[设计与裁定](working/proposals/one-purpose-stateless-core.md)）。
 
 统一入口 `chat.run(items, goal, ...)` 接受日志引用或原始消息，要求非空目的并放在请求末尾，返回 `(ctx, text)`。构造、行动、沉淀、反思、月年汇总和分身共用模型构造、工具绑定、记录、计费、取消与超时；`functions` 可给出本次可见工具的白名单。超时立即返回，若 worker 尚未退出则 `finalization=pending`，待它退出后后台完成归档。迟到的准备材料不会追加到已经关闭的运行。
 

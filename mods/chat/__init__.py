@@ -860,6 +860,7 @@ def on_load(ctx) -> None:
                 _attention.start(_agent.notify)
                 _attention.rescan()
                 _settle.start(_agent.kick)
+                _agent.adopt_last_view()
             except Exception:
                 _reflect_stream.exception("恢复注意力失败")
 
