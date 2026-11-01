@@ -29,6 +29,8 @@ QQ `#` 消息在画面中隐藏并不代表源记录缺失：转换以同消息�
 schema 顺序进入 view 的 `tool_state.schemas`。`follow/mute/on` 原文保留，旧 `wait`
 行删除，`loop/subconscious` 全局运行开关清除。`boxes.json` 等其它文件原地保留。
 
+当前折叠树内的历史工具公告以 `legacy_kind=tool_announcement_unknown_state`、`tool_state=null` 保留原文和来源，并报告 `historical-tool-state-unknown`；原 marks/told 保存在归档 view 的 legacy_metadata，不用可能被旧 fold 回写的快照冒充历史状态。再次引入这些公告时状态明确未知，新 run 用实际 binding 重新完整公告；当前可见公告及实时状态仍严格校验。
+
 冻结历史中不可分解的消息以明确 `legacy` 来源保存，旧上下文元数据保存在
 view.stats.legacy_metadata，旧折叠名称保存在 legacy row 的 legacy_fold_sources。
 当前折叠引用则恢复实际 covers。脚本不会为缺失的旧快照猜一个唤醒、行动或工具状态。
@@ -38,7 +40,7 @@ view.stats.legacy_metadata，旧折叠名称保存在 legacy row 的 legacy_fold
 - 当前消息没有完整唤醒快照，或第一份快照前还有无法归属的消息。
 - 当前行动找不到唯一 oplog 原文，工具结果无法配对，或正式编号与关联分片日冲突。
 - 当前画面头无法唯一对应原始 chatlog、唤醒前画面边界缺失，或末尾位置不符。
-- 当前笔记来源/版本不符，工具宣告的状态快照无法恢复，包括展开当前折叠后需要的状态。
+- 当前笔记来源/版本不符，当前可见工具宣告的状态快照无法恢复；折叠历史的未知状态按上述方式明确保留。
 - 当前折叠源缺失、循环，旧 oplog 有坏行或未完成尾部，源在转换期间变化，或存在符号链接。
 
 `data/pyload.py` 和 `data/storage/links.json` 中的旧公开名只报告文件和行号，不执行、

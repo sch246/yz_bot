@@ -757,7 +757,7 @@ class Import:
         stats = {key: clone(value) for key, value in data.items() if key not in {
             "started", "messages", "last_shown", "windows", "scopes", "told", "marks", "note_hashes", "last_number"}}
         view["stats"] = stats
-        if not strict:
+        if not envelope:
             view["stats"]["legacy_metadata"] = {key: clone(value) for key, value in data.items() if key != "messages"}
         self.detailed[name] = view
         marks = (data.get("marks") or []) if strict else []
@@ -802,7 +802,7 @@ class Import:
             if mark:
                 # Snapshot's tool state is the value immediately before this wake.
                 # Proven announcements keep their state; later snapshots keep their boundary.
-                if tool_rows and mark.get("told") is not None:
+                if envelope and tool_rows and mark.get("told") is not None:
                     remember_tool_state(mark["told"], {"path": str(path), "mark": index, "field": "told"},
                                         finite(mark["time"], path))
                 wake_id = self.add("wake", owner, stamp=finite(mark["time"], path),
@@ -924,6 +924,13 @@ class Import:
                     latest_notes.update(sources)
                 if text.startswith("<system-reminder>") and ("工具模块" in text or "可用模块" in text):
                     metadata["legacy_tool_announcement"] = True
+                    if not envelope:
+                        # WHY: 旧 fold_between 会回写后续 mark.told；即使有值也不能证明
+                        # 历史公告当时的状态。保留原文与原快照，明确未知，让再次引入它的
+                        # run 用实际 binding 重发完整公告；父当前状态仍按严格路径验证。
+                        kind = "legacy"
+                        metadata.update(tool_state=None, legacy_kind="tool_announcement_unknown_state")
+                        self.warn("historical-tool-state-unknown", path, index)
             if eid is None:
                 eid = self.add(kind, owner, [message], stamp=stamp, **metadata)
                 if metadata.get("legacy_tool_announcement"):
@@ -979,9 +986,15 @@ class Import:
         if self.legacy_current is not None:
             self.current = self.convert_context(self.legacy_current, "legacy-current", "data/context/current.json", strict=True)
             for row in self.rows.values():
-                if row["ctx"] == self.current["ctx"] and row.get("legacy_tool_announcement") and "tool_state" not in row:
+                if row["ctx"] == self.current["ctx"] and row.get("legacy_tool_announcement"):
                     source = row["source"]
-                    raise Blocked("folded-tool-state-unrecoverable", source["path"], source["message"])
+                    if source["path"] == "data/context/current.json":
+                        valid = "tool_state" in row
+                    else:
+                        valid = (row.get("legacy_kind") == "tool_announcement_unknown_state"
+                                 and "tool_state" in row and row["tool_state"] is None)
+                    if not valid:
+                        raise Blocked("folded-tool-state-unrecoverable", source["path"], source["message"])
             # Preserve high-water numbering even after old dismiss removed marks.
             highest = int(self.legacy_current.get("last_number") or 0)
             existing = max((row.get("number", 0) for row in self.rows.values() if row["kind"] == "wake" and row["ctx"] == self.current["ctx"]), default=0)
