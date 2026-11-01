@@ -584,8 +584,12 @@ class Import:
             labels.update((current.get("last_shown") or {}).keys())
             labels.update(current.get("windows") or [])
         read = {}
+        visible_ids = {}
         for text in labels:
             _, records = self.window_records(text)
+            # WHY: 生产 dry-run 调用栈采样落在 pending 的存在性检查；每条 pending
+            # 都重新扫描该窗口全部记录。只索引可见身份，隐藏记录仍走原同号同秒证明。
+            visible_ids[text] = {record["id"] for record in records}
             stamps = [record["time"] for record in records if record["time"] is not None]
             boundary = max(stamps + ([seen[text]] if text in seen else []), default=None)
             state = {"through": boundary, "at": [r["id"] for r in records if r["time"] == boundary],
@@ -610,7 +614,6 @@ class Import:
                     "unread": True, "recovered": False}
         for arrival, entry in self.pending.items():
             text = windows.label(tuple(entry["window"]))
-            _, records = self.window_records(text)
             identity_, event = self.arrival_identity(text, entry["event"])
             if identity_ is None:
                 if not entry.get("activated"):
@@ -620,7 +623,7 @@ class Import:
                         self.issues.append(issue)
                     continue
                 raise Blocked("unresolved-pending-identity", entry["_source"]["path"], entry["_source"]["line"])
-            if not any(record["id"] == identity_ for record in records):
+            if identity_ not in visible_ids[text]:
                 # WHY: 2026-11-01 生产 dry-run 的 pending-record-missing 实际是 QQ # 消息：
                 # 旧版先登记 arrival，画面再隐藏它。未读和召唤不能丢，也不能把它塞进画面；
                 # 仅用同号同秒的唯一原始记录证明来源，当前画面仍严格使用默认可见记录。
