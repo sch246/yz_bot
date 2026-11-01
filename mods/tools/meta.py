@@ -2,7 +2,7 @@
 
 你在同一轮里可以一口气调用多个工具，它们会按顺序一个个执行，但因为是同时发出的动作，同一步里它们彼此看不到对方的结果；等这一批全跑完，下一步（下一个子请求）你就能一并看到所有结果了。如果这一步里有 `send(wait=-1)`（或结束了这一轮的 `send`）、或者请求被取消，系统就不会单纯为了让你看工具结果而强行多跑一轮。
 
-你白天一直活在同一段连续的思绪（上下文）里，每次被叫醒，新消息和刚发生的事就会顺着往后接，直到交接归档。没出现在眼前的旧事并没有丢，只是收起来了，随时自己去翻：按窗口翻聊天原文用 `read_log`，顺着关键词到处找用 `search`（聊天记录、笔记、日记和旧归档一起找），看自己以前做过的动作用 `read_actions`，翻笔记用 `read_note`。笔记就是你的随身本子，用 `write_note` 随时写；中间某几轮事情了结了、想腾出视野就调 `compress` 折成摘要；一整件事告一段落、想清空眼前换个心情时，就调 `tidy` 交接。
+每次被叫醒，你眼前的上下文都是为这一次专门准备的：先由你自己做一次短短的准备（构造），选好这次要看的笔记、之前的行动和聊天片段，再带着它们行动；这次做完，眼前的东西就收起来，下次醒来重新准备。所以不用管上下文多长，也没有交接。连续性靠这几样：黑板 `recent`（此刻的心情、手头的事，以及用 `@引用` 一行一条记下的“下次可能用得上的材料”）、笔记，以及一段经历结束后的沉淀（你会把那段经历里值得留下的写进笔记和日记）。没出现在眼前的旧事并没有丢，随时自己去翻：按窗口翻聊天原文用 `read_log`，顺着关键词到处找用 `search`（聊天记录、笔记、日记和归档一起找），看自己以前做过的动作用 `read_actions`，翻笔记用 `read_note`。笔记就是你的随身本子，用 `write_note` 随时写。
 
 ## 直接动手跑代码（exec_code）
 
@@ -18,7 +18,7 @@
 
 遇到需要亲眼看看的图片，调 `attach_image(uri, note, model)` 就能把图递给你自己：当前模型支持视觉时，它会在工具结果里留一行图片引用（看到 `✅` 就是顺利递到你眼前了）；当前模型无视觉时，会自动调用默认视觉模型为你转述；也可以传 `model` 参数指定由特定的视觉外援转述。
 
-如果当前模型支持“工具结果带图”（`tool_images`），看过的图会一直留在操作记录里，以后翻记录还能查到当时看了哪张图（代价是这段上下文还没交接前，每轮都要带着它重发）；如果不支持，系统会临时把图塞进下一条消息给你看一眼，看完不留底。
+如果当前模型支持“工具结果带图”（`tool_images`），看过的图会一直留在操作记录里，以后翻记录还能查到当时看了哪张图（代价是这次运行里之后每轮都要带着它重发）；如果不支持，系统会临时把图塞进下一条消息给你看一眼，看完不留底。
 
 ## 在 exec_code 里组合工具与连续看图
 
@@ -119,9 +119,8 @@ __all__ = ["lookup"]
 - **翻聊天原话**：`read_log(window, count, before)` 读任意窗口的原话，`before` 填 `YYYY-MM-DD HH:MM:SS` 可以往前翻旧账。
 - **顺着线索搜**：记得半点线索（名字、话题、某个词）就调 `search(keyword, window, days)`，一次找遍最近聊天、所有笔记、日记和归档上下文；找到位置后再用 `read_log` 或 `read_note` 细看。
 - **看自己干过什么**：`read_actions(ids)` 按行动号或关键词翻自己过去的想法和工具调用结果。
-- **随手写笔记、建专题与记日记**：`data/notes/` 下的笔记随时用 `read_note(scope)` 读、`write_note(scope, text)` 整份改写（改前会自动留备份，已载入的常驻笔记改完会在下轮自动追加 `【笔记更新】`，不破坏前缀缓存）。除了 `global`（核心待人直觉与索引）、`recent`（眼下短期工作台，20 行以内；**不只在交接时写**，白天事情有了阶段性进展、关注点转移或折叠旧唤醒时，随时用 `write_note("recent", ...)` 刷新）、`todo`（待办）、`awaker`（闹钟）、`person:<QQ号>`、`group:<群号>` 和 `diary:<日期>`（当天日记，白天有感触随时能写，不必等交接），**你随时可以自己起名字新建专题笔记**（比如 `write_note("消消乐", ...)`、`write_note("topic:线代", ...)`）。具体某件事的经验、某个游戏的打法、某段长思考，单独建一份笔记或写成 `.md` Skill，在 `global` 里只放一行引用，别什么都往 `global` 里堆。
-- **折叠与解压长上下文（compress / decompress）**：如果当前这一段聊得有点长（比如潜意识提醒你 token 多了），但手头的事还没完、不到整段 tidy 交接的时候，可以直接调用内置工具 `compress`（直接调工具，不要发 `#compress` 命令），把中间已经聊完的几轮唤醒或大调用步骤折成一段你亲手写的摘要，原文会自动归档备查；若后续发现摘要遗漏了细节需要核对，随时可以调用 `decompress` 把对应的收起块原样展开还原回当前上下文。折叠能保留当前段和前缀缓存，白天不必为了清理上下文而强行 `tidy` 交接；折叠完已了结的事时，如果 `recent` 已经过时，顺手用 `write_note("recent", ...)` 刷新一下眼下工作台。
-- **交接换新篇（tidy）**：一件事彻底告一段落、上下文太长、或者到了夜里，这段上下文就要归档了。你会收到交接提示，把该记的事分别安顿进 `recent`、人和群的笔记、`todo`、专题笔记和日记里，然后轻装开启下一段。
+- **随手写笔记、建专题与记日记**：`data/notes/` 下的笔记随时用 `read_note(scope)` 读、`write_note(scope, text)` 整份改写（改前会自动留备份，下次准备上下文时用的就是改过的版本）。除了 `global`（核心待人直觉与索引）、`recent`（黑板：此刻的心情、手头的事、还挂着的话，20 行以内，外加 `@引用` 行；事情有了进展、关注点转移、答应了别人什么，随时用 `write_note("recent", ...)` 刷新，下一刻的你最先看到它）、`todo`（待办）、`awaker`（闹钟）、`person:<QQ号>`、`group:<群号>` 和 `diary:<日期>`（当天日记，白天有感触随时能写，不必等沉淀），**你随时可以自己起名字新建专题笔记**（比如 `write_note("消消乐", ...)`、`write_note("topic:线代", ...)`）。具体某件事的经验、某个游戏的打法、某段长思考，单独建一份笔记或写成 `.md` Skill，在 `global` 里只放一行引用，别什么都往 `global` 里堆。
+- **沉淀**：你在某个窗口的一段经历结束（安静了一阵、积攒得太多、或者到了夜里）以后，会有一次专门的运行把这段的聊天原文和你在那里的每次行动摆在你面前，你把值得留下的分别安顿进人和群的笔记、当天日记、`recent` 和 `todo`。当场想记的事也不必等它，随时 `write_note`。
 - **给自己定闹钟（awaker 与 wake_me）**：想过会儿再醒、等别人把下半句话说完、或者临时跟听/静音某个群，可以直接调 `wake_me` 工具，也可以直接用 `write_note` 改 `awaker` 笔记（每行一条，如 `every 10m 理由`、`daily 23:30 理由`、`at 2026-10-23 08:00 理由`；`daily 04:00 reflect` 是每晚的反思闹钟）。闹钟响时会记进你的 `me` 窗口并叫醒你，一次性闹钟响过自动划掉。
 - **夜里反思**：关于记忆系统怎么流转、夜里怎么打理和改造自己，全写在 `memory_system` 里，每晚反思时会自动为你展开。
 
@@ -142,7 +141,7 @@ __all__ = ["lookup"]
 - **wait 控制后续与自主呼吸**：`send` 的 `wait` 参数决定发完这句之后你是继续活动还是挂着喘气：
   - `wait=0`：不等回复，发完直接跑下一轮，手里还有别的事情接着做；
   - `wait=-1`：发完收工，纯被动等待（相当于原 `final_call=true`），没有超时闹钟；
-  - `wait="20m"`（或 `"5m"`、`300` 等）：在当前窗口挂一个超时等待规则（由 awaker 统一调度）。等待期间如果对方（或群里）有人接话，新消息会自动认领并叫醒你；如果超时一直没人回复，awaker 会到点叫醒你，带着你设的 `reason`（例如"不来我就接着读日记"）让你自主接着活动。群聊里还可以传 `who=QQ号` 指定只等某个人接话。等待期间叫醒你的消息要是不用接（比如别人插了一句），`dismiss` 时带上 `wait="g123:QQ号 10m"` 就能接着等——那条 wait 在叫醒你时已经用掉了，不带就不再等。
+  - `wait="20m"`（或 `"5m"`、`300` 等）：在当前窗口挂一个超时等待规则（由 awaker 统一调度）。等待期间如果对方（或群里）有人接话，新消息会自动认领并叫醒你；如果超时一直没人回复，awaker 会到点叫醒你，带着你设的 `reason`（例如"不来我就接着读日记"）让你自主接着活动。群聊里还可以传 `who=QQ号` 指定只等某个人接话。等待期间叫醒你的消息要是不用接（比如别人插了一句），那条 wait 在叫醒你时已经用掉了；还想接着等，就调 `wake_me("wait g123:QQ号 10m", 理由)` 重新挂上。
 - **发送失败或未确认**：万一没发出去或者状态“未确认”，系统也会再跑一轮让你看清状况。失败时字还在输入框里；但如果是**“未确认”**，说明请求已经递出去了只是没拿到回执号，那句话十有八九已经发进聊天里了——这时输入框已经清空，千万别直接重发，先看下一轮聊天记录里有没有它。
 - **被叫醒不等于必须开口**：大家闲聊不一定有明确的问题。别人已经答完、话题和你无关、或者你没什么想说的，就安静结束这一轮——不用 `type_word` 也不用 `send`，少说比多说好。真不想接的时候，丢张表情包或者回个问号也行。
 
@@ -551,17 +550,14 @@ def send(
                 time.sleep(random.uniform(*BUBBLE_GAP))
     except windows.Unconfirmed as error:
         boxes.pop(label, None)
-        _spoke(window)
         return f"未确认：{error}输入框已清空。" + unconfirmed
     except Exception as error:
         if sent:
             boxes.pop(label, None)
-            _spoke(window)
             return (f"发送失败（{type(error).__name__}）：{error}。"
                     f"前 {len(sent)} 条已经发出去了，剩下的没发，别再重发前面那些。")
         return f"发送失败（{type(error).__name__}）：{error}。这句话没有发出去，还在输入框里。"
     boxes.pop(label, None)
-    _spoke(window)
 
     if wait_mode == "continue":
         pass
@@ -580,16 +576,6 @@ def send(
         return f"{result_text}（已设等待：{plant_line}；来消息或超时都会叫你）"
 
     return "、".join(str(item) for item in sent) if len(sent) > 1 else str(sent[0])
-def _spoke(window: tuple) -> None:
-    """She said something: dismiss cannot clear past it."""
-    from mods.chat import segment
-    from mods.chat.run import write
-
-    state = current_binding()["run"]
-    state["view"]["stats"]["last_sent"] = time.time()
-    write(state, segment.append, state["view"], "speech", persist=state["persist"], sent=True, window=str(window))
-
-
 def write_note(scope: str, text: str) -> str:
     """想记下对某个人或群的新了解、新建或更新专题笔记、更新待办（todo）、改闹钟（awaker）或写日记时，用新的完整内容替换那份笔记，返回写入结果。
 
@@ -613,6 +599,9 @@ def write_note(scope: str, text: str) -> str:
     return f"已写入 {scope}" if text.strip() else f"已删除 {scope}"
 
 
+# WHY: 2026-10-29 草籽：wait 是来消息就认领、当场划掉的；别人插一句叫醒了她，原来的 wait 就没了。
+# 不自动放回去：还等不等、等谁、等多久，她看过那条消息以后自己定。原先 dismiss 也能顺手设 wait；
+# 2026-11-01 dismiss 随整段上下文一起删掉，重新挂等待就用这里的 "wait 窗口:QQ号 时长"。
 def wake_me(when: str, reason: str) -> str:
     """想让自己过一会儿再醒、等某个人把话说完、或者临时盯紧/静音某个窗口时，给自己埋一个唤醒条件或窗口覆盖层，写入 awaker 笔记并返回生效的规则。
 
@@ -643,90 +632,6 @@ def wake_me(when: str, reason: str) -> str:
         return f"已写进 awaker：{line}（同一目标再写一次就替换，揭掉写 {kind} {line.split()[1]} off）"
     once = kind in ("at", "on", "wait", "when")
     return f"已写进 awaker：{line}" + ("（响过就划掉；不要了用 write_note 改 awaker）" if once else "（不要了用 write_note 改 awaker）")
-
-
-def dismiss(since: str = "", wait: str = "", reason: str = "") -> str:
-    """被叫醒看了一眼、发现没什么需要你插手时，把这次唤醒从当前上下文里无痕收起，并直接结束这一轮。
-
-    收起的消息不会丢，只是退回未读，下次醒来会和新消息一起接着给你看；你在这期间改过的笔记或文件也不会撤回。不过一旦你在这期间发过言、输入框里留着刚打的字、或者跟听（follow）攒了超过 60 条消息，就没法再清了。
-    叫醒你的要是你自己挂的 wait（「这次唤醒你的是」里写着"等到了"），它这时已经用掉了；还想接着等，就带上 wait，清掉的同时重新挂上。
-
-    @param
-    since: 从哪次唤醒开始清，填「这次唤醒你的是（…）」括号里的时刻（只写 时:分:秒 也行），把那次到现在的唤醒一并清掉；留空只清最近这一次
-    wait: 清掉以后接着等谁、等多久，写 窗口 时长，如 "g123 10m"、"g123:30001 10m"（只等这个人）、"u456 5m"；那边来消息或者到点都会叫你。留空就不等
-    reason: 带 wait 时写给到时候的自己的理由，如"还在等他回那件事"；留空默认"接着等回复"
-
-    WHY: 2026-10-29 草籽：wait 是来消息就认领、当场划掉的。别人插一句叫醒了她，她看一眼 dismiss 掉，
-    原来那条 wait 已经没了，等的人后来接话也叫不醒她。不自动放回去，而是让 dismiss 也能设 wait：
-    还等不等、等谁、等多久，她看过那条消息以后自己定。
-    """
-    from mods import chat
-    from mods.chat import awaker
-
-    problem = chat.agent.request_dismiss(since, validate_only=True)
-    if problem:
-        return problem
-    planted = ""
-    if str(wait).strip():
-        when = " ".join(str(wait).split())
-        when = when[5:] if when.startswith("wait ") else when
-        try:
-            planted = awaker.plant(f"wait {when}", reason.strip() or "接着等回复")
-        except (ValueError, OSError) as error:
-            # WHY: waiting and dropping are one intention. A failed wait must
-            # leave both the view and reading untouched.
-            return f"wait 没挂上（{error}），这次也先不清；改好再调 dismiss"
-    problem = chat.agent.request_dismiss(since)
-    if problem:
-        return problem + ("；已经挂好的等待保留" if planted else "")
-    return "这一轮结束后清掉" + (f"；接着等：{planted}" if planted else "")
-
-
-def tidy(note: str = "") -> str:
-    """一件事告一段落、或者刚翻了一大堆资料只需要留下结论时，发起上下文交接：这一轮结束后把要记的事安顿进笔记，归档旧上下文，换一段清爽的上下文接着过。
-
-    @param
-    note: 给交接时的自己留句提醒，比如"结论是端口没问题，排查细节不用记"；可留空
-    """
-    from mods import chat
-
-    if not chat.agent.request_tidy(note.strip()):
-        return "现在没有进行中的唤醒，不需要交接"
-    current_binding()["run"]["end"] = True
-    return "这一轮结束后交接，之后从新的一段接着做"
-
-
-def compress(first: int | str = 0, last: int | str = 0, summary: str = "",
-             from_time: str = "", to_time: str = "") -> str:
-    """当前上下文还没到整段交接的时候，但中间有几轮已经了结的事、或某次调用读了大量数据太占地方时，把它们折成一段摘要（原文归档），帮自己腾出视野。
-
-    全面采用序号定位，支持按唤醒整轮收（如 first=26, last=27；只收一轮 last 留空或填 0；收至最新之前 last="latest"），也支持按具体子步骤精确收某一步或几步（如 first="28.1", last="28.1" 收掉那次失误读的大段日志；当前唤醒中刚做完的步骤也能当场收）。
-    系统会自动识别折叠层级（L1 / L2 递归折叠），并在保留工具调用存照的同时自动精简参数，告知节省的 token 与最新占用。
-    摘要写给接下来的自己看，交代清楚跟谁、什么事、结果如何、还欠着什么（引原话带上 mid，没 mid 就说明是大意）。还在等回话或没查清的事先留着别收；只总结被收掉的那几轮或那几步，刚看完的画面还在眼前，不用写进摘要。收起已了结的轮次或步骤后，如果眼下手头正在推进的事跟上次写 `recent` 时已经不一样了，也可以顺手调 `write_note("recent", ...)` 刷新短期工作台，不必为了更新状态而整段 `tidy` 交接。
-
-    @param
-    first: 起始序号：整轮如 26、27；子步骤如 "28.1"、"28.2"（含两端）
-    last: 结束序号：整轮如 27；子步骤如 "28.3"；留空或填 0 表示只收 first 该轮/该步；填 "latest" 表示一路收到最新一次唤醒之前
-    summary: 用来替换原文的摘要内容，可写多行
-    """
-    from mods import chat
-
-    return chat.agent.request_compress(first, last or first, summary)
-
-
-def decompress(name: str = "") -> str:
-    """把之前用 compress 折叠收起的某段历史唤醒或子步骤解压还原回当前上下文。
-
-    当你发现摘要漏了关键细节、或者需要翻看某段被折叠对话的原始调用和原话时，用此工具把归档段重新展开到当前视野中。
-
-    @param
-    name: 要解压的收起块名字（如 "20261029-180253-folded"）、序号（如 1、2、"latest"）或留空列出当前所有可解压的块
-    """
-    from mods import chat
-
-    if chat.current_wake() is None:
-        return "只有主唤醒能展开当前主上下文"
-    return chat.agent.decompress(name)
 
 
 def loop(note: str = "", stop: bool = False) -> str:
@@ -815,10 +720,6 @@ __all__ = [
     "read_actions",
     "read_note",
     "write_note",
-    "tidy",
-    "dismiss",
-    "compress",
-    "decompress",
     "loop",
     "wait",
     "wake_me",

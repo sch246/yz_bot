@@ -198,17 +198,15 @@ cond 或 action 报错会写应用日志并把 traceback 回传当前聊天。co
 
 其它来源调用 `chat.wake(event, kind)` 或无事件的 `chat.wake(reason=..., kind=...)`；非消息唤醒实际发生后仍在 `me` 留理由。`wake_me` 设置长期规则、一次等待或 follow/mute 覆盖层，`send(wait=...)` 决定是否等回复。follow/mute/on 由 awaker 文件持久保存，wait、loop 和 other 重启丢弃；`#awaker` 显示文件和内存两边。
 
-主聊天由一个中心 agent 跨窗口串行处理。同一段普通追加，原文存 `data/chat/journal/`，`view.json` 与 `views/<ctx>.json` 存条目引用。默认开局给 global、recent、最近七篇非空非未来日记、年鉴和目录；`data/notes/policy/opening` 可逐行改引用，前段编辑后下段采用。人物/群笔记首次出现与笔记更新继续追加，目录 60 份和人物/群 20 份截断都明示遗漏。
-
-她用 `dismiss` 放下唤醒，退回对应阅读确认，保留原 journal 和实际动作；发过话、新草稿或 follow 积压超过 60 条时拦截。`compress` 按 `#n` 或 `n.m` 收起已完成材料，`decompress` 还原原引用；编号稳定、支持嵌套，子步骤不跨唤醒。压力提醒每增长五万 token 提示可收范围；`tidy`、策略条件或夜间反思触发同段交接，完成后冻结视图。handoff/reflect 仍可按输入框规则发言。
+主聊天由一个中心 agent 跨窗口串行处理，每次调用只为一个目的（[设计与裁定](working/proposals/one-purpose-stateless-core.md)）。每次唤醒先跑一次构造运行：她自己读黑板 `recent`、折叠索引和这次的消息，用 `construct__assemble` 提交一份或几份规格（目的、引用、注意、负责的窗口）；然后每份规格各跑一次行动。构造关着、出错或超时就按黑板加消息兜底。原文存 `data/chat/journal/`，每次运行的视图冻结在 `views/<ctx>.json`。她在某个窗口的一段经历结束后（安静 20 分钟、积压 200 条或夜里），有一次沉淀把值得留下的写进笔记、日记和黑板；沉淀在空闲时跑，有新召唤就让路。2026-11-01 起没有交接、压力、`tidy`、`dismiss`、`compress` 和 `decompress`。
 
 `loop("在做什么")` 显式开启连续循环；`wait(seconds, reason)` 在循环内推迟下一轮，循环外也可单独排唤醒；`loop(stop=True)`、取消或夜间反思停止循环。`loop_note_history` 从 journal 查备注。
 
-`#status` 查看模型、思考、防抖、旁观、容量、压力与循环运行态；`#model/#models` 看模型与价格，`#use_model` 切换；`#prompt` 管 self，`#image/#audio` 管多媒体，`#reasoning keep|drop` 管历史思考的请求投影，`#effort` 管生成思考等级，`#limit` 管首屏条数（80）与整理阈值（500000 token），`#reflect [now]` 看或运行反思，`#awaker` 管规则，`#debounce` 管防抖，`#observer` 管旁观助手。查看与完整语法用 `#help [名称]`，修改要求 op。`#hint` 仍是独立的窗口 QQ 收尾提示文件，变量 usage/peak/limit 与[LLM 文档](llm.md)一致。
+`#status` 查看模型、思考、防抖、构造运行、待沉淀窗口与循环运行态；`#model/#models` 看模型与价格，`#use_model` 切换；`#prompt` 管 self，`#image/#audio` 管多媒体，`#reasoning keep|drop` 管历史思考的请求投影，`#effort` 管生成思考等级，`#limit` 管首屏条数（80）与反思、沉淀的增长上限（500000 token），`#reflect [now|keep]` 看或运行反思（now 先沉淀），`#awaker` 管规则，`#debounce` 管防抖，`#construct` 管构造运行。查看与完整语法用 `#help [名称]`，修改要求 op。`#hint` 仍是独立的窗口 QQ 收尾提示文件，变量 usage/peak/limit 与[LLM 文档](llm.md)一致。
 
-发送先 `type_word(target, text)`，下一步再 `send(target)`；正文自语不自动发送，草稿跨唤醒/重启保留。`send(wait=0)` 继续，`wait=-1` 收工，正时长等回复或超时，可用 who 指定作者。分身工具 `agents__fork(goal, refs, tasks, tools, model)` 复用日志/唤醒/步骤/笔记/ctx 引用，最多五项并发，返回独立 ctx 与结果；默认没有 send/type_word，在本次 tools 显式授权。私聊主唤醒仍显示“正在输入”，`^C` 取消相关主运行与子进程。
+发送先 `type_word(target, text)`，下一步再 `send(target)`；正文自语不自动发送，草稿跨唤醒/重启保留。`send(wait=0)` 继续，`wait=-1` 收工，正时长等回复或超时，可用 who 指定作者。分身工具 `agents__fork(goal, refs, tasks, tools, model)` 复用同一套引用写法（日志编号、笔记、ctx、`policy:`、`log:`），最多五项并发，返回独立 ctx 与结果；默认没有 send/type_word，在本次 tools 显式授权。私聊主唤醒仍显示“正在输入”，`^C` 取消相关主运行与子进程。
 
-LLM 开局默认激活 `meta` 模块，直接获得共享 `.py` 环境执行工具和三个工具模块管理工具。完整目录及已加载模块说明在首次请求成为工具状态条目（位于笔记之后、第一条窗口画面之前）；之后变化在请求边界追加差异条目，不改写旧描述。模型用 `load_tools` 激活 last-good 模块，用 `list_tools` 取完整最新状态和磁盘差异，用 `reload_tools` 显式应用修改。闲置超过一小时的模块下轮不再激活，但已发送的函数定义保留并由调用 guard 提示重装。现有模块覆盖戳一戳、图片、视觉外援、时间、延时任务、天气、高德地图、联网搜索、B 站冲浪与互动、自管浏览器、安卓备用机控制、邮箱、TOTP 验证码、表情柜、语音合成、合并转发、文件发送、头像获取、宿主机文件与后台命令、用户 storage、子模型任务分派、夜间反思记忆系统和 MC 百科查询；不会自动热加载。历史上明确禁用的工具只在 `mods/tools/disable/README.md` 留有决策记录，仓库中没有对应实现。工具 schema、模块格式、循环回写和高权限边界见独立的 [LLM 文档](llm.md)。
+LLM 开局默认激活 `meta` 模块，直接获得共享 `.py` 环境执行工具和三个工具模块管理工具。完整目录及已加载模块说明在每次运行的首次请求成为工具状态条目；之后变化在请求边界追加差异条目，不改写旧描述。模型用 `load_tools` 激活 last-good 模块，用 `list_tools` 取完整最新状态和磁盘差异，用 `reload_tools` 显式应用修改。闲置超过一小时的模块下轮不再激活，但已发送的函数定义保留并由调用 guard 提示重装。现有模块覆盖戳一戳、图片、视觉外援、时间、延时任务、天气、高德地图、联网搜索、B 站冲浪与互动、自管浏览器、安卓备用机控制、邮箱、TOTP 验证码、表情柜、语音合成、合并转发、文件发送、头像获取、宿主机文件与后台命令、用户 storage、子模型任务分派、夜间反思记忆系统和 MC 百科查询；不会自动热加载。历史上明确禁用的工具只在 `mods/tools/disable/README.md` 留有决策记录，仓库中没有对应实现。工具 schema、模块格式、循环回写和高权限边界见独立的 [LLM 文档](llm.md)。
 
 ## Minecraft 与宿主服务
 

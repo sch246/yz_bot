@@ -1,8 +1,13 @@
-"""One central reader: attention supplies work, journal views supply memory.
+"""One central reader: attention supplies work; each wake is constructed, then acted.
 
-WHY: 2026-10-22: without a handoff this remains the same context. Handoff
-happens in that context, with everything she saw, rather than in a librarian
-session that has less evidence. Notes are rewritten, making retries safe.
+A wake claims its summons, runs one construct run that decides what each act
+sees (``construct.build``), then runs every spec as its own act with a fresh
+view. When nothing waits, due windows are settled (``settle``). No context
+outlives its run: there is no handoff, pressure, fold or dismiss any more.
+
+WHY: 2026-11-01 维护者推翻 D20（不交接就一直是同一个上下文）、同意无状态设计：每次调用
+只有一个目的，上下文由上下文构造（docs/working/proposals/one-purpose-stateless-core.md）。
+交接写记忆的那条路由沉淀接替，沉淀按日志编号拿到她亲历时看到的同一批材料。
 """
 from __future__ import annotations
 
@@ -10,18 +15,14 @@ from pathlib import Path
 import threading
 import time
 
-from mods import context, history, py, shell, storage
+from mods import context, history, shell, storage
 import mods.chat as _chat_root
-from . import attention, journal, notes as _notes, roles as _roles, screen as _screen, segment as _segment, windows as _windows
+from . import attention, construct as _construct, journal, notes as _notes, roles as _roles, screen as _screen, segment as _segment, settle as _settle, windows as _windows
 from .run import current_wake, run, write
 
-DEFAULT_TIDY = '''# stage: assemble / round; used/grown/limit are token estimates.
-# since_handoff is seconds; kind is the wake reason; hour is local time.
-"上下文太长" if used > limit else None
-'''
-_KNOWN_PEOPLE = 20
-_HANDOFFS_PER_WAKE = 3
-_TIDY_GRACE = 2
+# WHY: with no running context the act must see enough of the thread around a new
+# message to know who is answering whom; the constructor adds more through log: refs.
+_ACT_LEAD_IN = 10
 _lock = threading.RLock()
 _active = None
 _reader_running = False
@@ -46,9 +47,9 @@ def cancel_wake(window):
 
 
 def _new(kind="唤醒"):
-    return {"cancelled": False, "associated_windows": set(), "claims": [],
+    return {"cancelled": False, "associated_windows": set(), "claims": [], "deferred": [],
             "log": {"kind": kind, "start": time.time(), "peak": 0, "acts": 0},
-            "handoffs": 0, "release": "", "boxes": storage.get("", "boxes")}
+            "release": "", "boxes": storage.get("", "boxes")}
 
 
 def notify():
@@ -56,6 +57,20 @@ def notify():
     global _reader_running, _requested
     with _lock:
         _requested = True
+        if _reader_running or _active is not None:
+            return
+        _reader_running = True
+    threading.Thread(target=_reader, name="chat-reader", daemon=True).start()
+
+
+def kick():
+    """Start the reader for idle work (settling) without marking new attention work.
+
+    WHY: notify() sets _requested, which is exactly what tells a running settle to
+    yield; a settle deadline must not preempt another settle that is already running.
+    """
+    global _reader_running
+    with _lock:
         if _reader_running or _active is not None:
             return
         _reader_running = True
@@ -72,7 +87,33 @@ def _reader():
             wake, _active = _active, None
             _reader_running = False
         if wake is not None:
-            attention.release(wake["claims"])
+            attention.release(wake["claims"] + wake["deferred"])
+
+
+def _settle_idle():
+    """Settle one due window while nothing else waits; False when none is due."""
+    global _active
+    due = _settle.due()
+    if not due:
+        return False
+    label = due[0]
+    wake = _new("沉淀")
+    try:
+        wake["associated_windows"].add(_windows.parse(label))
+    except ValueError:
+        pass
+    with _lock:
+        if _requested:
+            return True
+        _active = wake
+    try:
+        _settle.settle(label, stop=lambda: _requested or wake["cancelled"])
+    except Exception:
+        _roles._stream.exception(f"沉淀 {label} 失败")
+    finally:
+        with _lock:
+            _active = None
+    return True
 
 
 def _read_work():
@@ -84,10 +125,18 @@ def _read_work():
             _active = wake
         claims = attention.claim()
         if not claims:
+            with _lock:
+                _active = None
+                if _requested:
+                    continue
+            if _settle_idle():
+                continue
+            # WHY: a settle deadline that fired while this reader was still busy was
+            # ignored by kick(); re-arm before leaving so that deadline is not lost.
+            _settle.arm()
             # WHY: unregister and observe arriving notifications under the
             # same lock; an arrival can neither lose its owner nor its wake.
             with _lock:
-                _active = None
                 if _requested:
                     continue
                 _reader_running = False
@@ -107,7 +156,7 @@ def _read_work():
         except BaseException:
             _roles._stream.exception("中心唤醒失败，保留未确认召唤")
             # release sets ready, but must not hot-retry the failed request.
-            attention.release(wake["claims"])
+            attention.release(wake["claims"] + wake["deferred"])
             with _lock:
                 _active = None
                 _reader_running = False
@@ -117,7 +166,7 @@ def _read_work():
             return
         finally:
             typing.set()
-            attention.release(wake["claims"])
+            attention.release(wake["claims"] + wake["deferred"])
             if origin is not None:
                 window = history.window(origin)
                 if window is not None and window[0] in _windows.QQ:
@@ -170,107 +219,46 @@ def _keep_typing(wake, stop):
         stop.wait(5)
 
 
-def _note(view, scope, title=""):
-    text = _notes.render(scope)
-    _segment.append(view, "note", messages=[{"role": "system", "content":
-                    (title + "\n" if title else "") + (text or f"【笔记 {scope} 已清空】")}],
-                    scope=scope, name=scope, version=_notes.note_hash(scope))
+def drafts() -> str:
+    """Unsent text in input boxes, for every act to see.
 
-
-def _opening(view, windows):
-    if any(journal.get(item).get("opening") for item in view["items"]):
-        return
-    path = _notes._policy_path("opening")
-    if path.exists():
-        for line in _notes.read_policy("opening").splitlines():
-            ref = line.strip()
-            if not ref or ref.startswith("//"):
-                continue
-            try:
-                _segment.extend(view, _segment.resolve_refs(view, [ref]))
-            except (ValueError, FileNotFoundError) as error:
-                _segment.append(view, "system", messages=[{"role": "system", "content":
-                    f"opening 引用 {ref!r} 无法载入：{error}；请改 policy/opening。"}])
-    else:
-        # WHY: seven existing diaries remain available even before today's
-        # entry is written; today's version also refreshes after edits/midnight.
-        today = _screen.clock()[:10]
-        days = sorted(key for key in _notes.diaries() if len(key) == 10 and key <= today
-                      and _notes.render(f"diary:{key}").strip())[-7:]
-        scopes = ["global", "recent", *(f"diary:{day}" for day in days)]
-        for scope in scopes:
-            if _notes.render(scope):
-                _note(view, scope, "以下是你的笔记：")
-        years = _notes.years()
-        if years:
-            _segment.append(view, "system", messages=[{"role": "system", "content":
-                "年鉴（用 read_context 读原样）：\n" + "\n".join(years)}])
-        _segment.append(view, "system", messages=[{"role": "system", "content":
-            "还能召回的东西（用 search、read_log、read_actions、read_note 读）：\n" + _roles.directory(windows)}])
-    _segment.append(view, "system", opening=True)
+    WHY: drafts survive wakes and restarts (input boxes live in storage); with no
+    running context the act would not otherwise know a draft is waiting to be sent.
+    """
     boxes = [f"{name}：{box.get('text', '')}" for name, box in storage.get("", "boxes").items()
              if isinstance(box, dict) and box.get("text")]
-    if boxes:
-        # WHY: drafts survive handoff; the old type_word return no longer does.
-        _segment.append(view, "system", messages=[{"role": "system", "content":
-            "交接前输入框里还没发的字：\n" + "\n".join(boxes)}])
+    return ("输入框里还没发的字：\n" + "\n".join(boxes)) if boxes else ""
 
 
-def _refresh_notes(view):
-    info = _segment.derive(view)
-    for scope, source in info["notes"].items():
-        if source["version"] != _notes.note_hash(scope):
-            _note(view, scope, "【笔记更新】")
-    today = "diary:" + _screen.clock()[:10]
-    if today not in info["notes"] and _notes.render(today):
-        _note(view, today, "【今天的日记】")
-
-
-def _people(wake, material):
-    view = wake["view"]
-    scopes = [_notes.scope_of(window) for window in wake["associated_windows"] if window[0] in _windows.QQ]
-    scopes += [f"person:{job['author']}" for job in wake["claims"] if str(job.get("author", "")).isdigit()]
-    scopes += [f"person:{who}" for who in _screen.extract_qqs([row["messages"][0]["content"] for row in material])]
-    known = set(_segment.derive(view)["notes"])
-    new = [scope for scope in dict.fromkeys(scopes) if scope not in known and _notes.render(scope)]
-    room = max(0, _KNOWN_PEOPLE - wake.get("people_count", 0))
-    for scope in new[:room]:
-        _note(view, scope, "这一段里第一次出现的人或群，你的笔记：")
-    wake["people_count"] = wake.get("people_count", 0) + min(room, len(new))
-    omitted = set(new[room:]) - wake.setdefault("omitted_people", set())
-    if omitted:
-        wake["omitted_people"].update(omitted)
-        _segment.append(view, "system", messages=[{"role": "system", "content":
-            f"人物/群笔记本次最多自动载入 20 份；另有 {len(omitted)} 份未载入："
-            + "、".join(sorted(omitted)) + "。用 read_note(scope) 或 search 自己召回。"}])
-
-
-def _prepare(wake):
+def _prepare(wake, view, windows):
     late = attention.claim()
     # WHY: reflection is control work dispatched after this wake, not a screen
     # request that an unrelated assistant output can acknowledge.
     attention.release([job for job in late if job["kind"] == "reflect"])
     late = [job for job in late if job["kind"] != "reflect"]
-    if late:
-        wake["claims"].extend(late)
-        _adopt(wake, late)
-    _refresh_notes(wake["view"])
-    info = _segment.derive(wake["view"])
+    mine = [job for job in late if tuple(job["window"]) in windows]
+    # Arrivals for other windows wait for the next wake and its own construction.
+    wake["deferred"].extend(job for job in late if tuple(job["window"]) not in windows)
+    if mine:
+        wake["claims"].extend(mine)
+        _adopt(wake, mine)
+    view["stats"]["windows"] = sorted(_windows.label(window) for window in windows)
+    info = _segment.derive(view)
     pending = [row["read_patch"] for row in info["screens"] if row.get("read_patch")]
     material, patches = [], []
     count, _threshold = _chat_root.limit()
-    for window in sorted(wake["associated_windows"], key=_windows.label):
+    for window in sorted(windows, key=_windows.label):
         label = _windows.label(window)
-        part = _screen.prepare(window, shown=info["shown"].get(label, []), count=count, pending=pending)
+        part = _screen.prepare(window, shown=info["shown"].get(label, []), count=count, pending=pending,
+                               lead_in=_ACT_LEAD_IN)
         patches.append(part["patch"])
         if part["text"]:
             material.append({"kind": "screen", "messages": [{"role": "user", "content": part["text"]}],
                              "window": label, "shown": part["shown"], "read_patch": part["patch"],
                              "follow_ids": part["follow_ids"]})
     wake["request_patches"] = patches
-    _people(wake, material)
     screens = "\n".join(row["messages"][0]["content"] for row in material)
-    present = set(_segment.derive(wake["view"])["notes"])
+    present = set(info["notes"])
     hits = [scope for scope, _word in _notes.mentioned(screens) if scope not in present]
     wake["breadcrumbs"] = "画面提到的这些你有笔记，用 read_note 召回：" + "、".join(dict.fromkeys(hits)) if hits else ""
     return material
@@ -287,188 +275,24 @@ def _confirm(wake):
     wake["claims"][:] = [job for job in wake["claims"] if job["id"] not in ids]
 
 
-def pressure(view, stage, wake=None):
-    """One pressure policy for grace, growth hints, handoff and forced fallback."""
-    body = _segment.render(view)
-    used = _segment.context_size(view["stats"].get("tokens"), body)
-    threshold = _chat_root.limit()[1]
-    state = view["stats"].setdefault("pressure", {})
-    failures = state.get("failures", 0)
-    forced = f"交接连着失败了 {failures} 次" if failures >= 2 else (
-        f"已经长到 {used} token，超过整理阈值的 2 倍" if used > threshold * 2 else "")
-    initial = (wake or {}).get("initial", used)
-    names = dict(py.loc)
-    names.update(stage=stage, used=used, grown=used-initial, limit=threshold,
-                 since_handoff=time.time()-view["started"], kind=(wake or {}).get("log", {}).get("kind", "唤醒"),
-                 hour=time.localtime().tm_hour)
-    code = _notes.read_policy("tidy").strip() or DEFAULT_TIDY
+def _act(wake, spec, model=None):
+    """Run one spec: its references, its note, and the screens of its windows."""
+    windows = set(spec["windows"])
+    items = list(spec["items"])
+    extra = [text for text in (
+        f"【准备这次上下文时注意到】\n{spec['note']}" if spec.get("note") else "",
+        drafts(),
+    ) if text]
+    items += [{"role": "system", "content": text} for text in extra]
+    wake["request_patches"] = []
     try:
-        result = py.eval_last(code, names)
-    except Exception:
-        _roles._stream.exception("交接条件求值失败，按默认判断")
-        result = used > threshold
-    reason = forced or (result if isinstance(result, str) else "交接条件成立" if result else "")
-    hint = ""
-    if used <= threshold:
-        state["grace"] = 0
-    elif reason and not forced and wake is not None and not wake.get("release"):
-        if stage == "assemble":
-            state["grace"] = state.get("grace", 0) + 1
-        if state.get("grace", 0) <= _TIDY_GRACE:
-            # WHY: over the threshold she gets two wakes to pick her own moment.
-            hint, reason = f"这一段 {used} token，整理阈值 {threshold}；请用 tidy 交接，宽限后会自动交接。", ""
-    settled = state.get("settled")
-    if not isinstance(settled, int) or used < settled:
-        state["settled"] = used
-    elif used - settled >= 50_000:
-        info = _segment.derive(view)
-        older = info["wakes"][1:-1]
-        if older:
-            listing = []
-            for item in older:
-                size = _segment.text_tokens(_segment.raw_messages({"items": item["items"]}))
-                listing.append(f"#{item['number']}（{item['at']}，约 {_segment.amount(size)} token）")
-            heavy = []
-            for step in info["steps"]:
-                if not step["complete"]:
-                    continue
-                size = _segment.text_tokens(_segment.raw_messages({"items": step["items"]}))
-                if size >= 10_000:
-                    heavy.append(f"{step['id']} {','.join(step['tools'])} 约 {_segment.amount(size)} token")
-            hint += "\n上下文又长了五万 token。已了结的旧唤醒可用 compress 收起：\n" + "\n".join(listing)
-            if heavy:
-                hint += "\n较大的已完成步骤（也可单独 compress）：\n" + "\n".join(heavy[:5])
-            age = time.time() - _notes.mtime("recent") if _notes.mtime("recent") > 0 else 0
-            hint += (f"\nrecent 已约 {int(age//3600)} 小时未更新；手头的事变了可用 write_note 刷新。" if age >= 7200
-                     else "\n手头的事变了也可顺手 write_note('recent', ...) 刷新。")
-            state["settled"], state["nudged_at"] = used, time.time()
-    _segment.save(view)
-    return {"used": used, "reason": reason, "forced": forced, "hint": hint}
-
-
-def request_tidy(note):
-    wake = current_wake()
-    if wake is None:
-        return False
-    wake["release"], wake["end"] = note or "她自己要求交接", True
-    return True
-
-
-def _dismiss_args(wake):
-    return dict(boxes=storage.get("", "boxes"), last_sent=wake["view"]["stats"].get("last_sent", 0))
-
-
-def request_dismiss(since="", *, validate_only=False):
-    wake = current_wake()
-    if wake is None:
-        return "这次运行不是主唤醒，不能清主上下文"
-    wake_id = wake["wake_id"]
-    if str(since).strip():
-        text = str(since).strip()
-        wakes = _segment.derive(wake["view"])["wakes"]
-        found = [item for item in wakes if text in {item["id"], str(item["number"]), "#"+str(item["number"]), item["at"], item["at"].split(" ")[-1]}]
-        if not found:
-            return "没找到那次唤醒；用 #编号、日志号或完整唤醒时刻"
-        wake_id = found[-1]["id"]
-    try:
-        _segment.validate_dismiss(wake["view"], wake_id, **_dismiss_args(wake))
-    except ValueError as error:
-        return str(error)
-    if not validate_only:
-        wake["dismiss"] = wake_id
-        wake["end"] = True
-    return ""
-
-
-def _apply_dismiss(wake):
-    if not wake.get("dismiss"):
-        return ""
-    try:
-        removed = _segment.dismiss(wake["view"], wake["dismiss"], **_dismiss_args(wake))
-    except ValueError as error:
-        problem = f"dismiss 未生效：{error}。已经设好的等待仍保留。"
-        _segment.append(wake["view"], "system", messages=[{"role": "system", "content": problem}])
-        _roles._stream.warning(problem)
-        return problem
-    _screen.restore_read(removed["snapshot"], removed["windows"], patches=removed["patches"])
-    return ""
-
-
-def request_compress(first, last, summary):
-    wake = current_wake()
-    if wake is None:
-        return "只有主唤醒能收起当前上下文"
-    try:
-        return "已收起：" + write(wake, _segment.fold, wake["view"], str(first), str(last), summary)
-    except ValueError as error:
-        return str(error)
-
-
-def decompress(name=""):
-    view = (running_wake() or {}).get("view") or _segment.load()
-    folds = _segment.derive(view)["folds"]
-    if not folds:
-        return "（没有收起的片段）"
-    if not name:
-        return "\n".join(f"{index+1}: {row['id']} {row.get('summary', '')}" for index, row in enumerate(folds))
-    key = folds[-1]["id"] if name in {"latest", "last"} else str(name)
-    if key.isdigit() and 1 <= int(key) <= len(folds):
-        key = folds[int(key)-1]["id"]
-    try:
-        write(running_wake() or {}, _segment.unfold, view, key)
-        return "已展开 " + key
-    except (ValueError, FileNotFoundError) as error:
-        return str(error)
-
-
-def diary_day(moment):
-    return time.strftime("%Y-%m-%d", time.localtime(moment - 6 * 3600))
-
-
-def _handoff(wake, reason, model=None):
-    view = wake.get("view") or _segment.load()
-    if not any(row.get("role") == "assistant" for row in _segment.raw_messages(view)):
-        return False
-    if wake["handoffs"] >= _HANDOFFS_PER_WAKE:
-        wake["handoff_failed"] = True
-        return False
-    wake["handoffs"] += 1
-    verdict = pressure(view, "handoff", wake)
-    forced = verdict["forced"]
-    if forced:
-        view["stats"]["reason"] = f"未交接，强制归档（{forced}；本来要交接：{reason}）"
-        name = _segment.archive(view)
-        fresh = _segment.fresh()
-        # WHY: durable warning survives failure of the first request in this view.
-        _segment.append(fresh, "system", messages=[{"role": "system", "content":
-            f"上一段 {name} 因 {forced} 未能交接就归档；用 read_context 读原样，补上 recent 等笔记。"}])
-        wake["view"] = fresh
-        return True
-    state = {"associated_windows": wake["associated_windows"], "cancelled": False}
-    def stop():
-        return wake["cancelled"]
-    def after(current):
-        if current["used"] - current["initial"] > _chat_root.limit()[1]:
-            current["end"] = True
-    try:
-        run([], _roles.handoff_prompt(reason, diary_day(time.time())), tools=("meta",),
-            model=model, kind="handoff", view=view, state=state, stop=stop, after_round=after)
-        final = state.get("last") or {}
-        complete = state.get("output_count") and not final.get("tool_calls") and not wake["cancelled"]
-    except Exception:
-        _roles._stream.exception("交接出错，当前上下文保留")
-        complete = False
-    if not complete:
-        if not wake["cancelled"]:
-            view["stats"].setdefault("pressure", {})["failures"] = verdict.get("failures", view["stats"]["pressure"].get("failures", 0)) + 1
-            _segment.save(view)
-        wake["handoff_failed"] = True
-        return False
-    view["stats"]["reason"] = reason
-    _segment.archive(view)
-    wake["view"] = _segment.fresh()
-    _segment.save(wake["view"])
-    return True
+        run(items, spec["goal"], tools=("meta",), model=model, kind="main", state=wake,
+            prepare=lambda state: _prepare(wake, state["view"], windows), on_output=_confirm,
+            hints=[lambda: _screen.unread_hint(windows), lambda: shell.running_hint(),
+                   lambda: wake.get("breadcrumbs", "")])
+    finally:
+        if wake.get("output_count"):
+            _settle.touch(windows)
 
 
 def _work(wake, model=None):
@@ -480,55 +304,14 @@ def _work(wake, model=None):
         attention.ack(jobs)
         wake["claims"] = []
         return
-    wake["view"] = _segment.load()
-    while not wake["cancelled"]:
-        view = wake["view"]
-        verdict = pressure(view, "assemble", wake)
-        if verdict["reason"] and not wake.get("handoff_failed"):
-            if _handoff(wake, verdict["reason"], model):
-                continue
-        _opening(view, list(wake["associated_windows"]))
-        wake["wake_id"] = _segment.begin_wake(view, boxes={key: value.get("text", "") if isinstance(value, dict) else value for key, value in wake["boxes"].items()},
-                                              read_snapshot=_screen.read_snapshot())
-        number = journal.get(wake["wake_id"])["number"]
-        lines = [f"{_windows.label(job['window'])} {job['kind']}：{job['reason']}" for job in wake["claims"]]
-        _segment.append(view, "system", messages=[{"role": "system", "content": f"【唤醒 #{number}】\n" + "\n".join(lines)}])
-        wake["pressure_hint"] = verdict["hint"]
-        def after(state):
-            next_ = pressure(view, "round", state)
-            state["pressure_hint"] = next_["hint"]
-            if next_["reason"]:
-                state["release"], state["end"] = next_["reason"], True
-        observer_hint = ""
-        if _chat_root._observer.is_enabled():
-            material = _prepare(wake)
-            # The same sources will be added by run before its request.
-            wake["prepared"] = material
-            observer_hint = _chat_root._observer.observe(view, [message for row in material for message in row["messages"]], should_stop=lambda: wake["cancelled"])
-        def prepare(state):
-            return state.pop("prepared") if "prepared" in state else _prepare(state)
-        run([], "看看这次唤醒和新到的消息，自主决定做什么；不必为了被叫醒而说话。",
-            tools=("meta",), model=model, kind="main", view=view, state=wake,
-            prepare=prepare, on_output=_confirm, after_round=after,
-            hints=[lambda: _screen.unread_hint(wake["associated_windows"]), lambda: shell.running_hint(),
-                   lambda: wake.get("pressure_hint", ""), lambda: wake.get("breadcrumbs", ""), lambda: observer_hint])
+    for spec in _construct.build(wake, model):
         if wake["cancelled"]:
             return
-        # WHY: 2026-10-26: thinking once without any action needn't linger.
-        if not wake.get("dismiss") and not wake["log"]["acts"]:
-            try:
-                _segment.validate_dismiss(view, wake["wake_id"], **_dismiss_args(wake))
-                wake["dismiss"] = wake["wake_id"]
-            except ValueError:
-                pass
-        _apply_dismiss(wake)
-        if wake.get("release") and not wake.get("handoff_failed"):
-            reason, wake["release"] = wake["release"], ""
-            if _handoff(wake, reason, model):
-                wake.pop("dismiss", None)
-                wake.pop("initial", None)
-                continue
-        return
+        _act(wake, spec, model)
+
+
+def diary_day(moment):
+    return _settle.diary_day(moment)
 
 
 def span(seconds):
@@ -539,7 +322,8 @@ def start_loop(note):
     state = attention.start_loop(note)
     wake = current_wake()
     if wake:
-        write(wake, _segment.append, wake["view"], "loop_note", note=note, round=state["round"])
+        write(wake, _segment.append, wake["view"], "loop_note", note=note, round=state["round"],
+              persist=wake.get("persist", False))
     return state
 
 
@@ -602,7 +386,7 @@ def _tail(text: str, lines: int) -> str:
 
 
 
-def reflect(model=None, handoff=True):
+def reflect(model=None, settle=True):
     global _active
     with _lock:
         if _active is not None or _reader_running:
@@ -610,7 +394,7 @@ def reflect(model=None, handoff=True):
         wake = _new("反思")
         _active = wake
     try:
-        _reflect(wake, model=model, handoff=handoff)
+        _reflect(wake, model=model, settle=settle)
         return True
     finally:
         with _lock:
@@ -618,22 +402,28 @@ def reflect(model=None, handoff=True):
         notify()
 
 
-def _reflect(wake, model=None, handoff=True):
+def _reflect(wake, model=None, settle=True):
     attention.stop_loop("夜里整理")
-    wake["view"] = _segment.load()
     data = storage.get("", "agent")
-    if handoff:
-        _handoff(wake, "夜里了", model)
+    if settle:
+        # WHY: 2026-11-01 没有交接了；夜里先把白天还没沉淀的经历沉淀完，反思看到的笔记才是齐的。
+        _settle.settle_all(model=model, stop=lambda: wake["cancelled"])
         _roll_up(diary_day(wake["log"]["start"]))
     last = data.get("reflected_at", 0)
-    archived = [(name, view) for name, view in _segment.each_archived(last if isinstance(last, (int,float)) else 0)
-                if not view["stats"].get("kind")]
-    if archived or not handoff:
+    since = last if isinstance(last, (int, float)) else 0
+    runs = [(name, view) for name, view in _segment.each_archived(since)
+            if view["stats"].get("kind") in ("main", "construct", "settle")]
+    if runs or not settle:
+        counts = {kind: sum(view["stats"].get("kind") == kind for _name, view in runs) for kind in ("main", "construct", "settle")}
+        settled = [f"{name}  {view['stats'].get('reason', '')}" for name, view in runs if view["stats"].get("kind") == "settle"]
         items = [{"role": "system", "content": "以下是你的笔记：\n" + "\n\n".join(_notes.render(scope) for scope in ("global", "recent"))},
-                 {"role": "system", "content": "上次反思以来归档的上下文（read_context 可读原样）：\n" + "\n".join(name for name, _view in archived)
-                  + "\ncurrent 是仍在使用的主上下文。"},
-                 {"role": "system", "content": "策略改动 changes：\n" + _tail(_notes.read_policy("changes"),40)
-                  + "\n给维护者的 proposals：\n" + _tail(_notes.read_policy("proposals"),20)}]
+                 {"role": "system", "content": f"上次反思以来：行动 {counts['main']} 次，构造 {counts['construct']} 次，沉淀 {counts['settle']} 次。\n"
+                  "每段经历的沉淀（read_context 读原样，里面有那段聊天原文和你在那里的每次行动）：\n"
+                  + ("\n".join(settled[-60:]) or "（没有）")
+                  + "\n每次行动之前的构造运行也能用 read_context 按 ctx 读：它准备了什么、后来行动里又召回了什么，"
+                  "可以看出构造漏带了哪类材料。构造的说明在 policy:construct，沉淀的附加说明在 policy:settle，都用 edit_policy 改。"},
+                 {"role": "system", "content": "策略改动 changes：\n" + _tail(_notes.read_policy("changes"), 40)
+                  + "\n给维护者的 proposals：\n" + _tail(_notes.read_policy("proposals"), 20)}]
         state = {"associated_windows": wake["associated_windows"]}
         def after(current):
             current["end"] = current["used"] - current["initial"] > _chat_root.limit()[1]

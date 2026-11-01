@@ -29,27 +29,21 @@ _SUBCOMMAND_HELP = (
 #prompt set <全文>   整份替换；set 之后第一个换行起是全文，留空表示清空"""),
     ("image [off|lazy|eager]", "查看或设置图片读取档位"),
     ("audio [off|lazy|eager]", "查看或设置语音条读取档位（off: 仅提示语音; lazy: 附本地音频路径; eager: 自动转录语音内容）"),
-    ("reasoning [keep|drop]", "查看或设置以前几次唤醒的思考是否随这一段上下文带回"),
+    ("reasoning [keep|drop]", "查看或设置引用来的旧行动里的思考是否一起带回（本次运行自己的思考总是保留）"),
     ("effort [default|off|none|low|medium|high|max]", "查看或设置主模型思考等级（管理员），默认 default（按模型自身默认）。"),
-    ("limit [<画面条数> <整理阈值>|reset]", """查看或设置中心 agent 的窗口画面条数与整理阈值（管理员）。
+    ("limit [<画面条数> <增长上限>|reset]", """查看或设置画面条数与单次运行的增长上限（管理员）。
 
-格式：#limit | #limit <画面条数> <整理阈值> | #limit reset
-画面条数是一个窗口第一次出现在这一段上下文里时展示多少条聊天记录；整理阈值（token）是这一段上下文长到多少就交接，即 data/notes/policy/tidy.py 里的 limit。默认值分别为 80、500000。
+格式：#limit | #limit <画面条数> <增长上限> | #limit reset
+画面条数是从没看过的窗口第一次出现时展示多少条聊天记录；增长上限（token）是一次反思或沉淀里材料之后新长出来的部分最多多少，超过就让那次运行收尾。默认值分别为 80、500000。
 #limit                      显示两个值，并标出来自全局覆盖还是默认
-#limit <画面条数> <整理阈值>  写入全局设置
+#limit <画面条数> <增长上限>  写入全局设置
 #limit reset                清掉全局设置，回落到默认"""),
     ("reflect [now|keep]", """查看上次反思时间，或现在就跑一次反思（管理员）。
 
-默认会先把手上这一段上下文交接掉（归档到 data/chat/views/）；如果加 keep（如 #reflect keep 或 #reflect now keep），则保留当前活跃上下文不交接/不重置，直接进入反思（适合白天调整 self 人设又不希望丢失当前聊天上下文）。
+#reflect now 和夜里一样：先把各窗口还没沉淀的经历沉淀完，再反思；#reflect keep 跳过沉淀直接反思（适合白天调整 self）。每次运行都封存在 data/chat/views/。
 #reflect          显示上次反思时间
-#reflect now      现在就跑一次完整夜间交接与反思（会交接重置上下文）
-#reflect keep     立即进入反思，保留当前活跃上下文不交接/不重置"""),
-    ("decompress [<序号|名称|latest>]", """查看或解压还原当前上下文中被 compress 折叠收起的某段历史（管理员）。
-
-留空列出当前上下文中所有可解压的收起块；指定序号或名称还原原始消息。
-#decompress           列出当前可解压的收起块
-#decompress latest    解压最近一次收起的块
-#decompress <名称>    解压指定的收起块（如 20261029-180253-folded）"""),
+#reflect now      先沉淀再反思
+#reflect keep     不沉淀，直接反思"""),
     ("awaker [set <规则>]", """查看或改写她的闹钟规则（改写要管理员）。
 
 规则就是笔记 awaker（data/notes/awaker.md），她自己也能改，每行一条：
@@ -64,7 +58,7 @@ mute bili until 2026-10-24 08:00 <理由>     覆盖层：到点之前都不叫�
 同一目标只留一层；me 不能盖，master 的话 mute 压不住。
 when <Python 表达式> -> <理由>   每分钟求值，第一次为真时叫她
 at、on、wait、when 响过就从笔记里划掉。她平时用 wake_me 写这些行。
-理由写 reflect 表示夜间交接与反思；其它理由原样交给她。文件为空时只有 daily 04:00 reflect。
+理由写 reflect 表示夜间沉淀与反思；其它理由原样交给她。文件为空时只有 daily 04:00 reflect。
 #awaker              显示规则、上次响的时间和不认识的行
 #awaker set <规则>   整份替换；set 之后第一个换行起是规则全文"""),
     ("hint [get|set|default]", """查看、编写或开关本窗口的结束提示（管理员）。
@@ -88,28 +82,28 @@ at、on、wait、when 响过就从笔记里划掉。她平时用 wake_me 写这�
 #debounce off         关闭防抖（收到消息立即秒回）
 #debounce 3 12        设置等待 3 秒，最多延长至 12 秒
 #debounce reset       重置为默认值（3s / 12s）"""),
-    ("observer [on|off|model [selection]|effort [level]|context [recent|full]|prompt|set <全文>|reset]", """查看或设置旁观助手（Observer，修改需管理员）。
+    ("construct [on|off|model [selection]|effort [level]|timeout [秒]|prompt|set <全文>|reset]", """查看或设置构造运行（修改需管理员）。
 
-在中心会话被唤醒时执行单轮旁观，检测未登记黑话与存疑指代并检索、点出矛盾、自我限制和被跳过的情绪，暴露做事的非预期情况。无盲区时静默不打扰。
-#observer                    查看当前状态、模型、思考等级、上下文模式与提示词概况
-#observer on|off             开启或关闭旁观助手
-#observer model [selection]  查看或设置旁观助手模型（留空查看）
-#observer effort [level]     查看或设置旁观助手思考等级（default/off/none/low/medium/high/max）
-#observer context [recent|full] 查看或设置上下文模式（recent 仅上一轮省 token，full 全段历史）
-#observer prompt             查看当前提示词与 Checklist 全文
-#observer set <全文>         整份替换 data/notes/observer.md；留空清空并回落默认
-#observer reset              恢复默认配置与模型"""),
+每次唤醒、行动之前，先跑一次构造：她自己看黑板 recent、这次的消息和折叠索引，决定这次要做什么、展开哪些材料，写下注意（陌生说法、矛盾、情绪、意外）。关掉或失败时按黑板加这次的消息直接行动。原来的 observer 并在这里。
+#construct                    查看状态、模型、思考等级、超时和说明来源
+#construct on|off             开启或关闭构造运行
+#construct model [selection]  查看或设置构造运行的模型（留空查看）
+#construct effort [level]     查看或设置思考等级（default/off/none/low/medium/high/max）
+#construct timeout [秒]       查看或设置超时，超时就按黑板加消息直接行动
+#construct prompt             查看当前构造说明（data/notes/policy/construct.md 或内置说明）
+#construct set <全文>         整份替换构造说明；留空清空并回落内置说明
+#construct reset              恢复默认配置"""),
 )
 _SUBCOMMAND_NAMES = {pattern.partition(" ")[0] for pattern, _description in _SUBCOMMAND_HELP}
 
 
 def requires_op(value: str) -> bool:
     name, _, tail = value.strip().partition(" ")
-    if name == "observer":
+    if name == "construct":
         first, _, remaining = tail.strip().partition(" ")
         if first in ("on", "off", "set", "reset"):
             return True
-        if first in ("model", "effort") and bool(remaining.strip()):
+        if first in ("model", "effort", "timeout") and bool(remaining.strip()):
             return True
         return False
     return (name == "hint" or name == "use_model"
@@ -283,11 +277,11 @@ def _hint_subcommand(raw: str) -> str:
 
 
 def _limit_report() -> str:
-    """`#limit` 查看画面条数与整理阈值。"""
+    """`#limit` 查看画面条数与单次运行的增长上限。"""
     _chat_root.limit()
     data = storage.get("", "agent")
     lines = []
-    for name, label in (("max_events", "画面条数"), ("tidy_token", "整理阈值")):
+    for name, label in (("max_events", "画面条数"), ("tidy_token", "增长上限")):
         key, normalize = _chat_root.AGENT_SETTINGS[name]
         origin = "全局" if key in data else "默认"
         lines.append(f"{label}: {normalize(data.get(key))}（{origin}）")
@@ -295,7 +289,7 @@ def _limit_report() -> str:
 
 
 def _limit_set(tail: str) -> str:
-    """`#limit <画面条数> <整理阈值>` 写全局设置；`reset` 回落默认。
+    """`#limit <画面条数> <增长上限>` 写全局设置；`reset` 回落默认。
 
     WHY: 两个值仍一起写，避免只改其中一个造成难解释的半份配置。
     """
@@ -304,15 +298,15 @@ def _limit_set(tail: str) -> str:
         for name in ("max_events", "tidy_token", "max_token", "pressure_percent"):
             data.pop(name, None)
         storage.save()
-        return "已重置画面条数与整理阈值，回落到默认"
+        return "已重置画面条数与增长上限，回落到默认"
     parts = tail.split()
     if len(parts) != 2 or not all(part.isdigit() and int(part) >= 1 for part in parts):
-        return "limit 参数错误：#limit <画面条数> <整理阈值>，可用 #help limit 查看"
+        return "limit 参数错误：#limit <画面条数> <增长上限>，可用 #help limit 查看"
     data["max_events"], data["tidy_token"] = int(parts[0]), int(parts[1])
     data.pop("max_token", None)
     data.pop("pressure_percent", None)
     storage.save()
-    return f"画面条数: {parts[0]}\n整理阈值: {parts[1]}"
+    return f"画面条数: {parts[0]}\n增长上限: {parts[1]}"
 
 
 def _reflect_subcommand(tail: str) -> str:
@@ -321,14 +315,10 @@ def _reflect_subcommand(tail: str) -> str:
         shown = datetime.fromtimestamp(last).strftime("%Y-%m-%d %H:%M") if isinstance(last, (int, float)) else "还没有"
         return f"上次反思：{shown}；什么时候自动跑见 #awaker"
     if tail == "now":
-        return "开始夜间交接与反思，反思这一段归档在 data/chat/views/" if _chat_root.reflect_now() else "中心 agent 正忙，稍后再试"
+        return "开始沉淀和反思，每次运行封存在 data/chat/views/" if _chat_root.reflect_now() else "中心 agent 正忙，稍后再试"
     if tail in ("keep", "now keep", "keep now", "now --keep-context"):
-        return "开始反思（保留当前上下文不交接/不重置，反思这一段归档在 data/chat/views/）" if _chat_root.reflect_now(handoff=False) else "中心 agent 正忙，稍后再试"
+        return "开始反思（不先沉淀），封存在 data/chat/views/" if _chat_root.reflect_now(settle=False) else "中心 agent 正忙，稍后再试"
     return "reflect 参数错误，可用 #help reflect 查看"
-
-
-def _decompress_subcommand(tail: str) -> str:
-    return _chat_root._agent.decompress(tail.strip())
 
 
 def _awaker_subcommand(raw: str) -> str:
@@ -404,103 +394,79 @@ def _debounce_subcommand(tail: str) -> str:
     return f"debounce: 已设置为 等待 {idle:.1f}s，上限 {max_delay:.1f}s"
 
 
-def _observer_report() -> str:
-    cfg = _chat_root._observer.get_config()
-    state = "开" if cfg.get("on", True) else "关"
-    model = cfg.get("model", "deepseek/deepseek-flash")
-    effort = cfg.get("effort", "none")
-    context_mode = cfg.get("context", "recent")
-    note_text = _chat_root._notes.read("observer").strip()
-    prompt_status = f"自定义（{len(note_text)} 字）" if note_text else "默认"
-    return f"observer: {state}\nmodel: {model}\neffort: {effort}\ncontext: {context_mode}\nprompt: {prompt_status}（data/notes/observer.md）"
+def _construct_report() -> str:
+    cfg = _chat_root._construct.get_config()
+    custom = _chat_root._notes.read_policy("construct").strip()
+    return (f"construct: {'开' if cfg.get('on', True) else '关'}\nmodel: {cfg.get('model')}\neffort: {cfg.get('effort')}\n"
+            f"timeout: {cfg.get('timeout')}s\nprompt: {'自定义（' + str(len(custom)) + ' 字）' if custom else '内置'}（data/notes/policy/construct.md）")
 
 
-def _observer_subcommand(raw: str, tail: str) -> str:
-    cfg = _chat_root._observer.get_config()
+def _construct_subcommand(raw: str, tail: str) -> str:
+    construct = _chat_root._construct
+    cfg = construct.get_config()
     if not tail:
-        return _observer_report()
+        return _construct_report()
     action, _, arg = tail.partition(" ")
-    action = action.lower()
-    arg = arg.strip()
-
+    action, arg = action.lower(), arg.strip()
     if action in ("on", "off"):
         if arg:
-            return f"observer {action} 参数过多"
-        cfg["on"] = (action == "on")
-        _chat_root._observer.save_config(cfg)
-        return f"observer: {'开' if cfg['on'] else '关'}"
-
+            return f"construct {action} 参数过多"
+        cfg["on"] = action == "on"
+        construct.save_config(cfg)
+        return f"construct: {'开' if cfg['on'] else '关'}"
     if action == "model":
         if not arg:
-            return f"observer model: {cfg.get('model', 'deepseek/deepseek-flash')}"
+            return f"construct model: {cfg.get('model')}"
         selection, remaining = _first_argument(arg)
         if remaining.strip():
-            return "observer model 参数过多"
+            return "construct model 参数过多"
         try:
             llm.resolve_model(_chat_root.llm_config, selection)
         except ValueError as error:
             return str(error)
         cfg["model"] = selection
-        _chat_root._observer.save_config(cfg)
-        return f"observer model: {selection}"
-
+        construct.save_config(cfg)
+        return f"construct model: {selection}"
     if action == "effort":
         if not arg:
-            return f"observer effort: {cfg.get('effort', 'none')}"
+            return f"construct effort: {cfg.get('effort')}"
         level, remaining = _first_argument(arg)
         if remaining.strip():
-            return "observer effort 参数过多"
-        raw_level = level.lower()
-        normalized = _chat_root.REASONING_EFFORT_ALIASES.get(raw_level, raw_level)
+            return "construct effort 参数过多"
+        normalized = _chat_root.REASONING_EFFORT_ALIASES.get(level.lower(), level.lower())
         if normalized not in _chat_root.REASONING_EFFORTS:
-            return "observer effort 必须是 default、off/none、low、medium、high 或 max"
+            return "construct effort 必须是 default、off/none、low、medium、high 或 max"
         cfg["effort"] = normalized
-        _chat_root._observer.save_config(cfg)
-        return f"observer effort: {normalized}"
-
-    if action == "context":
+        construct.save_config(cfg)
+        return f"construct effort: {normalized}"
+    if action == "timeout":
         if not arg:
-            return f"observer context: {cfg.get('context', 'recent')}"
-        mode, remaining = _first_argument(arg)
-        if remaining.strip():
-            return "observer context 参数过多"
-        mode = mode.lower()
-        if mode not in ("recent", "full"):
-            return "observer context 必须是 recent（仅上一轮，省 token）或 full（全段历史）"
-        cfg["context"] = mode
-        _chat_root._observer.save_config(cfg)
-        return f"observer context: {mode}"
-
+            return f"construct timeout: {cfg.get('timeout')}s"
+        if not arg.isdigit() or not 5 <= int(arg) <= 600:
+            return "construct timeout 写 5 到 600 之间的秒数"
+        cfg["timeout"] = int(arg)
+        construct.save_config(cfg)
+        return f"construct timeout: {arg}s"
     if action == "prompt":
         if arg:
-            return "observer prompt 参数过多"
-        text = _chat_root._notes.read("observer").strip()
-        origin = "data/notes/observer.md"
-        if text:
-            return f"{text}\n({origin})"
-        return f"{_chat_root._observer.DEFAULT_OBSERVER_PROMPT}\n(内置兜底，尚未创建 {origin})"
-
+            return "construct prompt 参数过多"
+        text = _chat_root._notes.read_policy("construct").strip()
+        return f"{text}\n(data/notes/policy/construct.md)" if text else f"{construct.DEFAULT_POLICY}\n(内置说明，尚未创建 data/notes/policy/construct.md)"
     if action == "set":
         body = raw.lstrip()
-        set_idx = body.find("set")
-        if set_idx >= 0:
-            content = body[set_idx + len("set"):].lstrip(" \t")
-            if content.startswith("\n"):
-                content = content[1:]
-        else:
-            content = arg
+        at = body.find("set")
+        content = body[at + len("set"):].lstrip(" \t") if at >= 0 else arg
+        if content.startswith("\n"):
+            content = content[1:]
         text = cq.unescape(content.strip())
-        _chat_root._observer.set_prompt(text)
-        return "已改写 observer 提示词" if text else "已清空 observer 提示词，回落到默认"
-
+        _chat_root._notes.write_policy("construct", text)
+        return "已改写构造说明" if text else "已清空构造说明，回落到内置说明"
     if action == "reset":
         if arg:
-            return "observer reset 参数过多"
-        cfg = {"on": True, "model": "deepseek/deepseek-flash", "effort": "none", "context": "recent"}
-        _chat_root._observer.save_config(cfg)
-        return "observer 已恢复默认配置（开，deepseek/deepseek-flash，effort=none，context=recent）"
-
-    return "observer 参数错误，可用 #help observer 查看"
+            return "construct reset 参数过多"
+        construct.save_config(dict(construct.DEFAULT_CONFIG))
+        return "construct 已恢复默认配置"
+    return "construct 参数错误，可用 #help construct 查看"
 
 
 def _status_report(data: dict) -> str:
@@ -512,19 +478,16 @@ def _status_report(data: dict) -> str:
     audio = _chat_root.get_audio_mode(data)
 
     max_events, threshold = _chat_root.limit()
-    segment = _chat_root._segment.load()
-    used = _chat_root._segment.context_size(segment["stats"].get("tokens"), _chat_root._segment.render(segment))
 
     from mods.chat import attention as _debounce
     deb_cfg = _debounce.get_config()
     deb_mode = "on" if deb_cfg.get("enabled") else "off"
     deb_detail = f"等待 {deb_cfg['idle']:.1f}s，上限 {deb_cfg['max']:.1f}s" if deb_cfg.get("enabled") else "已关闭"
-    obs_cfg = _chat_root._observer.get_config()
-    obs_switch = "on" if obs_cfg.get("on", True) else "off"
-    obs_model = obs_cfg.get("model", "deepseek/deepseek-flash")
-    obs_effort = obs_cfg.get("effort", "none")
-    obs_context = obs_cfg.get("context", "recent")
-    obs_custom = "自定义" if _chat_root._notes.read("observer").strip() else "默认"
+    con_cfg = _chat_root._construct.get_config()
+    con_switch = "on" if con_cfg.get("on", True) else "off"
+    con_custom = "自定义" if _chat_root._notes.read_policy("construct").strip() else "内置"
+    unsettled = _chat_root._settle.pending()
+    settle_str = ("、".join(sorted(unsettled)) + " 还没沉淀") if unsettled else "都沉淀过了"
 
     last_reflect = data.get("reflected_at")
     reflect_str = datetime.fromtimestamp(last_reflect).strftime("%Y-%m-%d %H:%M") if isinstance(last_reflect, (int, float)) else "还没有"
@@ -541,10 +504,10 @@ def _status_report(data: dict) -> str:
         f"#reasoning {reasoning}（历史思考保留：keep/drop）",
         f"#image {image}（图像读取：off/lazy/eager）",
         f"#audio {audio}（语音读取：off/lazy/eager）",
-        f"#limit {max_events} {threshold}（画面 {max_events} 条，整理阈值 {threshold}；当前段约 {used}/{threshold} token）",
+        f"#limit {max_events} {threshold}（画面 {max_events} 条，反思和沉淀的增长上限 {threshold}）",
         f"#debounce {deb_mode}（防抖延迟：{deb_detail}；改用 #debounce on/off/<等待秒数> [上限秒数]）",
-        f"pressure 当前约 {used}/{threshold} token，增长提醒和交接策略在 policy/tidy；{_chat_root._agent.loop_status()}",
-        f"#observer {obs_switch}（旁观助手；模型: {obs_model}，effort: {obs_effort}，context: {obs_context}，prompt: {obs_custom}）",
+        f"settle：{settle_str}（安静 {_chat_root._settle.config()['quiet']} 秒或积压 {_chat_root._settle.config()['backlog']} 条后沉淀）；{_chat_root._agent.loop_status()}",
+        f"#construct {con_switch}（构造运行；模型: {con_cfg.get('model')}，effort: {con_cfg.get('effort')}，超时 {con_cfg.get('timeout')}s，说明: {con_custom}）",
         f"#reflect（上次反思：{reflect_str}；立即执行：#reflect now / #reflect keep）",
         f"#awaker（闹钟：{awaker_str}；改写：#awaker set <规则>）",
     ]
@@ -678,14 +641,12 @@ def _subcommand(value: str):
         return _limit_set(tail)
     if name == "reflect":
         return _reflect_subcommand(tail.strip())
-    if name == "decompress":
-        return _decompress_subcommand(tail.strip())
     if name == "awaker":
         return _awaker_subcommand(raw)
     if name == "hint":
         return _hint_subcommand(raw)
     if name == "debounce":
         return _debounce_subcommand(tail)
-    if name == "observer":
-        return _observer_subcommand(raw, tail)
+    if name == "construct":
+        return _construct_subcommand(raw, tail)
     return "子命令格式错误，可用 #help 查看"

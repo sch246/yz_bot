@@ -14,44 +14,40 @@
 
 默认触发器之上可设 `follow`（每条都叫）、`mute`（都不叫）和代码 `awaker.override` 的 `other` 函数。`me` 不能覆盖，master 的话不被 mute 压住；覆盖只决定默认唤醒，消息仍可未读，显式 `chat.wake` 与她设置的 `on/wait` 仍有效。`follow/mute/on` 以 awaker 文件为权威，跨重启保留；`other`、`wait` 和 loop 运行态只在内存。普通离线补回只补历史；离线时叫她的记录以身份登记，即使时间早于已确认位置也能被恢复和唤醒。
 
-设置面使用 `#status`、`#model`、`#models`、`#prompt`、`#image`、`#audio`、`#reasoning`、`#effort`、`#limit`、`#reflect`、`#awaker`、`#debounce`、`#observer` 与 `#help`；修改全局设置要求 op。`#status` 合并显示压力与循环运行态。模型设置、Bot 全局工具激活和预算属于全局 agent；每窗口 `#hint` 独立。精确语法以 `#help` 为准。
+设置面使用 `#status`、`#model`、`#models`、`#prompt`、`#image`、`#audio`、`#reasoning`、`#effort`、`#limit`、`#reflect`、`#awaker`、`#debounce`、`#construct` 与 `#help`；修改全局设置要求 op。`#status` 合并显示待沉淀窗口、构造运行与循环运行态。模型设置、Bot 全局工具激活和预算属于全局 agent；每窗口 `#hint` 独立。精确语法以 `#help` 为准。
 
 **B 站**（`mods/bili.py`，2026-10-23 起）：柚子自己的 B 站号，种类 `bili`。一个评论区是一个窗口：视频写 `bili:BV…`，动态、图文、专栏写 `bili:t<评论区类型>-<oid>`。每两分钟轮询一次"回复我的"和"@ 我的"，新的一条以评论号为记录号 `push` 进对应窗口并叫醒她，原因写"B 站有人回复你：《标题》"或"B 站有人 @ 你"；第一次轮询只记位置，不把账号以前的通知倒进来。每次只看第一页（约 20 条）；两分钟里来了一页以上，不往前翻、不全记在本地，而是在她的 `me` 窗口留一句并叫醒她，让她用 `bili__inbox` 去 B 站消息中心翻。通知里只有文字，表情是 `[doge]` 这样的文字，只有图片的那条正文换成一句占位；某一条数据不对就记日志跳过，写盘这类错误停在那一条、下次重试。她用 `type_word`／`send` 发评论，只能发文字（表情照 B 站写法写在正文里），正文开头 `[CQ:reply,id=评论号]` 表示回复那条，别的 CQ 码会被拒绝；评论工具把评论带的图片列成 `[图片] 地址`，她用 `attach_image` 看。楼中楼的楼主号由模块记着（通知、评论工具和她自己的回复都会记）。她发出去的评论只写进 chatlog、不登记到达（B 站没有回声）。刷首页、热门、搜索、视频详情、字幕原文、评论和楼中楼、评论点赞点踩与删除、视频点赞投币与收藏夹管理、个人主页与资料修改、动态查看与删除、关注与粉丝管理，以及直接读 B 站消息中心的 `inbox`（回复、@、赞、系统通知、私信会话，带未读数和翻页）和读私信的 `dm`，是工具模块 `bili`（`mods/tools/bili.py`），不进窗口；私信还不能回。登录是 `.bili login`，二维码只发到管理员私聊：管理员自己发，或者她用 `cmds__run_command(".bili login", target="u<管理员>")` 在管理员私聊里发起（谁扫码谁的号就成了她的号，所以不能发进群或发给别人）。私聊里只发二维码这一张图，扫码的说明由她自己说；登好了、过期了或出错写进她的 `me` 窗口并叫醒她；另一条路是她在自己的浏览器里登 B 站，用 `browser__get_cookies` 取出 Cookie（含 httpOnly 的 SESSDATA）交给 `bili__use_cookie`；两条路存凭证后都要用它查到自己的 uid 才算登好；凭证在 `data/bili/credential.json`，每天检查一次要不要刷新。
 
 ## 上下文如何组装
 
-经历与眼前材料分别保存。`data/chat/journal/YYYYMMDD.jsonl` 是原始内容权威，保存稳定 `YYYYMMDD-N` 编号、时间、ctx、种类、原样模型消息和来源。当前 `data/chat/view.json` 只保存有序条目引用与不能推导的统计，交接后冻结到 `data/chat/views/<ctx>.json`。笔记版本、已展示身份、工具状态和唤醒/步骤地址由条目推导。视图原子保存并保留 `view.bak.json` 恢复保护；正常追加保持历史前缀。
+经历与眼前材料分别保存。`data/chat/journal/YYYYMMDD.jsonl` 是原始内容权威，保存稳定 `YYYYMMDD-N` 编号、时间、ctx、种类、原样模型消息和来源。每次运行有自己的编号视图，只保存有序条目引用与不能推导的统计（`stats.windows` 记行动和沉淀负责的窗口），结束时冻结到 `data/chat/views/<ctx>.json`。没有跨运行的当前视图，不再写 `view.json`（迁移来的旧文件只用于迁移检查）。2026-11-01 起不再有整段压力、折叠、dismiss 或交接（[设计与裁定](working/proposals/one-purpose-stateless-core.md)）。
 
-统一入口 `chat.run(items, goal, ...)` 接受日志引用或原始消息，要求非空目的并放在请求末尾，返回 `(ctx, text)`。主唤醒、交接、反思、旁观、月年汇总和分身共用模型构造、工具绑定、记录、计费、取消与超时。独立运行保存自己的冻结视图；超时立即返回，若 worker 尚未退出则 `finalization=pending`，待它退出后后台完成归档。迟到的准备材料不会追加到已经关闭的运行。
+统一入口 `chat.run(items, goal, ...)` 接受日志引用或原始消息，要求非空目的并放在请求末尾，返回 `(ctx, text)`。构造、行动、沉淀、反思、月年汇总和分身共用模型构造、工具绑定、记录、计费、取消与超时；`functions` 可给出本次可见工具的白名单。超时立即返回，若 worker 尚未退出则 `finalization=pending`，待它退出后后台完成归档。迟到的准备材料不会追加到已经关闭的运行。
 
-1. **新段开局**：系统提示仍由 self、base 注意事项和 `memory_system` 的记忆说明提供。开局材料由 `data/notes/policy/opening` 逐行引用；文件未创建时默认 global、recent、最近七篇非空且不在未来的日记、年鉴与目录。可以在交接时改 opening，下一段采用；坏引用在上下文中指出具体引用与修改位置。目录最多列 60 份，明确报告遗漏数及召回入口。
-2. **每次唤醒追加**：记录 wake、相关人/群笔记与窗口画面。人物也从画面消息头和 at 中提取；每次唤醒最多自动载入 20 份人/群笔记，遗漏的列出并指向 `read_note/search`。已载笔记变化以新版本追加，保留旧思考的依据；当天日记新建或跨天后也会刷新。窗口正文用 user，笔记、唤醒说明、目录和工具状态用 system。
-3. **展示与读确认**：`screen.prepare` 返回画面、记录身份和待确认 patch，展示身份来自视图；全局 `agent.read` 是唯一已确认读状态，包含连续位置、同秒身份及待确认例外。第一次出现的窗口有已读位置时补 3 条旧记录接话，没有时按 `max_events`（默认 80，至少 3 条）给首屏。普通新消息超过 60 条只给最新 60 条并说明翻查入口，follow 期间到的不截。首次模型输出才 `commit_read`，只确认该请求实际展示的记录，生成期间新到的消息不会被旧 patch 清掉。失败重试复用已展示身份。
-4. **临时提示**：todo、其它窗口未读、当前时间、面包屑、旁观提醒、后台命令和压力提示按请求重算，只放本次末尾 hint。`#` 控制/调试输出不作为画面正文；Bot 自己经命令工具获取的结果保留既有回流例外。原始聊天记录与撤回、回声规则见[运行文档](runtime.md)。
+引用写法只有一套（`segment.resolve_refs`）：唤醒 `#n` 与步骤 `n.m`（只在有这些地址的视图里）、日志编号、运行或旧段的 ctx、笔记名、`policy:名字`、`log:窗口[@时刻][*条数]`（那一时刻之前的若干条聊天，默认 30 条）。黑板、构造规格和 `agents__fork` 都用它；坏引用报出具体那一行。
 
-### 放下与折叠
+1. **构造**：每次唤醒先跑一次 kind `construct` 的运行。系统提示照旧（self、身份与 `memory_system` 的记忆说明）；材料是构造说明（`data/notes/policy/construct.md`，缺省用 `construct.DEFAULT_POLICY`）、黑板 `recent` 全文与其 `@引用` 行的折叠描述、索引（笔记目录与首行、最近三小时行动时间线、最近几次运行的目的、其它窗口未读与 @），以及这次的唤醒原因和被叫醒窗口的新消息（`screen.prepare` 不确认阅读，前面带 20 条接话）和面包屑。可见工具只有 `construct__assemble`、`search`、`read_note`、`read_log`、`read_actions` 与 `agents__fork`。`assemble(goal, refs, note, windows)` 当场解析引用（坏引用退回、不记下）、校验窗口，把 note 里「」括起的词交给代码查笔记和日记并注明有无。模型、思考等级和超时在 storage `agent.construct`（旧 `agent.observer` 第一次读到时搬入），默认 `deepseek/deepseek-flash`、不思考、45 秒。
+2. **规格与兜底**：一次唤醒可交几份规格；没被认领的被叫醒窗口补一份默认规格，被 @、戳一戳和私聊的那份先跑。构造关闭、出错、超时或没交规格时，用黑板（`recent` 加其可解析的 `@引用`）兜底，并在注意里写明原因和读不出的引用。
+3. **行动**：每份规格跑一次 kind `main` 的运行，材料依次是规格解析出的引用、注意（system）、输入框里还没发的字，再由 `prepare` 在每次请求前追加它负责窗口的画面。画面里上次看过的位置之后标出新消息，前面带 10 条接话；从没看过的窗口按 `max_events`（默认 80）给首屏；普通新消息超过 60 条只给最新 60 条并说明翻查入口，follow 期间到的不截。全局 `agent.read` 是唯一已确认读状态；首次模型输出才 `commit_read`，只确认该请求实际展示的记录。行动期间别的窗口到的召唤记为 deferred，唤醒结束时释放，交给下一次唤醒的构造。
+4. **临时提示**：todo、其它窗口未读、当前时间、面包屑和后台命令按请求重算，只放本次末尾 hint。`#` 控制/调试输出不作为画面正文；Bot 自己经命令工具获取的结果保留既有回流例外。原始聊天记录与撤回、回声规则见[运行文档](runtime.md)。
 
-`dismiss(since, wait, reason)` 从指定唤醒起移除视图引用，并追加 drop 记录；原日志、实际笔记/文件操作和行动仍在。它将被移除画面的阅读确认退回，保留期间无关的新到达；已消费的召唤与 wait 不复活。仍有三个拦截：期间发过话、输入框留着期间新打或改过的字、follow 待退回消息超过 60 条。带 `wait` 时先验证并挂新等待，挂不上就保留视图和读状态。整轮没有调用工具的白醒仍自动 dismiss。
+### 沉淀
 
-`compress(first, last, summary)` 支持整轮 `#n`／数字与步骤 `n.m`；子步骤不能跨唤醒，正在执行的步骤不能收，当前轮已完成的前序步骤可以收。整轮不能收本段首次或最新唤醒。一个 fold 用 `covers` 指向原条目并替换对应引用，展开把原引用放回，支持嵌套。原编号及步骤地址稳定；折叠不可见的笔记和工具状态按视图推导结果补齐。`decompress` 与 `read_context` 使用折叠标识或归档名。compress 调用入参缩短与 `#reasoning drop` 都只影响模型投影，原始内容保留。
+`settle.touch(windows)` 在每次有输出的行动后记下窗口（storage `agent.unsettled`）。到期条件：最后一次行动后安静 `quiet` 秒（默认 1200），或沉淀位置之后积攒超过 `backlog` 条聊天记录（默认 200），配置在 storage `agent.settle`；夜间反思前全部到期。计时器在内存里，到点只启动读线程（`agent.kick`，不标记新工作）；读线程没有召唤时才沉淀一个到期窗口，`stop` 是“有新召唤”或被取消，所以在轮次边界让路，之后重跑；读线程空闲退出前重新排计时器。
 
-### 压力与交接
-
-`agent.pressure(view, stage)` 集中长度、增长、宽限和失败判断。每增长五万 token 可在末尾提示可折叠范围与较大的已完成步骤；recent 久未更新时提醒刷新。`#status` 显示压力。整理条件仍是 `data/notes/policy/tidy.py` 的普通 Python，在 `.py` 环境副本中求值，可用 `stage`、`used`、`grown`、`limit`、`since_handoff`、`kind`、`hour`；缺省或写坏回到 `used > limit`，错误留 traceback。整理阈值默认 500000，未发言时保留两次唤醒宽限。
-
-她调用 `tidy`、条件成立或夜间 reflect 到点时，在看过本段的同一上下文里交接：确认 recent、人/群笔记、todo 与当天日记已经写好。handoff 和 reflect 可调用 `type_word/send`，仍遵守输入框和发送规则。正常输出结束、最后回复不再调工具且没有异常/取消，才归档视图并从新段继续；失败保留本段，下次再试，被取消不计失败。连败两次或长度超过阈值两倍时强制归档，新段留下补记提醒；一次唤醒最多交接三次。归档仍向 `data/notes/years.md` 追加年鉴摘要。
+一次沉淀是 kind `settle` 的运行：材料是相关笔记（recent、窗口的群或人笔记、这段里说过话的人的笔记最多 5 份、当天日记、todo）、那段聊天原文（沉淀位置之后最多 300 条，多的下次接着）和那段时间负责这个窗口的行动视图（目的、注意、思考、工具调用与结果，超过六万字只留最近的并提示用 `read_context`），目的由 `roles.settle_prompt` 生成并附上 `policy/settle`。可调用全部 meta（交接与反思不封嘴的裁定沿用到沉淀），提示里要求不改 global。正常结束、最后回复不再调工具且没有取消，才把 storage `agent.settled` 的位置推进到这次看到的最后一条；出错或没完成隔 10 分钟再试，被让路不算失败。沉淀的视图进 `data/notes/years.md` 年鉴。
 
 ### 笔记、唤醒与夜间反思
 
-笔记是 `data/notes/` 下的普通 Markdown，改写/删除前备份到 `.history/`，内容不变不重写。self 放系统提示最前，她只能在夜间反思用 `edit_policy` 改，维护者可直接编辑或 `#prompt set`；global、recent、todo、awaker、person、group 和 diary 照常读写。旧 self 与 todo 的一次性导入保留。
+笔记是 `data/notes/` 下的普通 Markdown，改写/删除前备份到 `.history/`，内容不变不重写。self 放系统提示最前，她只能在夜间反思用 `edit_policy` 改，维护者可直接编辑或 `#prompt set`；global、recent（黑板）、todo、awaker、person、group 和 diary 照常读写。旧 self 与 todo 的一次性导入保留。
 
-awaker 文件提供 `every/daily/at/when/on/follow/mute`；默认 `daily 04:00 reflect`。每分钟检查长期规则，间隔第一次见到时起算，定点错过三小时不补；`on` 在消息到达时认领。wait 用 `wake_me`、send 或 dismiss 设置到内存等待表，消息或秒级超时只触发一次；`#awaker` 同时列文件规则和内存等待。直接在笔记写 wait 不装回，返回可定位提示。
+awaker 文件提供 `every/daily/at/when/on/follow/mute`；默认 `daily 04:00 reflect`。每分钟检查长期规则，间隔第一次见到时起算，定点错过三小时不补；`on` 在消息到达时认领。wait 用 `wake_me` 或 send 设置到内存等待表，消息或秒级超时只触发一次；`#awaker` 同时列文件规则和内存等待。直接在笔记写 wait 不装回，返回可定位提示。
 
-她用 `loop("在做什么")` 显式开启连续循环，外部唤醒不会自动开启。每次主唤醒收尾排下一轮，普通间隔两秒；无动作时逐次翻倍，最长半小时。`wait(seconds, reason)` 在循环内推迟下一轮，循环外也可单独排一次唤醒，保留理由。`loop(stop=True)`、维护者取消或夜间反思停止循环；loop/wait 重启丢弃。`loop_note_history` 从 journal 查备注，已发生的循环唤醒仍记入 `me`。
+她用 `loop("在做什么")` 显式开启连续循环，外部唤醒不会自动开启。每次唤醒收尾排下一轮，普通间隔两秒；每轮照样先构造再行动；无动作时逐次翻倍，最长半小时。`wait(seconds, reason)` 在循环内推迟下一轮，循环外也可单独排一次唤醒，保留理由。`loop(stop=True)`、维护者取消或夜间反思停止循环；loop/wait 重启丢弃。`loop_note_history` 从 journal 查备注，已发生的循环唤醒仍记入 `me`。
 
-夜间反思占住中心执行线：先交接，月末/年末汇总日记，再开新视图加载 `memory_system` 与 `data/prompts/reflect.md`（缺省用仓库 `mods/chat/reflect.md`），沿归档、聊天/行动记录和笔记版本找真实问题，改 self/global 或策略并记录 changes。反思视图也归档；期间来的普通召唤和后到的 reflect 控制工作留待后续分派。
+夜间反思占住中心执行线：先沉淀所有待沉淀窗口，月末/年末汇总日记，再开一次反思运行加载 `memory_system` 与 `data/prompts/reflect.md`（缺省用仓库 `mods/chat/reflect.md`）。材料给出上次反思以来行动、构造、沉淀的次数和沉淀列表，她沿沉淀、构造、聊天/行动记录和笔记版本找真实问题，改 self/global 或策略并记录 changes。`#reflect keep` 跳过沉淀。反思视图也归档；期间来的普通召唤和后到的 reflect 控制工作留待后续分派。
 
-`chat.current_wake()` 仅在主运行及其工具里返回普通 dict，结束写 `wake["end"]`。fork、observer、summary 与 handoff/reflect 的运行状态独立，不能借继承的上下文改掉主唤醒。相关窗口的 `^C` 从主唤醒取关联窗口，取消模型并停止该执行线的子进程。私聊主唤醒每五秒续一次“正在输入”。
+`chat.current_wake()` 仅在主运行及其工具里返回普通 dict，结束写 `wake["end"]`。构造、fork、summary、沉淀与反思的运行状态独立，不能借继承的上下文改掉主唤醒。相关窗口的 `^C` 从主唤醒取关联窗口，取消模型并停止该执行线的子进程。私聊主唤醒每五秒续一次“正在输入”。
 
 
 ## 多媒体与提示词笔记（图片、语音与音乐）
@@ -123,7 +119,7 @@ awaker 文件提供 `every/daily/at/when/on/follow/mute`；默认 `daily 04:00 r
 | `reload_tools` | 按模块名从磁盘显式应用、更新或删除模块；逐项返回成功和带完整 traceback 的失败结果，失败保留旧 last-good。 |
 | `load_tools` | 将 last-good 模块激活到当前 Chat；中心名单存全局 `agent`，不读取磁盘。 |
 
-`meta` 还提供明确目标的 `type_word/send`、规则 `wake_me`、召回 `search/read_log/read_actions/read_note`、笔记 `write_note`、视图操作 `tidy/dismiss/compress/decompress`、连续活动 `loop/wait/loop_note_history`、`set_name` 与 `attach_image`。发送先打字、下个模型输出再发送；输入框存在 storage，跨唤醒和重启保留。`send(wait=0)` 继续工作，`wait=-1` 收工被动等，正时长则挂回复或超时的一次等待，可用 `who` 限定作者。
+`meta` 还提供明确目标的 `type_word/send`、规则 `wake_me`、召回 `search/read_log/read_actions/read_note`、笔记 `write_note`、连续活动 `loop/wait/loop_note_history`、`set_name` 与 `attach_image`（2026-11-01 删除了 `tidy/dismiss/compress/decompress`）。工具模块 `construct` 只有 `assemble`，只在构造运行里可见、可用。发送先打字、下个模型输出再发送；输入框存在 storage，跨唤醒和重启保留。`send(wait=0)` 继续工作，`wait=-1` 收工被动等，正时长则挂回复或超时的一次等待，可用 `who` 限定作者。
 
 仓库当前提供以下按需模块；函数只在对应模块激活后出现：
 
@@ -210,7 +206,7 @@ hint 与追加式上下文是两层，判据是一句话：**频繁变化、且�
 - 与 system 提示词一样支持用函数生成（`Chat.add_hint` 接受字符串或可调用对象），只是重置时机不同：system 在建会话时定一次，hint 每个子请求重来一次。
 - 因此 hint 里只放随时可重算的东西，不放"只此一次、错过就没有"的信息——那种必须走 provider。
 
-中心待办是笔记 todo，每次子请求都在末尾 hint 重新读一遍，而不是逐版挂到模型末尾；完成后整体更新或清空。长期可复用经验可写成 `mods/tools/*.md` Skill，经 `reload_tools` 应用、`load_tools` 按需插入。关于人、群和跨场合的事，她当场或在交接时写进笔记；原话不复制，需要时按窗口和时间用 `read_log` 读回。
+中心待办是笔记 todo，每次子请求都在末尾 hint 重新读一遍，而不是逐版挂到模型末尾；完成后整体更新或清空。长期可复用经验可写成 `mods/tools/*.md` Skill，经 `reload_tools` 应用、`load_tools` 按需插入。关于人、群和跨场合的事，她当场或在沉淀时写进笔记；原话不复制，需要时按窗口和时间用 `read_log` 读回。
 
 `tools.drift_hint(binding)` 报告 `mods/tools` 磁盘源与 last-good 不一致的模块名；只报告不加载，也不重复工具正文。它每次请求重读磁盘，文件改回去，提醒就自行消失。
 
@@ -225,10 +221,10 @@ hint 与追加式上下文是两层，判据是一句话：**频繁变化、且�
 
 ### 中心设置与旧窗口配置
 
-`image`（图片档位）、`reasoning`、`reasoning_effort`（思考等级）、`max_events`、`tidy_token` 共用 `mods.chat.AGENT_SETTINGS` 的全局归一化规则。中心主会话只读全局 `agent` storage；op 用 `#use_model`、`#image`、`#reasoning`、`#effort`、`#limit`、`#observer` 等命令修改它。旧窗口聊天配置不自动迁移，也不再读取；`#hint` 的窗口配置是独立例外。
+`image`（图片档位）、`reasoning`、`reasoning_effort`（思考等级）、`max_events`、`tidy_token` 共用 `mods.chat.AGENT_SETTINGS` 的全局归一化规则。中心主会话只读全局 `agent` storage；op 用 `#use_model`、`#image`、`#reasoning`、`#effort`、`#limit`、`#construct` 等命令修改它。旧窗口聊天配置不自动迁移，也不再读取；`#hint` 的窗口配置是独立例外。
 
 - **缺省值写死在代码里**（`DEFAULT_MAX_EVENTS` / `DEFAULT_TIDY_TOKEN` 与各归一化函数的兜底分支），不再读 `llm_system/config.json`。中心运行期覆盖只有全局 `agent` storage 一份；`#limit` 是唯一预算命令入口。
-- **两个预算**：`max_events`（默认 80，存储键沿用旧名）是从没看过的窗口的首屏条数；交接后已有看到位置的窗口只补 3 条旧记录接话，新消息仍按前述画面规则给；`tidy_token`（默认 500000，维护者 2026-10-23 定，约是模型上下文的一半，给交接留出余量）是整理阈值，即整理条件里的 `limit`：默认条件下这一段上下文超过它就交接；反思只限制材料之后新长出来的部分不超过它。2026-10-22 以前是 `max_token × pressure_percent` 两个数，那是按每次重组上下文定的预算，第一次读到时删掉旧键、用默认。旧窗口覆盖不自动迁入全局主体。每晚反思的时刻在笔记 awaker 里，`agent.reflected_at` 记上次反思的时间。旧的 `agent.librarian_model`、`agent.tidied_at` 不再读取。
+- **两个预算**：`max_events`（默认 80，存储键沿用旧名）是从没看过的窗口的首屏条数；`tidy_token`（默认 500000，存储键沿用旧名）在 2026-11-01 以前是交接阈值，现在只限制一次反思或沉淀里材料之后新长出来的部分。2026-10-22 以前是 `max_token × pressure_percent` 两个数，那是按每次重组上下文定的预算，第一次读到时删掉旧键、用默认。旧窗口覆盖不自动迁入全局主体。每晚反思的时刻在笔记 awaker 里，`agent.reflected_at` 记上次反思的时间。旧的 `agent.librarian_model`、`agent.tidied_at` 不再读取。
 - **`hint` 与 `prompt` 不在表里**：窗口结束提示的 `#hint` 是 `data/hint/` 下的文件，独立合并全局默认与窗口覆盖；她对自己的认识是笔记 self（`data/notes/self.md`）。它们不是单值档位，不使用 `AGENT_SETTINGS` 的归一化。
 - 已退役的窗口聊天设置仍可能留在生产 storage，但运行代码不再读取；其清理需先获维护者授权，见[第二轮调查](working/round2-legacy-and-backfill-audit.md)。
 
@@ -238,7 +234,7 @@ hint 与追加式上下文是两层，判据是一句话：**频繁变化、且�
 
 每个完整 assistant 输出先取得稳定 `YYYYMMDD-N` 号并落 journal，再执行工具。派发前记录 `tool_started`，每个工具完成后立即记录它的原生 tool 结果，最后关闭逻辑 act。取消后已完成结果仍在；未执行、结果未知与中断由读取投影说明，恢复不自动重跑外部动作。当前运行的写入失败停止后续派发并报告；下次独立运行可重试，没有 oplog 的进程级熔断。
 
-`read_actions` 按正式号、最近条数或关键词分页读可读行动；`read_context` 渲染冻结视图。chatlog 继续负责窗口原文。思考和工具原参数都保存在 journal，`#reasoning drop` 与 compress 参数缩短不删原文。
+`read_actions` 按正式号、最近条数或关键词分页读可读行动；`read_context` 渲染冻结视图。chatlog 继续负责窗口原文。思考和工具原参数都保存在 journal，`#reasoning drop`（以及旧视图里 compress 参数的缩短）只影响投影，不删原文。
 
 
 ### 思考内容开关与思考等级（Reasoning Effort）
@@ -283,65 +279,34 @@ hint 与追加式上下文是两层，判据是一句话：**频繁变化、且�
 
 ## `fork` 的分身分派
 
-`agents__fork(goal, refs="", tasks="", tools="", model="")` 按引用组装独立运行。refs 每行支持唤醒 `#n`、步骤 `n.m`、笔记名、ctx 或日志编号；复用原条目，坏引用指出具体引用。tasks 每行一项，最多五项同时运行，结果按原顺序返回 `(任务, ctx, 结果)`；失败也给独立 ctx，能用 `read_context` 查已完成部分。
+`agents__fork(goal, refs="", tasks="", tools="", model="")` 按引用组装独立运行。refs 用上文那一套引用写法（笔记名、日志编号、ctx、`policy:`、`log:` 等），复用原条目，坏引用指出具体引用。tasks 每行一项，最多五项同时运行，结果按原顺序返回 `(任务, ctx, 结果)`；失败也给独立 ctx，能用 `read_context` 查已完成部分。
 
-分身默认有 meta，与主运行分别绑定 active/schema 和唤醒状态。默认不暴露 `send/type_word`，tools 中逐行显式写函数名才授权，`me` 同时授权两者；重新 `load_tools` 不能绕过默认过滤。该授权只属于本次运行，仍使用 Bot 固定宿主权限。主运行的全局工具激活跨交接与重启保留；schema 顺序来自各自视图。
+分身默认有 meta，与主运行分别绑定 active/schema 和唤醒状态。默认不暴露 `send/type_word`，tools 中逐行显式写函数名才授权，`me` 同时授权两者；重新 `load_tools` 不能绕过默认过滤。该授权只属于本次运行，仍使用 Bot 固定宿主权限。主运行的全局工具激活跨重启保留；schema 顺序来自各自视图。
 
 所有模型调用经 run 把供应商返回的 usage 记入 Bot 账；费用按请求时刻的未命中、缓存命中和输出单价计算。缺 usage 暂无 token 估算计费兜底。`.chattop` 按自然月显示，调用次数与 HTTP 子请求数不同。
 
 
-## 旁观助手（Observer Subagent）
+## 构造运行（原旁观助手）
 
-中心 agent 在中心会话循环中运行时存在固有认知与交互盲区：顺畅接话惯性导致对未登记黑话与未知指代习惯性望文生义盲猜、行动碰壁或死板规则冲突时顺手敷衍过去未及时暴露冲突留作反思。为此，系统在 `mods/chat/observer.py` 中实现了单轮旁观助手（Observer）。
+2026-10-27 起的旁观助手在每次唤醒、主模型推理之前跑一次，点出陌生说法、矛盾、自我限制、情绪和行动里的意外。2026-11-01 它并入构造运行（`mods/chat/construct.py`）：同一个位置、同一套模型配置，产出从一段提醒变成行动的规格，提醒放进规格的注意。10-29 拿掉它的 `load_notes`，理由是挂上的整篇笔记会一直占着那一段；每次行动都是新上下文以后，构造可以按需在规格里带笔记。
 
-### 运行机制与严格单轮执行
-
-Observer 在中心 agent（柚子）被唤醒之后、正式启动主模型推理之前介入执行：
-- **严格单轮运行**：通过统一 `run(kind="observer", tools=(), timeout=15)`，只输出一段提醒。
-- **独立模型与思考等级**：配置保存在 storage `agent.json` 的 `observer` 字典中（`{"on": True, "model": "deepseek/deepseek-flash", "effort": "none", "context": "recent"}`）。默认开启，默认使用轻量模型 `deepseek/deepseek-flash`，且默认设置思考等级为 `effort="none"`，彻底关闭深度思考链实现亚秒级极速旁观。
-- **可切换上下文模式（`context`）**：支持 `recent`（默认）与 `full` 两种模式。在 `recent` 模式下，Observer 仅摄入当前段中上一轮唤醒的画面、柚子的思考/自语/工具调用结果，以及当轮新画面，相比摄入全段历史大幅削减 ~90% 的 token 开销与请求延迟；在 `full` 模式下遍历全段历史消息并维持前缀缓存。可通过 `#observer context [recent|full]` 随时切换。
-- **定位与绝对原则**：Observer 是帮柚子发现盲区的贴心助手，绝不是监工。绝对禁止进行代码审查、操作审计、反黑话审查或文风说教，绝不限制柚子的自主行动与发言自由。
-
-### Checklist 检查清单与惊奇检测职责
-
-Observer 的提示词与检查清单统一保存在普通笔记 `data/notes/observer.md`（文件不存在或为空时回退模块内置 `DEFAULT_OBSERVER_PROMPT`）。Checklist 聚焦于**点出陌生说法、矛盾、自我限制、情绪与惊奇**（2026-10-29 起不再挂笔记，见下文「查词与直通 Hint」）：
-1. **陌生说法**：新到达画面中她可能不认识的黑话、圈内梗、缩写、外号或未注明来源的特殊指代，把词本身用「」括起来点出（「」只括词，引用原话用“”），提醒柚子切勿望文生义；交由柚子自己检索或询问，Observer 不替她搜聊天记录，免得一搜一大片塞满上下文。
-2. **矛盾**：她说的、想的、做的，和画面里的事实、她之前说过的、她的笔记（self、global 等）对不上，或者两条规矩互相打架，指出是哪两处。
-3. **自我限制**：她想做、想说却被一条规矩或顾虑拦回去（咽回去的话、缩回去的动作、“不能”“不该”“别太”这类念头），点出是哪条拦住了她、那条现在还成不成立。
-4. **情绪**：她自己的情绪有没有被跳过去，对方话里的情绪她接住了没有；只提醒，怎么回应由她。
-5. **行动里的意外**：工具或命令报错、碰壁、绕远路、结果和预期对不上，简短指出，提醒当场审视或记入 `recent`/`todo`。
-6. **静默原则**：什么都没注意到就只回 `【无】`，不向主模型注入额外提示块。
-
-### 前缀缓存机制（第二个缓存头）
-
-为了避免每次唤醒 Observer 时重复计算完整历史的 prompt token，`observer.py` 严格复用会话历史构造了稳定的消息流：
-1. **System 消息**：稳定的 `get_prompt()`（`observer.md` 提示词全文）；
-2. **规范引用消息流**：从视图条目渲染消息（或 `recent` 模式取上一轮），通过 `quote_message` 将系统说明、画面、柚子思考、柚子自语、柚子调用工具与工具返回逐条格式化为规范的 `user` 文本块；
-3. **末尾新材料**：本次唤醒新到达的 `material`（新画面与通知）。
-
-由于前面两部分在段内多轮唤醒中完全保持稳定，服务端前缀缓存命中率极高（与主模型会话形成互补的第二个稳定缓存头），单次唤醒调用费用极低。
-
-### 查词与直通 Hint
-
-Observer 只看画面和上下文，看不见笔记内容，所以「笔记里有没有这个词」不让它猜：它在提醒里用「」括起来的词（20 字以内），由 `_annotate` 拿去按子串在笔记（`notes.listing` 列出的那些，`observer` 本身除外）和日记里各查一遍，在词后面注明「（group:… 、diary:… 里有）」或「（笔记和日记里都没有）」。查到的是给她的指路，查不到的才是真正笔记里没有的词。若 Observer 正文输出了有效提醒（非空且非 `【无】`），就拼成 `【旁观助手 observer】` 提示块，通过 `hints` 回调注入柚子当轮子请求末尾（只进当前发出的请求，不写进 `messages` 历史）。
-
-2026-10-29 以前 Observer 还有一个 `load_notes` 工具，把它认为相关的整篇笔记挂进这一段。那一半换成了面包屑（见下一节），因为整篇倒进来、挂上就一直占着上下文，正和提案说的「只递一句」相反。`data/notes/observer.md` 若还是旧提示词，里面提到的 `load_notes` 已经不存在，Observer 调不了它；用 `#observer set` 改掉，或清空回落到新的默认提示词。
+- **说明**：`data/notes/policy/construct.md`（不存在或为空时用 `construct.DEFAULT_POLICY`）。默认说明的第 4 条沿用旁观助手的检查清单：陌生说法用「」括起来、矛盾、情绪、意外；清单里只放她真的容易漏的，不做代码审查、操作审计或文风说教。旧的 `data/notes/observer.md` 不再读取。
+- **查词**：注意里「」括起的词（20 字以内）由代码按子串在笔记和日记里各查一遍，在词后注明「（group:…、diary:… 里有）」或「（笔记和日记里都没有）」；构造运行不必猜笔记里有没有。
+- **超时兜底**：构造运行有硬超时（默认 45 秒），超时、出错或没交规格都按黑板加消息直接行动，并在注意里写明，绝不因上游卡住而挡住唤醒。
+- **重放**：`construct.replay(ctx, policy_text=None, model=None)` 取一次封存构造的原样输入，换一版说明重跑，返回原来和重放的规格对照；不给 `agents__fork`、不跑行动。
 
 ### 面包屑（笔记名与别名）
 
-`agent._breadcrumbs` 在每次唤醒组装好画面以后、Observer 之前运行，不调模型：把这次的画面文本和每份笔记的名字（`topic:线代` 取冒号后的 `线代`；`person:`、`group:` 的号码不算）以及笔记里 `别名：A、B` 行写的词做子串匹配（英文词两头不能紧挨别的字母数字，两个字以下不认），`global`、`recent`、`todo`、`awaker`、`observer` 不参与。命中、而那份笔记不在眼前（不在当前视图推导出的笔记集合、这次带上的人或群的笔记里，段内和这次材料里也没有它的 `## 笔记 <scope>（` 标题）时，在请求末尾挂一行「画面里提到的这些你有笔记，要看就 read_note：…」。它和压力提醒一样是 hint，不进这一段、不动前缀缓存，读不读由她。
+`agent._prepare` 在每次行动组装好画面以后运行，不调模型：把画面文本和每份笔记的名字（`topic:线代` 取冒号后的 `线代`；`person:`、`group:` 的号码不算）以及笔记里 `别名：A、B` 行写的词做子串匹配（英文词两头不能紧挨别的字母数字，两个字以下不认），`global`、`recent`、`todo`、`awaker`、`observer` 不参与。命中、而那份笔记不在这次行动的材料里时，在请求末尾挂一行「画面提到的这些你有笔记，用 read_note 召回：…」。构造运行的输入里也有同样的一行。
 
-### `#observer` 管理子命令
+### `#construct` 管理子命令
 
-管理员可通过 `#observer` 系列子命令随时查看或调整旁观助手：
-- `#observer`：查看当前状态（开/关）、模型、思考等级、上下文模式与提示词概况；
-- `#observer on|off`：开启或关闭旁观助手（需管理员）；
-- `#observer model [selection]`：查看或切换旁观助手模型（需管理员，留空查看）；
-- `#observer effort [level]`：查看或设置旁观助手思考等级（需管理员，支持 `default|off|none|low|medium|high|max`）；
-- `#observer context [recent|full]`：查看或切换上下文模式（`recent` 仅上一轮省 token，`full` 全段历史，需管理员）；
-- `#observer prompt`：查看当前提示词与 Checklist 全文；
-- `#observer set <全文>`：整份替换 `data/notes/observer.md`（需管理员，留空清空回退默认）；
-- `#observer reset`：恢复默认配置与模型（开，`deepseek/deepseek-flash`，`effort=none`，`context=recent`，需管理员）。
+- `#construct`：查看开关、模型、思考等级、超时和说明来源；
+- `#construct on|off`：开启或关闭构造运行（需管理员；关闭时每次都按黑板加消息兜底）；
+- `#construct model [selection]`、`#construct effort [level]`、`#construct timeout [秒]`：查看或设置（带参数时需管理员）；
+- `#construct prompt`：查看当前构造说明；
+- `#construct set <全文>`：整份替换 `data/notes/policy/construct.md`（需管理员，留空回落内置说明）；
+- `#construct reset`：恢复默认配置（需管理员）。
 
 ## 当前信任边界与维护取舍
 

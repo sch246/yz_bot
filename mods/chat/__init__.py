@@ -42,6 +42,8 @@ llm_config: dict = {}
 # max_token × pressure_percent 两个数，维护者觉得一个阈值拆成两个数没有意义，合成一个。
 # 2026-10-23 维护者定默认 50 万，约是模型上下文的一半：同一段上下文一直往后接，阈值
 # 要给交接本身（整段再加一句交接指令）留出余量，也让"超长卡死"在正常使用里遇不到。
+# 2026-11-01 起没有整段上下文和交接，tidy_token 只剩一个用途：单次反思或沉淀运行里
+# 材料之后新长出来的部分不超过它（存储键沿用旧名）。
 DEFAULT_MAX_EVENTS = 80
 DEFAULT_TIDY_TOKEN = 500000
 AGENT_WINDOW = ("agent", 0)
@@ -79,7 +81,7 @@ def agent_setting(name: str, data: dict | None = None):
 
 
 def limit() -> tuple[int, int]:
-    """Screen size and tidy threshold."""
+    """Screen size and the per-run growth cap of reflection and settling."""
     data = storage.get("", "agent")
     if "max_token" in data or "pressure_percent" in data:
         # 旧的两个数是按每次重组上下文定的预算，套到同一段上下文上会太小：直接删掉，用默认。
@@ -146,7 +148,7 @@ _reflect_lock = threading.Lock()
 _reflect_pending = False
 
 
-def reflect_now(handoff: bool = True, wait_seconds: float = 60.0) -> bool:
+def reflect_now(settle: bool = True, wait_seconds: float = 60.0) -> bool:
     """Start the reflection pass right away on its own thread; False when already reflecting or pending.
 
     WHY: 2026-10-29 修复：当她在轮次中执行 send_command("#reflect keep") 时，AGENT_WINDOW 处于活动状态；
@@ -172,7 +174,7 @@ def reflect_now(handoff: bool = True, wait_seconds: float = 60.0) -> bool:
                 if running_wake() is None:
                     break
                 time.sleep(0.5)
-            _agent.reflect(handoff=handoff)
+            _agent.reflect(settle=settle)
         except Exception:
             _reflect_stream.exception("反思失败")
         finally:
@@ -603,7 +605,7 @@ def _private_from_peer(event: dict) -> bool:
 
     WHY: 维护者 2026-10-23：私聊每次都要先叫「柚子，」太累，私聊每条都叫醒她。话没说完
     就回的问题不靠延迟解决（人可能隔几分钟才想到下一句），靠她的沉默纪律和干活时
-    插进这一段的新消息，见 view._base_prompt 与 agent._prepare。
+    插进这次运行的新消息，见 view._base_prompt 与 agent._prepare。
     """
     return event.get("group_id") is None and event.get("user_id") != identity.bot_id()
 
@@ -817,7 +819,8 @@ def migration_problem() -> str:
         if not complete:
             return "chat core 迁移未完成；停机后运行 scripts/once/migrate_chat_core.py --runtime-root ABS --apply --rollback 恢复，再检查并迁移"
     old = any(Path(name).exists() for name in ("data/context", "data/event_stream"))
-    if old and not (_segment.ROOT / "view.json").exists():
+    migrated = (_segment.ROOT / "view.json").exists() or any(_journal.ROOT.glob("*.jsonl"))
+    if old and not migrated:
         return "旧经历数据尚未迁移；停机后对离线 runtime root 运行 scripts/once/migrate_chat_core.py --runtime-root ABS，先 dry-run 再 --apply"
     return ""
 
@@ -856,6 +859,7 @@ def on_load(ctx) -> None:
             try:
                 _attention.start(_agent.notify)
                 _attention.rescan()
+                _settle.start(_agent.kick)
             except Exception:
                 _reflect_stream.exception("恢复注意力失败")
 
@@ -876,10 +880,11 @@ def cancel_wake(window: tuple) -> bool:
 
 def on_exit() -> None:
     _attention.stop()
+    _settle.stop()
 
 
 
-from . import recognize as _recognize, view as _view, segment as _segment, screen as _screen, agent as _agent, roles as _roles, subcommands as _subcommands, notes as _notes, awaker as _awaker, attention as _attention, observer as _observer, voice as _voice, face as _face
+from . import recognize as _recognize, view as _view, segment as _segment, screen as _screen, agent as _agent, roles as _roles, subcommands as _subcommands, notes as _notes, awaker as _awaker, attention as _attention, construct as _construct, settle as _settle, journal as _journal, voice as _voice, face as _face
 from .view import has_at, msg_split
 from .windows import kind, parse_target
 from .run import run, current_wake

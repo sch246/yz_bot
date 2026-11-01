@@ -1,12 +1,13 @@
-"""Her recall tools, the handoff instruction, and the diary roll-ups.
+"""Her recall tools, the settle instruction, and the diary roll-ups.
 
 WHY: 2026-10-22 the maintainer split memory this way: recall is hers -- she
 reads chat logs, her own actions and notes when she judges she needs them.
-Letting go is a handoff: the context she has been working in is about to be
-removed, so she confirms every kind of information is where it belongs.  An
-earlier version had a separate librarian session with its own assembled
-material; it was removed because it saw less than she had seen, and the
-handoff only needs the same context with a different purpose.
+An earlier librarian session was removed because it saw less than she had seen.
+
+WHY: 2026-11-01 the stateless core replaced the handoff with settling: when a
+stretch of experience in one window ends, a run of hers gets that stretch's chat
+text and every act she ran there, by journal reference -- the same evidence she
+saw while living it, which answers why the librarian had been removed.
 """
 
 from __future__ import annotations
@@ -101,7 +102,7 @@ def read_actions(ids: list[str] | None = None, count: int = 10, keyword: str = "
 
 
 def read_context(name: str = "", start: int = 0, match: str = "", around: int = 300) -> str:
-    """Read current, frozen ctx, fold or original journal id; paginate full text.
+    """Read the running main view, a frozen ctx, fold or original journal id; paginate full text.
 
     Empty name lists the latest thirty archived views. ``match`` searches the
     full original text, before compact display or page slicing.
@@ -114,7 +115,11 @@ def read_context(name: str = "", start: int = 0, match: str = "", around: int = 
         return "\n".join(f"{item['name']}  {_screen.clock(item['started'])[5:16]} 至 "
                          f"{_screen.clock(item['ended'])[5:16]}  {item['messages']} 条消息  "
                          f"窗口 {'、'.join(item['windows']) or '无'}  · {item['reason'][:40]}" for item in found)
-    data = _segment.load() if target == "current" else _segment.read_archived(target)
+    if target == "current":
+        running = _root().current_wake()
+        data = running.get("view") if running else None
+    else:
+        data = _segment.read_archived(target)
     if data is None:
         return f"（没有叫 {name} 的段或日志条目；不给 name 可以列出最近的段）"
     text = f"# {target}\n" + _segment.readable(data, compact=not bool(match.strip()), expand_folds=bool(match.strip()))
@@ -298,24 +303,25 @@ def directory(woken: list[tuple]) -> str:
 
 
 # WHY: 2026-10-26 审查发现：交接若也要求改写 global，她会在每次交接时把偶发小事和实操坐标往 global 里堆，
-# 并在 04:00 的交接里把反思的活提前干完，紧接着进入 _run_reflection 时看见刚改过的 global 和 recent 误以为
-# 系统重复触发了两次反思。因此交接只负责封存当前现场（recent、人和群、todo、日记），global 留给夜里反思统一打理。
-_HANDOFF = """这段上下文要被移除了（原因：{reason}）。移除之前确认交接做好：对照这段上下文，逐类确认每种信息都已经在它该在的地方。
+# 并在 04:00 的交接里把反思的活提前干完。因此交接只负责封存当前现场（recent、人和群、todo、日记），global
+# 留给夜里反思统一打理。2026-11-01 交接换成沉淀，这条照旧：沉淀也不改 global。
+_SETTLE = """上面是你刚才在 {title} 的一段经历（{span}）：这段时间的聊天原文，和你在这里每次行动时想了什么、做了什么。
+现在没有人在等你回话。对照原来的笔记，把这段里值得留下的写下来：
 
-- 眼下在进行的事、还没回的话、刚看过的材料的结论与出处 → recent：改写成交接时的样子，做完的、和眼下无关的拿掉，不超过二十行。
-- 关于某个人、某个群的认识和经历 → person:<QQ号>／group:<群号>："## 认识"写知道什么，变了就写成"某日起改为……"；"## 经历"一行一件事，带日期和出处（窗口和时刻，或行动号）。
+- 关于这里的人和群的认识和经历 → person:<QQ号>／group:<群号>："## 认识"写知道什么，变了就写成"某日起改为……"；"## 经历"一行一件事，带日期和出处（窗口和时刻，或行动号）。
+- 今天发生了什么、心里怎么想的 → diary:{day}：改写成到目前为止的这一天，第一行一句话概括，之后按时间写，每条带出处。已经写过的保留，不要往后追加重复的段落。
+- 黑板 recent：此刻的心情、手头的事、还没回的话，改写成现在的样子，做完的、和眼下无关的拿掉。下次醒来可能用得上的材料，用 @引用 一行一条记在 recent 里（如 @person:123、@diary:{day}、@某次行动的编号），构造下一次上下文的你会先看到它们。
 - 答应了还没做的事 → todo。
-- 今天发生了什么 → diary:{day}：改写成到目前为止的这一天——第一行一句话概括，之后按时间写发生了什么、做了什么决定、答应了什么，每条带出处。已经写过的保留，不要往后追加重复的段落。
 
-每份先用 read_note 读现有内容：已经在了就算确认过，不用重写；没在的补上；过时的删掉。写用 write_note，text 是改写后的全文。不确定是不是事实的，标明"未确认"。
-这次专心收拾，不必对外说话；真有想对谁说的话，写进笔记、留到明天也行，想给自己留一句就打进 me 窗口。都确认好了，用一两句话说交接了什么，然后结束。"""
+情绪、玩笑、关系的变化也是值得留下的。每份先看现有内容（上面给了的就不用再读）：已经在了就不用重写；没在的补上；过时的删掉。写用 write_note，text 是改写后的全文。不确定是不是事实的，标明"未确认"。没有新东西就什么都不改。
+这次专心收拾，不必对外说话。都写好了，用一句话说这段经历是什么，然后结束。"""
 
 
-def handoff_prompt(reason: str, day: str) -> str:
-    text = _HANDOFF.format(reason=reason, day=day)
-    guidance = _notes.read_policy("handoff").strip()
+def settle_prompt(title: str, span: str, day: str) -> str:
+    text = _SETTLE.format(title=title, span=span, day=day)
+    guidance = _notes.read_policy("settle").strip()
     if guidance:
-        text += "\n\n## 你在反思里给交接写的附加说明\n" + guidance
+        text += "\n\n## 你在反思里给沉淀写的附加说明\n" + guidance
     return text
 
 

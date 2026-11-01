@@ -8,7 +8,7 @@ append/begin_wake/begin_act/tool_started/record_results default to persisting
 main view.json. A fork passes persist=False, keeps its references in memory,
 and finally archive(view, "fork"); it cannot replace the main current view.
 All frozen views use views/<ctx>.json; kind is metadata, never part of identity.
-Only central handoffs and reflection enter the years.md handoff index.
+Settle runs, reflection and old central handoffs enter the years.md index.
 Only a wake owned by this view's ctx is inherited by newly appended entries.
 
 Source metadata on journal rows:
@@ -32,16 +32,13 @@ steps:[{id:"n.m",wake:int,sub:int,act_id,items:[refs],tools:[name],complete:bool
 folds:[fold rows]}. Folded rows retain screens/shown but hide notes/tool state;
 re-showing those is the caller's ordinary source comparison, not another mirror.
 
-``dismiss(view,wake_id,*,boxes,last_sent,follow_counts)`` returns
-{snapshot: opaque wake snapshot, windows:{label:[cleared record ids]},
-patches:[original read patches], removed:[item ids], drop_id:str}.
-Caller applies screen.restore_read(snapshot, windows, patches=patches).
-It neither rewinds external actions nor calls screen. Supply current boxes and
-last_sent at application time; follow_counts optionally includes unseen backlog.
+Each run owns one view (stateless core, 2026-11-01): the caller passes
+persist=False and run() freezes it with archive(view, kind) at the end.
+view.json/load/save remain only for migrated installs and old tooling.
 
-WHY: she stays in one context until handoff (2026-10-22). Ordinary appends
-preserve the old prefix. Folding and dismiss change only references; original
-protocol messages, step addresses and completed external actions survive.
+WHY: 2026-11-01 维护者推翻 D20（不交接就一直是同一段上下文）：每次运行只为一个目的，
+视图随运行冻结，不再折叠、清除或交接。迁移来的旧视图里仍有 fold/drop 行，渲染、derive
+和 read_context 照旧能读，所以这里保留读取它们的代码，只删掉了创建它们的接口。
 """
 
 from __future__ import annotations
@@ -346,11 +343,15 @@ def derive(view):
 
 
 def resolve_refs(view, refs):
-    """Resolve newline refs: #wake, n.m, journal id, ctx name, note scope/name.
+    """Resolve newline refs: #wake, n.m, journal id, ctx name, note scope/name,
+    ``policy:<name>`` and ``log:<window>[@<before>][*<count>]``.
 
     Invisible folded addresses resolve to the visible containing fold. Exact
     journal ids always mean the original row; a note not present uses its file.
     Unknown refs fail with the failing line rather than silently disappearing.
+
+    WHY: 2026-11-01 维护者的视角是“只有原子，线把原子串起来”：所有种类的原子（日志条目、
+    视图、笔记、策略、聊天记录）用同一套写法放上线，黑板、assemble、fork 共用这一处。
     """
     if isinstance(refs, (str, int)):
         refs = str(refs).splitlines()
@@ -370,6 +371,10 @@ def resolve_refs(view, refs):
             found = [ref]
         elif ref == view["ctx"] or ref == "current":
             found = list(view["items"])
+        elif ref.startswith("policy:"):
+            found = _policy_ref(view, ref[len("policy:"):].strip())
+        elif ref.startswith("log:"):
+            found = _log_ref(view, ref[len("log:"):].strip())
         else:
             archived_view = read_archived(ref)
             if archived_view is not None:
@@ -393,145 +398,48 @@ def _note_refs(view, scope):
         text = notes.render(scope).strip()
     except ValueError:
         return None
-    if not text:
+    return _text_ref(view, scope, text) if text else None
+
+
+def _policy_ref(view, name):
+    from . import notes
+
+    try:
+        text = notes.read_policy(name).strip()
+    except ValueError:
         return None
+    return _text_ref(view, "policy:" + name, f"## 策略 {name}\n{text}") if text else None
+
+
+def _log_ref(view, value):
+    """A window's chatlog records before a moment, recorded as one row of this run."""
+    from . import roles
+
+    match = re.fullmatch(r"([^@*\s]+)(?:@([^*]+?))?(?:\*(\d+))?", value)
+    if match is None:
+        return None
+    window, moment, count = match[1], (match[2] or "").strip(), int(match[3] or 30)
+    try:
+        text = roles.read_log(window, count, moment)
+    except (ValueError, KeyError):
+        return None
+    return [journal.append("log", ctx=view["ctx"], window=window, before=moment, count=count,
+                           messages=[{"role": "user", "content": f"【聊天记录 {window}"
+                                      + (f"，{moment} 之前" if moment else "") + f"，{count} 条】\n{text}"}])]
+
+
+def _text_ref(view, scope, text):
     version = hashlib.md5(text.encode("utf-8")).hexdigest()
     # Reuse an identical already-recorded source version instead of copying a
     # note each time a fork names it. Referencing alone does not change the view.
-    for row in reversed(journal.events(kind="note")):
+    # WHY: 2026-11-01 every construct resolves several notes; scanning the whole
+    # journal each time grows without bound. Reuse is only an optimisation, so a
+    # week of history is enough; an older identical version just gets a new row.
+    for row in reversed(journal.events(kind="note", after=time.time() - 7 * 86400)):
         if row.get("scope") == scope and row.get("version") == version:
             return [row["id"]]
     return [journal.append("note", ctx=view["ctx"], scope=scope, name=scope, version=version,
                            messages=[{"role": "system", "content": text}])]
-
-
-def _range(view, first, last):
-    last = first if str(last or "0") == "0" else last
-    info = derive(view)
-    if str(last).lower() in ("latest", "all", "max", "-1"):
-        offered = info["wakes"][1:-1]
-        if not offered:
-            raise ValueError("no historical wake to fold")
-        last = offered[-1]["number"]
-    substep = "." in str(first) or "." in str(last)
-    if substep:
-        if not re.fullmatch(r"\d+\.\d+", str(first)) or not re.fullmatch(r"\d+\.\d+", str(last)):
-            raise ValueError("use two step addresses")
-        if str(first).split(".")[0] != str(last).split(".")[0]:
-            # WHY: cross-wake step ranges swallow the next wake's first screens
-            # and notes; use the whole-wake address for that (2026-10-29).
-            raise ValueError("子步骤只能在同一次唤醒里收；跨唤醒请按整轮收")
-    elif re.fullmatch(r"#?\d+", str(first)) and re.fullmatch(r"#?\d+", str(last)):
-        protected = [info["wakes"][0]["number"], info["wakes"][-1]["number"]] if info["wakes"] else []
-        lo, hi = int(str(first).lstrip("#")), int(str(last).lstrip("#"))
-        if any(lo <= number <= hi for number in protected):
-            raise ValueError("第一次和最近一次唤醒不能整轮收")
-    left, right = resolve_refs(view, [first]), resolve_refs(view, [last])
-    if not left or not right or any(one not in view["items"] for one in left + right):
-        raise ValueError("fold endpoints must be visible references")
-    start = min(view["items"].index(one) for one in left)
-    end = max(view["items"].index(one) for one in right) + 1
-    if end <= start:
-        raise ValueError("last must follow first")
-    chosen = set(view["items"][start:end])
-    protected_ids = {info["wakes"][0]["id"], info["wakes"][-1]["id"]} if info["wakes"] else set()
-    if any(row["id"] in protected_ids for row in _entries({"items": list(chosen)}, deep=True)):
-        raise ValueError("第一次和最近一次唤醒不能整轮收")
-    for step in info["steps"]:
-        if chosen.intersection(step["items"]):
-            if not step["complete"]:
-                raise ValueError("当前仍在执行的步骤不能收走")
-            if not set(step["items"]).issubset(chosen):
-                raise ValueError("fold range must contain the complete assistant/tool step")
-    return start, end
-
-
-def fold(view, first, last, summary):
-    summary = str(summary).strip()
-    if not summary:
-        raise ValueError("先写摘要：什么事、到哪一步、还欠着什么")
-    with _lock:
-        start, end = _range(view, first, last)
-        covers = view["items"][start:end]
-        level = 1 + max((journal.get(one).get("level", 0) for one in covers), default=0)
-        item_id = journal.append("fold", ctx=view["ctx"], covers=covers, summary=summary, level=level,
-                                 messages=[{"role": "system", "content": f"【收起 L{level}】{summary}\n（原文引用：{'、'.join(covers)}；用 read_context 读日志编号或本收起块）"}])
-        changed = [*view["items"][:start], item_id, *view["items"][end:]]
-        _replace(view, changed)
-        return item_id
-
-
-def _replace(view, items):
-    before, old_stats = view["items"], copy.deepcopy(view["stats"])
-    view["items"] = items
-    view["stats"].pop("tokens", None)
-    try:
-        save(view)
-    except BaseException:
-        view["items"], view["stats"] = before, old_stats
-        raise
-
-
-def unfold(view, fold_id):
-    with _lock:
-        row = journal.get(fold_id)
-        if row["kind"] != "fold" or fold_id not in view["items"]:
-            raise ValueError("fold is not visible in this view")
-        at = view["items"].index(fold_id)
-        _replace(view, [*view["items"][:at], *row["covers"], *view["items"][at + 1:]])
-
-
-def validate_dismiss(view, wake_id, *, boxes=None, last_sent=0, follow_counts=None):
-    """Validate a prospective drop without changing the view or read state."""
-    with _lock:
-        wake = journal.get(wake_id)
-        if wake["kind"] != "wake" or wake_id not in view["items"]:
-            raise ValueError("wake is not visible in this view")
-        start = view["items"].index(wake_id)
-        removed = view["items"][start:]
-        rows = _entries({"items": removed}, deep=True)
-        # WHY: clearing work memory is trusted even after tools, but speech is
-        # already part of somebody else's conversation, and a new draft needs
-        # its cause (maintainer 2026-10-23). Existing unchanged drafts are fine.
-        if last_sent and last_sent >= wake["time"]:
-            raise ValueError("从那次唤醒起你发过话，这段不能清")
-        if any(row.get("sent") for row in rows):
-            raise ValueError("从那次唤醒起你发过话，这段不能清")
-        old_boxes = wake.get("boxes", {})
-        typed = [label for label, value in (boxes or {}).items()
-                 if (value.get("text", "") if isinstance(value, dict) else value)
-                 and (value.get("text", "") if isinstance(value, dict) else value) != old_boxes.get(label, "")]
-        if typed:
-            raise ValueError("、".join(typed) + " 的输入框里有那次唤醒之后打的或改过的字")
-        windows, patches, follows = {}, [], {}
-        for row in rows:
-            if row["kind"] != "screen":
-                continue
-            label = row["window"]
-            ids = windows.setdefault(label, [])
-            ids.extend(one for one in row.get("shown", []) if one not in ids)
-            if row.get("read_patch"):
-                patches.append(row["read_patch"])
-            follows.setdefault(label, set()).update(row.get("follow_ids", []))
-        counts = {label: len(ids) for label, ids in follows.items()}
-        for label, count in (follow_counts or {}).items():
-            counts[label] = max(counts.get(label, 0), count)
-        # WHY: follow never truncates. Repeated dismiss must eventually leave
-        # the >60 record batch in thought rather than accumulate it forever.
-        if any(count > 60 for count in counts.values()):
-            raise ValueError("follow 期间已经攒了超过 60 条，这次留着把它们看完")
-        return {"snapshot": wake.get("read_snapshot", {}), "windows": windows,
-                "patches": patches, "removed": removed}
-
-
-def dismiss(view, wake_id, *, boxes=None, last_sent=0, follow_counts=None):
-    with _lock:
-        result = validate_dismiss(view, wake_id, boxes=boxes, last_sent=last_sent,
-                                  follow_counts=follow_counts)
-        result["drop_id"] = journal.append("drop", ctx=view["ctx"],
-                                           covers=result["removed"], wake_id=wake_id)
-        _replace(view, view["items"][:view["items"].index(wake_id)])
-        return result
 
 
 def archive(view, kind=""):
@@ -558,7 +466,7 @@ def archive(view, kind=""):
             frozen["stats"].setdefault("ended", time.time())
             _validate(frozen)
             _atomic(target, frozen)
-        if frozen["stats"].get("kind", "") in ("", "reflect"):
+        if frozen["stats"].get("kind", "") in ("", "reflect", "settle"):
             _index_year(frozen)
         if not kind:
             current = ROOT / "view.json"
@@ -591,6 +499,11 @@ def _year_line(view):
 def each_archived(since=0, newest_first=False):
     views = []
     for path in (ROOT / "views").glob("*.json"):
+        # WHY: 2026-11-01 every act freezes its own view, so this directory grows by
+        # hundreds a day. A file is written once, at or after its view ended, so a
+        # file older than ``since`` cannot hold a view that ended after it.
+        if since and path.stat().st_mtime < since:
+            continue
         view = json.loads(path.read_text(encoding="utf-8"))
         _validate(view)
         if view["stats"].get("ended", 0) > since:

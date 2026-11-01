@@ -330,7 +330,7 @@ def extract_qqs(texts: Iterable[str]) -> list[int]:
     return result
 
 
-def prepare(window: tuple, *, shown, count, pending=()) -> dict:
+def prepare(window: tuple, *, shown, count, pending=(), lead_in=None) -> dict:
     """Render new material and return an opaque read patch without confirming it.
 
     WHY: 已读等第一次输出；展示身份却来自已经保存的 view，失败重试不重复追加画面。
@@ -342,12 +342,13 @@ def prepare(window: tuple, *, shown, count, pending=()) -> dict:
 
     window = tuple(window)
     shown = set(shown)
+    lead_in = LEAD_IN if lead_in is None else max(0, int(lead_in))
     with context.window_lock(window), _lock:
         state = deepcopy(_state(window))
         marks = [state["through"], *(item.get("time") for item in state["pending"].values())]
         since = min((stamp for stamp in marks if stamp is not None), default=None)
         # Ordinary requests walk only the unread range and a short tail for lead-in.
-        rows = records(window, max(count, LEAD_IN) + FRESH_MAX)
+        rows = records(window, max(count, lead_in) + FRESH_MAX)
         if since is not None:
             fresh_rows = records(window, 1_000_000, since=since)
             fresh_ids = {item["id"] for item in fresh_rows}
@@ -372,7 +373,7 @@ def prepare(window: tuple, *, shown, count, pending=()) -> dict:
             # Never read: count chooses the initial history, even if every line
             # currently has an unread arrival. Follow/offline calls remain explicit exceptions.
             fresh = available
-            selected = {item["id"] for item in available[-max(count, LEAD_IN):]} | exceptions
+            selected = {item["id"] for item in available[-max(count, lead_in):]} | exceptions
         else:
             # After handoff, display the range after the confirmed boundary and
             # exact older unread exceptions. Excluded recovery still belongs to
@@ -385,7 +386,7 @@ def prepare(window: tuple, *, shown, count, pending=()) -> dict:
             # WHY: 2026-10-25：交接后只补三条接话，不把刚压缩掉的历史重新倒回来。
             fresh_ids = {item["id"] for item in fresh}
             older = [item for item in available if item["id"] not in fresh_ids]
-            selected.update(item["id"] for item in older[-LEAD_IN:])
+            selected.update(item["id"] for item in older[-lead_in:] if lead_in)
         skipped = sum(item["id"] not in selected for item in fresh)
         items = [item for item in available if item["id"] in selected]
         by_id = {item["id"]: item for item in rows}

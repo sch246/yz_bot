@@ -72,11 +72,12 @@ uv run --frozen python run.py --smoke
 |---|---|---|---|
 | `chatlog/` | QQ 上发生了什么 | 没进模型画面的消息、通知、发送回声 | 一直留 |
 | `data/chat/journal/YYYYMMDD.jsonl` | 她看过、想过和做过什么 | 稳定编号、原样模型消息、来源、输出与逐个工具结果；`read_actions/read_context` 读取 | 一直留，只追加；中断尾部保留证据后恢复 |
-| `data/chat/view.json`、`view.bak.json` 与 `views/<ctx>.json` | 她眼前放了什么、哪些已经归档 | 有序条目引用、fold/drop 关系与运行统计；归档冻结视图 | 一直留，按段归档 |
-| storage `agent.read` | 哪些窗口记录已被模型确认读过 | 连续位置、同秒身份、待确认与排除例外；dismiss 退回对应确认 | 持久保存；计数和展示边界为派生 |
-| `log/llm.log`（`yz.llm.request`） | 每次请求发了什么 | 每次请求末尾的临时提示（待办、未读数、时间）；同一段里已经记过的前缀不再重复打印，只写"前 N 条已经记过" | 7 天 |
+| `data/chat/views/<ctx>.json` | 每次运行（构造、行动、沉淀、反思、分身）眼前放了什么 | 有序条目引用与运行统计（行动和沉淀记 `stats.windows`）；迁移来的旧视图里有 fold/drop 关系。旧的 `view.json`、`view.bak.json` 不再写，只用于迁移检查 | 一直留，每次运行结束冻结 |
+| storage `agent.read` | 哪些窗口记录已被模型确认读过 | 连续位置、同秒身份、待确认与排除例外 | 持久保存；计数和展示边界为派生 |
+| storage `agent.settled`、`agent.unsettled` | 各窗口沉淀到了哪里、哪些窗口还有没沉淀的行动 | 沉淀位置（时间）与最后一次行动的时间 | 持久保存；沉淀计时器只在内存，重启后从这里重排 |
+| `log/llm.log`（`yz.llm.request`） | 每次请求发了什么 | 每次请求末尾的临时提示（待办、未读数、时间）；同一次运行里已经记过的前缀不再重复打印，只写"前 N 条已经记过" | 7 天 |
 | `data/notes/.history/` | 笔记改写或删除前是什么样 | 每个旧版本 | 一直留 |
-| `data/notes/years.md` | 以前交接归档过哪些段 | 每段归档时追加一行的年鉴摘要（起止时间、条数、结束原因），默认开局展示最近 8 段 | 一直留 |
+| `data/notes/years.md` | 以前沉淀过哪些经历（2026-11-01 以前是交接归档的段） | 每次沉淀和反思追加一行的年鉴摘要（起止时间、条数、窗口与时段） | 一直留 |
 | journal 的循环备注条目与 `me` 的实际唤醒记录 | 她给循环写过什么、何时醒过 | `loop_note_history` 查 journal；`read_log("me")` 查已发生理由 | 记录保留；loop/wait 排期只在内存 |
 | `data/storage/window_titles.json` | 她给窗口起的名字 | `set_name` 设定的窗口自定义称呼（优先于群名和昵称） | 一直留 |
 | `data/usage/YYYY-MM-DD.jsonl` | 每次模型调用（含 `describe_image` 旁路视觉调用）花了多少 token | 按天记录每次调用的时间、模型、`prompt`、`completion`、`cached` token 数 | 滚动保留 30 天 |

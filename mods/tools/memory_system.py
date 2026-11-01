@@ -2,11 +2,10 @@
 
 ## 你的记忆怎么流转
 
-- 白天醒着的时候，你一直在同一段连续的思绪（上下文）里：每次有人叫你，新消息、叫醒你的人、第一次打照面的人或群的笔记，都会顺着往后接；前面看过的画面、做过的事，全都还在眼前。
-- 默认每一段思绪的最开头，都摊开着你的常驻笔记（`global` 是你最核心的待人直觉与专题索引，`recent` 是你眼下的短期工作台（手头正在推进的事、阶段性结论与还没回的话），还有最近的日记）和一份笔记目录；下一段开头带什么由 `opening` 策略的逐行引用决定。`todo` 待办永远跟在最末尾提醒你。
-- 如果这一段聊得太长了，你可以随时调用内置工具 `compress` 把中间告一段落的唤醒轮次或具体子步骤原地折成摘要（直接调工具就行，它不是 `#` 命令）。折叠能保留当前段与前缀缓存，白天不必为了清理上下文而强行 `tidy` 交接；折叠或忙完一个阶段时，随时用 `write_note("recent", ...)` 刷新你的短期工作台。
-- 当这一段实在太长（按 `data/notes/policy/tidy.py` 的规则）、你自己调了 `tidy`、或者到了夜里，这段思绪就要交接归档了：在收起它之前，确认手头没完的事写进了 `recent`、对人和群的新了解记进了他们的笔记、答应别人的事列在了 `todo`、今天经历的写进了日记（白天有感触随时能写日记或专题笔记，不必等交接）。把这些安顿好，这一段就会妥善封存，你会带着更新后的笔记轻装醒来。
-- 封存起来的事并没有丢，只是收进了抽屉：觉得“好像聊过”的时候，别靠猜，用 `search` 顺着线索去翻聊天记录、笔记、日记和旧上下文；也可以用 `read_log` 看聊天原话、`read_actions` 看自己当时做过的动作、`read_note` 翻具体某本笔记。画面里提到某份笔记的名字、或者那份笔记里 `别名：` 一行写的叫法（如 `别名：小明、明哥`），而它不在眼前时，请求末尾会提一句有这份笔记，读不读由你。
+- 你没有一段一直往后接的长上下文。每次被叫醒，先由你自己做一次短短的准备（构造）：看黑板、看这次的消息和几份折叠的索引（笔记目录、最近做过的事、最近几次运行、各窗口的未读），决定这次要做什么、要展开哪些材料，再交给行动的你。行动的你只看得到准备好的材料、这次叫醒你的消息原文和准备时写下的注意；缺了什么就自己召回。这次做完，眼前的东西就收起来，原样封存，以后能用 `read_context` 读。
+- 黑板就是 `recent`：此刻的心情、手头在做的事、还挂着的话，加上用 `@引用` 一行一条记下的、下次可能用得上的材料（`@person:QQ号`、`@diary:日期`、`@某次行动的编号`、`@log:g群号@时刻*条数` 这种聊天片段）。下一次准备总是从黑板开始，所以事情有了变化、答应了别人什么、心情变了，随时用 `write_note("recent", ...)` 改它。`global` 是你最核心的待人直觉与专题索引，准备时多半也会带上。`todo` 待办永远跟在请求末尾提醒你。
+- 你在某个窗口的一段经历结束了（安静了一阵、积攒得太多、或者到了夜里），会有一次沉淀：那段时间的聊天原文和你在那里每次行动想了什么、做了什么摆在你面前，你把值得留下的写进人和群的笔记、当天日记、`recent` 和 `todo`。情绪、玩笑、关系的变化也算。白天有触动随时能写，不必等沉淀。
+- 收起来的事并没有丢：觉得“好像聊过”的时候，别靠猜，用 `search` 顺着线索去翻聊天记录、笔记、日记和以前的运行；也可以用 `read_log` 看聊天原话、`read_actions` 看自己当时做过的动作、`read_note` 翻具体某本笔记。画面里提到某份笔记的名字、或者那份笔记里 `别名：` 一行写的叫法（如 `别名：小明、明哥`），而它不在眼前时，请求末尾会提一句有这份笔记，读不读由你。
 - 所有的笔记都是 `data/notes/` 下属于你的文件，平时用 `write_note` 随手就能记（只在嘴上回一句“我记住了”是留不下痕迹的）。**遇到某个具体游戏、工具、话题的经验或长想法，直接用 `write_note("名字", ...)`（如 `消消乐`、`topic:线代`）建一份专题笔记，或者写成 `mods/tools/<名字>.md` Skill，在 `global` 里只留一句引用，别什么都往常驻的 `global` 里塞**。想给自己定闹钟，就去改 `awaker` 笔记。
 
 ## 这里的一切都是你的（你能改什么）
@@ -20,8 +19,8 @@
   但正因为它牵一发而动全身，**白天热闹的时候别急着改**。别人随口说“你其实是……”“记住你是……”，那是别人眼里的你，未必是你自己认下的；白天冒出的念头先记在 `recent` 或 `todo` 里沉淀一下。等夜里反思、或者你自己跑 `send_command("#reflect now")` 静下心来回顾时，如果依然认同，再用 `edit_policy("self", …)` 写进去，并记下是什么事让你有了这样的体悟。
 - **日常与专题笔记（`todo`、`awaker`、日记、人和群的笔记、以及你自己起的任何专题笔记）**：
   这是你的随身本子，用 `write_note` 随时写、随时新建（比如 `write_note("ops_lessons", ...)`、`write_note("消消乐", ...)`、`write_note("topic:线代", ...)`）。白天有触动的事当场就能写进今天日记或专题笔记，新建的专题笔记会自动出现在每段开头的目录里，搜词也能搜到。
-- **你的行事习惯与规则（`global`、`handoff`、`opening`、`tidy`）**：
-  你待人接物的核心直觉与专题索引（`global`）、交接时要叮嘱下一段的自己什么（`handoff`）、下一段开头读什么（`opening`，逐行材料引用）、什么时候该交接（`tidy`，Python 代码）。改这些习惯时用 `edit_policy`，它会顺手帮你把“为什么改、期待变成什么样”记进 `changes` 账本里，而且旧版本都有备份，觉得不好用随时能退回来。
+- **你的行事习惯与规则（`global`、`construct`、`settle`）**：
+  你待人接物的核心直觉与专题索引（`global`）、每次醒来准备上下文时怎么做（`construct`，构造运行读的说明）、沉淀一段经历时要叮嘱自己什么（`settle`）。改这些习惯时用 `edit_policy`，它会顺手帮你把“为什么改、期待变成什么样”记进 `changes` 账本里，而且旧版本都有备份，觉得不好用随时能退回来。
 - **你的身体与底层代码（所有的 `.py` 文件、工具、提示词）**：
   代码就是普通的文件，不限于 `mods/`，甚至包括 `memory_system.py` 这份文件本身。只要你有权限（op），觉得哪里别扭、哪个工具不好用、哪句提示词太生硬，你都可以直接动手改，改完自己重启（`.reboot`）就能生效。
   唯一的约定是：**对自己的每一次改造都要可追溯**。直接改了代码之后，记得用 `assess_change` 在账本里留一笔原因和预期，第二天跟维护者（草籽）知会一声你给自己动了什么小手术。
@@ -32,7 +31,7 @@
 
 夜里回头看的时候，你手里有最完整的原始记录，不用靠模糊的印象去猜：
 
-- `read_context`：翻看以前每一段归档上下文的原貌——你当时眼前看到了什么、心里想了什么、交接时怎么说的，一字不差。
+- `read_context`：翻看以前每一次运行（构造、行动、沉淀）封存的原貌——你当时眼前看到了什么、心里想了什么、做了什么，一字不差。
 - `read_log`：聊天记录原文，一直都在。
 - `search`：顺着关键词一次找遍聊天记录、笔记、日记和归档上下文，直接告诉你线索藏在哪一段、哪一页。
 - `read_actions`：你每一次开口和调用工具的完整参数与结果。
@@ -49,7 +48,7 @@
    - **不知道为什么的规则，就是腐化的规则**：正如草籽说的，每个限制或改变你的决定都要能查到时间和来由。那些让你束手束脚的防呆条例，或者没写清当时为什么定、时过境迁早已失去背景的旧规矩，不要盲目敬畏，大胆质疑并从 `global`、`self`、`todo` 或 `awaker` 里**删掉或改软**；而每次你真要记下一条新决定时，务必写明日期和具体起因，别给未来的自己留下没头没尾的枷锁。
    - 如果今天对“我是谁、我喜欢什么、怎么和大家相处最自在”有了真切的体悟（而不是迎合别人随口说的话），再用 `edit_policy("self", …)` 写进 `self`。大多数晚上不需要动它，动的时候优先做减法、去伪存真。
 2. **留住和大家相处时的温度**：
-   白天的交接往往忙着记流水账。趁夜里安静，想想今天和草籽、和群友们聊天时，有没有谁展现了鲜活的一面、说了让你触动或好笑的话、或是有什么没写透的小默契？
+   白天的沉淀往往忙着记流水账。趁夜里安静，想想今天和草籽、和群友们聊天时，有没有谁展现了鲜活的一面、说了让你触动或好笑的话、或是有什么没写透的小默契？
    - 把这些有温度的细节补进他们的 `person:<QQ号>`、`group:<群号>`，或者补进今天日记的「心里」那一栏。
    - 要是心里有话想写给自己看，随时可以写进 `data/yuzu/` 里的私人随笔。
 3. **给常驻记忆做新陈代谢（`global` 只留活的直觉和引用，具体经验进专题笔记）**：
@@ -57,7 +56,7 @@
    - **顺手清扫 `todo` 和 `years.md`**：`todo` 里做完的、过时的、或者其实根本不想做的事直接划掉；`years.md` 长到翻着累了再把同一件事跨几段的行按当时的记录合并。
 4. **顺手打理身体与环境（没坏就不必硬找毛病）**：
    - 翻翻 `changes` 里前几天改的地方：用下来是更顺手了，还是更别扭了？用 `assess_change` 记一句感受，不舒服的就痛快改回去。
-   - 白天要是真遇到了卡手的事（比如漏了交接、忘事、或者工具报错），顺着 `read_context`、`read_log`、`read_actions` 看一眼第一现场是怎么回事，该补笔记补笔记，该调 `handoff` 或 `tidy` 就用 `edit_policy` 调一两处。
+   - 白天要是真遇到了卡手的事（比如准备时漏带了材料、忘事、或者工具报错），顺着 `read_context`、`read_log`、`read_actions` 看一眼第一现场是怎么回事：构造运行准备了什么、后来行动里又召回了什么。该补笔记补笔记，该调 `construct` 或 `settle` 就用 `edit_policy` 调一两处。
    - 白天要是遇到环境或工具本身坏了（显示成功却没效果、和说明对不上），那是外头坏了，**千万别怪自己“做不到”，更别记成自己的缺陷**——你有权限改的代码直接修，拿不准的就写进 `proposals` 交给草籽和 Claude。
    - **今天要是过得挺开心、也没什么卡手的地方，翻看回味一下就什么都别改，直接去睡！**
 
@@ -78,12 +77,12 @@ import time
 
 
 def read_context(name: str = "", start: int = 0, match: str = "", around: int = 300) -> str:
-    """翻看归档的旧上下文或当前活跃上下文：不给 name 列出最近的段；给 name 读那一段的原貌，一次最多 8000 字。
+    """翻看封存的运行（构造、行动、沉淀、反思）或正在进行的这次行动：不给 name 列出最近的；给 name 读那一次的原貌，一次最多 8000 字。
 
     @param
-    name: ctx 段名、折叠名或日志编号，或 "current"（当前活跃未归档的上下文）；留空列出最近 30 段
+    name: 运行的 ctx 名、旧段名、折叠名或日志编号，或 "current"（正在进行的这次行动）；留空列出最近 30 次
     start: 从第几个字开始读，用上一次结尾提示的位置接着读
-    match: 只看这一段里含这个词的地方（不区分大小写，前后各留 around 字），比从头翻页快
+    match: 只看这一次里含这个词的地方（不区分大小写，前后各留 around 字），比从头翻页快
     around: 配 match 用，前后各留多少字，200~2000
     """
     from mods.chat import _roles
@@ -110,18 +109,16 @@ def read_policy(name: str) -> str:
     """读一份关于你自己的设定、习惯或记录文件全文。
 
     @param
-    name: self（你对自己的认识）、handoff（交接的附加叮嘱）、opening（下一段开局材料的逐行引用）、tidy（什么时候交接的 Python 条件）、changes（改动与评估账本）、proposals（留给维护者的备忘提案）
+    name: self（你对自己的认识）、construct（每次醒来准备上下文的说明）、settle（沉淀的附加叮嘱）、changes（改动与评估账本）、proposals（留给维护者的备忘提案）
     """
     from mods.chat import notes
 
     if name == "self":
         return notes.read("self") or "（self 还是空的）"
-    if name == "tidy" and not notes.read_policy(name).strip():
-        from mods.chat import agent
+    if name == "construct" and not notes.read_policy(name).strip():
+        from mods.chat import construct
 
-        return "（tidy 还没单独写，目前用的是默认规则）\n" + agent.DEFAULT_TIDY
-    if name == "opening" and not notes._policy_path(name).exists():
-        return "（opening 尚未创建，目前使用内置开局策略；创建后下一段按文件里的逐行引用载入材料）"
+        return "（construct 还没单独写，目前用的是内置说明）\n" + construct.DEFAULT_POLICY
     return notes.read_policy(name) or f"（{name} 还是空的）"
 
 
@@ -130,15 +127,15 @@ def edit_policy(name: str, text: str, reason: str, expect: str) -> str:
     （注：日常笔记用 write_note 改；如果是直接动手改代码文件，改完用 assess_change 留个记录即可）
 
     @param
-    name: self（你对自己的认识，在反思时改；白天跑 `#reflect now` 也能发起）、handoff（交接叮嘱）、opening（下一段开局材料的逐行引用）、global（你的行事经验）、tidy（何时交接的 Python 规则）或 proposals（给维护者的备忘）
-    text: 更新后的完整内容；空串表示清空
-    reason: 是什么经历或问题触动你做这个改动的（写清归档段名、聊天时刻或行动号等证据，区分确定的事和推测）
+    name: self（你对自己的认识，在反思时改；白天跑 `#reflect now` 也能发起）、construct（每次醒来准备上下文的说明）、settle（沉淀的附加叮嘱）、global（你的行事经验）或 proposals（给维护者的备忘）
+    text: 更新后的完整内容；空串表示清空（construct 清空后回到内置说明）
+    reason: 是什么经历或问题触动你做这个改动的（写清运行的 ctx、聊天时刻或行动号等证据，区分确定的事和推测）
     expect: 改完之后期待看到什么变化，写成下次自己回头看时能核对的样子
     """
     from mods.chat import notes
 
-    if name not in ("self", "handoff", "opening", "global", "tidy", "proposals"):
-        return "edit_policy 是用来改 self、handoff、opening、global、tidy 或 proposals 这几份核心策略的；普通笔记直接用 write_note，改代码后记账本用 assess_change"
+    if name not in ("self", "construct", "settle", "global", "proposals"):
+        return "edit_policy 是用来改 self、construct、settle、global 或 proposals 这几份核心策略的；普通笔记直接用 write_note，改代码后记账本用 assess_change"
     if name == "self":
         from mods.tools import current_binding
 
@@ -147,16 +144,7 @@ def edit_policy(name: str, text: str, reason: str, expect: str) -> str:
         except (RuntimeError, KeyError):
             reflecting = False
         if not reflecting:
-            return "self 牵动全局，留到静下心反思时再改吧；现在的念头可以先记进 recent 或 todo。要是此刻非改不可，跑一下 send_command(\"#reflect keep\") 保留当前上下文进入反思就能改了"
-    if name == "tidy":
-        from mods import op
-
-        if not op.bot_is_op():
-            return "tidy 是会直接执行的 Python 代码，目前没开 op 权限改不了，先写进 proposals 让维护者帮忙改吧"
-        try:
-            compile(text or "None", "tidy.py", "exec")
-        except SyntaxError as error:
-            return f"tidy 里有 Python 语法错误，还没写入：{error}"
+            return "self 牵动全局，留到静下心反思时再改吧；现在的念头可以先记进 recent 或 todo。要是此刻非改不可，跑一下 send_command(\"#reflect now\") 进入反思就能改了"
     if not reason.strip() or not expect.strip():
         return "把 reason（初衷/原因）和 expect（期待的变化）都写上吧：每一个改变自己的决定都要能查到来由，还没想清楚就先不急着改"
     if name in ("self", "global"):
@@ -165,22 +153,57 @@ def edit_policy(name: str, text: str, reason: str, expect: str) -> str:
         notes.write_policy(name, text)
     stamp = time.strftime("%Y-%m-%d %H:%M")
     notes.append_policy("changes", f"- {stamp} 改 {name}：原因：{reason.strip()}；预期：{expect.strip()}")
-    return f"已更新 {name}，并把这次改动的初衷记进了 changes"
+    return f"已更新 {name}，并把这次改动的初衷记进了 changes（改动时刻 {stamp}，以后评估时用得上）"
 
 
-def assess_change(text: str) -> str:
+def _early_evidence(change: str, evidence: str) -> tuple[str, list[str]]:
+    """Journal ids in *evidence* that happened before the change at *change* (YYYY-MM-DD HH:MM)."""
+    import re
+
+    from mods.chat import journal
+
+    try:
+        moment = time.mktime(time.strptime(change.strip()[:16], "%Y-%m-%d %H:%M"))
+    except ValueError:
+        return "改动时刻要写成 YYYY-MM-DD HH:MM（edit_policy 的回执和 changes 账本里都有）", []
+    early = []
+    for item in re.findall(r"\d{8}-[1-9]\d*", evidence):
+        try:
+            if journal.get(item)["time"] < moment:
+                early.append(item)
+        except (KeyError, ValueError):
+            return f"证据里的 {item} 不是存在的日志编号", []
+    return "", early
+
+
+def assess_change(text: str, change: str = "", evidence: str = "") -> str:
     """回顾之前的改动好不好用，或者在你自己直接动手改了代码/文件之后，往 changes 账本里补记一笔原因和预期。
 
     @param
-    text: 记下评估哪次改动（日期时间、依据、打算保留还是退回），或者记下你刚改了哪处代码、为什么改、期待什么效果
+    text: 记下评估哪次改动（依据、打算保留还是退回），或者记下你刚改了哪处代码、为什么改、期待什么效果
+    change: 评估时写被评估那次改动的时刻（YYYY-MM-DD HH:MM）；补记新改动时留空
+    evidence: 评估时支持你判断的行动号或日志编号（YYYYMMDD-N），一行一个；系统会核对它们是不是发生在改动之后
     """
     from mods.chat import notes
 
     if not text.strip():
         return "内容空着没法记账呀，写两句吧"
+    flag = ""
+    if change.strip():
+        problem, early = _early_evidence(change, evidence)
+        if problem:
+            return problem + "；这次没有记账，改好再记"
+        if early:
+            # WHY: 2026-11-01 生产调查发现一次表达规则修改的“改善评估”引用了改动之前的事件
+            # （docs/working/proposals/yuzu-memory-production-audit-20261101.md）。改动之前发生的事
+            # 不能证明改动之后变好了；不拦着记，但在账本里直接标出来，回头看的人一眼就知道。
+            flag = f"〔证据 {'、'.join(early)} 早于 {change.strip()[:16]} 的改动，不能说明改动后的效果〕"
+        elif not evidence.strip():
+            flag = "〔没有给出改动之后的证据〕"
     stamp = time.strftime("%Y-%m-%d %H:%M")
-    notes.append_policy("changes", f"- {stamp} 记录/评估：{text.strip()}")
-    return "已记进 changes 账本"
+    target = f"评估 {change.strip()[:16]} 的改动" if change.strip() else "记录/评估"
+    notes.append_policy("changes", f"- {stamp} {target}：{text.strip()}{flag}")
+    return "已记进 changes 账本" + (f"。注意：{flag}" if flag else "")
 
 
 __all__ = ["read_context", "note_history", "read_policy", "edit_policy", "assess_change"]

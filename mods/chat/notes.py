@@ -1,10 +1,11 @@
 """Plain Markdown notes she keeps.
 
 ``self`` is who she is (it replaced the old persona prompt), ``global`` how
-she does things (procedural memory), ``recent`` what is
-going on right now (short-term memory), ``todo`` what is still open, ``awaker``
+she does things (procedural memory), ``recent`` the blackboard: what is
+going on right now plus ``@ref`` lines for the next construct run (2026-11-01),
+``todo`` what is still open, ``awaker``
 when she wakes herself, one note per person and per group what she knows and
-what happened with them, and ``diary:<day|month|year>`` the diary each handoff
+what happened with them, and ``diary:<day|month|year>`` the diary each settle
 rewrites for its day.
 
 WHY: 2026-10-22 维护者："能用普通文件的不搞复杂系统"。这些都是她随时能读写的普通
@@ -33,10 +34,11 @@ _lock = threading.RLock()
 # WHY: 2026-10-26 维护者指出：以前 _SCOPE 只许写死的那几种名字，她没法随手建专题笔记，只好把什么都往
 # global 里塞。现在放开任意名字或「分类:名字」（如 消消乐、topic:线代），同时守住 person:/group: 必须用
 # 号码、diary: 必须用日期、years 与 policy 不走普通笔记。
+# WHY: 2026-11-01：log: 是引用聊天记录区间的写法（segment.resolve_refs），不能同时是笔记名。
 _NAME = r"[0-9A-Za-z_\u4e00-\u9fff-]+"
 _SCOPE = re.compile(
     rf"^(?:(?!years$|policy$){_NAME}|person:\d+|group:\d+|diary:\d{{4}}(?:-\d{{2}}(?:-\d{{2}})?)?"
-    rf"|(?!person:|group:|diary:|policy:|years:){_NAME}:{_NAME})$"
+    rf"|(?!person:|group:|diary:|policy:|years:|log:){_NAME}:{_NAME})$"
 )
 
 
@@ -165,20 +167,22 @@ def read_version(scope: str, version: str) -> str:
     return target.read_text(encoding="utf-8") if target.is_file() else ""
 
 
-# WHY: 策略文件是她在反思里能改的那一层（2026-10-22）：handoff 是她给交接写的附加说明，
-# tidy 是什么时候交接的 Python 条件，changes 是每次改动的原因、预期和事后评估，
-# proposals 是要维护者动手的改动；开局材料由 opening 选择，长度与增长由 tidy/pressure 判断。
-POLICIES = ("handoff", "tidy", "opening", "changes", "proposals")
+# WHY: 策略文件是她在反思里能改的那一层（2026-10-22）：changes 是每次改动的原因、预期和事后评估，
+# proposals 是要维护者动手的改动。2026-11-01 起没有交接和整段压力：construct 是每次唤醒前
+# 构造上下文的说明，settle 是她给沉淀写的附加说明（原 handoff）；tidy.py 与 opening 不再读取。
+POLICIES = ("construct", "settle", "changes", "proposals")
 
 
 def _policy_path(name: str) -> Path:
     if name not in POLICIES:
         raise ValueError("策略文件只有 " + "、".join(POLICIES))
-    path = ROOT / "policy" / (name if name == "opening" else f"{name}.py" if name == "tidy" else f"{name}.md")
-    old = ROOT / "policy" / "librarian.md"
-    if name == "handoff" and not path.exists() and old.is_file():
-        # 以前给图书管理员的附加说明，现在给交接；第一次读到时改名。
-        os.replace(old, path)
+    path = ROOT / "policy" / f"{name}.md"
+    if name == "settle" and not path.exists():
+        # 给交接（更早是图书管理员）写的附加说明，现在给沉淀；第一次读到时改名。
+        for old in (ROOT / "policy" / "handoff.md", ROOT / "policy" / "librarian.md"):
+            if old.is_file():
+                os.replace(old, path)
+                break
     return path
 
 
@@ -188,7 +192,7 @@ def read_policy(name: str) -> str:
 
 
 def write_policy(name: str, text: str) -> str:
-    return _replace(_policy_path(name), text, keep_empty=name == "opening")
+    return _replace(_policy_path(name), text)
 
 
 def append_policy(name: str, line: str) -> None:

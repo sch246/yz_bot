@@ -35,7 +35,7 @@ def write(state, operation, *args, **kwargs):
 
 def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
         stop=None, timeout=None, state=None, prepare=None, hints=(),
-        on_output=None, after_round=None, effort=None, grant=()) -> tuple[str, str]:
+        on_output=None, after_round=None, effort=None, grant=(), functions=None) -> tuple[str, str]:
     """Execute and record one purpose, returning its ctx and assistant text.
 
     ``items`` are journal ids or original message dictionaries. A supplied main
@@ -46,6 +46,7 @@ def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
     and background archiving finishes; timeout does not promise an immediate freeze.
     ``prepare(state)`` may append durable sources and return more source dicts
     to append after the tool announcement. It runs before every actual request.
+    ``functions``, when given, is the exact set of tool names this run may see.
     """
     import mods.chat as chat
 
@@ -80,12 +81,12 @@ def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
             return segment.append(view, persist=persist, **source)
 
     def execute():
-        # WHY: copy_context can carry a parent's wake into fork or observer.
+        # WHY: copy_context can carry a parent's wake into fork or construct.
         # Clearing explicitly is what keeps their tools from ending that wake.
         token = _wake.set(state if kind == "main" else None)
         previous_event, previous_mode = context.current(), context.agent_mode()
         context.set_current(None)
-        context.set_agent_mode(kind in {"main", "handoff", "reflect"})
+        context.set_agent_mode(kind in {"main", "settle", "reflect"})
         ledger = image.begin_conversation()
         try:
             chat.inc_call_count()
@@ -99,7 +100,7 @@ def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
             session.hint_role = "system"
             configured_effort = effort if effort is not None else chat.get_reasoning_effort()
             session.reasoning_effort = None if configured_effort == "default" else configured_effort
-            central = kind in {"main", "handoff", "reflect"}
+            central = kind in {"main", "settle", "reflect"}
             binding = None
             if tools:
                 prior = segment.derive(view)["tool_state"]
@@ -110,6 +111,7 @@ def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
                     persist=chat._persist_modules if central else None,
                     schema_modules=list((prior or {}).get("schemas", {})) if central else (),
                     kind=kind, grant=grant,
+                    function_visible=(lambda name, _tool: name in functions) if functions is not None else None,
                 )
                 binding["run"] = state
                 state["binding"] = binding
@@ -127,7 +129,7 @@ def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
 
             head = [*chat.get_prompt(), *chat._view._base_prompt(),
                     {"role": "system", "content": "你是唯一的中心 agent；窗口只是来源与明确发送目标。"}]
-            if kind in {"observer", "summary"}:
+            if kind == "summary":
                 head = []
 
             def assemble():
@@ -160,7 +162,7 @@ def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
                     source = segment.begin_act(view, assistant, persist=persist, run_kind=kind, model=session.model)
                     state["last"], state["act"] = assistant, source
                     state["output_count"] += 1
-                    state["log"]["acts"] += sum(call.get("function", {}).get("name") != "dismiss" for call in calls)
+                    state["log"]["acts"] += len(calls)
                     if state.pop("reported", None) is not None:
                         view["stats"]["tokens"] = [state["last_usage"], len(segment.render(view))]
                     if on_output is not None:
@@ -218,9 +220,9 @@ def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
                 session.add_hint(hint)
             session.add_hint(lambda: f"现在是 {chat._screen.clock()}。")
             session.add_hint(f"【本次目的】{goal}")
-            # WHY: observer is an internal assistant; its live words must not
-            # become the central agent's terminal self-talk (2026-10-29).
-            session.chat(recall_func=collect, stream=kind != "observer")
+            # WHY: the construct run (formerly observer) prepares context; its live
+            # words must not become the central agent's terminal self-talk (2026-10-29).
+            session.chat(recall_func=collect, stream=kind != "construct")
             if state.get("failure"):
                 raise state["failure"]
         finally:
