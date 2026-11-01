@@ -289,8 +289,12 @@ def _confirm(wake):
     patches = wake.get("request_patches", [])
     _screen.commit_read(patches)
     confirmed = {patch["window"]: set(patch["records"]) for patch in patches}
-    done = [job for job in wake["claims"] if not job["record_ids"] or
-            set(job["record_ids"]) <= confirmed.get(_windows.label(job["window"]), set())]
+    acting = wake.get("acting", set())
+    # WHY: 一步只做一件以后（设计文档第 18 节），没有消息号的召唤（闹钟、循环、命令）只能由
+    # 负责它窗口或 me 的行动消掉；以前任何一次行动有输出都会把它们一并消掉，别的事就丢了。
+    done = [job for job in wake["claims"]
+            if (not job["record_ids"] and (tuple(job["window"]) in acting or _windows.ME in acting))
+            or job["record_ids"] and set(job["record_ids"]) <= confirmed.get(_windows.label(job["window"]), set())]
     attention.ack(done)
     ids = {job["id"] for job in done}
     wake["claims"][:] = [job for job in wake["claims"] if job["id"] not in ids]
@@ -299,6 +303,7 @@ def _confirm(wake):
 def _act(wake, spec, model=None):
     """Run one spec: its references, its note, and the screens of its windows."""
     windows = set(spec["windows"])
+    wake["acting"] = windows
     items = list(spec["items"])
     extra = [text for text in (
         f"【准备这次上下文时注意到】\n{spec['note']}" if spec.get("note") else "",

@@ -59,9 +59,10 @@ DEFAULT_POLICY = """你现在不回应任何人，只为接下来的自己准备
    - 情绪：对方话里的情绪，你自己的情绪；
    - 意外：上一轮的报错、碰壁、结果和预期不一样。
    只说注意到的，不说教，不替行动的你决定怎么做。
-5. 一次唤醒里有几件互不相干的事（比如两个窗口各有人找你），就调用几次 assemble，各交一份；同一件事交一份。
-   windows 写这份规格负责回应的窗口（g群号、u对端号；闹钟、循环、命令写 me）。漏掉的被叫醒窗口，系统会补一份没经过构造的默认规格。
-6. 提交完就结束。你在这里不发言、不写笔记。
+5. 只交一份：从等着你的事里选现在最该做的那一件（谁在等、等了多久、轻重缓急、和手头的事连不连得上）。
+   同一个窗口里同时发生的几件事算一件。没选的留在队里，做完这件你会再被叫起来重新选，期间新到的也一起排。
+   windows 写这份规格负责回应的窗口（g群号、u对端号；闹钟、循环、命令写 me），至少要有一个是等着你的。
+6. 交完这一份就结束了。你在这里不发言、不写笔记。
 """
 
 
@@ -227,7 +228,10 @@ def material(wake: dict) -> list[dict]:
     board = text or "（黑板是空的）"
     if refs:
         board += "\n\n引用展开前是这样：\n" + "\n".join(f"@{ref} —— {fold(ref)}" for ref in refs)
+    now = time.time()
     reasons = "\n".join(f"{_windows.title(tuple(job['window']))} {job['kind']}：{job['reason']}"
+                        + (f"（等了 {_waited(now - job['event']['time'])}）"
+                           if isinstance((job.get("event") or {}).get("time"), (int, float)) else "")
                         for job in wake["claims"]) or "（没有记录原因）"
     screens = _screens(wake["associated_windows"], chat.limit()[0])
     mentioned = [scope for scope, _word in _notes.mentioned(screens)]
@@ -242,8 +246,14 @@ def material(wake: dict) -> list[dict]:
                                       "最近你做过的事：\n" + timeline()
                                       + "\n\n最近几次运行：\n" + recent_runs()
                                       + "\n\n" + windows_status(wake["associated_windows"])},
-        {"role": "user", "content": "【这次唤醒】\n" + reasons + "\n\n" + (screens or "（没有新消息）") + crumbs},
+        {"role": "user", "content": "【等着你的（这一步只选一件做，其余留到下一步）】\n" + reasons + "\n\n"
+                                    + (screens or "（没有新消息）") + crumbs},
     ]
+
+
+def _waited(seconds: float) -> str:
+    minutes = int(max(seconds, 0) // 60)
+    return f"{minutes // 60} 小时 {minutes % 60} 分" if minutes >= 60 else f"{minutes} 分钟" if minutes else "不到一分钟"
 
 
 def _tier(ref: str) -> int:
@@ -311,7 +321,7 @@ def build(wake: dict, model: str | None = None) -> list[dict]:
                  effort=None if effort == "default" else effort, prepare=prepare)
     except TimeoutError:
         _roles._stream.warning("构造运行超时，这次按黑板和消息直接行动")
-        return [fallback(claimed, "构造运行超时")] if state["specs"] == [] else _cover(state["specs"], claimed, wake)
+        return [fallback(claimed, "构造运行超时")] if state["specs"] == [] else state["specs"][:1]
     except Exception as error:
         if wake["cancelled"]:
             return []
@@ -321,17 +331,10 @@ def build(wake: dict, model: str | None = None) -> list[dict]:
         return []
     if not state["specs"]:
         return [fallback(claimed, "构造运行没有提交规格")]
-    return _cover(state["specs"], claimed, wake)
-
-
-def _cover(specs: list[dict], claimed: list, wake: dict) -> list[dict]:
-    covered = {window for spec in specs for window in spec["windows"]}
-    missing = [window for window in claimed if window not in covered]
-    if missing:
-        specs = [*specs, fallback(missing, "构造运行没有为这些窗口交规格")]
-    # 被 @、戳一戳和私聊的先回应；其余保持构造运行提交的先后（sorted 是稳定的）。
-    called = {tuple(job["window"]) for job in wake["claims"] if job["kind"] in ("mention", "private", "poke")}
-    return sorted(specs, key=lambda spec: not called.intersection(spec["windows"]))
+    # WHY: 2026-11-01 维护者：每一步首先是“现在该干什么”，选先做哪件也是她的一个操作，
+    # 而且是全局串行的（设计文档第 18 节）。没选中的召唤不补兜底规格，这一步结束时放回
+    # 队列，读线程再起一次构造重新选；以前一次排完、按代码定的顺序跑到底。
+    return state["specs"][:1]
 
 
 def submit(state: dict, goal: str, refs: str, note: str, windows: str) -> str:
@@ -344,17 +347,22 @@ def submit(state: dict, goal: str, refs: str, note: str, windows: str) -> str:
         targets = [_windows.parse(value) for value in labels]
     except ValueError as error:
         return f"windows 写错了：{error}"
+    if state["specs"]:
+        return "这一步已经交过一份了。只做一件事；其余的留在队里，做完会再叫你选"
     claimed = state.get("associated_windows") or set()
     if not targets:
-        targets = [window for window in claimed
-                   if window not in {one for spec in state["specs"] for one in spec["windows"]}]
+        targets = list(claimed)
+    if claimed and not claimed.intersection(targets):
+        # 每一步都要处理掉一件等着的事，否则队列不会变短，会一直被叫起来重选同一批。
+        return "这份规格没有负责任何等着你的窗口；从等着的事里选一件，windows 写它的窗口"
     ref_lines = sorted((line.strip() for line in str(refs).splitlines() if line.strip()), key=_tier)
     items, bad = _resolve(ref_lines, state["view"])
     if bad:
         return "这些引用读不出来，改好再交一次（这份没有记下）：" + "、".join(bad)
     state["specs"].append({"goal": goal, "items": items, "note": annotate(str(note).strip()),
                            "windows": targets, "refs": ref_lines, "ctx": state["view"]["ctx"], "fallback": ""})
-    return (f"已记下第 {len(state['specs'])} 份：{goal}（{len(items)} 条材料，负责 "
+    state["end"] = True  # one spec per step: the construct run ends with this batch of calls
+    return (f"已记下：{goal}（{len(items)} 条材料，负责 "
             + ("、".join(_windows.label(window) for window in targets) or "无窗口") + "）")
 
 
