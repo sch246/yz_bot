@@ -152,6 +152,14 @@ def compress_projection(message):
     return result
 
 
+def first_call_id(message):
+    calls = message.get("tool_calls")
+    if not isinstance(calls, list) or not calls or not isinstance(calls[0], dict):
+        return None
+    value = calls[0].get("id")
+    return value if isinstance(value, str) and value else None
+
+
 def context_matches(original, old):
     value = compress_projection(original)
     # The old runner deleted previous thinking in drop mode; its oplog can
@@ -279,6 +287,7 @@ class Import:
         self.sources = {}
         self.events = []
         self.outputs = {}
+        self.action_candidates = {}
         self.returns = defaultdict(list)
         self.pending = {}
         self.arrivals = {}
@@ -718,8 +727,21 @@ class Import:
         return label, found
 
     def act_match(self, message, path, index, *, strict):
+        if strict not in self.action_candidates:
+            # WHY: 生产副本 dry-run 连续采样落在归档匹配的全量 JSON clone；首 call id
+            # 不受 compress 投影或缺字段补全影响。仍先校验本 strict 范围全部投影，不能
+            # 因坏 function 与当前候选不同桶，就把旧脚本会报的损坏隐藏掉。
+            buckets = defaultdict(list)
+            for eid in self.outputs:
+                row = self.rows[eid]
+                if strict and row.get("legacy_window") != ["agent", 0]:
+                    continue
+                source = row["messages"][0]
+                compress_projection(source)
+                buckets[first_call_id(source)].append(eid)
+            self.action_candidates[strict] = buckets
         candidates = []
-        for eid in self.outputs:
+        for eid in self.action_candidates[strict].get(first_call_id(message), ()):
             row = self.rows[eid]
             if strict and row.get("legacy_window") != ["agent", 0]:
                 continue
