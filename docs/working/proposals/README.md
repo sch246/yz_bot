@@ -16,8 +16,9 @@
 - [注意力的整理：分层前缀、潜意识与分支](attention-and-subconscious.md)（历史研究与实验；当前 dismiss/fold/压力机制由[最终规格](../tasks/chat-core-rewrite/spec.md)替代，分支研究未因此实现）
 - [长期记忆离线回放实验](memory-replay-evaluation.md)（实施中；现分开验证系统是否允许运行中产生的改进被后续真实消费，以及怎样通过可逆重放形成实践反馈；固定召回指标只作诊断，所有发送与运行数据隔离）
 - [记忆估值与索引演进](memory-valuation-and-index-evolution.md)（研究提案；把 MDL、压缩进步、结构可达、实际路径和使用结果作为需要分别解释的派生观察，先离线校准，不自动晋级、淡出或删除记忆）
-- [记忆与自我演化研究地图](memory-and-self-evolution-research.md)（外部研究记录，不是运行合同；区分论文证据、本项目迁移推论和适用边界，串起长期记忆、经验 Skill、任务层学习与元层改进；2026-11-01 增补按需组装、事件切分、延迟整理、召回后重整与治理恢复的新工作，多为摘要级，待正文复核）
-- [GAM 与 Nemori 源码对照](gam-nemori-source-reading.md)（2026-11-01 只读源码；GAM 的召回循环与目录式记忆、Nemori 的交错切分与 predict-calibrate，逐项对照柚子的笔记、目录与召回；留下需用生产数据和论文正文回答的问题）
+- [记忆与自我演化研究地图](memory-and-self-evolution-research.md)（外部研究记录，不是运行合同；2026-11-01 复核 RecMem、REALM、LycheeMemory V2、Sleep-time Compute、SSGM 正文与附录，以及 Always-On 的指定章节，修正机制、数字和证据边界；GAM／Nemori 由同轮论文对照更新，其余未复核项保留原阅读状态）
+- [GAM 与 Nemori 源码对照](gam-nemori-source-reading.md)（2026-11-01 源码与论文核对；完整读取 GAM v1、Nemori v3／v4，补消融与版本差异，纠正页头、问题变化、情绪过滤及来源保留的过强判断）
+- [柚子长期记忆的生产数据调查](yuzu-memory-production-audit-20261101.md)（2026-11-01 只读调查；十日工具计数、搜索失败后的动作、目录入口、三组写入与冲突、三天群聊样本；记录措辞漏检与效果自评的时间异常，未运行模型对照或修改生产）
 - [QQ Bot 持久记忆实现调查](qqbot-persistent-memory-research.md)（公开源码调查；复核 SLA 收录，区分视频 QQ-agent、dsh-qqbot 与宿主机制，记录 Bili Note 的持久安装与字幕覆盖限制）
 - [记忆、预测与统一事件流：基础问题讨论](memory-foundations-discussion.md)（讨论记录，不批准实现；保留预测、编码器、二阶惊奇与可达性的工作假设；2026-10-08 第十四节记录全文补读后的变化：条件推断、表征持续、潜在情境信用与学会推断；2026-10-28 第十五节记录第一性原理对谈：认知物理类比、目的论信息论与多尺度探测算子，未替维护者决定结构）
 - [上下文、预测与通透](context-prediction-and-permeability.md)（2026-10-29 至 31 讨论记录；从预测、确信／阴与通透／阳，续至组合缓存、必要串行、范围内穷尽与感性表达；新增当下上下文的准备、召回前后计算，以及修正的改善证据、累积代价、异常察觉与问题定位，保留原话和开放问题，未决定实现）
