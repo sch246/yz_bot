@@ -163,6 +163,79 @@ def context_matches(original, old):
     return value == old
 
 
+def legacy_tool_frame(body):
+    """The aa7c597 tools announcement frame, independent of the live registry."""
+    return "<system-reminder>\n" + body.replace("</system-reminder>", "<\\/system-reminder>") + "\n</system-reminder>"
+
+
+def legacy_tool_content(encoded, expected):
+    # A literal close and an already escaped close have the same framed text.
+    # Only a digest-proven body is usable; unsupported mixed escapes stay blocked.
+    candidates = {encoded, encoded.replace("<\\/system-reminder>", "</system-reminder>")}
+    found = [body for body in candidates if hashlib.sha256(body.encode()).hexdigest() == expected
+             and legacy_tool_frame(body) == "<system-reminder>\n" + encoded + "\n</system-reminder>"]
+    return found[0] if len(found) == 1 else None
+
+
+def recover_initial_tool_state(full, delta, after):
+    """Prove a full announcement's state across exactly one active-module addition."""
+    # WHY: aa7c597 的 full 只写目录和非空模块正文，不写 schemas 摘要；不能从全文
+    # 猜快照。只有完整 single-add delta 及正文摘要均通过旧模板验证，才沿用 after 的
+    # catalog/schemas 和未变 active；正文里的伪标题不构成状态证据。
+    if not isinstance(after, dict) or set(after) != {"catalog", "active", "schemas"}:
+        return None
+    if any(not isinstance(after[key], dict) or any(not isinstance(name, str) or not isinstance(value, str)
+           for name, value in after[key].items()) for key in after):
+        return None
+    if any(not re.fullmatch(r"[0-9a-f]{64}", value) for key in ("active", "schemas") for value in after[key].values()):
+        return None
+    opening, closing = "<system-reminder>\n", "\n</system-reminder>"
+    if not all(text.startswith(opening) and text.endswith(closing) for text in (full, delta)):
+        return None
+    full_body, delta_body = (text[len(opening):-len(closing)] for text in (full, delta))
+    empty = hashlib.sha256(b"").hexdigest()
+    found = []
+    for added, expected in after["active"].items():
+        change = f"工具模块状态变化（本条由系统追加，不是用户发言）：\n- 已激活模块 {added}：新增"
+        content = "" if expected == empty and delta == legacy_tool_frame(change) else None
+        prefix = legacy_tool_frame(change + f"\n\n## 已激活模块 {added}\n")[len(opening):-len(closing)]
+        if delta_body.startswith(prefix):
+            content = legacy_tool_content(delta_body[len(prefix):], expected)
+        if content is None or delta != legacy_tool_frame(change + (f"\n\n## 已激活模块 {added}\n{content}" if content else "")):
+            continue
+        before = clone(after)
+        del before["active"][added]
+        catalog = "\n".join(["## 可用工具模块", *(
+            [f"- {name}: {description}" for name, description in before["catalog"].items()] or ["- (无)"])])
+        encoded_catalog = legacy_tool_frame(catalog)[len(opening):-len(closing)]
+        if not full_body.startswith(encoded_catalog):
+            continue
+        remaining = full_body[len(encoded_catalog):]
+        names = sorted(name for name, version in before["active"].items() if version != empty)
+        contents = {}
+        for index, name in enumerate(names):
+            header = f"\n\n## 已激活模块 {name}\n"
+            if not remaining.startswith(header):
+                break
+            remaining = remaining[len(header):]
+            if index + 1 == len(names):
+                ends = [len(remaining)]
+            else:
+                next_header = f"\n\n## 已激活模块 {names[index + 1]}\n"
+                ends = [match.start() for match in re.finditer(re.escape(next_header), remaining)]
+            matches = [(end, body) for end in ends
+                       if (body := legacy_tool_content(remaining[:end], before["active"][name])) is not None]
+            if len(matches) != 1:
+                break
+            end, contents[name] = matches[0]
+            remaining = remaining[end:]
+        else:
+            rendered = catalog + "".join(f"\n\n## 已激活模块 {name}\n{contents[name]}" for name in names)
+            if not remaining and legacy_tool_frame(rendered) == full:
+                found.append(before)
+    return found[0] if len(found) == 1 else None
+
+
 @contextmanager
 def isolated(root, agent=None):
     """Use pure module APIs with an explicit root, without loading storage."""
@@ -708,6 +781,9 @@ class Import:
         latest_notes = {}
         screen_rows = []
         tool_rows = []
+        tool_pair = None
+        tool_gap = False
+        tool_anchors = []
         active_act = None
         for index in range(len(messages) + 1):
             mark = marks_by_index.get(index)
@@ -745,6 +821,14 @@ class Import:
                 folded = self.read(archive_path)
                 if not isinstance(folded, dict):
                     raise Blocked("fold-source-missing", path, index)
+                # WHY: 旧 fold_since/between 会回退父 told，不能把子归档的末尾公告
+                # 接到父快照上。生产缺口是 full→单 active 新增，紧接 fold 的首个
+                # mark.told 才是近端 after 证据；保留局部关联，且不跨先前 fold 推断。
+                fold_marks = folded.get("marks")
+                first = fold_marks[0] if isinstance(fold_marks, list) and fold_marks else None
+                if envelope and tool_pair and not tool_gap and isinstance(first, dict) and first.get("index") == 0:
+                    tool_anchors.append((*tool_pair, clone(first.get("told"))))
+                tool_gap = True
                 self.folded[fold_name] = True
                 covered = self.convert_context(folded, fold_name, str(archive_path.relative_to(self.root)), strict=strict,
                                                inherited=wake_id, owner=owner,
@@ -823,13 +907,23 @@ class Import:
             if eid is None:
                 eid = self.add(kind, owner, [message], stamp=stamp, **metadata)
                 if metadata.get("legacy_tool_announcement"):
+                    tool_pair = (tool_rows[-1], eid) if tool_rows and not tool_gap else None
                     tool_rows.append(eid)
+                    tool_gap = False
             view["items"].append(eid)
         if envelope:
             if data.get("told") is not None:
                 if not tool_rows:
                     raise Blocked("tool-announcement-missing", path)
                 self.rows[tool_rows[-1]]["tool_state"] = clone(data["told"])
+            for earlier, later, anchor in tool_anchors:
+                before, after = self.rows[earlier], self.rows[later]
+                # Old state_text includes every catalog/active/schema change. The complete
+                # delta and full frame must agree with this anchor and the final local state.
+                if "tool_state" not in before and after.get("tool_state") == anchor:
+                    recovered = recover_initial_tool_state(plain(before["messages"][0]), plain(after["messages"][0]), anchor)
+                    if recovered is not None:
+                        before["tool_state"] = recovered
             for eid in tool_rows:
                 if "tool_state" not in self.rows[eid]:
                     raise Blocked("intermediate-tool-state-unrecoverable", path, self.rows[eid]["source"]["message"])
