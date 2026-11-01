@@ -151,9 +151,12 @@ def annotate(text: str) -> str:
 
 def directory(most: int = 80) -> str:
     rows = _notes.listing(limit=10**6)
-    lines = [f"- {item['scope']}：{item['first']}" for item in rows[:most]]
+    # WHY: 选哪些仍按修改时间（最近动过的优先），显示按名字排：按修改时间显示时每写一次
+    # 笔记顺序就变，整份目录连同后面的内容都进不了缓存（2026-11-01）。
+    shown = sorted(rows[:most], key=lambda item: item["scope"])
+    lines = [f"- {item['scope']}：{item['first']}" for item in shown]
     if len(rows) > most:
-        lines.append(f"（还有 {len(rows) - most} 份，按修改时间排在后面；用 search 或 read_note 找）")
+        lines.append(f"（还有 {len(rows) - most} 份不常动的没列出；用 search 或 read_note 找）")
     return "\n".join(lines) or "（还没有笔记）"
 
 
@@ -229,16 +232,37 @@ def material(wake: dict) -> list[dict]:
     screens = _screens(wake["associated_windows"], chat.limit()[0])
     mentioned = [scope for scope, _word in _notes.mentioned(screens)]
     crumbs = ("\n\n画面提到了这些有笔记的东西：" + "、".join(dict.fromkeys(mentioned))) if mentioned else ""
+    # WHY: 2026-11-01 缓存按字节前缀命中，按变化快慢排：策略和目录几乎不变，黑板随沉淀改写，
+    # 时间线和运行列表每次都变。以前黑板排在目录前面，构造首轮只命中两成。
     return [
         {"role": "system", "content": policy()},
+        {"role": "system", "content": "【笔记目录（折叠的，要用就写进 refs）】\n" + directory()},
         {"role": "system", "content": "【黑板 recent】\n" + board},
-        {"role": "system", "content": "【索引（都是折叠的，要用就写进 refs）】\n"
-                                      "笔记目录：\n" + directory()
-                                      + "\n\n最近你做过的事：\n" + timeline()
+        {"role": "system", "content": "【最近（折叠的，要用就写进 refs）】\n"
+                                      "最近你做过的事：\n" + timeline()
                                       + "\n\n最近几次运行：\n" + recent_runs()
                                       + "\n\n" + windows_status(wake["associated_windows"])},
         {"role": "user", "content": "【这次唤醒】\n" + reasons + "\n\n" + (screens or "（没有新消息）") + crumbs},
     ]
+
+
+def _tier(ref: str) -> int:
+    """Where a ref goes in an act's context: things that rarely change first.
+
+    WHY: 2026-11-01 缓存按字节前缀命中。构造写 refs 的顺序随手，两次行动带了同样的
+    global 和人物笔记，顺序不同也对不上前缀。笔记之间先后没有含义，按变化快慢排；同一档
+    保持她写的顺序，日志、运行和聊天记录排最后且不打乱，它们的先后可能就是时间顺序。
+    """
+    if ref == "global":
+        return 0
+    if (journal._ID.fullmatch(ref) or ref.startswith("log:") or re.fullmatch(r"#?\d+(\.\d+)?", ref)
+            or re.match(r"\d{8}-\d{6}", ref)):  # a run's ctx
+        return 4
+    if ref in ("recent", "todo") or ref.startswith("diary:"):
+        return 3
+    if ref.startswith(("person:", "group:")):
+        return 2
+    return 1
 
 
 def _resolve(refs, lookup) -> tuple[list[str], list[str]]:
@@ -324,7 +348,7 @@ def submit(state: dict, goal: str, refs: str, note: str, windows: str) -> str:
     if not targets:
         targets = [window for window in claimed
                    if window not in {one for spec in state["specs"] for one in spec["windows"]}]
-    ref_lines = [line.strip() for line in str(refs).splitlines() if line.strip()]
+    ref_lines = sorted((line.strip() for line in str(refs).splitlines() if line.strip()), key=_tier)
     items, bad = _resolve(ref_lines, state["view"])
     if bad:
         return "这些引用读不出来，改好再交一次（这份没有记下）：" + "、".join(bad)

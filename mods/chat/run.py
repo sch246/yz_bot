@@ -145,12 +145,18 @@ def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
                     writable(dispatch=True)
                     if binding is not None:
                         tool_modules.reconcile(binding)
-                        previous = segment.derive(view)["tool_state"]
+                        previous = segment.own_tool_state(view) if own_view else segment.derive(view)["tool_state"]
                         snapshot = tool_modules.state_snapshot(binding)
                         if snapshot != previous:
                             text = tool_modules.state_text(binding, previous)
-                            append({"kind": "system", "messages": [{"role": "system", "content": text}],
-                                    "tool_state": snapshot})
+                            added = append({"kind": "system", "messages": [{"role": "system", "content": text}],
+                                            "tool_state": snapshot})
+                            if previous is None and own_view:
+                                # WHY: 2026-11-01 切到无状态后缓存命中从 96% 掉到 80%：这份约 8k token
+                                # 的完整工具宣告跨运行不变，却排在本次的材料和目的之后，每次运行都
+                                # 重新计费。只在第一次请求前挪到最前，之后的请求仍是追加。
+                                view["items"].remove(added)
+                                view["items"].insert(0, added)
                     for source in sources or ():
                         append(source)
                     session.messages[:] = [*head, *segment.render(view, reasoning=chat.get_reasoning_mode(),

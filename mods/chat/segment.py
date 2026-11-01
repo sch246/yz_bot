@@ -297,6 +297,19 @@ def render(view, *, reasoning="keep", mark_borrowed=False):
     return result
 
 
+def own_tool_state(view):
+    """The tool state this view announced itself; borrowed rows do not count.
+
+    WHY: run puts its first announcement before borrowed refs, so the last
+    tool_state in the view may belong to a borrowed row rather than to this run.
+    """
+    found = None
+    for row in _entries(view):
+        if row["ctx"] == view["ctx"] and "tool_state" in row:
+            found = row["tool_state"]
+    return found
+
+
 def derive(view):
     visible = _entries(view)
     all_rows = _entries(view, deep=True)

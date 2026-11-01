@@ -25,6 +25,7 @@ from . import journal, notes as _notes, roles as _roles, screen as _screen, segm
 DEFAULT_CONFIG = {"quiet": 1200, "backlog": 200}
 EPISODE_MAX = 300
 ACTS_MAX_CHARS = 60000
+RESULT_MAX_CHARS = 600
 PEOPLE_MAX = 5
 RETRY_AFTER = 600
 _stream = log.stream("agent")
@@ -153,10 +154,19 @@ def _acts(label: str, since: float, until: float) -> str:
         lines = []
         for item in _segment.source_ids(view):
             row = journal.get(item)
+            # WHY: 2026-11-01 一次沉淀输入五万多 token、几乎全不命中缓存。借来的行是构造给的材料，
+            # 不是她在这里做的事；工具结果（读到的笔记、搜到的记录）占大头，沉淀要的是她做了什么，
+            # 结果截到开头一段，要看全文用 read_context。
+            if row["ctx"] != view["ctx"]:
+                continue
             if row["kind"] == "goal":
                 lines.append(f"目的：{row.get('goal', '')}")
             elif row["kind"] in ("assistant", "tool", "input"):
-                lines.append(_segment.readable_messages(row["messages"], compact=True))
+                messages = [dict(message, content=str(message["content"])[:RESULT_MAX_CHARS]
+                                 + f"……（共 {len(str(message['content']))} 字，后面略）")
+                            if message.get("role") == "tool" and len(str(message.get("content") or "")) > RESULT_MAX_CHARS
+                            else message for message in row["messages"]]
+                lines.append(_segment.readable_messages(messages, compact=True))
         parts.append(f"### {_screen.clock(view['started'])[5:19]} 行动 {name}\n" + "\n".join(lines))
     text = "\n\n".join(parts)
     if len(text) > ACTS_MAX_CHARS:
