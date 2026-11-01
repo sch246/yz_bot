@@ -174,8 +174,27 @@ def cancel(kind=None, *, window=None) -> int:
     return len(keys)
 
 
-def _debounce(window, author, identity_, kind, reason, event, now) -> None:
+def _timing(window) -> tuple[float, float]:
+    """The (idle, max) seconds this window's kind batches with; see windows.spec."""
+    declared = windows.spec(window)["debounce"]
+    if isinstance(declared, dict):
+        return float(declared.get("idle", 0)), float(declared.get("max", 0))
     cfg = get_config()
+    return cfg["idle"], cfg["max"]
+
+
+def _batches(window, event) -> bool:
+    """Whether a new summons in this window waits for its debounce before queueing."""
+    from mods import msgs
+
+    declared = windows.spec(window)["debounce"]
+    if not declared or not (msgs.is_msg(event) or event.get("post_type") == "push"):
+        return False
+    return isinstance(declared, dict) or get_config()["enabled"]
+
+
+def _debounce(window, author, identity_, kind, reason, event, now) -> None:
+    idle, longest = _timing(window)
     key = (tuple(window), str(author))
     with _lock:
         session = _debouncing.setdefault(key, {"first": now, "ids": [], "window": tuple(window),
@@ -184,7 +203,7 @@ def _debounce(window, author, identity_, kind, reason, event, now) -> None:
             session["ids"].append(identity_)
         session["event"] = deepcopy(event)
         # WHY: 同窗口同作者的短句才重置；热闹群里别人的聊天不会拖延这个人的 3 秒。
-        due = min(now + cfg["idle"], session["first"] + cfg["max"])
+        due = min(now + idle, session["first"] + longest)
         schedule("debounce", due, window=window, key=f"debounce:{key}", session_key=key)
 
 
@@ -241,11 +260,11 @@ def on_record(window, event, *, recovered=False) -> bool:
     if not kind:
         with _lock:
             waiting = _debouncing.get(key)
-        if waiting and not own and msgs.is_msg(event):
+        if waiting and not own and (msgs.is_msg(event) or event.get("post_type") == "push"):
             _debounce(window, author, identity_, waiting["kind"], waiting["reason"], event, time.time())
             return True
         return False
-    if window[0] in windows.QQ and msgs.is_msg(event) and get_config()["enabled"]:
+    if _batches(window, event):
         _debounce(window, author, identity_, kind, reason, event, time.time())
         return True
     return enqueue(window, kind=kind, reason=reason, record_ids=[identity_], author=author, event=event)

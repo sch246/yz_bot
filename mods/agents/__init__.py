@@ -184,8 +184,6 @@ def send(window, text):
     return record_id
 
 
-send.split_bubbles = False
-
 
 def on_load(_ctx):
     global _stopping
@@ -196,7 +194,8 @@ def on_load(_ctx):
     _stopping = False
     _process.start()
     for kind in DRIVERS:
-        chat.kind(kind, send)
+        # WHY: CLI 的多段 prompt 是一次任务；按气泡拆开会让第二段撞上忙碌检查，丢掉后半任务。
+        chat.kind(kind, send, whole=True)
 
 
 def on_exit():

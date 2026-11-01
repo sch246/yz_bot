@@ -151,7 +151,7 @@ def _layer_problem(state: str, target: str) -> str:
     if scope is None:
         return "目标写 g群号、u私聊号、g群号:QQ号、一整类（group、private、bili 这样的种类名）或 种类:目标；me 不能盖"
     kind = scope[1] if scope[0] == "kind" else scope[1][0]
-    if state == "follow" and kind not in _windows.QQ:
+    if state == "follow" and not _windows.spec(kind)["follow"]:
         return "follow 只认 QQ 窗口：B 站这类窗口只收到回复和 @，本来就都叫醒你"
     master = _master()
     if state == "mute" and master is not None and scope[0] == "window" and (

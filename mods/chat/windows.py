@@ -107,15 +107,32 @@ def _send_qq(window: tuple, text: str) -> str:
 _kinds: dict[str, Callable[[tuple, str], str] | None] = {"group": _send_qq, "private": _send_qq, "me": None}
 
 
-def kind(name: str, send: Callable[[tuple, str], str] | None = None) -> None:
+# WHY: 2026-11-01 窗口种类的差别只收已经有两种以上实际变体的项（设计文档第 18.2 节）：
+# whole 整段一次发出、不按空行拆气泡；debounce 攒批（True 用 #debounce 的配置，或给
+# {"idle": 秒, "max": 秒}）；follow 覆盖层有没有意义（每条都叫醒的种类没有）；hide_control
+# 隐藏 `#` 开头的控制消息。记录来源（QQ 的 OneBot 事件 vs chat.push）是另一回事，不在这里。
+_QQ_SPEC = {"whole": False, "debounce": True, "follow": True, "hide_control": True}
+_DEFAULT_SPEC = {"whole": False, "debounce": False, "follow": False, "hide_control": False}
+_specs: dict[str, dict] = {"group": dict(_QQ_SPEC), "private": dict(_QQ_SPEC), "me": dict(_DEFAULT_SPEC)}
+
+
+def kind(name: str, send: Callable[[tuple, str], str] | None = None, *, whole: bool = False,
+         debounce: bool | dict = False, follow: bool = False, hide_control: bool = False) -> None:
     """Register a window kind; *send* makes its windows answerable, None leaves them read-only.
 
-    Registering the same name again replaces its sender, so a reloaded module can
+    Registering the same name again replaces its sender and spec, so a reloaded module can
     register on every load.  QQ's two kinds and ``me`` are fixed.
     """
     if not _NAME.fullmatch(name) or name in (*QQ, "me", "bot"):
         raise ValueError(f"种类名要是小写字母开头的 [a-z0-9_]，且不能是 group、private、me、bot：{name}")
     _kinds[name] = send
+    _specs[name] = {"whole": whole, "debounce": debounce, "follow": follow, "hide_control": hide_control}
+
+
+def spec(window_or_kind) -> dict:
+    """The declared behaviour of a window's kind; unknown kinds get the plain defaults."""
+    name = window_or_kind[0] if isinstance(window_or_kind, (tuple, list)) else str(window_or_kind)
+    return _specs.get(name, _DEFAULT_SPEC)
 
 
 def known(window) -> bool:

@@ -545,9 +545,8 @@ def send(
     unconfirmed = (
         "先在下一轮的聊天记录里看它在不在，再决定要不要重发——不要直接重发。"
     )
-    # WHY: CLI 的多段 prompt 是一次任务；按气泡拆开会让第二段撞上忙碌检查，丢掉后半任务。
     sender = windows.sender(window)
-    parts = _split_turns(box["text"]) if getattr(sender, "split_bubbles", True) else [box["text"]]
+    parts = [box["text"]] if windows.spec(window)["whole"] else _split_turns(box["text"])
     if tuple(window) == windows.ME:
         # WHY: 2026-10-27 早上草籽拆掉「现在是交接或反思，不对外说话」那道代码胶带——
         # me 是写给自己看的一行，想说的话有地方落下，第二天醒来自己看得见，也不吵到谁。
