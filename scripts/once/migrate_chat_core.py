@@ -96,6 +96,51 @@ def fsync_dir(path):
         os.close(fd)
 
 
+def stage_append(row):
+    """Use append's durable write, then verify its tail to maintain the private stage cache."""
+    # WHY: 实测逐条导入时，append 后 stat 改变使下一次 _read 重解析整日 JSON，
+    # 同日后 987 条比前 1000 条多耗近三倍时间。仅在迁移私有 stage 中验证新增尾行
+    # 后续接原缓存；append 的校验/fsync 不变，最终校验前仍清缓存从磁盘重读。
+    path = journal.ROOT / (row["id"].split("-")[0] + ".jsonl")
+    with journal._reading():
+        journal._read(path)
+        cached = journal._cache.get(path)
+        previous = cached[0] if cached is not None else None
+        offset = previous[1] if previous is not None else 0
+    item_id = journal.append(row["kind"], ctx=row["ctx"], messages=row["messages"],
+                             item_id=row["id"], timestamp=row["time"],
+                             **{k: v for k, v in row.items() if k not in {"kind", "ctx", "messages", "id", "time"}})
+    with journal._reading():
+        stat = path.stat()
+        signature = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        usable = (journal._cache.get(path) is cached and stat.st_size > offset
+                  and (previous is None or stat.st_ino == previous[0]))
+        if usable:
+            with path.open("rb") as handle:
+                handle.seek(offset)
+                tail = handle.read()
+            after = path.stat()
+            usable = (signature == (after.st_ino, after.st_size, after.st_mtime_ns)
+                      and len(tail) == stat.st_size - offset
+                      and tail.endswith(b"\n") and tail.count(b"\n") == 1)
+        if usable:
+            rows, index = (cached[1], cached[2]) if cached is not None else ([], {})
+            try:
+                added = journal._row(tail[:-1], path, len(rows) + 1)
+            except ValueError:
+                usable = False
+            else:
+                usable = added["id"] == item_id and item_id not in index
+        if usable:
+            rows.append(added)
+            index[item_id] = added
+            journal._cache[path] = (signature, rows, index)
+        else:
+            journal._cache.pop(path, None)
+            journal._read(path)
+    return item_id
+
+
 def sync_parents(path, root):
     while path.is_relative_to(root):
         fsync_dir(path)
@@ -1160,9 +1205,7 @@ class Import:
                     if any(parent in pending for parent in parents):
                         continue
                     try:
-                        journal.append(row["kind"], ctx=row["ctx"], messages=row["messages"],
-                                       item_id=eid, timestamp=row["time"],
-                                       **{k: v for k, v in row.items() if k not in {"kind", "ctx", "messages", "id", "time"}})
+                        stage_append(row)
                     except (ValueError, KeyError):
                         source = row.get("source", {})
                         raise Blocked("journal-import-invariant", source.get("path", "data/event_stream"), source.get("message")) from None
@@ -1175,6 +1218,9 @@ class Import:
                 atomic_json(segment.ROOT / "views" / (name + ".json"), view)
             if self.current:
                 segment.save(self.current)
+            for path in list(journal._cache):
+                if path.is_relative_to(journal.ROOT):
+                    del journal._cache[path]
             self.validate(stage)
         atomic_json(stage / "data/storage/agent.json", self.agent)
         if self.awaker is not None:
