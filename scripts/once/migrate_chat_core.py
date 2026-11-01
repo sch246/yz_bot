@@ -783,15 +783,28 @@ class Import:
         tool_rows = []
         tool_pair = None
         tool_gap = False
-        tool_anchors = []
+        frozen_tools = {}
+
+        def remember_tool_state(state, source, stamp):
+            tail = tool_rows[-1]
+            if tail not in frozen_tools:
+                self.rows[tail]["tool_state"] = clone(state)
+            elif frozen_tools[tail] != state:
+                # WHY: 近端锚点证明的是早期公告，晚期 mark/told 可以合法不同；生产
+                # S1→S2 没有新可见公告。把真实快照留在自身边界，不能倒写已证明的 S1。
+                eid = self.add("system", owner, stamp=stamp, tool_state=state, source=source)
+                view["items"].append(eid)
+                frozen_tools[tail] = clone(state)
+
         active_act = None
         for index in range(len(messages) + 1):
             mark = marks_by_index.get(index)
             if mark:
-                # Snapshot's tool state is the value immediately before this
-                # wake. Attach it to the announcement that really precedes it.
+                # Snapshot's tool state is the value immediately before this wake.
+                # Proven announcements keep their state; later snapshots keep their boundary.
                 if tool_rows and mark.get("told") is not None:
-                    self.rows[tool_rows[-1]]["tool_state"] = clone(mark["told"])
+                    remember_tool_state(mark["told"], {"path": str(path), "mark": index, "field": "told"},
+                                        finite(mark["time"], path))
                 wake_id = self.add("wake", owner, stamp=finite(mark["time"], path),
                                    number=mark["number"], at=mark["at"], ctx_started=started,
                                    boxes=mark.get("boxes", {}), read_snapshot=self.snapshot(mark),
@@ -827,7 +840,14 @@ class Import:
                 fold_marks = folded.get("marks")
                 first = fold_marks[0] if isinstance(fold_marks, list) and fold_marks else None
                 if envelope and tool_pair and not tool_gap and isinstance(first, dict) and first.get("index") == 0:
-                    tool_anchors.append((*tool_pair, clone(first.get("told"))))
+                    before, after = (self.rows[eid] for eid in tool_pair)
+                    anchor = first.get("told")
+                    if "tool_state" not in before and ("tool_state" not in after or after["tool_state"] == anchor):
+                        recovered = recover_initial_tool_state(plain(before["messages"][0]), plain(after["messages"][0]), anchor)
+                        if recovered is not None:
+                            before["tool_state"] = recovered
+                            after["tool_state"] = clone(anchor)
+                            frozen_tools.update({tool_pair[0]: clone(recovered), tool_pair[1]: clone(anchor)})
                 tool_gap = True
                 self.folded[fold_name] = True
                 covered = self.convert_context(folded, fold_name, str(archive_path.relative_to(self.root)), strict=strict,
@@ -915,15 +935,8 @@ class Import:
             if data.get("told") is not None:
                 if not tool_rows:
                     raise Blocked("tool-announcement-missing", path)
-                self.rows[tool_rows[-1]]["tool_state"] = clone(data["told"])
-            for earlier, later, anchor in tool_anchors:
-                before, after = self.rows[earlier], self.rows[later]
-                # Old state_text includes every catalog/active/schema change. The complete
-                # delta and full frame must agree with this anchor and the final local state.
-                if "tool_state" not in before and after.get("tool_state") == anchor:
-                    recovered = recover_initial_tool_state(plain(before["messages"][0]), plain(after["messages"][0]), anchor)
-                    if recovered is not None:
-                        before["tool_state"] = recovered
+                remember_tool_state(data["told"], {"path": str(path), "field": "told"},
+                                    self.rows[wake_id]["time"] if wake_id else started)
             for eid in tool_rows:
                 if "tool_state" not in self.rows[eid]:
                     raise Blocked("intermediate-tool-state-unrecoverable", path, self.rows[eid]["source"]["message"])
