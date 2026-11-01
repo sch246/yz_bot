@@ -100,6 +100,10 @@ def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
             session.hint_role = "system"
             configured_effort = effort if effort is not None else chat.get_reasoning_effort()
             session.reasoning_effort = None if configured_effort == "default" else configured_effort
+            # WHY: #temperature 是给她说话用的（effort=none 时默认 1.3 是创意写作的推荐值）；
+            # 构造只挑材料、另有自己的 effort 设置，不跟着升温。
+            session.temperature = None if kind == "construct" else chat.temperature_for(session.reasoning_effort)
+            session.describe_images = chat.get_image_describe()
             central = kind in {"main", "settle", "reflect"}
             binding = None
             if tools:
@@ -149,7 +153,8 @@ def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
                                     "tool_state": snapshot})
                     for source in sources or ():
                         append(source)
-                    session.messages[:] = [*head, *segment.render(view, reasoning=chat.get_reasoning_mode())]
+                    session.messages[:] = [*head, *segment.render(view, reasoning=chat.get_reasoning_mode(),
+                                                                  mark_borrowed=True)]
                     session.messages.extend(state.pop("images", []))
                     state["used"] = segment.context_size(view["stats"].get("tokens"), session.messages[len(head):])
                     state["initial"] = state.get("initial", state["used"])

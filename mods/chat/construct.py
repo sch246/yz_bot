@@ -105,7 +105,9 @@ def fold(ref: str) -> str:
             row = journal.get(ref)
             if row["kind"] == "goal":
                 return f"{row.get('run_kind', '运行')}的目的：{str(row.get('goal', ''))[:60]}"
-            text = " ".join(str(message.get("content") or "") for message in row["messages"]).strip()
+            text = " ".join(" ".join(part.get("text", "[图片]") for part in message["content"])
+                            if isinstance(message.get("content"), list) else str(message.get("content") or "")
+                            for message in row["messages"]).strip()
             calls = [call.get("function", {}).get("name", "?") for message in row["messages"]
                      for call in message.get("tool_calls") or []]
             return f"{row['kind']} {_screen.clock(row['time'])[5:16]}" + (f" 调用 {'、'.join(calls)}" if calls else "") + (f"：{text[:50]}" if text else "")

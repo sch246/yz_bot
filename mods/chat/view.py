@@ -34,7 +34,12 @@ def msg_split(value: str) -> list[dict]:
             continue
         if _image_pattern.fullmatch(part):
             try:
-                uri = cq.load(part)["data"]["url"]
+                data = cq.load(part)["data"]
+                uri = data.get("url") or data.get("file")
+                if not uri:
+                    raise ValueError("图片没有地址")
+                if "://" not in uri and (Path(uri).is_absolute() or Path(uri).is_file()):
+                    uri = Path(uri).resolve().as_uri()
                 parts.append({"type": "image_url", "image_url": {"url": uri}})
             except (KeyError, ValueError):
                 parts.append({"type": "text", "text": "[解析失败的图片]"})
@@ -62,6 +67,19 @@ def outside(label: str, facts: list[str], text: str) -> dict:
     text = voice.transform_screen_text(text, get_audio_mode())
     text = face.enrich_text_faces(text)
     return {"role": "user", "content": msg_split(" · ".join([f"窗口 {label}", *facts]) + "\n" + text)}
+
+
+def screen_content(text: str) -> str | list[dict]:
+    """A screen's records as message content: voice and QQ faces rendered, images as image parts.
+
+    WHY: 2026-11-01 接本地图片改动时发现，cf8f0d4 把中心改走 journal 以后画面直接放原文，
+    不再经过 `outside`：聊天图片只剩 `[CQ:image…]` 字样（llm 只认 Markdown 图和图片 part），
+    语音档位和 QQ 表情注释也没了。行动的画面重新走这里；没有图时仍是普通字符串。
+    """
+    from mods.chat import get_audio_mode, voice, face
+    text = face.enrich_text_faces(voice.transform_screen_text(text, get_audio_mode()))
+    parts = msg_split(text)
+    return parts if any(part["type"] == "image_url" for part in parts) else text
 
 
 def is_incoming(message: dict) -> bool:

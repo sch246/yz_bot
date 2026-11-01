@@ -11,8 +11,8 @@
    保证的。
 
    这条路的收益是图**长在工具调用的位置上**：经历日志（mods/chat/journal）原样存下它，重建回
-   上下文时还带着，"哪次调用看到了哪张图"不必靠记忆。代价是留在历史里的图每轮都会重发
-   （有前缀缓存兜着，image 那一层还按内容摘要去重、长图自动切片）。
+   上下文时还带着，"哪次调用看到了哪张图"不必靠记忆。本次运行内一直带图；被以后的运行
+   借去时只保留地址与已有描述，要重新看可以再次 attach。
 
    引用一律写**地址**，不内联 base64：工具结果会原样落进操作记录，一段几百 KB 的 base64
    会跟着每一次重建一起膨胀。所以 `data:` 图先落盘再引用。
@@ -67,6 +67,9 @@ def _file_uri(selection: str) -> str:
     """
     matched = _DATA_URI.match(selection)
     if matched is None:
+        if os.path.isfile(selection):
+            from pathlib import Path
+            return Path(selection).resolve().as_uri()
         return selection
     try:
         from mods import image as image_module
@@ -143,28 +146,34 @@ def attach(uri: str, note: str = "", model: str | None = None) -> str:
         except Exception as error:
             return f"⚠️ 当前模型不支持视觉，自动调用视觉模型失败（{type(error).__name__}: {error}）"
     text = str(note or "").strip()
-    if capabilities.tool_images:
-        reference = _file_uri(selection)
-        _stream.info("图片已写进工具结果：%s", _brief(reference))
-        head = f"✅ 图片已随这条工具结果一起送到（{_brief(reference)}），就在下面这一行："
-        return "\n".join(part for part in (head, text, "!" + f"[图片]({reference})") if part)
-    # WHY: 退回那条老路时图片一律转成 data URI 再放进消息。provider 拿不到 `file://`，而
-    # "把图交给模型"这件事不该依赖某个窗口的 #image 档位（那一档管的是入站图片要不要先转述）。
     try:
         from mods import image
 
-        value = selection if selection.startswith("data:") else image.image_uri_to_data_uri(selection)
+        reference = _file_uri(selection)
+        value = selection if selection.startswith("data:") else image.image_uri_to_data_uri(reference)
+        pictures, explanation = image.prepare_image_data_uri(value, gif_mode="grid")
+        if "GIF" in explanation:
+            references = [_file_uri(picture) for picture in pictures]
+            text = "\n".join(part for part in (text, explanation) if part)
+        else:
+            references = [reference]
     except Exception as error:
         return f"⚠️ 图片读取失败（{type(error).__name__}: {error}）"
+    if capabilities.tool_images:
+        _stream.info("图片已写进工具结果：%s", _brief(reference))
+        head = f"✅ 图片已随这条工具结果一起送到（{_brief(reference)}），就在下面这一行："
+        return "\n".join(part for part in (head, text, *(f"![图片]({uri})" for uri in references)) if part)
+    # WHY: 对端不收 tool 图时用显式标记放行 user 附图，#image off 也能看（那一档只管自动看
+    # 聊天图）。消息里存地址，由 llm 发送前再编码。
     parts = []
     if text:
         parts.append({"type": "text", "text": text})
-    parts.append({"type": "image_url", "image_url": {"url": value}})
+    parts.extend({"type": "image_url", "image_url": {"url": uri}} for uri in references)
     # WHY: 图片只属于这次运行，不能被另一个并发请求取走；统一 run 在重建请求后
-    # 消费一次，不把一次性退回图片写进经历日志或持久视图。
-    state.setdefault("images", []).append({"role": "user", "content": parts})
+    # 消费一次，不写进经历日志或持久视图。要再看就再 attach，结果里留着地址。
+    state.setdefault("images", []).append({"role": "user", "content": parts, "_tool_image": True})
     _stream.info("图片已排入下一次请求：%s", _brief(selection))
-    return f"✅ 图片已附加到下一次请求（{_brief(selection)}），你马上就能看到它"
+    return f"✅ 图片已附加到下一次请求（{_brief(reference)}），你马上就能看到它"
 
 
 __all__ = ["attach"]

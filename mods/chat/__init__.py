@@ -75,6 +75,12 @@ def normalize_audio_mode(value) -> str:
     return normalized if normalized in AUDIO_MODES else "off"
 
 
+def normalize_image_describe(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in ("off", "0", "false")
+
+
 def agent_setting(name: str, data: dict | None = None):
     key, normalize = AGENT_SETTINGS[name]
     return normalize((storage.get("", "agent") if data is None else data).get(key))
@@ -93,6 +99,10 @@ def limit() -> tuple[int, int]:
 
 def get_image_mode(data: dict | None = None) -> str:
     return agent_setting("image", data)
+
+
+def get_image_describe(data: dict | None = None) -> bool:
+    return agent_setting("image_describe", data)
 
 
 def get_audio_mode(data: dict | None = None) -> str:
@@ -120,6 +130,42 @@ def get_reasoning_effort(data: dict | None = None) -> str:
     return agent_setting("reasoning_effort", data)
 
 
+def normalize_temperature(value) -> float | str:
+    if value is None or value == "" or str(value).lower() == "default":
+        return "default"
+    try:
+        val = float(value)
+        if 0.0 <= val <= 2.0:
+            return round(val, 2)
+    except (TypeError, ValueError):
+        pass
+    return "default"
+
+
+def get_temperature(data: dict | None = None) -> float | str:
+    return agent_setting("temperature", data)
+
+
+def temperature_for(effort: str | None) -> float | None:
+    """The sampling temperature of a run whose effective effort is *effort*; None leaves the model default."""
+    configured = get_temperature()
+    if configured != "default":
+        return float(configured)
+    # DeepSeek 官方推荐：非思考模式/创意写作推荐温度 1.3~1.5
+    return 1.3 if effort == "none" else None
+
+
+def normalize_brake(value) -> str:
+    if value is None or value == "":
+        return "on"
+    val = str(value).strip().lower()
+    return "off" if val in ("off", "0", "false") else "on"
+
+
+def get_brake(data: dict | None = None) -> str:
+    return agent_setting("brake", data)
+
+
 def _bounded_int(minimum: int, fallback: int, maximum: int | None = None):
     """归一化成指定范围内的整数，否则回到默认值。"""
 
@@ -136,9 +182,12 @@ def _bounded_int(minimum: int, fallback: int, maximum: int | None = None):
 # 单值全局 agent 配置：storage 键与归一化。
 AGENT_SETTINGS = {
     "image": ("image", normalize_image_mode),
+    "image_describe": ("image_describe", normalize_image_describe),
     "audio": ("audio", normalize_audio_mode),
     "reasoning": ("reasoning", normalize_reasoning_mode),
     "reasoning_effort": ("reasoning_effort", normalize_reasoning_effort),
+    "temperature": ("temperature", normalize_temperature),
+    "brake": ("brake", normalize_brake),
     "max_events": ("max_events", _bounded_int(1, DEFAULT_MAX_EVENTS)),
     "tidy_token": ("tidy_token", _bounded_int(1, DEFAULT_TIDY_TOKEN)),
 }
@@ -758,15 +807,17 @@ def _message_image_urls(event: dict) -> list[str]:
 
 
 @thread.to_thread(None)
-def _eager_cache_images(event: dict, model: str) -> None:
-    capabilities = llm.get_client().get_model_capabilities(model)
-    vision_model = llm.get_client().get_vision_model()
+def _eager_cache_images(event: dict, describe: bool = True) -> None:
+    client = llm.get_client()
+    vision_model = client.get_vision_model() if describe else None
     for uri in _message_image_urls(event):
         try:
-            if capabilities.vision or not vision_model:
-                image.image_uri_to_data_uri(uri)
-            else:
-                llm.get_client()._get_image_description(uri, vision_model, description_cache)
+            image.image_uri_to_data_uri(uri)
+            if describe and vision_model:
+                # WHY: 主模型能看图也要留下文字：原图被下一次运行借去时只剩地址和描述。
+                client._get_image_description(uri, vision_model, description_cache)
+            elif describe:
+                _image_stream.info("❌ eager 图片描述失败：未配置视觉模型")
         except Exception as error:
             _image_stream.info(f"❌ eager 图片捕获失败：{error}")
 
@@ -778,7 +829,7 @@ def eager_cache_images(event: dict) -> None:
             model = get_model(data)
             count = len(_message_image_urls(event))
             _image_stream.info(f"🖼️ eager 图片捕获：{count} 张，目标模型 {model}")
-            _eager_cache_images(event.copy(), model)
+            _eager_cache_images(event.copy(), get_image_describe(data))
 
 
 def recognize_images(event: dict) -> None:

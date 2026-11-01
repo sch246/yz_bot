@@ -15,7 +15,7 @@ from pathlib import Path
 import threading
 import time
 
-from mods import context, history, shell, storage
+from mods import context, history, identity, shell, storage
 import mods.chat as _chat_root
 from . import attention, construct as _construct, journal, notes as _notes, roles as _roles, screen as _screen, segment as _segment, settle as _settle, windows as _windows
 from .run import current_wake, run, write
@@ -23,6 +23,14 @@ from .run import current_wake, run, write
 # WHY: with no running context the act must see enough of the thread around a new
 # message to know who is answering whom; the constructor adds more through log: refs.
 _ACT_LEAD_IN = 10
+# WHY: 针对 DeepSeek-V4.1 (0910/1017) 架构及强化学习本能设计的后置刹车补丁 (Post-History Directive)。
+# 原版英文直接注入 hint（Depth 0），不进入上下文历史，刹住抢词推进、死磕细节、全知视角与过度说教。
+# 2026-11-01 接到无状态中心时只给行动（main）：构造不对外说话，沉淀和反思写的是笔记。
+_PACING_BRAKE = """[System Directive - Pacing, Epistemology & Anti-Fixation Rules]
+1. PACING BRAKE (CRITICAL): Advance the timeline by ONLY ONE immediate reaction or micro-action per turn. STOP writing the exact moment a response, decision, or reaction from {{user}} is naturally required. NEVER resolve a scene, skip time, change locations, or narrate {{user}}'s actions, speech, or internal feelings.
+2. STRICT POV & ANTI-OMNIPRESENCE: {{char}} ONLY knows what is explicitly spoken aloud or physically visible in the immediate shared space. {{char}} CANNOT read {{user}}'s mind, internal monologue, or past events where {{char}} was absent.
+3. SENSORY & PROP ROTATION: Do NOT repeat any specific environmental detail, lighting description, beverage/food, clothing adjustment, or physical tic that already appeared in the last 2 messages. Introduce fresh sensory angles or focus purely on dialogue and action.
+4. ANTI-MELODRAMA: Maintain {{char}}'s grounded baseline personality. Do not artificially escalate conflict, angst, or philosophical lecturing unless directly provoked in-scene."""
 _lock = threading.RLock()
 _active = None
 _reader_running = False
@@ -47,7 +55,7 @@ def cancel_wake(window):
 
 
 def _new(kind="唤醒"):
-    return {"cancelled": False, "associated_windows": set(), "claims": [], "deferred": [],
+    return {"cancelled": False, "associated_windows": set(), "claims": [], "deferred": [], "interlocutors": {},
             "log": {"kind": kind, "start": time.time(), "peak": 0, "acts": 0},
             "release": "", "boxes": storage.get("", "boxes")}
 
@@ -185,10 +193,21 @@ def _read_work():
             return
 
 
+def _brake_hint() -> str:
+    return "" if _chat_root.get_brake() == "off" else _PACING_BRAKE
+
+
 def _adopt(wake, claims):
+    try:
+        bot = identity.bot_id()
+    except RuntimeError:
+        bot = None
     for job in claims:
         window = tuple(job["window"])
         wake["associated_windows"].add(window)
+        # send(wait=…) 在群里不写 who 时默认等这个人；只记叫她的人，不记之后路过的人。
+        if isinstance(job.get("author"), int) and job["author"] != bot:
+            wake["interlocutors"][window] = job["author"]
         if not job["record_ids"]:
             # Clock/command work must leave the same ordinary me record as an
             # external producer. Releasing a failed claim reuses its identity.
@@ -245,19 +264,21 @@ def _prepare(wake, view, windows):
     view["stats"]["windows"] = sorted(_windows.label(window) for window in windows)
     info = _segment.derive(view)
     pending = [row["read_patch"] for row in info["screens"] if row.get("read_patch")]
-    material, patches = [], []
+    material, patches, parts = [], [], []
     count, _threshold = _chat_root.limit()
     for window in sorted(windows, key=_windows.label):
         label = _windows.label(window)
         part = _screen.prepare(window, shown=info["shown"].get(label, []), count=count, pending=pending,
                                lead_in=_ACT_LEAD_IN)
         patches.append(part["patch"])
+        parts.append(part)
         if part["text"]:
-            material.append({"kind": "screen", "messages": [{"role": "user", "content": part["text"]}],
+            material.append({"kind": "screen",
+                             "messages": [{"role": "user", "content": _chat_root._view.screen_content(part["text"])}],
                              "window": label, "shown": part["shown"], "read_patch": part["patch"],
                              "follow_ids": part["follow_ids"]})
     wake["request_patches"] = patches
-    screens = "\n".join(row["messages"][0]["content"] for row in material)
+    screens = "\n".join(part["text"] for part in parts if part["text"])
     present = set(info["notes"])
     hits = [scope for scope, _word in _notes.mentioned(screens) if scope not in present]
     wake["breadcrumbs"] = "画面提到的这些你有笔记，用 read_note 召回：" + "、".join(dict.fromkeys(hits)) if hits else ""
@@ -289,7 +310,7 @@ def _act(wake, spec, model=None):
         run(items, spec["goal"], tools=("meta",), model=model, kind="main", state=wake,
             prepare=lambda state: _prepare(wake, state["view"], windows), on_output=_confirm,
             hints=[lambda: _screen.unread_hint(windows), lambda: shell.running_hint(),
-                   lambda: wake.get("breadcrumbs", "")])
+                   lambda: wake.get("breadcrumbs", ""), _brake_hint])
     finally:
         if wake.get("output_count"):
             _settle.touch(windows)

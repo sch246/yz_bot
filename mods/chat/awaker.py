@@ -73,7 +73,7 @@ _GRACE = 3 * 3600
 _stream = log.stream("agent")
 _LINE = re.compile(r"^\s*(?:[-*]\s+)?(?:(every)\s+(\S+)|(daily)\s+(\d{1,2}):(\d{2})"
                    r"|(at)\s+(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2}))\s+(.+?)\s*$")
-_TARGET = r"([gu][1-9][0-9]*(?::[1-9][0-9]*)?)"
+_TARGET = r"([gu][1-9][0-9]*(?::[1-9][0-9]*)?|[a-z][a-z0-9_]*:\S+)"
 _ON = re.compile(r"^\s*(?:[-*]\s+)?on\s+" + _TARGET + r"\s+(.+?)\s*$")
 _WAIT = re.compile(r"^\s*(?:[-*]\s+)?wait\s+" + _TARGET
                    + r"\s+until\s+(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})\s+(.+?)\s*$")
@@ -111,16 +111,26 @@ def _moment(day: str, hour: str, minute: str) -> float | None:
 
 
 def _target(text: str) -> tuple[tuple, int | None]:
-    """``g123`` / ``g123:30001`` / ``u456`` → (window, author or None)."""
+    """``g123`` / ``g123:30001`` / ``u456`` / ``dsh:main`` → (window, author or None); ValueError otherwise."""
     head, _, author = text.partition(":")
-    window = ("group" if head[0] == "g" else "private", int(head[1:]))
-    return window, int(author) if author else None
+    if head[:1] in ("g", "u") and head[1:].isdigit():
+        window = ("group" if head[0] == "g" else "private", int(head[1:]))
+        return window, int(author) if author else None
+    # WHY: 2026-10-30 CLI agent 窗口（dsh:main）也要能挂 wait；它的回复走 chat.push，
+    # 窗口元组和这里解析出来的一致，take_waiting 就认得上。不在这里查种类是否已登记：
+    # 模块没加载时 bili:BV… 这样的行照旧能读，和 _scope 对一整类的处理一致。
+    if head in ("me", "bot", *_windows.QQ) or not author:
+        raise ValueError(f"认不出窗口：{text}")
+    return (head, author), None
 
 
 def _scope(text: str) -> tuple | None:
     """A layer's target as ("window", window, author or None) or ("kind", 种类, None); None when unreadable."""
     if re.fullmatch(_TARGET, text):
-        return ("window", *_target(text))
+        try:
+            return ("window", *_target(text))
+        except ValueError:
+            return None
     if not re.fullmatch(r"[a-z][a-z0-9_]*(?::\S+)?", text):
         return None
     name, _, target = text.partition(":")
@@ -161,13 +171,19 @@ def _once(line: str) -> dict | None:
         return {"key": key, "kind": "layer", "state": match[1], "target": match[2], "scope": _scope(match[2]),
                 "moment": moment, "until": f"{match[3]} {int(match[4]):02d}:{match[5]}", "reason": match[6]}
     if match := _ON.match(line):
-        window, author = _target(match[1])
+        try:
+            window, author = _target(match[1])
+        except ValueError as error:
+            return {"key": key, "kind": "bad", "why": str(error)}
         return {"key": key, "kind": "on", "target": match[1], "window": window, "author": author, "reason": match[2]}
     if match := _WAIT.match(line):
         moment = _moment(match[2], match[3], match[4])
         if moment is None:
             return {"key": key, "kind": "bad", "why": "日期不对"}
-        window, author = _target(match[1])
+        try:
+            window, author = _target(match[1])
+        except ValueError as error:
+            return {"key": key, "kind": "bad", "why": str(error)}
         return {"key": key, "kind": "wait", "target": match[1], "window": window, "author": author,
                 "moment": moment, "until": f"{match[2]} {int(match[3]):02d}:{match[4]}", "reason": match[5]}
     if match := _WHEN.match(line):

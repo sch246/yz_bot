@@ -27,10 +27,17 @@ _SUBCOMMAND_HELP = (
 就是笔记 self（data/notes/self.md），放在系统提示最前面，取代以前的提示词和命名设定。维护者可以直接编辑文件；她只能在夜间反思里改，要写原因和预期。
 #prompt              显示全文
 #prompt set <全文>   整份替换；set 之后第一个换行起是全文，留空表示清空"""),
-    ("image [off|lazy|eager]", "查看或设置图片读取档位"),
+    ("image [off|lazy|eager|discribe [on|off]]", """查看或设置图片读取档位与文字描述开关（修改要管理员）。
+#image off|lazy|eager       设置图片读取档位（兼容 0/1/2）
+#image discribe            查看文字描述开关（兼容 describe 拼写）
+#image discribe on|off     开关自动生成并缓存文字描述，默认 on；独立于读取档位
+lazy 在读取图片时生成描述，eager 在图片到达时生成；主模型能看图时也生成。off 不再生成新描述，已有描述仍可使用。"""),
     ("audio [off|lazy|eager]", "查看或设置语音条读取档位（off: 仅提示语音; lazy: 附本地音频路径; eager: 自动转录语音内容）"),
     ("reasoning [keep|drop]", "查看或设置引用来的旧行动里的思考是否一起带回（本次运行自己的思考总是保留）"),
     ("effort [default|off|none|low|medium|high|max]", "查看或设置主模型思考等级（管理员），默认 default（按模型自身默认）。"),
+    ("temperature [default|<0.0-2.0>]", "查看或设置主模型采样温度（管理员），默认 default（按模型默认；effort 为 none 时默认 1.3）；构造运行不用它。别名 temp。"),
+    ("brake [on|off]", "查看或设置节奏与防抢戏英文刹车（管理员），默认 on；只加在行动运行的提示末尾。"),
+    ("years [rebuild]", "查看年鉴索引最近 10 条，或补齐缺了的行（管理员；只补不删）。"),
     ("limit [<画面条数> <增长上限>|reset]", """查看或设置画面条数与单次运行的增长上限（管理员）。
 
 格式：#limit | #limit <画面条数> <增长上限> | #limit reset
@@ -94,11 +101,13 @@ at、on、wait、when 响过就从笔记里划掉。她平时用 wake_me 写这�
 #construct set <全文>         整份替换构造说明；留空清空并回落内置说明
 #construct reset              恢复默认配置"""),
 )
-_SUBCOMMAND_NAMES = {pattern.partition(" ")[0] for pattern, _description in _SUBCOMMAND_HELP}
+_SUBCOMMAND_NAMES = {pattern.partition(" ")[0] for pattern, _description in _SUBCOMMAND_HELP} | {"temp"}
 
 
 def requires_op(value: str) -> bool:
     name, _, tail = value.strip().partition(" ")
+    if name == "image" and tail.strip().lower() in ("discribe", "describe"):
+        return False
     if name == "construct":
         first, _, remaining = tail.strip().partition(" ")
         if first in ("on", "off", "set", "reset"):
@@ -107,7 +116,8 @@ def requires_op(value: str) -> bool:
             return True
         return False
     return (name == "hint" or name == "use_model"
-            or name in {"image", "reasoning", "effort", "limit", "reflect", "awaker", "prompt", "debounce"} and bool(tail.strip()))
+            or name in {"image", "reasoning", "effort", "temperature", "temp", "brake", "years", "limit", "reflect",
+                        "awaker", "prompt", "debounce"} and bool(tail.strip()))
 
 
 def _subcommand_help(name: str = "") -> str:
@@ -321,6 +331,17 @@ def _reflect_subcommand(tail: str) -> str:
     return "reflect 参数错误，可用 #help reflect 查看"
 
 
+def _years_subcommand(tail: str) -> str:
+    tail = tail.strip().lower()
+    if tail in ("rebuild", "fix"):
+        return _chat_root._segment.fill_years()
+    lines = _chat_root._notes.years(last=1_000_000)
+    if not lines:
+        return "年鉴为空"
+    recent = "\n".join(lines[-10:])
+    return f"年鉴索引（共 {len(lines)} 条，显示最近 10 条）：\n{recent}\n\n使用 #years rebuild 补齐归档里缺了的行"
+
+
 def _awaker_subcommand(raw: str) -> str:
     body = raw.lstrip()[len("awaker"):]
     head, _, rest = body.partition("\n")
@@ -501,8 +522,11 @@ def _status_report(data: dict) -> str:
         "status 状态面板（复制每行开头命令即可修改）：",
         f"#use_model {model}（当前模型，改用 #use_model <名称>）",
         f"#effort {effort}（思考等级：default/off/none/low/medium/high/max）",
+        f"#temperature {_chat_root.get_temperature(data)}（采样温度：default/<0.0-2.0>；effort=none 时默认 1.3）",
+        f"#brake {_chat_root.get_brake(data)}（Pacing Brake 英文后置刹车补丁：on/off）",
         f"#reasoning {reasoning}（历史思考保留：keep/drop）",
         f"#image {image}（图像读取：off/lazy/eager）",
+        f"#image discribe {'on' if _chat_root.get_image_describe(data) else 'off'}（自动生成图片文字描述：on/off）",
         f"#audio {audio}（语音读取：off/lazy/eager）",
         f"#limit {max_events} {threshold}（画面 {max_events} 条，反思和沉淀的增长上限 {threshold}）",
         f"#debounce {deb_mode}（防抖延迟：{deb_detail}；改用 #debounce on/off/<等待秒数> [上限秒数]）",
@@ -588,6 +612,15 @@ def _subcommand(value: str):
         return f"image: {_chat_root.get_image_mode(data)}"
     if name == "image" and tail:
         mode, remaining = _first_argument(tail)
+        if mode.lower() in ("discribe", "describe"):
+            if not remaining.strip():
+                return f"image discribe: {'on' if _chat_root.get_image_describe(data) else 'off'}"
+            setting, extra = _first_argument(remaining)
+            if extra.strip() or setting.lower() not in ("on", "off"):
+                return "图片文字描述开关必须是 on 或 off"
+            data["image_describe"] = setting.lower() == "on"
+            storage.save()
+            return f"image discribe: {setting.lower()}"
         if remaining.strip():
             return "image 参数过多"
         mode = _chat_root.IMAGE_MODE_ALIASES.get(mode.lower(), mode.lower())
@@ -633,6 +666,27 @@ def _subcommand(value: str):
         data["reasoning_effort"] = normalized
         storage.save()
         return f"effort: {normalized}"
+    if name in ("temperature", "temp") and not tail:
+        return f"temperature: {_chat_root.get_temperature(data)}"
+    if name in ("temperature", "temp") and tail:
+        val_str, remaining = _first_argument(tail)
+        if remaining.strip():
+            return "temperature 参数过多"
+        normalized = _chat_root.normalize_temperature(val_str)
+        if normalized == "default" and val_str.lower() != "default":
+            return "temperature 必须是 default 或 0.0 到 2.0 之间的数值"
+        data["temperature"] = normalized
+        storage.save()
+        return f"temperature: {normalized}"
+    if name == "brake" and not tail:
+        return f"brake: {_chat_root.get_brake(data)}"
+    if name == "brake" and tail:
+        val_str, remaining = _first_argument(tail)
+        if remaining.strip() or val_str.lower() not in ("on", "off"):
+            return "brake 必须是 on 或 off"
+        data["brake"] = val_str.lower()
+        storage.save()
+        return f"brake: {val_str.lower()}"
     if name == "prompt":
         return _prompt_subcommand(raw)
     if name == "limit" and not tail:
@@ -641,6 +695,8 @@ def _subcommand(value: str):
         return _limit_set(tail)
     if name == "reflect":
         return _reflect_subcommand(tail.strip())
+    if name == "years":
+        return _years_subcommand(tail.strip())
     if name == "awaker":
         return _awaker_subcommand(raw)
     if name == "hint":

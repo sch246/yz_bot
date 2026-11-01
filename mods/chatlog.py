@@ -542,8 +542,9 @@ _DAY_NAME = re.compile(r"(?P<day>\d{2})\.log$")
 _MONTH_NAME = re.compile(r"(?P<year>\d{4})-(?P<month>\d{2})$")
 
 
-def window_of(path: str | os.PathLike, root: str | os.PathLike = rootfile) -> tuple[str, int | None] | None:
+def window_of(path: str | os.PathLike, root: str | os.PathLike | None = None) -> tuple[str, int | str | None] | None:
     """The window a log file belongs to, read off its path below *root*."""
+    root = rootfile if root is None else root
     try:
         rest = Path(path).relative_to(root).parts
     except ValueError:
@@ -557,8 +558,16 @@ def window_of(path: str | os.PathLike, root: str | os.PathLike = rootfile) -> tu
         return None
     if rest[0] == "bot":
         return "bot", None
-    if rest[0] in ("group", "private") and len(rest) > 1 and rest[1].isdigit():
-        return rest[0], int(rest[1])
+    if rest[0] == "me":
+        return "me", ""
+    if rest[0] in ("group", "private"):
+        return (rest[0], int(rest[1])) if len(rest) > 1 and rest[1].isdigit() else None
+    if len(rest) > 1:
+        try:
+            window_path(rest[0], rest[1], root)
+        except ValueError:
+            return None
+        return rest[0], rest[1]
     return None
 
 
@@ -1342,14 +1351,21 @@ def read_range(
     return records
 
 
-def known_windows() -> list[tuple[str, int]]:
-    """Only windows already represented in the local archive are boot candidates."""
+def known_windows() -> list[tuple[str, int | str | None]]:
+    """Windows represented by directories in the local archive, including custom kinds."""
     windows = []
-    for kind in ("group", "private"):
-        base = Path(rootfile) / kind
-        if base.is_dir():
-            windows.extend((kind, int(path.name)) for path in base.iterdir()
-                           if path.is_dir() and path.name.isdecimal())
+    root = Path(rootfile)
+    if not root.is_dir():
+        return windows
+    for base in sorted(root.iterdir()):
+        if not base.is_dir():
+            continue
+        if base.name in ("bot", "me"):
+            windows.append((base.name, None if base.name == "bot" else ""))
+            continue
+        for path in sorted(base.iterdir()):
+            if path.is_dir() and (window := window_of(path, root)) is not None:
+                windows.append(window)
     return windows
 
 
@@ -1393,6 +1409,9 @@ def freeze_boot_anchors() -> dict[tuple[str, int], str | None]:
         if _boot_anchors is None:
             anchors = {}
             for window in known_windows():
+                # CLI aliases and record ids must never become NapCat history requests.
+                if window[0] not in ("group", "private"):
+                    continue
                 try:
                     anchors[window] = last_message_anchor(*window)
                 except (OSError, UnicodeError, ValueError):

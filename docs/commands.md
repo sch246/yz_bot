@@ -202,9 +202,9 @@ cond 或 action 报错会写应用日志并把 traceback 回传当前聊天。co
 
 `loop("在做什么")` 显式开启连续循环；`wait(seconds, reason)` 在循环内推迟下一轮，循环外也可单独排唤醒；`loop(stop=True)`、取消或夜间反思停止循环。`loop_note_history` 从 journal 查备注。
 
-`#status` 查看模型、思考、防抖、构造运行、待沉淀窗口与循环运行态；`#model/#models` 看模型与价格，`#use_model` 切换；`#prompt` 管 self，`#image/#audio` 管多媒体，`#reasoning keep|drop` 管历史思考的请求投影，`#effort` 管生成思考等级，`#limit` 管首屏条数（80）与反思、沉淀的增长上限（500000 token），`#reflect [now|keep]` 看或运行反思（now 先沉淀），`#awaker` 管规则，`#debounce` 管防抖，`#construct` 管构造运行。查看与完整语法用 `#help [名称]`，修改要求 op。`#hint` 仍是独立的窗口 QQ 收尾提示文件，变量 usage/peak/limit 与[LLM 文档](llm.md)一致。
+`#status` 查看模型、思考、防抖、构造运行、待沉淀窗口与循环运行态；`#model/#models` 看模型与价格，`#use_model` 切换；`#prompt` 管 self，`#image/#audio` 管多媒体（`#image discribe on|off` 单独开关图片文字描述，查看不要求 op），`#reasoning keep|drop` 管历史思考的请求投影，`#effort` 管生成思考等级，`#temperature`（别名 `#temp`）管采样温度，`#brake` 管行动提示末尾的节奏刹车，`#years [rebuild]` 看年鉴最近几行或补齐缺行，`#limit` 管首屏条数（80）与反思、沉淀的增长上限（500000 token），`#reflect [now|keep]` 看或运行反思（now 先沉淀），`#awaker` 管规则，`#debounce` 管防抖，`#construct` 管构造运行。查看与完整语法用 `#help [名称]`，修改要求 op。`#hint` 仍是独立的窗口 QQ 收尾提示文件，变量 usage/peak/limit 与[LLM 文档](llm.md)一致。
 
-发送先 `type_word(target, text)`，下一步再 `send(target)`；正文自语不自动发送，草稿跨唤醒/重启保留。`send(wait=0)` 继续，`wait=-1` 收工，正时长等回复或超时，可用 who 指定作者。分身工具 `agents__fork(goal, refs, tasks, tools, model)` 复用同一套引用写法（日志编号、笔记、ctx、`policy:`、`log:`），最多五项并发，返回独立 ctx 与结果；默认没有 send/type_word，在本次 tools 显式授权。私聊主唤醒仍显示“正在输入”，`^C` 取消相关主运行与子进程。
+发送先 `type_word(target, text)`，下一步再 `send(target)`；正文自语不自动发送，草稿跨唤醒/重启保留。`send(wait=0)` 继续，`wait=-1` 收工，正时长等回复或超时，可用 who 指定作者；群里不写 who 时默认等叫醒她的那个人，`who="any"` 等全群。分身工具 `agents__fork(goal, refs, tasks, tools, model)` 复用同一套引用写法（日志编号、笔记、ctx、`policy:`、`log:`），最多五项并发，返回独立 ctx 与结果；默认没有 send/type_word，在本次 tools 显式授权。私聊主唤醒仍显示“正在输入”，`^C` 取消相关主运行与子进程。
 
 LLM 开局默认激活 `meta` 模块，直接获得共享 `.py` 环境执行工具和三个工具模块管理工具。完整目录及已加载模块说明在每次运行的首次请求成为工具状态条目；之后变化在请求边界追加差异条目，不改写旧描述。模型用 `load_tools` 激活 last-good 模块，用 `list_tools` 取完整最新状态和磁盘差异，用 `reload_tools` 显式应用修改。闲置超过一小时的模块下轮不再激活，但已发送的函数定义保留并由调用 guard 提示重装。现有模块覆盖戳一戳、图片、视觉外援、时间、延时任务、天气、高德地图、联网搜索、B 站冲浪与互动、自管浏览器、安卓备用机控制、邮箱、TOTP 验证码、表情柜、语音合成、合并转发、文件发送、头像获取、宿主机文件与后台命令、用户 storage、子模型任务分派、夜间反思记忆系统和 MC 百科查询；不会自动热加载。历史上明确禁用的工具只在 `mods/tools/disable/README.md` 留有决策记录，仓库中没有对应实现。工具 schema、模块格式、循环回写和高权限边界见独立的 [LLM 文档](llm.md)。
 

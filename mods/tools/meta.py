@@ -137,7 +137,7 @@ __all__ = ["lookup"]
 这是你唯一能让别人听见你说话的方式——你直接写在模型回复正文里的文字，全是你心里的自言自语（虽然会留在你自己的行动记录里，但外面的人一个字也看不见）。每次打字和发送都要写清窗口名字，比如 `target="g<群号>"`、`target="u<私聊QQ号>"` 或 `bili:<BV号>`，别凭感觉盲猜（`me` 是你自己的内置窗口，只能看不能回）。
 
 - **先打字、看一眼、再发送**：`type_word` 会把字放进输入框（想改口就重新调一次覆盖，传空串清空；草稿会保留到发送或主动清空）。同一次输出里刚打的字，不能在同一批里紧跟着 `send`——系统特意让你在打字和发送之间隔一步，好让你先看一眼打字这几秒钟里对方有没有发来新消息。等下一步看清了，再决定是照发、改口还是算了不发。
-- **分段与发送回执**：在输入框里用空行隔开的几段话，`send` 时会像真人聊天一样，隔一两秒一条、拆成几个气泡依次发出去，并返回消息号（`message_id`）。
+- **分段与发送回执**：在输入框里用空行隔开的几段话，`send` 时会像真人聊天一样，隔一两秒一条、拆成几个气泡依次发出去，并返回消息号（`message_id`）。CLI 窗口（`dsh:main`、`agy:review`、`codex:code`）把完整输入作为一轮任务，立即返回接收编号，回答稍后回到同一窗口并叫醒你；运行中再次发送会保留草稿。
 - **wait 控制后续与自主呼吸**：`send` 的 `wait` 参数决定发完这句之后你是继续活动还是挂着喘气：
   - `wait=0`：不等回复，发完直接跑下一轮，手里还有别的事情接着做；
   - `wait=-1`：发完收工，纯被动等待（相当于原 `final_call=true`），没有超时闹钟；
@@ -440,7 +440,7 @@ def send(
     target: 要发送的窗口，和 type_word 填的一样（如 g<群号>、u<私聊号>、bili:<BV号>、me）
     wait: 发完后怎么安排后续。传 0 表示不等、发完继续这一轮干手头的活；传 -1 表示结束这轮、纯被动等待；传等待时长（如 "5m"、"20m"、"1h" 或秒数 300）表示在当前窗口挂一个超时等待闹钟，期间有人回复立刻叫醒，到点超时还没人回也会自动叫醒你继续呼吸
     reason: 挂超时等待（wait > 0）时写给到时候自己的理由，如"不来我就接着读日记"、"等草籽接话"；留空默认"等回复"
-    who: 在群聊窗口中指定只等特定人回复（填 QQ 号，如 123456）；不填则等待群里任何人回复
+    who: 在群聊窗口中指定只等特定人回复（填 QQ 号，如 123456；传 "any" 等群里任何人）。若不填：在有人跟你说话的轮次里自动默认等刚才跟你说话的人，避免路人插话吞掉等待；在你自己醒来的轮次（闹钟、订阅等无对话人轮次）不填则等待群里任何人回复
 
     WHY: 同一次输出里刚 type_word 的字不发。那一批调用的参数是一起生成的，她还没看到
     打字之后到的消息；拒绝一次，下一次请求里新消息就在眼前（维护者 2026-10-23）。
@@ -505,10 +505,28 @@ def send(
         if len(parts) == 1:
             dur_str = parts[0]
         elif len(parts) >= 2:
-            who_parsed = parts[0]
-            dur_str = parts[1]
+            if re.search(r"^\d+[smhd]", parts[0]):
+                dur_str = parts[0]
+                if not reason:
+                    reason = " ".join(parts[1:])
+            else:
+                who_parsed = parts[0]
+                dur_str = parts[1]
+                if not reason and len(parts) > 2:
+                    reason = " ".join(parts[2:])
 
         target_who = who if who is not None else who_parsed
+        if target_who is not None and str(target_who).strip().lower() in ("any", "all", "*"):
+            target_who = None
+        elif target_who is None and label.startswith("g"):
+            # WHY: 2026-10-31 群聊中若未显式指定 who，判一下当前唤醒里该窗口是否有正在对话的人；
+            # 只有有具体对话人时才默认绑定其 QQ，避免路人闲聊误吃 wait 规则；
+            # 自主唤醒（闹钟、B站订阅等无对话人轮次）不瞎绑人，保持等全群或传 -1 纯被动等待（草籽与柚子定）。
+            # 对话人是这次唤醒里叫她的人（agent._adopt 从召唤记下），不是之后路过的人。
+            interlocutors = current_binding()["run"].get("interlocutors", {})
+            if window in interlocutors:
+                target_who = interlocutors[window]
+
         if target_who is not None and label.startswith("g"):
             who_id = str(target_who).lstrip("u:")
             wait_target = f"{label}:{who_id}"
@@ -527,7 +545,9 @@ def send(
     unconfirmed = (
         "先在下一轮的聊天记录里看它在不在，再决定要不要重发——不要直接重发。"
     )
-    parts = _split_turns(box["text"])
+    # WHY: CLI 的多段 prompt 是一次任务；按气泡拆开会让第二段撞上忙碌检查，丢掉后半任务。
+    sender = windows.sender(window)
+    parts = _split_turns(box["text"]) if getattr(sender, "split_bubbles", True) else [box["text"]]
     if tuple(window) == windows.ME:
         # WHY: 2026-10-27 早上草籽拆掉「现在是交接或反思，不对外说话」那道代码胶带——
         # me 是写给自己看的一行，想说的话有地方落下，第二天醒来自己看得见，也不吵到谁。
@@ -544,7 +564,7 @@ def send(
     sent = []
     try:
         for index, part in enumerate(parts):
-            sent.append(windows.sender(window)(window, part))
+            sent.append(sender(window, part))
             if index < len(parts) - 1:
                 # 人打下一句要时间：随机停一秒到两秒，别像机器连着吐（维护者 2026-10-24）。
                 time.sleep(random.uniform(*BUBBLE_GAP))

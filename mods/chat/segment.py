@@ -46,6 +46,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -225,7 +226,13 @@ def raw_messages(view, *, expand_folds=False):
     return [message for row in _entries(view, deep=expand_folds) for message in row["messages"]]
 
 
-def render(view, *, reasoning="keep"):
+def render(view, *, reasoning="keep", mark_borrowed=False):
+    """Provider messages for this view; ``mark_borrowed`` flags messages from other contexts.
+
+    WHY: 2026-10-31 维护者定图片以唤醒为界变旧：这次的图一直可见，以前的只留地址和已有描述。
+    无状态中心里"以前的"就是借来的行——构造带进来的旧材料、fork 继承的引用；这次运行自己
+    写下的行（画面、附图结果）才是新的。llm 看到 _old_image 就不再下载或描述它的图。
+    """
     if reasoning not in ("keep", "drop"):
         raise ValueError("reasoning must be keep or drop")
     rows = _entries(view)
@@ -278,6 +285,8 @@ def render(view, *, reasoning="keep"):
                     # provider history without its assistant call.
                     continue
                 waiting.remove(call_id)
+            if mark_borrowed and row["ctx"] != view["ctx"]:
+                message["_old_image"] = True
             result.append(message)
     finish()
     return result
@@ -485,8 +494,34 @@ def _index_year(view):
             return
         with _YEARS.open("a", encoding="utf-8") as handle:
             handle.write(_year_line(view) + "\n")
-    except OSError:
-        pass  # the yearbook is only an index, not the frozen view
+    except OSError as error:
+        # 年鉴只是索引，写不进去不能妨碍归档本身，但记录告警。
+        logging.getLogger(__name__).warning("追加年鉴索引失败：%s", error)
+
+
+def fill_years() -> str:
+    """Append yearbook lines missing for archived views; never removes or rewrites a line.
+
+    WHY: 2026-10-31 维护者加了 `#years rebuild`，从归档整份重建年鉴并核对每行能定位到原文。
+    新核心的年鉴行本来就带 `[ctx]`；迁移来的 views/ 里旧段的 kind 不全，整份重建会把不该进
+    年鉴的段写进去、把手写的行冲掉，所以只补缺：明确标了可入年鉴 kind 的视图没有行就补一行。
+    """
+    with _lock:
+        text = _YEARS.read_text(encoding="utf-8") if _YEARS.is_file() else ""
+        lines = [line for line in text.splitlines() if line.strip()]
+        marked = {line.rstrip().rsplit("[", 1)[-1].rstrip("]") for line in lines if line.rstrip().endswith("]")}
+        missing = []
+        for name, view in each_archived():
+            if "kind" in view["stats"] and view["stats"]["kind"] in ("", "reflect", "settle") and name not in marked:
+                view["stats"].setdefault("ended", view["started"])
+                missing.append((view["started"], _year_line(view)))
+        unlocated = sum(not line.rstrip().endswith("]") for line in lines)
+        if missing:
+            _YEARS.parent.mkdir(parents=True, exist_ok=True)
+            with _YEARS.open("a", encoding="utf-8") as handle:
+                handle.write("".join(line + "\n" for _started, line in sorted(missing)))
+        return (f"年鉴原有 {len(lines)} 行（其中 {unlocated} 行没有 [ctx] 定位，是切换前写的），"
+                f"补了 {len(missing)} 行")
 
 
 def _year_line(view):

@@ -14,7 +14,7 @@
 
 默认触发器之上可设 `follow`（每条都叫）、`mute`（都不叫）和代码 `awaker.override` 的 `other` 函数。`me` 不能覆盖，master 的话不被 mute 压住；覆盖只决定默认唤醒，消息仍可未读，显式 `chat.wake` 与她设置的 `on/wait` 仍有效。`follow/mute/on` 以 awaker 文件为权威，跨重启保留；`other`、`wait` 和 loop 运行态只在内存。普通离线补回只补历史；离线时叫她的记录以身份登记，即使时间早于已确认位置也能被恢复和唤醒。
 
-设置面使用 `#status`、`#model`、`#models`、`#prompt`、`#image`、`#audio`、`#reasoning`、`#effort`、`#limit`、`#reflect`、`#awaker`、`#debounce`、`#construct` 与 `#help`；修改全局设置要求 op。`#status` 合并显示待沉淀窗口、构造运行与循环运行态。模型设置、Bot 全局工具激活和预算属于全局 agent；每窗口 `#hint` 独立。精确语法以 `#help` 为准。
+设置面使用 `#status`、`#model`、`#models`、`#prompt`、`#image`、`#audio`、`#reasoning`、`#effort`、`#temperature`、`#brake`、`#limit`、`#reflect`、`#years`、`#awaker`、`#debounce`、`#construct` 与 `#help`；修改全局设置要求 op。`#status` 合并显示待沉淀窗口、构造运行与循环运行态。模型设置、Bot 全局工具激活和预算属于全局 agent；每窗口 `#hint` 独立。精确语法以 `#help` 为准。
 
 **B 站**（`mods/bili.py`，2026-10-23 起）：柚子自己的 B 站号，种类 `bili`。一个评论区是一个窗口：视频写 `bili:BV…`，动态、图文、专栏写 `bili:t<评论区类型>-<oid>`。每两分钟轮询一次"回复我的"和"@ 我的"，新的一条以评论号为记录号 `push` 进对应窗口并叫醒她，原因写"B 站有人回复你：《标题》"或"B 站有人 @ 你"；第一次轮询只记位置，不把账号以前的通知倒进来。每次只看第一页（约 20 条）；两分钟里来了一页以上，不往前翻、不全记在本地，而是在她的 `me` 窗口留一句并叫醒她，让她用 `bili__inbox` 去 B 站消息中心翻。通知里只有文字，表情是 `[doge]` 这样的文字，只有图片的那条正文换成一句占位；某一条数据不对就记日志跳过，写盘这类错误停在那一条、下次重试。她用 `type_word`／`send` 发评论，只能发文字（表情照 B 站写法写在正文里），正文开头 `[CQ:reply,id=评论号]` 表示回复那条，别的 CQ 码会被拒绝；评论工具把评论带的图片列成 `[图片] 地址`，她用 `attach_image` 看。楼中楼的楼主号由模块记着（通知、评论工具和她自己的回复都会记）。她发出去的评论只写进 chatlog、不登记到达（B 站没有回声）。刷首页、热门、搜索、视频详情、字幕原文、评论和楼中楼、评论点赞点踩与删除、视频点赞投币与收藏夹管理、个人主页与资料修改、动态查看与删除、关注与粉丝管理，以及直接读 B 站消息中心的 `inbox`（回复、@、赞、系统通知、私信会话，带未读数和翻页）和读私信的 `dm`，是工具模块 `bili`（`mods/tools/bili.py`），不进窗口；私信还不能回。登录是 `.bili login`，二维码只发到管理员私聊：管理员自己发，或者她用 `cmds__run_command(".bili login", target="u<管理员>")` 在管理员私聊里发起（谁扫码谁的号就成了她的号，所以不能发进群或发给别人）。私聊里只发二维码这一张图，扫码的说明由她自己说；登好了、过期了或出错写进她的 `me` 窗口并叫醒她；另一条路是她在自己的浏览器里登 B 站，用 `browser__get_cookies` 取出 Cookie（含 httpOnly 的 SESSDATA）交给 `bili__use_cookie`；两条路存凭证后都要用它查到自己的 uid 才算登好；凭证在 `data/bili/credential.json`，每天检查一次要不要刷新。
 
@@ -53,25 +53,33 @@ awaker 文件提供 `every/daily/at/when/on/follow/mute`；默认 `daily 04:00 r
 ## 多媒体与提示词笔记（图片、语音与音乐）
 
 中心主聊天的多媒体档位由 op 用 `#image <mode>` 与 `#audio <mode>` 全局设置。名称与数字别名分别为 `off/0`、`lazy/1`、`eager/2`。
-- **图片档位（#image）**：`off` 会把历史消息中的图片 part 降级为 `[图片(URI)]` 文本；`lazy` 只在 LLM 实际触发时处理图片；`eager` 在图片消息到达时后台预取并按需预生成描述。
+- **图片档位（#image）**：`off` 只给图片地址和已有描述；`lazy` 在请求时处理这次运行的新图；`eager` 在图片消息到达时后台预取。文字描述另由 `#image discribe` 开关，见下文。
 - **语音档位（#audio）**：`off` 时聊天画面呈现 `[语音: 5秒]`（无时长时为 `[语音]`），不触发下载；`lazy` 时调用 NapCat `get_record` 转码或直链下载到 `data/tmp_files/<sha256>.mp3`（复用 15 天闲置清理），画面呈现 `[语音: 5秒, file:///...]` 供柚子需要时调用 `audio__listen` 倾听；`eager` 时后台拉取并通过多模态模型自动转录，画面直接呈现 `[语音: 5秒: {转录与语气描述}]`。
 - **音乐卡片（music CQ）**：聊天中的音乐分享（`[CQ:music,...]`）在进入画面时被自动解析转换为结构化的 `[音乐卡片: 《歌名》- 歌手 (平台)]`，便于模型准确理解歌曲信息。
 
 ### 提示词笔记与缓存自动失效
 
-图片与音频的默认描述提示词分别存放在普通笔记 `data/notes/vision.md` 与 `data/notes/audio.md` 中（若文件不存在则平滑回退到模块内默认常量）。提示词采用**动态哈希版本**（`auto-v1:<hash>` 与 `audio-v1:<hash>`）：
+图片与音频的默认描述提示词分别存放在普通笔记 `data/notes/vision.md` 与 `data/notes/audio.md` 中（若文件不存在则平滑回退到模块内默认常量）。提示词采用**动态哈希版本**（`auto-v2:<hash>` 与 `audio-v1:<hash>`）：
 - 只要维护者或柚子修改了 `vision.md` 或 `audio.md` 的内容，提示词 SHA256 哈希值改变，系统在读取描述缓存时判定版本不匹配，旧缓存自动被淘汰并重新请求多模态大模型，无需人工清理缓存。
 - 图片描述缓存保存在 `llm_system/description_cache`，音频描述缓存保存在 `llm_system/audio_cache`，两套缓存物理隔离，避免相互误清。
 
-中心主聊天的图片档位由 op 用 `#image <mode>` 全局设置。名称与数字别名分别为 `off/0`、`lazy/1`、`eager/2`；历史布尔值兼容为 `False → off`、`True → lazy`。`off` 会把历史消息中的图片 part 降级为 `[图片(URI)]` 文本：避免把 `image_url` 发给纯文本模型；没设过 `#image` 时就是 `off`。例外是工具结果里的图：模型登记了 `vision` 和 `tool_images` 时，她用 `attach_image` 要看的图在 `off` 下照样展开（2026-10-23 起），所以 `off` 只管聊天里别人发来的图。中心 agent 可按需加载 `image` 模块：`recognize_image` 不依赖窗口，生图返回临时文件 URI，由模型再用带显式目标的 `type_word`／`send` 发送。`lazy` 只在 LLM 聊天实际触发时处理本轮上下文中的图片；**一次对话内同一张图只解析一次**——这里的“一次对话”指 `chat.chat()` 的一次持有（多轮工具调用与插话续写都算同一轮，直到它的 `finally`），解析失败的不再逐轮重试（腾讯 `rkey` 过期后只会拿到 HTML），成功的也直接复用，对话结束后重新聊会重新检查；不会自己好的失败（下回来的不是图、本地文件没了）跨对话记一小时，网络不通的不记。成功的图不再每次打日志，只有下载、上传和失败才说一句。模型登记了 `files_api` 时（DeepSeek 的 Files API），每张图第一次发给模型时上传一次（7 天有效，对端每个账号最多存 10000 个文件），之后请求里只放 `{"type": "file", "file_id": ...}`：file_id 按内容摘要记在 storage 的 `llm_system/image_files`，还在用、离过期不到一天的才重传，不用的到期就没了；传过的本地图另记路径，文件删了也照样引用；上传出错时这张图改成内联，5 分钟内先都内联。这项检查台账挂在线程局部，eager 预取另在线程记账。`eager` 在图片消息到达时立即启动后台下载：中心聊天模型能直接读图时只缓存原图，纯文本模型才会同时预生成文字描述。同一来源若恰好同时被 eager 和聊天请求，描述生成会等待同一个进行中任务，避免重复计费。纯文本模型的识别结果统一压成一个 `[图片(URI)识别结果：描述]` 文本 part，明确 URL 与描述属于同一张图片；视觉模型收到的实际图片 part 前会保留一段“下方图片的原始链接”文本。图片加载失败或没有可用视觉模型时也使用同一个带 URI 的单段格式。
+中心主聊天的图片档位由 op 用 `#image <mode>` 全局设置。名称与数字别名分别为 `off/0`、`lazy/1`、`eager/2`；历史布尔值兼容为 `False → off`、`True → lazy`，未设置时默认 `off`。`off` 只让聊天图片以地址和已有描述出现，不自动下载或生成新描述；内联图片会保存为本地文件，以便之后调用 `attach_image`。`lazy` 在聊天请求时处理这次运行自己的新图；`eager` 在图片消息到达时后台下载。行动画面里的聊天图片以图片 part 进入请求，语音档位和 QQ 表情注释也在这里套用（2026-11-01 接回；cf8f0d4 起画面只放原文，图片一直只剩 `[CQ:image…]` 字样）。构造运行看到的仍是原文，图只是一段 CQ 码。
 
-画面每次组装都重新读取，图片随请求按当前档位处理：纯文本模型的描述走描述缓存，缓存失效时会重新描述或给出失败占位；视觉模型直看图片时也可能因原图缓存过期而看到不同内容。`attach_image(uri, note="", model=None)` 支持传参指定外部视觉模型（如 `azure/gpt-5.6-luna`、`cheap` 等）直接转述；若未指定且当前主模型无视觉能力，会自动回退调用默认视觉模型（`get_vision_model`）转述图中内容；在不支持工具结果带图的视觉模型上只把附图保留于当前子请求，不进持久视图。
+`#image discribe on/off` 独立控制 lazy/eager 是否自动调用视觉模型生成并缓存文字描述，兼容 `describe` 拼写，默认 `on`，查看不要求 op。开启时，即使主模型能直接看图也会生成描述；关闭后不生成新描述，但已有缓存仍可使用。eager 与聊天请求遇到同一内容时等待同一个进行中任务，避免重复识别。
+
+**图片以运行为界变旧**：一次运行自己写下的行（行动的画面、`attach_image` 的结果）里的图，在它的工具续轮里一直按档位展开；从别的上下文借来的行——构造带进来的旧材料、fork 继承的引用——由 `run` 标成旧图，只发送 `[图片(URI)]` 或 `[图片(URI)识别结果：描述]`，不重新下载或付费描述。需要再看时调用 `attach_image(uri, note="", model="")`。主动附图在 `off` 下也放行，长截图照常切片；支持工具结果带图的模型在工具消息里看，不支持的视觉模型通过带来源标记的 user 消息看，这条消息只活下一次请求、不进经历日志，结果文字里留着地址；发给供应商前移除所有标记。指定 `model` 时由该视觉模型转述；主模型无视觉时自动调用默认视觉模型。
+
+GIF 按实际文件内容识别。DeepSeek 自动看图保留原始 GIF；其他主模型默认只收到第一帧 PNG，并明确提示这是 GIF、可用 `attach_image` 查看完整过程。主动附图和自动描述都把 GIF 的**每一帧**依次排进网格，每张最多 25 帧，按帧的宽高比选择行列，超过就分多张。每格有全局帧号和累计时间戳，透明与增量帧先合成，不抽样，也不把网格当作长截图再次切割。[DeepSeek 支持 GIF 格式](https://api-docs.deepseek.com/guides/vision/)，这不表示服务端保证理解动画的每一帧。
+
+Files API 只对 `deepseek` 供应商启用，默认开启，可在该模型配置中显式设 `files_api: false`；其它供应商即使登记 `files_api: true` 也不会上传。图片第一次发送时上传，之后用 `{"type": "file", "file_id": ...}` 引用。file_id 按内容摘要保存在 `llm_system/image_files`，有效期 7 天，仍在使用且离过期不到一天才重传，不用的到期后不续；上传失败后 5 分钟内改为内联。缓存同时保存切片/GIF 阅读说明，旧格式记录首次使用时重新上传。[Files API 的格式与限额](https://api-docs.deepseek.com/guides/files_api/)由对端规定。
+
+一次 `chat.chat()` 持有期间，同一张图只解析一次，失败也不逐轮重试；本地文件消失、返回内容不是图片等不会自行恢复的失败跨对话记一小时，网络失败不记。成功图静默复用，只有下载、上传和失败才记录提示。中心 agent 可按需加载 `image` 工具模块：`recognize_image` 不依赖窗口，生图返回临时文件 URI，由模型再通过 `type_word`／`send` 发到显式目标。`vision__storyboard(video, count=9, cols=3)` 用本机 ffmpeg 从视频文件或流地址均匀抽帧，拼成带时间戳的分镜图，返回它的 `file://` 地址。
 
 自动描述使用固定 prompt，要求直接概括可见内容、转录重要文字、标明不确定项，并禁止“如果你愿意我还可以……”一类元话术。自动聊天图片处理、eager 预取、`recognize_image` 和参考图生图共用图片解析入口：`http://`、`https://` 和本机绝对 `file://` URI 都解析为 SHA-256 内容身份；网络图片按摘要缓存在 `data/tmp_files`，本地文件只计算摘要而不复制。所有入口都执行图片格式和 20 MiB 上限校验。需要把图片交给视觉模型时，再统一由 `image_uri_to_data_uri` 编码。`recognize_image` 支持自定义识别 prompt，不设置输出 token 上限，也不读写自动描述缓存，避免长文本识别被截断以及不同识别任务互相串用答案。
 
-视觉模型实际收到图片前会检查已经编码的图片尺寸。若图片高度严格大于宽度的 4 倍，原图会被仅在内存中切成从上到下排列的多个 PNG 片段：每片从 3 倍图宽的整数倍高度开始，先覆盖 3 倍图宽；若后续仍超过 1 倍图宽则向后延伸四分之一图宽作为重叠，否则直接延伸到末尾，因此片段最高为 4 倍图宽。这些片段替代原图，并附带 `【自动图片切割】` 提示，让模型按一张连续图片理解并避免重复转录。原生视觉聊天和为纯文本模型生成图片描述共用这项处理；分片不写入文件或缓存，自动描述仍按原始图片的内容摘要缓存最终结果。生图参考图不经过这项识别预处理。
+视觉模型实际收到图片前会检查已经编码的图片尺寸。若图片高度严格大于宽度的 4 倍，原图会被仅在内存中切成从上到下排列的多个 PNG 片段：每片从 3 倍图宽的整数倍高度开始，先覆盖 3 倍图宽；若后续仍超过 1 倍图宽则向后延伸四分之一图宽作为重叠，否则直接延伸到末尾，因此片段最高为 4 倍图宽。这些片段替代原图，并附带 `【自动图片切割】` 提示，让模型按一张连续图片理解并避免重复转录。原生视觉聊天和生成图片描述共用这项处理；长图分片只在请求中使用，自动描述仍按原始图片的内容摘要缓存最终结果；主动打开 GIF 的网格图会保存为临时文件引用。生图参考图不经过这项识别预处理。
 
-新生成的描述缓存以图片 SHA-256 为键，值包含 `description`、`cached_at` 和自动描述 prompt 版本。迁移脚本也能保留 QQ URL 自带内容摘要的历史描述：`multimedia` 使用 `sha1:<摘要>`，`gchat` 使用 `md5:<摘要>`；这些迁移键只用于命中描述，不伪装成可解析原图的 alias。只有视觉调用成功才写入新描述；lazy 和 eager 对字节相同的图片直接复用文字，即使来源 URL 不同。进行中识别也以“描述缓存对象、内容摘要、prompt 版本”合并。
+新生成的描述缓存以图片 SHA-256 为键，值包含 `description`、`cached_at` 和自动描述 prompt 版本。迁移脚本也能保留 QQ URL 自带内容摘要的历史描述：`multimedia` 使用 `sha1:<摘要>`，`gchat` 使用 `md5:<摘要>`；这些迁移键只用于命中描述，不伪装成可解析原图的 alias。只有视觉调用成功才写入新描述；lazy 和 eager 对字节相同的图片直接复用文字，即使来源 URL 不同。进行中识别以“内容摘要、prompt 版本”合并，等待方将同一结果写入各自的描述缓存。
 
 摘要是内部身份，不是模型或工具参数。原始 URI 始终保留在 `[图片(URI)]`、`[图片(URI)识别结果：描述]` 或视觉图片前的“原始链接”文本中，模型调用 `recognize_image`、`create_image_from_references` 等工具时继续传这个 URI；解析入口再用 URI alias 透明定位本地 SHA-256 文件。因此更换 `rkey` 不会改变同一 QQ 图片的来源身份，已有本地 alias 时也不必用旧链接重新下载。
 
@@ -119,7 +127,7 @@ awaker 文件提供 `every/daily/at/when/on/follow/mute`；默认 `daily 04:00 r
 | `reload_tools` | 按模块名从磁盘显式应用、更新或删除模块；逐项返回成功和带完整 traceback 的失败结果，失败保留旧 last-good。 |
 | `load_tools` | 将 last-good 模块激活到当前 Chat；中心名单存全局 `agent`，不读取磁盘。 |
 
-`meta` 还提供明确目标的 `type_word/send`、规则 `wake_me`、召回 `search/read_log/read_actions/read_note`、笔记 `write_note`、连续活动 `loop/wait/loop_note_history`、`set_name` 与 `attach_image`（2026-11-01 删除了 `tidy/dismiss/compress/decompress`）。工具模块 `construct` 只有 `assemble`，只在构造运行里可见、可用。发送先打字、下个模型输出再发送；输入框存在 storage，跨唤醒和重启保留。`send(wait=0)` 继续工作，`wait=-1` 收工被动等，正时长则挂回复或超时的一次等待，可用 `who` 限定作者。
+`meta` 还提供明确目标的 `type_word/send`、规则 `wake_me`、召回 `search/read_log/read_actions/read_note`、笔记 `write_note`、连续活动 `loop/wait/loop_note_history`、`set_name` 与 `attach_image`（2026-11-01 删除了 `tidy/dismiss/compress/decompress`）。工具模块 `construct` 只有 `assemble`，只在构造运行里可见、可用。发送先打字、下个模型输出再发送；输入框存在 storage，跨唤醒和重启保留。`send(wait=0)` 继续工作，`wait=-1` 收工被动等，正时长则挂回复或超时的一次等待，可用 `who` 限定作者；群里不写 `who` 时，这次唤醒若是某人叫醒的就默认只等这个人，写 `who="any"` 等全群（2026-10-31）。时长后面可以直接跟理由，如 `wait="5m 等他接话"`。CLI 窗口（[CLI agent 窗口](cli-agents.md)）把整段输入作为一轮任务，不拆气泡。
 
 仓库当前提供以下按需模块；函数只在对应模块激活后出现：
 
@@ -221,7 +229,7 @@ hint 与追加式上下文是两层，判据是一句话：**频繁变化、且�
 
 ### 中心设置与旧窗口配置
 
-`image`（图片档位）、`reasoning`、`reasoning_effort`（思考等级）、`max_events`、`tidy_token` 共用 `mods.chat.AGENT_SETTINGS` 的全局归一化规则。中心主会话只读全局 `agent` storage；op 用 `#use_model`、`#image`、`#reasoning`、`#effort`、`#limit`、`#construct` 等命令修改它。旧窗口聊天配置不自动迁移，也不再读取；`#hint` 的窗口配置是独立例外。
+`image`（图片档位）、`image_describe`（图片文字描述）、`reasoning`、`reasoning_effort`（思考等级）、`temperature`（采样温度）、`brake`（节奏刹车）、`max_events`、`tidy_token` 共用 `mods.chat.AGENT_SETTINGS` 的全局归一化规则。中心主会话只读全局 `agent` storage；op 用 `#use_model`、`#image`、`#reasoning`、`#effort`、`#temperature`、`#brake`、`#limit`、`#construct` 等命令修改它。`#temperature` 是 `default` 或 0.0–2.0；`default` 时 effort 为 `none` 的运行用 1.3（DeepSeek 对非思考与创意写作的推荐值），其它交给模型默认；构造运行另有自己的 effort，不跟着升温。`#brake on`（默认）在行动运行的提示末尾加一段英文的节奏与视角约束（只推进一个反应、不替对方说话、不全知、不重复细节、不煽情），不进经历日志；构造、沉淀和反思不加。旧窗口聊天配置不自动迁移，也不再读取；`#hint` 的窗口配置是独立例外。
 
 - **缺省值写死在代码里**（`DEFAULT_MAX_EVENTS` / `DEFAULT_TIDY_TOKEN` 与各归一化函数的兜底分支），不再读 `llm_system/config.json`。中心运行期覆盖只有全局 `agent` storage 一份；`#limit` 是唯一预算命令入口。
 - **两个预算**：`max_events`（默认 80，存储键沿用旧名）是从没看过的窗口的首屏条数；`tidy_token`（默认 500000，存储键沿用旧名）在 2026-11-01 以前是交接阈值，现在只限制一次反思或沉淀里材料之后新长出来的部分。2026-10-22 以前是 `max_token × pressure_percent` 两个数，那是按每次重组上下文定的预算，第一次读到时删掉旧键、用默认。旧窗口覆盖不自动迁入全局主体。每晚反思的时刻在笔记 awaker 里，`agent.reflected_at` 记上次反思的时间。旧的 `agent.librarian_model`、`agent.tidied_at` 不再读取。

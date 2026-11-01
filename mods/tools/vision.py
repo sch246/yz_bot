@@ -277,4 +277,90 @@ def ask(images: str, prompt: str = "", model: str = "cheap") -> str:
         return f"外援识图失败（{selection}）：{type(error).__name__}: {error}"
 
 
-__all__ = ["ask", "models", "stitch"]
+def storyboard(video: str, count: int = 9, cols: int = 3) -> str:
+    """从本地视频文件或流地址中均匀抽取代表帧，拼成带时间戳的网格分镜大图。
+
+    @param
+    video: 视频文件路径（绝对路径或 file://）或流地址
+    count: 抽取的帧数，默认 9 帧（适合 3x3 排布）
+    cols: 拼图的列数，默认 3
+    """
+    import shutil
+    import subprocess
+    import tempfile
+    from PIL import Image, ImageDraw, ImageFont
+
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        return "分镜失败：本机未安装 ffmpeg 或 ffprobe"
+
+    source = _local(video) if video.startswith("file://") else video.strip()
+    if not source:
+        return "分镜失败：没有给出视频地址"
+    if not source.startswith("http://") and not source.startswith("https://") and not os.path.isfile(source):
+        return f"分镜失败：找不到视频文件 {source}"
+
+    try:
+        count = max(2, min(36, int(count)))
+        cols = max(1, min(6, int(cols)))
+    except (TypeError, ValueError):
+        return "分镜失败：count 和 cols 必须是正整数"
+
+    try:
+        probe = subprocess.run([
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", source
+        ], capture_output=True, text=True, timeout=15)
+        duration = float(probe.stdout.strip())
+    except Exception as error:
+        return f"分镜探测时长失败：{error}"
+
+    if duration <= 0:
+        return "分镜失败：无法获取视频有效时长"
+
+    start = max(0.5, duration * 0.05)
+    end = max(start, duration * 0.95)
+    step = (end - start) / max(1, count - 1)
+    timestamps = [start + i * step for i in range(count)]
+
+    frames = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for idx, ts in enumerate(timestamps):
+            out_img = os.path.join(tmpdir, f"frame_{idx:03d}.jpg")
+            m, s = divmod(int(ts), 60)
+            h, m = divmod(m, 60)
+            time_label = f"{h:02d}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
+
+            cmd = [
+                "ffmpeg", "-ss", f"{ts:.2f}", "-i", source,
+                "-frames:v", "1", "-q:v", "3", out_img, "-y"
+            ]
+            try:
+                subprocess.run(cmd, capture_output=True, timeout=15)
+                if os.path.isfile(out_img):
+                    with Image.open(out_img) as img:
+                        frame = img.convert("RGB")
+                        draw = ImageDraw.Draw(frame)
+                        try:
+                            font = ImageFont.load_default(size=18)
+                        except Exception:
+                            font = ImageFont.load_default()
+                        draw.rectangle([6, 6, 6 + len(time_label) * 11, 28], fill=(0, 0, 0))
+                        draw.text((10, 8), time_label, fill=(255, 255, 255), font=font)
+                        frames.append(frame)
+            except Exception:
+                continue
+
+    if not frames:
+        return "分镜失败：未能成功抽取任何有效画面帧"
+
+    canvas = _tile(frames, cols=cols, labels=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    filename = f"storyboard_{int(time.time())}_{count}.jpg"
+    out_path = os.path.join(OUTPUT_DIR, filename)
+    canvas.save(out_path, format="JPEG", quality=88)
+
+    uri = f"file://{os.path.abspath(out_path)}"
+    return f"{uri}\n共抽取 {len(frames)} 帧分镜（时长 {int(duration)}s），带时间戳标签。"
+
+
+__all__ = ["ask", "models", "stitch", "storyboard"]

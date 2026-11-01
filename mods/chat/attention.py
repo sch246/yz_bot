@@ -219,7 +219,10 @@ def on_record(window, event, *, recovered=False) -> bool:
             return enqueue(window, kind=kind, record_ids=[identity_], author=author, event=event)
         return False
     wanted, layer = awaker.triggered(window, event, author, matched) if not own else (False, None)
-    waited = (awaker.take_waiting(window, author) if not own and msgs.is_msg(event) else [])
+    # WHY: 2026-10-30 起 push 来的记录（CLI 回复、B 站回复）也认领她挂在那个窗口的 wait；
+    # 以前只认 QQ 消息，dsh:main 上挂的 wait 只能等到超时。
+    waited = (awaker.take_waiting(window, author)
+              if not own and (msgs.is_msg(event) or event.get("post_type") == "push") else [])
     producer = event.get("_default_wake")
     default_kind = str(producer) if isinstance(producer, str) and producer else "wake"
     kind = (str(explicit) if explicit else "poke" if msgs.is_poke(event)
