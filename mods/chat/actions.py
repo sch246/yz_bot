@@ -18,23 +18,22 @@ def _short(value, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + f"…（共 {len(text)} 字）"
 
 
-def pairs(*, ids=None, after: float | None = None) -> list[tuple[dict, dict | None]]:
+def pairs(*, ids=None, after: float | None = None, last: int | None = None) -> list[tuple[dict, dict | None]]:
     """Outputs in journal order, each with all results despite clock rollback.
 
-    after selects assistant times only. Explicit ids load just their shards.
+    after selects assistant times only. last limits assistants before pairing.
     """
     if ids is None:
-        entries = journal.events(kind="assistant", after=after or 0)
+        entries = journal.events(kind="assistant", after=after or 0, last=last)
     else:
         entries = [journal.get(one) for one in dict.fromkeys(ids)]
         entries.sort(key=lambda row: (row["id"].split("-")[0], int(row["id"].split("-")[1])))
+    entries = [entry for entry in entries if entry["kind"] == "assistant"
+               and (after is None or entry["time"] >= after)]
+    related = journal.act_entries_many(entry["id"] for entry in entries)
     found = []
     for entry in entries:
-        if entry["kind"] != "assistant":
-            continue
-        if after is not None and entry["time"] < after:
-            continue
-        rows = journal.act_entries(entry["id"])
+        rows = related[entry["id"]]
         assistant = entry["messages"][0]
         output = {**entry, "assistant": assistant, "read_at": entry["time"]}
         returns = [message for row in rows[1:] for message in row["messages"] if message.get("role") == "tool"]

@@ -77,10 +77,8 @@ def read_actions(ids: list[str] | None = None, count: int = 10, keyword: str = "
     """
     # WHY: 先按完整原文筛选、再分页（2026-10-22 审查发现：先截 4000 字再搜，长工具结果的
     # 尾部既按行动号读不到、也搜不到；原文只在行动记录里，召回工具得能拿全）。
-    found = _actions.pairs(ids=ids or None)
-    if not ids and not keyword:
-        # 只要最近几条时先截再渲染；按词筛只能在完整原文里找，没法先截。
-        found = found[-max(1, min(int(count), 50)):]
+    last = max(1, min(int(count), 50)) if not ids and not keyword else None
+    found = _actions.pairs(ids=ids or None, last=last)
     rendered = [_actions.render(output, result, chars=10**9) for output, result in found]
     if keyword:
         rendered = [text for text in rendered if keyword.casefold() in text.casefold()]

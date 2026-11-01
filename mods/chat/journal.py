@@ -148,23 +148,32 @@ def _read(path):
     return rows
 
 
-def _events_from_day(first_day=None, *, ctx=None, kind=None):
-    """Detached rows from stable shard days; no wall-clock filtering."""
+def _events_from_day(first_day=None, *, ctx=None, kind=None, after=None, last=None):
+    """Detached rows in shard order, optionally filtered by time and limited."""
     with _reading():
         found = []
-        for path in sorted(ROOT.glob("[0-9]" * 8 + ".jsonl")):
+        if last is not None and last <= 0:
+            return []
+        for path in sorted(ROOT.glob("[0-9]" * 8 + ".jsonl"), reverse=last is not None):
             if first_day is not None and path.stem < first_day:
                 continue
-            found.extend(row for row in _read(path)
-                         if (ctx is None or row["ctx"] == ctx)
-                         and (kind is None or row["kind"] == kind))
+            rows = _read(path)
+            for row in reversed(rows) if last is not None else rows:
+                if ((ctx is None or row["ctx"] == ctx)
+                        and (kind is None or row["kind"] == kind)
+                        and (after is None or row["time"] >= after)):
+                    found.append(row)
+                    if last is not None and len(found) >= last:
+                        return clone(found[::-1])
+        if last is not None:
+            found.reverse()
         return clone(found)
 
 
-def events(*, ctx=None, kind=None, after=0):
-    """Rows whose actual wall-clock time is >= after, in shard/id order."""
+def events(*, ctx=None, kind=None, after=0, last=None):
+    """Rows whose actual time is >= after, optionally the last in shard/id order."""
     first_day = time.strftime("%Y%m%d", time.localtime(after)) if after else None
-    return [row for row in _events_from_day(first_day, ctx=ctx, kind=kind) if row["time"] >= after]
+    return _events_from_day(first_day, ctx=ctx, kind=kind, after=after, last=last)
 
 
 def get(item_id: str) -> dict:
@@ -269,11 +278,30 @@ def begin_act(ctx, assistant, **metadata) -> str:
 
 
 def act_entries(act_id) -> list[dict]:
-    act = get(act_id)
-    if act["kind"] != "assistant":
-        raise ValueError("not an assistant act")
-    return [act, *(row for row in _events_from_day(act_id.split("-")[0], ctx=act["ctx"])
-                  if row.get("act_id") == act_id)]
+    return act_entries_many([act_id])[act_id]
+
+
+def act_entries_many(act_ids) -> dict[str, list[dict]]:
+    """Each assistant and its related rows, reading the relevant shards once."""
+    with _reading():
+        found = {act_id: [get(act_id)] for act_id in dict.fromkeys(act_ids)}
+        if any(rows[0]["kind"] != "assistant" for rows in found.values()):
+            raise ValueError("not an assistant act")
+        if not found:
+            return {}
+        first_day = min(act_id.split("-")[0] for act_id in found)
+        # WHY: copying every later ctx for each act made read_actions(count=15)
+        # expand the entire history quadratically before taking its last 15.
+        # Results may be on a later shard even when their wall clock went back.
+        for path in sorted(ROOT.glob("[0-9]" * 8 + ".jsonl")):
+            if path.stem < first_day:
+                continue
+            for row in _read(path):
+                act_id = row.get("act_id")
+                if (act_id in found and path.stem >= act_id.split("-")[0]
+                        and row["ctx"] == found[act_id][0]["ctx"]):
+                    found[act_id].append(row)
+        return clone(found)
 
 
 def _act(act_id):
