@@ -34,7 +34,12 @@ def msg_split(value: str) -> list[dict]:
             continue
         if _image_pattern.fullmatch(part):
             try:
-                uri = cq.load(part)["data"]["url"]
+                data = cq.load(part)["data"]
+                uri = data.get("url") or data.get("file")
+                if not uri:
+                    raise ValueError("图片没有地址")
+                if "://" not in uri and (Path(uri).is_absolute() or Path(uri).is_file()):
+                    uri = Path(uri).resolve().as_uri()
                 parts.append({"type": "image_url", "image_url": {"url": uri}})
             except (KeyError, ValueError):
                 parts.append({"type": "text", "text": "[解析失败的图片]"})

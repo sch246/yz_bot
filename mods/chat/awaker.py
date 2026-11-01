@@ -72,7 +72,7 @@ _stream = log.stream("agent")
 _running = threading.Lock()
 _LINE = re.compile(r"^\s*(?:[-*]\s+)?(?:(every)\s+(\S+)|(daily)\s+(\d{1,2}):(\d{2})"
                    r"|(at)\s+(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2}))\s+(.+?)\s*$")
-_TARGET = r"([gu][1-9][0-9]*(?::[1-9][0-9]*)?)"
+_TARGET = r"([gu][1-9][0-9]*(?::[1-9][0-9]*)?|[a-z][a-z0-9_]*:\S+)"
 _ON = re.compile(r"^\s*(?:[-*]\s+)?on\s+" + _TARGET + r"\s+(.+?)\s*$")
 _WAIT = re.compile(r"^\s*(?:[-*]\s+)?wait\s+" + _TARGET
                    + r"\s+until\s+(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})\s+(.+?)\s*$")
@@ -108,10 +108,14 @@ def _moment(day: str, hour: str, minute: str) -> float | None:
 
 
 def _target(text: str) -> tuple[tuple, int | None]:
-    """``g123`` / ``g123:30001`` / ``u456`` → (window, author or None)."""
+    """``g123`` / ``g123:30001`` / ``u456`` / ``dsh:main`` → (window, author or None)."""
     head, _, author = text.partition(":")
-    window = ("group" if head[0] == "g" else "private", int(head[1:]))
-    return window, int(author) if author else None
+    if head[:1] in ("g", "u") and head[1:].isdigit():
+        window = ("group" if head[0] == "g" else "private", int(head[1:]))
+        return window, int(author) if author else None
+    # WHY: 2026-10-30 CLI agent 窗口（dsh:main）也要能挂 wait；它的回复走 chat.push，
+    # 窗口元组和这里解析出来的一致，take_waiting 就认得上。
+    return _windows.parse(text), None
 
 
 def _scope(text: str) -> tuple | None:

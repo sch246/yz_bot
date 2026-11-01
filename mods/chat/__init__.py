@@ -74,6 +74,12 @@ def normalize_audio_mode(value) -> str:
     return normalized if normalized in AUDIO_MODES else "off"
 
 
+def normalize_image_describe(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in ("off", "0", "false")
+
+
 def agent_setting(name: str, data: dict | None = None):
     key, normalize = AGENT_SETTINGS[name]
     return normalize((storage.get("", "agent") if data is None else data).get(key))
@@ -92,6 +98,10 @@ def limit() -> tuple[int, int]:
 
 def get_image_mode(data: dict | None = None) -> str:
     return agent_setting("image", data)
+
+
+def get_image_describe(data: dict | None = None) -> bool:
+    return agent_setting("image_describe", data)
 
 
 def get_audio_mode(data: dict | None = None) -> str:
@@ -119,6 +129,33 @@ def get_reasoning_effort(data: dict | None = None) -> str:
     return agent_setting("reasoning_effort", data)
 
 
+def normalize_temperature(value) -> float | str:
+    if value is None or value == "" or str(value).lower() == "default":
+        return "default"
+    try:
+        val = float(value)
+        if 0.0 <= val <= 2.0:
+            return round(val, 2)
+    except (TypeError, ValueError):
+        pass
+    return "default"
+
+
+def get_temperature(data: dict | None = None) -> float | str:
+    return agent_setting("temperature", data)
+
+
+def normalize_brake(value) -> str:
+    if value is None or value == "":
+        return "on"
+    val = str(value).strip().lower()
+    return "off" if val in ("off", "0", "false") else "on"
+
+
+def get_brake(data: dict | None = None) -> str:
+    return agent_setting("brake", data)
+
+
 def _bounded_int(minimum: int, fallback: int, maximum: int | None = None):
     """归一化成指定范围内的整数，否则回到默认值。"""
 
@@ -135,9 +172,12 @@ def _bounded_int(minimum: int, fallback: int, maximum: int | None = None):
 # 单值全局 agent 配置：storage 键与归一化。
 AGENT_SETTINGS = {
     "image": ("image", normalize_image_mode),
+    "image_describe": ("image_describe", normalize_image_describe),
     "audio": ("audio", normalize_audio_mode),
     "reasoning": ("reasoning", normalize_reasoning_mode),
     "reasoning_effort": ("reasoning_effort", normalize_reasoning_effort),
+    "temperature": ("temperature", normalize_temperature),
+    "brake": ("brake", normalize_brake),
     "max_events": ("max_events", _bounded_int(1, DEFAULT_MAX_EVENTS)),
     "tidy_token": ("tidy_token", _bounded_int(1, DEFAULT_TIDY_TOKEN)),
 }
@@ -361,9 +401,18 @@ def _activate_chat(
     # WHY: 工具恢复可能持久化 ttl 回收；它必须先于其余全局设置读取，避免无关的配置异常
     # 改变这一轮是否完成回收。
     session.do_process_image = get_image_mode() != "off"
+    session.describe_images = get_image_describe()
     session.keep_reasoning = get_reasoning_mode() == "keep"
     effort = get_reasoning_effort()
     session.reasoning_effort = None if effort == "default" else effort
+    temp = get_temperature()
+    if temp != "default":
+        session.temperature = float(temp)
+    elif session.reasoning_effort == "none":
+        # DeepSeek 官方推荐：非思考模式/创意写作推荐温度 1.3~1.5
+        session.temperature = 1.3
+    else:
+        session.temperature = None
     return binding
 
 
@@ -898,6 +947,13 @@ def push(window: tuple, author: str, text: str, *, wake: str = "", record_id: st
         wake = ""
     with context.window_lock(window):
         chatlog.append_record(window[0], window[1], author, body, now, record_id)
+        try:
+            waited = _awaker.take_waiting(window, author)
+            if waited:
+                wake = "；".join(filter(None, [wake, *(f"等到了（{rule['key']}）" for rule in waited)]))
+        except Exception:
+            # WHY: 记录已经写入；认领失败不能丢掉原来的 wake，也不能让 B 站轮询重投。
+            _reflect_stream.exception("push 认领唤醒规则失败")
         arrival = oplog.arrive(window, {"post_type": "push", "time": int(now), "author": str(author),
                                         "text": body, "id": record_id})
         if wake:
@@ -939,15 +995,17 @@ def _message_image_urls(event: dict) -> list[str]:
 
 
 @thread.to_thread(None)
-def _eager_cache_images(event: dict, model: str) -> None:
-    capabilities = llm.get_client().get_model_capabilities(model)
-    vision_model = llm.get_client().get_vision_model()
+def _eager_cache_images(event: dict, describe: bool = True) -> None:
+    client = llm.get_client()
+    vision_model = client.get_vision_model() if describe else None
     for uri in _message_image_urls(event):
         try:
-            if capabilities.vision or not vision_model:
-                image.image_uri_to_data_uri(uri)
-            else:
-                llm.get_client()._get_image_description(uri, vision_model, description_cache)
+            image.image_uri_to_data_uri(uri)
+            if describe and vision_model:
+                # WHY: 主模型能看图也要留下文字，原图到下次唤醒退成旧图以后仍靠描述接续。
+                client._get_image_description(uri, vision_model, description_cache)
+            elif describe:
+                _image_stream.info("❌ eager 图片描述失败：未配置视觉模型")
         except Exception as error:
             _image_stream.info(f"❌ eager 图片捕获失败：{error}")
 
@@ -959,7 +1017,7 @@ def eager_cache_images(event: dict) -> None:
             model = get_model(data)
             count = len(_message_image_urls(event))
             _image_stream.info(f"🖼️ eager 图片捕获：{count} 张，目标模型 {model}")
-            _eager_cache_images(event.copy(), model)
+            _eager_cache_images(event.copy(), get_image_describe(data))
 
 
 def recognize_images(event: dict) -> None:

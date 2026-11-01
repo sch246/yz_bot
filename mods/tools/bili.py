@@ -5,6 +5,7 @@
 - **随便逛逛与搜索**：`bili__feed()` 刷首页推荐（按你这个号平时的口味推，每次调换一批），`bili__hot()` 看全站热门，`bili__search("关键词")` 搜你想看的东西。
 - **看视频先读字幕**：挑中一条视频后，先调 `bili__video(bv)` 看简介、UP 主和数据，再调 `bili__subtitle(bv)` 读字幕原文。**想真正知道视频讲了什么，一定要读字幕原文**，别光看标题和简介就瞎猜。如果遇到纯音乐、游戏录屏或者烧在画面里的硬字幕读不出来，坦然记下“没有字幕读不到”就好，不用死磕重试。
 - **翻评论区**：`bili__comments(目标)` 看评论列表，`bili__thread(目标, 评论号)` 展开看某一楼底下的楼中楼回复。别人评论里如果带了图，会显示成 `[图片] 地址`，想看就调 `attach_image(地址)` 递给自己看。
+- **看别人的最新动态**：`bili__user_dynamics(uid, count=10)` 按发布时间倒序看对方最近的公开动态，带正文摘要、视频或专栏的标题和链接。
 
 ## 怎么在评论区说话与互动
 
@@ -138,19 +139,58 @@ def search(keyword: str, order: str = "totalrank", page: int = 1) -> str:
                      for item in items) or "（没搜到）"
 
 
+_BV_PATTERN = re.compile(r"(BV[0-9A-Za-z]{10})", re.IGNORECASE)
+_B23_PATTERN = re.compile(r"b23\.tv/([0-9A-Za-z]+)")
+
+
+def resolve_bvid(target: str) -> str:
+    """把 BV 号、完整链接、b23.tv 短链或分享卡片文本统一解析成标准 BV 号。"""
+    target = str(target or "").strip()
+    match = _BV_PATTERN.search(target)
+    if match:
+        return match.group(1)
+    short_match = _B23_PATTERN.search(target)
+    if short_match:
+        import requests
+        short_url = f"https://b23.tv/{short_match.group(1)}"
+        try:
+            resp = requests.head(short_url, allow_redirects=True, timeout=10)
+            loc_match = _BV_PATTERN.search(resp.url)
+            if loc_match:
+                return loc_match.group(1)
+        except Exception:
+            pass
+    return target
+
+
 def video(bvid: str) -> str:
-    """一条视频的详情：标题、UP、分区、简介、各项数据、分 P。
+    """一条视频的详情：标题、UP、分区、简介、各项数据、分 P。支持直接传 BV 号、完整链接或 b23 短链。
 
     @param
-    bvid: BV 号
+    bvid: BV 号、视频链接或短链
     """
     from bilibili_api import video as video_api
 
+    bvid = resolve_bvid(bvid)
     bili = _bili()
     try:
         info = bili.call(video_api.Video(bvid=bvid, credential=bili._load_credential()).get_info())
     except Exception as error:
         return _failure(error)
+    try:
+        real_bvid = info.get("bvid", bvid)
+        state = bili._state()
+        history_map = state.setdefault("history", {})
+        history_map[real_bvid] = {
+            "title": info.get("title", ""),
+            "up": (info.get("owner") or {}).get("name", ""),
+            "time": int(time.time()),
+            "shared": history_map.get(real_bvid, {}).get("shared", False),
+        }
+        from mods import storage
+        storage.save()
+    except Exception:
+        pass
     stat = info.get("stat") or {}
     pages = info.get("pages") or []
     lines = [_video_line(info),
@@ -164,19 +204,20 @@ def video(bvid: str) -> str:
 
 
 def subtitle(bvid: str, page: int = 1, start: int = 0) -> str:
-    """读字幕原文（优先中文，含 AI 字幕）。长的分段给，按返回里说的 start 接着读。
+    """读字幕原文（优先中文，含 AI 字幕）。长的分段给，按返回里说的 start 接着读。支持 BV 号或链接。
 
     @param
-    bvid: BV 号
+    bvid: BV 号、视频链接或短链
     page: 第几 P，从 1 开始
     start: 从第几个字开始
     """
     import requests
     from bilibili_api import video as video_api
 
+    bvid = resolve_bvid(bvid)
     bili = _bili()
     try:
-        found = bili.credential()
+        found = bili._load_credential()
         clip = video_api.Video(bvid=bvid, credential=found)
         info = bili.call(clip.get_info())
         pages = info.get("pages") or [{"cid": info.get("cid")}]
@@ -601,6 +642,100 @@ def dynamics(count: int = 10) -> str:
     return "\n".join(lines)
 
 
+def _dynamic_lines(item: dict) -> list[str]:
+    detail = (item.get("modules") or {}).get("module_dynamic") or {}
+    major = detail.get("major") or {}
+    archive, article, opus = (major.get(kind) or {} for kind in ("archive", "article", "opus"))
+    text = ((detail.get("desc") or {}).get("text")
+            or (opus.get("summary") or {}).get("text")
+            or article.get("desc") or archive.get("desc"))
+    lines = [_short(text) or "（没有文字）"]
+    for kind, content in (("视频", archive), ("专栏", article), ("图文", opus)):
+        if not content:
+            continue
+        url = str(content.get("jump_url") or "")
+        if url.startswith("//"):
+            url = "https:" + url
+        bvid = content.get("bvid") or ""
+        if bvid and not url:
+            url = f"https://www.bilibili.com/video/{bvid}"
+        if kind == "专栏" and not url and content.get("id"):
+            url = f"https://www.bilibili.com/read/cv{content['id']}"
+        if kind == "图文" and item.get("type") == "DYNAMIC_TYPE_ARTICLE":
+            kind = "专栏"
+        title = _short(content.get("title"), 80)
+        if title or bvid or url:
+            lines.append(f"{kind}《{title or '无标题'}》 {bvid} {url}".rstrip())
+    return lines
+
+
+def user_dynamics(uid: int, count: int = 10) -> str:
+    """看一个 B 站用户最近的公开动态，按发布时间倒序，正文最多约 200 字。
+
+    @param
+    uid: 对方的 B 站 UID
+    count: 最多看几条，正整数；默认 10 条
+    """
+    try:
+        uid, count = int(uid), int(count)
+    except (TypeError, ValueError, OverflowError):
+        return "uid 和 count 都要填正整数"
+    if uid <= 0 or count <= 0:
+        return "uid 和 count 都要填正整数"
+    try:
+        from bilibili_api import user
+
+        bili = _bili()
+        person = user.User(uid, bili.credential())
+
+        async def recent():
+            items, offsets, offset, regular = {}, set(), "", set()
+            while True:
+                listed = await person.get_dynamics_new(offset=offset)
+                data = listed.get("data") or listed
+                page = data.get("items") or []
+                for item in page:
+                    key = item["id_str"]
+                    items[key] = item
+                    if ((item.get("modules") or {}).get("module_tag") or {}).get("text") != "置顶":
+                        regular.add(key)
+                # WHY: 旧置顶也占一条；凑够 count 条非置顶再排序，才不会漏掉下一页较新的动态。
+                if len(regular) >= count or not data.get("has_more"):
+                    return list(items.values())
+                offset = data.get("offset")
+                if not page or not offset or offset in offsets:
+                    raise RuntimeError("B 站没有返回有效的下一页，暂时取不全动态，请稍后再试")
+                offsets.add(offset)
+
+        items = bili.call(recent())
+        items.sort(key=lambda item: int(((item.get("modules") or {}).get("module_author") or {}).get("pub_ts") or 0),
+                   reverse=True)
+        items = items[:count]
+        if not items:
+            return "（没有可见的公开动态；对方可能还没发过动态，或设置了隐私）"
+        lines = [f"（{len(items)} 条公开动态，最新的在前）"]
+        for item in items:
+            author = (item.get("modules") or {}).get("module_author") or {}
+            lines.append(f"{_when(author.get('pub_ts'))}  https://t.bilibili.com/{item['id_str']}")
+            lines.extend("    " + line for line in _dynamic_lines(item))
+            if item.get("orig"):
+                lines.extend("    转发原文：" + line for line in _dynamic_lines(item["orig"]))
+        return "\n".join(lines)
+    except Exception as error:
+        code = getattr(error, "code", None)
+        status = getattr(error, "status", None)
+        message = str(getattr(error, "msg", None) or error)
+        if code == -101 or "登录" in message or "SESSDATA" in message:
+            return "B 站还没登录或登录已失效，请重新 .bili login 后再看动态"
+        if code in (-352, -412) or status in (412, 429) or "风控" in message or "Wbi" in type(error).__name__:
+            return "B 站暂时拦住了请求（风控或签名校验失败），请稍后再试"
+        if code == -403 or status == 403 or any(word in message for word in ("隐私", "权限", "禁止访问")):
+            return "看不了这个用户的动态：对方可能设置了隐私，或 B 站限制了访问"
+        if isinstance(error, TimeoutError):
+            return "B 站请求超时，暂时读不到动态，请稍后再试"
+        return _failure(RuntimeError(f"暂时读不到这个用户的动态：{_short(message)}"))
+
+
 def _people(listed: dict, page: int) -> str:
     data = listed.get("data") or listed
     people = data.get("list") or []
@@ -827,9 +962,53 @@ def use_cookie(cookie: str) -> str:
         return _failure(error)
 
 
+def history(count: int = 10, shared_only: bool = False) -> str:
+    """查看本地浏览过的 B 站视频历史记录，按时间倒序。
+
+    @param
+    count: 最多看几条，正整数；默认 10 条
+    shared_only: 是否只看已标记分享过的视频
+    """
+    bili = _bili()
+    state = bili._state()
+    items = list((state.get("history") or {}).items())
+    if shared_only:
+        items = [item for item in items if item[1].get("shared")]
+    items.sort(key=lambda pair: pair[1].get("time", 0), reverse=True)
+    items = items[:int(count)]
+    if not items:
+        return "（暂无相关视频浏览历史）"
+    lines = [f"（共 {len(items)} 条本地历史记录）："]
+    for bvid, meta in items:
+        shared_tag = "[已分享]" if meta.get("shared") else "[未分享]"
+        lines.append(f"- {bvid} 《{meta.get('title', '未知标题')}》 UP {meta.get('up', '未知')} {shared_tag} · {_when(meta.get('time'))}")
+    return "\n".join(lines)
+
+
+def mark_shared(target: str, shared: bool = True) -> str:
+    """标记某个视频是否已分享给群友或外部窗口。
+
+    @param
+    target: BV 号或链接
+    shared: 是否标记为已分享，默认 True
+    """
+    bvid = resolve_bvid(target)
+    bili = _bili()
+    state = bili._state()
+    history_map = state.setdefault("history", {})
+    if bvid not in history_map:
+        history_map[bvid] = {"title": "", "up": "", "time": int(time.time()), "shared": bool(shared)}
+    else:
+        history_map[bvid]["shared"] = bool(shared)
+    from mods import storage
+    storage.save()
+    status = "已分享" if shared else "未分享"
+    return f"{bvid} 已标记为：{status}"
+
+
 __all__ = ["feed", "hot", "search", "video", "subtitle", "comments", "thread", "vote",
            "delete_comment", "delete_dynamic", "like_video", "coin_video", "favorite_video",
            "favorites", "make_folder", "drop_folder", "unfavorite_video",
-           "profile", "dynamics", "following", "followers", "follow", "edit_profile",
+           "profile", "dynamics", "user_dynamics", "following", "followers", "follow", "edit_profile",
            "rename_folder",
-           "inbox", "dm", "use_cookie"]
+           "inbox", "dm", "use_cookie", "history", "mark_shared", "resolve_bvid"]

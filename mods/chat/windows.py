@@ -103,7 +103,7 @@ def _send_qq(window: tuple, text: str) -> str:
 
 
 # 种类 → 发送函数 send(window, text) -> 记录号；None 表示只能看。发送函数要等到知道结果才返回：
-# 返回＝发出去了；抛 Unconfirmed＝可能发出去了；抛别的＝没发出去，字留在输入框里。
+# 返回＝发出去了（CLI 窗口是已接收任务）；抛 Unconfirmed＝可能发出去了；抛别的＝没发出去，字留在输入框里。
 _kinds: dict[str, Callable[[tuple, str], str] | None] = {"group": _send_qq, "private": _send_qq, "me": None}
 
 
@@ -181,12 +181,4 @@ def logged() -> list[tuple]:
     """Every window of a registered kind that has a chatlog directory."""
     from mods import chatlog
 
-    found = list(chatlog.known_windows())
-    root = Path(chatlog.rootfile)
-    if (root / "me").is_dir():
-        found.append(ME)
-    for name in _kinds:
-        if name in (*QQ, "me") or not (root / name).is_dir():
-            continue
-        found.extend((name, path.name) for path in (root / name).iterdir() if path.is_dir())
-    return found
+    return [window for window in chatlog.known_windows() if known(window)]

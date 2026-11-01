@@ -16,6 +16,7 @@
 - [原始历史文档](md/README.md)：旧仓库的开发记录、0.4 使用说明和背景文章；用于追溯，不作为当前契约。
 - [功能与命令目录](docs/commands.md)：按功能族说明公开命令、扩展运行环境和主要状态。
 - [LLM 聊天与工具调用](docs/llm.md)：上下文构建、模型配置、函数工具、自动调用循环和当前信任边界。
+- [CLI agent 窗口](docs/cli-agents.md)：在 `dsh:main`、`agy:review`、`codex:code` 中发送任务、续接会话及翻历史。
 - [运行边界与交互测试](docs/runtime.md)：NapCat 接入、真实消息路径，以及如何避免测试影响正在运行的实例。
 - [当前维护队列](docs/working/current-issues.md)：已经确认要修的缺陷、接受的现行约束，以及仍可选的加固项。
 - [旧代码组织调查](docs/working/code-organization-analysis.md)：切换前 `main.py`、`funcs.py`、动态名称环境和 import 副作用的历史摘要。

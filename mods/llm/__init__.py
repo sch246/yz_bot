@@ -100,12 +100,25 @@ def build_audio_description_prompt(prompt: str = "") -> str:
 
 
 def format_image_reference(uri: str, label: str = "图片") -> str:
-    return f"[{label}]" if not uri or uri.startswith("data:image/") else f"[{label}({uri})]"
+    uri = _image_reference_uri(uri)
+    return f"[{label}({uri})]" if uri else f"[{label}]"
+
+
+def _image_reference_uri(uri: str) -> str:
+    # WHY: off 与旧图仍要留下能重新 attach 的地址；内联图只剩 [图片] 就再也打不开了。
+    if uri.startswith("data:image/"):
+        header, _, payload = uri.partition(",")
+        if ";base64" not in header.lower():
+            raise ValueError("图片 data URI 必须使用 base64")
+        path, _, _ = image.cache_image_bytes(base64.b64decode(payload, validate=True))
+        return Path(path).resolve().as_uri()
+    return uri
 
 
 def format_image_description(uri: str, description: str | None = None) -> str:
     detail = description or "图片解析失败"
-    return f"[图片识别结果：{detail}]" if not uri or uri.startswith("data:image/") else f"[图片({uri})识别结果：{detail}]"
+    uri = _image_reference_uri(uri)
+    return f"[图片({uri})识别结果：{detail}]" if uri else f"[图片识别结果：{detail}]"
 
 
 def usage_cached_tokens(usage) -> int:
@@ -266,6 +279,7 @@ def _rewrite_message_images(
     when preparing one of them failed.
     """
     result = message.copy()
+    result.pop("_tool_image", None)
     content = message.get("content")
     if not isinstance(content, (str, list)):
         return result
@@ -382,18 +396,19 @@ class LLMClient:
 
     def get_model_capabilities(self, model: str) -> ModelCapabilities:
         try:
-            capabilities = resolve_model(self.config, model)[2]
+            provider, _, capabilities = resolve_model(self.config, model)
         except ValueError:
             return ModelCapabilities()
         known = {field: capabilities.get(field, default) for field, default in {
             "vision": False,
             "tool_images": False,
-            "files_api": False,
+            "files_api": provider == "deepseek",
             "function_calling": False,
             "prompt_price": 0.0,
             "prompt_cached_price": 0.0,
             "completion_price": 0.0,
         }.items()}
+        known["files_api"] = provider == "deepseek" and bool(known["files_api"])
         return ModelCapabilities(**known)
 
     def get_vision_model(self) -> str | None:
@@ -457,7 +472,8 @@ class LLMClient:
 
     @staticmethod
     def _convert_images(messages: list[dict], convert_url: Callable[[str], str], allow_tool_images: bool = False,
-                        files: Callable[[str], tuple[list[str], bool] | None] | None = None) -> list[dict]:
+                        files: Callable[[str], tuple[list[str], str] | None] | None = None,
+                        gif_mode: str = "first") -> list[dict]:
         """把消息里的图换成对端认的 part：给了 *files*（Files API）就引用传过的 file_id，否则内联 data URI。"""
         def replace(uri: str) -> list[dict]:
             # WHY: 同一张图只走一遍这条路径。判定过失败的直接给占位文本，不再重复下载、也不再每轮
@@ -470,17 +486,17 @@ class LLMClient:
             try:
                 uploaded = files(uri) if files is not None and not uri.startswith("data:") else None
                 if uploaded is not None:
-                    ids, split = uploaded
+                    ids, note = uploaded
                     pictures = [{"type": "file", "file_id": value} for value in ids]
                 else:
                     data_uri = uri if uri.startswith("data:") else convert_url(uri)
-                    slices, split = image.split_long_image_data_uri(data_uri)
+                    slices, note = image.prepare_image_data_uri(data_uri, gif_mode=gif_mode)
                     pictures = [{"type": "image_url", "image_url": {"url": value}} for value in slices]
                 if uri and not uri.startswith("data:"):
                     parts.append(_text_part(f"[下方图片的原始链接: {uri}]"))
+                if note:
+                    parts.append(_text_part(note))
                 parts.extend(pictures)
-                if split:
-                    parts.append(_text_part(image.AUTO_IMAGE_SPLIT_PROMPT))
             except Exception as error:
                 if not quiet:
                     console.error(
@@ -502,10 +518,10 @@ class LLMClient:
             result.append(_rewrite_message_images(message, replace, collapse_text=False))
         return result
 
-    def _image_files(self, provider: str, client: OpenAI, uri: str) -> tuple[list[str], bool] | None:
-        """*uri* 那张图在 *provider* 上的 file_id（长图切成几张就有几个）和切没切；没传过就现在传。
+    def _image_files(self, provider: str, client: OpenAI, uri: str) -> tuple[list[str], str] | None:
+        """DeepSeek 的 file_id（长图可有多个）和阅读说明；没传过就现在传。
 
-        传过的按内容摘要记在 storage 的 `llm_system/image_files`（`{provider: {摘要: {"ids", "split",
+        传过的按内容摘要记在 storage 的 `llm_system/image_files`（`{provider: {摘要: {"ids", "note",
         "expires_at"}}}`），所以同一张图换个地址、换次唤醒都不再传；地址到摘要先查图片模块的别名表，
         链接过期了也照样引用得到。本地文件的别名按路径、大小、修改时间算，文件删了就算不出来，所以
         传过的本地图另记一份路径到摘要（`"_paths"`）：截图目录清掉的旧图，她上下文里还看得见。
@@ -515,6 +531,8 @@ class LLMClient:
         """
         from mods import storage
 
+        if provider != "deepseek":
+            return None
         with self._files_lock:
             table = storage.get("llm_system", "image_files")
             known, paths = table.setdefault(provider, {}), table.setdefault("_paths", {})
@@ -524,15 +542,15 @@ class LLMClient:
         except ValueError:
             digest = paths.get(uri)
         entry = known.get(digest) if digest else None
-        if entry and entry.get("expires_at", 0) - now > FILE_MARGIN:
-            return list(entry["ids"]), bool(entry.get("split"))
+        if entry and "note" in entry and entry.get("expires_at", 0) - now > FILE_MARGIN:
+            return list(entry["ids"]), entry["note"]
         path, mime, digest = image.resolve_image_with_digest(uri)
         entry = known.get(digest)
-        if entry and entry.get("expires_at", 0) - now > FILE_MARGIN:
-            return list(entry["ids"]), bool(entry.get("split"))
+        if entry and "note" in entry and entry.get("expires_at", 0) - now > FILE_MARGIN:
+            return list(entry["ids"]), entry["note"]
         with open(path, "rb") as stream:
             data_uri = f"data:{mime};base64," + base64.b64encode(stream.read()).decode("ascii")
-        slices, split = image.split_long_image_data_uri(data_uri)
+        slices, note = image.prepare_image_data_uri(data_uri, gif_mode="native")
         ids = []
         uploader = _files_client(client)
         try:
@@ -550,14 +568,14 @@ class LLMClient:
         with self._files_lock:
             for stale in [key for key, value in known.items() if value.get("expires_at", 0) <= now]:
                 del known[stale]
-            known[digest] = {"ids": ids, "split": split, "expires_at": int(now + FILE_SECONDS)}
+            known[digest] = {"ids": ids, "note": note, "expires_at": int(now + FILE_SECONDS)}
             if uri.startswith("file:"):
                 paths[uri] = digest
             alive = {key for name, values in table.items() if name != "_paths" for key in values}
             for gone in [key for key, value in paths.items() if value not in alive]:
                 del paths[gone]
         console.notice(f"⬆️ 图片已传到 {provider}（{len(ids)} 个文件）：{console.format_uri(uri)}")
-        return ids, split
+        return ids, note
 
     def _get_image_description(self, uri: str, vision_model: str, description_cache: dict) -> str | None:
         template = get_image_description_template()
@@ -639,13 +657,33 @@ class LLMClient:
                 self._description_inflight.pop(key, None)
                 task.event.set()
 
-    def _describe_images(self, messages: list[dict], cache: dict) -> list[dict]:
-        vision_model = self.get_vision_model()
-        if not vision_model:
-            console.error("⚠️ 目标模型不支持视觉，且未配置可用的图片描述模型")
-            return self._replace_images_with_text(messages, "图片，未配置可用的视觉模型")
+    def _cached_image_description(self, uri: str, cache: dict, version: str) -> str | None:
+        # 不下载旧图，也不为它重新计费；off 与描述开关关闭时仍可读已有描述。
+        try:
+            identities = [image.get_cached_image_digest(uri), image.intrinsic_image_description_identity(uri)]
+        except ValueError:
+            identities = []
+        with self._description_lock:
+            for identity in filter(None, identities):
+                description = image.get_cached_description(cache, identity, prompt_version=version)
+                if description is not None:
+                    return description
+        return None
+
+    def _describe_images(self, messages: list[dict], cache: dict, generate: bool = True,
+                         version: str | None = None) -> list[dict]:
+        vision_model = self.get_vision_model() if generate else None
+        version = version or image.description_version(get_image_description_template())
 
         def replace(uri: str) -> list[dict]:
+            uri = _image_reference_uri(uri)
+            cached = self._cached_image_description(uri, cache, version)
+            if cached is not None:
+                return [_text_part(format_image_description(uri, cached))]
+            if not generate:
+                return [_text_part(format_image_reference(uri))]
+            if not vision_model:
+                return [_text_part(format_image_description(uri, "图片，未配置可用的视觉模型"))]
             # WHY: 同 _convert_images——一次对话里同一张图只检查一遍。已判定失败的直接给
             # 占位文本（不再重试、不再报错），已查过的成功图静默复用那段描述。
             if image.checked_failed(uri):
@@ -672,11 +710,11 @@ class LLMClient:
         if client is None:
             raise ValueError(f"Provider {provider} not configured")
         data_uri = uri if uri.startswith("data:image/") else image.image_uri_to_data_uri(uri)
-        slices, split = image.split_long_image_data_uri(data_uri)
+        slices, note = image.prepare_image_data_uri(data_uri, gif_mode="grid")
         text = build_image_description_prompt(prompt)
-        if split:
-            text += "\n\n" + image.AUTO_IMAGE_SPLIT_PROMPT
-            console.notice(f"🧩 图片较长，将以 {len(slices)} 个切片请求 {selection}")
+        if note:
+            text += "\n\n" + note
+            console.notice(f"🧩 图片展开为 {len(slices)} 张，请求 {selection}")
         console.notice(f"等待 {selection} 的图片识别响应…")
         response = client.chat.completions.create(
             model=api_model,
@@ -686,6 +724,8 @@ class LLMClient:
             ]}],
         )
         description = response.choices[0].message.content
+        if description and "GIF" in note:
+            description = f"GIF 动图：{description}"
         _record_usage(selection, response)
         if description:
             console.notice(f"✅ 视觉模型调用成功：{console.format_uri(uri)}")
@@ -746,29 +786,38 @@ class LLMClient:
             console.error(f"❌ 音频识别失败：{error}")
             raise
 
-    def generate_response(self, messages: list[dict], tools: list[Tool] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None, logged: int = 0, reasoning_effort: str | None = None):
+    def generate_response(self, messages: list[dict], tools: list[Tool] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None, logged: int = 0, reasoning_effort: str | None = None, temperature: float | None = None, describe_images: bool = True, image_history: set[int] | None = None):
         selection = model or self.config["default_model"]
         provider, api_model, raw_capabilities = resolve_model(self.config, selection)
         client = self.clients.get(provider)
         if client is None:
             raise ValueError(f"Provider {provider} not configured")
         capabilities = ModelCapabilities(**{key: raw_capabilities.get(key, default) for key, default in {
-            "vision": False, "function_calling": False, "tool_images": False, "files_api": False,
+            "vision": False, "function_calling": False, "tool_images": False, "files_api": provider == "deepseek",
             "prompt_price": 0.0, "prompt_cached_price": 0.0, "completion_price": 0.0,
         }.items()})
         files = ((lambda uri: self._image_files(provider, client, uri))
-                 if capabilities.files_api and time.time() >= self._files_down_until else None)
-        if do_process_image:
-            messages = self._convert_images(messages, image.image_uri_to_data_uri, capabilities.tool_images, files) if capabilities.vision else self._describe_images(messages, description_cache or {})
-        elif capabilities.vision and capabilities.tool_images:
-            # WHY: `#image off` 管的是聊天里别人发来的图，工具结果里的图是她自己 attach_image
-            # 要看的，照样展开。以前 off 把它也换成一行链接，她调了 attach_image 却只看见地址，
-            # 以为自己的眼睛不行（2026-10-23 设备上；没设过 #image 时默认就是 off）。
-            messages = [self._convert_images([message], image.image_uri_to_data_uri, True, files)[0]
-                        if message.get("role") == "tool" else self._replace_images_with_text([message])[0]
-                        for message in messages]
-        else:
-            messages = self._replace_images_with_text(messages)
+                 if provider == "deepseek" and capabilities.files_api and time.time() >= self._files_down_until else None)
+        cache = description_cache if description_cache is not None else {}
+        version = image.description_version(get_image_description_template())
+        prepared = []
+        for message in messages:
+            old = image_history is not None and id(message) in image_history
+            attached = message.get("role") == "tool" or message.get("_tool_image")
+            if old or not (do_process_image or attached):
+                prepared.extend(self._describe_images([message], cache, generate=False, version=version))
+                continue
+            if capabilities.vision:
+                if do_process_image and describe_images and not attached:
+                    self._describe_images([message], cache, version=version)
+                # WHY: off 只管自动看聊天图；主动附图的 user 退路也必须放行。
+                prepared.extend(self._convert_images([message], image.image_uri_to_data_uri,
+                                                     capabilities.tool_images, files,
+                                                     gif_mode="native" if provider == "deepseek" else "first"))
+            else:
+                prepared.extend(self._describe_images([message], cache,
+                                                      generate=bool(attached or describe_images), version=version))
+        messages = prepared
         # DeepSeek and OpenAI require every tool call in assistant messages to have type="function".
         for message in messages:
             if message.get("role") == "assistant" and "tool_calls" in message:
@@ -779,6 +828,11 @@ class LLMClient:
         # caller's count still lines up with what is about to be sent.
         console.print_request(selection, messages, logged)
         params = {"model": api_model, "messages": messages, "stream": stream}
+        if temperature is not None:
+            try:
+                params["temperature"] = float(temperature)
+            except (TypeError, ValueError):
+                pass
         if reasoning_effort:
             effort = str(reasoning_effort).strip().lower()
             if effort in ("off", "none"):
@@ -918,7 +972,7 @@ class LLMClient:
             reasoning_content=reasoning_content,
         )
 
-    def chat(self, messages: list[dict], tools: list[Tool] | Callable[[], list[Tool]] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None, on_round: Callable[[], list[dict]] | None = None, should_stop: Callable[[], bool] | None = None, hints: Callable[[], list[dict]] | None = None, keep_reasoning: bool = True, on_output: Callable[[dict, list[dict]], str | tuple[str, dict] | None] | None = None, on_results: Callable[[str, list[ToolCallResult], list[dict]], None] | None = None, turn_done: Callable[[], bool] | None = None, on_action: Callable[[str | None], None] | None = None, preserve_native: bool = False, logged: int = 0, reasoning_effort: str | None = None) -> Generator[LLMResponse, None, None]:
+    def chat(self, messages: list[dict], tools: list[Tool] | Callable[[], list[Tool]] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None, on_round: Callable[[], list[dict]] | None = None, should_stop: Callable[[], bool] | None = None, hints: Callable[[], list[dict]] | None = None, keep_reasoning: bool = True, on_output: Callable[[dict, list[dict]], str | tuple[str, dict] | None] | None = None, on_results: Callable[[str, list[ToolCallResult], list[dict]], None] | None = None, turn_done: Callable[[], bool] | None = None, on_action: Callable[[str | None], None] | None = None, preserve_native: bool = False, logged: int = 0, reasoning_effort: str | None = None, temperature: float | None = None, describe_images: bool = True, image_history: list[dict] | None = None) -> Generator[LLMResponse, None, None]:
         # Every message appended below is printed live as it happens, so each
         # further round only logs what it has not shown yet -- usually nothing.
         # *logged* starts past whatever the caller already logged before.
@@ -948,7 +1002,7 @@ class LLMClient:
             # 在上下文里堆出几代互相矛盾的副本。因此 hint 里只放随时可重算的东西，不放
             # 任何"只此一次、错过就没有"的信息——那种必须走 on_round。
             outgoing = (messages + hints()) if hints is not None else messages
-            response = iter(self.generate_response(outgoing, tools_snapshot, tool_choice, model, stream, description_cache, do_process_image, logged, reasoning_effort=reasoning_effort))
+            response = iter(self.generate_response(outgoing, tools_snapshot, tool_choice, model, stream, description_cache, do_process_image, logged, reasoning_effort=reasoning_effort, temperature=temperature, describe_images=describe_images, image_history={id(item) for item in image_history} if image_history else None))
             mapping = {tool.description["function"]["name"]: tool for tool in tools_snapshot}
             pending_calls = []
             # Yielded chunks remain the live display/tool stream.  The return
@@ -1091,13 +1145,16 @@ class LLMClient:
 
 
 class Chat:
-    def __init__(self, model: str | None = None, messages: list | None = None, functions: dict | list | None = None, chat_client: LLMClient | None = None, recall_func: Callable | None = None, description_cache: dict | None = None, do_process_image: bool | None = None, reasoning_effort: str | None = None) -> None:
+    def __init__(self, model: str | None = None, messages: list | None = None, functions: dict | list | None = None, chat_client: LLMClient | None = None, recall_func: Callable | None = None, description_cache: dict | None = None, do_process_image: bool | None = None, reasoning_effort: str | None = None, temperature: float | None = None) -> None:
         self.chat_client = chat_client
         self.model = model or (chat_client.config["default_model"] if chat_client else None)
         self.recall_func = recall_func
         self.description_cache = description_cache
         self.do_process_image = do_process_image
+        self.describe_images = True
+        self.image_history: list[dict] = []
         self.reasoning_effort: str | None = reasoning_effort
+        self.temperature: float | None = temperature
         self.messages: list[dict] = []
         self.functions: dict[str, Tool] = {}
         # WHY: 追加式上下文。每个 provider 在每次模型子请求前被调用一次，返回要追加到
@@ -1248,6 +1305,9 @@ class Chat:
                 self.preserve_native,
                 self.logged,
                 reasoning_effort=self.reasoning_effort,
+                temperature=self.temperature,
+                describe_images=self.describe_images,
+                image_history=self.image_history,
             )
             results = []
             for chunk in response:

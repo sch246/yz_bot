@@ -113,7 +113,8 @@ def records(window: tuple, count: int, before: int | None = None, since: float |
         for start, end in chatlog._file_records(lines):
             # WHY: `#` 开头的消息是控制与调试输出（子命令结果、traceback、`#hint` 状态），
             # 按跨模块约定不回流进模型，见 docs/llm.md「上下文如何组装」。
-            if end - start > 1 and lines[start + 1].startswith("    #"):
+            # Non-QQ windows have no # commands: CLI prompts and answers often start with Markdown headings.
+            if window[0] in _windows.QQ and end - start > 1 and lines[start + 1].startswith("    #"):
                 continue
             text = "\n".join(lines[start:end])
             stamp = _record_time(day, lines[start])

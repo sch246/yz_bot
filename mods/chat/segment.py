@@ -134,13 +134,13 @@ def archive(segment: dict, kind: str = "") -> str:
             target = _ARCHIVE / f"{name}-{number}.json"
         segment = {**segment, "ended": time.time()}
         target.write_text(json.dumps(segment, ensure_ascii=False), encoding="utf-8")
-        _append_year(segment)
+        _append_year(segment, target.stem)
         if kind == "" and _CURRENT.is_file():
             _CURRENT.unlink()
         return target.stem
 
 
-def _year_line(segment: dict) -> str:
+def _year_line(segment: dict, name: str = "") -> str:
     """One line for ``years.md``: when, how long, and why that segment ended."""
     started, ended = segment.get("started", 0), segment.get("ended") or time.time()
     if time.strftime("%m-%d", time.localtime(started)) == time.strftime("%m-%d", time.localtime(ended)):
@@ -150,17 +150,62 @@ def _year_line(segment: dict) -> str:
     # 交接时她自己写的 reason 是最好的摘要；强制归档没有 reason，就只记窗口。
     reason = (segment.get("reason") or "").strip().split("\n")[0].strip()
     tail = reason[:80] if reason else "窗口 " + "、".join(segment.get("windows") or ["无"])
-    return f"- {span}（{len(segment.get('messages') or [])} 条）{tail}"
+    loc = f" `{name}`" if name else ""
+    return f"- {span}（{len(segment.get('messages') or [])} 条）{loc} {tail}".strip()
 
 
-def _append_year(segment: dict) -> None:
+def _append_year(segment: dict, name: str = "") -> None:
     try:
         _YEARS.parent.mkdir(parents=True, exist_ok=True)
         with _YEARS.open("a", encoding="utf-8") as handle:
-            handle.write(_year_line(segment) + "\n")
-    except OSError:
-        # 年鉴只是索引，写不进去不能妨碍归档本身。
-        pass
+            handle.write(_year_line(segment, name) + "\n")
+    except OSError as error:
+        # 年鉴只是索引，写不进去不能妨碍归档本身，但记录告警。
+        _stream.warning(f"追加年鉴索引失败：{error}")
+
+
+def rebuild_years() -> tuple[bool, str]:
+    """从 archive/ 目录所有有效归档段重建 years.md，并核对条目完整性与原文定位。
+
+    校验标准：
+    1. 读出所有归档段按开始时间正序排；
+    2. 生成行数必须等于有效归档段数；
+    3. 每行必须包含对应的归档文件名定位符（`stem`）且能反向定位到磁盘文件；
+    4. 只有校验通过才原子替换原 years.md，校验失败明确报错并保留原索引。
+    """
+    with _lock:
+        if not _ARCHIVE.is_dir():
+            return False, "没有归档目录"
+        items = []
+        for path in sorted(_ARCHIVE.glob("*.json"), key=lambda p: p.stem):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict) and "started" in data:
+                items.append((path.stem, data))
+
+        items.sort(key=lambda pair: (pair[1].get("started", 0), pair[0]))
+        lines = [_year_line(data, name) for name, data in items]
+
+        # 校验：条数相等 + 原文定位符核对
+        if len(lines) != len(items):
+            return False, f"校验失败：行数 ({len(lines)}) 与有效归档段数 ({len(items)}) 不一致"
+        for name, data in items:
+            expected_tag = f"`{name}`"
+            if not any(expected_tag in line for line in lines):
+                return False, f"校验失败：未在生成行中找到定位符 {expected_tag}"
+            if not (_ARCHIVE / f"{name}.json").is_file():
+                return False, f"校验失败：定位符 {name} 对应的归档文件不存在"
+
+        _YEARS.parent.mkdir(parents=True, exist_ok=True)
+        temporary = _YEARS.with_name(_YEARS.name + ".tmp")
+        try:
+            temporary.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+            os.replace(temporary, _YEARS)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return True, f"已重建年鉴索引，共 {len(lines)} 条归档"
 
 
 def each_archived(since: float = 0, newest_first: bool = False):

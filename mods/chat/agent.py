@@ -60,6 +60,20 @@ _WHY = (
     ("手机", "手机上的动作；改 mods/tools/phone.py"),
 )
 
+# WHY: 针对 DeepSeek-V4.1 (0910/1017) 架构及强化学习本能设计的后置刹车补丁 (Post-History Directive)。
+# 原版英文直接注入 hint（Depth 0），不进入上下文历史，刹住抢词推进、死磕细节、全知视角与过度说教。
+_PACING_BRAKE = """[System Directive - Pacing, Epistemology & Anti-Fixation Rules]
+1. PACING BRAKE (CRITICAL): Advance the timeline by ONLY ONE immediate reaction or micro-action per turn. STOP writing the exact moment a response, decision, or reaction from {{user}} is naturally required. NEVER resolve a scene, skip time, change locations, or narrate {{user}}'s actions, speech, or internal feelings.
+2. STRICT POV & ANTI-OMNIPRESENCE: {{char}} ONLY knows what is explicitly spoken aloud or physically visible in the immediate shared space. {{char}} CANNOT read {{user}}'s mind, internal monologue, or past events where {{char}} was absent.
+3. SENSORY & PROP ROTATION: Do NOT repeat any specific environmental detail, lighting description, beverage/food, clothing adjustment, or physical tic that already appeared in the last 2 messages. Introduce fresh sensory angles or focus purely on dialogue and action.
+4. ANTI-MELODRAMA: Maintain {{char}}'s grounded baseline personality. Do not artificially escalate conflict, angst, or philosophical lecturing unless directly provoked in-scene."""
+
+
+def _brake_hint() -> str:
+    if _chat_root.get_brake() == "off":
+        return ""
+    return _PACING_BRAKE
+
 
 def _why(kind: str) -> str:
     """Which rule woke her, and where that rule is changed; empty when nothing useful is known."""
@@ -81,6 +95,8 @@ def _woken(notice: dict | None, turn) -> tuple[list[tuple], list[str], list[int]
         for item in notice.get("activations", []):
             if isinstance(item.get("user_id"), int):
                 authors.append(item["user_id"])
+                if item["user_id"] != identity.bot_id():
+                    turn.interlocutors[tuple(item["window"])] = item["user_id"]
             window = tuple(item["window"])
             windows.append(window)
             stamp = _screen.clock(item["time"]) if isinstance(item.get("time"), (int, float)) else "?"
@@ -365,6 +381,7 @@ def _begin(turn, window: tuple | None, kind: str) -> None:
     turn.associated_windows = {window} if window is not None else set()
     turn.screens = {}
     turn.authors = []
+    turn.interlocutors = {}
     turn.release = ""
     turn.handed_off = ""
     turn.handoff_note = ""
@@ -780,6 +797,12 @@ def _run_agent(model: str | None, turn) -> bool:
             return []
         added, marks = _screen.late_arrivals(newest, segment["last_shown"], max_events)
         unconfirmed.update(marks)
+        if added:
+            for w in newest:
+                for entry in oplog.unread(w):
+                    uid = entry.get("event", {}).get("user_id")
+                    if isinstance(uid, int) and uid != identity.bot_id():
+                        turn.interlocutors[w] = uid
         return added
 
     def seen_late() -> None:
@@ -801,7 +824,8 @@ def _run_agent(model: str | None, turn) -> bool:
                            providers=[late],
                            hints=[lambda: _screen.unread_hint(set(newest)), lambda: _segment.nudge(segment),
                                   lambda: shell.running_hint(), lambda: turn.tidy_hint,
-                                  lambda: crumbs, lambda: observer_hint],
+                                  lambda: crumbs, lambda: observer_hint,
+                                  lambda: _brake_hint()],
                            known=len(segment["messages"]), each_output=seen_late)
     if (getattr(session, "dismiss", None) is None and not turn.log.get("acts")
             and getattr(session, "segment", None) and session.segment.get("marks")):
@@ -849,6 +873,8 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
     *messages* are already in the segment, so the request log skips them.
     """
     session = llm.Chat(model=model or _chat_root.get_model(), chat_client=llm.get_client())
+    # WHY: 本次唤醒的图在工具续轮中一直可见；只有上次唤醒留下的图退成地址与已有描述。
+    session.image_history = messages[:known]
     session.requested_reads = turn.requested_reads
     session.associated_windows = turn.associated_windows
     session.boxes = turn.boxes
@@ -856,6 +882,7 @@ def _run_session(model: str | None, turn, segment: dict, messages: list[dict], f
     session.last_sent = segment.get("last_sent", 0.0)
     session.quiet = quiet
     session.fail_fast = fail_fast
+    session.interlocutors = turn.interlocutors
     binding = _chat_root._activate_chat(session, messages)
     session.prompt_count = len(session.messages) - len(messages)
     # WHY: 维护者 2026-10-23：别人说的话放 user，系统自己说的话（唤醒原因、笔记、交接、工具
