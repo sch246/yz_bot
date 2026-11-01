@@ -177,22 +177,19 @@ def legacy_tool_content(encoded, expected):
     return found[0] if len(found) == 1 else None
 
 
-def recover_initial_tool_state(full, delta, after):
-    """Prove a full announcement's state across exactly one active-module addition."""
-    # WHY: aa7c597 的 full 只写目录和非空模块正文，不写 schemas 摘要；不能从全文
-    # 猜快照。只有完整 single-add delta 及正文摘要均通过旧模板验证，才沿用 after 的
-    # catalog/schemas 和未变 active；正文里的伪标题不构成状态证据。
+def legacy_tool_additions(delta, after):
+    """Digest-proven single-active-addition candidates, using only the saved after state."""
     if not isinstance(after, dict) or set(after) != {"catalog", "active", "schemas"}:
-        return None
+        return []
     if any(not isinstance(after[key], dict) or any(not isinstance(name, str) or not isinstance(value, str)
            for name, value in after[key].items()) for key in after):
-        return None
+        return []
     if any(not re.fullmatch(r"[0-9a-f]{64}", value) for key in ("active", "schemas") for value in after[key].values()):
-        return None
+        return []
     opening, closing = "<system-reminder>\n", "\n</system-reminder>"
-    if not all(text.startswith(opening) and text.endswith(closing) for text in (full, delta)):
-        return None
-    full_body, delta_body = (text[len(opening):-len(closing)] for text in (full, delta))
+    if not delta.startswith(opening) or not delta.endswith(closing):
+        return []
+    delta_body = delta[len(opening):-len(closing)]
     empty = hashlib.sha256(b"").hexdigest()
     found = []
     for added, expected in after["active"].items():
@@ -205,6 +202,22 @@ def recover_initial_tool_state(full, delta, after):
             continue
         before = clone(after)
         del before["active"][added]
+        found.append((added, before))
+    return found
+
+
+def recover_initial_tool_state(full, delta, after):
+    """Prove a full announcement's state across exactly one active-module addition."""
+    # WHY: aa7c597 的 full 只写目录和非空模块正文，不写 schemas 摘要；不能从全文
+    # 猜快照。只有完整 single-add delta 及正文摘要均通过旧模板验证，才沿用 after 的
+    # catalog/schemas 和未变 active；正文里的伪标题不构成状态证据。
+    opening, closing = "<system-reminder>\n", "\n</system-reminder>"
+    if not full.startswith(opening) or not full.endswith(closing):
+        return None
+    full_body = full[len(opening):-len(closing)]
+    empty = hashlib.sha256(b"").hexdigest()
+    found = []
+    for added, before in legacy_tool_additions(delta, after):
         catalog = "\n".join(["## 可用工具模块", *(
             [f"- {name}: {description}" for name, description in before["catalog"].items()] or ["- (无)"])])
         encoded_catalog = legacy_tool_frame(catalog)[len(opening):-len(closing)]
@@ -784,6 +797,10 @@ class Import:
         tool_pair = None
         tool_gap = False
         frozen_tools = {}
+        tool_pair_marked = False
+        last_fold_index = max((index for index, message in enumerate(messages)
+                               if message.get("role") == "system" and plain(message).startswith(("【收起", "【步骤收起"))
+                               and FOLD.findall(plain(message))), default=-1) if envelope else -1
 
         def remember_tool_state(state, source, stamp):
             tail = tool_rows[-1]
@@ -800,6 +817,38 @@ class Import:
         for index in range(len(messages) + 1):
             mark = marks_by_index.get(index)
             if mark:
+                if envelope and tool_pair and not tool_pair_marked:
+                    tool_pair_marked = True
+                    # WHY: 生产当前段有单卸载→同 key 新增；旧转换丢了两者之间的状态。
+                    # 只用首个后方 local mark 逆推，且它必须晚于全部 fold 的 ended，避开
+                    # fold_between 回写的旧快照；不从任意前方 mark 猜工具正文或 schemas。
+                    ends = [fold["stats"]["legacy_metadata"].get("ended") for fold in self.views.values()]
+
+                    def after_folds(candidate):
+                        return candidate["index"] > last_fold_index and all(
+                            type(end) in (int, float) and math.isfinite(end) and finite(candidate["time"], path) > end for end in ends)
+
+                    before, after = (self.rows[eid] for eid in tool_pair)
+                    first = before["source"]["message"]
+                    control = any(call.get("function", {}).get("name") in {"compress", "decompress"}
+                                  for message in messages[first:index] for call in message.get("tool_calls") or [])
+                    if not tool_gap and after_folds(mark) and not control and "tool_state" not in before:
+                        candidates = legacy_tool_additions(plain(after["messages"][0]), mark.get("told"))
+                        if len(candidates) == 1:
+                            added, middle = candidates[0]
+                            unload = legacy_tool_frame(f"工具模块状态变化（本条由系统追加，不是用户发言）：\n- 已激活模块 {added}：已卸载；不要再调用它的函数，需要时先 load_tools")
+                            prior = next((m for m in reversed(marks) if m["index"] <= first), None)
+                            agrees = True
+                            if prior and prior.get("told") is not None and after_folds(prior):
+                                state = clone(prior["told"])
+                                agrees = isinstance(state, dict) and isinstance(state.get("active"), dict) and added in state["active"]
+                                if agrees:
+                                    del state["active"][added]
+                                    agrees = state == middle
+                            if agrees and plain(before["messages"][0]) == unload:
+                                before["tool_state"] = middle
+                                after["tool_state"] = clone(mark["told"])
+                                frozen_tools.update({tool_pair[0]: clone(middle), tool_pair[1]: clone(mark["told"])})
                 # Snapshot's tool state is the value immediately before this wake.
                 # Proven announcements keep their state; later snapshots keep their boundary.
                 if envelope and tool_rows and mark.get("told") is not None:
@@ -935,6 +984,7 @@ class Import:
                 eid = self.add(kind, owner, [message], stamp=stamp, **metadata)
                 if metadata.get("legacy_tool_announcement"):
                     tool_pair = (tool_rows[-1], eid) if tool_rows and not tool_gap else None
+                    tool_pair_marked = False
                     tool_rows.append(eid)
                     tool_gap = False
             view["items"].append(eid)
