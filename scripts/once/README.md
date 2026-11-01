@@ -36,6 +36,8 @@ schema 顺序进入 view 的 `tool_state.schemas`。`follow/mute/on` 原文保�
 
 冻结历史中不可分解的消息以明确 `legacy` 来源保存，旧上下文元数据保存在
 view.stats.legacy_metadata，旧折叠名称保存在 legacy row 的 legacy_fold_sources。
+同一冻结归档中重复出现的 formal 行，后续每次以独立 legacy 行保留该次原 JSON 和归档位置，legacy_source_id 仅记录来路，并报告 `repeated-archive-reference`；不新增行动或结果，当前严格校验不变。
+若该次调用 JSON 与 formal 原参数不同、且精确等于其 compress 投影，则标记 legacy_compress_projected，渲染时保留这份已投影原文；不按摘要尾注形状猜测，正式行仍照常投影。
 当前折叠引用则恢复实际 covers。脚本不会为缺失的旧快照猜一个唤醒、行动或工具状态。
 
 以下情况会阻止应用，并给出对应来源位置：

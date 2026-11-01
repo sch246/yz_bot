@@ -1050,6 +1050,17 @@ class Import:
                         kind = "legacy"
                         metadata.update(tool_state=None, legacy_kind="tool_announcement_unknown_state")
                         self.warn("historical-tool-state-unknown", path, index)
+            if not strict and eid is not None and eid in view["items"]:
+                # WHY: 真实冻结归档重复保存了相同 assistant/tool 消息；复用 formal 行
+                # 会违反 view 引用唯一性。每次历史出现仍保留原 JSON 和归档位置，来路 id
+                # 只作 legacy 元数据，不把重复出现伪造成一次新行动或结果。
+                metadata.update(legacy_kind="repeated_archive_reference", legacy_source_id=eid)
+                native = self.rows[eid]["messages"][0]
+                if (message.get("tool_calls") != native.get("tool_calls")
+                        and message.get("tool_calls") == compress_projection(native).get("tool_calls")):
+                    metadata["legacy_compress_projected"] = True
+                self.warn("repeated-archive-reference", path, index)
+                eid = None
             if eid is None:
                 eid = self.add(kind, owner, [message], stamp=stamp, **metadata)
                 if metadata.get("legacy_tool_announcement"):

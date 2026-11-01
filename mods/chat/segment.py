@@ -270,6 +270,11 @@ def render(view, *, reasoning="keep", mark_borrowed=False):
                     function = call.get("function", {})
                     if function.get("name") != "compress":
                         continue
+                    # WHY: 迁移中的重复历史行可能原本就保存了旧 compress 投影；转换器
+                    # 已与 formal 原参数逐字核验后打标，不能再次截短尾注改变当时原文。
+                    # 正式原参数仍留在 legacy_source_id 指向的行，不能凭尾注形状猜测。
+                    if row["kind"] == "legacy" and row.get("legacy_compress_projected") is True:
+                        continue
                     try:
                         args = json.loads(function.get("arguments", "{}"))
                         text = args.get("summary", "")
