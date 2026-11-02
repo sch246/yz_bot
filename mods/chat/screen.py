@@ -366,10 +366,19 @@ def event_for_record(window: tuple, item: dict) -> dict:
     return event
 
 
-def render(window: tuple, items: list[dict], seen: int | None = None) -> str:
+def record_key(item: dict) -> str:
+    """Identity of one exact historical version, within its window."""
+    # WHY: 消息号跨日会重用，撤回/改写也会保留原号；去重不能只比 id。
+    value = repr((item["id"], tuple(item["day"]), item["time"], item["text"]))
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def render(window: tuple, items: list[dict], seen: int | None = None, *, annotated=False) -> str:
     """Join records under day headers; mark where unseen records begin."""
     lines: list[str] = []
-    texts = _recognize.annotate(window, [item["text"] for item in items])
+    texts = [item["text"] for item in items]
+    if not annotated:
+        texts = _recognize.annotate(window, texts)
     current = None
     divided = seen is None
     for index, item in enumerate(items):
@@ -535,6 +544,7 @@ def prepare(window: tuple, *, shown, count, pending=(), lead_in=None) -> dict:
             text = (f"（{label(window)} 还有 {skipped} 条新消息未展示；更早的用 "
                     f'read_log("{label(window)}", before="{clock(items[0]["time"])}") 往前翻）\n' + text)
         return {"text": text, "shown": [item["id"] for item in items],
+                "record_keys": [record_key(item) for item in items],
                 "patch": {"window": label(window), "records": metadata},
                 "follow_ids": [item["id"] for item in followed]}
 

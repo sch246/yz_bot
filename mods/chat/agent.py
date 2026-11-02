@@ -249,7 +249,7 @@ def drafts() -> str:
     return ("输入框里还没发的字：\n" + "\n".join(boxes)) if boxes else ""
 
 
-def _prepare(wake, view, windows):
+def _prepare(wake, view, windows, lead_in=_ACT_LEAD_IN):
     attention.flush(windows)
     late = attention.claim()
     # WHY: reflection is control work dispatched after this wake, not a screen
@@ -270,14 +270,14 @@ def _prepare(wake, view, windows):
     for window in sorted(windows, key=_windows.label):
         label = _windows.label(window)
         part = _screen.prepare(window, shown=info["shown"].get(label, []), count=count, pending=pending,
-                               lead_in=_ACT_LEAD_IN)
+                               lead_in=lead_in)
         patches.append(part["patch"])
         parts.append(part)
         if part["text"]:
             material.append({"kind": "screen",
                              "messages": [{"role": "user", "content": _chat_root._view.screen_content(part["text"])}],
                              "window": label, "shown": part["shown"], "read_patch": part["patch"],
-                             "follow_ids": part["follow_ids"]})
+                             "follow_ids": part["follow_ids"], "record_keys": part["record_keys"]})
     wake["request_patches"] = patches
     screens = "\n".join(part["text"] for part in parts if part["text"])
     present = set(info["notes"])
@@ -307,14 +307,16 @@ def _act(wake, spec, model=None):
     wake["acting"] = windows
     items = list(spec["items"])
     extra = [text for text in (
-        f"【准备这次上下文时注意到】\n{spec['note']}" if spec.get("note") else "",
+        f"【构造提供的关注情境，供你判断】\n{spec['focus']}",
+        f"【准备时的观察与联想，供参考】\n{spec['note']}" if spec.get("note") else "",
         drafts(),
     ) if text]
     items += [{"role": "system", "content": text} for text in extra]
     wake["request_patches"] = []
     try:
-        run(items, spec["goal"], tools=("meta",), model=model, kind="main", state=wake,
-            prepare=lambda state: _prepare(wake, state["view"], windows), on_output=_confirm,
+        run(items, _construct.DEFAULT_ACT_GOAL, tools=("meta", *spec["tools"]), inherit_tools=False,
+            model=model, kind="main", state=wake,
+            prepare=lambda state: _prepare(wake, state["view"], windows, spec["history"]), on_output=_confirm,
             hints=[lambda: _screen.unread_hint(windows), lambda: shell.running_hint(),
                    lambda: wake.get("breadcrumbs", ""), _brake_hint])
     finally:

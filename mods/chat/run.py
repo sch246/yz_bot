@@ -35,7 +35,7 @@ def write(state, operation, *args, **kwargs):
 
 def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
         stop=None, timeout=None, state=None, prepare=None, hints=(),
-        on_output=None, after_round=None, effort=None, grant=(), functions=None) -> tuple[str, str]:
+        on_output=None, after_round=None, effort=None, grant=(), functions=None, inherit_tools=True) -> tuple[str, str]:
     """Execute and record one purpose, returning its ctx and assistant text.
 
     ``items`` are journal ids or original message dictionaries. A supplied main
@@ -47,6 +47,8 @@ def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
     ``prepare(state)`` may append durable sources and return more source dicts
     to append after the tool announcement. It runs before every actual request.
     ``functions``, when given, is the exact set of tool names this run may see.
+    ``inherit_tools=False`` keeps tool activation local to this run; its caller
+    supplies the opening modules rather than restoring the global selection.
     """
     import mods.chat as chat
 
@@ -112,14 +114,16 @@ def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
                     session,
                     visible=lambda name, module: name not in {"baidumap", "dianping"}
                     and tool_modules.bot_op_tool_visible(name, module),
-                    persist=chat._persist_modules if central else None,
+                    persist=chat._persist_modules if central and inherit_tools else None,
                     schema_modules=list((prior or {}).get("schemas", {})) if central else (),
                     kind=kind, grant=grant,
                     function_visible=(lambda name, _tool: name in functions) if functions is not None else None,
                 )
                 binding["run"] = state
                 state["binding"] = binding
-                if central:
+                # WHY: 每次行动的工具由构造选，旧激活态不应绕过这次选择。
+                # 临时选用也不覆盖反思/沉淀自行维护的持久集合（2026-11-02）。
+                if central and inherit_tools:
                     active = chat._active_modules()
                     if active:
                         tool_modules.restore(binding, active)
@@ -226,7 +230,9 @@ def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
             session.should_stop = stopped
             session.turn_done = lambda: state["end"]
             session.add_context_provider(assemble)
-            session.add_hint(chat._agent_hint)
+            # WHY: 构造决定 todo 全文或选区；其它运行保留召回入口，不再自动摊开全文。
+            if kind != "construct":
+                session.add_hint('待办保存在笔记 todo，需要时用 read_note("todo") 召回。')
             for hint in hints:
                 session.add_hint(hint)
             session.add_hint(lambda: f"现在是 {chat._screen.clock()}。")

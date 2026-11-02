@@ -84,11 +84,11 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 `mods/tools/` 是工具和可按需载入说明的唯一目录，`mods.tools` 的模块级字典持有进程级 last-good 模块表。顶层 `foo.py` 和 `foo.md` 具有同一种模块语义：第一行是目录描述，余下文本在激活后进入中心 agent 的工具状态条目；子代理仍在开头显示一次。Markdown 模块没有函数，Python 模块通过 `__all__` 导出一组普通函数。Python 文件可以正常 import 第三方依赖、其它 `mods` 和同目录 `_helper.py`，导出函数仍由现有 `Tool` 校验，模型侧名称通常为 `foo__function`。
 
-首次使用 registry 时，每个顶层模块独立尝试进入 last-good；单模块失败只记录 traceback。之后修改磁盘不会自动改变运行版本：`list_tools` 查看差异，`reload_tools` 才逐模块读取、执行、校验并原子替换 last-good，失败保留旧版；`load_tools` 不读磁盘，只激活 last-good 模块。中心 agent 的实际激活名单及最后使用时刻在全局 `agent.active_tools`，超过 1 小时未使用的模块下轮不再装回；函数定义模块顺序从当前视图的工具状态条目推导，卸载不删除定义，调用只返回重装提示。请求边界先同步共享 registry 与本会话函数，再把完整或差异状态写入工具状态 system 条目，状态快照随条目保存；磁盘漂移仍只作末尾 hint。首次完整状态与后续差异都以 system 消息写入 journal。
+首次使用 registry 时，每个顶层模块独立尝试进入 last-good；单模块失败只记录 traceback。之后修改磁盘不会自动改变运行版本：`list_tools` 查看差异，`reload_tools` 才逐模块读取、执行、校验并原子替换 last-good，失败保留旧版；`load_tools` 不读磁盘，只激活 last-good 模块。反思和沉淀的持久激活名单及最后使用时刻在全局 `agent.active_tools`，行动则由构造选择开场模块、只在本次运行内保持，超过 1 小时未使用的模块下轮不再装回；函数定义模块顺序从当前视图的工具状态条目推导，卸载不删除定义，调用只返回重装提示。请求边界先同步共享 registry 与本会话函数，再把完整或差异状态写入工具状态 system 条目，状态快照随条目保存；磁盘漂移仍只作末尾 hint。首次完整状态与后续差异都以 system 消息写入 journal。
 
-`meta.py` 是唯一默认激活的必需模块，保存工具维护说明并导出 `exec_code`、`list_tools`、`reload_tools`、`load_tools` 四个无前缀恢复入口。`__init__.py` 只持有 registry、last-good 和每次运行的普通 dict binding；它不再伪装成工具格式。`meta` 调用通过一次调用范围内的 `ContextVar` 取得当前 binding，多运行和 `fork` 工作线程不会共享错误会话；磁盘删除 `meta.py` 的 reload 会失败并保留旧 last-good。
+`meta.py` 是唯一默认激活的必需模块，提供简要基础说明，开发手册在按需加载的 `tool_development.md`，并导出 `exec_code`、`list_tools`、`reload_tools`、`load_tools` 四个无前缀恢复入口。`__init__.py` 只持有 registry、last-good 和每次运行的普通 dict binding；它不再伪装成工具格式。`meta` 调用通过一次调用范围内的 `ContextVar` 取得当前 binding，多运行和 `fork` 工作线程不会共享错误会话；磁盘删除 `meta.py` 的 reload 会失败并保留旧 last-good。
 
-中心 agent 的可用模块描述从首次工具状态条目 开始可见；持久激活模块从全局 `agent.active_tools` 装回。`load_tools` 更新当前 Chat 的实际模块和函数，`reload_tools` 更新 last-good；每个 LLM 子请求冻结同一份 schema/callable 快照，所以加载或重载只从下一子请求起生效。
+中心 agent 的可用模块描述从首次工具状态条目 开始可见；反思和沉淀的持久激活模块从全局 `agent.active_tools` 装回；行动按规格选择，后续仍可自行加载。`load_tools` 更新当前 Chat 的实际模块和函数，`reload_tools` 更新 last-good；每个 LLM 子请求冻结同一份 schema/callable 快照，所以加载或重载只从下一子请求起生效。
 
 提示词没有新增编辑管理器；`.py` 共享环境继续暴露可变 `prompts` 对象，模型需要时可自己编写工具编辑它。
 
@@ -130,9 +130,11 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 日志先落盘，成功后才把编号加入视图。assistant 行动先登记，派发前登记调用开始，每个工具完成后立即记录结果；取消或崩溃后的未执行/未知结果由渲染说明，恢复不重跑动作。当前写入失败停止该运行后续派发，没有进程级 oplog 熔断。每次运行结束时冻结自己的视图；笔记版本、展示身份、工具状态都从条目推导。
 
-中心执行线只有一条，唤醒串行：先跑一次构造运行，它读黑板、折叠索引和这次的消息，用 `construct__assemble` 提交一份或几份规格（目的、引用、注意、负责的窗口）；然后每份规格各跑一次行动运行（kind `main`），被叫到的窗口先跑，没被认领的被叫醒窗口补一份兜底规格；构造关着、出错或超时就按黑板加消息兜底。程序只保证叫醒她的消息和窗口可见、展开引用、生成索引。`chat.current_wake()` 在行动运行及其工具里返回普通 dict，`wake["end"]` 结束本轮；其它运行隔离其状态。行动请求前准备它负责的窗口画面，别的窗口新到的召唤留给下一次唤醒；首次输出确认实际展示记录并 ack 召唤，失败 release。
+中心执行线只有一条，唤醒串行：先跑一次构造，从等着的事项里选一件，用 `construct__assemble(focus, refs, note, windows, tools, history)` 交准备结果；行动以自主判断为目的，focus 和 note 是标明来源的参考材料。未选中的召唤保留到下一次构造；构造关闭、出错或超时就按黑板加消息兜底。程序保证当前消息可见，构造选择整篇或局部笔记、工具模块和接话历史长度。`chat.current_wake()` 在行动及其工具里返回普通 dict，`wake["end"]` 结束本轮；其它运行隔离其状态。首次输出确认实际展示记录并 ack 召唤，失败 release。
 
-`run(items, goal, ...)` 统一构造、行动、沉淀、反思、汇总和分身，返回 `(ctx, text)`。todo、其它未读、当前时间、面包屑与后台命令提示只挂当次请求。独立运行超时立即返回；worker 尚未退出时 finalization 为 pending，退出后后台归档，关闭后不再接受迟到材料。`agents__fork` 复用唤醒/步骤/笔记/ctx/日志引用，最多五项并发，默认隐藏 send/type_word，须在本次 tools 显式授权。
+聊天片段引用保存逐条版本身份（窗口、消息号、日期、时间、原文摘要）。`segment.render` 省去 log 中与本次可见 screen 或前面的 log 重复的部分，保留 screen 的原文、图片和读确认。旧 log 没有这些元数据时原样显示；journal 原文不改。后来新增 screen 若覆盖先前引用，会改变那部分请求前缀，去重优先于维持这一小段缓存。
+
+`run(items, goal, ...)` 统一构造、行动、沉淀、反思、汇总和分身，返回 `(ctx, text)`。todo 全文只在构造输入中读取一次，行动按 refs 选入；其它运行保留召回入口，沉淀原本显式选入 todo 的路径保留。其它未读、当前时间、面包屑与后台命令提示只挂当次请求。独立运行超时立即返回；worker 尚未退出时 finalization 为 pending，退出后后台归档，关闭后不再接受迟到材料。`agents__fork` 复用唤醒/步骤/笔记/ctx/日志引用，最多五项并发，默认隐藏 send/type_word，须在本次 tools 显式授权。
 
 黑板是笔记 `recent`：正文是她写的此刻状态，`@引用` 行是为下一次构造准备的材料，每次构造都从它开始。构造说明在 `data/notes/policy/construct.md`（不存在时用内置说明），她在反思里用 `edit_policy` 改，下一次构造实际读到；`construct.replay(ctx, 说明)` 用另一版说明重跑过去某次构造，只比较规格、不跑行动、不给分身。self 与系统说明仍由系统提示提供。
 
@@ -140,7 +142,7 @@ Module 顶层应以定义和注册为主。端口绑定、storage 读取、sched
 
 `follow/mute/on` 由 awaker 文件持久保存，执行投影在内存；wait、loop、other 重启丢弃。长期 every/daily/at/when 每分钟检查，短期等待精确到秒。规则到点、循环每轮和无事件 wake 的已发生理由仍写 me 的 chatlog。普通离线补回不增加未读；旧时间点名用记录身份恢复，启动/补回后扫描未确认有效召唤。
 
-`mods.tools` 共享 last-good catalog，各运行的 active/schema/grant 由独立 dict binding 保存；主运行 active 写 Bot 全局设置并跨重启保留，schema 顺序由视图记录。ContextVar 在工具与后台线程间传播归属。工具后台 `wake/quiet` 仍把结果推进 me；手机工具走单队列，exec_code 用独立线程，shell 后台命令由 `mods.shell` 登记进程组与输出文件。
+`mods.tools` 共享 last-good catalog，各运行的 active/schema/grant 由独立 dict binding 保存；行动 active 按次选择；反思和沉淀 active 写 Bot 全局设置并跨重启保留，schema 顺序由视图记录。ContextVar 在工具与后台线程间传播归属。工具后台 `wake/quiet` 仍把结果推进 me；手机工具走单队列，exec_code 用独立线程，shell 后台命令由 `mods.shell` 登记进程组与输出文件。
 
 天气模块只投影现有 `mods.weather`；`mods.image/` 持有图片身份、缓存和视觉输入；`mods.forward` 持有合并转发的取回、落盘与渲染——转发的 id 和节点里的图片 url 都会过期，所以取回来的节点落在 `data/forward/<id>.json`，`.cave` 存转发时走的就是它，发送方向则由 `send_forward_msg` 的节点数组承担。`mods.websearch` 持有互联网检索，把 DeepSeek 的服务端 `web_search` 包成一个普通函数——密钥与聊天共用，搜回来的外部正文只当数据交回，不当指令；每次请求的 token 按 Flash 单价、服务端搜索按次（北京时间 2026-11-01 起每千次 5 元）记进 Bot 账。`mods.bili` 持有柚子自己的 B 站号：登记窗口种类 `bili`（一个评论区一个窗口，发送函数发评论）、扫码登录、每两分钟把回复和 @ 推进窗口；所有 bilibili-api 请求排进模块自己的一个常驻事件循环，因为库按事件循环缓存 HTTP 客户端。刷视频、读字幕和评论的工具在 `mods/tools/bili.py`。`mods.agents/` 登记 `dsh`、`agy`、`codex` 三种窗口（2026-10-30，维护者的本地改动）：别名与真实会话号在 `data/agents/sessions.json`，每个窗口一次只跑一轮后台 CLI 进程组，超时或退出时整组 `SIGKILL`，回答经 `chat.push` 回写并叫醒她；发送要求 Bot 自身有 op，见 [CLI agent 窗口](cli-agents.md)。`mods/tools/dsh.py` 是另一条入口：同步 `ask` 与后台 `ask_bg`，不建窗口。`mods.browser` 持有自管的常驻 Chromium 与裸 CDP 会话：打开页面、读渲染后的正文、在页面里跑 JS、截图交给视觉链路，每个聊天窗口一个标签页；进程由 `watchdog.detached()` 起，不随工具调用被 `^C` 带走；顶层导航只校验 http/https 地址语法，不解析或限制本机、内网、公网等目标，也不拦截页面的后续请求；启动就绪后清掉 Chrome 按 profile 恢复出来的遗留标签页，让每次启动都从一页空白开始。`mods.phone` 持有她自己那台安卓备用机（维护者定的：她想用就用，不设 op 门槛）：第一次要看屏幕时经 adb 推送并起 scrcpy-server 1.25，由后台线程常驻一条 H.264 流，只攒最近一个关键帧以来的包，看的时候交给 ffmpeg 解出最后一帧，整张黑才当屏幕灭着去点亮；半小时没人用就关流。点、滑、按键、打字只管做、不带图（维护者：截图和操作分开，顺手带回的图常常太早或太晚，她也就不主动看了），要看由她自己挑时候 `look`。`frames(auto=True)` 开自动连拍：后台最快每半秒看一眼，比上一张留下的变了 `threshold`%（默认 5）才留下，攒够一波拼成一张、格子上标着隔了几秒，经 `chat.push` 推进她的 `me` 窗口叫醒她；变过以后静下来两秒就交出最后一波、自己停（维护者：定时一组组拍太笨，要画面变了才截、攒够就发，治她截图不积极；它取代了柚子写的那版每次调用来取一组的后台连拍）。没收到新包就不解码，静着时几乎不花什么；后台截的存成 `frame-*.jpg`、拼完就删，不算她看过的那张。截图留最近 300 张：她上下文里引用着的图被删了，下次请求里就成了一行占位字。看视频这类会动的东西用 `frames`：那段时间里读流线程把收到的包另抄一份，最后只调一次 ffmpeg 解出按时间取的那几帧，拼成一张网格图给她。点、滑、按住走同一条 scrcpy 连接的控制通道：坐标就是她最近看的那张图上的，server 自己换算；按下和抬起是两条消息，所以能推着摇杆不放、边走边看，另一根手指照样点，一分钟没碰手机就自己松开；转屏或流重连过后要她先看一眼再点。她可以像模拟器的键位映射那样定键位（按钮、带半径的摇杆，存在 `data/phone/marks.json`）；摇杆能一推到八个方向的边，也能给偏移推到相对中心的任意一点，点击同样能在控件、键位旁边偏一点；`look` 可以把键位和坐标线画在图上，也可以用 uiautomator 读一遍界面、把控件框出来编号（游戏画面读不出）；画了标注的那张另存，和干净的原图一起给她，因为标注会挡东西。`aim` 转视角对准一个东西：拖一下、在新画面里用模板匹配找到它、按它实际挪了多少修正，量出的拖动比例存在视角键位里当下次的起点（3D 场景里近处远处挪得不一样，比例算不准，靠的是闭环）。这些后端函数她也能在 `exec_code` 里组合着用（`find`、`stitch` 只给脚本用）；`exec_code` 在调用方上下文的副本里跑，脚本里也能用 `_vision.attach` 把图交给她。按键走 `adb shell input`；中文经 ADB Keyboard 输入法的广播打字；输入法被切成搜狗时，`keyboard` 打开输入法设置页、用 uiautomator 读出开关去点（手机上的 shell 没有权限直接设）。设备地址和 server 路径在 `data/device/phone.json`，截图在 `data/phone/shots/`；工具在 `mods/tools/phone.py`。图片与子任务工具只惰性调用 `mods.chat` 的既有 usage/cost 入口，不复制计费状态。`llm`、`tools`、`chat` 和 `image` 采用文件夹 Module，是因为各自内部实现共同拥有明确状态；具体能力仍优先由普通函数表达。
 

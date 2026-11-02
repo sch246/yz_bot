@@ -369,12 +369,12 @@ def _window_storage(window: tuple) -> dict:
 _AGENT_HINT_KEY = "agent_hint"
 
 
-def _agent_hint() -> str:
-    """The todo note, shown at the end of every sub-request so edits show up at once.
+def todo_material() -> str:
+    """The todo note, read once when constructing the next context.
 
     WHY: 待办以前存在 storage 的 `agent_hint` 键里，2026-10-22 维护者让它退化成普通文件
     （笔记 `todo`）。第一次读到旧键时搬过去并删掉旧键，之后只认文件。
-    WHY: 末尾附上结束标记，避免模型误将后续渲染的动态提示（如其它窗口未读）当成 todo 内容误写进文件。
+    WHY: 2026-11-02 待办全文改由构造选入行动，不再绕过材料选择在每轮末尾重复注入。
     """
     data = storage.get("", "agent")
     legacy = data.get(_AGENT_HINT_KEY)

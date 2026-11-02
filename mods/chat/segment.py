@@ -236,6 +236,11 @@ def render(view, *, reasoning="keep", mark_borrowed=False):
     if reasoning not in ("keep", "drop"):
         raise ValueError("reasoning must be keep or drop")
     rows = _entries(view)
+    # WHY: log 引用与行动的接话画面会重叠。保留本次 screen（含新图和读确认），
+    # 只省引用里的重复正文；不能把 log 塞进 shown，提前改变未读选择范围。
+    supplied = {(row["window"], key) for row in rows
+                if row["kind"] == "screen" and row["ctx"] == view["ctx"]
+                for key in row.get("record_keys", [])}
     latest_wake = _current_wake(view)
     latest_wake_id = latest_wake["id"] if latest_wake else None
     by_act = {}
@@ -249,6 +254,21 @@ def render(view, *, reasoning="keep", mark_borrowed=False):
         waiting.clear()
 
     for row in rows:
+        if row["kind"] == "log" and "records" in row:
+            from . import screen
+
+            remaining = []
+            for record in row["records"]:
+                key = (row["window"], record["key"])
+                if key not in supplied:
+                    remaining.append(record)
+                    supplied.add(key)
+            if len(remaining) != len(row["records"]):
+                if not remaining:
+                    continue
+                # Frozen annotation, never re-run recognition against today's storage.
+                text = screen.render(_chat_root._windows.parse(row["window"]), remaining, annotated=True)
+                row["messages"] = [{"role": "user", "content": "【引用的聊天记录；与其它材料重复的部分已省略】\n" + text}]
         for message in row["messages"]:
             if message.get("role") != "tool":
                 finish()
@@ -440,17 +460,22 @@ def _policy_ref(view, name):
 
 def _log_ref(view, value):
     """A window's chatlog records before a moment, recorded as one row of this run."""
-    from . import roles
+    from . import roles, screen, windows, recognize
 
     match = re.fullmatch(r"([^@*\s]+)(?:@([^*]+?))?(?:\*(\d+))?", value)
     if match is None:
         return None
     window, moment, count = match[1], (match[2] or "").strip(), int(match[3] or 30)
     try:
-        text = roles.read_log(window, count, moment)
+        target = windows.parse(window)
+        window = windows.label(target)
+        items = screen.records(target, max(1, min(count, 200)), roles._moment(moment))
+        texts = recognize.annotate(target, [item["text"] for item in items])
+        records = [dict(item, key=screen.record_key(item), text=text) for item, text in zip(items, texts)]
+        text = screen.render(target, records, annotated=True) or "（没有记录）"
     except (ValueError, KeyError):
         return None
-    return [journal.append("log", ctx=view["ctx"], window=window, before=moment, count=count,
+    return [journal.append("log", ctx=view["ctx"], window=window, before=moment, count=count, records=records,
                            messages=[{"role": "user", "content": f"【聊天记录 {window}"
                                       + (f"，{moment} 之前" if moment else "") + f"，{count} 条】\n{text}"}])]
 

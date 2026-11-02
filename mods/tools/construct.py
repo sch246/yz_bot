@@ -1,22 +1,22 @@
-"""构造运行专用：为接下来行动的自己提交一份运行规格（目的、材料引用、注意）。
+"""构造运行专用：提交这次关注的情境、材料与提醒，帮助接下来的自己自主判断。
 
-只在每次唤醒前的构造运行里有用；在别处调用会直接返回错误。一次唤醒可以提交几份，
-每份是一次独立的行动，按提交顺序依次进行（被叫到的窗口先）。
+每次只提交一份。构造提供信息和洞察；怎样行动、怎样表达由行动运行决定。
 """
-
 from __future__ import annotations
 
 from mods import tools as tool_modules
 
 
-def assemble(goal: str, refs: str = "", note: str = "", windows: str = "") -> str:
-    """提交一份行动规格，返回记下的结果或需要改正的地方。
+def assemble(focus: str, refs: str = "", note: str = "", windows: str = "", tools: str = "", history: int = 10) -> str:
+    """为接下来的自己交一份上下文准备；提交成功就结束这次构造。
 
     @param
-    goal: 这一份要做的具体的事，一句话，例如“接着回答某人关于某事的追问”
-    refs: 每行一条材料引用：笔记名、日志编号、运行 ctx、log:窗口@时刻*条数、policy:名字
-    note: 写给行动的自己的注意：陌生说法用「」括起来、矛盾、情绪、意外；没有就留空
-    windows: 这份负责回应的窗口，空格分隔，如 "g123 u456"、"me"；留空表示还没被其它规格认领的被叫醒窗口
+    focus: 这次关注的情境或问题，例如“某人在切换模型后确认是否在线”；描述情况，具体行动留给接下来的自己
+    refs: 每行一条：笔记名、局部笔记如 topic:线索@L12-28、日志编号、运行 ctx、log:窗口@时刻*条数、policy:名字
+    note: checklist 帮你注意到的信息、提醒和洞察，附依据或不确定之处；没有发现就留空
+    windows: 这份关注的窗口，空格分隔，如 "g123 u456"、"me"；留空表示本次所有等着的窗口
+    tools: 行动开场需要的工具/Skill 模块名，空格或逗号分隔；同时提供说明与函数；空串只有 meta 基础能力，行动还可自行加载
+    history: 窗口新消息之前的接话条数，可为 0，默认 10；新消息仍可见，更早的用 log: 引用
     """
     from mods.chat import construct
 
@@ -27,7 +27,7 @@ def assemble(goal: str, refs: str = "", note: str = "", windows: str = "") -> st
     state = binding.get("run")
     if not state or state.get("kind") != "construct":
         return "assemble 只能在构造运行里用"
-    return construct.submit(state, goal, refs, note, windows)
+    return construct.submit(state, focus, refs, note, windows, tools, history)
 
 
 __all__ = ["assemble"]

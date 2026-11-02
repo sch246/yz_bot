@@ -95,6 +95,16 @@ def render(scope: str) -> str:
 
     WHY: 2026-10-26 维护者：每一段上下文开头都写明它来自哪个文件，她一眼就能看到改哪里。
     """
+    match = re.fullmatch(r"(.+)@L([1-9]\d*)-L?([1-9]\d*)", scope)
+    if match:
+        name, first, last = match[1], int(match[2]), int(match[3])
+        lines = read(name).splitlines()
+        if not 1 <= first <= last <= len(lines):
+            raise ValueError(f"{name} 共 {len(lines)} 行；选区须满足 1 <= 起行 <= 末行 <= 总行数")
+        # WHY: 整篇人物笔记夹着多年不同话题。选区与 read_note 共用同一语法，
+        # 行号按源文件计算，来源保留选区，不能让一小段冒充整份笔记。
+        body = "\n".join(f"{number}: {lines[number - 1]}" for number in range(first, last + 1))
+        return f"## 笔记 {scope}（{_path(name).as_posix()}，第 {first}–{last} 行／共 {len(lines)} 行；其余未载入）\n{body}"
     body = read(scope).strip()
     name = custom_name(scope)
     if name:
@@ -227,9 +237,11 @@ def listing(limit: int = 60) -> list[dict]:
         # self 总在系统提示最前面，不用列进"可以召回的东西"。
         if not _SCOPE.fullmatch(scope) or scope == "self":
             continue
-        text = path.read_text(encoding="utf-8").strip()
+        raw = path.read_text(encoding="utf-8")
+        text = raw.strip()
         found.append({"scope": scope, "changed": path.stat().st_mtime,
-                      "first": text.split("\n", 1)[0][:80], "chars": len(text)})
+                      "first": text.split("\n", 1)[0][:80], "chars": len(text),
+                      "lines": len(raw.splitlines())})
     found.sort(key=lambda item: item["changed"], reverse=True)
     return found[:limit]
 

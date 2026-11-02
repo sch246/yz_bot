@@ -2,7 +2,7 @@
 
 A wake brings new messages; the blackboard (the ``recent`` note) carries what an
 earlier moment prepared for this one. The construct run reads both plus folded
-indexes and submits one or more specs with ``construct__assemble``: a goal,
+indexes and submits one preparation with ``construct__assemble``: a focus,
 references and a note to the act. The program only guarantees that the
 summoning messages and their windows are visible, and expands references.
 
@@ -21,12 +21,12 @@ from __future__ import annotations
 import re
 import time
 
-from mods import storage
+from mods import storage, tools as tool_modules
 
 from . import journal, notes as _notes, roles as _roles, screen as _screen, segment as _segment, windows as _windows
 
 DEFAULT_CONFIG = {"on": True, "model": "deepseek/deepseek-flash", "effort": "none", "timeout": 45}
-GOAL = "为接下来的自己构造这次要看的上下文：用 construct__assemble 提交一份或几份规格，提交完就结束。"
+GOAL = "为接下来的自己提供信息、提醒和洞察；用 construct__assemble 提交一份上下文准备，提交后结束。"
 DEFAULT_ACT_GOAL = "看看这次唤醒和新到的消息，自主决定做什么；不必为了被叫醒而说话。"
 # WHY: 构造运行原本是 observer（没有任何工具）；现在只多给召回和提交规格。发言、写笔记、
 # 跑代码都不在其中：它为别人准备上下文，自己不行动。这是新角色的白名单，不是给已有角色加禁令。
@@ -34,35 +34,40 @@ TOOLS = frozenset({"construct__assemble", "search", "read_note", "read_log", "re
 # WHY: the construct run must understand the new message in its thread before choosing
 # material; twenty earlier lines is enough to see who is answering whom.
 LEAD_IN = 20
-_WORD = re.compile(r"「([^「」\n]{1,20})」")
 _REF_LINE = re.compile(r"^\s*@\s*(\S.*?)\s*$")
 
-# WHY: 第 4 条来自 observer 的检查清单（2026-10-27 起，2026-10-29 草籽修订）：清单里只放她真的
+# WHY: 默认清单来自 observer 的检查清单（2026-10-27 起，2026-10-29 草籽修订）：清单里只放她真的
 # 容易漏的。想加一条，先确认她确实会漏；她已经不会漏的就拿掉。它是旁观补盲，不是监工：不做代码
 # 审查、操作审计或文风说教。设备上有 data/notes/policy/construct.md 时用那份，这里只是兜底。
-DEFAULT_POLICY = """你现在不回应任何人，只为接下来的自己准备这一次要看的上下文。
-接下来真正行动的那个你，只看得到你用 construct__assemble 交过去的东西，加上程序保证的这次消息原文。
+# WHY: 2026-11-02 维护者明确构造只提供信息和洞察。接口职责独立于她可修改的
+# checklist：旧设备策略可能还写着 goal/自动查引号，不能覆盖新的材料接口。
+CONTRACT = """你正在为下一次行动准备上下文，提供信息、提醒和洞察。行动的你会结合这些材料自主判断。
+从等着的事里选一件，focus 说明这次关注的情境或问题；note 写观察、依据和仍不确定的联系。
+具体说什么、做什么由行动决定。交一份 construct__assemble 后，这次准备结束。
 
-1. 先看清这次是谁、为什么叫醒你；黑板（recent）记着此刻的心情、手头的事和上一刻为此刻准备的引用。
-2. 想清楚这次要做的是什么，写成 goal：一句具体的话，例如“接着回答某人关于某事的追问”“继续循环里在做的那件事”。
-3. 选材料 refs，每行一个：
-   - 笔记名：global、recent、todo、person:QQ号、group:群号、diary:日期、专题笔记名；
-   - 日志编号（YYYYMMDD-N）或某次运行的 ctx：之前那次行动、那次的结果；
-   - 某个窗口的一段聊天：log:窗口@时刻*条数，例如 log:g123@2026-10-30 21:00*40 是 21:00 之前的 40 条；
-   - 策略：policy:名字。
-   recent 一般都要带，它记着心情和手头的事；global 是你待人接物的直觉，多数时候也要带。
-   拿不准某份材料有没有用，先用 read_note、search、read_log 看一眼再决定。找线索可以用 fork 分几路同时找。
-   只带这件事需要的，不为了保险把东西都塞进去。
-4. note 写给行动的你，没有就留空：
-   - 陌生的说法：画面里你可能不认识的词（黑话、梗、外号、没交代来源的指代），用「」括起来，一个词一对，系统会去笔记和日记里查有没有；
-   - 矛盾：画面和你之前说的、笔记里写的对不上，或者两条规矩打架；
-   - 情绪：对方话里的情绪，你自己的情绪；
-   - 意外：上一轮的报错、碰壁、结果和预期不一样。
-   只说注意到的，不说教，不替行动的你决定怎么做。
-5. 只交一份：从等着你的事里选现在最该做的那一件（谁在等、等了多久、轻重缓急、和手头的事连不连得上）。
-   同一个窗口里同时发生的几件事算一件。没选的留在队里，做完这件你会再被叫起来重新选，期间新到的也一起排。
-   windows 写这份规格负责回应的窗口（g群号、u对端号；闹钟、循环、命令写 me），至少要有一个是等着你的。
-6. 交完这一份就结束了。你在这里不发言、不写笔记。
+你可以选择：
+- refs：每行一条，笔记名、日志编号、运行 ctx、log:窗口@时刻*条数、policy:名字。
+  笔记可以选原文件行号，如 topic:线索@L12-28；read_note 用同一写法预览，目录标字符数和总行数。
+  整份与局部都可选；关系、心情和表达所需的材料也在选择范围内。
+- tools：行动开场展开的工具/Skill 模块，空格或逗号分隔。meta 基础能力一直有，其余按这次需要选；
+  加载会同时提供说明和函数，行动仍可自行 load_tools。工具目录中的 tool_development 是开发手册。
+- history：当前窗口新消息之前的接话条数，默认 10，可为 0；更早的聊天用 log: 补。
+  当前消息、运行期间同窗口的新消息由程序保证可见；第一次进入陌生窗口仍按历史上限补画面。
+- windows：这份关注的窗口，至少包含一个等着的窗口；未选的留到下一次构造。
+
+行动还会看到 self、身份与记忆说明、基础工具、输入框草稿、时间及运行状态提示。
+todo 全文在这次准备中供你参考，行动只带你选进 refs 的全文或片段；没有另外一份末尾全文。
+需要确认陌生指代时用 search/read_note 查；引号只表示引用，不触发自动检索。
+以下策略是你的补充检查清单；提交接口和职责以本说明为准。
+"""
+
+DEFAULT_POLICY = """先看这次是谁、为什么叫醒你，以及 recent 中的心情、手头的事和留给此刻的引用。
+准备材料时留意这些容易漏的地方；有发现再交给行动，没有发现就留空：
+- 陌生说法、梗、外号或指代：查到的含义与出处，或尚未查清的部分。
+- 矛盾：画面、旧经历和笔记哪里对不上；旧结论的时间和适用条件。
+- 情绪：对方和自己的感受，有哪些关系经历能帮助理解；把猜测和原话分开。
+- 意外：报错、碰壁、结果与预期的落差，目前知道什么、还缺什么。
+清单用来补盲和发现联系，不逐项交作业。只留下这次有帮助的信息；表达方式和行动由接下来的自己决定。
 """
 
 
@@ -86,7 +91,7 @@ def save_config(config: dict) -> None:
 
 
 def policy() -> str:
-    return _notes.read_policy("construct").strip() or DEFAULT_POLICY
+    return CONTRACT + "\n" + (_notes.read_policy("construct").strip() or DEFAULT_POLICY)
 
 
 def blackboard() -> tuple[str, list[str]]:
@@ -124,38 +129,14 @@ def fold(ref: str) -> str:
         return "（认不出这条引用）"
 
 
-def annotate(text: str) -> str:
-    """After each 「word」, say which notes and diaries mention it, or that none do.
-
-    WHY (observer, 2026-10-29): the constructor may not know what the notes hold;
-    whether a word is in them is looked up by code, not guessed by the model.
-    """
-    words = list(dict.fromkeys(match.strip() for match in _WORD.findall(text) if match.strip()))
-    if not words:
-        return text
-    found = _notes.where(words)
-    done: set[str] = set()
-
-    def mark(match: re.Match) -> str:
-        word = match[1].strip()
-        if word not in found or word in done:
-            return match[0]
-        done.add(word)
-        scopes = found[word]
-        if not scopes:
-            return f"{match[0]}（笔记和日记里都没有）"
-        more = f" 等 {len(scopes)} 处" if len(scopes) > 2 else ""
-        return f"{match[0]}（{'、'.join(scopes[:2])}{more} 里有）"
-
-    return _WORD.sub(mark, text)
-
-
+# WHY: 删除 observer 的引号查词：普通原话也会带引号，文本命中不等于相关记忆。
+# 构造已有 search/read_note 与目录，需要验证的联系由它显式查询（2026-11-02）。
 def directory(most: int = 80) -> str:
     rows = _notes.listing(limit=10**6)
     # WHY: 选哪些仍按修改时间（最近动过的优先），显示按名字排：按修改时间显示时每写一次
     # 笔记顺序就变，整份目录连同后面的内容都进不了缓存（2026-11-01）。
     shown = sorted(rows[:most], key=lambda item: item["scope"])
-    lines = [f"- {item['scope']}：{item['first']}" for item in shown]
+    lines = [f"- {item['scope']}（{item['chars']} 字符，{item['lines']} 行）：{item['first']}" for item in shown]
     if len(rows) > most:
         lines.append(f"（还有 {len(rows) - most} 份不常动的没列出；用 search 或 read_note 找）")
     return "\n".join(lines) or "（还没有笔记）"
@@ -242,6 +223,7 @@ def material(wake: dict) -> list[dict]:
         {"role": "system", "content": policy()},
         {"role": "system", "content": "【笔记目录（折叠的，要用就写进 refs）】\n" + directory()},
         {"role": "system", "content": "【黑板 recent】\n" + board},
+        {"role": "system", "content": chat.todo_material() or "（todo 是空的）"},
         {"role": "system", "content": "【最近（折叠的，要用就写进 refs）】\n"
                                       "最近你做过的事：\n" + timeline()
                                       + "\n\n最近几次运行：\n" + recent_runs()
@@ -263,6 +245,7 @@ def _tier(ref: str) -> int:
     global 和人物笔记，顺序不同也对不上前缀。笔记之间先后没有含义，按变化快慢排；同一档
     保持她写的顺序，日志、运行和聊天记录排最后且不打乱，它们的先后可能就是时间顺序。
     """
+    ref = ref.split("@L", 1)[0]
     if ref == "global":
         return 0
     if (journal._ID.fullmatch(ref) or ref.startswith("log:") or re.fullmatch(r"#?\d+(\.\d+)?", ref)
@@ -294,7 +277,8 @@ def fallback(windows, reason: str) -> dict:
     note = f"（这次没有经过构造：{reason}。眼前只有黑板和这次的消息，缺什么就自己召回。）"
     if bad:
         note += "\n黑板里这些引用读不出来，记得改 recent：" + "、".join(bad)
-    return {"goal": DEFAULT_ACT_GOAL, "items": items, "note": note, "windows": list(windows),
+    return {"focus": "这次唤醒和新到的消息", "items": items, "note": note, "windows": list(windows),
+            "tools": [], "history": 10,
             "refs": refs, "ctx": "", "fallback": reason}
 
 
@@ -337,11 +321,19 @@ def build(wake: dict, model: str | None = None) -> list[dict]:
     return state["specs"][:1]
 
 
-def submit(state: dict, goal: str, refs: str, note: str, windows: str) -> str:
+def submit(state: dict, focus: str, refs: str, note: str, windows: str, tools: str = "", history: int = 10) -> str:
     """Validate one spec inside a construct run and keep it on the run state."""
-    goal = str(goal).strip()
-    if not goal:
-        return "goal 不能空：写这一份要做的具体的事"
+    focus = str(focus).strip()
+    if not focus:
+        return "focus 不能空：说明这次关注的情境或问题"
+    if isinstance(history, bool) or not isinstance(history, int) or history < 0:
+        return "history 写非负整数：新消息之前需要几条接话"
+    modules = list(dict.fromkeys(value for value in re.split(r"[\s,，、]+", str(tools)) if value))
+    catalog = tool_modules.catalog()
+    bad_tools = [name for name in modules if name not in catalog or name in {"baidumap", "dianping"}
+                 or not tool_modules.bot_op_tool_visible(name, catalog[name])]
+    if bad_tools:
+        return "这些工具模块不可用：" + "、".join(bad_tools)
     labels = [value for value in re.split(r"[\s,，、]+", str(windows)) if value]
     try:
         targets = [_windows.parse(value) for value in labels]
@@ -359,10 +351,10 @@ def submit(state: dict, goal: str, refs: str, note: str, windows: str) -> str:
     items, bad = _resolve(ref_lines, state["view"])
     if bad:
         return "这些引用读不出来，改好再交一次（这份没有记下）：" + "、".join(bad)
-    state["specs"].append({"goal": goal, "items": items, "note": annotate(str(note).strip()),
+    state["specs"].append({"focus": focus, "items": items, "note": str(note).strip(), "tools": modules, "history": history,
                            "windows": targets, "refs": ref_lines, "ctx": state["view"]["ctx"], "fallback": ""})
     state["end"] = True  # one spec per step: the construct run ends with this batch of calls
-    return (f"已记下：{goal}（{len(items)} 条材料，负责 "
+    return (f"已记下关注：{focus}（{len(items)} 条材料，负责 "
             + ("、".join(_windows.label(window) for window in targets) or "无窗口") + "）")
 
 
@@ -383,13 +375,15 @@ def _submitted(view: dict) -> list[str]:
                 args = json.loads(function.get("arguments") or "{}")
             except ValueError:
                 args = {}
-            lines.append(_spec_text(args.get("goal", ""), str(args.get("refs", "")).splitlines(),
-                                    args.get("note", ""), args.get("windows", "")))
+            lines.append(_spec_text(args.get("focus", args.get("goal", "")), str(args.get("refs", "")).splitlines(),
+                                    args.get("note", ""), args.get("windows", ""),
+                                    args.get("tools", "（旧规格未选择）"), args.get("history", 10)))
     return lines
 
 
-def _spec_text(goal, refs, note, windows) -> str:
-    return (f"- 目的：{goal}\n  窗口：{windows or '（默认）'}\n  材料：{'、'.join(r.strip() for r in refs if r.strip()) or '无'}"
+def _spec_text(focus, refs, note, windows, tools="", history=10) -> str:
+    return (f"- 关注：{focus}\n  窗口：{windows or '（默认）'}\n  材料：{'、'.join(r.strip() for r in refs if r.strip()) or '无'}"
+            + f"\n  工具：{tools or 'meta'}；接话历史：{history} 条"
             + (f"\n  注意：{note}" if str(note).strip() else ""))
 
 
@@ -415,7 +409,10 @@ def replay(name: str, policy_text: str | None = None, model: str | None = None) 
     if not messages:
         raise ValueError(f"{name} 没有可重放的输入")
     if policy_text is not None:
-        messages[0] = {"role": "system", "content": str(policy_text).strip() or DEFAULT_POLICY}
+        messages[0] = {"role": "system", "content": CONTRACT + "\n" + (str(policy_text).strip() or DEFAULT_POLICY)}
+    elif not str(messages[0].get("content", "")).startswith(CONTRACT):
+        # Replay uses today's tool interface even when its evidence predates it.
+        messages[0] = {"role": "system", "content": CONTRACT + "\n" + str(messages[0].get("content", ""))}
     windows = set()
     for label in view["stats"].get("windows", []):
         try:
@@ -429,6 +426,7 @@ def replay(name: str, policy_text: str | None = None, model: str | None = None) 
                           model=model or str(config.get("model") or "") or None, kind="construct", state=state,
                           timeout=float(config.get("timeout", 45)), effort=None if effort == "default" else effort)
     before = _submitted(view) or ["（原来没有提交规格）"]
-    after = [_spec_text(spec["goal"], spec["refs"], spec["note"], " ".join(_windows.label(w) for w in spec["windows"]))
+    after = [_spec_text(spec["focus"], spec["refs"], spec["note"], " ".join(_windows.label(w) for w in spec["windows"]),
+                       " ".join(spec["tools"]), spec["history"])
              for spec in state["specs"]] or ["（重放没有提交规格）"]
     return f"原来（{name}）：\n" + "\n".join(before) + f"\n\n重放（{ctx}）：\n" + "\n".join(after)
