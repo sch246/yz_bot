@@ -179,10 +179,10 @@ def restore_read(snapshot: dict, windows: dict, *, patches=()) -> None:
         storage.save()
 
 
-def _day_files(window: tuple) -> list[tuple[tuple[int, int, int], Path]]:
+def _day_files(window: tuple, days=None) -> list[tuple[tuple[int, int, int], Path]]:
     directory = chatlog.window_path(window[0], window[1])
     found = []
-    for day in chatlog._archive_days(directory):
+    for day in chatlog._archive_days(directory) if days is None else sorted(set(days), reverse=True):
         path, _sidecar = chatlog._day_paths(window[0], window[1], day, None)
         if path.is_file():
             found.append((day, path))
@@ -195,28 +195,31 @@ def _record_time(day: tuple[int, int, int], head: str) -> int | None:
 
 
 def records(window: tuple, count: int, before: int | None = None, since: float | None = None,
-            *, include_hidden: bool = False) -> list[dict]:
+            *, include_hidden: bool = False, days=None) -> list[dict]:
     """The newest *count* records of one window, oldest first.
 
     *before* is an exclusive Unix time; it pages backwards through the files.
     *since* stops at day files that end before it.
+    *days* restricts reads to those exact dates, without enumerating the archive.
     *include_hidden* also reads QQ control/debug records for offline source verification.
     """
     if count <= 0:
         return []
     picked: list[dict] = []
-    for day, path in _day_files(window):
+    hide_control = not include_hidden and _windows.spec(window)["hide_control"]
+    for day, path in _day_files(window, days):
         if since is not None and chatlog._day_bounds(day)[1] < since:
             break
         lines = path.read_text(encoding="utf-8").split("\n")
         if lines and lines[-1] == "":
             lines.pop()
-        day_records = []
-        for start, end in chatlog._file_records(lines):
+        # WHY: 画面通常只要几十条；先解析整天再截尾，会在每次工具续轮
+        # 重做当天所有消息的时间、身份和正文解析。按文件位置倒读，够数就停。
+        for start, end in reversed(chatlog._file_records(lines)):
             # WHY: `#` 开头的消息是控制与调试输出（子命令结果、traceback、`#hint` 状态），
             # 按跨模块约定不回流进模型，见 docs/llm.md「上下文如何组装」。
             # Only kinds declaring hide_control (QQ) have # commands: CLI answers often start with Markdown headings.
-            if (not include_hidden and _windows.spec(window)["hide_control"] and end - start > 1
+            if (hide_control and end - start > 1
                     and lines[start + 1].startswith("    #")):
                 continue
             text = "\n".join(lines[start:end])
@@ -226,11 +229,38 @@ def records(window: tuple, count: int, before: int | None = None, since: float |
             head = chatlog._split_head(lines[start])
             value = head.get("message_id") if head else None
             identity_ = str(value) if value else "~" + hashlib.sha256(f"{stamp}\n{text}".encode()).hexdigest()
-            day_records.append({"id": identity_, "day": day, "time": stamp, "text": text})
-        picked[:0] = day_records[-(count - len(picked)):]
-        if len(picked) >= count:
-            break
-    return picked
+            picked.append({"id": identity_, "day": day, "time": stamp, "text": text})
+            if len(picked) >= count:
+                return picked[::-1]
+    return picked[::-1]
+
+
+def _with_pending(window: tuple, rows: list[dict], pending: dict) -> list[dict]:
+    """Add exact old exceptions without reading the history between them and now."""
+    present = {(item["id"], item["day"]) for item in rows}
+    missing = {}
+    for identity_, saved in pending.items():
+        stamp = saved.get("time")
+        if stamp is None:
+            stamp = saved.get("event", {}).get("time")
+        if stamp is None:
+            # 未知日期仍保留在 pending 中，不能猜日期或假称已经读过。
+            continue
+        day = tuple(time.localtime(stamp)[:3])
+        if (identity_, day) not in present:
+            missing.setdefault(day, set()).add(identity_)
+    for day, identities in missing.items():
+        identities.update(item["id"] for item in rows if item["day"] == day)
+        extra = [item for item in records(window, 1_000_000, days=[day]) if item["id"] in identities]
+        reread = {(item["id"], item["time"], item["text"]) for item in extra}
+        if any((item["id"], item["time"], item["text"]) not in reread
+               for item in rows if item["day"] == day):
+            # 两次读取之间文件被改动时保留已有画面；旧例外仍未确认，下轮再读。
+            continue
+        # WHY: 补回的旧时刻可能追加在当天末尾；同日按原文件位置合并，
+        # 不能按时间重排，否则 shown 的位置和接话范围都会改变。
+        rows = [item for item in rows if item["day"] != day] + extra
+    return sorted(rows, key=lambda item: item["day"]) if missing else rows
 
 
 def event_for_record(window: tuple, item: dict) -> dict:
@@ -349,19 +379,23 @@ def prepare(window: tuple, *, shown, count, pending=(), lead_in=None) -> dict:
     lead_in = LEAD_IN if lead_in is None else max(0, int(lead_in))
     with context.window_lock(window), _lock:
         state = deepcopy(_state(window))
-        marks = [state["through"], *(item.get("time") for item in state["pending"].values())]
+        layer = awaker.layer(window)
+        follow_since = layer.get("since") if layer and layer["state"] == "follow" else None
+        marks = [state["through"], follow_since]
         since = min((stamp for stamp in marks if stamp is not None), default=None)
-        # Ordinary requests walk only the unread range and a short tail for lead-in.
+        # WHY: 旧 pending 是离散例外，不是连续扫描的起点。2026-11-02 实测
+        # 一条多年前的未读使每次请求重扫数年日志、占满一个核；只按它所在日
+        # 补原文，连续区间由已读边界和 follow 决定，保留跟听期间的完整消息。
         rows = records(window, max(count, lead_in) + FRESH_MAX)
         if since is not None:
             fresh_rows = records(window, 1_000_000, since=since)
             fresh_ids = {item["id"] for item in fresh_rows}
             rows = [item for item in rows if item["id"] not in fresh_ids] + fresh_rows
+        rows = _with_pending(window, rows, state["pending"])
         for item in rows:
             item["unread"] = is_unread(state, item["id"], item["time"])
         available = [item for item in rows if item["id"] not in shown]
-        layer = awaker.layer(window)
-        since = layer.get("since") if layer and layer["state"] == "follow" else None
+        since = follow_since
         followed = [item for item in available if item["unread"] and since is not None
                     and item["time"] is not None and item["time"] >= int(since)]
         calls = [item for item in available if item["unread"]
