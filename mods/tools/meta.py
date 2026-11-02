@@ -321,7 +321,7 @@ def send(
     target: 要发送的窗口，和 type_word 填的一样（如 g<群号>、u<私聊号>、bili:<BV号>、me）
     wait: 发完后怎么安排后续。传 0 表示不等、发完继续这一轮干手头的活；传 -1 表示结束这轮、纯被动等待；传等待时长（如 "5m"、"20m"、"1h" 或秒数 300）表示在当前窗口挂一个超时等待闹钟，期间有人回复立刻叫醒，到点超时还没人回也会自动叫醒你继续呼吸
     reason: 挂超时等待（wait > 0）时写给到时候自己的理由，如"不来我就接着读日记"、"等草籽接话"；留空默认"等回复"
-    who: 在群聊窗口中指定只等特定人回复（填 QQ 号，如 123456；传 "any" 等群里任何人）。若不填：在有人跟你说话的轮次里自动默认等刚才跟你说话的人，避免路人插话吞掉等待；在你自己醒来的轮次（闹钟、订阅等无对话人轮次）不填则等待群里任何人回复
+    who: 在群聊窗口中指定只等特定人回复（填 QQ 号，如 123456；传 "any" 等群里任何人）。若不填：在有人跟你说话的轮次里自动默认等刚才跟你说话的人，避免路人插话吞掉等待；在你自己醒来的轮次（闹钟、订阅等无对话人轮次）不填则等待群里任何人回复。命令行窗口（term:名字）里填一段文字，等输出里出现它才算等到（同一批输出里出现才算）
 
     WHY: 同一次输出里刚 type_word 的字不发。那一批调用的参数是一起生成的，她还没看到
     打字之后到的消息；拒绝一次，下一次请求里新消息就在眼前（维护者 2026-10-23）。
@@ -397,8 +397,12 @@ def send(
                     reason = " ".join(parts[2:])
 
         target_who = who if who is not None else who_parsed
+        wait_text = None
         if target_who is not None and str(target_who).strip().lower() in ("any", "all", "*"):
             target_who = None
+        elif target_who is not None and windows.spec(window)["wait_text"]:
+            # 命令行窗口的限定词是要等的一段文字，不是人（设计文档 18.2）。
+            wait_text, target_who = str(target_who), None
         elif target_who is None and label.startswith("g"):
             # WHY: 2026-10-31 群聊中若未显式指定 who，判一下当前唤醒里该窗口是否有正在对话的人；
             # 只有有具体对话人时才默认绑定其 QQ，避免路人闲聊误吃 wait 规则；
@@ -466,10 +470,10 @@ def send(
         awaker.lift_wait(label)
     elif wait_mode == "wait":
         current_binding()["run"]["end"] = True
-        wait_reason = reason.strip() or f"等 {wait_target} 回复"
+        wait_reason = reason.strip() or (f"等 {wait_target} 出现「{wait_text}」" if wait_text else f"等 {wait_target} 回复")
         dur_label = f"{wait_seconds // 60}m" if wait_seconds >= 60 and wait_seconds % 60 == 0 else f"{wait_seconds}s"
         try:
-            plant_line = awaker.plant(f"wait {wait_target} {dur_label}", wait_reason)
+            plant_line = awaker.plant(f"wait {wait_target} {dur_label}", wait_reason, text=wait_text)
         except Exception as error:
             plant_line = f"（挂等待规则失败：{error}）"
         result_text = "、".join(str(item) for item in sent) if len(sent) > 1 else str(sent[0])
@@ -508,7 +512,7 @@ def wake_me(when: str, reason: str) -> str:
     平时群里只有 @、叫名字、戳一戳才叫醒你（说完话想听别人接不接，用 send 的 wait）。如果你对正在聊的话题感兴趣，可以用 follow 临时跟听每一条（被叫醒不代表每条都要接话，聊完或插不上话了用 off 关掉）；嫌吵就用 mute 暂时静音，期间消息照常记未读，你自己定的 on、wait 闹钟也照常响。
 
     @param
-    when: 触发写法——延时如 "10m"/"2h"；定点如 "2026-10-23 08:00"；周期如 "every 30m"/"daily 23:30"；等下一条消息如 "on g123" 或 "on g123:30001"；等某人后续（来了或超时都叫一次）如 "wait g123:30001 10m"；条件成立如 "when <Python表达式>"；临时聚焦或静音如 "follow g123 30m"、"mute g123 2h"（默认 30m，目标支持窗口、g群号:QQ号 或 group/private/bili 整类，传 "follow g123 off" 揭掉）
+    when: 触发写法——延时如 "10m"/"2h"；定点如 "2026-10-23 08:00"；周期如 "every 30m"/"daily 23:30"；等下一条消息如 "on g123" 或 "on g123:30001"；等某人后续（来了或超时都叫一次）如 "wait g123:30001 10m"；等命令行输出里出现某段文字如 "wait term:main「Listening on」 10m"；条件成立如 "when <Python表达式>"；临时聚焦或静音如 "follow g123 30m"、"mute g123 2h"（默认 30m，目标支持窗口、g群号:QQ号 或 group/private/bili 整类，传 "follow g123 off" 揭掉）
     reason: 写给到时候的自己看的唤醒理由，比如"等他把下半句说完"
 
     WHY: 维护者 2026-10-23：她要能自己决定什么时候再醒。最常用的是 wait——对方话说了一半、

@@ -4,11 +4,13 @@
 新会话（工作目录是 Bot 的运行目录）。会话的输出由 tmux 的 pipe-pane 追加到
 ``data/term/<名字>.log``，读线程每 0.25 秒看一眼，停顿 1 秒或攒满 10 秒，就把这一批去掉控制
 字符、作为一条记录 push 进窗口；作者写此刻前台的程序（bash、make、python3），她看记录头就
-知道命令还在不在跑。一条记录太长时留开头一点和结尾，往前翻用 ``term__look``。
+知道命令还在不在跑。她敲的那行的回显不进记录，它已经记成她自己的一条。一条记录太长时留开头
+一点和结尾，往前翻用 ``term__look``。
 
 叫醒：她发完以后，前台回到 shell，或者回到她敲字时的那个程序（python 的 ``>>>`` 这类），
 那一批叫醒她；shell 退出、会话没了也叫醒。没人问时的输出（服务器日志）只记成未读，要每批
-都叫醒就 follow。起服务器、进 REPL 这种前台换了程序的，用 send 的 wait 等第一批输出。
+都叫醒就 follow。起服务器、进 REPL 这种前台换了程序的，用 send 的 wait 等第一批输出，或者
+等输出里出现某段文字（send 的 who，或 ``wake_me("wait term:main「Listening」 10m", …)``）。
 
 WHY: 用 tmux 而不是 GNU screen（维护者 2026-11-02 问 screen 是不是过时了）。pipe-pane 当场
 写出，screen 的 ``-L`` 日志默认攒十秒才落盘；load-buffer/paste-buffer 按字节原样粘贴，
@@ -144,7 +146,7 @@ def _clean(text: str) -> str:
     return "\n".join(lines).strip("\n")
 
 
-def _cap(text: str, name: str) -> str:
+def _cap(text: str, name: str, keep: str | None = None) -> str:
     if len(text) <= RECORD_MAX:
         return text
     head = text[:HEAD]
@@ -152,8 +154,16 @@ def _cap(text: str, name: str) -> str:
     tail = text[-(RECORD_MAX - HEAD):]
     tail = tail[tail.find("\n") + 1:] if "\n" in tail else tail
     dropped = len(text) - len(head) - len(tail)
-    return (f"{head}\n……（中间省略 {dropped} 字；往前翻用 term__look(\"{name}\", lines=200)，"
-            f"最近的原始输出在 data/term/{name}.log）……\n{tail}")
+    back = f"往前翻用 term__look(\"{name}\", lines=200)，最近的原始输出在 data/term/{name}.log"
+    middle = f"……（中间省略 {dropped} 字；{back}）……"
+    # WHY: wait 是拿记录正文找要等的文字；它若落在省略的中间，那一行要留下，否则永远等不到。
+    if keep and keep in text and keep not in head and keep not in tail:
+        at = text.find(keep)
+        start = max(text.rfind("\n", 0, at) + 1, at - 200)
+        end = text.find("\n", at + len(keep))
+        end = min(len(text) if end < 0 else end, at + len(keep) + 200)
+        middle = f"……（中间省略 {dropped} 字，你等的那段在这里）……\n{text[start:end]}\n……（{back}）……"
+    return f"{head}\n{middle}\n{tail}"
 
 
 def _fresh(offset: int) -> dict:
@@ -197,23 +207,34 @@ def _read_new(name: str, live: dict) -> None:
 def _flush(name: str, live: dict, fg: str, *, quiet: bool = False, ending: str = "", reason: str = "") -> None:
     """Push what has piled up as one record, waking her when it answers her input."""
     from mods import chat
+    from mods.chat import awaker
 
     text = _clean(live["text"])
     live.update(text="", first=None)
     state = _state().setdefault(name, {})
     state["offset"] = live["offset"]
+    pending = state.get("pending")
+    if pending and pending.get("echo") and text:
+        # WHY: 回显已经记成她自己的一条；留着它，wait 要等的文字若也写在命令里（make && echo 完成），
+        # 自己的回显就先把等待认领了。只在发完后的第一批里找最后一行，多行输入的前几行回显照旧留着。
+        echo = pending.pop("echo")
+        lines = text.split("\n")
+        for index, line in enumerate(lines[:8]):
+            if line.rstrip().endswith(echo):
+                text = "\n".join(lines[index + 1:]).strip("\n")
+                break
     if ending:
         text = (text + "\n" if text else "") + ending
     if not text.strip():
         return
-    pending = state.get("pending")
     wake = reason
     if reason:
         state["pending"] = None
     elif not quiet and pending and fg and (fg in SHELLS or fg == pending.get("fg") or pending.get("fg") == "*"):
         wake = f"term:{name} 的命令跑完了" if fg in SHELLS else f"term:{name} 的 {fg} 回话了"
         state["pending"] = None
-    chat.push((KIND, name), author=fg or "终端", text=_cap(text, name), wake=wake)
+    body = _cap(text, name, awaker.waiting_text((KIND, name)))
+    chat.push((KIND, name), author=fg or "终端", text=body, wake=wake)
 
 
 def _bury(name: str, pane: dict | None) -> None:
@@ -319,7 +340,8 @@ def send(window, text: str) -> str:
         _read_new(name, live)
         if live["text"]:
             _flush(name, live, fg, quiet=True)
-        _state().setdefault(name, {})["pending"] = {"fg": fg, "at": time.time()}
+        _state().setdefault(name, {})["pending"] = {"fg": fg, "at": time.time(),
+                                                    "echo": body.split("\n")[-1].strip()}
         record_id = uuid4().hex[:8]
         with context.window_lock((KIND, name)):
             chatlog.append_record(KIND, name, "我", body, time.time(), record_id)
@@ -413,7 +435,7 @@ def on_load(_ctx) -> None:
         raise RuntimeError("命令行窗口需要 chat 模块加载成功")
     # WHY: 攒批在这里做而不是交给 attention 的防抖：一次 pty 读一条记录会把窗口刷爆，一批就是
     # 一条记录，到了才登记，所以种类上不再声明 debounce。整段粘贴，不按空行拆。
-    chat.kind(KIND, send, whole=True, follow=True)
+    chat.kind(KIND, send, whole=True, follow=True, wait_text=True)
     try:
         _resume()
     except Exception:
