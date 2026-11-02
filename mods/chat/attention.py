@@ -458,15 +458,24 @@ def rescan() -> None:
             continue
         # Close the write-before-registration crash gap. Older offline calls are
         # already explicit pending exceptions supplied by backfill/migration.
-        for row in screen.records(window, 1_000_000, since=state.get("through")):
-            identity_ = row["id"]
-            if identity_ in state["pending"] or not screen.is_unread(state, identity_, row["time"]):
-                continue
-            event = screen.event_for_record(window, row)
-            own = event.get("post_type") == "message_sent"
-            matched = bool(chat.activation_signal(event)) if window[0] in windows.QQ and not own else False
-            wanted, _ = awaker.triggered(window, event, history.author(event), matched) if not own else (False, None)
-            screen.register(window, event, kind="恢复的召唤" if wanted else "")
+        changed = False
+        try:
+            for row in screen.records(window, 1_000_000, since=state.get("through")):
+                identity_ = row["id"]
+                if identity_ in state["pending"] or not screen.is_unread(state, identity_, row["time"]):
+                    continue
+                event = screen.event_for_record(window, row)
+                own = event.get("post_type") == "message_sent"
+                matched = bool(chat.activation_signal(event)) if window[0] in windows.QQ and not own else False
+                wanted, _ = awaker.triggered(window, event, history.author(event), matched) if not own else (False, None)
+                changed = True
+                screen.register(window, event, kind="恢复的召唤" if wanted else "", persist=False)
+        finally:
+            # WHY: 历史本已落盘，崩溃可以重建；逐条 register 会对每条旧消息
+            # 重写整个 storage 并唤醒文件监听（2026-11-02 实测 CPU 热点）。
+            # 每窗口一次，异常也保存已登记部分，且必须在下面通知行动之前完成。
+            if changed:
+                screen.save_read()
         for identity_, item in screen.unread(window).items():
             if not item.get("kind"):
                 continue

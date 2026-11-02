@@ -88,8 +88,8 @@ def is_unread(state: dict, identity_: str, stamp) -> bool:
             (stamp > through or stamp == through and identity_ not in state.get("at", [])))
 
 
-def register(window: tuple, event: dict, *, recovered=False, kind="", reason="") -> str:
-    """Persist an arrival before attention queues it; ordinary recovery is explicitly excluded."""
+def register(window: tuple, event: dict, *, recovered=False, kind="", reason="", persist=True) -> str:
+    """Register before queueing; history batches use persist=False then save_read()."""
     identity_ = record_id(event)
     with _lock:
         state = _state(window)
@@ -105,8 +105,15 @@ def register(window: tuple, event: dict, *, recovered=False, kind="", reason="")
                 "reason": reason, "recovered": bool(recovered), "unread": True})
             if kind:
                 state["pending"][identity_].update(kind=kind, reason=reason)
-        storage.save()
+        if persist:
+            storage.save()
     return identity_
+
+
+def save_read() -> None:
+    """Persist a restored batch before its summons are queued."""
+    with _lock:
+        storage.save()
 
 
 def unread(window: tuple) -> dict:
