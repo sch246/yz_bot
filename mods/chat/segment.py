@@ -32,12 +32,14 @@ steps:[{id:"n.m",wake:int,sub:int,act_id,items:[refs],tools:[name],complete:bool
 folds:[fold rows]}. Folded rows retain screens/shown but hide notes/tool state;
 re-showing those is the caller's ordinary source comparison, not another mirror.
 
-Each run owns one view (stateless core, 2026-11-01): the caller passes
-persist=False and run() freezes it with archive(view, kind) at the end.
+Each run owns its current view (stateless core, 2026-11-01). Explicit reframe
+(2026-11-02) freezes the old segment and starts another over selected refs;
+run() freezes the final segment with archive(view, kind) when the call ends.
 view.json/load/save remain only for migrated installs and old tooling.
 
 WHY: 2026-11-01 维护者推翻 D20（不交接就一直是同一段上下文）：每次运行只为一个目的，
-视图随运行冻结，不再折叠、清除或交接。迁移来的旧视图里仍有 fold/drop 行，渲染、derive
+视图随运行冻结，不再折叠、清除或交接；2026-11-02 的显式 reframe 另开材料段，保留这条不可变边界。
+迁移来的旧视图里仍有 fold/drop 行，渲染、derive
 和 read_context 照旧能读，所以这里保留读取它们的代码，只删掉了创建它们的接口。
 """
 
@@ -226,8 +228,10 @@ def raw_messages(view, *, expand_folds=False):
     return [message for row in _entries(view, deep=expand_folds) for message in row["messages"]]
 
 
-def render(view, *, reasoning="keep", mark_borrowed=False):
+def render(view, *, reasoning="keep", mark_borrowed=False, with_sources=False):
     """Provider messages for this view; ``mark_borrowed`` flags messages from other contexts.
+
+    ``with_sources`` also returns one originating journal id per projected message.
 
     WHY: 2026-10-31 维护者定图片以唤醒为界变旧：这次的图一直可见，以前的只留地址和已有描述。
     无状态中心里"以前的"就是借来的行——构造带进来的旧材料、fork 继承的引用；这次运行自己
@@ -247,10 +251,12 @@ def render(view, *, reasoning="keep", mark_borrowed=False):
     for row in rows:
         if row.get("act_id"):
             by_act.setdefault(row["act_id"], []).append(row)
-    result, waiting, current = [], [], []
+    result, waiting, current, origins = [], [], [], []
+    current_ref = None
 
     def finish():
         result.extend(journal.missing_result(call_id, current) for call_id in waiting)
+        origins.extend(current_ref for _ in waiting)
         waiting.clear()
 
     for row in rows:
@@ -273,6 +279,7 @@ def render(view, *, reasoning="keep", mark_borrowed=False):
             if message.get("role") != "tool":
                 finish()
             if message.get("role") == "assistant":
+                current_ref = row["id"]
                 current = by_act.get(row["id"], [])
                 waiting = [call["id"] for call in message.get("tool_calls") or []]
                 own_current_chain = row["ctx"] == view["ctx"] and (
@@ -313,8 +320,146 @@ def render(view, *, reasoning="keep", mark_borrowed=False):
             if mark_borrowed and row["ctx"] != view["ctx"]:
                 message["_old_image"] = True
             result.append(message)
+            origins.append(row["id"])
     finish()
-    return result
+    return (result, origins) if with_sources else result
+
+
+def request_outline(view, messages, schemas, *, head_count, source_refs, attachment_count, model, goal):
+    """Metadata for the actual outgoing projection, before provider conversion.
+
+    No request body is retained. Message origins follow render's omissions and
+    synthetic missing receipts, rather than guessing from the final view.
+    """
+    def size(values):
+        text = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+        return {"chars": len(text), "estimated_text_tokens": _chat_root.count_tokens(text)}
+
+    body_end = head_count + len(source_refs)
+    attachment_end = body_end + attachment_count
+    parts = {"head": size(messages[:head_count]), "view": size(messages[head_count:body_end]),
+             "attachments": size(messages[body_end:attachment_end]), "hints": size(messages[attachment_end:]),
+             "tools": size(schemas)}
+    for key, count in (("head", head_count), ("view", len(source_refs)),
+                       ("attachments", attachment_count), ("hints", len(messages) - attachment_end),
+                       ("tools", len(schemas))):
+        parts[key]["count"] = count
+    parts["tools"]["names"] = [schema["function"]["name"] for schema in schemas]
+    grouped = {}
+    for item_id, message in zip(source_refs, messages[head_count:body_end]):
+        grouped.setdefault(item_id, []).append(message)
+    refs = []
+    for item_id, projected in grouped.items():
+        row = journal.get(item_id)
+        source = {"ref": item_id, "ctx": row["ctx"], "kind": row["kind"],
+                  **size(projected)}
+        for key in ("scope", "version", "name", "window", "before", "count", "note_sources"):
+            if key in row:
+                source[key] = copy.deepcopy(row[key])
+        refs.append(source)
+    return {"ctx": view["ctx"], "goal": goal, "focus": view["stats"].get("focus", goal), "model": model,
+            "scope": "before_provider_conversion", "size_basis": "compact_json_characters",
+            "estimate_basis": "text_heuristic_including_image_references_not_image_tokens",
+            "messages": size(messages), "parts": parts, "refs": refs,
+            "usage": None}
+
+
+def record_request(view, outline, *, persist=False):
+    """Freeze first and replace latest; usage is attached to their request number."""
+    with _lock:
+        requests = view["stats"].setdefault("requests", {"count": 0})
+        requests["count"] += 1
+        fields = ("prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens")
+        totals = requests.setdefault("usage_totals", {"reported_requests": 0,
+                                                     "known": dict.fromkeys(fields, 0),
+                                                     "coverage": dict.fromkeys(fields, 0),
+                                                     "cached_all_reported": False, "last_request": 0})
+        totals["cached_all_reported"] = False
+        outline = copy.deepcopy(outline)
+        outline.update(number=requests["count"], dispatched_at=time.time())
+        requests.setdefault("first", outline)
+        requests["latest"] = outline
+        if persist:
+            save(view)
+        return outline["number"]
+
+
+def record_request_usage(view, number, info, *, persist=False):
+    """Keep omitted provider fields null, including an unreported cache count."""
+    def value(source, key):
+        raw = source.get(key) if isinstance(source, dict) else getattr(source, key, None)
+        return max(0, int(raw)) if raw is not None else None
+
+    cached = value(info, "prompt_cache_hit_tokens")
+    if cached is None:
+        details = info.get("prompt_tokens_details") if isinstance(info, dict) else getattr(info, "prompt_tokens_details", None)
+        cached = value(details, "cached_tokens")
+    reported = {key: value(info, key) for key in ("prompt_tokens", "completion_tokens", "total_tokens")}
+    reported["cached_tokens"] = cached
+    with _lock:
+        requests = view["stats"]["requests"]
+        totals = requests["usage_totals"]
+        # WHY: each run has one sequential request stream. A repeated usage
+        # callback must not charge the same response twice; no per-request body
+        # or growing usage ledger is needed to remember this frontier.
+        if number <= totals["last_request"]:
+            return
+        if number != requests["latest"]["number"]:
+            raise ValueError("usage must belong to the current dispatched request")
+        totals["last_request"] = number
+        totals["reported_requests"] += 1
+        for key, count in reported.items():
+            if count is not None:
+                totals["known"][key] += count
+                totals["coverage"][key] += 1
+        totals["cached_all_reported"] = totals["coverage"]["cached_tokens"] == requests["count"]
+        for key in ("first", "latest"):
+            if requests[key]["number"] == number:
+                requests[key]["usage"] = copy.deepcopy(reported)
+        if persist:
+            save(view)
+
+
+def combine_usage(*records):
+    """Sum known usage and coverage across segments, without inventing missing fields."""
+    fields = ("prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens")
+    total = {"count": 0, "usage_totals": {"reported_requests": 0, "known": dict.fromkeys(fields, 0),
+                                        "coverage": dict.fromkeys(fields, 0), "cached_all_reported": False}}
+    for record in records:
+        total["count"] += record.get("count", 0)
+        usage = record.get("usage_totals", {})
+        total["usage_totals"]["reported_requests"] += usage.get("reported_requests", 0)
+        for group in ("known", "coverage"):
+            for key in fields:
+                total["usage_totals"][group][key] += usage.get(group, {}).get(key, 0)
+    total["usage_totals"]["cached_all_reported"] = bool(total["count"] and
+        total["usage_totals"]["coverage"]["cached_tokens"] == total["count"])
+    return total
+
+
+def link_reframe(previous, following, *, items, goal, kind, focus, note, refs, tools, history, origin):
+    """Record the accepted transition after its tool batch has durably finished.
+
+    Selected refs keep their frozen versions; the new note is stored once, on
+    the transition row, then referenced from the following view.
+    """
+    with _lock:
+        transition = append(previous, "reframe", persist=False, next_ctx=following["ctx"],
+                            focus=focus, refs=refs, selected=list(items), tools=tools, history=history,
+                            messages=[{"role": "system", "content": "【换段时留下的接续说明】\n" + note}] if note else [])
+        previous["stats"]["next_ctx"] = following["ctx"]
+        following["stats"].update(previous_ctx=previous["ctx"], origin=copy.deepcopy(origin), focus=focus,
+                                  selection={"refs": refs, "items": list(items), "tools": tools, "history": history},
+                                  reframe_ref=transition)
+        extend(following, items, persist=False)
+        if note:
+            extend(following, [transition], persist=False)
+        append(following, "goal", persist=False, goal=goal, run_kind=kind, origin=origin)
+        append(following, "focus", persist=False,
+               messages=[{"role": "system", "content": f"【当前关注】{focus}\n"
+                          f"【同一次调用】原目的不变；入口 ctx {origin['ctx']}，目的条目 {origin['goal_ref']}；"
+                          f"前段 {previous['ctx']}，换段记录 {transition}。需要旧轨迹时按引用召回，不重做已发生的动作。"}])
+        return transition
 
 
 def own_tool_state(view):

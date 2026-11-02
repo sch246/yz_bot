@@ -56,11 +56,11 @@ generator 与 `.py input()` 共用 `mods.context` 的 continuation 登记。`^C`
 
 主聊天只有一个中心 agent。群聊、私聊仍各自保留原始聊天记录；群里任何人的消息都可成为同一主体的经历，不为每个窗口创建独立的主模型。
 
-2026-11-01 起没有一段一直往后接的上下文（设计与裁定见[一次一个目的](working/proposals/one-purpose-stateless-core.md)，当前实现见[LLM 文档](llm.md)）。每次调用只为一个目的：唤醒时先跑一次**构造**，为接下来的**行动**准备上下文；行动做完，这次的上下文原样封存到 `data/chat/views/<ctx>.json`，下次醒来重新准备。一段经历结束后有一次**沉淀**，把值得留下的写进笔记。
+2026-11-01 起没有一段一直往后接的上下文（设计与裁定见[一次一个目的](working/proposals/one-purpose-stateless-core.md)，当前实现见[LLM 文档](llm.md)）。每次调用只为一个目的：唤醒时先跑一次**构造**，为接下来的**行动**准备上下文；构造、行动和分身可以在同一次调用中重新选材料、换 ctx 继续，每段原样封存到 `data/chat/views/<ctx>.json`；行动做完，下次醒来重新准备。一段经历结束后有一次**沉淀**，把值得留下的写进笔记。
 
 1. **构造**（每次唤醒、行动之前）：她自己的一次短运行，原来的旁观助手并在这里。
    - 看到：固定的构造职责与材料接口，加笔记 `policy/construct` 的补充 checklist（不存在时用内置清单）；todo 全文；黑板 `recent` 的全文，其中 `@引用` 行只显示展开前的一句描述；几份折叠索引：笔记目录（名字、首行、字符数和总行数）、最近几小时她在各窗口做过的事（带日志编号）、最近几次运行的目的、其它窗口的未读与 @；等着她的事（每件写明谁、为什么、等了多久）和叫醒她的窗口的新消息（前面带 20 条接话）。
-   - 能做：用 `search`、`read_note`、`read_log`、`read_actions` 先确认，用 `fork` 分几路找线索；用 `construct__assemble(focus, refs, note, windows, tools, history)` 提交一份规格。不能发言、不能写笔记。
+   - 能做：用 `search`、`read_note`、`read_log`、`read_actions` 先确认，用 `fork` 分几路找线索；按需加载 `memory_system` 看当前上下文概览，用 `reframe` 选材料继续；用 `construct__assemble(focus, refs, note, windows, tools, history)` 提交一份规格。不能发言、不能写笔记，它开出的分身和再次委派的分身也继承这些限制。
    - 规格：关注的情境或问题 `focus`；材料 `refs`（完整笔记、原文件行段如 `topic:线索@L12-28`、日志编号、运行 ctx、`log:窗口@时刻*条数`、`policy:名字`）；checklist 提供的观察、依据与洞察 `note`；负责的窗口 `windows`。坏引用当场退回。`tools` 选行动开场的工具与 Skill（说明和函数一起加载，meta 始终存在），`history` 选新消息前的接话条数，默认 10、可为 0。构造提供帮助，具体行动与表达由行动运行判断；focus 不作为行动命令。
    - checklist 留意陌生指代、矛盾、情绪和意外，发现了再提醒；引号不再触发按子串遍查笔记，需要确认时显式 search/read_note。
    - 每一步只做一件事（2026-11-01 起，见[分层串行](working/proposals/one-purpose-stateless-core.md#18-分层串行与快慢路径2026-11-01-上线后的讨论)）：她从等着的事里选现在最该做的那一件，规格至少负责一个等着的窗口，交完构造就结束。没选的留在队里，这件做完立刻再起一次构造重新选，期间新到的一起排。同一个窗口里同时发生的几件事算一件。闹钟、循环、命令这类没有消息的召唤，只有负责它窗口或 `me` 的行动才算处理掉。
@@ -89,6 +89,10 @@ generator 与 `.py input()` 共用 `mods.context` 的 continuation 登记。`^C`
    - 做什么：把对人和群的认识与经历、当天日记、黑板（含下次可能用得上的 `@引用`）、答应了还没做的事写好；情绪、玩笑和关系的变化也算。global 留给夜里反思。已经在了就不重写，重跑是安全的。附加说明在 `data/notes/policy/settle.md`（原 `handoff.md`，第一次读到时改名）。
    - 之后：正常结束才推进这个窗口的沉淀位置（storage `agent.settled`），出错隔 10 分钟再试；沉淀的运行进 `data/notes/years.md` 年鉴索引。
 
+**换材料继续**：构造、行动和分身可主动调用 `reframe(focus, refs, note, tools, history)`。目的没变、只是所需材料变了，也能换段；情绪、关系和表达来路都可以是选入的材料。旧轨迹保留 ctx 入口，下一段只带选定引用、接续说明和必要调用信息。没有按长度或次数自动换段的规则，构造开场的 todo、目录、时间线等默认材料保持原样。
+
+主行动换段仍在处理同一次唤醒，负责窗口、取消和已用时限延续。同窗口插话继续进入画面，每次输出只确认该次请求实际展示的消息；每段重新读取输入框草稿。`history` 只改下一段的接话范围。`reframe` 必须单独一批调用，混入其它工具时整批不执行，也不确认这轮消息；合法换段不提前触发沉淀或 loop。构造多次换段最后仍只交一份规格，分身则只交回最后一条无工具调用的最终答复与轨迹 ctx；取消、失败或没有最终答复会明确标出。
+
 **什么时候醒**：除了被 at、叫名字、戳一戳和私聊里的每条消息，她还会被笔记 awaker 里的规则叫醒。长期规则写在 awaker 文件中；wait 通过工具设置到内存。可用写法：
 - `every 10m <理由>`：间隔规则，最短 1 分钟；
 - `daily 23:30 <理由>`：每天定点；
@@ -111,7 +115,7 @@ generator 与 `.py input()` 共用 `mods.context` 的 continuation 登记。`^C`
 
 被叫醒了看一眼没什么要做的，她什么都不做就结束这一轮。2026-11-01 以前她用 `dismiss` 把这样的唤醒从同一段上下文里清掉；现在每次运行都是独立的，不会叠在一起，`dismiss` 随之删除。叫醒她的要是她挂的 `wait`，那条规则在叫醒时就划掉了；还想接着等，用 `wake_me("wait g123:QQ号 10m", 理由)` 重新挂上。
 
-**运行与封存**：经历原文只追加到 `data/chat/journal/`；每次运行（构造、行动、沉淀、反思、分身、汇总）有自己的编号视图，结束时冻结到 `data/chat/views/<ctx>.json`，能用 `read_context` 原样读。不再有整段压力、折叠或交接；`#reasoning drop` 只影响引用来的旧行动里的思考。
+**运行与封存**：经历原文只追加到 `data/chat/journal/`；每段上下文有自己的编号视图，结束时冻结到 `data/chat/views/<ctx>.json`，能用 `read_context` 原样读。`read_context("current", detail="outline", request="first")` 查看当前工具所属运行本段首次实际请求的来源、大小和接口 usage，`latest` 看最近请求；不会误取父行动。实际 token 与字符估算分开，未报告的缓存命中保持未知。不再有整段压力、折叠或交接；`#reasoning drop` 只影响引用来的旧行动里的思考。
 
 **循环与等待**：她调用 `loop("在做什么")` 开启连续循环，每轮结束后通常隔两秒再叫醒，没动作时退避、最长半小时。`wait(seconds, reason)` 在循环内推迟下一轮，循环外单独排一次唤醒，理由保留。`loop(stop=True)`、维护者取消或夜间反思停止循环。loop/wait 重启丢弃，已发生的理由仍在 me 日志；`loop_note_history` 从 journal 查备注。
 
@@ -129,7 +133,7 @@ generator 与 `.py input()` 共用 `mods.context` 的 continuation 登记。`^C`
 3. 期间来的召唤在结束后接着处理。
 
 工具模块 `memory_system` 说明记忆如何流转与夜间如何打理自己，提供读归档上下文、看笔记历史版本、改策略、记评估的工具；它开头"你的记忆怎么流转"那一节每次都在系统提示里。
-- **策略层**：构造说明（`data/notes/policy/construct.md`，每次构造都读；她在反思里改，改动被下一次构造实际使用）、沉淀的附加说明（`data/notes/policy/settle.md`）、她的做法笔记 `global` 和 `self`。每次改动必须写原因和预期，记进 `data/notes/policy/changes.md`；评估一次改动时可以给出改动时刻和证据的日志编号，证据早于改动的会在账本里直接标出。旧的 `policy/tidy.py` 与 `policy/opening` 不再读取。构造说明改得好不好，可以用 `chat.construct.replay(构造的 ctx, 新说明)` 拿过去某次唤醒重跑构造比较（只看规格，不行动）。
+- **策略层**：构造说明（`data/notes/policy/construct.md`，每次构造都读；她在反思里改，改动被下一次构造实际使用）、沉淀的附加说明（`data/notes/policy/settle.md`）、她的做法笔记 `global` 和 `self`。每次改动必须写原因和预期，记进 `data/notes/policy/changes.md`；评估一次改动时可以给出改动时刻和证据的日志编号，证据早于改动的会在账本里直接标出。旧的 `policy/tidy.py` 与 `policy/opening` 不再读取。构造说明改得好不好，可以用 `chat.construct.replay(构造的 ctx, 新说明)` 拿过去某次唤醒重跑构造比较（只看规格，不行动）；传入换段后的末段 ctx 也会回到这次构造的原始输入。
 - **代码与提案**：她有 op 权限时可直接修改代码与提示词文件（改完记入 `changes` 并重启）；没权限或拿不准的改动写进 `data/notes/policy/proposals.md` 交给维护者，每条写证据、原因、改动方案、代价和验证方法。
 
 **设置**：主模型、提示词、工具激活与这些预算只从全局 agent 设置读取；`#model` 等命令查看全局状态，修改命令由管理员操作。

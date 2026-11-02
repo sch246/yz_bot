@@ -359,8 +359,13 @@ def event_for_record(window: tuple, item: dict) -> dict:
         bot = identity.bot_id()
     except RuntimeError:
         bot = None
-    event = chatlog.parse_log(item["text"], kind=window[0], target=window[1], day=item["day"],
-                              bot_id=bot)[0]
+    parsed = chatlog.parse_log(item["text"], kind=window[0], target=window[1], day=item["day"],
+                               bot_id=bot)
+    # WHY: 日档分割保留空行和孤立缩进，而 parse_log 会跳过它们；画面仍需原记录身份。
+    event = parsed[0] if parsed else {
+        "_source": chatlog.rootfile, "_kind": "unparsed", "text": item["text"],
+        "time": item["time"], "_derived": ["time"] if item["time"] is not None else [],
+        "_missing": [] if item["time"] is not None else ["time"]}
     event["record_id"] = item["id"]
     event["_record_text"] = item["text"]
     return event

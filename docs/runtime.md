@@ -72,7 +72,7 @@ uv run --frozen python run.py --smoke
 |---|---|---|---|
 | `chatlog/` | QQ 上发生了什么 | 没进模型画面的消息、通知、发送回声 | 一直留 |
 | `data/chat/journal/YYYYMMDD.jsonl` | 她看过、想过和做过什么 | 稳定编号、原样模型消息、来源、输出与逐个工具结果；`read_actions/read_context` 读取 | 一直留，只追加；中断尾部保留证据后恢复 |
-| `data/chat/views/<ctx>.json` | 每次运行（构造、行动、沉淀、反思、分身）眼前放了什么 | 有序条目引用与运行统计（行动和沉淀记 `stats.windows`）；迁移来的旧视图里有 fold/drop 关系。旧的 `view.json`、`view.bak.json` 不再写；迁移写出的那份第一次启动时封存进这里 | 一直留，每次运行结束冻结 |
+| `data/chat/views/<ctx>.json` | 每段上下文眼前放了什么；同次构造、行动或分身可串起多个 ctx | 有序条目引用与运行统计（行动和沉淀记 `stats.windows`）；迁移来的旧视图里有 fold/drop 关系。旧的 `view.json`、`view.bak.json` 不再写；迁移写出的那份第一次启动时封存进这里 | 一直留，每段结束冻结 |
 | storage `agent.read` | 哪些窗口记录已被模型确认读过 | 连续位置、同秒身份、待确认与排除例外 | 持久保存；计数和展示边界为派生 |
 | storage `agent.settled`、`agent.unsettled` | 各窗口沉淀到了哪里、哪些窗口还有没沉淀的行动 | 沉淀位置（时间）与最后一次行动的时间 | 持久保存；沉淀计时器只在内存，重启后从这里重排 |
 | `log/llm.log`（`yz.llm.request`） | 每次请求发了什么 | 每次请求末尾的临时提示（待办、未读数、时间）；同一次运行里已经记过的前缀不再重复打印，只写"前 N 条已经记过" | 7 天 |

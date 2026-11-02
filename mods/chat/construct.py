@@ -30,7 +30,10 @@ GOAL = "为接下来的自己提供信息、提醒和洞察；用 construct__ass
 DEFAULT_ACT_GOAL = "看看这次唤醒和新到的消息，自主决定做什么；不必为了被叫醒而说话。"
 # WHY: 构造运行原本是 observer（没有任何工具）；现在只多给召回和提交规格。发言、写笔记、
 # 跑代码都不在其中：它为别人准备上下文，自己不行动。这是新角色的白名单，不是给已有角色加禁令。
-TOOLS = frozenset({"construct__assemble", "search", "read_note", "read_log", "read_actions", "agents__fork"})
+# WHY: reframe 可显式清空可选模块，load_tools 让她恢复 assemble/概览；加载仍经过
+# 这份只读白名单，不能借此或通过 fork 取得写入与发言能力。
+TOOLS = frozenset({"construct__assemble", "search", "read_note", "read_log", "read_actions", "agents__fork",
+                   "memory_system__read_context", "reframe", "load_tools"})
 # WHY: the construct run must understand the new message in its thread before choosing
 # material; twenty earlier lines is enough to see who is answering whom.
 LEAD_IN = 20
@@ -302,8 +305,10 @@ def build(wake: dict, model: str | None = None) -> list[dict]:
         chat.run(material(wake), GOAL, tools=("meta", "construct", "agents"), functions=TOOLS,
                  model=str(config.get("model") or "") or model, kind="construct", state=state,
                  stop=lambda: wake["cancelled"], timeout=float(config.get("timeout", 45)),
-                 effort=None if effort == "default" else effort, prepare=prepare)
+                 effort=None if effort == "default" else effort, prepare=prepare, allow_reframe=True)
     except TimeoutError:
+        if wake["cancelled"]:
+            return []
         _roles._stream.warning("构造运行超时，这次按黑板和消息直接行动")
         return [fallback(claimed, "构造运行超时")] if state["specs"] == [] else state["specs"][:1]
     except Exception as error:
@@ -399,8 +404,16 @@ def replay(name: str, policy_text: str | None = None, model: str | None = None) 
     view = _segment.read_archived(str(name).strip())
     if view is None or view["stats"].get("kind") != "construct":
         raise ValueError(f"{name} 不是一次封存的构造运行")
+    opening = view
+    origin = view["stats"].get("origin", {}).get("ctx")
+    if origin and origin != view["ctx"]:
+        # WHY: assemble returns the current ctx after reframe, but replay needs
+        # the same wake's original input, not just the last segment's selection.
+        opening = _segment.read_archived(origin)
+        if opening is None or opening["stats"].get("kind") != "construct":
+            raise ValueError(f"{name} 的构造开场 {origin} 不可读")
     messages = []
-    for item in view["items"]:
+    for item in opening["items"]:
         row = journal.get(item)
         if row["kind"] == "goal":
             break
@@ -424,7 +437,8 @@ def replay(name: str, policy_text: str | None = None, model: str | None = None) 
     state = {"associated_windows": windows, "specs": [], "cancelled": False}
     ctx, _text = chat.run(messages, GOAL, tools=("meta", "construct"), functions=TOOLS - {"agents__fork"},
                           model=model or str(config.get("model") or "") or None, kind="construct", state=state,
-                          timeout=float(config.get("timeout", 45)), effort=None if effort == "default" else effort)
+                          timeout=float(config.get("timeout", 45)), effort=None if effort == "default" else effort,
+                          allow_reframe=True)
     before = _submitted(view) or ["（原来没有提交规格）"]
     after = [_spec_text(spec["focus"], spec["refs"], spec["note"], " ".join(_windows.label(w) for w in spec["windows"]),
                        " ".join(spec["tools"]), spec["history"])

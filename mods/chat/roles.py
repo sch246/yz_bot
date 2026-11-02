@@ -13,6 +13,7 @@ saw while living it, which answers why the librarian had been removed.
 from __future__ import annotations
 
 import time
+import json
 
 from mods import chatlog, history, log
 
@@ -99,12 +100,17 @@ def read_actions(ids: list[str] | None = None, count: int = 10, keyword: str = "
     return page
 
 
-def read_context(name: str = "", start: int = 0, match: str = "", around: int = 300) -> str:
-    """Read the running main view, a frozen ctx, fold or original journal id; paginate full text.
+def read_context(name: str = "", start: int = 0, match: str = "", around: int = 300,
+                 detail: str = "body", request: str = "latest") -> str:
+    """Read the owning run, a frozen ctx, fold or journal id; paginate full text.
 
     Empty name lists the latest thirty archived views. ``match`` searches the
     full original text, before compact display or page slicing.
     """
+    if detail not in {"body", "outline"}:
+        raise ValueError("detail 写 body 或 outline")
+    if request not in {"first", "latest"}:
+        raise ValueError("request 写 first 或 latest")
     target = name.strip()
     if not target:
         found = _segment.archived(last=30)
@@ -114,12 +120,16 @@ def read_context(name: str = "", start: int = 0, match: str = "", around: int = 
                          f"{_screen.clock(item['ended'])[5:16]}  {item['messages']} 条消息  "
                          f"窗口 {'、'.join(item['windows']) or '无'}  · {item['reason'][:40]}" for item in found)
     if target == "current":
-        running = _root().current_wake()
+        from .run import current_run
+
+        running = current_run()
         data = running.get("view") if running else None
     else:
         data = _segment.read_archived(target)
     if data is None:
         return f"（没有叫 {name} 的段或日志条目；不给 name 可以列出最近的段）"
+    if detail == "outline":
+        return _context_outline(data, request)
     text = f"# {target}\n" + _segment.readable(data, compact=not bool(match.strip()), expand_folds=bool(match.strip()))
     start = max(0, int(start))
     if match.strip():
@@ -146,6 +156,22 @@ def read_context(name: str = "", start: int = 0, match: str = "", around: int = 
     if start + _READ_CHARS < len(text):
         page += f"\n（共 {len(text)} 字，还有 {len(text) - start - _READ_CHARS} 字；加 start={start + _READ_CHARS} 接着读）"
     return page
+
+
+def _context_outline(data, request):
+    recorded = data["stats"].get("requests", {})
+    outline = recorded.get(request)
+    if outline is None:
+        return f"# {data['ctx']} · {request}\n（未记录实际请求概览；旧归档不从最终统计倒推，请求尚未发出时也没有记录）"
+    return (f"# {data['ctx']} · {request}（本段共派发 {recorded['count']} 次请求）\n"
+            "以下是供应商转换前的请求构成；chars 是紧凑 JSON 字符数，estimated_text_tokens 只是文本启发式估算，"
+            "不包含真实图片 token 或供应商协议开销。head/view/attachments/hints 是消息分区，tools 单列。\n"
+            "usage 是该次请求的供应商实际报告；null 表示未报告，cached_tokens 为 0 才表示报告了零命中。"
+            "segment_usage 的 known 是本段所有请求的已知用量小计，coverage 是各字段报告次数，"
+            "reported_requests 是有 usage 的请求数；覆盖不足时小计不能当作完整用量。"
+            "call_usage 若有记录，是到该段结束为止同一次调用的累计计数与用量，覆盖规则相同。"
+            "这里只显示元数据，正文用 detail=body 读取。\n"
+            + json.dumps({**outline, "segment_usage": recorded.get("usage_totals"), "call_usage": data["stats"].get("call_usage")}, ensure_ascii=False, indent=2))
 
 
 def _matching(lines, needle: str, most: int) -> tuple[int, list[str]]:

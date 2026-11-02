@@ -76,18 +76,21 @@
 import time
 
 
-def read_context(name: str = "", start: int = 0, match: str = "", around: int = 300) -> str:
-    """翻看封存的运行（构造、行动、沉淀、反思）或正在进行的这次行动：不给 name 列出最近的；给 name 读那一次的原貌，一次最多 8000 字。
+def read_context(name: str = "", start: int = 0, match: str = "", around: int = 300,
+                 detail: str = "body", request: str = "latest") -> str:
+    """翻看封存或当前运行的正文，或实际请求的构成与用量概览。正文一次最多 8000 字。
 
     @param
-    name: 运行的 ctx 名、旧段名、折叠名或日志编号，或 "current"（正在进行的这次行动）；留空列出最近 30 次
+    name: 运行的 ctx 名、旧段名、折叠名或日志编号，或 "current"（当前工具所属运行，包括构造与分身）；留空列出最近 30 次
     start: 从第几个字开始读，用上一次结尾提示的位置接着读
     match: 只看这一次里含这个词的地方（不区分大小写，前后各留 around 字），比从头翻页快
     around: 配 match 用，前后各留多少字，200~2000
+    detail: body 读正文并支持分页与 match；outline 只读构成、引用、大小与用量元数据，enum: [body, outline]
+    request: outline 查 first 首次实际请求或 latest 最近实际请求；first 不随探索增长，enum: [first, latest]
     """
     from mods.chat import _roles
 
-    return _roles.read_context(name, start, match, around)
+    return _roles.read_context(name, start, match, around, detail, request)
 
 
 def note_history(scope: str, version: str = "") -> str:

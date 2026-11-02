@@ -1,20 +1,22 @@
 """把独立任务交给分身并发处理，按原顺序返回任务、上下文编号和结果。
 
-分身只看你通过 refs 引用的材料和本次 goal，不继承主运行的工具或唤醒状态。
+分身只看你通过 refs 引用的材料和本次 goal，独立选择工具，继承父运行的能力限制。
 refs 每行可写唤醒编号 #n、步骤 n.m、笔记名、上下文名或日志编号；引用保留原始来源。
 tasks 每行一个独立任务，接在公共 goal 后；留空就只运行一次 goal。最多同时运行五项。
 
 工具模块在 tools 中逐行指定，meta 始终可用。默认不暴露 send、type_word；确实需要
 对外发言时可逐行显式写这两个函数名（me 表示同时授权两者）。授权只属于本次分身，
-不会改变主运行。每项成功或失败都返回独立 ctx，可用 read_context 查看已完成的部分。
+不会改变主运行，也不能越过父运行的限制。每项返回独立 ctx 和最后的最终答复；
+取消、失败或没有最终答复会明确标明，可用 read_context 查看原始探索轨迹。
 """
 
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 import threading
 
-from mods import context, log, tools as tool_modules
+from mods import context, log, tools as tool_modules, watchdog
 
 
 _stream = log.stream("agent")
@@ -22,7 +24,9 @@ _stream = log.stream("agent")
 
 def fork(goal: str, refs: str = "", tasks: str = "", tools: str = "",
          model: str = "") -> str:
-    """并发处理独立任务，返回 [(任务, ctx, 结果), ...]；失败结果以 ERROR: 开头。
+    """并发处理独立任务，返回 [(任务, ctx, 最终答复或状态), ...]。
+
+    ERROR: 表示失败，CANCELLED: 表示取消，NO_FINAL: 表示没有非空最终答复。
 
     @param
     goal: 所有分身共同的明确目的，包含任务要求和输出格式
@@ -64,18 +68,34 @@ def fork(goal: str, refs: str = "", tasks: str = "", tools: str = "",
         _stream.info(f"线程 {worker_id}: 开始处理 LLM 分身任务")
         try:
             purpose = goal + ("\n\n" + task_value if task_value else "")
-            ctx, text = run(items, purpose, tools=requested, model=model or None,
-                            kind="fork", state=state, stop=stopped, grant=grants)
+            ctx, _text = run(items, purpose, tools=requested, model=model or None,
+                             kind="fork", state=state, stop=stopped, grant=grants,
+                             deadline=parent_run.get("deadline") if parent_run is not None else None)
+            last = state.get("last") or {}
+            # WHY: 流式文本含工具前的自言自语；只认本次最后输出，不能从旧轮回填成果。
+            if state.get("failure"):
+                text = f"ERROR: {state['failure']}"
+            elif state.get("cancelled") or stopped():
+                text = "CANCELLED: 分身已取消；未交付最终答复。"
+            elif last.get("role") != "assistant" or last.get("tool_calls"):
+                text = "NO_FINAL: 分身结束时没有最终答复。"
+            else:
+                text = str(last.get("content") or "").strip() or "NO_FINAL: 分身的最终答复为空。"
             _stream.info(f"线程 {worker_id}: LLM 分身任务完成")
             return task_value or goal, ctx, text
+        except watchdog.Interrupted as error:
+            return task_value or goal, state.get("view", {}).get("ctx", ""), f"CANCELLED: {error}"
         except Exception as error:
             _stream.info(f"线程 {worker_id}: LLM 分身任务失败：{error}")
             return task_value or goal, state.get("view", {}).get("ctx", ""), f"ERROR: {error}"
         finally:
             context.set_current(previous)
 
+    # WHY: 线程池不会传播 ContextVar；子运行绑定时必须看到真实父 binding 的过滤，
+    # 不能只靠 tools 参数或提示正文，load/reload 和再次 fork 也要受同一限制。
+    scope = copy_context()
     with ThreadPoolExecutor(max_workers=5) as executor:
-        results = list(executor.map(execute, task_list))
+        results = list(executor.map(lambda task: scope.copy().run(execute, task), task_list))
     return repr(results)
 
 

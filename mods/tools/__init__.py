@@ -39,6 +39,7 @@ _initialized = False
 _catalog_lock = threading.RLock()
 _IMPORT_PACKAGE = __name__ + "._sources"
 _current_binding_var: ContextVar[dict | None] = ContextVar("tool_session_binding", default=None)
+_CURRENT_PARENT = object()
 
 
 def current_binding() -> dict:
@@ -352,6 +353,8 @@ def _catalog(binding: dict) -> dict[str, dict]:
 
 
 def _function_visible(binding: dict, name: str, tool: Tool) -> bool:
+    if binding["kind"] == "fork" and name == "construct__assemble":
+        return False
     leaf = name.rsplit("__", 1)[-1]
     granted = name in binding["grant"] or leaf in binding["grant"]
     # WHY: 这里只限制 fork 的默认暴露。交接/反思不封嘴是维护者已裁定的行为，
@@ -359,7 +362,8 @@ def _function_visible(binding: dict, name: str, tool: Tool) -> bool:
     if binding["kind"] == "fork" and leaf in {"send", "type_word"} and not granted:
         return False
     pick = binding["function_visible"]
-    return pick is None or bool(pick(name, tool))
+    return (pick is None or bool(pick(name, tool))) and (binding["local_function_visible"] is None
+            or bool(binding["local_function_visible"](name, tool)))
 
 
 def _bind_module(binding: dict, module: dict) -> dict:
@@ -472,12 +476,19 @@ def bind_session(
     kind: str = "fork",
     function_visible: Callable[[str, Tool], bool] | None = None,
     grant: Iterable[str] = (),
+    parent_binding=_CURRENT_PARENT,
+    local_function_visible: Callable[[str, Tool], bool] | None = None,
 ) -> dict:
     """Bind one run; main persists global stamps, while schema order belongs to its view.
 
     A fork gets independent stamps, schema order and grants, and excludes send and
     type_word unless explicitly granted. function_visible applies after that rule
-    on every load/reload/reconcile. It controls exposure, not the host trust domain.
+    on every load/reload/reconcile. A fork also intersects the calling binding's
+    module/function filters, while its speech grants remain local. It never gets
+    construct__assemble. local_function_visible hides lifecycle-specific entries only
+    in this session; unlike function_visible it is not inherited by child forks.
+    parent_binding can pin the original caller across segments, avoiding a growing
+    chain of inherited predicates. This controls exposure, not the host trust domain.
     context_message, if supplied, is filled once; callers record later state
     changes explicitly. No context provider or session pocket is installed.
     """
@@ -486,10 +497,23 @@ def bind_session(
     if context_message is not None and (not isinstance(context_message, dict)
                                         or context_message.get("role") != "system"):
         raise TypeError("context_message must be an existing system message dict")
+    pick_module = bot_op_tool_visible if visible is None else visible
+    parent = ((_current_binding_var.get() if parent_binding is _CURRENT_PARENT else parent_binding)
+              if kind == "fork" else None)
+    if parent is not None:
+        parent_module = parent["visible"]
+        own_module = pick_module
+        pick_module = lambda name, module: parent_module(name, module) and own_module(name, module)
+        parent_function = parent["function_visible"]
+        if parent_function is not None:
+            own_function = function_visible
+            function_visible = lambda name, tool: parent_function(name, tool) and (
+                own_function is None or own_function(name, tool))
     binding = {
-        "session": session, "visible": bot_op_tool_visible if visible is None else visible,
+        "session": session, "visible": pick_module,
         "persist": persist, "ttl": ttl, "schema_modules": list(dict.fromkeys(schema_modules)),
         "persist_schema": persist_schema, "kind": kind, "function_visible": function_visible,
+        "local_function_visible": local_function_visible,
         "grant": frozenset(_requested_names(grant)), "active": {}, "stamps": {}, "owners": {},
         "lock": threading.RLock(),
     }

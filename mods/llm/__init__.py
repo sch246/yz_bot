@@ -786,7 +786,8 @@ class LLMClient:
             console.error(f"❌ 音频识别失败：{error}")
             raise
 
-    def generate_response(self, messages: list[dict], tools: list[Tool] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None, logged: int = 0, reasoning_effort: str | None = None, temperature: float | None = None, describe_images: bool = True):
+    def generate_response(self, messages: list[dict], tools: list[Tool] | None = None, tool_choice: str | dict | None = None, model: str | None = None, stream: bool = True, description_cache: dict | None = None, do_process_image: bool | None = None, logged: int = 0, reasoning_effort: str | None = None, temperature: float | None = None, describe_images: bool = True, on_request=None, on_request_usage=None):
+        original_messages = messages
         selection = model or self.config["default_model"]
         provider, api_model, raw_capabilities = resolve_model(self.config, selection)
         client = self.clients.get(provider)
@@ -852,11 +853,16 @@ class LLMClient:
             params.update(options)
         if stream:
             params["stream_options"] = {"include_usage": True}
-            return self._stream_response(client, params, selection)
-        return self._non_stream_response(client, params, selection)
+        # WHY: observe only at dispatch, after validation/image preparation. The
+        # original projection keeps source boundaries; provider usage counts the
+        # converted request, so callers must label these two measurements apart.
+        observe = (lambda: on_request(original_messages, params.get("tools", []))) if on_request else None
+        if stream:
+            return self._stream_response(client, params, selection, observe, on_request_usage)
+        return self._non_stream_response(client, params, selection, observe, on_request_usage)
 
     @staticmethod
-    def _stream_response(client: OpenAI, params: dict, model: str) -> Generator[LLMResponse, None, LLMResponse]:
+    def _stream_response(client: OpenAI, params: dict, model: str, on_request=None, on_request_usage=None) -> Generator[LLMResponse, None, LLMResponse]:
         requested_at = datetime.now(timezone.utc)
         buffer = ""
         assistant_content = ""
@@ -867,6 +873,8 @@ class LLMClient:
         finished = False
         output = console.StreamPrinter(model)
         try:
+            if on_request is not None:
+                on_request()
             for chunk in client.chat.completions.create(**params):
                 if getattr(chunk, "usage", None):
                     usage = chunk.usage
@@ -943,11 +951,18 @@ class LLMClient:
             output.finish()
             console.error(f"流式响应处理失败：{error}")
             raise
+        finally:
+            if usage is not None and on_request_usage is not None:
+                on_request_usage(usage)
 
     @staticmethod
-    def _non_stream_response(client: OpenAI, params: dict, model: str) -> Generator[LLMResponse, None, LLMResponse]:
+    def _non_stream_response(client: OpenAI, params: dict, model: str, on_request=None, on_request_usage=None) -> Generator[LLMResponse, None, LLMResponse]:
         requested_at = datetime.now(timezone.utc)
+        if on_request is not None:
+            on_request()
         response = client.chat.completions.create(**params)
+        if response.usage is not None and on_request_usage is not None:
+            on_request_usage(response.usage)
         finish_reason = getattr(response.choices[0], "finish_reason", None)
         if finish_reason not in ("stop", "tool_calls", "function_call"):
             raise RuntimeError(f"模型响应未完整结束: {finish_reason}")
@@ -1004,6 +1019,9 @@ class LLMClient:
         on_tool_result: Callable[[str | None, ToolCallResult, dict], None] | None = None,
         temperature: float | None = None,
         describe_images: bool = True,
+        on_request=None,
+        on_request_usage=None,
+        before_output=None,
     ) -> Generator[LLMResponse, None, None]:
         # Every message appended below is printed live as it happens, so each
         # further round only logs what it has not shown yet -- usually nothing.
@@ -1031,9 +1049,10 @@ class LLMClient:
             # 在上下文里堆出几代互相矛盾的副本。因此 hint 里只放随时可重算的东西，不放
             # 任何"只此一次、错过就没有"的信息——那种必须走 on_round。
             outgoing = (messages + hints()) if hints is not None else messages
-            response = iter(self.generate_response(outgoing, tools_snapshot, tool_choice, model, stream, description_cache, do_process_image, logged, reasoning_effort=reasoning_effort, temperature=temperature, describe_images=describe_images))
+            response = iter(self.generate_response(outgoing, tools_snapshot, tool_choice, model, stream, description_cache, do_process_image, logged, reasoning_effort=reasoning_effort, temperature=temperature, describe_images=describe_images, on_request=on_request, on_request_usage=on_request_usage))
             mapping = {tool.description["function"]["name"]: tool for tool in tools_snapshot}
             pending_calls = []
+            pending_errors = []
             # Yielded chunks remain the live display/tool stream.  The return
             # value supplies response-wide content fields; this loop combines
             # them with collected tool calls into the one history message.
@@ -1069,7 +1088,7 @@ class LLMClient:
                 tool = mapping.get(name)
                 if tool is None:
                     if self.strict_tools:
-                        raise RuntimeError(f"tool is not available in this session: {name}")
+                        pending_errors.append(RuntimeError(f"tool is not available in this session: {name}"))
                     # WHY: 多半是模型照上一轮的印象直呼（激活态已经变了），或者自己写错。
                     # 丢掉它会让整轮静默结束，所以换成一个会说话的占位工具留在这批调用里。
                     tool = UnavailableTool(name, sorted(mapping))
@@ -1079,9 +1098,10 @@ class LLMClient:
                         arguments = json.loads(function["arguments"] or "{}")
                     except Exception as error:
                         if self.strict_tools:
-                            raise RuntimeError(f"invalid arguments for tool: {name}") from error
-                        _log.exception("failed to parse LLM tool arguments")
-                        console.error(f"工具参数解析失败：{error}")
+                            pending_errors.append(RuntimeError(f"invalid arguments for tool: {name}"))
+                        else:
+                            _log.exception("failed to parse LLM tool arguments")
+                            console.error(f"工具参数解析失败：{error}")
                         tool = UnavailableTool(name, sorted(mapping), f"参数不是合法 JSON（{error}）")
                         arguments = {}
                 pending_calls.append((call, tool, arguments))
@@ -1094,6 +1114,12 @@ class LLMClient:
                 assistant_message["reasoning_content"] = assistant.reasoning_content
             if pending_calls:
                 assistant_message["tool_calls"] = [call for call, _, _ in pending_calls]
+            # Preflight sees the entire batch before the caller acknowledges
+            # input or any tool starts. Rejection still records the native output
+            # and one paired error per call, without pretending to dispatch it.
+            batch_error = before_output(assistant_message, assistant_message.get("tool_calls", [])) if before_output else None
+            if pending_errors and batch_error is None:
+                raise pending_errors[0]
             output_id = on_output(assistant_message, assistant_message.get("tool_calls", [])) if on_output else None
             if not keep_reasoning and assistant.reasoning_content is not None and not preserve_native:
                 assistant_message["reasoning_content"] = ""
@@ -1110,6 +1136,17 @@ class LLMClient:
             results: list[ToolCallResult] = []
             native_results: list[dict] = []
             for position, (call, tool, arguments) in enumerate(pending_calls):
+                if batch_error is not None:
+                    function = call["function"]
+                    result = ToolCallResult(call["id"], function["name"], function["arguments"],
+                                            f"工具批次未执行：{batch_error}")
+                    native = {"role": "tool", "tool_call_id": result.tool_call_id, "content": result.content}
+                    results.append(result)
+                    native_results.append(native)
+                    messages.append(native)
+                    if on_tool_result is not None:
+                        on_tool_result(output_id, result, native)
+                    continue
                 if should_stop is not None and should_stop():
                     if on_results is not None:
                         on_results(output_id, results, native_results)
@@ -1209,6 +1246,11 @@ class Chat:
         self.on_tool_start = on_tool_start
         self.on_tool_result = on_tool_result
         self.on_action = on_action
+        # Dispatch observes the source projection plus the schemas actually sent;
+        # usage observes raw provider fields, before billing's missing-as-zero rule.
+        self.on_request: Callable[[list[dict], list[dict]], None] | None = None
+        self.on_request_usage: Callable[[object], None] | None = None
+        self.before_output: Callable[[dict, list[dict]], str | None] | None = None
         self.active_action: str | None = None
         self.fail_fast = False
         # How many leading messages an earlier request already put in the request
@@ -1348,6 +1390,9 @@ class Chat:
                 on_tool_result=record_tool_result if self.on_tool_result is not None else None,
                 temperature=self.temperature,
                 describe_images=self.describe_images,
+                on_request=self.on_request,
+                on_request_usage=self.on_request_usage,
+                before_output=self.before_output,
             )
             results = []
             for chunk in response:

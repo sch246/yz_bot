@@ -13,6 +13,8 @@
 `list_tools` 查看状态；改了文件用 `reload_tools`，只有 `mods/tools/` 的模块和下划线 helper 能热更新，其它核心代码需完整重启。
 需要开发、改写、删除工具或写 Skill 时，`load_tools(["tool_development"])` 展开手册。`exec_code` 是共享 Python 环境，不是沙箱；函数说明里有时限和后台选项。`attach_image` 把图片递到眼前。
 
+工具列表包含 `reframe` 时，材料需求变了可以单独调用它，选下一段的 focus、refs、接续 note 和工具。它在同一次任务里继续，旧轨迹按 ctx 封存；不会把旧探索全文自动搬过来。reframe 必须独占一次工具批次，不能和其它工具一起调用。
+
 ## 怎么开口说话（type_word 与 send）
 
 你看的每条聊天记录都带一个头：`【头衔】名字(QQ号) 时:分:秒 | message_id`，正文缩进在下一行。头里那个 QQ 号要是你自己，那就是你之前说过的话。想艾特谁写 `[CQ:at,qq=号码]`，想引用哪条就在正文里写 `[CQ:reply,id=message_id]`，id 就是竖线后面那串。
@@ -155,6 +157,27 @@ def load_tools(names: list[str]) -> str:
     from mods import tools
 
     return _format_results(tools.load(current_binding(), names))
+
+
+def reframe(focus: str, refs: str = "", note: str = "", tools: str | None = None,
+            history: int | None = None) -> str:
+    """当前材料已经不适合接下来的工作时，选择材料换到新 ctx，在同一次任务里继续。
+
+    必须独占这次工具批次。校验失败留在原段继续；成功后旧 ctx 仍可用 read_context 查。
+    取消、原目的、父运行的能力限制和已有总时限会延续。
+
+    @param
+    focus: 下一段关注的情境或问题，不能为空；允许随发现调整方法
+    refs: 下一段要带的材料，每行一个日志编号、ctx、笔记、选区、policy: 或 log: 引用；空串不带旧材料
+    note: 给下一段的接续说明，记录为本次新产生的材料，不必搬整份旧轨迹
+    tools: 下一段激活的工具模块，用换行、空格或逗号分隔；省略继承当前选择，空串清空可选模块，meta 始终保留
+    history: 仅主行动可调下一段新消息前的接话条数，非负整数；省略继承，不改变负责的窗口
+    """
+    state = current_binding()["run"]
+    prepare = state.get("prepare_reframe")
+    if prepare is None:
+        return "这次运行不支持 reframe；原段继续"
+    return prepare(focus, refs, note, tools, history)
 
 
 def read_log(window: str, count: int = 30, before: str = "") -> str:
@@ -627,6 +650,7 @@ __all__ = [
     "list_tools",
     "reload_tools",
     "load_tools",
+    "reframe",
     "attach_image",
     "set_name",
     "loop_note_history",

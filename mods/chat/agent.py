@@ -153,6 +153,7 @@ def _read_work():
         typing = threading.Event()
         origin = next((job.get("event") for job in claims if job.get("event")), None)
         context.set_current(origin)
+        released = False
         try:
             _adopt(wake, claims)
             threading.Thread(target=_keep_typing, args=(wake, typing), daemon=True).start()
@@ -164,7 +165,10 @@ def _read_work():
         except BaseException:
             _roles._stream.exception("中心唤醒失败，保留未确认召唤")
             # release sets ready, but must not hot-retry the failed request.
+            # WHY: release before a retry reader can claim, rather than waiting
+            # for finally after notify() has already started it.
             attention.release(wake["claims"] + wake["deferred"])
+            released = True
             with _lock:
                 _active = None
                 _reader_running = False
@@ -174,7 +178,8 @@ def _read_work():
             return
         finally:
             typing.set()
-            attention.release(wake["claims"] + wake["deferred"])
+            if not released:
+                attention.release(wake["claims"] + wake["deferred"])
             if origin is not None:
                 window = history.window(origin)
                 if window is not None and window[0] in _windows.QQ:
@@ -309,14 +314,32 @@ def _act(wake, spec, model=None):
     extra = [text for text in (
         f"【构造提供的关注情境，供你判断】\n{spec['focus']}",
         f"【准备时的观察与联想，供参考】\n{spec['note']}" if spec.get("note") else "",
-        drafts(),
     ) if text]
     items += [{"role": "system", "content": text} for text in extra]
     wake["request_patches"] = []
+    draft_ctx = None
+
+    def prepare(state):
+        nonlocal draft_ctx
+        view = state["view"]
+        material = []
+        if draft_ctx != view["ctx"]:
+            if state["segment_index"] == 0:
+                view["stats"]["focus"] = spec["focus"]
+            # WHY: input boxes are live state, not a snapshot restored from refs.
+            # Read even an empty box once per segment; later rounds must not keep
+            # appending the same draft or resurrect one that has been sent.
+            text = drafts()
+            draft_ctx = view["ctx"]
+            if text:
+                material.append({"kind": "system", "messages": [{"role": "system", "content": text}]})
+        material.extend(_prepare(wake, view, windows, state["history"]))
+        return material
+
     try:
         run(items, _construct.DEFAULT_ACT_GOAL, tools=("meta", *spec["tools"]), inherit_tools=False,
-            model=model, kind="main", state=wake,
-            prepare=lambda state: _prepare(wake, state["view"], windows, spec["history"]), on_output=_confirm,
+            model=model, kind="main", state=wake, allow_reframe=True, history=spec["history"],
+            prepare=prepare, on_output=_confirm,
             hints=[lambda: _screen.unread_hint(windows), lambda: shell.running_hint(),
                    lambda: wake.get("breadcrumbs", ""), _brake_hint])
     finally:

@@ -20,16 +20,36 @@
 
 ## 上下文如何组装
 
-经历与眼前材料分别保存。`data/chat/journal/YYYYMMDD.jsonl` 是原始内容权威，保存稳定 `YYYYMMDD-N` 编号、时间、ctx、种类、原样模型消息和来源。每次运行有自己的编号视图，只保存有序条目引用与不能推导的统计（`stats.windows` 记行动和沉淀负责的窗口），结束时冻结到 `data/chat/views/<ctx>.json`。没有跨运行的当前视图，不再写 `view.json`；迁移脚本写出的那份（旧的当前段，没有经过交接）在第一次启动时由 `agent.adopt_last_view` 封存进 `views/` 和年鉴，并在 `me` 留一条叫醒她补记的记录。2026-11-01 起不再有整段压力、折叠、dismiss 或交接（[设计与裁定](working/proposals/one-purpose-stateless-core.md)）。
+经历与眼前材料分别保存。`data/chat/journal/YYYYMMDD.jsonl` 是原始内容权威，保存稳定 `YYYYMMDD-N` 编号、时间、ctx、种类、原样模型消息和来源。每段有自己的编号视图，保存有序条目引用、请求边界、段间关联与不能推导的统计（`stats.windows` 记行动和沉淀负责的窗口），段结束时冻结到 `data/chat/views/<ctx>.json`。没有跨运行的当前视图，不再写 `view.json`；迁移脚本写出的那份（旧的当前段，没有经过交接）在第一次启动时由 `agent.adopt_last_view` 封存进 `views/` 和年鉴，并在 `me` 留一条叫醒她补记的记录。2026-11-01 起不再有整段压力、折叠、dismiss 或交接（[设计与裁定](working/proposals/one-purpose-stateless-core.md)）。
 
-统一入口 `chat.run(items, goal, ...)` 接受日志引用或原始消息，要求非空目的并放在请求末尾，返回 `(ctx, text)`。构造、行动、沉淀、反思、月年汇总和分身共用模型构造、工具绑定、记录、计费、取消与超时；`functions` 可给出本次可见工具的白名单。超时立即返回，若 worker 尚未退出则 `finalization=pending`，待它退出后后台完成归档。迟到的准备材料不会追加到已经关闭的运行。
+统一入口 `chat.run(items, goal, ...)` 接受日志引用或原始消息，要求非空目的并放在请求末尾，返回 `(ctx, text)`；支持重新组装的调用可以产生多个 ctx，返回末段 ctx。构造、行动、沉淀、反思、月年汇总和分身共用模型构造、工具绑定、记录、计费、取消与超时；`functions` 可给出本次可见工具的白名单。超时立即返回，若 worker 尚未退出则 `finalization=pending`，待它退出后后台完成归档。迟到的准备材料不会追加到已经关闭的运行。
 
 引用写法只有一套（`segment.resolve_refs`）：唤醒 `#n` 与步骤 `n.m`（只在有这些地址的视图里）、日志编号、运行或旧段的 ctx、笔记名（可加 `@L12-28` 选原文件行段）、`policy:名字`、`log:窗口[@时刻][*条数]`（那一时刻之前的若干条聊天，默认 30 条）。黑板、构造规格和 `agents__fork` 都用它；坏引用报出具体那一行。
 
-1. **构造**：每次唤醒先跑一次 kind `construct` 的运行，提供信息、提醒和洞察，行动自行决定怎么回应。系统提示照旧（self、身份与 `memory_system` 的记忆说明）；材料按变化快慢排列：接口职责 `construct.CONTRACT` 和检查清单（`data/notes/policy/construct.md`，缺省用 `construct.DEFAULT_POLICY`）、笔记目录与首行（最近修改的 80 份，按名字显示，并标字符数和行数）、黑板 `recent` 全文与其 `@引用` 行的折叠描述、todo 全文、最近三小时行动时间线、最近几次运行的目的、其它窗口未读与 @、等着她的事和被叫醒窗口的新消息（`screen.prepare` 不确认阅读，前面带 20 条接话）及面包屑。可见工具只有 `construct__assemble`、`search`、`read_note`、`read_log`、`read_actions` 与 `agents__fork`。`assemble(focus, refs, note, windows, tools, history)` 提交关注情境、材料、观察、窗口、开场工具模块和接话条数；当场校验引用、工具和窗口，坏引用退回。引号只表示引用，不自动查笔记。模型、思考等级和超时在 storage `agent.construct`（旧 `agent.observer` 第一次读到时搬入），默认 `deepseek/deepseek-flash`、不思考、45 秒。
+1. **构造**：每次唤醒先跑一次 kind `construct` 的运行，提供信息、提醒和洞察，行动自行决定怎么回应。系统提示照旧（self、身份与 `memory_system` 的记忆说明）；材料按变化快慢排列：接口职责 `construct.CONTRACT` 和检查清单（`data/notes/policy/construct.md`，缺省用 `construct.DEFAULT_POLICY`）、笔记目录与首行（最近修改的 80 份，按名字显示，并标字符数和行数）、黑板 `recent` 全文与其 `@引用` 行的折叠描述、todo 全文、最近三小时行动时间线、最近几次运行的目的、其它窗口未读与 @、等着她的事和被叫醒窗口的新消息（`screen.prepare` 不确认阅读，前面带 20 条接话）及面包屑。可见工具限于 `construct__assemble`、`search`、`read_note`、`read_log`、`read_actions`、`agents__fork`、`reframe`、`load_tools` 与按需加载的 `memory_system__read_context`。`load_tools(["memory_system"])` 让概览可用，清空可选模块后也能恢复构造工具；实际函数过滤始终保留，只加载模块不会得到写入、执行代码或发言能力，也不默认装入整份反思工具说明。`assemble(focus, refs, note, windows, tools, history)` 提交关注情境、材料、观察、窗口、开场工具模块和接话条数；当场校验引用、工具和窗口，坏引用退回。引号只表示引用，不自动查笔记。模型、思考等级和超时在 storage `agent.construct`（旧 `agent.observer` 第一次读到时搬入），默认 `deepseek/deepseek-flash`、不思考、45 秒。
 2. **规格与兜底**：每一步只交一份规格（2026-11-01 起，设计文档第 18 节）：`assemble` 要求规格至少负责一个被认领的窗口，记下后把运行状态的 `end` 置真，构造随这批工具调用结束，再交会被退回。没被选中的召唤不补规格，这一步结束时随 `wake["claims"]` 一起释放，读线程马上再认领、再起构造。没有记录号的召唤（闹钟、循环、命令）只在行动的 `wake["acting"]` 含它的窗口或 `me` 时才在 `_confirm` 里确认。构造关闭、出错、超时或没交规格时，用黑板（`recent` 加其可解析的 `@引用`）为所有被认领窗口兜底一份，并在注意里写明原因和读不出的引用。
 3. **行动**：这份规格跑一次 kind `main` 的运行，材料依次是规格解析出的引用、关注情境和观察（system，供参考）、输入框里还没发的字；运行目的固定为结合材料自主判断，再由 `prepare` 在每次请求前追加它负责窗口的画面。画面里上次看过的位置之后标出新消息，前面带构造指定的接话条数（默认 10，可为 0）；从没看过的窗口按 `max_events`（默认 80）给首屏；普通新消息超过 60 条只给最新 60 条并说明翻查入口，follow 期间到的不截。全局 `agent.read` 是唯一已确认读状态；首次模型输出才 `commit_read`，只确认该请求实际展示的记录。每次请求前先把它负责的窗口里还在防抖的召唤直接并进来（`attention.flush`，2026-11-01 起），叫她的人也记进这次唤醒；行动期间别的窗口到的召唤记为 deferred，唤醒结束时释放，交给下一次唤醒的构造。攒批规则由窗口种类声明（`windows.kind(..., whole, debounce, follow, hide_control)`）：QQ 按 `#debounce` 的配置攒，同一人续期；B 站、CLI、`me` 不攒。
 4. **临时提示**：其它窗口未读、当前时间、面包屑和后台命令按请求重算，只放本次末尾 hint。行动等运行的末尾只留 todo 的召回入口；行动里的 todo 全文或片段由构造选择，构造只在开场读取一次全文。`#` 控制/调试输出不作为画面正文；Bot 自己经命令工具获取的结果保留既有回流例外。原始聊天记录与撤回、回声规则见[运行文档](runtime.md)。
+
+### 上下文概览
+
+按需加载 `memory_system` 后调用 `memory_system__read_context(name="current", detail="outline", request="first")`。`current` 由执行上下文中的当前 run 定位，在 main、construct 和并行 fork 中各指向自身；`chat.current_wake()` 仍只供主唤醒控制。显式 ctx 也能查询，`detail="body"` 保留原来的正文、分页与 match 用法。
+
+每段记录第一次和最近一次实际派发的请求，`request="first"` 不随后续探索增长，`latest` 查看最近一次。概览包含 ctx、goal/focus、来源引用与笔记版本、紧凑 JSON 字符数和文本 token 估算；消息分为 head、view、attachments、hints，工具 schema 单列。记录点在供应商转换前，估算不包含真实图片 token 或供应商协议开销，不能当作服务端逐块 token。复用 journal 来源和大小元数据，不再保存一份完整请求正文。
+
+`usage` 关联所选请求，保留服务端原始报告的 prompt/completion/total/cached 字段；`null` 表示未报告，只有显式 0 才表示零。`segment_usage.known` 是本段所有请求的已知小计，`coverage` 标出字段报告次数，覆盖不足不能当作完整用量。`call_usage` 若已记录，给出截至该段结束的整调用累计，末段覆盖全部段。旧归档或尚未派发请求返回“未记录”，不从最终 view 或费用倒推首请求。
+
+### 运行中重新组装上下文
+
+`reframe(focus, refs="", note="", tools=None, history=None)` 使用 meta 入口。fork 默认启用，construct 和 main 显式启用；settle、reflect、summary 及外部传入 view 的调用不启用。换段是同一次调用的接续，由迭代循环重建 session/view，不叠加 Python 调用栈。
+
+- `focus` 非空，描述下一段关注的问题；原调用 goal 与来源保留。主行动首段 focus 记录构造的 `spec.focus`，后段记录 reframe 的 focus。
+- `refs` 沿用已有引用与选区，解析时固定内容版本；空串不带旧材料。`note` 写入 journal，作为下一段接续材料。
+- `tools=None` 继承当前激活模块，空串清空可选模块，meta 保留；父权限过滤继续生效。`history` 仅 main 接受非负整数，省略继承，0 不带接话；它不改负责窗口。
+
+reframe 必须独占一次 assistant 工具批次。混合批次在任何工具派发与主行动确认前整批拒绝，输出和逐调用协议错误仍配对记入 journal，但不提交 read patches、不 ack。合法批次记全工具回执和批次完成后，写入旧段后继、新段来源、选择与 focus，封存旧段再继续；旧轨迹可按 ctx 展开，不自动搬进新段。坏引用等校验错误留在原段修正。提交后落盘或归档失败则终止并保留定位入口，不承诺多文件事务、崩溃自动续跑或外部动作重放。
+
+整次调用保留取消、已有绝对截止时间、父调用等待与权限。已经开始的工具在取消后仍记录真实回执，没有回执的结果保持未知。主行动继续使用同一个 wake、claims、deferred 与负责窗口；每次请求重新 prepare 画面和 read patches，每段重新取最新草稿（含空草稿）与 history。有效换段输出仍确认当次实际展示的消息；整次行动结束才标记待沉淀，由外层 reader 处理 loop 和 claims 释放。构造总时限与已收集规格同样跨段延续。
 
 ### 沉淀
 
@@ -118,7 +138,7 @@ Files API 只对 `deepseek` 供应商启用，默认开启，可在该模型配�
 
 ## 基础工具与现有模块
 
-每个 `Chat` 开局默认激活标准 Python 模块 `meta.py`。中心 agent 每次组装时在系统提示后给出完整模块说明，子代理在开头显示；导出的工具一律不带前缀，其中四个是**必需**的恢复入口（少一个模型就没法自救）：
+普通 `Chat` 开局默认激活标准 Python 模块 `meta.py`；构造等受限运行另按自身函数白名单过滤。中心 agent 每次组装时在系统提示后给出完整模块说明，子代理在开头显示；导出的工具一律不带前缀，其中四个是**必需**的恢复入口（少一个模型就没法自救）：
 
 | 工具 | 当前效果与边界 |
 |---|---|
@@ -127,7 +147,7 @@ Files API 只对 `deepseek` 供应商启用，默认开启，可在该模型配�
 | `reload_tools` | 按模块名从磁盘显式应用、更新或删除模块；逐项返回成功和带完整 traceback 的失败结果，失败保留旧 last-good。 |
 | `load_tools` | 将 last-good 模块激活到当前 Chat；中心名单存全局 `agent`，不读取磁盘。 |
 
-`meta` 还提供明确目标的 `type_word/send`、规则 `wake_me`、召回 `search/read_log/read_actions/read_note`、笔记 `write_note`、连续活动 `loop/wait/loop_note_history`、`set_name` 与 `attach_image`（2026-11-01 删除了 `tidy/dismiss/compress/decompress`）。工具模块 `construct` 只有 `assemble`，只在构造运行里可见、可用。发送先打字、下个模型输出再发送；输入框存在 storage，跨唤醒和重启保留。`send(wait=0)` 继续工作，`wait=-1` 收工被动等，正时长则挂回复或超时的一次等待，可用 `who` 限定作者；群里不写 `who` 时，这次唤醒若是某人叫醒的就默认只等这个人，写 `who="any"` 等全群（2026-10-31）。时长后面可以直接跟理由，如 `wait="5m 等他接话"`。CLI 窗口（[CLI agent 窗口](cli-agents.md)）把整段输入作为一轮任务，不拆气泡。
+`meta` 还提供按运行启用的 `reframe`（见[重新组装](#运行中重新组装上下文)）、明确目标的 `type_word/send`、规则 `wake_me`、召回 `search/read_log/read_actions/read_note`、笔记 `write_note`、连续活动 `loop/wait/loop_note_history`、`set_name` 与 `attach_image`（2026-11-01 删除了 `tidy/dismiss/compress/decompress`）。工具模块 `construct` 只有 `assemble`，只在构造运行里可见、可用。发送先打字、下个模型输出再发送；输入框存在 storage，跨唤醒和重启保留。`send(wait=0)` 继续工作，`wait=-1` 收工被动等，正时长则挂回复或超时的一次等待，可用 `who` 限定作者；群里不写 `who` 时，这次唤醒若是某人叫醒的就默认只等这个人，写 `who="any"` 等全群（2026-10-31）。时长后面可以直接跟理由，如 `wait="5m 等他接话"`。CLI 窗口（[CLI agent 窗口](cli-agents.md)）把整段输入作为一轮任务，不拆气泡。
 
 仓库当前提供以下按需模块；函数只在对应模块激活后出现：
 
@@ -157,7 +177,7 @@ Files API 只对 `deepseek` 供应商启用，默认开启，可在该模型配�
 | `meme` | 表情柜子：`meme__collect` 把聊天里或网上的图下载进 `data/memes/<sha256>.<扩展名>`（同一张只存一份），连同她起的心情和一句话记进 storage `meme/index`；`meme__pick` 按心情或关键词随机挑一张（优先最久没发的），返回带 `sub_type=1` 的 `[CQ:image,file=file://…]`，她再经 `type_word`／`send` 发；`meme__browse` 看总览、`meme__edit` 改或扔 |
 | `tts` | `tts__speak`：用 edge-tts（微软 Edge 在线朗读，非官方、免账号）把文字念成 mp3，默认音色晓伊 `zh-CN-XiaoyiNeural`，存进 `data/tmp_files` 返回 `file://` 路径；她再用 `[CQ:record,file=…]` 经 `type_word`／`send` 发语音 |
 | `weather` | `weather__search_city`、`weather__get_realtime_weather`、`weather__get_daily_forecast`、`weather__get_hourly_forecast` |
-| `memory_system` | `read_context`、`note_history`、`read_policy`、`edit_policy`、`assess_change`（夜间反思时加载，回看归档上下文、笔记历史版本与策略账本） |
+| `memory_system` | `memory_system__read_context`、`note_history`、`read_policy`、`edit_policy`、`assess_change`（夜间反思时加载；构造可按需加载，但实际只开放 `memory_system__read_context`） |
 | `yuzu_hello` | `yuzu_hello__hello`（最小示例工具模块） |
 
 `host` 是 `exec_code` 之外的常用出口：文件读写和 shell 都不必再绕一次任意代码执行。读取按本次实际截取的窗口计字节，超过 `max_bytes` 时只回大小和后续建议（缩小区间、先 `grep -n` 定位、或用 `fork` 开子会话通读后带回摘要），不做分页会话。改写靠 `read_file` 首行 header 里的 `line`/`size`/`v` 定位与对账：位置与新内容的写法无关，`v` 只在该区间自读取后被改动过时失配，失配的返回自带现状和新 header。渲染格式与 `.edit` 同源，所以手动编辑和模型改写看到的是同一种东西；它没有目录白名单，`data/`、`config.json`、`.env` 和聊天记录都在可及范围内。
@@ -242,7 +262,7 @@ hint 与追加式上下文是两层，判据是一句话：**频繁变化、且�
 
 每个完整 assistant 输出先取得稳定 `YYYYMMDD-N` 号并落 journal，再执行工具。派发前记录 `tool_started`，每个工具完成后立即记录它的原生 tool 结果，最后关闭逻辑 act。取消后已完成结果仍在；未执行、结果未知与中断由读取投影说明，恢复不自动重跑外部动作。当前运行的写入失败停止后续派发并报告；下次独立运行可重试，没有 oplog 的进程级熔断。
 
-`read_actions` 按正式号、最近条数或关键词分页读可读行动；`read_context` 渲染冻结视图。chatlog 继续负责窗口原文。思考和工具原参数都保存在 journal，`#reasoning drop`（以及旧视图里 compress 参数的缩短）只影响投影，不删原文。
+`read_actions` 按正式号、最近条数或关键词分页读可读行动；`read_context` 渲染当前段或冻结视图，也能给出请求概览（见[上下文概览](#上下文概览)）。chatlog 继续负责窗口原文。思考和工具原参数都保存在 journal，`#reasoning drop`（以及旧视图里 compress 参数的缩短）只影响投影，不删原文。
 
 
 ### 思考内容开关与思考等级（Reasoning Effort）
@@ -287,9 +307,9 @@ hint 与追加式上下文是两层，判据是一句话：**频繁变化、且�
 
 ## `fork` 的分身分派
 
-`agents__fork(goal, refs="", tasks="", tools="", model="")` 按引用组装独立运行。refs 用上文那一套引用写法（笔记名、日志编号、ctx、`policy:`、`log:` 等），复用原条目，坏引用指出具体引用。tasks 每行一项，最多五项同时运行，结果按原顺序返回 `(任务, ctx, 结果)`；失败也给独立 ctx，能用 `read_context` 查已完成部分。
+`agents__fork(goal, refs="", tasks="", tools="", model="")` 按引用组装独立运行。refs 用上文那一套引用写法（笔记名、日志编号、ctx、`policy:`、`log:` 等），复用原条目，坏引用指出具体引用。tasks 每行一项，最多五项同时运行，结果按原顺序返回 `(任务, ctx, 结果)`。正常成果只取最后一条无工具调用的非空 assistant 答复，不拼接探索中的自语；异常为 `ERROR`、取消为 `CANCELLED`、没有最终答复为 `NO_FINAL`，均保留 ctx，不退回更早答复。分身可多次 `reframe`，父调用最后只收到一次结果；完整探索沿 ctx 查阅。本次没有新增 `return_result` 工具，出处可写在最终答复里。
 
-分身默认有 meta，与主运行分别绑定 active/schema 和唤醒状态。默认不暴露 `send/type_word`，tools 中逐行显式写函数名才授权，`me` 同时授权两者；重新 `load_tools` 不能绕过默认过滤。该授权只属于本次运行，仍使用 Bot 固定宿主权限。反思和沉淀的全局工具激活跨重启保留，行动由构造按次选择；schema 顺序来自各自视图。
+分身默认有 meta，与主运行分别绑定 active/schema 和唤醒状态。默认不暴露 `send/type_word`，tools 中逐行显式写函数名才授权，`me` 同时授权两者；重新 `load_tools` 不能绕过默认过滤。该授权只属于本次运行，仍使用 Bot 固定宿主权限。父运行已有的模块/函数限制与分身自身规则求交，load/reload、实际派发和再次 fork 都受约束；构造分身不能借显式发言授权或默认 meta 获得写笔记、执行代码和发言能力。生命周期入口按自身职责给：分身可 `reframe`，不能代父调用 `construct__assemble`。这些是工具暴露限制，沿用现有宿主信任域。反思和沉淀的全局工具激活跨重启保留，行动由构造按次选择；schema 顺序来自各自视图。
 
 所有模型调用经 run 把供应商返回的 usage 记入 Bot 账；费用按请求时刻的未命中、缓存命中和输出单价计算。缺 usage 暂无 token 估算计费兜底。`.chattop` 按自然月显示，调用次数与 HTTP 子请求数不同。
 
@@ -302,8 +322,8 @@ hint 与追加式上下文是两层，判据是一句话：**频繁变化、且�
 - **清单**：`CONTRACT` 说明职责和材料接口，随后加载 `data/notes/policy/construct.md` 的补充 checklist；不存在时用默认清单。保留陌生指代、矛盾、情绪、意外，要求依据与不确定性，不逐项交作业。引号自动查词已删除，构造显式调用 search/read_note 核对。
 - **材料选择**：目录显示首行、字符数与总行数。refs 和 read_note 同时支持 `笔记名@L起行-末行`，按源文件从 1 起计行，越界拒绝；局部引用保留独立 scope、出处与行段，不冒充全文。tools 选开场的工具/Skill 文档及函数；meta 基础能力保留，开发说明移到 `tool_development.md` 按需加载。history 选新消息前的接话条数，默认 10，可为 0；未读选择与确认不受它替代。
 - **聊天去重**：新 log 引用保存逐条版本身份；渲染时省略与本次 screen 或前面 log 重复的记录。保留当前图片和 screen 的 read_patch，首次输出才确认。旧无元数据的 log 原样显示。
-- **超时兜底**：构造运行有硬超时（默认 45 秒），超时、出错或没交规格都按黑板加消息直接行动，并在注意里写明，绝不因上游卡住而挡住唤醒。
-- **重放**：`construct.replay(ctx, policy_text=None, model=None)` 取一次封存构造的材料，带当前接口职责说明（旧样本会补上），可换一版 checklist 重跑，返回关注、引用、提醒、工具和接话条数的对照；不给 `agents__fork`、不跑行动。
+- **换段与超时兜底**：构造可用 `reframe` 选材料继续，也可委派继承只读限制的分身；新段不重新灌回整份初始材料，最终只交一份 assemble。构造运行有覆盖整次调用的硬超时（默认 45 秒），换段不重新计时；超时、出错或没交规格都按黑板加消息直接行动，并在注意里写明，绝不因上游卡住而挡住唤醒。
+- **重放**：`construct.replay(ctx, policy_text=None, model=None)` 取一次封存构造的原始材料（末段 ctx 沿 origin 回到开场），带当前接口职责说明（旧样本会补上），可换一版 checklist 重跑，返回关注、引用、提醒、工具和接话条数的对照；不给 `agents__fork`、不跑行动。
 
 ### 面包屑（笔记名与别名）
 
