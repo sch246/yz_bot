@@ -24,6 +24,7 @@ per-record ``unread`` facts when passed back to restore_read.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from copy import deepcopy
 import hashlib
 from pathlib import Path
@@ -44,6 +45,13 @@ FRESH_MAX = 60
 # One persistent owner, including exceptions that precede the continuous watermark.
 _READ_KEY = "read"
 _lock = threading.RLock()
+# WHY: 工具续轮反复准备同一个窗口，但扫描过不等于模型读过。解析缓存独立于
+# 已读状态；只留近期使用的日档，不能把多年档案变成常驻内存。容量按源文件字节计。
+_RECORD_CACHE_BYTES = 16 * 1024 * 1024
+_RECORD_CACHE_FILES = 64
+_record_cache: OrderedDict = OrderedDict()
+_record_cache_size = 0
+_record_cache_lock = threading.RLock()
 
 
 def _read() -> dict:
@@ -218,6 +226,59 @@ def _record_time(day: tuple[int, int, int], head: str) -> int | None:
     return chatlog._epoch(day, match) if match else None
 
 
+def _file_version(path: Path) -> tuple:
+    stat = path.stat()
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
+def _file_records(path: Path, day: tuple[int, int, int]) -> list[dict]:
+    """Cache raw records and lazy parsing; caller holds _record_cache_lock."""
+    global _record_cache_size
+    key = (path.absolute(), day)
+    version = _file_version(path)
+    previous = _record_cache.get(key)
+    if previous is not None and previous["version"] == version:
+        _record_cache.move_to_end(key)
+        return previous["records"]
+
+    text = path.read_text(encoding="utf-8")
+    after = _file_version(path)
+    records, offset = [], 0
+    last = None
+    if previous is not None:
+        del _record_cache[key]
+        _record_cache_size -= previous["size"]
+        # WHY: inode 相同且变大也可能是外部改写。变化时核对实际前缀，才可
+        # 复用旧记录；从末条重新分割，保留无末尾换行、半条正文继续追加的行为。
+        if text.startswith(previous["text"]) and previous["records"]:
+            records = previous["records"][:-1]
+            offset = previous["tail"]
+            last = previous["records"][-1]
+    lines = text[offset:].split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    spans = chatlog._file_records(lines) if lines else []
+    for start, end in spans:
+        raw = "\n".join(lines[start:end])
+        if last is not None and not start and raw == last["text"]:
+            records.append(last)
+        else:
+            records.append({"text": raw, "hidden": end - start > 1
+                            and lines[start + 1].startswith("    #"), "parsed": None})
+    tail = offset + sum(len(line) + 1 for line in lines[:spans[-1][0]]) if spans else 0
+    # 并发写入时不缓存这次观察，下次重新读；不把半途内容钉成最终版本。
+    size = version[2]
+    if version == after and size <= _RECORD_CACHE_BYTES:
+        _record_cache[key] = {"version": version, "text": text, "records": records,
+                              "tail": tail, "size": size}
+        _record_cache_size += size
+        while (len(_record_cache) > _RECORD_CACHE_FILES
+               or _record_cache_size > _RECORD_CACHE_BYTES):
+            _, evicted = _record_cache.popitem(last=False)
+            _record_cache_size -= evicted["size"]
+    return records
+
+
 def records(window: tuple, count: int, before: int | None = None, since: float | None = None,
             *, include_hidden: bool = False, days=None) -> list[dict]:
     """The newest *count* records of one window, oldest first.
@@ -234,28 +295,28 @@ def records(window: tuple, count: int, before: int | None = None, since: float |
     for day, path in _day_files(window, days):
         if since is not None and chatlog._day_bounds(day)[1] < since:
             break
-        lines = path.read_text(encoding="utf-8").split("\n")
-        if lines and lines[-1] == "":
-            lines.pop()
-        # WHY: 画面通常只要几十条；先解析整天再截尾，会在每次工具续轮
-        # 重做当天所有消息的时间、身份和正文解析。按文件位置倒读，够数就停。
-        for start, end in reversed(chatlog._file_records(lines)):
-            # WHY: `#` 开头的消息是控制与调试输出（子命令结果、traceback、`#hint` 状态），
-            # 按跨模块约定不回流进模型，见 docs/llm.md「上下文如何组装」。
-            # Only kinds declaring hide_control (QQ) have # commands: CLI answers often start with Markdown headings.
-            if (hide_control and end - start > 1
-                    and lines[start + 1].startswith("    #")):
-                continue
-            text = "\n".join(lines[start:end])
-            stamp = _record_time(day, lines[start])
-            if before is not None and stamp is not None and stamp >= before:
-                continue
-            head = chatlog._split_head(lines[start])
-            value = head.get("message_id") if head else None
-            identity_ = str(value) if value else "~" + hashlib.sha256(f"{stamp}\n{text}".encode()).hexdigest()
-            picked.append({"id": identity_, "day": day, "time": stamp, "text": text})
-            if len(picked) >= count:
-                return picked[::-1]
+        with _record_cache_lock:
+            # WHY: 首屏通常只要几十条；未触及的旧记录不提前解析。缓存保留
+            # 原文与解析值，不缓存 unread/shown，它们由每次请求的读状态决定。
+            for record in reversed(_file_records(path, day)):
+                # WHY: QQ 的 # 控制消息不回流模型；CLI 的 Markdown 标题照常可见。
+                if hide_control and record["hidden"]:
+                    continue
+                item = record["parsed"]
+                if item is None:
+                    text = record["text"]
+                    first = text.partition("\n")[0]
+                    stamp = _record_time(day, first)
+                    head = chatlog._split_head(first)
+                    value = head.get("message_id") if head else None
+                    identity_ = str(value) if value else "~" + hashlib.sha256(f"{stamp}\n{text}".encode()).hexdigest()
+                    item = record["parsed"] = {"id": identity_, "day": day, "time": stamp, "text": text}
+                if before is not None and item["time"] is not None and item["time"] >= before:
+                    continue
+                # prepare 会给返回值附 unread，调用者也能修改它；不能污染共享解析值。
+                picked.append(dict(item))
+                if len(picked) >= count:
+                    return picked[::-1]
     return picked[::-1]
 
 
