@@ -18,7 +18,7 @@ QQ / NapCat
 
 NapCat 的 API 默认位于 `5700`，Bot 的事件监听默认位于 `5701`。端口可通过 `run.py -q/-p` 调整；启动前应确认没有另一 Bot 进程占用同一账号、运行数据或监听端口。
 
-当前部署以 Linux 为主，聊天 shell、GNU screen、固定解释器路径和部分编译命令也直接依赖 Linux 环境。仓库根的 `.gitattributes` 使用 `* text=auto eol=lf`，因此所有被 Git 识别为文本的追踪文件都以 LF 入库和检出；即使从 Windows 操作，也不应重新提交 CRLF。二进制文件仍由 `text=auto` 排除在换行转换之外。
+当前部署以 Linux 为主，聊天 shell、GNU screen（mc、nl 在用）、tmux（命令行窗口）、固定解释器路径和部分编译命令也直接依赖 Linux 环境。仓库根的 `.gitattributes` 使用 `* text=auto eol=lf`，因此所有被 Git 识别为文本的追踪文件都以 LF 入库和检出；即使从 Windows 操作，也不应重新提交 CRLF。二进制文件仍由 `text=auto` 排除在换行转换之外。
 
 `run.py` 是生命周期监督者：子进程以特殊退出码请求重启，或在 `-a` 模式下异常退出时自动拉起。SIGINT 会转发给子进程，使退出保存器有机会落盘。
 
@@ -81,6 +81,7 @@ uv run --frozen python run.py --smoke
 | journal 的循环备注条目与 `me` 的实际唤醒记录 | 她给循环写过什么、何时醒过 | `loop_note_history` 查 journal；`read_log("me")` 查已发生理由 | 记录保留；loop/wait 排期只在内存 |
 | `data/storage/window_titles.json` | 她给窗口起的名字 | `set_name` 设定的窗口自定义称呼（优先于群名和昵称） | 一直留 |
 | `data/usage/YYYY-MM-DD.jsonl` | 每次模型调用（含 `describe_image` 旁路视觉调用）花了多少 token | 按天记录每次调用的时间、模型、`prompt`、`completion`、`cached` token 数 | 滚动保留 30 天 |
+| `data/term/` | 她的命令行窗口 | `tmux.sock` 是她自己的 tmux 服务器（和维护者自己开的 tmux 分开），`tmux.conf` 是它的设置（历史一万行、shell 退出后留着读退出码），`<名字>.log` 是 pipe-pane 追加的原始输出；已推到哪个位置、哪次输入还在等回答在 storage `term/state` | 会话跨重启一直留，`term__close` 或 shell 退出才收掉；单个 log 超过 20MB 时清空重来 |
 | `data/bili/credential.json` | B 站登录凭证 | 柚子 B 站号的 cookie（权限 600）；已读位置、昵称和"评论属于哪一楼"在 storage `bili/state` | 一直留，失效后重新 `.bili login` |
 | `data/notes/policy/changes.md` | 策略为什么改、改了有没有用 | 原因、预期和评估；只往后追加，追加不备份 | 一直留 |
 
@@ -122,6 +123,8 @@ HTTP 200 只表示事件已被本地监听器接收，不表示命令或回复�
 ### 命令超时转后台
 
 模型工具的 shell 命令不再在超时时被杀。`host__run_command` 默认等 15 秒；到点没跑完就交给 `mods/shell.py` 的后台登记，输出留在 `data/commands/<任务号>.log`（回执给绝对路径），返回任务号、文件路径和已有输出。后台进程的 stdin 是 `/dev/null`，stdout 和 stderr 合流进同一个文件。后台线程等它退出，把退出码和最后几十行推进她的 `me` 窗口；默认 wait 转后台时也会叫醒（等同 wake），`timeout=0` 只是立刻转后台，不是无限等。`host__stop_command` 按任务号对进程组发 SIGTERM，宽限 3 秒再 SIGKILL；组长先退出时仍按登记里的 pgid 收剩下的子进程。每个后台任务在 `data/commands/` 下还有一份 `<任务号>.json`；正常退出时 `shell` 在 atexit 里收掉所有组，崩溃重启后按这份记录接管还活着的组，`stop_command` 仍能停，不会把“日志存在”误判成“早就结束了”。`watchdog` 的 `^C` 终止也先看它是不是自己的进程组组长：组长就整组收，普通子进程只杀它本身，避免打到 Bot 的进程组；它现在记录 spawn 时的 pgid，SIGTERM 后把 3 秒宽限和 SIGKILL 交给后台线程，不再让 `Job.stop` 逐个等，^C 和超时路径能尽快拿回控制权。还在跑的命令列在每轮请求末尾的提示里，每次重新算、不存。`exec_code` 的 `timeout` 同样默认 15 秒，`0` 只允许后台模式；后台跑在独立线程、不排 `_tasks` 的单队列（0 可能无限等），`print` 捕获改成 `ContextVar`，用户代码自己起的线程也会继承同一捕获流，不再写共享的 `py.loc`。
+
+命令行窗口（`mods/term.py`）的 tmux 会话不随 Bot 退出：`on_exit` 只停读线程，重启后按 storage 里记下的位置接着读，停机期间的输出作为一批补进来；会话没了（机器重启、tmux 服务器被关）就在那个窗口留一句并叫醒她，下次发送重开。没装 tmux 时模块照常加载，发送报“没装 tmux”。
 
 `data/commands/` 是运行数据，不会被自动清理；每天整理时按需归档或删除。`mods/shell.py` 是普通核心模块（默认 FEATURE 阶段），改它要重启，不能靠 `reload_tools`。
 
