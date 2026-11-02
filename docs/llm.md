@@ -147,7 +147,7 @@ Files API 只对 `deepseek` 供应商启用，默认开启，可在该模型配�
 | `reload_tools` | 按模块名从磁盘显式应用、更新或删除模块；逐项返回成功和带完整 traceback 的失败结果，失败保留旧 last-good。 |
 | `load_tools` | 将 last-good 模块激活到当前 Chat；中心名单存全局 `agent`，不读取磁盘。 |
 
-`meta` 还提供按运行启用的 `reframe`（见[重新组装](#运行中重新组装上下文)）、明确目标的 `type_word/send`、规则 `wake_me`、召回 `search/read_log/read_actions/read_note`、笔记 `write_note`、连续活动 `loop/wait/loop_note_history`、`set_name` 与 `attach_image`（2026-11-01 删除了 `tidy/dismiss/compress/decompress`）。工具模块 `construct` 只有 `assemble`，只在构造运行里可见、可用。发送先打字、下个模型输出再发送；输入框存在 storage，跨唤醒和重启保留。`send(wait=0)` 继续工作，`wait=-1` 收工被动等，正时长则挂回复或超时的一次等待，可用 `who` 限定作者；群里不写 `who` 时，这次唤醒若是某人叫醒的就默认只等这个人，写 `who="any"` 等全群（2026-10-31）。时长后面可以直接跟理由，如 `wait="5m 等他接话"`。CLI 窗口（[CLI agent 窗口](cli-agents.md)）把整段输入作为一轮任务，不拆气泡。
+`meta` 还提供按运行启用的 `reframe`（见[重新组装](#运行中重新组装上下文)）、明确目标的 `type_word/send`、规则 `wake_me`、召回 `search/read_log/read_actions/read_note`、笔记 `write_note`、连续活动 `loop/wait/loop_note_history`、`set_name` 与 `attach_image`（2026-11-01 删除了 `tidy/dismiss/compress/decompress`）。工具模块 `construct` 只有 `assemble`，只在构造运行里可见、可用。发送先打字、下个模型输出再发送；输入框存在 storage，跨唤醒和重启保留。`send(wait=0)` 继续工作，`wait=-1` 收工被动等，正时长则挂回复或超时的一次等待，可用 `who` 限定作者（命令行窗口 `term:名字` 里 `who` 是要等的一段文字，输出里出现才算等到）；群里不写 `who` 时，这次唤醒若是某人叫醒的就默认只等这个人，写 `who="any"` 等全群（2026-10-31）。时长后面可以直接跟理由，如 `wait="5m 等他接话"`。CLI 窗口（[CLI agent 窗口](cli-agents.md)）把整段输入作为一轮任务，不拆气泡。
 
 仓库当前提供以下按需模块；函数只在对应模块激活后出现：
 
@@ -178,6 +178,7 @@ Files API 只对 `deepseek` 供应商启用，默认开启，可在该模型配�
 | `tts` | `tts__speak`：用 edge-tts（微软 Edge 在线朗读，非官方、免账号）把文字念成 mp3，默认音色晓伊 `zh-CN-XiaoyiNeural`，存进 `data/tmp_files` 返回 `file://` 路径；她再用 `[CQ:record,file=…]` 经 `type_word`／`send` 发语音 |
 | `weather` | `weather__search_city`、`weather__get_realtime_weather`、`weather__get_daily_forecast`、`weather__get_hourly_forecast` |
 | `memory_system` | `memory_system__read_context`、`note_history`、`read_policy`、`edit_policy`、`assess_change`（夜间反思时加载；构造可按需加载，但实际只开放 `memory_system__read_context`） |
+| `term` | `term__look`（命令行窗口渲染后的屏幕或最近若干行历史）、`term__keys`（按 tmux 键名，如 `C-c`）、`term__close`、`term__terminals`；`BOT_OP_ONLY`。往 `term:名字` 打字发送走 `type_word/send` |
 | `yuzu_hello` | `yuzu_hello__hello`（最小示例工具模块） |
 
 `host` 是 `exec_code` 之外的常用出口：文件读写和 shell 都不必再绕一次任意代码执行。读取按本次实际截取的窗口计字节，超过 `max_bytes` 时只回大小和后续建议（缩小区间、先 `grep -n` 定位、或用 `fork` 开子会话通读后带回摘要），不做分页会话。改写靠 `read_file` 首行 header 里的 `line`/`size`/`v` 定位与对账：位置与新内容的写法无关，`v` 只在该区间自读取后被改动过时失配，失配的返回自带现状和新 header。渲染格式与 `.edit` 同源，所以手动编辑和模型改写看到的是同一种东西；它没有目录白名单，`data/`、`config.json`、`.env` 和聊天记录都在可及范围内。

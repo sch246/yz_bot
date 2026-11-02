@@ -360,8 +360,12 @@ def check(now: float | None = None, *, active=None) -> None:
     storage.save()
 
 
-def take_waiting(window: tuple, author) -> list[dict]:
-    """Claim persistent on rules and the process-local wait satisfied by a message."""
+def take_waiting(window: tuple, author, text: str = "") -> list[dict]:
+    """Claim persistent on rules and the process-local wait satisfied by a message.
+
+    A wait carrying ``text`` (a terminal waiting for output) is satisfied only by a record
+    whose text contains it.
+    """
     window = tuple(window)
     with _edit:
         found, _skipped = rules()
@@ -370,7 +374,8 @@ def take_waiting(window: tuple, author) -> list[dict]:
         claimed = set(_claim([rule["key"] for rule in matched]))
         result = [rule for rule in matched if rule["key"] in claimed]
         waiting = _waiting.get(window)
-        if waiting and (waiting["author"] is None or waiting["author"] == author):
+        if (waiting and (waiting["author"] is None or waiting["author"] == author)
+                and (not waiting.get("text") or waiting["text"] in text)):
             result.append(_waiting.pop(window))
         return result
 
@@ -381,7 +386,14 @@ def expire_wait(rule: dict, now: float) -> bool:
         if current is None or current["token"] != rule["token"] or current["moment"] > now:
             return False
         del _waiting[tuple(rule["window"])]
-    return _ring(rule, f"等到 {rule['until']}，{rule['target']} 都没有新消息。当时想的是：{rule['reason']}")
+    missing = f"都没有出现「{rule['text']}」" if rule.get("text") else "都没有新消息"
+    return _ring(rule, f"等到 {rule['until']}，{rule['target']} {missing}。当时想的是：{rule['reason']}")
+
+
+def waiting_text(window: tuple) -> str | None:
+    """The text a terminal's pending wait is looking for, if any."""
+    with _edit:
+        return (_waiting.get(tuple(window)) or {}).get("text")
 
 
 def _layers(now: float) -> list[dict]:
@@ -454,7 +466,8 @@ def badges(window: tuple) -> list[str]:
         waiting = list(_waiting.values())
     for rule in waiting:
         if rule["kind"] == "wait" and rule["window"] == window and now < rule["moment"]:
-            target_desc = f"只看 {rule['author']}" if rule.get("author") is not None else "等回复"
+            target_desc = (f"等「{rule['text']}」出现" if rule.get("text")
+                           else f"只看 {rule['author']}" if rule.get("author") is not None else "等回复")
             found.append(f"{target_desc}到 {rule['until']}")
     return found
 
@@ -516,12 +529,23 @@ def override(target: str, decide, until: float | None = None, reason: str = "") 
     return f"{target}：{describe(item)}"
 
 
-def plant(when: str, reason: str, now: float | None = None) -> str:
-    """Turn what `wake_me` was given into one awaker line and append it; ValueError when unreadable."""
+def plant(when: str, reason: str, now: float | None = None, *, text: str | None = None) -> str:
+    """Turn what `wake_me` was given into one awaker line and append it; ValueError when unreadable.
+
+    *text* (or ``wait term:main「文字」 10m``) makes a wait on a terminal window come true only
+    when that text shows up in its output.
+    """
     now = time.time() if now is None else now
     when, reason = " ".join(when.split()), " ".join(str(reason).split())
     if not reason:
         raise ValueError("reason 不能空：写给到时候的自己，说明为什么叫醒")
+    if text is None and (quoted := re.fullmatch(r"wait\s+(\S+?)\s*「(.+)」\s+(\S+)", when)):
+        when, text = f"wait {quoted[1]} {quoted[3]}", quoted[2]
+    if text is not None:
+        # 终端的记录每行去掉了行尾空白，等的文字也去掉，否则 "$ " 永远等不到。
+        text = str(text).strip()
+        if not text or not when.startswith("wait "):
+            raise ValueError("等一段文字写 wait term:main「要等的文字」 10m")
 
     def stamp(seconds: float) -> str:
         # 规则只记到分钟：往后取整，宁晚不早。
@@ -560,10 +584,15 @@ def plant(when: str, reason: str, now: float | None = None) -> str:
     if found[0]["kind"] == "wait":
         from . import attention
         rule = dict(found[0], token=uuid4().hex)
+        if text is not None:
+            if not _windows.spec(rule["window"])["wait_text"] or rule["author"] is not None:
+                raise ValueError("只有命令行窗口（term:名字）能等一段文字；群里只等某人写 wait g群号:QQ号 10m")
+            rule["text"] = text
         if wait_seconds is not None:
             rule["moment"] = now + wait_seconds
             rule["until"] = datetime.fromtimestamp(rule["moment"]).strftime("%Y-%m-%d %H:%M:%S")
-            rule["key"] = line = f"wait {rule['target']} until {rule['until']} {reason}"
+            shown = f"「{text}」" if text is not None else ""
+            rule["key"] = line = f"wait {rule['target']}{shown} until {rule['until']} {reason}"
         with _edit:
             _waiting[tuple(rule["window"])] = rule
         attention.schedule("wait_rule", rule["moment"], window=rule["window"],
