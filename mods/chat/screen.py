@@ -19,6 +19,7 @@ A migration may set through to the latest known historical second and represent
 all genuinely unread records explicitly in pending; no timestamp rollback is
 needed for dismiss. Patches are opaque view metadata and must retain their
 per-record ``unread`` facts when passed back to restore_read.
+``replay_from`` marks the first live write's recovery boundary, never a read receipt.
 """
 
 from __future__ import annotations
@@ -56,6 +57,22 @@ def _state(window: tuple) -> dict:
 def read_snapshot() -> dict:
     with _lock:
         return deepcopy(_read())
+
+
+def begin_write(window: tuple, stamp=None) -> None:
+    """Persist a first-write recovery boundary without confirming any reading."""
+    with _lock:
+        state = _state(window)
+        if state.get("through") is None and state.get("replay_from") is None:
+            # WHY: 没有已读水位不代表多年档案全是新到达（2026-11-02 CPU 事故）。
+            # 在首条实时日志写入前留起点，崩溃后才能补登记，且不把旧档案激活。
+            # 不能拿 pending 的最大时间推进：中间一次登记失败后仍可能收到新消息。
+            state["replay_from"] = int(time.time() if stamp is None else stamp)
+            try:
+                storage.save()
+            except Exception:
+                del state["replay_from"]
+                raise
 
 
 def record_id(event: dict) -> str:

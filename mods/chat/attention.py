@@ -449,18 +449,24 @@ def rescan() -> None:
     import mods.chat as chat
 
     restored = screen.read_snapshot()
-    for window in windows.logged():
-        restored.setdefault(windows.label(window), {"through": None, "at": [], "pending": {}, "excluded": {}})
     for text, state in restored.items():
         try:
             window = windows.parse(text)
         except ValueError:
             continue
-        # Close the write-before-registration crash gap. Older offline calls are
-        # already explicit pending exceptions supplied by backfill/migration.
+        # WHY: 日档存在不证明其中有新到达。没有水位的旧窗口曾把数万条历史
+        # 登记成 pending、占满 CPU；只补已读水位或预写起点之后的登记缺口。
+        # 更早的离线召唤由 backfill/migration 明确登记，仍由下方独立恢复。
+        # 读到一个更早的 pending 不能把已建立的恢复起点倒退回多年以前。
+        since = max((stamp for stamp in (state.get("through"), state.get("replay_from"))
+                     if stamp is not None), default=None)
         changed = False
         try:
-            for row in screen.records(window, 1_000_000, since=state.get("through")):
+            rows = screen.records(window, 1_000_000, since=since) if since is not None else ()
+            for row in rows:
+                # records 的 since 只筛日档；同日更早的记录不属于这个恢复区间。
+                if row["time"] is None or row["time"] < since:
+                    continue
                 identity_ = row["id"]
                 if identity_ in state["pending"] or not screen.is_unread(state, identity_, row["time"]):
                     continue

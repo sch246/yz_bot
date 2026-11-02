@@ -587,6 +587,11 @@ def record_event(event: dict, write: Callable[[], object]) -> object:
     if window is None or not _mail_candidate(event):
         return write()
     with context.window_lock(window):
+        try:
+            _screen.begin_write(window, event.get("time"))
+        except Exception:
+            # 与下面登记失败相同：存储故障不能挡住维护命令的路由。
+            _reflect_stream.exception("保存恢复起点失败，仍继续明确命令路由")
         result = write()
         if result is None:
             context.remember_arrival(event, None)
@@ -775,6 +780,7 @@ def push(window: tuple, author: str, text: str, *, wake: str = "", record_id: st
     now = time.time()
     record_id = " ".join(str(record_id).split()) or uuid4().hex[:8]
     with context.window_lock(window):
+        _screen.begin_write(window, now)
         chatlog.append_record(window[0], window[1], author, body, now, record_id)
         event = {"post_type": "push", "time": int(now), "author": str(author),
                  "text": body, "id": record_id, "_default_wake": wake}
