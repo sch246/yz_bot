@@ -904,11 +904,16 @@ class LLMClient:
                     while len(tool_calls) <= index:
                         tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
                     target = tool_calls[index]
+                    # WHY: Gemini 的 OpenAI 兼容接口把 thought_signature 放在
+                    # extra_content 中；工具结果续轮必须原样带回，否则返回 400。
+                    # 扩展字段按调用保留，不把不透明签名当参数分片拼接。
+                    target.update({key: value for key, value in call.to_dict().items()
+                                   if key not in ("index", "id", "type", "function") and value is not None})
                     if call.id:
                         target["id"] = call.id
-                    if call.function.name:
+                    if call.function and call.function.name:
                         target["function"]["name"] = call.function.name
-                    if call.function.arguments:
+                    if call.function and call.function.arguments:
                         target["function"]["arguments"] += call.function.arguments
             if not finished:
                 raise RuntimeError("模型流缺少结束标记，拒绝派发行动")
@@ -957,7 +962,8 @@ class LLMClient:
                 label_role=role,
             )
             yield LLMResponse(
-                json.dumps({"id": call.id, "type": "function", "function": {"name": call.function.name, "arguments": call.function.arguments}}, ensure_ascii=False),
+                # 与流式路径一样保留供应商扩展字段，供工具续轮和历史回放。
+                json.dumps(call.to_dict(), ensure_ascii=False),
                 "tool",
             )
         if message.content:
