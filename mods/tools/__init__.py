@@ -327,7 +327,8 @@ def _render_context(
     else:
         lines.append("- (无)")
     result = "\n".join(lines)
-    for name in sorted(active):
+    # WHY: meta 是每轮共有的说明；可选模块先出现会在它之前截断可复用的请求前缀。
+    for name in sorted(active, key=lambda name: (name != _BASE_MODULE_NAME, name)):
         content = active[name]["content"]
         if content:
             result += f"\n\n## 已激活模块 {name}\n{content}"

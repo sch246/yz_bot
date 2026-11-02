@@ -220,13 +220,14 @@ def material(wake: dict) -> list[dict]:
     screens = _screens(wake["associated_windows"], chat.limit()[0])
     mentioned = [scope for scope, _word in _notes.mentioned(screens)]
     crumbs = ("\n\n画面提到了这些有笔记的东西：" + "、".join(dict.fromkeys(mentioned))) if mentioned else ""
-    # WHY: 2026-11-01 缓存按字节前缀命中，按变化快慢排：策略和目录几乎不变，黑板随沉淀改写，
-    # 时间线和运行列表每次都变。以前黑板排在目录前面，构造首轮只命中两成。
+    # WHY: 缓存按字节前缀命中；2026-11-01 黑板随沉淀改写，排在目录前使构造首轮只命中两成。
+    # 目录现含笔记字数和行数，任何笔记改写也可能让它变；相对稳定的 todo 提到目录和黑板前，
+    # 时间线和运行列表仍在后面。todo 自身改写仍会截断前缀，这是保留当前内容的取舍。
     return [
         {"role": "system", "content": policy()},
+        {"role": "system", "content": chat.todo_material() or "（todo 是空的）"},
         {"role": "system", "content": "【笔记目录（折叠的，要用就写进 refs）】\n" + directory()},
         {"role": "system", "content": "【黑板 recent】\n" + board},
-        {"role": "system", "content": chat.todo_material() or "（todo 是空的）"},
         {"role": "system", "content": "【最近（折叠的，要用就写进 refs）】\n"
                                       "最近你做过的事：\n" + timeline()
                                       + "\n\n最近几次运行：\n" + recent_runs()
