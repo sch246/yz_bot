@@ -51,4 +51,9 @@ def read_context(name: str = "", start: int = 0, match: str = "", around: int = 
     return _roles.read_context(name, start, match, around, detail, request)
 
 
+# WHY: 维护者 2026-11 定：edit_policy／assess_change 那套（强制 reason/expect、自动记 changes、
+# 标出早于改动的证据）太重，笔记和策略统一走 read_file/write_file。记账和“证据要晚于改动”
+# 现在只是上面的说明，需要提醒时由构造运行提。审计里证据早于改动的那次
+# （yuzu-memory-production-audit-20261101.md 第 5 条）就是当初加检查的原因；要是这种情况又出现，
+# 先考虑让构造去提醒，不要先把工具加回来。
 __all__ = ["read_context"]

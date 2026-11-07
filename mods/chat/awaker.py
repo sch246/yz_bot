@@ -80,14 +80,14 @@ _WAIT = re.compile(r"^\s*(?:[-*]\s+)?wait\s+" + _TARGET
 _LAYER = re.compile(r"^\s*(?:[-*]\s+)?(follow|mute)\s+(\S+)"
                     r"\s+until\s+(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})\s+(.+?)\s*$")
 _WHEN = re.compile(r"^\s*(?:[-*]\s+)?when\s+(.+?)\s+->\s+(.+?)\s*$")
-# 改笔记的地方（划掉响过的行、wake_me 追加）互相排队；她用 write_note 整份改不经过这里。
+# 改笔记的地方（划掉响过的行、wake_me 追加）互相排队；她用 write_file 改 awaker.md 不经过这里。
 _edit = threading.RLock()
 # wait is deliberately process-local; follow/mute/on remain file-authoritative.
 _waiting: dict[tuple, dict] = {}
 # 代码设的覆盖层（other），目标原文 → {"decide": 函数, "moment": 到期时刻或 None, "reason": …}。
 _custom: dict[str, dict] = {}
 # follow 从什么时候盖上的，目标原文 → 时刻：画面据此把 follow 期间到的消息给全（agent._screen_text）。
-# 只在内存里；重启后、或者她直接用 write_note 写的 follow 不知道起点，画面照旧截。
+# 只在内存里；重启后、或者她直接用 write_file 写的 follow 不知道起点，画面照旧截。
 _since: dict[str, float] = {}
 _broken: set[str] = set()
 _UNIT = {"s": 1, "m": 60, "h": 3600, "d": 86400}
@@ -295,7 +295,7 @@ def _holds(expression: str) -> bool:
     """Evaluate a ``when`` condition in a copy of the shared ``.py`` environment.
 
     WHY: 这是每分钟自动跑的任意代码，和 exec_code 同一个信任域，所以同样要 Bot 自己有 op；
-    否则 wake_me 或 write_note 写一行 when 就绕过了 exec_code 的门。
+    否则 wake_me 或 write_file 往 awaker.md 写一行 when 就绕过了 exec_code 的门。
     """
     from mods import op, py
 
