@@ -623,13 +623,16 @@ def resolve_refs(view, refs):
 
 
 def _note_refs(view, scope):
-    from . import notes
+    from . import construct, notes
 
     try:
         text = notes.render(scope).strip()
     except ValueError:
         return None
-    return _text_ref(view, scope, text) if text else None
+    if not text:
+        return None
+    construct.opened(scope)
+    return _text_ref(view, scope, text)
 
 
 def _policy_ref(view, name):

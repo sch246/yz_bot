@@ -64,10 +64,51 @@ def log_request(row: dict) -> None:
     每次实际派发记一行（各条消息的哈希与来源，不存正文），usage 回来再记一行，按
     ctx 和请求序号对上。和上面的账一样，写盘失败不能弄崩对话。
     """
+    _append("requests", row)
+
+
+def log_recall(row: dict) -> None:
+    """记一条笔记召回：一次唤醒有哪些提示，或这次唤醒里她第一次用到某份笔记。
+
+    WHY: 2026-11-07 维护者：长期记忆的问题是“需要的时候能不能触发”，提醒本身又会占
+    注意力、成为偏向。所以相近笔记的候选先只记不给她看（construct.SHOW_SIMILAR），
+    面包屑没点到、她却翻开了的笔记记下当时重合的词，夜里反思时给她当别名候选。
+    这两件事都靠这份记录对账；和请求组成一样只是日志，写盘失败不能弄崩对话。
+    """
+    _append("recall", row)
+
+
+def read_recall(since: float) -> list[dict]:
+    """``recall/`` 里时间不早于 since 的行，按时间顺序。"""
+    directory = os.path.join(_root, "recall")
+    rows = []
+    try:
+        names = sorted(name for name in os.listdir(directory) if name.endswith(".jsonl"))
+    except OSError:
+        return rows
+    first = _day(since)
+    for name in names:
+        if name[:10] < first:
+            continue
+        try:
+            with open(os.path.join(directory, name), encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(row, dict) and float(row.get("t") or 0) >= since:
+                        rows.append(row)
+        except OSError:
+            continue
+    return rows
+
+
+def _append(subdirectory: str, row: dict) -> None:
     try:
         now = float(row.get("t") or time.time())
         line = json.dumps(row, ensure_ascii=False, separators=(",", ":"))
-        directory = os.path.join(_dir(), "requests")
+        directory = os.path.join(_dir(), subdirectory)
         os.makedirs(directory, exist_ok=True)
         with _lock:
             with open(os.path.join(directory, _day(now) + ".jsonl"), "a", encoding="utf-8") as fh:
@@ -78,7 +119,7 @@ def log_request(row: dict) -> None:
 
 
 def purge(keep_days: int = KEEP_DAYS) -> int:
-    """删掉太老的日文件（账本和 ``requests/`` 两处）；一天最多扫一次。返回删了几个。"""
+    """删掉太老的日文件（账本、``requests/`` 和 ``recall/``）；一天最多扫一次。返回删了几个。"""
     today = time.strftime("%Y-%m-%d")
     with _lock:
         if _last_purge[0] == today:
@@ -86,7 +127,7 @@ def purge(keep_days: int = KEEP_DAYS) -> int:
         _last_purge[0] = today
     removed = 0
     cutoff = time.time() - keep_days * 86400
-    for directory in (_dir(), os.path.join(_root, "requests")):
+    for directory in (_dir(), os.path.join(_root, "requests"), os.path.join(_root, "recall")):
         try:
             names = os.listdir(directory)
         except OSError:

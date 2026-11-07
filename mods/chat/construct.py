@@ -22,9 +22,14 @@ import logging
 import re
 import time
 
-from mods import storage, tools as tool_modules
+from mods import storage, tools as tool_modules, usage
 
 from . import journal, notes as _notes, roles as _roles, screen as _screen, segment as _segment, windows as _windows
+
+# WHY: 2026-11-07 维护者：提醒只要占了注意力就是偏向。相近笔记的候选（notes.similar）照算、
+# 照记进 usage 的 recall 日志，但先不挂给构造看，等记录说明她自己翻开的笔记常在候选里再打开；
+# 挂出来以后“被打开”会自己证明自己，就量不出它到底有没有用了。
+SHOW_SIMILAR = False
 
 DEFAULT_CONFIG = {"on": True, "model": "deepseek/deepseek-flash", "effort": "none", "timeout": 45}
 GOAL = "为接下来的自己提供信息、提醒和洞察；用 construct__assemble 提交一份上下文准备，提交后结束。"
@@ -136,13 +141,13 @@ def fold(ref: str) -> str:
 # WHY: 删除 observer 的引号查词：普通原话也会带引号，文本命中不等于相关记忆。
 # 构造已有 search/read_file 与目录，需要验证的联系由它显式查询（2026-11-02）。
 def directory(most: int = 80) -> str:
-    rows = _notes.listing(limit=10**6)
-    # WHY: 选哪些仍按修改时间（最近动过的优先），显示按名字排：按修改时间显示时每写一次
-    # 笔记顺序就变，整份目录连同后面的内容都进不了缓存（2026-11-01）。
+    rows = _notes.ranked(_notes.listing(limit=10**6))
+    # WHY: 选哪些按激活度（读得多、读得近的优先，2026-11-07；以前按修改时间），显示按名字排：
+    # 按修改时间显示时每写一次笔记顺序就变，整份目录连同后面的内容都进不了缓存（2026-11-01）。
     shown = sorted(rows[:most], key=lambda item: item["scope"])
     lines = [f"- {item['scope']}（{item['chars']} 字符，{item['lines']} 行）：{item['first']}" for item in shown]
     if len(rows) > most:
-        lines.append(f"（还有 {len(rows) - most} 份不常动的没列出；用 search 或 read_file 找）")
+        lines.append(f"（还有 {len(rows) - most} 份不常用的没列出；用 search 或 read_file 找）")
     return "\n".join(lines) or "（还没有笔记）"
 
 
@@ -225,13 +230,19 @@ def material(wake: dict) -> list[dict]:
     screens = _screens(wake["associated_windows"], chat.limit()[0])
     mentioned = [scope for scope, _word in _notes.mentioned(screens)]
     crumbs = ("\n\n画面提到了这些有笔记的东西：" + "、".join(dict.fromkeys(mentioned))) if mentioned else ""
-    # 接在本次消息末尾：这一条每次唤醒都不同，挂在这里不动前面的缓存前缀。
+    query = reasons + "\n\n" + screens
     try:
-        close = _notes.similar(reasons + "\n\n" + screens, exclude=mentioned)
+        close = _notes.similar(query, exclude=mentioned)
     except (OSError, ValueError):
         logging.getLogger(__name__).exception("similar notes failed")
         close = []
-    if close:
+    wake["recall"] = {"t": round(now, 3), "mentioned": set(mentioned), "similar": close,
+                      "query": query[-_notes._SIMILAR_CHUNK:], "seen": set()}
+    usage.log_recall({"t": round(now, 3), "event": "wake",
+                      "windows": sorted(_windows.label(tuple(window)) for window in wake["associated_windows"]),
+                      "breadcrumbs": list(dict.fromkeys(mentioned)), "similar": close})
+    # 接在本次消息末尾：这一条每次唤醒都不同，挂在这里不动前面的缓存前缀。
+    if close and SHOW_SIMILAR:
         crumbs += ("\n\n和这些消息用词相近的笔记（程序按字面重合排的，不一定相关；要用就写进 refs）："
                    + "、".join(close))
     # WHY: 缓存按字节前缀命中；2026-11-01 黑板随沉淀改写，排在目录前使构造首轮只命中两成。
@@ -249,6 +260,80 @@ def material(wake: dict) -> list[dict]:
         {"role": "user", "content": "【等着你的（这一步只选一件做，其余留到下一步）】\n" + reasons + "\n\n"
                                     + (screens or "（没有新消息）") + crumbs},
     ]
+
+
+def opened(scope: str) -> None:
+    """A note was strung into a run: count the use, and log whether this wake had pointed at it.
+
+    Called where a note ref resolves into a run and where read_file reads a note. Only the
+    first use of each note within one wake is logged, and only inside the construct run and
+    the act that follows it; standing notes are always in front of her and are not logged.
+    """
+    try:
+        _opened(scope)
+    except Exception:
+        # 只是记账：读笔记和展开引用不能因为它失败。
+        logging.getLogger(__name__).exception("note use not recorded")
+
+
+def _opened(scope: str) -> None:
+    from .run import current_run
+
+    scope = scope.split("@L", 1)[0].strip()
+    _notes.used(scope)
+    run = current_run()
+    recall = run.get("recall") if run else None
+    if not recall or scope in recall["seen"] or scope in _notes._STANDING:
+        return
+    recall["seen"].add(scope)
+    view = run.get("view") or {}
+    ranks = [ref.split("@L", 1)[0] for ref in recall["similar"]]
+    row = {"t": round(time.time(), 3), "event": "open", "wake": recall["t"], "ctx": view.get("ctx"),
+           "kind": (view.get("stats") or {}).get("kind"), "scope": scope,
+           "breadcrumb": scope in recall["mentioned"],
+           "similar_rank": ranks.index(scope) + 1 if scope in ranks else None}
+    if not row["breadcrumb"] and not scope.startswith("diary:"):
+        row["terms"] = _notes.shared_terms(recall["query"], scope)
+    usage.log_recall(row)
+
+
+def missed_since(since: float, most: int = 15) -> str:
+    """For the night: notes she opened that the breadcrumbs had not pointed at, with the shared words.
+
+    WHY: 2026-11-07 维护者：能保证“需要时一定被想起”的只有自己声明了触发词的笔记——面包屑
+    每次都把所有名字和 `别名：` 逐个比一遍，所以可信，只是词写得少。词靠用来长：她翻开了一份
+    面包屑没点到的笔记，就说明它可能少一个词。只在真实使用暴露缺口的地方补，不另起整理；
+    加不加、加哪个由她在反思里定，程序不替她写别名。
+    """
+    from collections import Counter
+
+    listed = {item["scope"] for item in _notes.listing(limit=10**6)}
+    counts, words, where = Counter(), {}, {}
+    for row in usage.read_recall(since):
+        scope = row.get("scope")
+        if row.get("event") != "open" or row.get("breadcrumb") or scope not in listed:
+            continue
+        counts[scope] += 1
+        words.setdefault(scope, Counter()).update(row.get("terms") or [])
+        if row.get("ctx"):
+            where.setdefault(scope, []).append(row["ctx"])
+    if not counts:
+        return ""
+    lines = []
+    for scope, count in counts.most_common(most):
+        line = f"- {scope}（{count} 次"
+        if where.get(scope):
+            line += "，最近在 " + "、".join(list(dict.fromkeys(reversed(where[scope])))[:2])
+        line += "）"
+        if words[scope]:
+            line += "：" + "、".join(word for word, _n in words[scope].most_common(5))
+        lines.append(line)
+    if len(counts) > most:
+        lines.append(f"（还有 {len(counts) - most} 份没列出）")
+    return ("上次反思以来，这些笔记你翻开过，但当时画面里的词没有点到它们（面包屑只认笔记名和 `别名：` 行）。"
+            "觉得以后该被自动点到的，可以在那份笔记里加一行 `别名：词1、词2`；一个词要是平时到处都会出现，"
+            "加上反而会乱点，就别加。括号里是最近翻开它的运行（read_context 能看当时的情形）；冒号后面是"
+            "当时消息里和这份笔记共有、别处少见的词，可能是名字，也可能只是笔记里引用的原话，只是参考：\n" + "\n".join(lines))
 
 
 def _waited(seconds: float) -> str:
@@ -308,6 +393,7 @@ def build(wake: dict, model: str | None = None) -> list[dict]:
     config = get_config()
     if not config.get("on", True):
         return [fallback(claimed, "构造运行关着")]
+    wake["recall"] = None
     state = {"associated_windows": set(claimed), "specs": [], "cancelled": False}
     effort = chat.normalize_reasoning_effort(config.get("effort", "none"))
     labels = sorted(_windows.label(window) for window in claimed)
@@ -317,7 +403,9 @@ def build(wake: dict, model: str | None = None) -> list[dict]:
         return []
 
     try:
-        chat.run(material(wake), GOAL, tools=("meta", "construct", "agents"), functions=TOOLS,
+        items = material(wake)
+        state["recall"] = wake["recall"]
+        chat.run(items, GOAL, tools=("meta", "construct", "agents"), functions=TOOLS,
                  model=str(config.get("model") or "") or model, kind="construct", state=state,
                  stop=lambda: wake["cancelled"], timeout=float(config.get("timeout", 45)),
                  effort=None if effort == "default" else effort, prepare=prepare, allow_reframe=True)

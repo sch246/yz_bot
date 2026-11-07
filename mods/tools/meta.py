@@ -331,6 +331,11 @@ def read_file(path: str, start: int = 0, end: int | None = None, max_bytes: int 
             f"或用 agents__fork 开子会话通读后只带回摘要；"
             f"确实要整段进上下文时再调高 max_bytes。"
         )
+    scope = notes.scope_of(target)
+    if scope:
+        from mods.chat import construct
+
+        construct.opened(scope)
     return _render_file_window(target, lines, start, end)
 
 

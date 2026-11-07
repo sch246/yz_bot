@@ -287,6 +287,8 @@ def _prepare(wake, view, windows, lead_in=_ACT_LEAD_IN):
     screens = "\n".join(part["text"] for part in parts if part["text"])
     present = set(info["notes"])
     hits = [scope for scope, _word in _notes.mentioned(screens) if scope not in present]
+    if wake.get("recall"):
+        wake["recall"]["mentioned"].update(hits)
     wake["breadcrumbs"] = "画面提到的这些你有笔记，用 read_file 召回：" + "、".join(dict.fromkeys(hits)) if hits else ""
     return material
 
@@ -500,6 +502,9 @@ def _reflect(wake, model=None, settle=True):
                   "可以看出构造漏带了哪类材料。构造的说明在 data/notes/policy/construct.md，沉淀的附加说明在 data/notes/policy/settle.md，都用 write_file 改。"},
                  {"role": "system", "content": "策略改动 changes（data/notes/policy/changes.md）：\n" + _tail(_notes.read_policy("changes"), 40)
                   + "\n给维护者的 proposals（data/notes/policy/proposals.md）：\n" + _tail(_notes.read_policy("proposals"), 20)}]
+        missed = _construct.missed_since(since)
+        if missed:
+            items.append({"role": "system", "content": missed})
         state = {"associated_windows": wake["associated_windows"]}
         def after(current):
             current["end"] = current["used"] - current["initial"] > _chat_root.limit()[1]

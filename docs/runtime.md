@@ -82,6 +82,7 @@ uv run --frozen python run.py --smoke
 | `data/storage/window_titles.json` | 她给窗口起的名字 | `set_name` 设定的窗口自定义称呼（优先于群名和昵称） | 一直留 |
 | `data/usage/YYYY-MM-DD.jsonl` | 每次模型调用（含 `describe_image` 旁路视觉调用）花了多少 token | 按天记录每次调用的时间、模型、`prompt`、`completion`、`cached` token 数 | 滚动保留 30 天 |
 | `data/usage/requests/YYYY-MM-DD.jsonl` | 中心运行（构造、行动、分身、沉淀、反思）每次请求由什么组成、缓存前缀断在哪 | 每次派发一行：ctx、序号、模型与参数、工具 schema 摘要、转换后每条消息的部分、journal 编号、role、字符数和摘要；usage 回来另记一行。不含正文，但 journal 编号和笔记来源能对回聊天，按 chatlog 同等对待 | 滚动保留 30 天 |
+| `data/usage/recall/YYYY-MM-DD.jsonl` | 每次唤醒提示过哪些笔记、她实际翻开了哪些 | 构造时一行面包屑与相近候选；唤醒内第一次用到某份笔记时一行：ctx、运行种类、笔记名、面包屑是否点到、在候选里的名次，没点到时带当时消息与笔记共有的几个词（来自聊天，按 chatlog 对待） | 滚动保留 30 天 |
 | `data/term/` | 她的命令行窗口 | `tmux.sock` 是她自己的 tmux 服务器（和维护者自己开的 tmux 分开），`tmux.conf` 是它的设置（历史一万行、shell 退出后留着读退出码），`<名字>.log` 是 pipe-pane 追加的原始输出；已推到哪个位置、哪次输入还在等回答在 storage `term/state` | 会话跨重启一直留，`term__close` 或 shell 退出才收掉；单个 log 超过 20MB 时清空重来 |
 | `data/bili/credential.json` | B 站登录凭证 | 柚子 B 站号的 cookie（权限 600）；已读位置、昵称和"评论属于哪一楼"在 storage `bili/state` | 一直留，失效后重新 `.bili login` |
 | `data/notes/policy/changes.md` | 策略为什么改、改了有没有用 | 原因、预期和评估；只往后追加，追加不备份 | 一直留 |
