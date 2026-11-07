@@ -364,6 +364,41 @@ def request_outline(view, messages, schemas, *, head_count, source_refs, attachm
             "usage": None}
 
 
+def request_composition(params, *, head_count, source_refs, attachment_count):
+    """Identity of each message actually dispatched, after provider conversion; no bodies.
+
+    One row per message: [part, journal ref or None, role, chars, digest]. Image
+    conversion keeps one output message per input, so outline boundaries still apply.
+
+    WHY: digests are over insertion-ordered compact JSON, not sorted keys: a
+    provider prefix cache sees key order too, so a reordering must read as a change.
+    Per-message digests rather than one prefix chain let an offline reader find the
+    shared prefix of any two requests, including ones from different runs.
+    """
+    def digest(value):
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+        return len(text), hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+    body_end = head_count + len(source_refs)
+    attachment_end = body_end + attachment_count
+    rows = []
+    for index, message in enumerate(params.get("messages") or []):
+        if index < head_count:
+            part, ref = "head", None
+        elif index < body_end:
+            part, ref = "view", source_refs[index - head_count]
+        elif index < attachment_end:
+            part, ref = "attachment", None
+        else:
+            part, ref = "hint", None
+        chars, value = digest(message)
+        rows.append([part, ref, message.get("role") if isinstance(message, dict) else None, chars, value])
+    tools = params.get("tools") or []
+    return {"model": params.get("model"), "effort": params.get("reasoning_effort"),
+            "temperature": params.get("temperature"),
+            "tools": digest(tools)[1] if tools else None, "tool_count": len(tools), "messages": rows}
+
+
 def record_request(view, outline, *, persist=False):
     """Freeze first and replace latest; usage is attached to their request number."""
     with _lock:
@@ -385,7 +420,10 @@ def record_request(view, outline, *, persist=False):
 
 
 def record_request_usage(view, number, info, *, persist=False):
-    """Keep omitted provider fields null, including an unreported cache count."""
+    """Keep omitted provider fields null, including an unreported cache count.
+
+    Returns the recorded fields, or None when this callback repeated an earlier one.
+    """
     def value(source, key):
         raw = source.get(key) if isinstance(source, dict) else getattr(source, key, None)
         return max(0, int(raw)) if raw is not None else None
@@ -403,7 +441,7 @@ def record_request_usage(view, number, info, *, persist=False):
         # callback must not charge the same response twice; no per-request body
         # or growing usage ledger is needed to remember this frontier.
         if number <= totals["last_request"]:
-            return
+            return None
         if number != requests["latest"]["number"]:
             raise ValueError("usage must belong to the current dispatched request")
         totals["last_request"] = number
@@ -418,6 +456,7 @@ def record_request_usage(view, number, info, *, persist=False):
                 requests[key]["usage"] = copy.deepcopy(reported)
         if persist:
             save(view)
+        return reported
 
 
 def combine_usage(*records):

@@ -39,6 +39,8 @@
 
 `usage` 关联所选请求，保留服务端原始报告的 prompt/completion/total/cached 字段；`null` 表示未报告，只有显式 0 才表示零。`segment_usage.known` 是本段所有请求的已知小计，`coverage` 标出字段报告次数，覆盖不足不能当作完整用量。`call_usage` 若已记录，给出截至该段结束的整调用累计，末段覆盖全部段。旧归档或尚未派发请求返回“未记录”，不从最终 view 或费用倒推首请求。
 
+每一次实际派发（不只首次和最近一次）另记一行到 `data/usage/requests/YYYY-MM-DD.jsonl`（2026-11-06）：ctx、段内请求序号、运行种类、所选模型与实际 `model`、`effort`、`temperature`、工具 schema 的摘要和个数，以及**供应商转换之后**每条消息的 `[部分, journal 编号, role, 字符数, 摘要]`，部分是 head、view、attachment、hint。usage 回来时再记一行 `{ctx, n, usage}`，按 ctx 和序号对上。不存正文；摘要按插入顺序的紧凑 JSON 计算，键顺序变化也算变化，因为前缀缓存同样看得见。两次请求从哪一条开始不同、断在哪个来源，可以离线比对摘要得出。
+
 ### 运行中重新组装上下文
 
 `reframe(focus, refs="", note="", tools=None, history=None)` 使用 meta 入口。fork 默认启用，construct 和 main 显式启用；settle、reflect、summary 及外部传入 view 的调用不启用。换段是同一次调用的接续，由迭代循环重建 session/view，不叠加 Python 调用栈。

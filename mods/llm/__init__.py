@@ -959,7 +959,7 @@ class LLMClient:
         # WHY: observe only at dispatch, after validation/image preparation. The
         # original projection keeps source boundaries; provider usage counts the
         # converted request, so callers must label these two measurements apart.
-        observe = (lambda: on_request(original_messages, params.get("tools", []))) if on_request else None
+        observe = (lambda: on_request(original_messages, params.get("tools", []), params)) if on_request else None
         if stream:
             return self._stream_response(client, params, selection, observe, on_request_usage)
         return self._non_stream_response(client, params, selection, observe, on_request_usage)
@@ -1349,9 +1349,10 @@ class Chat:
         self.on_tool_start = on_tool_start
         self.on_tool_result = on_tool_result
         self.on_action = on_action
-        # Dispatch observes the source projection plus the schemas actually sent;
-        # usage observes raw provider fields, before billing's missing-as-zero rule.
-        self.on_request: Callable[[list[dict], list[dict]], None] | None = None
+        # Dispatch observes the source projection, the schemas actually sent, and
+        # the converted params (read-only); usage observes raw provider fields,
+        # before billing's missing-as-zero rule.
+        self.on_request: Callable[[list[dict], list[dict], dict], None] | None = None
         self.on_request_usage: Callable[[object], None] | None = None
         self.before_output: Callable[[dict, list[dict]], str | None] | None = None
         self.active_action: str | None = None

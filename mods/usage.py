@@ -56,8 +56,29 @@ def log_call(model: str, prompt_tokens: int = 0, completion_tokens: int = 0, cac
         return
 
 
+def log_request(row: dict) -> None:
+    """记一条请求组成或它的 usage，进 ``requests/`` 子目录的日文件。
+
+    WHY: 2026-11-06 维护者：上下文的组成没法监测、没法追踪，前缀缓存在哪里断、换了
+    哪份材料，事后都说不清；11-02 的缓存调查因此只能比可见文字，给不出逐轮前缀。这里
+    每次实际派发记一行（各条消息的哈希与来源，不存正文），usage 回来再记一行，按
+    ctx 和请求序号对上。和上面的账一样，写盘失败不能弄崩对话。
+    """
+    try:
+        now = float(row.get("t") or time.time())
+        line = json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+        directory = os.path.join(_dir(), "requests")
+        os.makedirs(directory, exist_ok=True)
+        with _lock:
+            with open(os.path.join(directory, _day(now) + ".jsonl"), "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        purge()
+    except Exception:
+        return
+
+
 def purge(keep_days: int = KEEP_DAYS) -> int:
-    """删掉太老的日文件；一天最多扫一次。返回删了几个。"""
+    """删掉太老的日文件（账本和 ``requests/`` 两处）；一天最多扫一次。返回删了几个。"""
     today = time.strftime("%Y-%m-%d")
     with _lock:
         if _last_purge[0] == today:
@@ -65,8 +86,12 @@ def purge(keep_days: int = KEEP_DAYS) -> int:
         _last_purge[0] = today
     removed = 0
     cutoff = time.time() - keep_days * 86400
-    try:
-        for name in os.listdir(_dir()):
+    for directory in (_dir(), os.path.join(_root, "requests")):
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            continue
+        for name in names:
             if not name.endswith(".jsonl") or len(name) != 16:
                 continue
             try:
@@ -75,12 +100,10 @@ def purge(keep_days: int = KEEP_DAYS) -> int:
                 continue
             if day < cutoff:
                 try:
-                    os.remove(os.path.join(_root, name))
+                    os.remove(os.path.join(directory, name))
                     removed += 1
                 except OSError:
                     pass
-    except OSError:
-        pass
     return removed
 
 

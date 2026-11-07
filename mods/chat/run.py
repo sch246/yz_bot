@@ -232,7 +232,7 @@ def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
                         state["log"]["peak"] = max(state["log"].get("peak", 0), state["used"])
                         return []
 
-                def record_request(messages, schemas):
+                def record_request(messages, schemas, sent=None):
                     with guard:
                         writable(dispatch=True)
                         outline = segment.request_outline(
@@ -240,13 +240,23 @@ def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
                             attachment_count=state["request_attachments"], model=session.model, goal=goal)
                         state["request_number"] = segment.record_request(view, outline, persist=persist)
                         refresh_usage()
+                        if sent is not None:
+                            usage.log_request({
+                                "t": round(time.time(), 3), "ctx": view["ctx"], "n": state["request_number"],
+                                "kind": kind, "selection": session.model,
+                                **segment.request_composition(
+                                    sent, head_count=len(head), source_refs=state["request_sources"],
+                                    attachment_count=state["request_attachments"])})
 
                 def record_request_usage(info):
                     with guard:
                         # A dispatched request may report usage while cancellation
                         # closes its stream; keep the bill with that request.
-                        segment.record_request_usage(view, state["request_number"], info, persist=persist)
+                        recorded = segment.record_request_usage(view, state["request_number"], info, persist=persist)
                         refresh_usage()
+                        if recorded is not None:
+                            usage.log_request({"t": round(time.time(), 3), "ctx": view["ctx"],
+                                               "n": state["request_number"], "usage": recorded})
 
                 def before_output(_assistant, calls):
                     error = "reframe 必须独占一次工具批次；本批全部工具均未执行，请单独重试" if (
