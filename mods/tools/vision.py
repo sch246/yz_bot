@@ -38,6 +38,10 @@ OUTPUT_DIR = os.path.join(ROOT, "data", "tmp_files")
 
 CHEAP = "kiro/claude-haiku-4-5-20251001"
 LUNA = "azure/gpt-5.6-luna"
+GEMINI_FLASH = "gemini/gemini-3.7-flash"
+GEMINI_PRO = "gemini/gemini-3-pro-preview"
+GOOGLE_FLASH = "google/gemini-2.5-flash"
+LEAF_FLASH = "leaf/gemini-3-8-f"
 
 ALIASES = {
     "": CHEAP,
@@ -47,6 +51,19 @@ ALIASES = {
     "便宜": CHEAP,
     "luna": LUNA,
     "haiku": CHEAP,
+    "gemini": GEMINI_FLASH,
+    "gemini-flash": GEMINI_FLASH,
+    "gemini-3.7": "gemini/gemini-3.7-flash",
+    "gemini-3.8": "gemini/gemini-3.8-flash",
+    "gemini-pro": GEMINI_PRO,
+    "google": GOOGLE_FLASH,
+    "google-2.5": "google/gemini-2.5-flash",
+    "google-3.7": "google/gemini-3.7-flash",
+    "google-3.8": "google/gemini-3.8-flash",
+    "leaf": LEAF_FLASH,
+    "叶子": LEAF_FLASH,
+    "中转": GEMINI_FLASH,
+    "官方": GOOGLE_FLASH,
 }
 
 PROVIDER_FACTOR = {}   # 价格已按各自分组的实价填好，无需再折算

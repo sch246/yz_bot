@@ -100,41 +100,71 @@ def provider_config(config: dict, selection: str) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def default_providers() -> dict:
+    return {
+        "openai": {"base_url": "OPENAI_BASE_URL", "api_key": "OPENAI_API_KEY", "models": {
+            "gpt-4o-mini": {"vision": True, "function_calling": True},
+            "gpt-4o": {"vision": True, "function_calling": True},
+            "gpt-3.5-turbo": {"vision": False, "function_calling": True},
+        }},
+        "deepseek": {"base_url": "DEEPSEEK_BASE_URL", "api_key": "DEEPSEEK_API_KEY",
+            "price_fn": DEEPSEEK_PRICE_FN,
+            "models": {
+            # 价格是人民币元/百万 token，这里写基础（高峰）价；实际单价由 price_fn 返回。
+            # prompt_cached_price 是输入中命中缓存那部分的价格，比未命中价低两个数量级——
+            # 聊天的 prompt 绝大多数是重复上下文，不区分就会把费用高估一大截。
+            # deepseek-flash 就是原 v4-flash 系列（DeepSeek-V4.1-Flash），自带图像理解；
+            # 两个旧名仍可调用、按 Flash 计费，保留它们以免存量的模型选择失效。
+            # tool_images：图片可以放进 tool 消息（工具结果里带图），2026-09-18 实测
+            # deepseek-flash 读对了工具结果里那张图的随机码；2026-10-23 用随机数字图复测仍然
+            # 成立（4 次对 3 次，错的一次是 1031 读成 1021）。别用纯色图测，它会被说成一片白。
+            # 官方文档（2026-10-23）Chat Completions 只写了 user 可带图、system/assistant 带图
+            # 400，没写 tool；Responses API 才明说工具输出可带图。所以这是没写进文档的行为，
+            # 哪天变成 400 就把这里改回 False，attach_image 会自动走老路。
+            # 同族的两个旧名一起登记；
+            # 别的供应商没验过，一律不写（默认 False）。
+            # WHY: 维护者指定只给 DeepSeek 开 Files API；其它供应商即使登记同名能力也不上传。
+            # DeepSeek 的 GIF 保留原始数据，主动 attach 则和其它模型一样看全部帧网格。
+
+            "deepseek-flash": {"vision": True, "tool_images": True, "files_api": True, "function_calling": True, "prompt_price": 2, "prompt_cached_price": 0.04, "completion_price": 8},
+            "deepseek-v4-pro": {"vision": False, "function_calling": True, "prompt_price": 9, "prompt_cached_price": 0.30, "completion_price": 27},
+            "deepseek-v4-flash": {"vision": True, "tool_images": True, "files_api": True, "function_calling": True, "prompt_price": 2, "prompt_cached_price": 0.04, "completion_price": 8},
+            "deepseek-v4-flash-vision-exp": {"vision": True, "tool_images": True, "files_api": True, "function_calling": True, "prompt_price": 2, "prompt_cached_price": 0.04, "completion_price": 8},
+        }},
+        "bytecat": deepcopy(BYTECAT_PROVIDER_CONFIG),
+    }
+
+
 def default_config() -> dict:
     return {
-        "providers": {
-            "openai": {"base_url": "OPENAI_BASE_URL", "api_key": "OPENAI_API_KEY", "models": {
-                "gpt-4o-mini": {"vision": True, "function_calling": True},
-                "gpt-4o": {"vision": True, "function_calling": True},
-                "gpt-3.5-turbo": {"vision": False, "function_calling": True},
-            }},
-            "deepseek": {"base_url": "DEEPSEEK_BASE_URL", "api_key": "DEEPSEEK_API_KEY",
-                "price_fn": DEEPSEEK_PRICE_FN,
-                "models": {
-                # 价格是人民币元/百万 token，这里写基础（高峰）价；实际单价由 price_fn 返回。
-                # prompt_cached_price 是输入中命中缓存那部分的价格，比未命中价低两个数量级——
-                # 聊天的 prompt 绝大多数是重复上下文，不区分就会把费用高估一大截。
-                # deepseek-flash 就是原 v4-flash 系列（DeepSeek-V4.1-Flash），自带图像理解；
-                # 两个旧名仍可调用、按 Flash 计费，保留它们以免存量的模型选择失效。
-                # tool_images：图片可以放进 tool 消息（工具结果里带图），2026-09-18 实测
-                # deepseek-flash 读对了工具结果里那张图的随机码；2026-10-23 用随机数字图复测仍然
-                # 成立（4 次对 3 次，错的一次是 1031 读成 1021）。别用纯色图测，它会被说成一片白。
-                # 官方文档（2026-10-23）Chat Completions 只写了 user 可带图、system/assistant 带图
-                # 400，没写 tool；Responses API 才明说工具输出可带图。所以这是没写进文档的行为，
-                # 哪天变成 400 就把这里改回 False，attach_image 会自动走老路。
-                # 同族的两个旧名一起登记；
-                # 别的供应商没验过，一律不写（默认 False）。
-                # WHY: 维护者指定只给 DeepSeek 开 Files API；其它供应商即使登记同名能力也不上传。
-                # DeepSeek 的 GIF 保留原始数据，主动 attach 则和其它模型一样看全部帧网格。
-
-                "deepseek-flash": {"vision": True, "tool_images": True, "files_api": True, "function_calling": True, "prompt_price": 2, "prompt_cached_price": 0.04, "completion_price": 8},
-                "deepseek-v4-pro": {"vision": False, "function_calling": True, "prompt_price": 9, "prompt_cached_price": 0.30, "completion_price": 27},
-                "deepseek-v4-flash": {"vision": True, "tool_images": True, "files_api": True, "function_calling": True, "prompt_price": 2, "prompt_cached_price": 0.04, "completion_price": 8},
-                "deepseek-v4-flash-vision-exp": {"vision": True, "tool_images": True, "files_api": True, "function_calling": True, "prompt_price": 2, "prompt_cached_price": 0.04, "completion_price": 8},
-            }},
-            "bytecat": deepcopy(BYTECAT_PROVIDER_CONFIG),
-        },
+        "model": DEFAULT_MODEL,
         "default_model": DEFAULT_MODEL,
+        "construct": {
+            "model": DEFAULT_MODEL,
+            "on": True,
+            "effort": "none",
+            "timeout": 45,
+        },
         "vision_model": DEFAULT_VISION_MODEL,
         "request_timeout": DEFAULT_REQUEST_TIMEOUT,
+        "brake": "off",
+        "temperature": "default",
+        "reasoning_effort": "default",
+        "reasoning": "keep",
+        "debounce": {
+            "mode": "on",
+            "idle": 10.0,
+            "max_delay": 30.0,
+        },
+        "settle": {
+            "quiet": 1200,
+            "backlog": 200,
+        },
+        "limit": {
+            "max_events": 30,
+            "tidy_token": 100,
+        },
+        "image": "lazy",
+        "image_describe": False,
+        "audio": "lazy",
     }

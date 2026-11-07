@@ -46,12 +46,41 @@ def _path(scope: str) -> Path:
     if not _SCOPE.fullmatch(scope):
         raise ValueError(
             "scope 可以是 global、recent、todo、awaker、person:<QQ号>、group:<群号>、diary:<日期>，"
-            "或你自己起的专题笔记名（如 消消乐、topic:线代；person/group 冒号后写号码，policy 用 edit_policy）"
+            "或你自己起的专题笔记名（如 消消乐、topic:线代；person/group 冒号后写号码）"
         )
     if ":" not in scope:
         return ROOT / f"{scope}.md"
     kind, number = scope.split(":")
     return ROOT / kind / f"{number}.md"
+
+
+def is_note_path(path: str | Path) -> bool:
+    try:
+        Path(path).resolve().relative_to(ROOT.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def resolve_path(path: str) -> tuple[str, tuple[int, int] | None]:
+    """Resolve a plain path or a note/policy scope (with optional ``@Lfirst-last``) to a file path."""
+    raw = path.strip()
+    line_slice = None
+    match = re.fullmatch(r"(.+)@L([1-9]\d*)-L?([1-9]\d*)", raw)
+    if match:
+        raw, first, last = match[1].strip(), int(match[2]), int(match[3])
+        line_slice = (first - 1, last)
+    if raw.startswith("policy:"):
+        return _policy_path(raw.split(":", 1)[1].strip()).as_posix(), line_slice
+    if raw in ("years", "years.md"):
+        return (ROOT / "years.md").as_posix(), line_slice
+    if raw.replace("\\", "/") == "data/notes/policy/settle.md":
+        return _policy_path("settle").as_posix(), line_slice
+    if "/" not in raw and "\\" not in raw and not os.path.exists(raw):
+        stem = raw[:-3] if raw.endswith(".md") else raw
+        if _SCOPE.fullmatch(stem):
+            return _path(stem).as_posix(), line_slice
+    return raw, line_slice
 
 
 def scope_of(window: tuple) -> str:
@@ -101,15 +130,17 @@ def render(scope: str) -> str:
         lines = read(name).splitlines()
         if not 1 <= first <= last <= len(lines):
             raise ValueError(f"{name} 共 {len(lines)} 行；选区须满足 1 <= 起行 <= 末行 <= 总行数")
-        # WHY: 整篇人物笔记夹着多年不同话题。选区与 read_note 共用同一语法，
+        # WHY: 整篇人物笔记夹着多年不同话题。选区与 read_file 共用同一语法，
         # 行号按源文件计算，来源保留选区，不能让一小段冒充整份笔记。
         body = "\n".join(f"{number}: {lines[number - 1]}" for number in range(first, last + 1))
         return f"## 笔记 {scope}（{_path(name).as_posix()}，第 {first}–{last} 行／共 {len(lines)} 行；其余未载入）\n{body}"
-    body = read(scope).strip()
+    raw = read(scope)
+    body = raw.strip()
     name = custom_name(scope)
     if name:
         body = f"维护者设定的称呼：{name}\n{body}".strip()
-    return f"## 笔记 {scope}（{_path(scope).as_posix()}）\n{body}" if body else ""
+    lines_count = len(raw.splitlines())
+    return f"## 笔记 {scope}（{_path(scope).as_posix()}，开场全文，共 {lines_count} 行、{len(body)} 字）\n{body}" if body else ""
 
 
 def note_hash(scope: str) -> str:
@@ -134,6 +165,22 @@ def _backup(path: Path) -> None:
     target.write_bytes(path.read_bytes())
 
 
+def backup_file(path: str | Path) -> None:
+    """Back up an existing note file under ``.history/`` before write_file modifies or deletes it.
+
+    WHY: 维护者 2026-10-23 定：changes 是只往后加的流水账，旧内容都还在文件里；以前每追加
+    一行都把整个旧文件复制进 .history，备份总量随条数平方增长（一万条约 15 GB）。
+    """
+    target = Path(path)
+    if not target.is_file() or not is_note_path(target):
+        return
+    relative = target.resolve().relative_to(ROOT.resolve())
+    if (relative.parts and relative.parts[0] == ".history") or relative == Path("policy/changes.md"):
+        return
+    with _lock:
+        _backup(ROOT / relative)
+
+
 def _replace(path: Path, text: str, *, keep_empty=False) -> str:
     """Back up, then write or delete one file; returns the text it replaced."""
     with _lock:
@@ -154,27 +201,6 @@ def _replace(path: Path, text: str, *, keep_empty=False) -> str:
 
 def write(scope: str, text: str) -> str:
     return _replace(_path(scope), text)
-
-
-def versions(scope: str) -> list[str]:
-    """Backed-up versions of one note, oldest first, as their time stamps."""
-    path = _path(scope)
-    relative = path.relative_to(ROOT)
-    directory = ROOT / ".history" / relative.parent
-    if not directory.is_dir():
-        return []
-    prefix = relative.stem + "."
-    return sorted(item.name[len(prefix):-len(path.suffix)] for item in directory.glob(f"{relative.stem}.*{path.suffix}")
-                  if item.name.startswith(prefix))
-
-
-def read_version(scope: str, version: str) -> str:
-    path = _path(scope)
-    if not re.fullmatch(r"\d{8}-\d{6}(-\d+)?", version):
-        raise ValueError("version 写 versions 列出的时间戳，如 20261022-153000")
-    relative = path.relative_to(ROOT)
-    target = ROOT / ".history" / relative.parent / f"{relative.stem}.{version}{path.suffix}"
-    return target.read_text(encoding="utf-8") if target.is_file() else ""
 
 
 # WHY: 策略文件是她在反思里能改的那一层（2026-10-22）：changes 是每次改动的原因、预期和事后评估，
@@ -203,25 +229,6 @@ def read_policy(name: str) -> str:
 
 def write_policy(name: str, text: str) -> str:
     return _replace(_policy_path(name), text)
-
-
-def append_policy(name: str, line: str) -> None:
-    """Add one line at the end, without a backup.
-
-    WHY: 维护者 2026-10-23 定：changes 是只往后加的流水账，旧内容都还在文件里；以前每追加
-    一行都把整个旧文件复制进 .history，备份总量随条数平方增长（一万条约 15 GB）。整份改写
-    仍走 write_policy，改前照样备份。
-    """
-    with _lock:
-        path = _policy_path(name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        ending = b""
-        if path.is_file() and path.stat().st_size:
-            with path.open("rb") as stream:
-                stream.seek(-1, os.SEEK_END)
-                ending = stream.read(1)
-        with path.open("a", encoding="utf-8") as stream:
-            stream.write(("\n" if ending and ending != b"\n" else "") + line.strip() + "\n")
 
 
 def listing(limit: int = 60) -> list[dict]:

@@ -36,7 +36,13 @@ lazy 在读取图片时生成描述，eager 在图片到达时生成；主模型
     ("reasoning [keep|drop]", "查看或设置引用来的旧行动里的思考是否一起带回（本次运行自己的思考总是保留）"),
     ("effort [default|off|none|low|medium|high|max]", "查看或设置主模型思考等级（管理员），默认 default（按模型自身默认）。"),
     ("temperature [default|<0.0-2.0>]", "查看或设置主模型采样温度（管理员），默认 default（按模型默认；effort 为 none 时默认 1.3）；构造运行不用它。别名 temp。"),
-    ("brake [on|off]", "查看或设置节奏与防抢戏英文刹车（管理员），默认 on；只加在行动运行的提示末尾。"),
+    ("brake [on|off]", "查看或设置节奏与防抢戏英文刹车（管理员），默认 off；只加在行动运行的提示末尾。"),
+    ("settle [quiet [秒]|backlog [条]|now|reset]", """查看或设置沉淀规则（修改需管理员）。
+#settle                    查看当前沉淀配置、未沉淀窗口与循环状态
+#settle quiet [秒]         查看或设置沉淀所需安静时间（默认 1200 秒）
+#settle backlog [条]       查看或设置积压消息触发沉淀的条数（默认 200 条）
+#settle now                立即唤起沉淀空闲检查
+#settle reset              恢复默认沉淀配置（安静 1200s，积压 200 条）"""),
     ("years [rebuild]", "查看年鉴索引最近 10 条，或补齐缺了的行（管理员；只补不删）。"),
     ("limit [<画面条数> <增长上限>|reset]", """查看或设置画面条数与单次运行的增长上限（管理员）。
 
@@ -117,7 +123,7 @@ def requires_op(value: str) -> bool:
         return False
     return (name == "hint" or name == "use_model"
             or name in {"image", "reasoning", "effort", "temperature", "temp", "brake", "years", "limit", "reflect",
-                        "awaker", "prompt", "debounce"} and bool(tail.strip()))
+                        "awaker", "prompt", "debounce", "settle"} and bool(tail.strip()))
 
 
 def _subcommand_help(name: str = "") -> str:
@@ -289,7 +295,7 @@ def _hint_subcommand(raw: str) -> str:
 def _limit_report() -> str:
     """`#limit` 查看画面条数与单次运行的增长上限。"""
     _chat_root.limit()
-    data = storage.get("", "agent")
+    data = storage.get("agent", "config")
     lines = []
     for name, label in (("max_events", "画面条数"), ("tidy_token", "增长上限")):
         key, normalize = _chat_root.AGENT_SETTINGS[name]
@@ -303,7 +309,7 @@ def _limit_set(tail: str) -> str:
 
     WHY: 两个值仍一起写，避免只改其中一个造成难解释的半份配置。
     """
-    data = storage.get("", "agent")
+    data = storage.get("agent", "config")
     if tail.strip() == "reset":
         for name in ("max_events", "tidy_token", "max_token", "pressure_percent"):
             data.pop(name, None)
@@ -321,7 +327,7 @@ def _limit_set(tail: str) -> str:
 
 def _reflect_subcommand(tail: str) -> str:
     if not tail:
-        last = storage.get("", "agent").get("reflected_at")
+        last = storage.get("agent", "config").get("reflected_at")
         shown = datetime.fromtimestamp(last).strftime("%Y-%m-%d %H:%M") if isinstance(last, (int, float)) else "还没有"
         return f"上次反思：{shown}；什么时候自动跑见 #awaker"
     if tail == "now":
@@ -371,7 +377,7 @@ def _debounce_subcommand(tail: str) -> str:
     from mods.chat import attention as _debounce
 
     tail = tail.strip()
-    data = storage.get("", "agent")
+    data = storage.get("agent", "config")
     cfg = _debounce.get_config()
     if not tail:
         if not cfg["enabled"]:
@@ -413,6 +419,49 @@ def _debounce_subcommand(tail: str) -> str:
     data["debounce"] = cfg
     storage.save()
     return f"debounce: 已设置为 等待 {idle:.1f}s，上限 {max_delay:.1f}s"
+
+
+def _settle_subcommand(tail: str) -> str:
+    settle = _chat_root._settle
+    cfg = settle.config()
+    unsettled = settle.pending()
+    settle_str = ("、".join(sorted(unsettled)) + " 还没沉淀") if unsettled else "都沉淀过了"
+    if not tail:
+        return (f"settle: 安静 {cfg.get('quiet', 1200)} 秒或积压 {cfg.get('backlog', 200)} 条后沉淀\n"
+                f"未沉淀窗口: {settle_str}\n循环状态: {_chat_root._agent.loop_status()}")
+    action, _, arg = tail.partition(" ")
+    action, arg = action.strip().lower(), arg.strip()
+    if action == "quiet":
+        if not arg:
+            return f"settle quiet: {cfg.get('quiet', 1200)}s"
+        try:
+            val = float(arg)
+            if val < 10 or val > 86400:
+                return "settle quiet 写 10 到 86400 之间的秒数"
+        except ValueError:
+            return "settle quiet 写 10 到 86400 之间的秒数"
+        cfg["quiet"] = val
+        settle.save_config(cfg)
+        return f"settle quiet: {val:g}s"
+    if action == "backlog":
+        if not arg:
+            return f"settle backlog: {cfg.get('backlog', 200)}条"
+        try:
+            val = int(arg)
+            if val < 5 or val > 5000:
+                return "settle backlog 写 5 到 5000 之间的条数"
+        except ValueError:
+            return "settle backlog 写 5 到 5000 之间的条数"
+        cfg["backlog"] = val
+        settle.save_config(cfg)
+        return f"settle backlog: {val}条"
+    if action == "now":
+        _chat_root._agent.kick()
+        return "已触发沉淀检查，空闲时将开始沉淀"
+    if action == "reset":
+        settle.save_config(dict(settle.DEFAULT_CONFIG))
+        return "settle 已恢复默认配置（安静 1200s，积压 200 条）"
+    return "settle 参数错误，可用 #help settle 查看"
 
 
 def _construct_report() -> str:
@@ -527,11 +576,12 @@ def _status_report(data: dict) -> str:
         f"#reasoning {reasoning}（历史思考保留：keep/drop）",
         f"#image {image}（图像读取：off/lazy/eager）",
         f"#image discribe {'on' if _chat_root.get_image_describe(data) else 'off'}（自动生成图片文字描述：on/off）",
+        f"#image vision {data.get('vision_model') or llm.DEFAULT_VISION_MODEL}（视觉模型：改用 #image vision <模型名/default>）",
         f"#audio {audio}（语音读取：off/lazy/eager）",
         f"#limit {max_events} {threshold}（画面 {max_events} 条，反思和沉淀的增长上限 {threshold}）",
         f"#debounce {deb_mode}（防抖延迟：{deb_detail}；改用 #debounce on/off/<等待秒数> [上限秒数]）",
-        f"settle：{settle_str}（安静 {_chat_root._settle.config()['quiet']} 秒或积压 {_chat_root._settle.config()['backlog']} 条后沉淀）；{_chat_root._agent.loop_status()}",
-        f"#construct {con_switch}（构造运行；模型: {con_cfg.get('model')}，effort: {con_cfg.get('effort')}，超时 {con_cfg.get('timeout')}s，说明: {con_custom}）",
+        f"#settle（沉淀：安静 {_chat_root._settle.config()['quiet']}s 或积压 {_chat_root._settle.config()['backlog']} 条；{settle_str}；改用 #settle quiet <秒> / #settle backlog <条> / #settle now）",
+        f"#construct {con_switch}（构造运行；模型: {con_cfg.get('model')}；改用 #construct on/off / #construct model <名称> / #construct effort <等级>）",
         f"#reflect（上次反思：{reflect_str}；立即执行：#reflect now / #reflect keep）",
         f"#awaker（闹钟：{awaker_str}；改写：#awaker set <规则>）",
     ]
@@ -544,7 +594,7 @@ def _subcommand(value: str):
     value = value.strip()
     name, _, tail = value.partition(" ")
     tail = tail.strip()
-    data = storage.get("", "agent")
+    data = storage.get("agent", "config")
     if name == "status" and not tail:
         return _status_report(data)
     if name == "status" and tail:
@@ -612,6 +662,28 @@ def _subcommand(value: str):
         return f"image: {_chat_root.get_image_mode(data)}"
     if name == "image" and tail:
         mode, remaining = _first_argument(tail)
+        if mode.lower() in ("vision", "vision_model"):
+            if not remaining.strip():
+                current = data.get("vision_model") or llm.DEFAULT_VISION_MODEL
+                return f"image vision: {current}（默认: {llm.DEFAULT_VISION_MODEL}）"
+            selection, extra = _first_argument(remaining)
+            if extra.strip():
+                return "image vision 参数过多"
+            if selection.lower() in ("reset", "default", "恢复", "默认"):
+                data.pop("vision_model", None)
+                storage.save()
+                return f"image vision 已恢复默认: {llm.DEFAULT_VISION_MODEL}"
+            from mods.tools import vision as vision_tool
+            resolved = vision_tool.ALIASES.get(selection.lower(), selection)
+            try:
+                _p, _m, caps = llm.resolve_model(_chat_root.llm_config, resolved)
+                if not caps.get("vision"):
+                    return f"{resolved} 不支持视觉能力"
+            except ValueError as error:
+                return str(error)
+            data["vision_model"] = resolved
+            storage.save()
+            return f"image vision 设置为 {resolved}"
         if mode.lower() in ("discribe", "describe"):
             if not remaining.strip():
                 return f"image discribe: {'on' if _chat_root.get_image_describe(data) else 'off'}"
@@ -705,4 +777,6 @@ def _subcommand(value: str):
         return _debounce_subcommand(tail)
     if name == "construct":
         return _construct_subcommand(raw, tail)
+    if name == "settle":
+        return _settle_subcommand(tail.strip())
     return "子命令格式错误，可用 #help 查看"

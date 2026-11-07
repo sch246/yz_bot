@@ -35,10 +35,13 @@ _stopping = False
 _generation = 0
 _notify = None
 ready = threading.Event()
+_forced_until: float = 0.0
+_forced_reason: str = ""
+_forced_held: list[dict] = []
 
 
 def get_config() -> dict:
-    cfg = storage.get("", "agent").get("debounce")
+    cfg = storage.get("agent", "config").get("debounce")
     if not isinstance(cfg, dict):
         cfg = {}
     return {"enabled": bool(cfg.get("enabled", True)),
@@ -55,8 +58,159 @@ def _signal() -> None:
             _log.exception("attention work notification failed")
 
 
+def _hold(window, *, kind, reason="", record_ids=(), author=None, event=None) -> None:
+    with _lock:
+        window = tuple(window)
+        identities = list(dict.fromkeys(str(i) for i in record_ids if i))
+        _forced_held.append({
+            "window": window,
+            "kind": str(kind),
+            "reason": str(reason),
+            "record_ids": identities,
+            "author": author,
+            "event": deepcopy(event),
+            "time": time.time(),
+        })
+
+
+def is_forced_quiet(now: float | None = None) -> bool:
+    now = time.time() if now is None else now
+    with _lock:
+        return _forced_until > now
+
+
+def forced_quiet_state(now: float | None = None) -> dict:
+    now = time.time() if now is None else now
+    with _lock:
+        active = _forced_until > now
+        return {
+            "active": active,
+            "until": _forced_until if active else 0.0,
+            "remaining": max(0.0, _forced_until - now) if active else 0.0,
+            "reason": _forced_reason if active else "",
+            "held_count": len(_forced_held) if active else 0,
+        }
+
+
+def _flush_forced_held(now: float, reason: str = "", *, manual: bool = False) -> int:
+    """Flush all held summons into synthesized wake reason and queue them."""
+    global _forced_until, _forced_reason
+    with _lock:
+        held = list(_forced_held)
+        _forced_held.clear()
+        saved_reason = _forced_reason or reason
+        _forced_reason = ""
+        _forced_until = 0.0
+        if not held:
+            desc = f"强制等待结束（{saved_reason}）" if saved_reason else "强制等待结束"
+            _put(windows.ME, kind="forced_quiet", reason=desc)
+            _signal()
+            return 0
+
+        by_window: dict[tuple, list[dict]] = {}
+        for item in held:
+            by_window.setdefault(tuple(item["window"]), []).append(item)
+
+        window_summaries = []
+        for w, items in by_window.items():
+            label = windows.label(w)
+            rec_ids = list(dict.fromkeys(r for item in items for r in item.get("record_ids", ()) if r))
+            if w == windows.ME:
+                me_parts = [item.get("reason") or item["kind"] for item in items]
+                me_summary = "、".join(me_parts[:3]) + (f"等{len(me_parts)}件" if len(me_parts) > 3 else "")
+                window_summaries.append(f"me: {me_summary}")
+            else:
+                count = len(rec_ids) if rec_ids else len(items)
+                window_summaries.append(f"{label} {count}条")
+
+        summary_text = "；".join(window_summaries)
+        prefix = f"强制等待结束（{saved_reason}）" if saved_reason else "强制等待结束"
+        combined_reason = f"{prefix}。期间有：{summary_text}"
+
+        me_records = []
+        for w, items in by_window.items():
+            rec_ids = list(dict.fromkeys(r for item in items for r in item.get("record_ids", ()) if r))
+            last_event = next((item["event"] for item in reversed(items) if item.get("event")), None)
+            authors = [item.get("author") for item in items if item.get("author")]
+            author = authors[-1] if authors else None
+            if w == windows.ME:
+                me_records.extend(rec_ids)
+            else:
+                _put(w, kind="强制等待积压", reason=f"期间积压 {len(rec_ids) or len(items)} 条",
+                     record_ids=rec_ids, author=author, event=last_event)
+
+        if _loop is not None:
+            _loop["pending"] = False
+            _loop.pop("due", None)
+            waited = _loop.pop("waited", None)
+            wait_reason = _loop.pop("wait_reason", "")
+            _loop["round"] += 1
+            doing = _loop["note"]
+            age = now - _loop["since"]
+            if age >= 1800 or _loop["round"] - _loop["note_round"] >= 5:
+                doing += f"（这条 {age:.0f} 秒前、第 {_loop['note_round']} 轮留下的）"
+            loop_reason = f"循环第 {_loop['round']} 轮：接着做——{doing}"
+            if waited is not None:
+                loop_reason += f"；强制等了 {waited:g} 秒：{wait_reason}"
+            _put(windows.ME, kind="loop", reason=loop_reason)
+
+        _put(windows.ME, kind="forced_quiet", reason=combined_reason, record_ids=me_records)
+        _signal()
+        return len(held)
+
+
+def force_quiet(seconds: float, reason: str = "") -> dict:
+    """Enter forced quiet: hold all summons and alarms until deadline (up to 1 day / 86400s)."""
+    seconds = float(seconds)
+    if not math.isfinite(seconds):
+        raise ValueError("seconds must be finite")
+    seconds = max(0.0, min(seconds, 86400.0))
+    with _lock:
+        now = time.time()
+        if seconds <= 0:
+            return lift_force(now=now)
+        due = now + seconds
+        global _forced_until, _forced_reason
+        _forced_until = due
+        _forced_reason = str(reason).strip()
+        for key, session in list(_debouncing.items()):
+            del _debouncing[key]
+            _scheduled.pop(f"debounce:{key}", None)
+            _deadlines.pop(f"debounce:{key}", None)
+            _hold(session["window"], kind=session["kind"], reason=session["reason"],
+                  record_ids=session["ids"], author=session.get("author"), event=session.get("event"))
+        for key, job in list(_jobs.items()):
+            if job.get("claim") is None:
+                del _jobs[key]
+                _hold(job["window"], kind=job["kind"], reason=job["reason"],
+                      record_ids=job["record_ids"], author=job.get("author"), event=job.get("event"))
+        ready.clear()
+        schedule("forced_quiet_expire", due, window=windows.ME,
+                 reason=_forced_reason, key="forced-quiet-expire")
+        return {
+            "active": True,
+            "until": _forced_until,
+            "seconds": seconds,
+            "reason": _forced_reason,
+            "held_count": len(_forced_held),
+        }
+
+
+def lift_force(now: float | None = None) -> dict:
+    """End forced quiet immediately, flushing any held summons into a synthesized wake."""
+    now = time.time() if now is None else now
+    with _lock:
+        cancel("forced_quiet_expire")
+        was_active = _forced_until > now
+        flushed = _flush_forced_held(now, manual=True) if was_active else 0
+        return {"was_active": was_active, "flushed": flushed}
+
+
 def _put(window, *, kind, reason="", record_ids=(), author=None, event=None) -> bool:
     """Insert under _lock; callers signal only after leaving their critical section."""
+    if _forced_until > time.time() and kind not in ("forced_quiet", "forced_quiet_expire"):
+        _hold(window, kind=kind, reason=reason, record_ids=record_ids, author=author, event=event)
+        return False
     window = tuple(window)
     identities = list(dict.fromkeys(str(i) for i in record_ids))
     owned = {i for job in _jobs.values() if job["window"] == window for i in job["record_ids"]}
@@ -285,6 +439,11 @@ def on_record(window, event, *, recovered=False) -> bool:
             _debounce(window, author, identity_, waiting["kind"], waiting["reason"], event, time.time())
             return True
         return False
+    with _lock:
+        in_force = _forced_until > time.time()
+    if in_force:
+        _hold(window, kind=kind, reason=reason, record_ids=[identity_], author=author, event=event)
+        return True
     if _batches(window, event):
         _debounce(window, author, identity_, kind, reason, event, time.time())
         return True
@@ -315,11 +474,14 @@ def stop_loop(reason="") -> dict | None:
         return deepcopy(old)
 
 
-def wait(seconds: float, reason: str = "") -> dict:
+def wait(seconds: float, reason: str = "", *, force: bool = False) -> dict:
     """A seconds deadline retains its reason even without an active loop."""
     seconds = float(seconds)
     if not math.isfinite(seconds) or seconds < 0:
         raise ValueError("seconds must be finite and nonnegative")
+    seconds = min(seconds, 86400.0)
+    if force:
+        return force_quiet(seconds, reason)
     with _lock:
         due = time.time() + seconds
         if _loop is not None:
@@ -428,7 +590,9 @@ def _fire(job: dict, now: float) -> None:
             # State update and queue insertion share stop_loop's lock: ^C cannot
             # slip between them and leave one final round queued after stopping.
             signal = _put(windows.ME, kind="loop", reason=reason)
-        elif kind not in ("awaker_check", "wait_rule"):
+        elif kind == "forced_quiet_expire":
+            _flush_forced_held(now, reason=job.get("reason", ""))
+        elif kind not in ("awaker_check", "wait_rule", "forced_quiet_expire"):
             signal = _put(job["window"] or windows.ME, kind=kind, reason=job["reason"],
                           record_ids=job.get("record_ids", ()))
     if signal:
@@ -528,7 +692,7 @@ def _clock(generation: int) -> None:
 
 
 def stop() -> None:
-    global _stopping, _thread, _loop, _notify, _generation
+    global _stopping, _thread, _loop, _notify, _generation, _forced_until, _forced_reason
     with _lock:
         _stopping = True
         _generation += 1
@@ -536,6 +700,9 @@ def stop() -> None:
         _deadlines.clear()
         _debouncing.clear()
         _jobs.clear()
+        _forced_held.clear()
+        _forced_until = 0.0
+        _forced_reason = ""
         _loop = None
         _notify = None
         ready.clear()

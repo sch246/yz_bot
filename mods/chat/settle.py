@@ -41,7 +41,7 @@ def diary_day(moment: float) -> str:
 
 
 def config() -> dict:
-    data = storage.get("", "agent")
+    data = storage.get("agent", "config")
     value = data.setdefault("settle", dict(DEFAULT_CONFIG))
     if not isinstance(value, dict):
         value = data["settle"] = dict(DEFAULT_CONFIG)
@@ -50,8 +50,23 @@ def config() -> dict:
     return value
 
 
+def save_config(cfg: dict) -> None:
+    data = storage.get("agent", "config")
+    data["settle"] = cfg
+    storage.save()
+    arm()
+
+
 def _books() -> tuple[dict, dict]:
-    data = storage.get("", "agent")
+    data = storage.get("agent", "settle")
+    if "settled" not in data and "unsettled" not in data:
+        old_agent = storage.get("", "agent")
+        if "settled" in old_agent:
+            data["settled"] = old_agent.pop("settled")
+        if "unsettled" in old_agent:
+            data["unsettled"] = old_agent.pop("unsettled")
+        if "settled" in data or "unsettled" in data:
+            storage.save()
     settled = data.setdefault("settled", {})
     unsettled = data.setdefault("unsettled", {})
     return settled, unsettled

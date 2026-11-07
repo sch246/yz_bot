@@ -800,8 +800,8 @@ def readable_messages(messages: list[dict], *, compact=True) -> str:
         elif compact and role == "system" and content.startswith(("以下是你的笔记", "还能召回的东西")) and len(content) > 400:
             # WHY: 2026-10-26 审查发现：每段开头的常驻笔记（global/recent/diary）和目录加起来常有上万字，
             # 不折叠的话 read_context 从 start=0 读整整第一页（8000 字）全在看静态笔记，根本看不到这一段
-            # 发生了什么，而且用 match 搜词也会先撞上开头的 global。想看当时那一版笔记可调 note_history。
-            lines.append(f"【开场笔记与目录，{len(content)} 字，略（查当时版本用 note_history）】")
+            # 发生了什么，而且用 match 搜词也会先撞上开头的 global。历史备份在 data/notes/.history/。
+            lines.append(f"【开场笔记与目录，{len(content)} 字，略（查历史备份可读 data/notes/.history/）】")
         else:
             lines.append(f"【{role}】" + content)
     return "\n".join(lines)

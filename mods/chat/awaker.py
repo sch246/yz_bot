@@ -125,7 +125,9 @@ def _target(text: str) -> tuple[tuple, int | None]:
 
 
 def _scope(text: str) -> tuple | None:
-    """A layer's target as ("window", window, author or None) or ("kind", 种类, None); None when unreadable."""
+    """A layer's target as ("all", "all", None), ("window", window, author or None) or ("kind", 种类, None); None when unreadable."""
+    if text in ("all", "*"):
+        return ("all", "all", None)
     if re.fullmatch(_TARGET, text):
         try:
             return ("window", *_target(text))
@@ -149,7 +151,11 @@ def _layer_problem(state: str, target: str) -> str:
     """Why this layer cannot be put on *target*; empty when it can."""
     scope = _scope(target)
     if scope is None:
-        return "目标写 g群号、u私聊号、g群号:QQ号、一整类（group、private、bili 这样的种类名）或 种类:目标；me 不能盖"
+        return "目标写 all、g群号、u私聊号、g群号:QQ号、一整类（group、private、bili 这样的种类名）或 种类:目标；me 不能盖"
+    if scope[0] == "all":
+        if state == "follow":
+            return "follow 不能跟全部窗口：只能跟指定的 QQ 群或私聊"
+        return ""
     kind = scope[1] if scope[0] == "kind" else scope[1][0]
     if state == "follow" and not _windows.spec(kind)["follow"]:
         return "follow 只认 QQ 窗口：B 站这类窗口只收到回复和 @，本来就都叫醒你"
@@ -246,11 +252,13 @@ def rules() -> tuple[list[dict], list[str]]:
 
 
 def _last() -> dict:
-    data = storage.get("", "agent")
-    value = data.get(_LAST_KEY)
-    if not isinstance(value, dict):
-        value = data[_LAST_KEY] = {}
-    return value
+    data = storage.get("agent", "awaker")
+    if not data:
+        old_agent = storage.get("", "agent")
+        if _LAST_KEY in old_agent and isinstance(old_agent[_LAST_KEY], dict):
+            data.update(old_agent.pop(_LAST_KEY))
+            storage.save()
+    return data
 
 
 def _due(rule: dict, last: float | None, now: float) -> float | None:
@@ -421,7 +429,9 @@ def layer(window: tuple, author=None, now: float | None = None) -> dict | None:
     ranked = []
     for item in _layers(now):
         scope = item["scope"]
-        if scope[0] == "kind":
+        if scope[0] == "all":
+            ranked.append((-1, item))
+        elif scope[0] == "kind":
             if window[0] == scope[1]:
                 ranked.append((0, item))
         elif tuple(scope[1]) == window and (scope[2] is None or scope[2] == author):
@@ -450,18 +460,26 @@ def triggered(window: tuple, event: dict | None, author, default: bool) -> tuple
 def describe(item: dict) -> str:
     """``mute 到 2026-10-24 08:00`` / ``follow（只看 30001）到 …`` / ``other（整类 bili）到重启为止``."""
     scope = item["scope"]
-    where = (f"（整类 {scope[1]}）" if scope[0] == "kind"
+    where = ("（全部窗口）" if scope[0] == "all"
+             else f"（整类 {scope[1]}）" if scope[0] == "kind"
              else f"（只看 {scope[2]}）" if scope[2] is not None else "")
     return f"{item['state']}{where}" + (f" 到 {item['until']}" if item["until"] else " 到重启为止")
 
 
 def badges(window: tuple) -> list[str]:
     """Every layer lying on *window* (whole kind, whole window, one person), for her to see on the screen."""
+    from . import attention
     window = tuple(window)
     now = time.time()
-    found = [describe(item) for item in _layers(now)
-             if item["scope"][0] == "kind" and window[0] == item["scope"][1]
-             or item["scope"][0] == "window" and tuple(item["scope"][1]) == window]
+    found = []
+    st = attention.forced_quiet_state(now)
+    if st["active"]:
+        rem_m = max(1, int(st["remaining"] // 60))
+        found.append(f"强制静音闸门（剩余{rem_m}分）")
+    found.extend(describe(item) for item in _layers(now)
+                 if item["scope"][0] == "all"
+                 or item["scope"][0] == "kind" and window[0] == item["scope"][1]
+                 or item["scope"][0] == "window" and tuple(item["scope"][1]) == window)
     with _edit:
         waiting = list(_waiting.values())
     for rule in waiting:
@@ -552,6 +570,43 @@ def plant(when: str, reason: str, now: float | None = None, *, text: str | None 
         return datetime.fromtimestamp(-(-int(now + seconds) // 60) * 60).strftime("%Y-%m-%d %H:%M")
 
     wait_seconds = None
+    clean_when = " ".join(when.split())
+    if re.fullmatch(r"(?:mute\s+force|force)\s+off", clean_when, flags=re.IGNORECASE):
+        from . import attention
+        attention.lift_force()
+        return "mute force off 已解除强制静音闸门"
+    if match_f := re.fullmatch(r"(?:mute\s+force|force)\s+(\S+)", clean_when, flags=re.IGNORECASE):
+        sec = _interval(match_f[1])
+        if sec is None or sec <= 0:
+            raise ValueError("强制静音时长写 30m、1h、2h，上限 1 天")
+        sec = min(sec, 86400)
+        from . import attention
+        attention.force_quiet(sec, reason)
+        return f"mute force until {stamp(sec)} {reason}"
+    if match_all_f := re.fullmatch(r"mute\s+(?:all|\*)\s+(\S+)\s+force", clean_when, flags=re.IGNORECASE):
+        sec = _interval(match_all_f[1])
+        if sec is None or sec <= 0:
+            raise ValueError("强制静音时长写 30m、1h、2h，上限 1 天")
+        sec = min(sec, 86400)
+        from . import attention
+        attention.force_quiet(sec, reason)
+        return f"mute force until {stamp(sec)} {reason}"
+    if match_mf := re.fullmatch(r"mute\s+(\S+)\s+(\S+)\s+force", clean_when, flags=re.IGNORECASE):
+        sec = _interval(match_mf[1]) or _interval(match_mf[2])
+        if sec is not None:
+            sec = min(sec, 86400)
+            from . import attention
+            attention.force_quiet(sec, reason)
+            return f"mute force until {stamp(sec)} {reason}"
+    if match_wf := re.fullmatch(r"wait\s+force\s+(\S+)", clean_when, flags=re.IGNORECASE):
+        sec = _interval(match_wf[1])
+        if sec is None or sec <= 0:
+            raise ValueError("wait force 后面写时长，例如 wait force 10m，上限 1 天")
+        sec = min(sec, 86400)
+        from . import attention
+        attention.force_quiet(sec, reason)
+        return f"wait force until {stamp(sec)} {reason}"
+
     if (seconds := _interval(when)) is not None:
         line = f"at {stamp(seconds)} {reason}"
     elif match := re.fullmatch(r"wait\s+" + _TARGET + r"\s+(\S+)", when):
@@ -618,9 +673,14 @@ def plant(when: str, reason: str, now: float | None = None, *, text: str | None 
 
 
 def report() -> str:
+    from . import attention
     found, skipped = rules()
     last = _last()
     lines = [("（awaker 笔记是空的，用默认）" if not _notes.read("awaker").strip() else "awaker 规则：")]
+    st = attention.forced_quiet_state()
+    if st["active"]:
+        rem_m = max(1, int(st["remaining"] // 60))
+        lines.append(f"【强制静音闸门开启中】剩余 {rem_m} 分钟（到期 {datetime.fromtimestamp(st['until']).strftime('%H:%M:%S')}），期间积压 {st['held_count']} 件（{st['reason']}）")
     for rule in found:
         if rule["kind"] == "layer":
             lines.append(f"{rule['key']}  ← 覆盖层 {rule['state']}，到期划掉")

@@ -1,9 +1,8 @@
 """构造运行专用：提交这次关注的情境、材料与提醒，帮助接下来的自己自主判断。
 
 每次只提交一份。构造提供信息和洞察；怎样行动、怎样表达由行动运行决定。
-先 load_tools(["memory_system"])，再用 memory_system__read_context("current", detail="outline")
-看当前请求构成；材料需求变了可单独用 reframe 选择下一段的 focus、refs、note 和 tools，
-同一次准备的总时限不重置。
+材料需求变了可单独用 reframe 选择下一段的 focus、refs、note 和 tools，同一次准备的总时限不重置；
+需要查看当前请求构成时可 load_tools(["memory_system"]) 并调用 read_context。
 换段不自动带回开场材料。load_tools 可恢复 construct、memory_system 或 agents；能力仍限于准备与召回。
 """
 from __future__ import annotations

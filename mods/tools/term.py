@@ -1,7 +1,7 @@
 """你自己的长期命令行窗口：看终端屏幕、按 Ctrl-C 这类键、关掉不用的终端。
 
-命令行窗口是 `term:名字`（如 `term:main`），用法和别的窗口一样：`type_word("term:main", "make")`
-再 `send("term:main")`，整段原样敲进去并回车，第一次发就开一个新的（在 Bot 的运行目录）。
+命令行窗口是 `term:名字`（如 `term:main`），用法和别的窗口一样：`send("term:main", "make")`，
+整段原样敲进去并回车，第一次发就开一个新的（在 Bot 的运行目录）。
 它是一个跨重启活着的 tmux 会话，需要 Bot 自身有 op。
 
 输出停顿 1 秒、或攒满 10 秒就成一条消息进窗口，记录头上的名字是那一刻前台的程序：
@@ -42,11 +42,11 @@ def look(name: str = "main", lines: int = 0) -> str:
 
 
 def keys(name: str, names: str) -> str:
-    """在命令行窗口里按键（不是打字，打字用 type_word/send），返回按了什么。
+    """在命令行窗口里按键（不是打字，打字用 send），返回按了什么。
 
     @param
     name: 窗口名字，term:main 就写 main
-    names: tmux 键名，空格分隔，如 "C-c"、"Up Enter"、"q"；要打的字用 type_word/send
+    names: tmux 键名，空格分隔，如 "C-c"、"Up Enter"、"q"；要打的字用 send
     """
     from mods import term
 

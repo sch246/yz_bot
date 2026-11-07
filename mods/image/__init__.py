@@ -544,6 +544,30 @@ def cache_description(cache: dict, identity: str, description: str, today: date 
     return prune_description_cache(cache, today, prompt_version=prompt_version)
 
 
+def invalidate_cached_description(cache: dict, uri: str) -> bool:
+    """清除某张图片的描述缓存与失败标记，供重新看一眼/刷新描述使用。"""
+    key = _ledger_key(uri)
+    if key is not None:
+        _failures.pop(key, None)
+    ledger = _ledger()
+    if ledger is not None and key is not None:
+        ledger.pop(key, None)
+    cleared = False
+    try:
+        digest = get_cached_image_digest(uri)
+    except Exception:
+        digest = None
+    try:
+        intrinsic = intrinsic_image_description_identity(uri)
+    except Exception:
+        intrinsic = None
+    for ident in filter(None, [digest, intrinsic]):
+        if ident in cache:
+            del cache[ident]
+            cleared = True
+    return cleared
+
+
 def on_load(ctx) -> None:
     from mods import storage
 

@@ -25,6 +25,7 @@ from .models import (
     DEFAULT_VISION_MODEL,
     DEFAULT_REQUEST_TIMEOUT,
     default_config as _default_config,
+    default_providers as _default_providers,
     provider_config,
     resolve_model,
     split_model_selection,
@@ -344,19 +345,90 @@ class _DescriptionTask:
         self.description: str | None = None
 
 
+class _LLMConfig(dict):
+    """Proxy mapping that unifies agent config and providers while keeping storage separated.
+
+    WHY: 将底层的 providers（12 个供应商大量模型与密钥）拆到 agent/providers.json，
+    而将 default_model 等配置收拢到 agent/config.json；
+    _LLMConfig 代理 providers 与 default_model，让所有 resolve_model 与历史调用方完全透明兼容，
+    同时在 storage.save() 时两份字典各自保存到各自的文件中，不再产生耦合或庞大杂糅文件。
+    """
+
+    def __init__(self, config: dict, providers: dict):
+        super().__init__()
+        self._config = config
+        self._providers = providers
+
+    def __getitem__(self, key: str) -> Any:
+        if key == "providers":
+            return self._providers
+        if key == "default_model":
+            return self._config.get("model", self._config.get("default_model", DEFAULT_MODEL))
+        return self._config[key]
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        if key == "providers":
+            if isinstance(value, dict):
+                self._providers.clear()
+                self._providers.update(value)
+            return
+        if key == "default_model":
+            self._config["model"] = value
+            self._config["default_model"] = value
+            return
+        self._config[key] = value
+
+    def __contains__(self, key: object) -> bool:
+        if key in ("providers", "default_model"):
+            return True
+        return key in self._config
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key == "providers":
+            return self._providers
+        if key == "default_model":
+            return self._config.get("model", self._config.get("default_model", default if default is not None else DEFAULT_MODEL))
+        return self._config.get(key, default)
+
+    def setdefault(self, key: str, default: Any = None) -> Any:
+        if key == "providers":
+            return self._providers
+        if key == "default_model":
+            val = self._config.get("model", self._config.get("default_model", default))
+            self._config["model"] = val
+            self._config["default_model"] = val
+            return val
+        return self._config.setdefault(key, default)
+
+    def pop(self, key: str, *args) -> Any:
+        if key == "providers":
+            res = dict(self._providers)
+            self._providers.clear()
+            return res
+        return self._config.pop(key, *args)
+
+    def items(self):
+        d = dict(self._config)
+        d["providers"] = self._providers
+        d["default_model"] = self.get("default_model")
+        return d.items()
+
+    def keys(self):
+        keys = set(self._config.keys()) | {"providers", "default_model"}
+        return keys
+
+    def values(self):
+        return [self[k] for k in self.keys()]
+
+
 class LLMClient:
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: dict, providers: dict | None = None) -> None:
         # WHY: 这里是**活引用**，不是副本：on_load 传进来的正是 storage 的
-        # ``llm_system/config`` 本身，靠它实现"文件改了，运行中的客户端立刻看得见"（见
-        # storage._replace 的 WHY）。别为了"安全"改成 deepcopy，那会切断这条唯一的
-        # 配置热更新路径。
-        # 代价是一个自指写法会静默清空整个配置：``client.config.clear()`` 之后
-        # ``client.config.update(新配置)``，只要那个"新配置"就是 client.config 本身，
-        # 就是先清空再拿清空后的自己更新自己——配置变成 {}，接着一次 _write_one 把 {}
-        # 写进磁盘，reload_clients() 又会把 clients 建成空的，进程从此不能说一句话
-        # （2026-09-17 就是这么崩的）。热换配置要改那个**共享字典**（storage.load、
-        # 或就地 update 一份独立构造的内容），再调 reload_clients()。
-        self.config = config
+        # ``agent/config`` 和 ``agent/providers``，靠它实现"文件改了，运行中的客户端立刻看得见"（见
+        # storage._replace 的 WHY）。
+        self.raw_config = config
+        self.providers = providers if providers is not None else config.get("providers", {})
+        self.config = _LLMConfig(config, self.providers)
         self.clients: dict[str, OpenAI] = {}
         self._description_inflight: dict[tuple[str, object], _DescriptionTask] = {}
         self._description_lock = threading.Lock()
@@ -380,8 +452,39 @@ class LLMClient:
         if not isinstance(value, str):
             return value
         if value.startswith("${") and value.endswith("}"):
-            return os.getenv(value[2:-1])
+            name = value[2:-1]
+        else:
+            name = value
+        env_val = os.getenv(name)
+        if env_val is not None:
+            return env_val
+        # WHY: 进程启动后热加进 .env 的密钥在当前进程 os.environ 里读不到；
+        # 尝试从 .env 读取并补入环境，避免新配置的供应商因未重启而失败。
+        try:
+            from dotenv import dotenv_values
+            file_val = dotenv_values(".env").get(name)
+            if file_val is not None:
+                os.environ[name] = file_val
+                return file_val
+        except Exception:
+            pass
         return os.getenv(value, value)
+
+    def _client_for(self, provider: str) -> OpenAI | None:
+        """Get an existing client or lazily construct one from live config."""
+        client = self.clients.get(provider)
+        if client is not None:
+            return client
+        provider_config = self.config.get("providers", {}).get(provider)
+        if isinstance(provider_config, dict):
+            base_url = self._resolve_config_value(provider_config.get("base_url"))
+            api_key = self._resolve_config_value(provider_config.get("api_key"))
+            options = {key: value for key, value in {"base_url": base_url, "api_key": api_key}.items() if value is not None}
+            options["timeout"] = self.config.get("request_timeout") or DEFAULT_REQUEST_TIMEOUT
+            client = OpenAI(**options)
+            self.clients[provider] = client
+            return client
+        return None
 
     def reload_clients(self) -> None:
         self.clients.clear()
@@ -412,7 +515,7 @@ class LLMClient:
         return ModelCapabilities(**known)
 
     def get_vision_model(self) -> str | None:
-        selection = self.config.get("vision_model")
+        selection = self.config.get("vision_model") or DEFAULT_VISION_MODEL
         if not selection:
             return None
         try:
@@ -449,7 +552,7 @@ class LLMClient:
         为准。取不到时退回本地配置而不是抛给调用方——一条查看用的命令不该因为网络或密钥
         失败变成报错。失败原因进 llm 流，聊天里只说已回退，见 chat._models_report。
         """
-        client = self.clients.get(provider)
+        client = self._client_for(provider)
         if client is None:
             return None
         try:
@@ -706,7 +809,7 @@ class LLMClient:
         if not selection:
             return None
         provider, api_model, _ = resolve_model(self.config, selection)
-        client = self.clients.get(provider)
+        client = self._client_for(provider)
         if client is None:
             raise ValueError(f"Provider {provider} not configured")
         data_uri = uri if uri.startswith("data:image/") else image.image_uri_to_data_uri(uri)
@@ -737,7 +840,7 @@ class LLMClient:
         if not selection:
             return None
         provider, api_model, _ = resolve_model(self.config, selection)
-        client = self.clients.get(provider)
+        client = self._client_for(provider)
         if client is None:
             raise ValueError(f"Provider {provider} not configured")
 
@@ -790,7 +893,7 @@ class LLMClient:
         original_messages = messages
         selection = model or self.config["default_model"]
         provider, api_model, raw_capabilities = resolve_model(self.config, selection)
-        client = self.clients.get(provider)
+        client = self._client_for(provider)
         if client is None:
             raise ValueError(f"Provider {provider} not configured")
         capabilities = ModelCapabilities(**{key: raw_capabilities.get(key, default) for key, default in {
@@ -1436,7 +1539,15 @@ def on_load(ctx) -> None:
     global client
     from mods import storage
 
-    config = storage.get("llm_system", "config")
+    config = storage.get("agent", "config")
+    providers = storage.get("agent", "providers")
     if not config:
         config.update(_default_config())
-    client = LLMClient(config)
+    if not providers:
+        old_config = storage.get("llm_system", "config")
+        if "providers" in old_config and isinstance(old_config["providers"], dict):
+            providers.update(old_config.pop("providers"))
+            storage.save()
+        else:
+            providers.update(_default_providers())
+    client = LLMClient(config, providers)

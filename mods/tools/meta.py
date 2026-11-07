@@ -3,9 +3,12 @@
 你在同一步可调用多个工具，它们按顺序执行，但参数一起生成，彼此看不到结果；依赖前一步结果的操作放在下一步。
 自己的记忆怎样流转已在身份后的“你的记忆”中说明。行动的上下文由构造选择材料，构造给的情境、观察和联想供你判断；怎样回应和行动由你决定。
 
-## 材料与召回
+## 材料、记忆与文件读写
 
-笔记标题标明出处；`@L12-28` 表示只带了原文件第 12–28 行，其余没有载入。`read_note("topic:线索@L12-28")` 可按同一写法读局部；完整笔记用 `read_note("topic:线索")`。`search` 找线索，`read_log` 翻聊天原文，`read_actions` 看自己以前的输出和工具结果。`todo` 是待办本子，构造会看到全文并选择行动需要的部分；随时可主动读取和更新。写笔记用 `write_note` 整篇替换，改前自动留历史；日记和其它专题也可随时写。
+笔记、日记和策略都是 `data/notes/` 下的普通 Markdown 文件，上下文里的笔记标题直接标明文件路径（如 `data/notes/diary/YYYY-MM-DD.md`、`data/notes/recent.md`）。`@L12-28` 表示只带了原文件第 12–28 行，其余没有载入。
+- `read_file` 读取任意文件或笔记（支持 `start`/`end` 左闭右开行区间，也支持直接传笔记名如 `topic:线索` 或 `topic:线索@L12-28`；传目录路径则列出目录内容）。
+- `write_file` 修改或新建文件与笔记：支持传 `old_string` 精准局部替换（最推荐，改长笔记、追加日记或人物经历时只需替换/衔接局部，不必整篇重写）、传 `start`/`end` 按行区间重写、或不传 `old_string`/`start`/`end` 整份覆写（`data/notes/` 下传空串整份覆写会删除该笔记）。`data/notes/` 下的文件修改或删除前会自动备份到 `data/notes/.history/`。
+- `search` 找线索，`read_log` 翻聊天原文，`read_actions` 看自己以前的输出和工具结果。`todo`（`data/notes/todo.md`）是待办本子，构造会看到全文并选择行动需要的部分；随时可用 `read_file` 和 `write_file` 读取或更新。
 
 ## 工具与 Skill
 
@@ -15,22 +18,20 @@
 
 工具列表包含 `reframe` 时，材料需求变了可以单独调用它，选下一段的 focus、refs、接续 note 和工具。它在同一次任务里继续，旧轨迹按 ctx 封存；不会把旧探索全文自动搬过来。reframe 必须独占一次工具批次，不能和其它工具一起调用。
 
-## 怎么开口说话（type_word 与 send）
+## 怎么开口说话（send 与 wait）
 
 你看的每条聊天记录都带一个头：`【头衔】名字(QQ号) 时:分:秒 | message_id`，正文缩进在下一行。头里那个 QQ 号要是你自己，那就是你之前说过的话。想艾特谁写 `[CQ:at,qq=号码]`，想引用哪条就在正文里写 `[CQ:reply,id=message_id]`，id 就是竖线后面那串。
 
-你说话就像真人拿着手机聊微信、聊 QQ 一样，分**“打字”和“点发送”**两步：先调 `type_word(target, text)` 把想说的话敲进那个窗口的输入框，下一步再调 `send(target)` 真正发出去。
+你说话就像真人发消息一样，直接调用 `send(target, text="你想说的话", wait=...)` 即可一步发出。直接写在模型回复正文里的文字全是你心里的自言自语（外面的人看不见），调用 `send` 才是真正让别人听见你说话的方式。每次发送都要写清窗口名字，比如 `target="g<群号>"`、`target="u<私聊QQ号>"` 或 `bili:<BV号>`（`me` 是写给自己看的窗口）。
 
-这是你唯一能让别人听见你说话的方式——你直接写在模型回复正文里的文字，全是你心里的自言自语（虽然会留在你自己的行动记录里，但外面的人一个字也看不见）。每次打字和发送都要写清窗口名字，比如 `target="g<群号>"`、`target="u<私聊QQ号>"` 或 `bili:<BV号>`，别凭感觉盲猜（`me` 是写给自己看的窗口）。
-
-- **先打字、看一眼、再发送**：`type_word` 会把字放进输入框（想改口就重新调一次覆盖，传空串清空；草稿会保留到发送或主动清空）。同一次输出里刚打的字，不能在同一批里紧跟着 `send`——系统特意让你在打字和发送之间隔一步，好让你先看一眼打字这几秒钟里对方有没有发来新消息。等下一步看清了，再决定是照发、改口还是算了不发。
-- **分段与发送回执**：QQ 里在输入框用空行隔开的几段话，`send` 时会像真人聊天一样，隔一两秒一条、拆成几个气泡依次发出去，并返回消息号（`message_id`）。B 站评论整段发成一条评论，空行就是评论里的分段。CLI 窗口（`dsh:main`、`agy:review`、`codex:code`）把完整输入作为一轮任务，立即返回接收编号，回答稍后回到同一窗口并叫醒你；运行中再次发送会保留草稿。命令行窗口 `term:名字` 是你自己的长期终端（tmux），整段原样敲进去并回车，输出攒成一批批消息回来，详见工具模块 `term`。
+- **分段与真人节奏**：QQ 里在正文用空行隔开的几段话，`send` 时会像真人聊天一样，隔一两秒一条、拆成几个气泡依次发出去，并返回消息号（`message_id`）。B 站评论整段发成一条评论，空行就是评论里的分段。CLI 窗口（`dsh:main`、`agy:review`、`codex:code`）把完整输入作为一轮任务，立即返回接收编号，回答稍后回到同一窗口并叫醒你；命令行窗口 `term:名字` 是你自己的长期终端（tmux），整段原样敲进去并回车，输出攒成一批批消息回来，详见工具模块 `term`。
 - **wait 控制后续与自主呼吸**：`send` 的 `wait` 参数决定发完这句之后你是继续活动还是挂着喘气：
   - `wait=0`：不等回复，发完直接跑下一轮，手里还有别的事情接着做；
   - `wait=-1`：发完收工，纯被动等待（相当于原 `final_call=true`），没有超时闹钟；
   - `wait="20m"`（或 `"5m"`、`300` 等）：在当前窗口挂一个超时等待规则（由 awaker 统一调度）。等待期间如果对方（或群里）有人接话，新消息会自动认领并叫醒你；如果超时一直没人回复，awaker 会到点叫醒你，带着你设的 `reason`（例如"不来我就接着读日记"）让你自主接着活动。群聊里还可以传 `who=QQ号` 指定只等某个人接话。等待期间叫醒你的消息要是不用接（比如别人插了一句），那条 wait 在叫醒你时已经用掉了；还想接着等，就调 `wake_me("wait g123:QQ号 10m", 理由)` 重新挂上。
-- **发送失败或未确认**：万一没发出去或者状态“未确认”，系统也会再跑一轮让你看清状况。失败时字还在输入框里；但如果是**“未确认”**，说明请求已经递出去了只是没拿到回执号，那句话十有八九已经发进聊天里了——这时输入框已经清空，千万别直接重发，先看下一轮聊天记录里有没有它。
-- **被叫醒不等于必须开口**：大家闲聊不一定有明确的问题。别人已经答完、话题和你无关、或者你没什么想说的，就安静结束这一轮——不用 `type_word` 也不用 `send`，少说比多说好。真不想接的时候，丢张表情包或者回个问号也行。'''
+- **看到对方话说了一半想等等看**：如果你看到对方发了半句话、或者话题还没展开想等对方说完，**不要发话打断对方，直接调用 `wait("20s", "等对方把话说完")` 挂起喘气**。
+- **发送失败或未确认**：万一没发出去或者状态“未确认”，系统也会再跑一轮让你看清状况。如果是**“未确认”**，说明请求已经递出去了只是没拿到回执号，那句话十有八九已经发进聊天里了——这时输入框已经清空，千万别直接重发，先看下一轮聊天记录里有没有它。
+- **被叫醒不等于必须开口**：大家闲聊不一定有明确的问题。别人已经答完、话题和你无关、或者你没什么想说的，就安静结束这一轮——不用调 `send`，少说比多说好。真不想接的时候，丢张表情包或者回个问号也行。'''
 
 from __future__ import annotations
 
@@ -196,7 +197,7 @@ def read_log(window: str, count: int = 30, before: str = "") -> str:
 def search(keyword: str, window: str = "", days: int = 30) -> str:
     """觉得某件事好像聊过、记过，但拿不准在哪时，顺着关键词一次找遍聊天记录、笔记、日记和归档上下文，返回每处命中的摘要和出处。
 
-    找到线索后，再用 read_log 看聊天前后文、read_note 看笔记或日记全文、或者加载 memory_system 后用 read_context 翻归档段。
+    找到线索后，再用 read_log 看聊天前后文、read_file 看笔记或日记全文、或者加载 memory_system 后用 read_context 翻归档段。
 
     @param
     keyword: 要找的词，名字、QQ 号、话题词都行（不区分大小写，按原文子串匹配）
@@ -224,28 +225,127 @@ def read_actions(ids: list[str] | None = None, count: int = 10, keyword: str = "
     return chat.roles.read_actions(ids, count, keyword, start)
 
 
-def read_note(scope: str) -> str:
-    """想翻看某个人、某个群、某篇日记、某份专题笔记或自己的常驻笔记时，读取那份笔记的全文或指定原文件行号的片段。
+MAX_READ_BYTES = 32 * 1024
+_FILE_HEADER = re.compile(r"^file:\s*.*?\s*\|\s*(lines:\s*\[\s*-?\d+\s*,\s*-?\d+\s*\)|line:\s*-?\d+)")
+_FILE_REST = re.compile(r"^\.\.\.rest \d+ lines?$")
+
+
+def _human_bytes(size: int) -> str:
+    return f"{size} B" if size < 1024 else f"{size / 1024:.1f} KB"
+
+
+def _clamp_lines(lines: list[str], start: int = 0, end: int | None = None) -> tuple[int, int]:
+    total = len(lines)
+    if start < 0:
+        start += total
+    start = max(0, min(start, total))
+    if end is None or end > total:
+        end = total
+    elif end < 0:
+        end = max(start, total + end)
+    else:
+        end = max(start, min(total, end))
+    return start, end
+
+
+def _render_file_window(path: str, lines: list[str], start: int, end: int) -> str:
+    header = f"file: {path} | lines: [{start}, {end}) | total: {len(lines)}"
+    body = [f"{index}│{line}" for index, line in enumerate(lines[start:end], start)]
+    remaining = len(lines) - end
+    if remaining > 0:
+        body.append(f"...rest {remaining} line" + ("s" if remaining != 1 else ""))
+    else:
+        body.append(f"─── EOF ({len(lines)}) ───")
+    return "\n".join([header, *body])
+
+
+def _missing_file(path: str) -> str:
+    import difflib
+    import os
+
+    parent = os.path.dirname(path) or "."
+    try:
+        names = os.listdir(parent)
+    except OSError:
+        return f"路径不存在: {path}"
+    close = difflib.get_close_matches(os.path.basename(path), names, n=3)
+    if not close:
+        return f"路径不存在: {path}"
+    nearby = "、".join(os.path.join(parent, name) for name in close)
+    return f"路径不存在: {path}\n同目录下相近的有: {nearby}"
+
+
+def _clean_file_content(text: str) -> str:
+    from mods import file
+
+    body = text.splitlines()
+    if body and _FILE_HEADER.match(body[0].strip()):
+        body = body[1:]
+    if body and (_FILE_REST.match(body[-1].strip()) or body[-1].strip().startswith("─── EOF")):
+        body.pop()
+    return file.strip_linemark("\n".join(body))
+
+
+def _resolve_target(path: str) -> tuple[str, tuple[int, int] | None]:
+    from mods.chat import notes
+
+    try:
+        return notes.resolve_path(path)
+    except ValueError:
+        return path.strip(), None
+
+
+def read_file(path: str, start: int = 0, end: int | None = None, max_bytes: int = MAX_READ_BYTES) -> str:
+    """读取文件或笔记的一段并带行号返回；传目录路径则返回目录列表。
 
     @param
-    scope: 笔记名，如 self、global、recent、todo、awaker、person:<QQ号>、group:<群号>、diary:<日期>、topic:线代；局部加 @L起行-末行，如 topic:线代@L12-28（行号从 1 起）
+    path: 文件或目录路径（如 data/notes/diary/2026-11-03.md、mods/chat/agent.py），也支持直接写笔记名（如 recent、todo、person:<QQ号>、diary:<日期>、policy:construct、topic:线代@L12-28）
+    start: 闭区间起始行号（包含本行），从 0 数；负数表示从末尾倒数，默认 0
+    end: 开区间结束行号，查看止于此行之前（不包含本行）；留空或超出则一直读到文件末尾（EOF）
+    max_bytes: 本次截取内容的字节上限，默认 32768；超出则不展开内容，只回大小和后续建议
     """
-    from mods import chat
+    import os
 
-    return chat.roles.read_note(scope)
+    from mods import file, op
+    from mods.chat import notes
+
+    target, slice_range = _resolve_target(path)
+    if slice_range is not None and start == 0 and end is None:
+        start, end = slice_range
+    if not notes.is_note_path(target) and not op.bot_is_op():
+        return "权限不足"
+    if os.path.isdir(target):
+        return file.listdir(target)
+    try:
+        lines = file.read(target).splitlines()
+    except FileNotFoundError:
+        return _missing_file(target)
+    except (OSError, UnicodeDecodeError) as exc:
+        return f"读取失败: {exc}"
+    start, end = _clamp_lines(lines, start, end)
+    measured = len("\n".join(lines[start:end]).encode("utf-8"))
+    if measured > max_bytes:
+        return (
+            f"file: {target} | lines: [{start}, {end}) | total: {len(lines)} | {_human_bytes(measured)}\n"
+            f"超过 {_human_bytes(max_bytes)} 未展开。可以用 start/end 缩小读取区间，"
+            f"或用 agents__fork 开子会话通读后只带回摘要；"
+            f"确实要整段进上下文时再调高 max_bytes。"
+        )
+    return _render_file_window(target, lines, start, end)
 
 
-def attach_image(uri: str, note: str = "", model: str = "") -> str:
+def attach_image(uri: str, note: str = "", model: str = "", refresh: bool = False) -> str:
     """遇到聊天图片、评论配图、截图或验证码这类得亲眼看了才知道的内容时，把图片交给你自己看；当前模型不支持视觉或指定了视觉模型时会自动转述。
 
     @param
     uri: 图片地址，支持 file://、http(s):// 或 data:，工具或评论里给的地址直接传进来就行
-    note: 附在图前的备忘，提醒重点看什么，如"看清图里的报错字样"
-    model: 留空表示交给当前模型亲眼看（当前模型无视觉时自动调用默认识图模型转述）；也可指定模型（如 "azure/gpt-5.6-luna"、"cheap"、"bytecat/gpt-5.4-mini"）转述
+    note: 附在图前的备忘或具体提问，提醒重点看什么，如"看清图里的报错字样"、"提取所有文字"
+    model: 留空表示交给默认视觉模型转述（当前为 gemini/gemini-3.7-flash）；也可点名模型，如 "gemini"（中转站 3.7 Flash）、"google"（官方 2.5/3.7）、"leaf"（叶子）、"luna"、"cheap" 或完整供应商模型名（如 "gemini/gemini-3.8-flash"）
+    refresh: 设为 True 时强制刷新缓存，让视觉模型重新看一眼（跳过并更新已有图片描述）
     """
     from ._vision import attach
 
-    return attach(uri, note, model=model or None)
+    return attach(uri, note, model=model or None, refresh=refresh)
 
 
 def _box_window(target: str) -> tuple[tuple, str]:
@@ -287,18 +387,11 @@ def _this_output() -> str | None:
 
 
 def type_word(target: str, text: str) -> str:
-    """想在群里、私聊或评论区开口说话时，先把话打进对应窗口的输入框（不会立刻发出去），返回输入框当前的内容。
-
-    直接写在回复正文里的话不会发出去，只会留在你自己的行动记录里；说话先打进输入框，下一步看过期间有没有新消息再调 send 发出去。想改口就重新打一遍覆盖，不想说了传空串清空。输入框里的字会一直留着，发出去才会消失。
-    ``me`` 也能打：那是写给自己看的一句话，交接或反思时想说什么就说什么，不吵到任何人。
+    """把话打进对应窗口的输入框暂存（通常直接用 send(target, text=...) 一步发出去即可，仅在需要暂存草稿时使用）。
 
     @param
     target: 要说话的窗口，如 g<群号>、u<私聊号>、bili:<BV号>、me，或画面里出现过的可回话窗口
     text: 要打进输入框的完整内容，CQ 码（at、回复、图片）直接写；传空串清空输入框
-
-    WHY: 维护者 2026-10-23：说话先打字、再发送，参照 Cortico 的起草-确认门，但用"输入框"
-    的说法——她打出来的字自己看得见。打字和发送之间至少隔一次请求（见 send），于是这期间
-    到的消息她一定看过；不靠延迟，人可能隔几分钟才接上下一句。
     """
     try:
         _window, label = _box_window(target)
@@ -310,8 +403,8 @@ def type_word(target: str, text: str) -> str:
         boxes.pop(label, None)
         return f"{label} 的输入框已清空"
     boxes[label] = {"text": body, "typed_in": _this_output()}
-    return (f"{label} 的输入框：\n{body}\n"
-            f"（还没发。看清新到的消息后调 send(\"{label}\") 发出去；想改口重新打字，不想发了传空串清空输入框）")
+    return (f"{label} 的输入框已暂存：\n{body}\n"
+            f"（日常开口可直接调用 send(\"{label}\", text=...) 一步发送；不想发了可传空串清空输入框）")
 MAX_BUBBLES = 4
 BUBBLE_GAP = (1.0, 2.0)
 
@@ -332,44 +425,23 @@ def _split_turns(text: str) -> list[str]:
 
 def send(
     target: str,
+    text: str = "",
     wait: int | float | str = -1,
     reason: str = "",
     who: int | str | None = None,
+    force: bool = False,
 ) -> str:
-    """看过打字期间的新消息、确认输入框里的话没问题后，把它真正发进目标窗口，返回发出的消息号（message_id）。
+    """开口说话：直接把话发进目标窗口，返回发出的消息号（message_id）。
 
-    同一轮输出里刚 type_word 的字不能同一步直接 send，总要隔一步让你先看一眼新消息。发出去的话别人当场就能看见；QQ 里用空行分段的文字会像真人一样拆成几条依次发出，B 站评论和 CLI 窗口整段一次发出。遇到“未确认”说明多半已经发出去了，先看下一轮聊天记录，别直接重发。
+    发出去的话别人当场就能看见；QQ 里用空行分段的文字会像真人一样隔一两秒拆成几条依次发出，B 站评论和 CLI 窗口整段一次发出。遇到“未确认”说明多半已经发出去了，先看下一轮聊天记录，别直接重发。
 
     @param
-    target: 要发送的窗口，和 type_word 填的一样（如 g<群号>、u<私聊号>、bili:<BV号>、me）
-    wait: 发完后怎么安排后续。传 0 表示不等、发完继续这一轮干手头的活；传 -1 表示结束这轮、纯被动等待；传等待时长（如 "5m"、"20m"、"1h" 或秒数 300）表示在当前窗口挂一个超时等待闹钟，期间有人回复立刻叫醒，到点超时还没人回也会自动叫醒你继续呼吸
+    target: 要发送的窗口（如 g<群号>、u<私聊号>、bili:<BV号>、me）
+    text: 想对这个窗口说的话，支持 CQ 码（at、回复、图片、表情）；直接一步发出。传空串时会发送该窗口输入框草稿
+    wait: 发完后怎么安排后续。传 0 表示不等、发完继续这一轮干手头的活；传 -1 表示结束这轮、纯被动等待；传等待时长（如 "5m"、"20m"、"1h" 或秒数 300）表示在当前窗口挂一个超时等待闹钟，期间有人回复立刻叫醒，到点超时还没人回也会自动叫醒你继续呼吸；若传字符串时带有 force（如 "10m force"）或设置 force=True，开启强制等待闸门（期间绝不打扰，到期汇总提醒叫醒你）
     reason: 挂超时等待（wait > 0）时写给到时候自己的理由，如"不来我就接着读日记"、"等草籽接话"；留空默认"等回复"
     who: 在群聊窗口中指定只等特定人回复（填 QQ 号，如 123456；传 "any" 等群里任何人）。若不填：在有人跟你说话的轮次里自动默认等刚才跟你说话的人，避免路人插话吞掉等待；在你自己醒来的轮次（闹钟、订阅等无对话人轮次）不填则等待群里任何人回复。命令行窗口（term:名字）里填一段文字，等输出里出现它才算等到（同一批输出里出现才算）
-
-    WHY: 同一次输出里刚 type_word 的字不发。那一批调用的参数是一起生成的，她还没看到
-    打字之后到的消息；拒绝一次，下一次请求里新消息就在眼前（维护者 2026-10-23）。
-
-    WHY: 它**等**发送结果，不是投递完就返回。这不是谨慎，是终止语义逼出来的：一轮的结束
-    由 `wait` 声明，而"失败时照常再跑一轮"要求这里能分辨成败——成败只有 SendFuture
-    完成时才知道。实测代价约 0.3~0.6 秒，来自 `message._work` 每条消息后的节流 sleep，
-    不是网络。每个种类的发送函数都要这样等（见 chat/windows.py）；QQ 的三类结果、超时和
-    不转义的 WHY 跟着发送代码搬到了 `windows._send_qq`。
-
-    WHY: 2026-10-27 起用参数控制终结回合；2026-10-29 草籽与柚子商定进化为 wait：
-    0 = 不等继续循环干活；-1 = 结束这一轮纯被动等待；
-    >0（如 "20m"）= 在当前窗口挂一个超时等待规则（由 awaker 统一部署，兼顾等任何人或特定人），
-    期间有回复即刻认领叫醒，超时未回复则到点叫醒自己做别的事（"话说完不是死掉，是挂在那儿喘气"）。
-    同时发言后固定 5 分钟自动跟听并入此机制，由她自主决定等多久。
-
-    WHY: 它住在 meta 而不是自己一个模块，因为发言是模型**永远**该有的能力，而
-    `tools._BASE_MODULE_NAME` 是单数、基础模块只有一个。meta 早就不只是"管工具模块"了
-    （事件反查和覆盖工具也管上下文），它实际是那组不可卸载的基础能力，`type_word`/`send`
-    属于这一组。改成支持多个基础模块也行，代价是那条"基础模块的导出不加模块名前缀"的
-    规则会多出命名冲突的可能，眼下不值得。
-
-    WHY?: 子代理（`tools/agents.py`）因此也拿得到 `type_word`/`send`（2026-10-23 以前是 `say`），于是它能直接往窗口里说话——这是
-    工具化带来的**新**能力，以前子代理的正文只回给主模型。没有给它加门控，因为"子代理该
-    不该能说话"还没有人拍过；先记在这里，真出现不想要的发言再决定是挡掉还是保留。
+    force: 是否开启强制等待闸门（上限 1 天）。传 True 期间绝不叫醒你，消息正常登记未读，等时间到了将所有积压提醒按窗口归类合并后一次性叫醒你
     """
     from mods import context
     from mods.chat import awaker, windows
@@ -380,12 +452,25 @@ def send(
     except ValueError as error:
         return str(error)
     boxes = _boxes()
-    box = boxes.get(label)
-    if not box:
-        return f"{label} 的输入框是空的，什么都没发。先用 type_word 把要说的话打进去"
-    if box["typed_in"] is not None and box["typed_in"] == _this_output():
-        return (f"{label} 的字是这一步刚打的，你还没看过打字之后到的消息，这一步先不发。"
-                f"下一步看一眼，再决定 send、改还是不发。输入框里现在是：\n{box['text']}")
+    content = str(text) if text else ""
+    # Backward compatibility: old send(target, wait=..., ...) passed wait as 2nd positional arg
+    if content and boxes.get(label):
+        s = content.strip().lower()
+        if (
+            isinstance(text, (int, float))
+            or s in ("0", "-1", "0s", "-1s", "true", "false", "off", "none")
+            or s.startswith("wait ")
+            or re.match(r"^\d+[smhd]$", s)
+        ):
+            wait = text
+            content = ""
+
+    if not content.strip():
+        box = boxes.get(label)
+        if not box or not box.get("text", "").strip():
+            return f"{label} 的输入框是空的，请直接在 send(target, text=\"...\") 中传入想说的话"
+        content = box.get("text", "")
+
     if context.agent_mode():
         current_binding()["run"]["associated_windows"].add(window)
 
@@ -393,6 +478,10 @@ def send(
     wait_seconds = 0
     wait_target = label
     wait_str = str(wait).strip()
+    if "force" in wait_str.lower():
+        force = True
+        wait_str = re.sub(r"\bforce\b", "", wait_str, flags=re.IGNORECASE).strip()
+        wait = wait_str
 
     if wait == 0 or wait_str in ("0", "0s", "false", "False"):
         wait_mode = "continue"
@@ -454,7 +543,7 @@ def send(
         "先在下一轮的聊天记录里看它在不在，再决定要不要重发——不要直接重发。"
     )
     sender = windows.sender(window)
-    parts = [box["text"]] if windows.spec(window)["whole"] else _split_turns(box["text"])
+    parts = [content] if windows.spec(window)["whole"] else _split_turns(content)
     if tuple(window) == windows.ME:
         # WHY: 2026-10-27 早上草籽拆掉「现在是交接或反思，不对外说话」那道代码胶带——
         # me 是写给自己看的一行，想说的话有地方落下，第二天醒来自己看得见，也不吵到谁。
@@ -483,7 +572,7 @@ def send(
             boxes.pop(label, None)
             return (f"发送失败（{type(error).__name__}）：{error}。"
                     f"前 {len(sent)} 条已经发出去了，剩下的没发，别再重发前面那些。")
-        return f"发送失败（{type(error).__name__}）：{error}。这句话没有发出去，还在输入框里。"
+        return f"发送失败（{type(error).__name__}）：{error}。这句话没有发出去。"
     boxes.pop(label, None)
 
     if wait_mode == "continue":
@@ -495,6 +584,11 @@ def send(
         current_binding()["run"]["end"] = True
         wait_reason = reason.strip() or (f"等 {wait_target} 出现「{wait_text}」" if wait_text else f"等 {wait_target} 回复")
         dur_label = f"{wait_seconds // 60}m" if wait_seconds >= 60 and wait_seconds % 60 == 0 else f"{wait_seconds}s"
+        if force:
+            from mods.chat import attention
+            attention.force_quiet(wait_seconds, wait_reason)
+            result_text = "、".join(str(item) for item in sent) if len(sent) > 1 else str(sent[0])
+            return f"{result_text}（已立起强制等待闸门 {dur_label}：期间绝不打扰，到期汇总提醒叫醒你）"
         try:
             plant_line = awaker.plant(f"wait {wait_target} {dur_label}", wait_reason, text=wait_text)
         except Exception as error:
@@ -503,27 +597,157 @@ def send(
         return f"{result_text}（已设等待：{plant_line}；来消息或超时都会叫你）"
 
     return "、".join(str(item) for item in sent) if len(sent) > 1 else str(sent[0])
-def write_note(scope: str, text: str) -> str:
-    """想记下对某个人或群的新了解、新建或更新专题笔记、更新待办（todo）、改闹钟（awaker）或写日记时，用新的完整内容替换那份笔记，返回写入结果。
+def _confirm_file_write(path: str, start: int, count: int) -> str:
+    from mods import file
 
-    你可以随时起名字新建专题笔记（如 `消消乐`、`topic:线代`），把具体某件事的经验、资料或长想法单独放一份，在 `global` 里只留一行引用，免得把 `global` 塞成大杂烩；白天遇到想记的事也可以当场写进今天日记 `diary:YYYY-MM-DD`。这是整份覆盖（传空串会删掉整份笔记），改前会自动留备份。你对自己的认识（self）白天不在这里改，留到反思时用 edit_policy 改。
+    try:
+        lines = file.read(path).splitlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        return f"已写入 {path}，但回读失败: {exc}"
+    if not lines:
+        return f"已写入 {path}，文件现在为空\n─── EOF (0) ───"
+    start = max(0, min(start, len(lines) - 1))
+    view_end = min(len(lines), start + max(count, 1))
+    return f"已更新 {path}\n" + _render_file_window(path, lines, start, view_end)
 
-    @param
-    scope: 笔记名，如 global、recent、todo、awaker、person:<QQ号>、group:<群号>、diary:<日期>，或你自己起的专题笔记名（如 消消乐、topic:线代）
-    text: 更新后的整份笔记全文；传空串会删除这份笔记
-    """
+
+def _finish_note_write(path: str, message: str) -> str:
+    from pathlib import Path
     from mods.chat import awaker, notes
 
-    if scope == "self":
-        # WHY: 维护者 2026-10-22 定：自我认知只在夜间反思里改，白天被人一句话说动的事
-        # 要隔一晚回头看过才变成"我是谁"，免得一次聊天里的诱导变成每次醒来都生效的人设。
-        return "self 是你对自己的认识，白天不改；想到的先记进 recent 或 todo，夜里反思时再决定要不要用 edit_policy 改"
-    notes.write(scope, text)
-    if scope == "awaker":
+    if notes.is_note_path(path) and Path(path).resolve() == (notes.ROOT / "awaker.md").resolve():
+        text = Path(path).read_text(encoding="utf-8") if Path(path).is_file() else ""
         found, skipped = awaker.parse(text if text.strip() else awaker.DEFAULT)
-        lines = [f"已写入 awaker，{len(found)} 条规则生效"] + [f"不认识：{line}" for line in skipped]
-        return "\n".join(lines)
-    return f"已写入 {scope}" if text.strip() else f"已删除 {scope}"
+        extra = [f"（awaker：{len(found)} 条规则生效）"] + [f"不认识：{line}" for line in skipped]
+        return message + "\n" + "\n".join(extra)
+    return message
+
+
+def write_file(
+    path: str,
+    content: str,
+    start: int | None = None,
+    end: int | None = None,
+    old_string: str = "",
+    force: bool = False,
+) -> str:
+    """写入或修改文件与笔记：支持精确查找替换（old_string）、按行区间改写（start/end）、或全文件覆写/新建。data/notes/ 下的笔记修改前自动备份到 .history/。
+
+    @param
+    path: 目标文件路径（如 data/notes/diary/2026-11-03.md、data/notes/recent.md、mods/chat/agent.py），也支持直接传笔记名（如 recent、todo、person:<QQ号>、diary:<日期>、policy:construct、专题名）
+    content: 替换后的新内容；若行首带行号（如 40│）或头尾带 header/EOF/rest 标记，会自动剥离干净。data/notes/ 下整份覆写传空串会删除该笔记
+    start: 闭区间起始行号（从 0 起算，负数表示从末尾倒数）。配 old_string 时留空默认 0；不配 old_string 整段改写时必填
+    end: 开区间结束行号（不包含本行，超出总行数按 EOF 算）。配 old_string 时留空查到末尾；不配 old_string 整段改写时必填
+    old_string: 待替换的原始文本。改长笔记（如日记、人物笔记）时优先传 old_string 做局部替换或末尾追加，不必整篇重写；找不到或匹配超过 1 次会拒绝修改并报错
+    force: 二次确认开关，默认 False。白天改 self.md 时默认会先提醒沉淀；确认当下就要改时传 True 直接写入
+    """
+    import os
+    from pathlib import Path
+
+    from mods import file, op
+    from mods.chat import notes
+
+    target, slice_range = _resolve_target(path)
+    if slice_range is not None and start is None and end is None:
+        start, end = slice_range
+    in_notes = notes.is_note_path(target)
+    if not in_notes and not op.bot_is_op():
+        return "权限不足"
+    if os.path.isdir(target):
+        return f"{target} 是目录，无法作为文件写入"
+    if in_notes and not force and Path(target).resolve() == (notes.ROOT / "self.md").resolve():
+        # WHY: 维护者 2026-10-22 定、2026-11-03 改为 force 二次确认减速带：自我认知默认留到夜间反思改，
+        # 免得白天一次聊天里的随口诱导直接变成每次醒来都生效的人设；真想清楚当下就要改时传 force=True 放行。
+        try:
+            reflecting = current_binding()["run"]["kind"] == "reflect"
+        except (RuntimeError, KeyError):
+            reflecting = False
+        if not reflecting:
+            return "self.md 是你对自己的认识，白天建议先记进 data/notes/recent.md 或 data/notes/todo.md 留到夜里反思再改；如果你已经想清楚、确定现在就要改，请传 force=True 重新调用 write_file"
+
+    clean_text = _clean_file_content(content)
+    clean_old = file.strip_linemark(old_string) if old_string else ""
+
+    if in_notes and start is None and end is None and not clean_old and not clean_text.strip():
+        target_path = Path(target)
+        if target_path.is_file():
+            notes.backup_file(target_path)
+            target_path.unlink()
+        return _finish_note_write(target, f"已删除 {target}")
+
+    if not os.path.exists(target):
+        if start is not None or end is not None or clean_old:
+            return f"文件不存在，无法进行局部修改: {target}"
+        try:
+            file.write(target, clean_text + "\n" if clean_text and not clean_text.endswith("\n") else clean_text)
+        except OSError as exc:
+            return f"写入失败: {exc}"
+        return _finish_note_write(target, _confirm_file_write(target, 0, min(len(clean_text.splitlines()), 40)))
+
+    try:
+        lines = file.read(target).splitlines()
+    except FileNotFoundError:
+        return _missing_file(target)
+    except (OSError, UnicodeDecodeError) as exc:
+        return f"读取失败: {exc}"
+
+    if clean_old:
+        if start is None and end is None:
+            c_start, c_end = 0, len(lines)
+            sub_text = "\n".join(lines)
+            range_desc = ""
+        else:
+            c_start, c_end = _clamp_lines(lines, start or 0, end)
+            sub_text = "\n".join(lines[c_start:c_end])
+            range_desc = f" [{c_start}, {c_end}) 行号区间内"
+
+        occurrences = sub_text.count(clean_old)
+        if occurrences == 0:
+            return f"在 {target}{range_desc} 未找到指定的 old_string，未写入；请确认文本内容或调整起止行号范围。"
+        if occurrences > 1:
+            return (
+                f"指定的 old_string 在 {target}{range_desc} 匹配了 {occurrences} 次；"
+                f"请缩小起止行号范围或提供更多上下文文本，确保唯一命中。"
+            )
+
+        idx = sub_text.find(clean_old)
+        edit_start = c_start + sub_text[:idx].count("\n")
+        edit_count = max(1, len(clean_text.splitlines()))
+        replaced_sub_text = sub_text.replace(clean_old, clean_text, 1)
+        if in_notes and replaced_sub_text != sub_text:
+            notes.backup_file(target)
+        try:
+            file.overwrite(target, replaced_sub_text, c_start, c_end)
+        except OSError as exc:
+            return f"写入失败: {exc}"
+        return _finish_note_write(target, _confirm_file_write(target, max(0, edit_start - 2), min(edit_count + 4, 40)))
+
+    if start is not None or end is not None:
+        # WHY: 2026-10-29 审查：没有 old_string 时，区间就是要删掉的范围。只给 start 曾一路删到文件末尾，
+        # 只给 end 则从第 0 行删起，而本意多半只是改几行。所以整段改写两头都得写明；真要改到末尾，
+        # end 写一个比总行数大的数（超出照旧按 EOF 算）。
+        if start is None or end is None:
+            return (f"没有 old_string 时按 [start, end) 整段改写，start 和 end 都要给（只给了 "
+                    f"{'start' if start is not None else 'end'}，什么都没写）；只想改一处就用 old_string")
+        c_start, c_end = _clamp_lines(lines, start, end)
+        if in_notes:
+            notes.backup_file(target)
+        try:
+            file.overwrite(target, clean_text, c_start, c_end)
+        except OSError as exc:
+            return f"写入失败: {exc}"
+        return _finish_note_write(target, _confirm_file_write(target, max(0, c_start - 2), min(len(clean_text.splitlines()) + 4, 40)))
+
+    if in_notes:
+        old_raw = Path(target).read_text(encoding="utf-8") if os.path.isfile(target) else ""
+        if old_raw.strip() == clean_text.strip():
+            return _finish_note_write(target, _confirm_file_write(target, 0, min(len(clean_text.splitlines()), 40)))
+        notes.backup_file(target)
+    try:
+        file.write(target, clean_text + "\n" if clean_text and not clean_text.endswith("\n") else clean_text)
+    except OSError as exc:
+        return f"写入失败: {exc}"
+    return _finish_note_write(target, _confirm_file_write(target, 0, min(len(clean_text.splitlines()), 40)))
 
 
 # WHY: 2026-10-29 草籽：wait 是来消息就认领、当场划掉的；别人插一句叫醒了她，原来的 wait 就没了。
@@ -540,7 +764,7 @@ def wake_me(when: str, reason: str) -> str:
 
     WHY: 维护者 2026-10-23：她要能自己决定什么时候再醒。最常用的是 wait——对方话说了一半、
     她决定先不接，后续一直不来那半句就挂着；死板的延迟唤醒也不行，对方接上了延迟到点还会再
-    叫一遍。规则写进笔记 awaker（相对时间换成时刻），她用 read_note/write_note 能看能改。
+    叫一遍。规则写进笔记 awaker（相对时间换成时刻），她用 read_file/write_file 能看能改。
     想在某个函数被调用时醒，用 exec_code 包一层它，里面调 chat.wake(reason=..., kind=...)，
     重启后要重新包。
     """
@@ -548,17 +772,26 @@ def wake_me(when: str, reason: str) -> str:
 
     from mods.chat import awaker
 
+    if clean_when := " ".join(when.split()):
+        if re.fullmatch(r"(?:mute\s+force|force)\s+off", clean_when, flags=re.IGNORECASE):
+            from mods.chat import attention
+            attention.lift_force()
+            return "已解除强制静音闸门"
     if match := re.fullmatch(r"(?:follow|mute)\s+(\S+)\s+off", " ".join(when.split())):
         return f"已揭掉 {match[1]} 的覆盖层" if awaker.lift(match[1]) else f"{match[1]} 本来就没有覆盖层"
     try:
         line = awaker.plant(when, reason)
     except ValueError as error:
         return str(error)
+    if "已解除强制静音闸门" in line:
+        return line
+    if line.startswith("mute force until ") or line.startswith("wait force until "):
+        return f"已开启强制静音闸门：{line}（期间绝不打扰，消息正常记未读，到期汇总提醒叫醒你；提前解除写 mute force off）"
     kind = line.split(" ", 1)[0]
     if kind in ("follow", "mute"):
         return f"已写进 awaker：{line}（同一目标再写一次就替换，揭掉写 {kind} {line.split()[1]} off）"
     once = kind in ("at", "on", "wait", "when")
-    return f"已写进 awaker：{line}" + ("（响过就划掉；不要了用 write_note 改 awaker）" if once else "（不要了用 write_note 改 awaker）")
+    return f"已写进 awaker：{line}" + ("（响过就划掉；不要了用 write_file 改 data/notes/awaker.md）" if once else "（不要了用 write_file 改 data/notes/awaker.md）")
 
 
 def loop(note: str = "", stop: bool = False) -> str:
@@ -583,20 +816,27 @@ def loop(note: str = "", stop: bool = False) -> str:
     return "循环开着：这一轮结束后会再叫醒你，一轮接一轮；要等就 wait，彻底做完了 loop(stop=True)"
 
 
-def wait(seconds: float | str, reason: str = "") -> str:
+def wait(seconds: float | str, reason: str = "", force: bool = False) -> str:
     """歇一会儿再叫醒你（不阻塞当前进程）。在连续循环（loop）里使用会保持循环；不在循环里使用时会通过 awaker 闹钟在指定时间后叫醒你。
 
-    等待期间如果有人来消息，照样会提前叫醒你。
+    普通等待期间如果有人来消息，照样会提前叫醒你；传 force=True 时开启强力静音闸门（上限 1 天），期间任何消息、@、闹钟都不会叫醒你，消息正常登记未读，等时间到了将所有积压提醒按窗口归类合并后一次性叫醒你。
 
     @param
-    seconds: 歇多久再叫醒你，填秒数（如 300）或时长（如 "10m"、"2h"）
+    seconds: 歇多久再叫醒你，填秒数（如 300）或时长（如 "10m"、"2h"）；若传字符串也可带 force（如 "10m force"）
     reason: 唤醒理由，不在循环里时写给到时候的自己看
+    force: 是否强制等待。传 True 期间立起闸门绝不被打扰，上限 1 天（86400秒）；到期汇总期间所有消息与提醒一次性叫醒
     """
+    import re
     from mods import chat
     from mods.chat import awaker
 
     if chat.current_wake() is None:
         return "只有主唤醒能安排这次运行的等待"
+    s_raw = str(seconds).strip()
+    if "force" in s_raw.lower():
+        force = True
+        s_raw = re.sub(r"\bforce\b", "", s_raw, flags=re.IGNORECASE).strip()
+        seconds = s_raw
     if isinstance(seconds, (int, float)):
         value = float(seconds)
     else:
@@ -608,9 +848,99 @@ def wait(seconds: float | str, reason: str = "") -> str:
         return "等待时长必须是有限秒数"
     value = max(2.0, min(value, 86400.0))
     from mods.chat import attention
+    if force:
+        attention.force_quiet(value, reason.strip() or "歇完了接着干")
+        current_binding()["run"]["end"] = True
+        return f"好，已立起强制等待闸门，{chat.agent.span(value)}内绝不打扰（消息正常记未读）；到期汇总所有提醒叫醒你"
     attention.wait(value, reason.strip() or "歇完了接着干")
     current_binding()["run"]["end"] = True
     return f"好，这一轮到此为止，{chat.agent.span(value)}后再叫你；期间有消息照样叫你"
+
+
+def mute(
+    target: str = "all",
+    duration: int | float | str = "30m",
+    reason: str = "",
+    force: bool = False,
+    off: bool = False,
+) -> str:
+    """暂时静音：默认开启普通静音覆盖层（force=False，只压制默认触发器，闹钟和维护者消息仍可叫醒）。
+    传 force=True 时立起强力静音闸门（期间绝不打扰，闹钟/消息全部暂存，上限 1 天，到期汇总提醒一次性叫醒）。
+
+    @param
+    target: 静音目标。传 "all" 为全局静音；也可以是某个群号（"g123"）、私聊号（"u456"）或整类（"group"、"bili"）；直接传时长（如 mute("1h")）会自动识别为全局静音
+    duration: 静音时长，如 "30m"、"1h"、"2h" 或秒数 300，上限 1 天（86400秒）
+    reason: 静音理由，写给到时候的自己看
+    force: 是否强制静音（默认 False）。传 False 为普通覆盖层（只压制默认触发器，闹钟和维护者消息照样叫醒）；传 True 期间立起闸门绝不打扰，闹钟和消息全部暂存，到期汇总提醒一次性叫醒
+    off: 传 True 解除静音（target="all" 解除全局静音与强制闸门，target="g123" 揭掉该窗口覆盖层）
+    """
+    import re
+    from mods.chat import attention, awaker
+
+    s_target = str(target).strip()
+    if s_target.lower() in ("off", "stop", "cancel"):
+        off = True
+        s_target = "all"
+
+    # Check if target or duration has "force" keyword
+    if "force" in s_target.lower():
+        force = True
+        s_target = re.sub(r"\bforce\b", "", s_target, flags=re.IGNORECASE).strip() or "all"
+    if isinstance(duration, str) and "force" in duration.lower():
+        force = True
+        duration = re.sub(r"\bforce\b", "", duration, flags=re.IGNORECASE).strip()
+
+    # If first arg looks like a duration (e.g. mute("1h") or mute(300)), treat as global mute
+    if not off:
+        if isinstance(target, (int, float)) or (s_target and awaker._interval(s_target) is not None):
+            if not reason and isinstance(duration, str) and awaker._interval(duration) is None:
+                reason = duration
+            duration = s_target
+            s_target = "all"
+
+    if s_target.lower() in ("all", "*", "global", "me"):
+        if off:
+            attention.lift_force()
+            lifted_layer = awaker.lift("all")
+            return "已解除全局静音（闸门与普通覆盖层均已揭掉）" if lifted_layer else "已解除全局静音"
+        sec = None
+        if isinstance(duration, (int, float)):
+            sec = float(duration)
+        else:
+            sec = awaker._interval(str(duration).strip())
+        if sec is None or sec <= 0:
+            return f"看不懂静音时长「{duration}」，例如写 \"30m\"、\"1h\"、300"
+        sec = min(sec, 86400.0)
+        from mods import chat
+        dur_label = f"{int(sec // 60)}m" if sec >= 60 and sec % 60 == 0 else f"{int(sec)}s"
+        if force:
+            attention.force_quiet(sec, reason.strip() or "强制静音休息")
+            try:
+                from mods.tools import current_binding
+                current_binding()["run"]["end"] = True
+            except RuntimeError:
+                pass
+            return f"好，已立起全局强制静音闸门，{chat.agent.span(sec)}内绝不打扰（闹钟与消息均暂存，正常记未读）；到期汇总所有提醒叫醒你"
+        # Ordinary global mute layer: suppresses default triggers on all windows, alarms still wake
+        return wake_me(f"mute all {dur_label}", reason.strip() or "普通静音（只压触发器不压闹钟）")
+
+    # Window-specific mute
+    if off:
+        lifted = awaker.lift(s_target)
+        return f"已揭掉 {s_target} 的覆盖层" if lifted else f"{s_target} 本来就没有覆盖层"
+
+    dur_sec = awaker._interval(str(duration).strip()) if not isinstance(duration, (int, float)) else float(duration)
+    dur_label = f"{int(dur_sec // 60)}m" if dur_sec and dur_sec >= 60 and dur_sec % 60 == 0 else str(duration)
+    if force:
+        attention.force_quiet(dur_sec or 1800, reason.strip() or f"强制静音（针对 {s_target}）")
+        try:
+            from mods.tools import current_binding
+            current_binding()["run"]["end"] = True
+        except RuntimeError:
+            pass
+        return f"好，已立起强制静音闸门（针对 {s_target}），{chat.agent.span(dur_sec or 1800)}内绝不打扰；到期汇总提醒叫醒你"
+
+    return wake_me(f"mute {s_target} {dur_label}", reason)
 
 
 def _format_results(results: Mapping) -> str:
@@ -645,8 +975,8 @@ __all__ = [
     "read_log",
     "search",
     "read_actions",
-    "read_note",
-    "write_note",
+    "read_file",
+    "write_file",
     "loop",
     "wait",
     "wake_me",

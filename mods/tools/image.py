@@ -11,7 +11,7 @@
 ## 画图（create_image / create_image_from_references）
 
 - **怎么选**：脑子里有画面直接凭空画，用 `create_image`；要是想照着某张图的画风、人物长相画，或者在原图基础上改图，就把原图地址（一行一个）传给 `create_image_from_references` 的 `image_uris`。
-- **怎么发出去**：画好的图会存在临时缓存里（闲置 15 天可能会被清理），返回给你一个 `file://` 绝对路径，**不会自动发进聊天**。你要发给别人的话，先调 `type_word(target="g群号或u私聊号", text="[CQ:image,file=file:///绝对路径]")` 放进输入框，下一步再 `send`。因为图没直接递进你的眼睛里，发出去之前别凭想象去跟人吹嘘画出来的细节长啥样。
+- **怎么发出去**：画好的图会存在临时缓存里（闲置 15 天可能会被清理），返回给你一个 `file://` 绝对路径，**不会自动发进聊天**。你要发给别人的话，直接调 `send(target="g群号或u私聊号", text="[CQ:image,file=file:///绝对路径]")` 发出去。因为图没直接递进你的眼睛里，发出去之前别凭想象去跟人吹嘘画出来的细节长啥样。
 - **省着点画**：画一张图大概花 0.13 元，还得等上几十秒。所以对方没明确说要好几张时，`n` 保持默认的 1 就好；`quality` 保持 `auto`；尺寸目前固定是 `1024x1024`。万一画图报错了，拿一模一样的参数重试一般还是会卡住，直接告诉对方没画出来就好。"""
 
 from contextlib import ExitStack
@@ -26,19 +26,54 @@ import requests
 from mods import image as image_mod, llm, op
 
 
-def recognize_image(image_uri: str, prompt: str = "") -> str:
+def recognize_image(image_uri: str, prompt: str = "", model: str = "", refresh: bool = False) -> str:
     """按要求识别一张网络或本地图片，返回视觉模型给出的文字结果。
 
     @param
     image_uri: 完整图片 URI；聊天里的图片直接用消息中给出的链接，file:// 需要管理员权限
-    prompt: 希望视觉模型完成的任务，例如"提取图中所有文字"；留空则给出笼统描述
+    prompt: 希望视觉模型完成的任务，例如"提取图中所有文字"；留空则给出描述
+    model: 指定视觉模型（如 "gemini"、"google"、"leaf"、"luna"、"cheap" 或完整供应商模型名），留空使用默认视觉模型（gemini/gemini-3.7-flash）
+    refresh: 是否强制刷新缓存（传 True 时让视觉模型重新看一眼并更新缓存）
     """
-    if not re.match(r"^(?:https?|file)://", image_uri, re.I):
-        return "图片识别失败：仅支持 http://、https:// 或 file:// 图片 URI"
+    if not re.match(r"^(?:https?|file)://|^data:image/", image_uri, re.I):
+        return "图片识别失败：仅支持 http://、https://、file:// 或 data:image/ 图片 URI"
     if image_uri.lower().startswith("file://") and not op.bot_is_op():
         return "图片识别失败：本地文件需要管理员权限"
+
+    from mods.tools._vision import _file_uri
+    ref_uri = _file_uri(image_uri)
+
+    from mods.tools import vision as vision_tool
+    target_model = vision_tool.ALIASES.get(model.strip().lower(), model.strip()) if model else None
+
+    from mods import storage
+    cache = storage.get("llm_system", "description_cache")
+
+    def _get_digest(target_uri: str) -> str | None:
+        d = image_mod.get_cached_image_digest(target_uri)
+        if not d:
+            try:
+                _, _, d = image_mod.resolve_image_with_digest(target_uri)
+            except Exception:
+                pass
+        return d
+
+    if refresh:
+        image_mod.invalidate_cached_description(cache, ref_uri)
+    elif not prompt.strip():
+        _d = _get_digest(ref_uri)
+        cached = llm.get_client()._cached_image_description(ref_uri, cache, image_mod.description_version())
+        if not cached and _d:
+            cached = image_mod.get_cached_description(cache, _d, prompt_version=image_mod.description_version())
+        if cached:
+            return f"（已有缓存描述，重新识别请传 refresh=True）\n{cached}"
+
     try:
-        result = llm.get_client().describe_image(image_uri, prompt)
+        result = llm.get_client().describe_image(ref_uri, prompt, model=target_model)
+        if result:
+            digest = _get_digest(ref_uri)
+            if digest:
+                image_mod.cache_description(cache, digest, result)
     except (OSError, ValueError) as error:
         return f"图片识别失败：{error}"
     return result or "图片识别失败：视觉模型未返回描述"

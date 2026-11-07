@@ -32,7 +32,7 @@ DEFAULT_ACT_GOAL = "看看这次唤醒和新到的消息，自主决定做什么
 # 跑代码都不在其中：它为别人准备上下文，自己不行动。这是新角色的白名单，不是给已有角色加禁令。
 # WHY: reframe 可显式清空可选模块，load_tools 让她恢复 assemble/概览；加载仍经过
 # 这份只读白名单，不能借此或通过 fork 取得写入与发言能力。
-TOOLS = frozenset({"construct__assemble", "search", "read_note", "read_log", "read_actions", "agents__fork",
+TOOLS = frozenset({"construct__assemble", "search", "read_file", "read_log", "read_actions", "agents__fork",
                    "memory_system__read_context", "reframe", "load_tools"})
 # WHY: the construct run must understand the new message in its thread before choosing
 # material; twenty earlier lines is enough to see who is answering whom.
@@ -50,7 +50,7 @@ CONTRACT = """你正在为下一次行动准备上下文，提供信息、提醒
 
 你可以选择：
 - refs：每行一条，笔记名、日志编号、运行 ctx、log:窗口@时刻*条数、policy:名字。
-  笔记可以选原文件行号，如 topic:线索@L12-28；read_note 用同一写法预览，目录标字符数和总行数。
+  笔记可以选原文件行号，如 topic:线索@L12-28；read_file 可用同一写法或 start/end 预览，目录标字符数和总行数。
   整份与局部都可选；关系、心情和表达所需的材料也在选择范围内。
 - tools：行动开场展开的工具/Skill 模块，空格或逗号分隔。meta 基础能力一直有，其余按这次需要选；
   加载会同时提供说明和函数，行动仍可自行 load_tools。工具目录中的 tool_development 是开发手册。
@@ -60,7 +60,7 @@ CONTRACT = """你正在为下一次行动准备上下文，提供信息、提醒
 
 行动还会看到 self、身份与记忆说明、基础工具、输入框草稿、时间及运行状态提示。
 todo 全文在这次准备中供你参考，行动只带你选进 refs 的全文或片段；没有另外一份末尾全文。
-需要确认陌生指代时用 search/read_note 查；引号只表示引用，不触发自动检索。
+开场已包含 recent、todo 和等着你的新消息，不必调 read_file/read_log 重复读取眼前的材料；需要确认陌生指代时用 search/read_file 查，查到的材料写进 refs 供行动直接查看，避免行动重复查询。引号只表示引用，不触发自动检索。
 以下策略是你的补充检查清单；提交接口和职责以本说明为准。
 """
 
@@ -76,7 +76,7 @@ DEFAULT_POLICY = """先看这次是谁、为什么叫醒你，以及 recent 中�
 
 def get_config() -> dict:
     """Construct settings in storage ``agent.construct``; the old observer settings move here once."""
-    data = storage.get("", "agent")
+    data = storage.get("agent", "config")
     config = data.get("construct")
     if not isinstance(config, dict):
         old = data.pop("observer", None)
@@ -89,7 +89,7 @@ def get_config() -> dict:
 
 
 def save_config(config: dict) -> None:
-    storage.get("", "agent")["construct"] = config
+    storage.get("agent", "config")["construct"] = config
     storage.save()
 
 
@@ -133,7 +133,7 @@ def fold(ref: str) -> str:
 
 
 # WHY: 删除 observer 的引号查词：普通原话也会带引号，文本命中不等于相关记忆。
-# 构造已有 search/read_note 与目录，需要验证的联系由它显式查询（2026-11-02）。
+# 构造已有 search/read_file 与目录，需要验证的联系由它显式查询（2026-11-02）。
 def directory(most: int = 80) -> str:
     rows = _notes.listing(limit=10**6)
     # WHY: 选哪些仍按修改时间（最近动过的优先），显示按名字排：按修改时间显示时每写一次
@@ -141,7 +141,7 @@ def directory(most: int = 80) -> str:
     shown = sorted(rows[:most], key=lambda item: item["scope"])
     lines = [f"- {item['scope']}（{item['chars']} 字符，{item['lines']} 行）：{item['first']}" for item in shown]
     if len(rows) > most:
-        lines.append(f"（还有 {len(rows) - most} 份不常动的没列出；用 search 或 read_note 找）")
+        lines.append(f"（还有 {len(rows) - most} 份不常动的没列出；用 search 或 read_file 找）")
     return "\n".join(lines) or "（还没有笔记）"
 
 
@@ -157,11 +157,15 @@ def _call_line(call: dict) -> str:
     if name == "type_word":
         return f"在 {args.get('target', '?')} 打字：{str(args.get('text', ''))[:50]}"
     if name == "send":
-        return f"发到 {args.get('target', '?')}"
-    if name == "write_note":
-        return f"写 {args.get('scope', '?')}"
-    if name in ("search", "read_note", "read_log"):
-        key = args.get("keyword") or args.get("scope") or args.get("window") or ""
+        target = args.get('target', '?')
+        text = str(args.get('text', '')).strip()
+        if text:
+            return f"发到 {target}：{text[:50]}"
+        return f"发到 {target}"
+    if name in ("write_file", "write_note"):
+        return f"写 {args.get('path') or args.get('scope') or '?'}"
+    if name in ("search", "read_file", "read_note", "read_log"):
+        key = args.get("keyword") or args.get("path") or args.get("scope") or args.get("window") or ""
         return f"{name}({str(key)[:30]})"
     return name
 
@@ -350,9 +354,13 @@ def submit(state: dict, focus: str, refs: str, note: str, windows: str, tools: s
     claimed = state.get("associated_windows") or set()
     if not targets:
         targets = list(claimed)
+    if _windows.ME in claimed and _windows.ME not in targets:
+        # 闹钟/定时等唤醒叫醒她去处理别的窗口时，me 顺带归入本次行动负责的范围消掉。
+        targets.append(_windows.ME)
     if claimed and not claimed.intersection(targets):
         # 每一步都要处理掉一件等着的事，否则队列不会变短，会一直被叫起来重选同一批。
-        return "这份规格没有负责任何等着你的窗口；从等着的事里选一件，windows 写它的窗口"
+        claimed_str = "、".join(_windows.label(w) for w in claimed)
+        return f"这份规格没有负责任何等着你的窗口（当前等着你的窗口有：{claimed_str}）；从等着的事里选一件，windows 写它的窗口"
     ref_lines = sorted((line.strip() for line in str(refs).splitlines() if line.strip()), key=_tier)
     items, bad = _resolve(ref_lines, state["view"])
     if bad:

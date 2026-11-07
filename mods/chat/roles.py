@@ -40,7 +40,7 @@ def _parse_window(target: str) -> tuple:
 
 
 def _moment(value) -> int | None:
-    """Unix seconds, or a local ``YYYY-MM-DD HH:MM[:SS]`` as the chat heads print it."""
+    """Unix seconds, or local time string as printed in chat heads or timeline."""
     text = str(value or "").strip()
     if not text or text == "0":
         return None
@@ -51,7 +51,15 @@ def _moment(value) -> int | None:
             return int(time.mktime(time.strptime(text, pattern)))
         except ValueError:
             pass
-    raise ValueError("before 写 Unix 秒，或 YYYY-MM-DD HH:MM:SS")
+    year = time.strftime("%Y")
+    today = time.strftime("%Y-%m-%d")
+    for pattern, prefix in (("%m-%d %H:%M:%S", f"{year}-"), ("%m-%d %H:%M", f"{year}-"),
+                            ("%H:%M:%S", f"{today} "), ("%H:%M", f"{today} ")):
+        try:
+            return int(time.mktime(time.strptime(prefix + text, "%Y-" + pattern if pattern.startswith("%m") else "%Y-%m-%d " + pattern)))
+        except ValueError:
+            pass
+    raise ValueError("before 写 Unix 秒，或 YYYY-MM-DD HH:MM:SS（也支持 MM-DD HH:MM 或 HH:MM）")
 
 
 def read_log(window: str, count: int = 30, before: str = "") -> str:
@@ -63,7 +71,10 @@ def read_log(window: str, count: int = 30, before: str = "") -> str:
     before: 只取这个时刻之前的记录，用来往前翻页或读 search 找到的那条的前文；写 YYYY-MM-DD HH:MM:SS 或 Unix 秒，留空表示到最新
     """
     target = _parse_window(window)
-    items = _screen.records(target, max(1, min(int(count), 200)), _moment(before))
+    before_stamp = _moment(before)
+    items = _screen.records(target, max(1, min(int(count), 200)), before_stamp)
+    if not str(before or "").strip():
+        _screen.ack_records(target, items)
     return _screen.render(target, items) or "（没有记录）"
 
 
@@ -258,7 +269,7 @@ def search(keyword: str, window: str = "", days: int = _SEARCH_DAYS) -> str:
                 found.append(f"# {scope}" + (f"（{count} 处）" if count > len(shown) else "") + "\n" + "\n".join(shown))
         if found:
             more = f"，列前 {_NOTE_HITS} 份" if len(found) > _NOTE_HITS else ""
-            sections.append(f"## {title}（{len(found)} 份{more}；用 read_note 读全文）\n" + "\n".join(found[:_NOTE_HITS]))
+            sections.append(f"## {title}（{len(found)} 份{more}；用 read_file 读全文）\n" + "\n".join(found[:_NOTE_HITS]))
 
     found, total, archived_ids = [], 0, set()
     # 一次只解析一段：只留要列出来的摘要，其余只计数。
@@ -291,15 +302,6 @@ def search(keyword: str, window: str = "", days: int = _SEARCH_DAYS) -> str:
     return "\n\n".join(sections) if sections else f"（最近 {days} 天的聊天记录、笔记、日记和归档里都没有找到）"
 
 
-def read_note(scope: str) -> str:
-    """读一份笔记全文。
-
-    @param
-    scope: self、global、recent、todo、awaker、person:<QQ号>、group:<群号>、diary:<日期> 或你自己建的专题笔记名（如 消消乐、topic:线代）
-    """
-    return _notes.render(scope) or f"（{scope} 还没有笔记）"
-
-
 def _recent_windows(exclude: list[tuple] = (), since: float = 0) -> list[tuple[tuple, dict]]:
     with history.lock():
         windows = [((kind, key), events[0]) for kind in ("group", "private")
@@ -317,7 +319,7 @@ def directory(woken: list[tuple]) -> str:
     notes = _notes.listing(limit=10**6)
     lines.append("、".join(item["scope"] for item in notes[:60]) or "（无）")
     if len(notes) > 60:
-        lines.append(f"（另有 {len(notes) - 60} 份笔记未列出；用 search 查找，或 read_note 按名字读取）")
+        lines.append(f"（另有 {len(notes) - 60} 份笔记未列出；用 search 查找，或 read_file 按路径或名字读取）")
     diaries = _notes.diaries()
     if diaries:
         days = [key for key in diaries if len(key) == 10][-7:]
@@ -330,14 +332,14 @@ def directory(woken: list[tuple]) -> str:
 # 并在 04:00 的交接里把反思的活提前干完。因此交接只负责封存当前现场（recent、人和群、todo、日记），global
 # 留给夜里反思统一打理。2026-11-01 交接换成沉淀，这条照旧：沉淀也不改 global。
 _SETTLE = """上面是你刚才在 {title} 的一段经历（{span}）：这段时间的聊天原文，和你在这里每次行动时想了什么、做了什么。
-现在没有人在等你回话。对照原来的笔记，把这段里值得留下的写下来：
+现在没有人在等你回话。开场给出的各份笔记就是本次醒来时磁盘上的最新全文（上面给出的不用再调 read_file 重复读取，直接对照修改）：
 
-- 关于这里的人和群的认识和经历 → person:<QQ号>／group:<群号>："## 认识"写知道什么，变了就写成"某日起改为……"；"## 经历"一行一件事，带日期和出处（窗口和时刻，或行动号）。
-- 今天发生了什么、心里怎么想的 → diary:{day}：改写成到目前为止的这一天，第一行一句话概括，之后按时间写，每条带出处。已经写过的保留，不要往后追加重复的段落。
-- 黑板 recent：此刻的心情、手头的事、还没回的话，改写成现在的样子，做完的、和眼下无关的拿掉。下次醒来可能用得上的材料，用 @引用 一行一条记在 recent 里（如 @person:123、@diary:{day}、@某次行动的编号），构造下一次上下文的你会先看到它们。
-- 答应了还没做的事 → todo。
+- 关于这里的人和群的认识和经历 → data/notes/person/<QQ号>.md／data/notes/group/<群号>.md："## 认识"写知道什么，变了就写成"某日起改为……"；"## 经历"一行一件事，带日期和出处（窗口和时刻，或行动号）。
+- 今天发生了什么、心里怎么想的 → data/notes/diary/{day}.md：第一行一句话概括到目前为止的这一天，之后按时间写，每条带出处。已经写过的保留，不要往后追加重复的段落。
+- 黑板 data/notes/recent.md：此刻的心情、手头的事、还没回的话，改写成现在的样子，做完的、和眼下无关的拿掉。下次醒来可能用得上的材料，用 @引用 一行一条记在 recent 里（如 @person:123、@diary:{day}、@某次行动的编号），构造下一次上下文的你会先看到它们。
+- 答应了还没做的事 → data/notes/todo.md。
 
-情绪、玩笑、关系的变化也是值得留下的。每份先看现有内容（上面给了的就不用再读）：已经在了就不用重写；没在的补上；过时的删掉。写用 write_note，text 是改写后的全文。不确定是不是事实的，标明"未确认"。没有新东西就什么都不改。
+情绪、玩笑、关系的变化也是值得留下的。已经在了就不用重写；没在的补上；过时的删掉。用 write_file 修改（长笔记如日记和人物笔记优先传 old_string 做局部替换或末尾追加，可同批多调用一次改完几份笔记，不必分多轮；空串整份覆写会删除笔记）。不确定是不是事实的，标明"未确认"。没有新东西就什么都不改。
 这次专心收拾，不必对外说话。都写好了，用一句话说这段经历是什么，然后结束。"""
 
 

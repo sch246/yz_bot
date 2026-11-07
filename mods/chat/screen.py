@@ -55,7 +55,13 @@ _record_cache_lock = threading.RLock()
 
 
 def _read() -> dict:
-    return storage.get("", "agent").setdefault(_READ_KEY, {})
+    data = storage.get("agent", "screen")
+    if not data:
+        old_agent = storage.get("", "agent")
+        if _READ_KEY in old_agent and isinstance(old_agent[_READ_KEY], dict):
+            data.update(old_agent.pop(_READ_KEY))
+            storage.save()
+    return data
 
 
 def _state(window: tuple) -> dict:
@@ -182,6 +188,17 @@ def commit_read(patches) -> None:
                 state["excluded"] = {i: t for i, t in state["excluded"].items()
                                      if t is None or t >= through}
         storage.save()
+
+
+def ack_records(window: tuple, items: list[dict]) -> None:
+    """Mark records as read when explicitly inspected up to the latest moment via read_log."""
+    if not items:
+        return
+    patch = {
+        "window": label(window),
+        "records": {item["id"]: {"time": item.get("time")} for item in items if item.get("id")},
+    }
+    commit_read(patch)
 
 
 def restore_read(snapshot: dict, windows: dict, *, patches=()) -> None:

@@ -287,7 +287,7 @@ def _prepare(wake, view, windows, lead_in=_ACT_LEAD_IN):
     screens = "\n".join(part["text"] for part in parts if part["text"])
     present = set(info["notes"])
     hits = [scope for scope, _word in _notes.mentioned(screens) if scope not in present]
-    wake["breadcrumbs"] = "画面提到的这些你有笔记，用 read_note 召回：" + "、".join(dict.fromkeys(hits)) if hits else ""
+    wake["breadcrumbs"] = "画面提到的这些你有笔记，用 read_file 召回：" + "、".join(dict.fromkeys(hits)) if hits else ""
     return material
 
 
@@ -480,7 +480,7 @@ def reflect(model=None, settle=True):
 
 def _reflect(wake, model=None, settle=True):
     attention.stop_loop("夜里整理")
-    data = storage.get("", "agent")
+    data = storage.get("agent", "config")
     if settle:
         # WHY: 2026-11-01 没有交接了；夜里先把白天还没沉淀的经历沉淀完，反思看到的笔记才是齐的。
         _settle.settle_all(model=model, stop=lambda: wake["cancelled"])
@@ -497,9 +497,9 @@ def _reflect(wake, model=None, settle=True):
                   "每段经历的沉淀（read_context 读原样，里面有那段聊天原文和你在那里的每次行动）：\n"
                   + ("\n".join(settled[-60:]) or "（没有）")
                   + "\n每次行动之前的构造运行也能用 read_context 按 ctx 读：它准备了什么、后来行动里又召回了什么，"
-                  "可以看出构造漏带了哪类材料。构造的说明在 policy:construct，沉淀的附加说明在 policy:settle，都用 edit_policy 改。"},
-                 {"role": "system", "content": "策略改动 changes：\n" + _tail(_notes.read_policy("changes"), 40)
-                  + "\n给维护者的 proposals：\n" + _tail(_notes.read_policy("proposals"), 20)}]
+                  "可以看出构造漏带了哪类材料。构造的说明在 data/notes/policy/construct.md，沉淀的附加说明在 data/notes/policy/settle.md，都用 write_file 改。"},
+                 {"role": "system", "content": "策略改动 changes（data/notes/policy/changes.md）：\n" + _tail(_notes.read_policy("changes"), 40)
+                  + "\n给维护者的 proposals（data/notes/policy/proposals.md）：\n" + _tail(_notes.read_policy("proposals"), 20)}]
         state = {"associated_windows": wake["associated_windows"]}
         def after(current):
             current["end"] = current["used"] - current["initial"] > _chat_root.limit()[1]

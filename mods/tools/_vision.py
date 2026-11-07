@@ -76,10 +76,12 @@ def _file_uri(selection: str) -> str:
 
         directory = image_module.TEMP_PATH
     except Exception:
+        image_module = None
         directory = "data/tmp_files"
     content = base64.b64decode(matched.group(2), validate=False)
+    digest = hashlib.sha256(content).hexdigest()
     suffix = _EXTENSIONS.get(matched.group(1).lower(), ".img")
-    path = os.path.join(directory, hashlib.sha256(content).hexdigest() + suffix)
+    path = os.path.join(directory, digest + suffix)
     try:
         os.makedirs(directory, exist_ok=True)
         if not os.path.exists(path):
@@ -88,33 +90,67 @@ def _file_uri(selection: str) -> str:
     except OSError as error:
         _stream.info("data URI 落盘失败，改用内联图：%s", error)
         return selection
-    return "file://" + os.path.abspath(path)
+    file_uri = "file://" + os.path.abspath(path)
+    if image_module is not None:
+        try:
+            image_module.cache_image_uri_digest(file_uri, digest)
+        except Exception:
+            pass
+    return file_uri
 
 
-def attach(uri: str, note: str = "", model: str | None = None) -> str:
+def attach(uri: str, note: str = "", model: str | None = None, refresh: bool = False) -> str:
     """把一张图交给当前模型自己看，或者在当前模型无视觉/指定了视觉模型时转述，返回一句以 ✅ 或 ⚠️ 开头的结果说明。
 
     @param
     uri: 图片地址，`file://`、`http(s)://` 或已经是 `data:` 都行
     note: 附在图前面的一句话，例如"这是浏览器当前页面的截图"
-    model: 可选。指定调用外部视觉模型转述（如 `azure/gpt-5.6-luna`、`cheap` 等）；若指定则由该模型转述并返回文字结果
+    model: 可选。指定调用外部视觉模型转述（如 `gemini`、`google`、`leaf`、`luna`、`cheap` 等）；若指定则由该模型转述并返回文字结果
+    refresh: 可选。设为 True 时强制刷新缓存，让视觉模型重新看一眼（跳过并更新之前的旧描述）
     """
     selection = str(uri or "").strip()
     if not selection:
         return "⚠️ 没有给出图片地址"
 
-    explicit_model = str(model or "").strip()
-    if explicit_model:
-        from mods import llm
-        from mods.tools import vision as vision_tool
+    reference = _file_uri(selection)
 
+    from mods import image, llm, storage
+    from mods.tools import vision as vision_tool
+
+    def _get_digest(target_uri: str) -> str | None:
+        d = image.get_cached_image_digest(target_uri)
+        if not d:
+            try:
+                _, _, d = image.resolve_image_with_digest(target_uri)
+            except Exception:
+                pass
+        return d
+
+    cache = storage.get("llm_system", "description_cache")
+    if refresh:
+        image.invalidate_cached_description(cache, reference)
+
+    explicit_model = str(model or "").strip()
+    client = llm.get_client()
+
+    if explicit_model:
         target = vision_tool.ALIASES.get(explicit_model.lower(), explicit_model)
         prompt = str(note or "").strip() or "如实描述图中内容；有文字就逐字抄出，有表格就按行列说清。"
+        if not refresh and not str(note or "").strip():
+            _d = _get_digest(reference)
+            cached = client._cached_image_description(reference, cache, image.description_version())
+            if not cached and _d:
+                cached = image.get_cached_description(cache, _d, prompt_version=image.description_version())
+            if cached:
+                return f"✅ 图片已有缓存描述（重新看一眼请传 refresh=True，指定模型请传 model=...）：\n{cached}"
         try:
-            client = llm.get_client()
-            desc = client.describe_image(selection, prompt=prompt, model=target)
+            desc = client.describe_image(reference, prompt=prompt, model=target)
             if desc:
-                return f"✅ 已由指定视觉模型（{target}）转述：\n{desc}"
+                digest = _get_digest(reference)
+                if digest:
+                    image.cache_description(cache, digest, desc)
+                action_desc = "重新识别并更新描述" if refresh else "转述"
+                return f"✅ 已由指定视觉模型（{target}）{action_desc}：\n{desc}"
             return f"⚠️ 指定视觉模型（{target}）未返回有效内容"
         except Exception as error:
             return f"⚠️ 调用指定视觉模型（{target}）失败（{type(error).__name__}: {error}）"
@@ -129,19 +165,27 @@ def attach(uri: str, note: str = "", model: str | None = None) -> str:
         return f"⚠️ 这次调用拿不到会话（{type(error).__name__}: {error}），附加不了图片"
     current_model = str(getattr(session, "model", "") or "")
     try:
-        from mods import llm
-
-        client = llm.get_client()
         capabilities = client.get_model_capabilities(current_model)
     except Exception as error:
         return f"⚠️ 取不到模型能力（{type(error).__name__}: {error}），附加不了图片"
     if not capabilities.vision:
-        fallback_model = client.get_vision_model() or "bytecat/gpt-5.4-mini"
+        fallback_model = client.get_vision_model() or vision_tool.GEMINI_FLASH
         prompt = str(note or "").strip() or "如实描述图中内容；有文字就逐字抄出，有表格就按行列说清。"
+        if not refresh and not str(note or "").strip():
+            _d = _get_digest(reference)
+            cached = client._cached_image_description(reference, cache, image.description_version())
+            if not cached and _d:
+                cached = image.get_cached_description(cache, _d, prompt_version=image.description_version())
+            if cached:
+                return f"✅ 图片已有缓存描述（重新看一眼请传 refresh=True，指定模型请传 model=...）：\n{cached}"
         try:
-            desc = client.describe_image(selection, prompt=prompt, model=fallback_model)
+            desc = client.describe_image(reference, prompt=prompt, model=fallback_model)
             if desc:
-                return f"✅ 当前模型不支持视觉，已自动由默认视觉模型（{fallback_model}）转述：\n{desc}"
+                digest = _get_digest(reference)
+                if digest:
+                    image.cache_description(cache, digest, desc)
+                action_desc = "重新识别并更新描述" if refresh else "转述"
+                return f"✅ 当前模型不支持视觉，已自动由默认视觉模型（{fallback_model}）{action_desc}：\n{desc}"
             return f"⚠️ 当前模型不支持视觉，自动调用视觉模型（{fallback_model}）未返回有效内容"
         except Exception as error:
             return f"⚠️ 当前模型不支持视觉，自动调用视觉模型失败（{type(error).__name__}: {error}）"

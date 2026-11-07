@@ -350,7 +350,7 @@ def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
                 session.add_context_provider(assemble)
                 # WHY: 构造决定 todo 全文或选区；其它运行保留召回入口，不再自动摊开全文。
                 if kind != "construct":
-                    session.add_hint('待办保存在笔记 todo，需要时用 read_note("todo") 召回。')
+                    session.add_hint('待办保存在笔记 todo（data/notes/todo.md），需要时用 read_file("data/notes/todo.md") 召回。')
                 for hint in hints:
                     session.add_hint(hint)
                 session.add_hint(lambda: f"现在是 {chat._screen.clock()}。")

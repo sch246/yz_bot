@@ -16,7 +16,7 @@
 - 行动号（20261023-12）：read_actions；写成 20261023-12#2 时指那次输出里的第 2 个调用，读的时候只传 # 前面那段；
 - 聊天记录：窗口加时刻（g123 2026-10-23 20:26:31）或 message_id：read_log 用 before 读前后文；
 - 封存的运行名（ctx，如 20261022-153000）：加载 memory_system 后用 read_context；
-- 笔记名（person:<QQ号>、group:<群号>、diary:<日期>……）：read_note，旧版本用 note_history。
+- 笔记（data/notes/ 下的 person/<QQ号>.md、group/<群号>.md、diary/<日期>.md……）：用 read_file 读（支持直接传笔记名或路径），历史备份在 data/notes/.history/。
 
 ## 一个循环
 1. 先看这次是谁、为什么叫醒你，再决定读多少。眼前的画面已经替你读了；没叫你的窗口只在「其它窗口还有没看过的消息」里报个数，要看再 read_log。
@@ -34,7 +34,7 @@
 真需要再 read_log。漏收的消息由系统补回，不用你反复去试。
 
 ## 判断「我在用哪个模型／配置」
-看 data/storage/llm_system/config.json 的 default_model 与 providers，或者请管理员发 #model，不要只看 .env。
+看 data/storage/agent/config.json 与 data/storage/agent/providers.json，或者请管理员发 #model，不要只看 .env。
 env 里可能有别的路径的遗留变量，据此下结论会错。
 
 ## 自检

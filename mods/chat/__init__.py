@@ -83,12 +83,12 @@ def normalize_image_describe(value) -> bool:
 
 def agent_setting(name: str, data: dict | None = None):
     key, normalize = AGENT_SETTINGS[name]
-    return normalize((storage.get("", "agent") if data is None else data).get(key))
+    return normalize((storage.get("agent", "config") if data is None else data).get(key))
 
 
 def limit() -> tuple[int, int]:
     """Screen size and the per-run growth cap of reflection and settling."""
-    data = storage.get("", "agent")
+    data = storage.get("agent", "config")
     if "max_token" in data or "pressure_percent" in data:
         # 旧的两个数是按每次重组上下文定的预算，套到同一段上下文上会太小：直接删掉，用默认。
         data.pop("max_token", None)
@@ -157,9 +157,9 @@ def temperature_for(effort: str | None) -> float | None:
 
 def normalize_brake(value) -> str:
     if value is None or value == "":
-        return "on"
+        return "off"
     val = str(value).strip().lower()
-    return "off" if val in ("off", "0", "false") else "on"
+    return "on" if val in ("on", "1", "true") else "off"
 
 
 def get_brake(data: dict | None = None) -> str:
@@ -248,7 +248,7 @@ def _migrate_self() -> str:
     storage 里的 `settings`、`agent.prompt` 和命名设定原样留着不删（`.py` 里仍能用 `prompts` 读到），
     搬过一次就记下，之后维护者删掉 self.md 表示真的不要人设，不会再被搬回来。
     """
-    data = storage.get("", "agent")
+    data = storage.get("agent", "config")
     if data.get("self_migrated"):
         return ""
     selected = data.get("prompt") or settings
@@ -270,7 +270,7 @@ def _migrate_self() -> str:
 
 
 def get_model(data: dict | None = None) -> str:
-    data = storage.get("", "agent") if data is None else data
+    data = storage.get("agent", "config") if data is None else data
     selection = data.get("model", llm_config.get("default_model", llm.DEFAULT_MODEL))
     try:
         llm.resolve_model(llm_config, selection)
@@ -363,7 +363,7 @@ def _window_storage(window: tuple) -> dict:
     的细节绑在一起。
     """
     if window == AGENT_WINDOW:
-        return storage.get("", "agent")
+        return storage.get("agent", "config")
     kind, key = window
     return storage.get("groups" if kind == "group" else "users", str(key))
 _AGENT_HINT_KEY = "agent_hint"
@@ -376,7 +376,7 @@ def todo_material() -> str:
     （笔记 `todo`）。第一次读到旧键时搬过去并删掉旧键，之后只认文件。
     WHY: 2026-11-02 待办全文改由构造选入行动，不再绕过材料选择在每轮末尾重复注入。
     """
-    data = storage.get("", "agent")
+    data = storage.get("agent", "config")
     legacy = data.get(_AGENT_HINT_KEY)
     if isinstance(legacy, str) and legacy.strip() and not _notes.read("todo").strip():
         _notes.write("todo", legacy)
@@ -384,7 +384,7 @@ def todo_material() -> str:
         del data[_AGENT_HINT_KEY]
         storage.save()
     value = _notes.read("todo").strip()
-    return f"待办（笔记 todo，用 write_note 改）：\n{value}\n（以上是笔记 todo 全文）" if value else ""
+    return f"待办（笔记 todo，data/notes/todo.md，用 write_file 改）：\n{value}\n（以上是笔记 todo 全文）" if value else ""
 
 # 会话主体持久激活的工具模块名，以及各自最后一次被调用的时刻。
 _ACTIVE_MODULES_KEY = "active_tools"
@@ -397,7 +397,7 @@ def _active_modules() -> dict[str, float]:
     该在这一轮收掉。旧格式（只存名字的列表）一律当成"就是刚才用过"——那是这份格式之前
     留下的，给它一个完整时限比让它立刻消失更不容易误伤。
     """
-    value = storage.get("", "agent").get(_ACTIVE_MODULES_KEY)
+    value = storage.get("agent", "config").get(_ACTIVE_MODULES_KEY)
     if isinstance(value, dict):
         return {
             name: float(stamp)
@@ -426,7 +426,7 @@ def _persist_modules(stamps: dict[str, float]) -> None:
     WHY: 值是使用时刻而不是只有名字，见 `_active_modules`；空闲回收在 `tools` 那层判，
     这里只负责如实来回搬。
     """
-    data = storage.get("", "agent")
+    data = storage.get("agent", "config")
     if stamps:
         data[_ACTIVE_MODULES_KEY] = {name: float(stamp) for name, stamp in stamps.items()}
     else:
@@ -835,7 +835,7 @@ def _eager_cache_images(event: dict, describe: bool = True) -> None:
 
 def eager_cache_images(event: dict) -> None:
     if msgs.is_msg(event) and "[CQ:image" in event.get("message", ""):
-        data = storage.get("", "agent")
+        data = storage.get("agent", "config")
         if get_image_mode(data) == "eager":
             model = get_model(data)
             count = len(_message_image_urls(event))
@@ -863,7 +863,7 @@ def recognize_images(event: dict) -> None:
 
 def process_incoming_voice(event: dict) -> None:
     if msgs.is_msg(event) and "[CQ:record" in event.get("message", ""):
-        data = storage.get("", "agent")
+        data = storage.get("agent", "config")
         mode = get_audio_mode(data)
         if mode != "off":
             _voice.cache_event_voice(event, eager=(mode == "eager"))
