@@ -18,6 +18,7 @@ wake; a timeout or failure falls back to blackboard + messages, and says so.
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 
@@ -224,6 +225,15 @@ def material(wake: dict) -> list[dict]:
     screens = _screens(wake["associated_windows"], chat.limit()[0])
     mentioned = [scope for scope, _word in _notes.mentioned(screens)]
     crumbs = ("\n\n画面提到了这些有笔记的东西：" + "、".join(dict.fromkeys(mentioned))) if mentioned else ""
+    # 接在本次消息末尾：这一条每次唤醒都不同，挂在这里不动前面的缓存前缀。
+    try:
+        close = _notes.similar(reasons + "\n\n" + screens, exclude=mentioned)
+    except (OSError, ValueError):
+        logging.getLogger(__name__).exception("similar notes failed")
+        close = []
+    if close:
+        crumbs += ("\n\n和这些消息用词相近的笔记（程序按字面重合排的，不一定相关；要用就写进 refs）："
+                   + "、".join(close))
     # WHY: 缓存按字节前缀命中；2026-11-01 黑板随沉淀改写，排在目录前使构造首轮只命中两成。
     # 目录现含笔记字数和行数，任何笔记改写也可能让它变；相对稳定的 todo 提到目录和黑板前，
     # 时间线和运行列表仍在后面。todo 自身改写仍会截断前缀，这是保留当前内容的取舍。

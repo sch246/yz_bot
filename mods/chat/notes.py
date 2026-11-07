@@ -231,19 +231,31 @@ def write_policy(name: str, text: str) -> str:
     return _replace(_policy_path(name), text)
 
 
-def listing(limit: int = 60) -> list[dict]:
-    """Existing notes, most recently changed first, with their first line."""
+def _listed() -> list[tuple[str, Path]]:
+    """(scope, path) of every note listing() shows, without reading any of them."""
     if not ROOT.is_dir():
         return []
+    # WHY: 2026-11-07 量到 rglob 每次要走完 .history 里上万份备份（每次约 0.3 秒，构造每次
+    # 唤醒调好几次）。收录范围本来就只有顶层和一层子目录，直接只走这两层。
+    candidates = [path for path in ROOT.glob("*.md")]
+    for directory in ROOT.iterdir():
+        if directory.is_dir() and directory.name not in (".history", "diary", "policy"):
+            candidates.extend(directory.glob("*.md"))
     found = []
-    for path in ROOT.rglob("*.md"):
+    for path in candidates:
         relative = path.relative_to(ROOT)
-        if len(relative.parts) > 2 or relative.parts[0] in (".history", "diary", "policy"):
-            continue
         scope = path.stem if len(relative.parts) == 1 else f"{relative.parts[0]}:{path.stem}"
         # self 总在系统提示最前面，不用列进"可以召回的东西"。
         if not _SCOPE.fullmatch(scope) or scope == "self":
             continue
+        found.append((scope, path))
+    return found
+
+
+def listing(limit: int = 60) -> list[dict]:
+    """Existing notes, most recently changed first, with their first line."""
+    found = []
+    for scope, path in _listed():
         raw = path.read_text(encoding="utf-8")
         text = raw.strip()
         found.append({"scope": scope, "changed": path.stat().st_mtime,
@@ -251,6 +263,118 @@ def listing(limit: int = 60) -> list[dict]:
                       "lines": len(raw.splitlines())})
     found.sort(key=lambda item: item["changed"], reverse=True)
     return found[:limit]
+
+
+_SIMILAR_CHUNK = 1200
+_similar_cache: dict[str, tuple] = {}  # scope -> (mtime_ns, size, [(first, last, total, Counter)])
+
+
+def _bigrams(text: str) -> list[str]:
+    text = text.casefold()
+    tokens = re.findall(r"[a-z0-9_]+", text)
+    for segment in re.sub(r"[a-z0-9_\s\W]+", " ", text).split():
+        tokens.extend(segment[i:i + 2] for i in range(max(1, len(segment) - 1)))
+    return tokens
+
+
+def _passages(scope: str) -> list[tuple]:
+    """A note cut into paragraphs of up to about _SIMILAR_CHUNK characters, cached by mtime and size."""
+    from collections import Counter
+
+    path = _path(scope)
+    stat = path.stat()
+    cached = _similar_cache.get(scope)
+    if cached and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+        return cached[2]
+    lines = path.read_text(encoding="utf-8").splitlines()
+    found, start, buffer, size = [], 0, [], 0
+    for number, line in enumerate(lines):
+        if not buffer:
+            start = number
+        buffer.append(line)
+        size += len(line) + 1
+        if size >= _SIMILAR_CHUNK or (not line.strip() and size >= 200):
+            found.append((start + 1, number + 1, len(lines), Counter(_bigrams("\n".join(buffer)))))
+            buffer, size = [], 0
+    if "\n".join(buffer).strip():
+        found.append((start + 1, len(lines), len(lines), Counter(_bigrams("\n".join(buffer)))))
+    _similar_cache[scope] = (stat.st_mtime_ns, stat.st_size, found)
+    return found
+
+
+def similar(text: str, most: int = 8, exclude=()) -> list[str]:
+    """Notes and diaries whose wording overlaps *text* most, as refs (``scope`` or ``scope@La-b``).
+
+    WHY: 2026-11-07 用生产数据离线对照（/root/yuzu-retrieval，维护者授权）：她醒来后实际打开的笔记，
+    画面点名的面包屑只提示到约 15%；拿新消息末尾约 1200 字对笔记段落做中文二元组 BM25，前 10 名
+    命中 58%，前 5 名 50%。同一批样本上 Qwen3-Embedding-8B 向量不如它（前 10 名 48–52%），
+    混合只多一两个点，所以没有用向量，也没有索引文件，只在内存里按 mtime 缓存分词。
+    这是给构造的提示，不替她选。请求组成记录能数出挂出来的候选后来有多少被打开；
+    若长期几乎没人打开，就删掉它，别加权重去救。
+    """
+    import math
+
+    query = set(_bigrams(text[-_SIMILAR_CHUNK:]))
+    index = _similar_index()
+    if not query or not index["docs"]:
+        return []
+    docs, average = index["docs"], index["average"]
+    scores: dict[int, float] = {}
+    for term in query:
+        postings = index["postings"].get(term)
+        if not postings:
+            continue
+        idf = math.log(1 + (len(docs) - len(postings) + 0.5) / (len(postings) + 0.5))
+        for number, hits in postings:
+            length = docs[number][4]
+            scores[number] = scores.get(number, 0.0) + idf * hits * 2.5 / (hits + 1.5 * (0.25 + 0.75 * length / average))
+    skip = set(exclude)
+    refs, seen = [], set()
+    for number in sorted(scores, key=scores.get, reverse=True):
+        scope, first, last, total, _length = docs[number]
+        if scope in seen or scope in skip:
+            continue
+        seen.add(scope)
+        refs.append(scope if (first, last) == (1, total) else f"{scope}@L{first}-{last}")
+        if len(refs) >= most:
+            break
+    return refs
+
+
+_similar_built: dict = {"signature": None}
+
+
+def _similar_index() -> dict:
+    """Inverted index over every recallable note's passages; rebuilt only when a file changed."""
+    scopes = [scope for scope, _path_ in _listed() if scope not in _STANDING]
+    scopes += [f"diary:{key}" for key in diaries()]
+    stats = []
+    for scope in scopes:
+        try:
+            stat = _path(scope).stat()
+        except (OSError, ValueError):
+            continue
+        stats.append((scope, stat.st_mtime_ns, stat.st_size))
+    signature = tuple(stats)
+    if _similar_built["signature"] == signature:
+        return _similar_built
+    docs, postings = [], {}
+    for scope, _mtime, _size in stats:
+        try:
+            passages = _passages(scope)
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+        for first, last, total, counts in passages:
+            number = len(docs)
+            docs.append((scope, first, last, total, sum(counts.values())))
+            for term, hits in counts.items():
+                postings.setdefault(term, []).append((number, hits))
+    live = {scope for scope, _m, _s in stats}
+    for scope in [scope for scope in _similar_cache if scope not in live]:
+        del _similar_cache[scope]
+    _similar_built.update(signature=signature, docs=docs, postings=postings,
+                          average=sum(doc[4] for doc in docs) / len(docs) if docs else 1.0)
+    return _similar_built
 
 
 def diaries(prefix: str = "") -> list[str]:
