@@ -181,6 +181,21 @@ def reframe(focus: str, refs: str = "", note: str = "", tools: str | None = None
     return prepare(focus, refs, note, tools, history)
 
 
+def handoff(focus: str, note: str = "", refs: str = "", tools: str = "", window: str = "") -> str:
+    """给下次醒来的自己写交接，存成笔记 handoff:<窗口>，下次这个窗口叫你时会自动带上；别的窗口的交接用 read_file 看。
+
+    @param
+    focus: 现在在做什么事，想要什么结果
+    note: 刚才做了什么、试过什么不行、弄清了什么（结论、数字、名字、编号）；还有什么没闭环。最多 800 字
+    refs: 下次要直接看的材料，每行一条：笔记名、笔记@L起行-末行、log:窗口@时刻*条数
+    tools: 下次要用的工具模块，空格分隔
+    window: 写给哪个窗口，如 g<群号>、u<私聊号>、me；留空写给这次负责的窗口。碰了几个窗口的事就并排调用几次
+    """
+    from mods.chat import construct
+
+    return construct.record_handoff(current_binding()["run"], window, focus, note, refs, tools)
+
+
 def read_log(window: str, count: int = 30, before: str = "") -> str:
     """想翻看某个窗口以前的聊天原话、或者顺着 search 找到的时间点看前后文时，从后往前读那个窗口的聊天记录原文。
 
@@ -410,6 +425,57 @@ def type_word(target: str, text: str) -> str:
     boxes[label] = {"text": body, "typed_in": _this_output()}
     return (f"{label} 的输入框已暂存：\n{body}\n"
             f"（日常开口可直接调用 send(\"{label}\", text=...) 一步发送；不想发了可传空串清空输入框）")
+_GATE_LOG = "data/chat/gate.jsonl"
+
+
+def _gate_record(entry: dict) -> None:
+    import json
+    import os
+
+    try:
+        os.makedirs(os.path.dirname(_GATE_LOG), exist_ok=True)
+        with open(_GATE_LOG, "a", encoding="utf-8") as file:
+            file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def _gate(window: tuple, label: str, content: str, lift: bool) -> str | None:
+    """窗口的闸：立着「没人叫就不说」时，这次唤醒没在这个窗口被叫到，就拦下这句。
+
+    WHY: 维护者 2026-11-08：群友要求关掉她的主动回复，但不能写成规矩放进她的上下文——
+    那是河道中央的岸（docs/working/proposals/river-banks-and-voice.md）。闸立在 send 上：
+    平时她看不见，只有真的要主动开口时才弹出来，带着立闸的原因；她判断时候到了可以自己
+    撤掉（lift）。被叫到的判断见 agent._CALLED_KINDS。拦下的话留在输入框里。
+    """
+    from mods import storage
+    from mods.tools import current_binding
+
+    gates = storage.get("agent", "config").get("send_gates") or {}
+    gate = gates.get(label)
+    if not isinstance(gate, dict):
+        return None
+    try:
+        run = current_binding()["run"]
+    except RuntimeError:
+        return None
+    when = time.strftime("%m-%d %H:%M", time.localtime(gate.get("since") or 0))
+    if lift:
+        gates.pop(label, None)
+        storage.save()
+        _gate_record({"time": time.time(), "window": label, "event": "lift", "reason": gate.get("reason"), "text": content})
+        return None
+    if window in run.get("called", ()):
+        return None
+    _boxes()[label] = {"text": content, "typed_in": _this_output()}
+    storage.save()
+    _gate_record({"time": time.time(), "window": label, "event": "block", "reason": gate.get("reason"), "text": content})
+    return (f"这句没有发出去：{label} 立着「没人叫你就不主动说话」的闸。\n"
+            f"原因：{gate.get('reason') or '（没写）'}（{when} 立的）\n"
+            "有人点你、戳你，或者你等的人回了你时，照常能说。这句话留在输入框里了。\n"
+            "如果你判断现在可以撤掉这道闸（比如提出的人说可以了），用 send(目标, lift=True) 发出输入框里这句，闸会一起撤掉。")
+
+
 MAX_BUBBLES = 4
 BUBBLE_GAP = (1.0, 2.0)
 
@@ -435,6 +501,7 @@ def send(
     reason: str = "",
     who: int | str | None = None,
     force: bool = False,
+    lift: bool = False,
 ) -> str:
     """开口说话：直接把话发进目标窗口，返回发出的消息号（message_id）。
 
@@ -447,9 +514,10 @@ def send(
     reason: 挂超时等待（wait > 0）时写给到时候自己的理由，如"不来我就接着读日记"、"等草籽接话"；留空默认"等回复"
     who: 在群聊窗口中指定只等特定人回复（填 QQ 号，如 123456；传 "any" 等群里任何人）。若不填：在有人跟你说话的轮次里自动默认等刚才跟你说话的人，避免路人插话吞掉等待；在你自己醒来的轮次（闹钟、订阅等无对话人轮次）不填则等待群里任何人回复。命令行窗口（term:名字）里填一段文字，等输出里出现它才算等到（同一批输出里出现才算）
     force: 是否开启强制等待闸门（上限 1 天）。传 True 期间绝不叫醒你，消息正常登记未读，等时间到了将所有积压提醒按窗口归类合并后一次性叫醒你
+    lift: 这句被窗口的闸拦下、你判断现在可以解除时传 True：撤掉那道闸并发出
     """
     from mods import context
-    from mods.chat import awaker, windows
+    from mods.chat import awaker, mouth, windows
     from mods.tools import current_binding
 
     try:
@@ -475,6 +543,10 @@ def send(
         if not box or not box.get("text", "").strip():
             return f"{label} 的输入框是空的，请直接在 send(target, text=\"...\") 中传入想说的话"
         content = box.get("text", "")
+
+    blocked = _gate(window, label, content, lift)
+    if blocked:
+        return blocked
 
     if context.agent_mode():
         current_binding()["run"]["associated_windows"].add(window)
@@ -548,6 +620,12 @@ def send(
         "先在下一轮的聊天记录里看它在不在，再决定要不要重发——不要直接重发。"
     )
     sender = windows.sender(window)
+    voiced = None
+    if mouth.enabled(window):
+        # 嘴：开了的 QQ 窗口里，草稿换成她自己的口气再发；任何一步不行都原样发草稿（见 chat/mouth.py）。
+        voiced = mouth.phrase(window, content)
+        if voiced:
+            content = voiced
     parts = [content] if windows.spec(window)["whole"] else _split_turns(content)
     if tuple(window) == windows.ME:
         # WHY: 2026-10-27 早上草籽拆掉「现在是交接或反思，不对外说话」那道代码胶带——
@@ -579,6 +657,8 @@ def send(
                     f"前 {len(sent)} 条已经发出去了，剩下的没发，别再重发前面那些。")
         return f"发送失败（{type(error).__name__}）：{error}。这句话没有发出去。"
     boxes.pop(label, None)
+    # 让脑子知道实际发出去的是哪句，免得它以为自己说的是草稿。
+    said_note = f"（换成你的口气发出：{content}）" if voiced else ""
 
     if wait_mode == "continue":
         pass
@@ -593,15 +673,15 @@ def send(
             from mods.chat import attention
             attention.force_quiet(wait_seconds, wait_reason)
             result_text = "、".join(str(item) for item in sent) if len(sent) > 1 else str(sent[0])
-            return f"{result_text}（已立起强制等待闸门 {dur_label}：期间绝不打扰，到期汇总提醒叫醒你）"
+            return f"{result_text}{said_note}（已立起强制等待闸门 {dur_label}：期间绝不打扰，到期汇总提醒叫醒你）"
         try:
             plant_line = awaker.plant(f"wait {wait_target} {dur_label}", wait_reason, text=wait_text)
         except Exception as error:
             plant_line = f"（挂等待规则失败：{error}）"
         result_text = "、".join(str(item) for item in sent) if len(sent) > 1 else str(sent[0])
-        return f"{result_text}（已设等待：{plant_line}；来消息或超时都会叫你）"
+        return f"{result_text}{said_note}（已设等待：{plant_line}；来消息或超时都会叫你）"
 
-    return "、".join(str(item) for item in sent) if len(sent) > 1 else str(sent[0])
+    return ("、".join(str(item) for item in sent) if len(sent) > 1 else str(sent[0])) + said_note
 def _confirm_file_write(path: str, start: int, count: int) -> str:
     from mods import file
 
@@ -990,6 +1070,7 @@ __all__ = [
     "reload_tools",
     "load_tools",
     "reframe",
+    "handoff",
     "attach_image",
     "set_name",
     "loop_note_history",

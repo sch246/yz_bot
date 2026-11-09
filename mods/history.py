@@ -86,10 +86,18 @@ def window(event: dict[str, Any]) -> tuple[str, Any] | None:
     ``user_id`` 改写成对端"凑出窗口——那要求每个入口都记得改写，也让"谁发的"和
     "发到哪个窗口"两个问题共用同一个字段。读不到 ``target_id`` 就返回 ``None``：
     窗口未知好过猜一个错的。
+
+    WHY: 私聊的戳一戳是例外：它的 ``target_id`` 是**被戳的人**，不是那条私聊。别人戳她时
+    读 ``target_id`` 会落到她自己的窗口，聊天记录却写在对方窗口，这条召唤上不了画面、永远
+    确认不了；2026-11-08 这样空转了近两天，沉淀也一直轮不到。所以被戳的是 Bot 时，窗口是
+    戳人的那一方。从 chatlog 重建的戳一戳没有 ``self_id``，它们的窗口由文件路径给出，不走这里。
     """
     if event.get("group_id") is not None:
         return "group", event["group_id"]
     target_id = event.get("target_id")
+    if (event.get("sub_type") == "poke" and event.get("user_id") is not None
+            and str(target_id) == str(event.get("self_id"))):
+        return "private", event["user_id"]
     return ("private", target_id) if target_id is not None else None
 
 

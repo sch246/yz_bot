@@ -652,7 +652,9 @@ def activation_signal(event: dict) -> bool:
             if value[1:].strip().partition(" ")[0] in _subcommands._SUBCOMMAND_NAMES:
                 # 子命令那一支：就地执行，不激活。谁来执行见 _subcommand_call。
                 return False
-        if _private_from_peer(event):
+        # WHY: `#` 开头是写给人看、不让她看见的话（screen.records 把它藏起来）。它要是叫醒她，
+        # 这条永远上不了画面、确认不了，就会反复唤醒（2026-11-09 私聊里敲错的 `#mouse` 实际发生过）。
+        if _private_from_peer(event) and not value.startswith("#"):
             return True
     return msgs.is_poke(event) and event.get("target_id") == identity.bot_id()
 
@@ -681,8 +683,9 @@ def _subcommand_call(event: dict) -> Callable | None:
     subcommand = value[1:].strip().partition(" ")[0]
     if subcommand not in _subcommands._SUBCOMMAND_NAMES:
         # WHY: 她自己用 op.send_command 敲错命令时不能静默——`#` 开头的输出默认不回她的
-        # 上下文（见 call），失败就这样消失了。普通群友仍不回，免得刷屏。
-        if event.get("user_id") == identity.bot_id() or op.is_op(event):
+        # 上下文（见 call），失败就这样消失了。别人一律不回：`#` 开头也是群里写给人看、
+        # 不让她看见的话的写法，管理员这样说话时被回一句“没有这个命令”是打扰（维护者 2026-11-08）。
+        if event.get("user_id") == identity.bot_id():
             return lambda name=subcommand: f"没有 #{name} 这个命令，用 #help 看全部"
         return None
     if _subcommands.requires_op(value[1:]) and not op.require_op(

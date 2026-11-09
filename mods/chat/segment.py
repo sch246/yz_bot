@@ -573,13 +573,15 @@ def derive(view):
     return info
 
 
-def resolve_refs(view, refs):
+def resolve_refs(view, refs, *, brief=False):
     """Resolve newline refs: #wake, n.m, journal id, ctx name, note scope/name,
     ``policy:<name>`` and ``log:<window>[@<before>][*<count>]``.
 
     Invisible folded addresses resolve to the visible containing fold. Exact
     journal ids always mean the original row; a note not present uses its file.
     Unknown refs fail with the failing line rather than silently disappearing.
+    *brief* shortens long whole notes read from file (``notes.render``); only the
+    construct's material for an act asks for it.
 
     WHY: 2026-11-01 维护者的视角是“只有原子，线把原子串起来”：所有种类的原子（日志条目、
     视图、笔记、策略、聊天记录）用同一套写法放上线，黑板、assemble、fork 共用这一处。
@@ -615,18 +617,18 @@ def resolve_refs(view, refs):
                 if note:
                     found = [note["id"]]
                 else:
-                    found = _note_refs(view, ref)
+                    found = _note_refs(view, ref, brief)
         if found is None:
             raise ValueError(f"unresolved reference: {ref}")
         result.extend(one for one in found if one not in result)
     return result
 
 
-def _note_refs(view, scope):
+def _note_refs(view, scope, brief=False):
     from . import construct, notes
 
     try:
-        text = notes.render(scope).strip()
+        text = notes.render(scope, brief=brief).strip()
     except ValueError:
         return None
     if not text:

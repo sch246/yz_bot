@@ -58,6 +58,7 @@ CONTRACT = """你正在为下一次行动准备上下文，提供信息、提醒
 - refs：每行一条，笔记名、日志编号、运行 ctx、log:窗口@时刻*条数、policy:名字。
   笔记可以选原文件行号，如 topic:线索@L12-28；read_file 可用同一写法或 start/end 预览，目录标字符数和总行数。
   整份与局部都可选；关系、心情和表达所需的材料也在选择范围内。
+  超过 8000 字的整份笔记，行动只看到开头、最近的部分和中间的小标题；要中间的内容就按行号选。
 - tools：行动开场展开的工具/Skill 模块，空格或逗号分隔。meta 基础能力一直有，其余按这次需要选；
   加载会同时提供说明和函数，行动仍可自行 load_tools。工具目录中的 tool_development 是开发手册。
 - history：当前窗口新消息之前的接话条数，默认 10，可为 0；更早的聊天用 log: 补。
@@ -365,7 +366,8 @@ def _resolve(refs, lookup) -> tuple[list[str], list[str]]:
     items, bad = [], []
     for ref in refs:
         try:
-            for one in _segment.resolve_refs(lookup, [ref]):
+            # 长笔记只给开头和最近的部分（notes._brief）；沉淀、反思要全文，不走这里。
+            for one in _segment.resolve_refs(lookup, [ref], brief=True):
                 if one not in items:
                     items.append(one)
         except (ValueError, KeyError, FileNotFoundError):
@@ -392,7 +394,7 @@ def build(wake: dict, model: str | None = None) -> list[dict]:
     claimed = list(wake["associated_windows"])
     config = get_config()
     if not config.get("on", True):
-        return [fallback(claimed, "构造运行关着")]
+        return [handoff_spec(wake)]
     wake["recall"] = None
     state = {"associated_windows": set(claimed), "specs": [], "cancelled": False}
     effort = chat.normalize_reasoning_effort(config.get("effort", "none"))
@@ -468,6 +470,137 @@ def submit(state: dict, focus: str, refs: str, note: str, windows: str, tools: s
     state["end"] = True  # one spec per step: the construct run ends with this batch of calls
     return (f"已记下关注：{focus}（{len(items)} 条材料，负责 "
             + ("、".join(_windows.label(window) for window in targets) or "无窗口") + "）")
+
+
+# WHY: 维护者 2026-11-09：构造本质上是一种特殊的交接，只是写的人没干过活，所以她总在重复调查
+# 已经查过的事（docs/working/proposals/river-banks-and-voice.md 6.10）。`#construct off` 时不再
+# 单独跑一轮构造：每次行动结束由干活的自己写交接，下次醒来按窗口取最近一份加新消息直接行动。
+# WHY: 交接就是普通笔记 handoff:<窗口>，唯一特殊的是醒来时自动带上这个窗口的那份（维护者同日）：
+# 她中途想看别的窗口的交接，read_file 就行，人也能直接看和改。
+HANDOFF_NOTE_MAX = 800
+HANDOFF_PROMPT = """这次行动到此结束，给下次醒来的自己写交接：调用 handoff，写完这次就结束了。
+下次的你只看得到这份交接和新消息，没写下来的就没了。这次碰了几个窗口的事，就并排调用几次，window 写窗口名；留空写给这次负责的窗口。
+- focus：现在在做什么事，想要什么结果。
+- note：刚才做了什么、试过什么不行、弄清了什么（结论、数字、名字、编号）；还有什么没闭环。
+- refs：下次要直接看的材料，每行一条，笔记名、笔记@L起行-末行、log:窗口@时刻*条数。
+- tools：下次要用的工具模块。"""
+_HANDOFF_TOOLS = re.compile(r"^\s*工具[:：]\s*(.*?)\s*$")
+_HANDOFF_RUN = re.compile(r"^\s*运行[:：]\s*(\S+)\s*$")
+
+
+def handoff_scope(window: tuple) -> str:
+    """The note holding one window's handoff; ``:`` in a window label is not allowed in a note name."""
+    return "handoff:" + _windows.label(window).replace(":", "-")
+
+
+def read_handoff(window: tuple) -> dict | None:
+    """Parse a handoff note; only ``@ref``, ``工具：`` and ``运行：`` lines are special, so hand edits still work."""
+    text = _notes.read(handoff_scope(window)).strip()
+    if not text:
+        return None
+    refs, tools, run, body = [], [], "", []
+    for line in text.splitlines():
+        if match := _REF_LINE.match(line):
+            refs.append(match[1])
+        elif match := _HANDOFF_TOOLS.match(line):
+            tools = [value for value in re.split(r"[\s,，、]+", match[1]) if value]
+        elif match := _HANDOFF_RUN.match(line):
+            run = match[1]
+        else:
+            body.append(line)
+    focus = next((line.strip() for line in body if line.strip()), "")
+    remaining = "\n".join(body).strip()[len(focus):].strip() if focus else ""
+    return {"focus": focus, "note": remaining, "refs": list(dict.fromkeys(refs)), "tools": tools, "ctx": run}
+
+
+def _usable_tools(names) -> list[str]:
+    catalog = tool_modules.catalog()
+    return [name for name in dict.fromkeys(names) if name in catalog and name not in {"baidumap", "dianping"}
+            and tool_modules.bot_op_tool_visible(name, catalog[name])]
+
+
+def closing(state: dict) -> str | None:
+    """The closing request of an act when handoffs replace the construct run."""
+    if get_config().get("on", True) or not state.get("acting"):
+        return None
+    return HANDOFF_PROMPT
+
+
+def _store_handoff(state: dict, targets, focus: str, note: str, refs: list[str], tools: list[str]) -> None:
+    note = note.strip()
+    if len(note) > HANDOFF_NOTE_MAX:
+        note = note[:HANDOFF_NOTE_MAX] + "……（交接太长，后面截掉了）"
+    lines = [focus.strip(), "", note, "", *(f"@{ref}" for ref in refs),
+             *([f"工具：{' '.join(tools)}"] if tools else []), f"运行：{state['view']['ctx']}"]
+    text = "\n".join(lines).replace("\n\n\n", "\n\n").strip() + "\n"
+    for window in targets:
+        # WHY: 每次运行都整份覆写，走 write_file 的 .history 备份会按次数堆文件；旧版本在运行记录里都查得到。
+        path = _notes._path(handoff_scope(window))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(text, encoding="utf-8")
+        temporary.replace(path)
+
+
+def record_handoff(state: dict, window: str, focus: str, note: str = "", refs: str = "", tools: str = "") -> str:
+    """Write one window's handoff (default: the windows this act answers for)."""
+    focus = str(focus).strip()
+    if not focus:
+        return "focus 不能空：写现在在做什么事"
+    if str(window).strip():
+        try:
+            targets = [_windows.parse(str(window).strip())]
+        except ValueError as error:
+            return f"window 写错了：{error}"
+    else:
+        targets = list(state.get("acting") or ())
+        if not targets:
+            return "这次运行没有负责的窗口；用 window 写给哪个窗口"
+    ref_lines = list(dict.fromkeys(line.strip().lstrip("@ ") for line in str(refs).splitlines() if line.strip()))
+    _store_handoff(state, targets, focus, str(note), ref_lines,
+                   _usable_tools(value for value in re.split(r"[\s,，、]+", str(tools)) if value))
+    if state.get("closing_now"):
+        state["handed_off"] = True
+        state["end"] = True  # 同一批并排的调用都会跑完，这批之后收尾结束
+        return "交接好了"
+    return "交接记下了；这次行动继续"
+
+
+def closing_done(state: dict) -> None:
+    """A closing request that answered in words still leaves those words for next time."""
+    if state.get("handed_off"):
+        return
+    last = state.get("last") or {}
+    text = str(last.get("content") or "").strip()
+    logging.getLogger(__name__).warning("行动收尾没有调用 handoff，%s", "存下它的话" if text else "这次没有交接")
+    if text:
+        _store_handoff(state, list(state["acting"]), "（上次没有写交接，这是它结束时说的话）", text, [], [])
+
+
+def handoff_spec(wake: dict) -> dict:
+    """One step without a construct run: the oldest waiting window, its last handoff, an index."""
+    claims = wake["claims"]
+    primary = next((tuple(job["window"]) for job in claims if tuple(job["window"]) != _windows.ME), _windows.ME)
+    targets = [primary] + ([_windows.ME] if primary != _windows.ME and _windows.ME in wake["associated_windows"] else [])
+    record = read_handoff(primary)
+    text, board_refs = blackboard()
+    refs = list(dict.fromkeys((["recent"] if text else []) + board_refs + list((record or {}).get("refs") or [])))
+    resolved, bad = _resolve(refs, _segment.fresh())
+    own = {handoff_scope(window) for window in targets}
+    others = [item for item in _notes.listing(limit=10**6) if item["scope"].startswith("handoff:") and item["scope"] not in own][:5]
+    index = ("【笔记目录（要用就 read_file）】\n" + directory() + "\n\n【最近你做过的事】\n" + timeline(most=15)
+             + ("\n\n【别的窗口的交接（要细看就 read_file）】\n" + "\n".join(
+                 f"{item['scope']}（{time.strftime('%m-%d %H:%M', time.localtime(item['changed']))}）：{item['first']}"
+                 for item in others) if others else ""))
+    note = str((record or {}).get("note") or "")
+    if record and record.get("ctx"):
+        note = (note + "\n" if note else "") + f"（上次运行 {record['ctx']}，要看原始过程用 memory_system 的 read_context）"
+    if bad:
+        note = (note + "\n" if note else "") + "这些引用读不出来：" + "、".join(bad)
+    return {"focus": str((record or {}).get("focus") or "这次唤醒和新到的消息"), "items": [{"role": "system", "content": index}, *resolved],
+            "note": note, "windows": targets, "tools": _usable_tools((record or {}).get("tools") or []), "history": 10,
+            "refs": refs, "ctx": "", "fallback": "",
+            "labels": ("【上次交接：当时在做的事】", "【上次交接：进展与未闭环】") if record else ("【这次醒来】", "【提醒】")}
 
 
 def _submitted(view: dict) -> list[str]:

@@ -164,6 +164,13 @@ def consume(window: tuple, identities) -> None:
         storage.save()
 
 
+def forget(window: tuple, identity_: str) -> None:
+    """Drop one pending summons outright; for entries that can never reach a screen."""
+    with _lock:
+        _state(window)["pending"].pop(identity_, None)
+        storage.save()
+
+
 def commit_read(patches) -> None:
     """Confirm exactly the records in a request, only after its first model output.
 

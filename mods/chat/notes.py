@@ -83,7 +83,9 @@ def resolve_path(path: str) -> tuple[str, tuple[int, int] | None]:
     return raw, line_slice
 
 
-def scope_of(window: tuple) -> str:
+def window_scope(window: tuple) -> str:
+    # WHY: 2026-11-07 末尾新加的 scope_of(path) 与这里原来的 scope_of(window) 同名，后定义的
+    # 覆盖了它，沉淀每次拿窗口求笔记名都抛 TypeError，空闲沉淀整夜失败重试。两者分开命名。
     return f"group:{window[1]}" if window[0] == "group" else f"person:{window[1]}"
 
 
@@ -119,8 +121,49 @@ def years(last: int = 8) -> list[str]:
     return lines[-last:]
 
 
-def render(scope: str) -> str:
+BRIEF_LIMIT = 8000
+BRIEF_HEAD = 4000
+BRIEF_TAIL = 4000
+
+
+def _brief(scope: str, raw: str, body: str) -> str:
+    """A long note as head + newest tail, with the middle's headings and line numbers.
+
+    WHY: 2026-11-07 一次开口的请求 5.8 万 token，大头是构造整份引用的群笔记（6.4 万字），
+    其中多半是一节一直在长的“经历”。11-01 至 11-08 构造提交 823 次，整份引用超过 8 千字的
+    笔记约一千次（人物、群、日记、todo），按行号挑片段的只有 235 次。维护者 2026-11-08 同意
+    从这里开始拆（docs/working/proposals/river-banks-and-voice.md 6.5）：开头通常是概括，
+    结尾是最近的经历，中间列出小标题和行号，要哪段用 read_file 的行号写法再读。
+    只截构造交给行动的材料；沉淀、反思和 fork 要对照全文改笔记，照旧给全文。
+    """
+    lines = raw.splitlines()
+    head_end, used = 0, 0
+    while head_end < len(lines) and used + len(lines[head_end]) <= BRIEF_HEAD:
+        used += len(lines[head_end]) + 1
+        head_end += 1
+    head_end = max(head_end, 1)
+    tail_start, used = len(lines), 0
+    while tail_start > head_end and used + len(lines[tail_start - 1]) <= BRIEF_TAIL:
+        tail_start -= 1
+        used += len(lines[tail_start]) + 1
+    if tail_start <= head_end:
+        return ""
+    outline = [f"{number}: {lines[number - 1].strip()}" for number in range(head_end + 1, tail_start + 1)
+               if lines[number - 1].lstrip().startswith("#")]
+    middle = f"（第 {head_end + 1}–{tail_start} 行未载入"
+    middle += "，其中的小标题：\n" + "\n".join(outline) + "\n）" if outline else "）"
+    name = custom_name(scope)
+    prefix = f"维护者设定的称呼：{name}\n" if name else ""
+    return (f"## 笔记 {scope}（{_path(scope).as_posix()}，共 {len(lines)} 行、{len(body)} 字；太长，只载入"
+            f"第 1–{head_end} 行和最近的第 {tail_start + 1}–{len(lines)} 行。要看中间哪段，用 read_file 读 "
+            f"{scope}@L起行-末行）\n{prefix}" + "\n".join(lines[:head_end]).strip() + f"\n{middle}\n"
+            + "\n".join(lines[tail_start:]).strip())
+
+
+def render(scope: str, brief: bool = False) -> str:
     """One note as the model sees it, or empty when there is nothing to show.
+
+    *brief* shortens a whole note longer than BRIEF_LIMIT characters (see ``_brief``).
 
     WHY: 2026-10-26 维护者：每一段上下文开头都写明它来自哪个文件，她一眼就能看到改哪里。
     """
@@ -136,6 +179,10 @@ def render(scope: str) -> str:
         return f"## 笔记 {scope}（{_path(name).as_posix()}，第 {first}–{last} 行／共 {len(lines)} 行；其余未载入）\n{body}"
     raw = read(scope)
     body = raw.strip()
+    if brief and len(body) > BRIEF_LIMIT:
+        shortened = _brief(scope, raw, body)
+        if shortened:
+            return shortened
     name = custom_name(scope)
     if name:
         body = f"维护者设定的称呼：{name}\n{body}".strip()

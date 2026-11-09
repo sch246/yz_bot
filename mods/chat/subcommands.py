@@ -7,6 +7,7 @@ from mods import context, cq, history, llm, op, storage, text
 from mods.llm import pricing
 
 import mods.chat as _chat_root
+from mods.chat import mouth as _mouth, windows as _windows
 
 
 _SUBCOMMAND_HELP = (
@@ -37,6 +38,19 @@ lazy 在读取图片时生成描述，eager 在图片到达时生成；主模型
     ("effort [default|off|none|low|medium|high|max]", "查看或设置主模型思考等级（管理员），默认 default（按模型自身默认）。"),
     ("temperature [default|<0.0-2.0>]", "查看或设置主模型采样温度（管理员），默认 default（按模型默认；effort 为 none 时默认 1.3）；构造运行不用它。别名 temp。"),
     ("brake [on|off]", "查看或设置节奏与防抢戏英文刹车（管理员），默认 off；只加在行动运行的提示末尾。"),
+    ("gate [on <原因>|off]", """查看或设置这个窗口的「闸」（修改要管理员）。
+
+立着闸的窗口里，这次唤醒没有人叫她（点名、戳、回复她、她等的人回了），她 send 的话就被拦下，留在输入框里，并弹给她立闸的原因。平时不进她的上下文。她判断可以了能用 send(..., lift=True) 自己撤掉。拦下和撤掉都记在 data/chat/gate.jsonl。
+#gate               看所有立着的闸
+#gate on <原因>     在这个窗口立闸，原因写具体：谁、什么时候、为什么
+#gate off           撤掉这个窗口的闸"""),
+    ("mouth [on|off [all]|model <模型>]", """查看或设置「嘴」（修改要管理员）。所有 QQ 窗口默认开着。
+
+开着时，她在 QQ 窗口里 send 的话只当草稿：先抽成一句意思，再用「数理柚子」人设卡加最近 40 条消息、用她自己的口气重说一遍发出去。出错、超时，或者草稿是长段、链接、代码、命令时，原样发草稿。每次记在 data/chat/mouth.jsonl。
+#mouth              看这个窗口开没开、总开关、用哪个模型、单独关掉了哪些窗口
+#mouth on|off       在这个窗口开或关
+#mouth on|off all   所有窗口的总开关
+#mouth model <模型>  换措辞模型（全局），默认 google/gemini-3.8-flash；deepseek/deepseek-flash 会关思考、温度 1.3"""),
     ("settle [quiet [秒]|backlog [条]|now|reset]", """查看或设置沉淀规则（修改需管理员）。
 #settle                    查看当前沉淀配置、未沉淀窗口与循环状态
 #settle quiet [秒]         查看或设置沉淀所需安静时间（默认 1200 秒）
@@ -99,7 +113,7 @@ at、on、wait、when 响过就从笔记里划掉。她平时用 wake_me 写这�
 
 每次唤醒、行动之前，先跑一次构造：她自己看黑板 recent、这次的消息和折叠索引，决定这次要做什么、展开哪些材料，写下注意（陌生说法、矛盾、情绪、意外）。关掉或失败时按黑板加这次的消息直接行动。原来的 observer 并在这里。
 #construct                    查看状态、模型、思考等级、超时和说明来源
-#construct on|off             开启或关闭构造运行
+#construct on|off             开启或关闭构造运行；关着时每次行动结束写交接，下次醒来按窗口取最近一份直接行动
 #construct model [selection]  查看或设置构造运行的模型（留空查看）
 #construct effort [level]     查看或设置思考等级（default/off/none/low/medium/high/max）
 #construct timeout [秒]       查看或设置超时，超时就按黑板加消息直接行动
@@ -123,7 +137,7 @@ def requires_op(value: str) -> bool:
         return False
     return (name == "hint" or name == "use_model"
             or name in {"image", "reasoning", "effort", "temperature", "temp", "brake", "years", "limit", "reflect",
-                        "awaker", "prompt", "debounce", "settle"} and bool(tail.strip()))
+                        "awaker", "prompt", "debounce", "settle", "mouth", "gate"} and bool(tail.strip()))
 
 
 def _subcommand_help(name: str = "") -> str:
@@ -464,6 +478,70 @@ def _settle_subcommand(tail: str) -> str:
     return "settle 参数错误，可用 #help settle 查看"
 
 
+def _gate_subcommand(tail: str) -> str:
+    import time
+
+    data = storage.get("agent", "config")
+    gates = data.setdefault("send_gates", {})
+    verb, rest = _first_argument(tail)
+    if not verb:
+        if not gates:
+            return "没有立着的闸"
+        return "\n".join(f"{label}：{gate.get('reason') or '（没写原因）'}（{time.strftime('%m-%d %H:%M', time.localtime(gate.get('since') or 0))} 立的）"
+                         for label, gate in gates.items())
+    event = context.current() or {}
+    window = history.window(event)
+    if window is None or window[0] not in _windows.QQ:
+        return "只能在 QQ 群聊或私聊窗口里立闸或撤闸"
+    label = _windows.label(window)
+    if verb == "on":
+        if not rest.strip():
+            return "立闸要写原因：#gate on <谁、什么时候、为什么>"
+        gates[label] = {"reason": rest.strip(), "since": time.time()}
+        storage.save()
+        return f"闸已立在 {label}：没人叫她时，她主动说的话会被拦下并看到原因"
+    if verb == "off":
+        if gates.pop(label, None) is None:
+            return f"{label} 没有闸"
+        storage.save()
+        return f"已撤掉 {label} 的闸"
+    return "gate 参数错误，可用 #help gate 查看"
+
+
+def _mouth_subcommand(tail: str) -> str:
+    event = context.current() or {}
+    window = history.window(event)
+    settings = _mouth.config()
+    verb, rest = _first_argument(tail)
+    rest = rest.strip()
+    if verb == "model":
+        if not rest:
+            return f"mouth model: {settings['model']}"
+        try:
+            llm.resolve_model(_chat_root.llm_config, rest)
+        except ValueError as error:
+            return str(error)
+        _mouth.save_config(model=rest)
+        return f"mouth model: {rest}"
+    if verb in ("on", "off") and rest == "all":
+        _mouth.save_config(all=verb == "on")
+        return f"嘴：所有窗口总开关已{'开' if verb == 'on' else '关'}"
+    if verb in ("on", "off") and not rest:
+        if window is None or window[0] not in _windows.QQ:
+            return "只能在 QQ 群聊或私聊窗口里开关这个窗口的嘴；全局用 #mouth on all / #mouth off all"
+        label = _windows.label(window)
+        off = [item for item in settings["off"] if item != label] + ([label] if verb == "off" else [])
+        _mouth.save_config(off=off)
+        return f"嘴：{label} 已{'开' if verb == 'on' else '关'}" + ("（总开关关着，要 #mouth on all 才生效）" if not settings["all"] else "")
+    if verb:
+        return "mouth 参数错误，可用 #help mouth 查看"
+    here = ""
+    if window is not None and window[0] in _windows.QQ:
+        here = f"这个窗口{'开着' if _mouth.enabled(window) else '关着'}；"
+    return (f"嘴：{here}总开关{'开' if settings['all'] else '关'}；模型 {settings['model']}；"
+            f"单独关掉的窗口：{'、'.join(settings['off']) or '没有'}")
+
+
 def _construct_report() -> str:
     cfg = _chat_root._construct.get_config()
     custom = _chat_root._notes.read_policy("construct").strip()
@@ -573,6 +651,8 @@ def _status_report(data: dict) -> str:
         f"#effort {effort}（思考等级：default/off/none/low/medium/high/max）",
         f"#temperature {_chat_root.get_temperature(data)}（采样温度：default/<0.0-2.0>；effort=none 时默认 1.3）",
         f"#brake {_chat_root.get_brake(data)}（Pacing Brake 英文后置刹车补丁：on/off）",
+        f"#gate（闸：{'、'.join(data.get('send_gates') or {}) or '没有立着的'}；在窗口里 #gate on <原因> / #gate off）",
+        f"#mouth（嘴：总开关{'开' if _mouth.config()['all'] else '关'}，单独关掉 {'、'.join(_mouth.config()['off']) or '无'}；模型 {_mouth.config()['model']}；改用 #mouth on/off [all]）",
         f"#reasoning {reasoning}（历史思考保留：keep/drop）",
         f"#image {image}（图像读取：off/lazy/eager）",
         f"#image discribe {'on' if _chat_root.get_image_describe(data) else 'off'}（自动生成图片文字描述：on/off）",
@@ -779,4 +859,8 @@ def _subcommand(value: str):
         return _construct_subcommand(raw, tail)
     if name == "settle":
         return _settle_subcommand(tail.strip())
+    if name == "mouth":
+        return _mouth_subcommand(tail)
+    if name == "gate":
+        return _gate_subcommand(tail)
     return "子命令格式错误，可用 #help 查看"

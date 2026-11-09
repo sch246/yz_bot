@@ -43,7 +43,7 @@ def write(state, operation, *args, **kwargs):
 def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
         stop=None, timeout=None, state=None, prepare=None, hints=(),
         on_output=None, after_round=None, effort=None, grant=(), functions=None, inherit_tools=True,
-        allow_reframe=None, history=None, deadline=None) -> tuple[str, str]:
+        allow_reframe=None, history=None, deadline=None, closing=None, closed=None) -> tuple[str, str]:
     """Execute and record one purpose, returning its ctx and assistant text.
 
     ``items`` are journal ids or original message dictionaries. A supplied main
@@ -159,7 +159,8 @@ def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
                     schema_modules=list((prior or {}).get("schemas", {})) if central and opening else (),
                     kind=kind, grant=grant,
                     function_visible=None if functions is None else lambda name, _tool: name in functions,
-                    local_function_visible=lambda name, _tool: name != "reframe" or can_reframe,
+                    local_function_visible=lambda name, _tool: (name != "reframe" or can_reframe) and (
+                        name != "handoff" or kind == "main" and not chat._construct.get_config().get("on", True)),
                     parent_binding=parent_binding,
                 )
                 binding["run"] = state
@@ -202,7 +203,8 @@ def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
                     writable(dispatch=True)
                     # WHY: preparation can wait on an observer or external source.
                     # Closing a timed-out run must not wait for that same callback.
-                    sources = list(prepare(state) or ()) if prepare is not None else []
+                    # WHY: 收尾只写交接。这时候读新消息会把它们标成已读，人却得不到回应；留给下一次。
+                    sources = list(prepare(state) or ()) if prepare is not None and not state.get("closing_now") else []
                     with guard:
                         writable(dispatch=True)
                         if binding is not None:
@@ -374,6 +376,21 @@ def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
                     raise TimeoutError("run 已到原定截止时间")
                 plan = state.pop("pending_reframe", None)
                 if plan is None or stopped() or state["end"]:
+                    prompt = closing(state) if closing is not None and plan is None and not stopped() and state["output_count"] else None
+                    if prompt:
+                        # WHY: 同一份工具和前缀再问一次，缓存能接上。DeepSeek 开思考时不接受强制
+                        # tool_choice（2026-11-09 实测 400），只能 auto，没调用的由 closed 兜底。
+                        # 收尾失败不算这次行动失败：要做的事已经做完了。
+                        append({"kind": "input", "messages": [{"role": "user", "content": prompt}]})
+                        state["end"], state["closing_now"] = False, True
+                        try:
+                            session.chat(recall_func=collect, stream=True)
+                        except Exception:
+                            logging.getLogger(__name__).exception("行动收尾的交接失败")
+                        else:
+                            if closed is not None:
+                                closed(state)
+                        state["end"] = True
                     break
                 writable(dispatch=True)
                 with guard:

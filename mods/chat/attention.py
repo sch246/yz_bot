@@ -21,6 +21,7 @@ DEFAULT_IDLE = 3.0
 DEFAULT_MAX = 12.0
 LOOP_GAP = 2.0
 LOOP_IDLE_MAX = 1800.0
+MAX_STRIKES = 3
 _log = logging.getLogger(__name__)
 _lock = threading.Condition(threading.RLock())
 _jobs: dict[str, dict] = {}
@@ -268,6 +269,30 @@ def ack(claimed) -> None:
                 continue
             del _jobs[item["id"]]
         screen.consume(job["window"], job["record_ids"])
+
+
+def strike(claimed, acting) -> None:
+    """Give up on a summons that runs in its own window keep failing to confirm.
+
+    WHY: 召唤要等它的记录上了画面才算确认，而跑完没确认的会被立刻再领走。记录永远上不了画面
+    时（2026-11-08 归错窗口的戳一戳、11-09 被藏起来的 `#` 消息）就是热循环：两天里每次
+    都是修完一个来源又来一个。所以兜一层：负责这个窗口的行动已经有输出、召唤仍没确认，
+    连续 MAX_STRIKES 次就放弃并记日志，不再指望把来源一个个堵完。没轮到的窗口不计。
+    """
+    for item in claimed:
+        if not item["record_ids"] or tuple(item["window"]) not in acting:
+            continue
+        with _lock:
+            job = _jobs.get(item["id"])
+            if job is None or job["claim"] != item["claim"]:
+                continue
+            job["strikes"] = job.get("strikes", 0) + 1
+            if job["strikes"] < MAX_STRIKES:
+                continue
+            del _jobs[item["id"]]
+        _log.warning("放弃确认不了的召唤：%s %s，%d 条记录", windows.label(item["window"]), item["kind"],
+                     len(item["record_ids"]))
+        screen.consume(item["window"], item["record_ids"])
 
 
 def release(claimed, *, notify=False) -> None:
@@ -647,6 +672,12 @@ def rescan() -> None:
             if changed:
                 screen.save_read()
         for identity_, item in screen.unread(window).items():
+            saved = item.get("event") or {}
+            if saved.get("sub_type") == "poke" and history.window(saved) not in (None, window):
+                # WHY: 2026-11-08 的两条戳一戳登记错了窗口（见 history.window），记录不在这个
+                # 窗口，重启后再排队还会空转。这样的存量清掉后，这个分支可以删。
+                screen.forget(window, identity_)
+                continue
             if not item.get("kind"):
                 continue
             with _lock:

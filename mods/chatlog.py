@@ -492,6 +492,9 @@ def _notice(msg: dict[str, Any]) -> str | None:
 
     if group_id is not None:
         return _group_write(msg, group_id, _notice_str(timestamp, text))
+    if sub_type == "poke" and history.window(msg) is not None:
+        # 记录和召唤必须落在同一个窗口（见 history.window）：她戳别人时算在对方的窗口。
+        return _private_write(msg, int(history.window(msg)[1]), _notice_str(timestamp, text))
     if user_id is not None:
         return _private_write(msg, user_id, _notice_str(timestamp, text))
     return _bot_write(msg, _notice_str(timestamp, text))

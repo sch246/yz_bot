@@ -224,7 +224,7 @@ def settle(label: str, *, model: str | None = None, stop=None) -> bool:
     day = diary_day(started)
     scopes = ["recent"]
     if window[0] in _windows.QQ:
-        scopes.append(_notes.scope_of(window))
+        scopes.append(_notes.window_scope(window))
     scopes += [f"diary:{day}", "todo", *_people(rows)]
     lookup = _segment.fresh()
     items = []

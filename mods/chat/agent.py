@@ -55,7 +55,7 @@ def cancel_wake(window):
 
 
 def _new(kind="唤醒"):
-    return {"cancelled": False, "associated_windows": set(), "claims": [], "deferred": [], "interlocutors": {},
+    return {"cancelled": False, "associated_windows": set(), "claims": [], "deferred": [], "interlocutors": {}, "called": set(),
             "log": {"kind": kind, "start": time.time(), "peak": 0, "acts": 0},
             "release": "", "boxes": storage.get("", "boxes")}
 
@@ -158,6 +158,8 @@ def _read_work():
             _adopt(wake, claims)
             threading.Thread(target=_keep_typing, args=(wake, typing), daemon=True).start()
             _work(wake, model=origin.get("_chat_model") if origin else None)
+            if wake.get("output_count") and not wake["cancelled"]:
+                attention.strike(wake["claims"], wake.get("acting", ()))
             if wake["cancelled"]:
                 attention.stop_loop("这一轮被叫停了")
             else:
@@ -202,6 +204,9 @@ def _brake_hint() -> str:
     return "" if _chat_root.get_brake() == "off" else _PACING_BRAKE
 
 
+_CALLED_KINDS = ("mention", "poke", "private", "等到了", "离线时叫你", "恢复的召唤")
+
+
 def _adopt(wake, claims):
     try:
         bot = identity.bot_id()
@@ -213,6 +218,10 @@ def _adopt(wake, claims):
         # send(wait=…) 在群里不写 who 时默认等这个人；只记叫她的人，不记之后路过的人。
         if isinstance(job.get("author"), int) and job["author"] != bot:
             wake["interlocutors"][window] = job["author"]
+        # 被点名、戳、私聊、等到了回复、离线补回的召唤算“被叫到”；只因 follow 关注或闹钟醒来不算。
+        # send 的闸（meta._gate）凭这个判断一句话是不是主动说的。
+        if any(mark in str(job.get("kind") or "") for mark in _CALLED_KINDS):
+            wake["called"].add(window)
         if not job["record_ids"]:
             # Clock/command work must leave the same ordinary me record as an
             # external producer. Releasing a failed claim reuses its identity.
@@ -313,9 +322,10 @@ def _act(wake, spec, model=None):
     windows = set(spec["windows"])
     wake["acting"] = windows
     items = list(spec["items"])
+    focus_label, note_label = spec.get("labels") or ("【构造提供的关注情境，供你判断】", "【准备时的观察与联想，供参考】")
     extra = [text for text in (
-        f"【构造提供的关注情境，供你判断】\n{spec['focus']}",
-        f"【准备时的观察与联想，供参考】\n{spec['note']}" if spec.get("note") else "",
+        f"{focus_label}\n{spec['focus']}",
+        f"{note_label}\n{spec['note']}" if spec.get("note") else "",
     ) if text]
     items += [{"role": "system", "content": text} for text in extra]
     wake["request_patches"] = []
@@ -341,7 +351,7 @@ def _act(wake, spec, model=None):
     try:
         run(items, _construct.DEFAULT_ACT_GOAL, tools=("meta", *spec["tools"]), inherit_tools=False,
             model=model, kind="main", state=wake, allow_reframe=True, history=spec["history"],
-            prepare=prepare, on_output=_confirm,
+            prepare=prepare, on_output=_confirm, closing=_construct.closing, closed=_construct.closing_done,
             hints=[lambda: _screen.unread_hint(windows), lambda: shell.running_hint(),
                    lambda: wake.get("breadcrumbs", ""), _brake_hint])
     finally:
