@@ -237,8 +237,19 @@ def _set(path, force=False):
     return "发送的不是文件或图片，操作终止"
 
 
-def _to(path, force=False):
-    recent = history.get_one(context.current(), msgs.is_file, 10)
+def _recv_msg(message_id: int, path: str):
+    """Receive the file carried by one historical message in this window."""
+    for event in history.getlog(context.current()):
+        if event.get("message_id") != message_id:
+            continue
+        if not msgs.is_file(event):
+            return f"消息 {message_id} 里没有文件"
+        return _recv_file(event, path)
+    return f"当前窗口的历史里没找到消息 {message_id}，可以先用 .file to"
+
+
+def _to(path, force=False, count=10):
+    recent = history.get_one(context.current(), msgs.is_file, count)
     if not recent:
         return "10条消息内没有文件"
     if force or not os.path.exists(path):
@@ -256,7 +267,7 @@ def run(body: str):
     """查看、收发和修改宿主机文件（管理员）。
 
     格式：.file read <路径> [-i] [起始行] [结束行]；write <路径> [起始行] [结束行]；get <路径>。
-    另有 set <路径> [-y|-f]、to <路径> [-y|-f] 接收文件，以及 del <路径> [-r] 删除；目录收发委托 .dir。
+    另有 set <路径> [-y|-f]、to <路径> [-y|-f] [条数]、msg <message_id> <路径> 接收文件，以及 del <路径> [-r] 删除；目录收发委托 .dir。
     """
     event = context.current()
     if not op.require_op(event):
@@ -285,12 +296,17 @@ def run(body: str):
 
             return directory.get(path)
         return "目标不存在"
+    if action == "msg":
+        ident, path, _ = text.read_params(tail, 2)
+        if not ident or not path or not ident.lstrip("-").isdigit():
+            return run.__doc__
+        return _recv_msg(int(ident), path)
     if action in ("set", "del", "to"):
-        path, extra, _ = text.read_params(tail, 2)
+        path, extra, third = text.read_params(tail, 3)
         force = extra in ("-y", "-f")
         if action == "set":
             return _set(path, force)
         if action == "del":
             return _del(path, extra == "-r")
-        return _to(path, force)
+        return _to(path, force, text.getint(third) or 10)
     return run.__doc__
