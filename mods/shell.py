@@ -27,6 +27,7 @@ import time
 _ROOT = os.path.abspath(os.path.join("data", "commands"))
 MODES = ("wait", "wake", "quiet")
 WAIT_SECONDS = 15.0
+LINE_WAIT_SECONDS = 5.0
 GRACE_SECONDS = 3.0
 TAIL_BYTES = 16 * 1024
 RESULT_LIMIT = 10_000
@@ -66,6 +67,7 @@ class Job:
         "code",
         "announced",
         "adopted",
+        "origin_line",
     )
 
     def __init__(
@@ -80,6 +82,7 @@ class Job:
         mode: str,
         started: float | None = None,
         adopted: bool = False,
+        origin_line: str = "",
     ):
         self.number = number
         self.process = process
@@ -96,9 +99,11 @@ class Job:
         self.code: int | None = None
         self.announced = False
         self.adopted = adopted
+        self.origin_line = str(origin_line or "")
 
 
-def run(command: str, cwd: str, timeout: float = WAIT_SECONDS, back: str = "wait", max_bytes: int = 8192) -> str:
+def run(command: str, cwd: str, timeout: float = WAIT_SECONDS, back: str = "wait", max_bytes: int = 8192,
+        *, origin_line: str = "") -> str:
     """执行 *command*；*timeout* 内没跑完就转后台，返回任务号和已有的输出。"""
     if back not in MODES:
         return f"back 只能是 {'、'.join(MODES)}"
@@ -138,7 +143,8 @@ def run(command: str, cwd: str, timeout: float = WAIT_SECONDS, back: str = "wait
         # WHY: start_new_session 正常时 pid 就是组长；万一环境没照做，killpg 可能打到
         # Bot 自己的进程组，所以这种进程只记 pid，由 _kill_group 单杀。
         pgid = 0
-    job = Job(number, process, pid, pgid, path, cwd, command, "wake" if back == "wait" else back)
+    job = Job(number, process, pid, pgid, path, cwd, command, "wake" if back == "wait" else back,
+              origin_line=origin_line)
     _write_meta(job)
 
     if back == "wait" and wait > 0:
@@ -215,6 +221,7 @@ def _receipt(job: Job, max_bytes: int, waited: float | None, note: str = "") -> 
     else:
         state = f"已转后台 #{job.number}（等了 {waited:g}s 没跑完）"
     parts = [
+        *([f"[已转入后台运行 task_id=#{job.number}；完成后会自动唤醒本线]"] if job.mode == "wake" else []),
         f"cwd: {job.cwd} | {state} | 已跑 {elapsed:.1f}s | 输出 {count}",
         f"文件: {job.path}",
         f"最后一行: {last}",
@@ -228,7 +235,10 @@ def _receipt(job: Job, max_bytes: int, waited: float | None, note: str = "") -> 
         parts.append(f"--- 已有输出{note} ---\n{text.rstrip()}")
     else:
         parts.append("(还没有输出)")
-    tail = "跑完会把结果推进 me 窗口并叫醒你" if job.mode == "wake" else "跑完只记进 me 窗口，不叫你"
+    if job.origin_line and job.mode == "wake":
+        tail = f"跑完会把结果回传唤醒本线（{job.origin_line}）并记入 me 窗口"
+    else:
+        tail = "跑完会把结果推进 me 窗口并叫醒你" if job.mode == "wake" else "跑完只记进 me 窗口，不叫你"
     parts.append(tail)
     return "\n".join(parts)
 
@@ -286,7 +296,13 @@ def _push_result(job: Job) -> None:
         from mods import chat
 
         wake = f"命令 #{job.number} 结束（{code}）" if job.mode == "wake" else ""
-        chat.push(chat.windows.ME, "命令", message, wake=wake)
+        if job.origin_line:
+            from mods.chat import line as _line
+
+            _line.send("system:shell", job.origin_line, message, wake=(job.mode == "wake"))
+            chat.push(chat.windows.ME, "命令", message, wake="")
+        else:
+            chat.push(chat.windows.ME, "命令", message, wake=wake)
     except Exception:
         _log().exception("命令 #%s 的结果没能推进 me 窗口", job.number)
 
@@ -398,6 +414,7 @@ def _write_meta(job: Job) -> None:
         "command": job.command,
         "started": job.started,
         "mode": job.mode,
+        "origin_line": job.origin_line,
     }
     temporary = job.meta + ".tmp"
     try:
@@ -460,6 +477,7 @@ def _recover() -> None:
                 str(data.get("mode") if data.get("mode") in MODES else "quiet"),
                 float(data.get("started") or time.time()),
                 adopted=True,
+                origin_line=str(data.get("origin_line") or ""),
             )
             _tasks[number] = job
             job.thread = threading.Thread(target=_watch, args=(job,), daemon=True, name=f"shell-{number}")

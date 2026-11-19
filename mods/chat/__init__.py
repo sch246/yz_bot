@@ -42,10 +42,12 @@ llm_config: dict = {}
 # max_token × pressure_percent 两个数，维护者觉得一个阈值拆成两个数没有意义，合成一个。
 # 2026-10-23 维护者定默认 50 万，约是模型上下文的一半：同一段上下文一直往后接，阈值
 # 要给交接本身（整段再加一句交接指令）留出余量，也让"超长卡死"在正常使用里遇不到。
-# 2026-11-01 起没有整段上下文和交接，tidy_token 只剩一个用途：单次反思或沉淀运行里
-# 材料之后新长出来的部分不超过它（存储键沿用旧名）。
+# 2026-11-01 起没有整段上下文和交接，tidy_token 用于单次反思或沉淀运行里的增长上限；
+# 2026-11-19：#construct line 下 `after_round`/`closing` 也用它当单线自动折叠水位。
+# 原默认 50 万在 DeepSeek Flash 等上下文下永远触不到（实跑 6 天 0 次自动触发，多条线涨到 170k–248k）；
+# 调到 12 万：单线在 12 万处及时触发原地折叠，同时高于实测沉淀/反思单次增长峰值，不误截断它们。
 DEFAULT_MAX_EVENTS = 80
-DEFAULT_TIDY_TOKEN = 500000
+DEFAULT_TIDY_TOKEN = 120000
 AGENT_WINDOW = ("agent", 0)
 NOTICE_TOKENS = 500
 _cost_lock = threading.Lock()
@@ -560,6 +562,21 @@ def chat(model: str | None = None) -> None:
                 event.pop("_chat_model", None)
             else:
                 event["_chat_model"] = prior
+
+
+def resume(event: dict | None = None, reason: str = "重启完成，接着刚才的事") -> bool:
+    """Queue a post-reboot continuation wake without requiring a live inbound arrival id.
+
+    WHY: 2026-11-19：reboot.py 从 data/reboot_greet.py 反序列化出的是重启前那条命令事件，
+    在新进程里没有经过 record_event 登记到达号；直接调 chat.chat() 必然在 context.event_arrival
+    抛出 RuntimeError（11-15、11-16 两次实测失败）。这里直接按原窗口入队一条无 record_ids 的
+    reboot 召唤（#construct line 下自动路由回仍认领该窗口的专注线，未认领则进 line:main），
+    不在聊天窗口里伪造入站消息。
+    """
+    window = history.window(event) if isinstance(event, dict) else None
+    if window is not None and (window[0] not in _windows.QQ or _in_chat_scope(event)):
+        return _attention.enqueue(window, kind="reboot", reason=reason)
+    return wake(None, kind="reboot", reason=reason)
 
 
 def _in_chat_scope(event: dict) -> bool:

@@ -8,6 +8,8 @@ outlives its run: there is no handoff, pressure, fold or dismiss any more.
 WHY: 2026-11-01 维护者推翻 D20（不交接就一直是同一个上下文）、同意无状态设计：每次调用
 只有一个目的，上下文由上下文构造（docs/working/proposals/one-purpose-stateless-core.md）。
 交接写记忆的那条路由沉淀接替，沉淀按日志编号拿到她亲历时看到的同一批材料。
+2026-11-10 维护者推翻上面这条里的“无状态”：上下文是延续和交接的组合。#construct fold 时
+每次行动借着主线（line.py）往下，结束后过程折叠进线；构造开着或只交接时照旧每次新开。
 """
 from __future__ import annotations
 
@@ -17,7 +19,7 @@ import time
 
 from mods import context, history, identity, shell, storage
 import mods.chat as _chat_root
-from . import attention, construct as _construct, journal, notes as _notes, roles as _roles, screen as _screen, segment as _segment, settle as _settle, windows as _windows
+from . import attention, construct as _construct, journal, line as _line, notes as _notes, roles as _roles, screen as _screen, segment as _segment, settle as _settle, windows as _windows
 from .run import current_wake, run, write
 
 # WHY: with no running context the act must see enough of the thread around a new
@@ -159,7 +161,8 @@ def _read_work():
             threading.Thread(target=_keep_typing, args=(wake, typing), daemon=True).start()
             _work(wake, model=origin.get("_chat_model") if origin else None)
             if wake.get("output_count") and not wake["cancelled"]:
-                attention.strike(wake["claims"], wake.get("acting", ()))
+                struck = set(wake.get("acting") or ()) - set(wake.get("delegated_windows") or ())
+                attention.strike(wake["claims"], struck)
             if wake["cancelled"]:
                 attention.stop_loop("这一轮被叫停了")
             else:
@@ -222,7 +225,7 @@ def _adopt(wake, claims):
         # send 的闸（meta._gate）凭这个判断一句话是不是主动说的。
         if any(mark in str(job.get("kind") or "") for mark in _CALLED_KINDS):
             wake["called"].add(window)
-        if not job["record_ids"]:
+        if not job["record_ids"] and not (isinstance(job.get("event"), dict) and job["event"].get("_target_line")):
             # Clock/command work must leave the same ordinary me record as an
             # external producer. Releasing a failed claim reuses its identity.
             record = "wake_" + job["id"]
@@ -294,6 +297,8 @@ def _prepare(wake, view, windows, lead_in=_ACT_LEAD_IN):
                              "follow_ids": part["follow_ids"], "record_keys": part["record_keys"]})
     wake["request_patches"] = patches
     screens = "\n".join(part["text"] for part in parts if part["text"])
+    if screens:
+        wake["last_screen_query"] = screens
     present = set(info["notes"])
     hits = [scope for scope, _word in _notes.mentioned(screens) if scope not in present]
     if wake.get("recall"):
@@ -302,39 +307,183 @@ def _prepare(wake, view, windows, lead_in=_ACT_LEAD_IN):
     return material
 
 
+def _prepare_triage(wake, view, windows, lead_in=_ACT_LEAD_IN):
+    """Default 3 (`§10`): ``line:main`` gets a compact arrival header; full ``screen.py`` slice waits for target line."""
+    material = []
+    if _windows.ME in windows:
+        material.extend(_prepare(wake, view, {_windows.ME}, lead_in))
+    external = sorted((w for w in windows if w != _windows.ME), key=_windows.label)
+    if not external:
+        return material
+    attention.flush(external)
+    late = attention.claim()
+    attention.release([job for job in late if job["kind"] == "reflect"])
+    late = [job for job in late if job["kind"] != "reflect"]
+    mine = [job for job in late if tuple(job["window"]) in external]
+    wake["deferred"].extend(job for job in late if tuple(job["window"]) not in windows)
+    if mine:
+        wake["claims"].extend(mine)
+        _adopt(wake, mine)
+    view["stats"]["windows"] = sorted(_windows.label(w) for w in windows)
+    triage_patches = wake.setdefault("triage_patches", {})
+    cards, snippets = [], []
+    for win in external:
+        if win in triage_patches:
+            continue
+        label = _windows.label(win)
+        part = _screen.prepare(win, shown=[], count=8, lead_in=4)
+        triage_patches[win] = part["patch"]
+        tail_lines = [ln for ln in (part["text"] or "").splitlines() if ln.strip()][-6:]
+        snippet = "\n".join(tail_lines) or "（无新增消息正文）"
+        snippets.append(snippet)
+        reasons = [
+            f"{job['kind']}：{job['reason']}" if job.get("reason") else str(job["kind"])
+            for job in wake["claims"] if tuple(job["window"]) == win
+        ]
+        handoff_rec = _construct.read_handoff(win)
+        handoff_line = ""
+        if handoff_rec and (handoff_rec.get("focus") or handoff_rec.get("note")):
+            h_note = str(handoff_rec.get("note") or "").strip().replace("\n", " ")[:200]
+            handoff_line = f"上次窗口交接：{handoff_rec.get('focus', '')}" + (f"｜{h_note}" if h_note else "") + "\n"
+            snippets.append(handoff_line)
+        try:
+            win_title = _windows.title(win)
+        except Exception:
+            win_title = label
+        cards.append(
+            f"【外部新到达分诊｜窗口 {win_title}】\n"
+            f"触发：{('；'.join(reasons)) or '新消息'}\n"
+            f"{handoff_line}"
+            f"近期末尾摘要（完整上下文将在分派后挂入目标专注线）：\n{snippet}"
+        )
+    if cards:
+        joined_snippets = "\n".join(snippets)
+        wake["last_screen_query"] = joined_snippets
+        hits = [scope for scope, _word in _notes.mentioned(joined_snippets)]
+        wake["breadcrumbs"] = "画面提到的这些你有笔记，用 read_file 召回：" + "、".join(dict.fromkeys(hits)) if hits else ""
+        material.append({
+            "kind": "input",
+            "messages": [{"role": "user", "content": "\n\n".join(cards)}],
+        })
+    return material
+
+
 def _confirm(wake):
-    patches = wake.get("request_patches", [])
+    if wake.get("line"):
+        calls = (wake.get("last") or {}).get("tool_calls") or []
+        if any((c.get("function") or {}).get("name") == "line__hand_back" for c in calls):
+            return
+    delegated = set(wake.get("delegated_windows") or ())
+    patches = [p for p in wake.get("request_patches", [])
+               if _windows.parse(p["window"]) not in delegated]
     _screen.commit_read(patches)
     confirmed = {patch["window"]: set(patch["records"]) for patch in patches}
-    acting = wake.get("acting", set())
+    acting = set(wake.get("acting", set())) - delegated
     # WHY: 一步只做一件以后（设计文档第 18 节），没有消息号的召唤（闹钟、循环、命令）只能由
     # 负责它窗口或 me 的行动消掉；以前任何一次行动有输出都会把它们一并消掉，别的事就丢了。
     done = [job for job in wake["claims"]
-            if (not job["record_ids"] and (tuple(job["window"]) in acting or _windows.ME in acting))
-            or job["record_ids"] and set(job["record_ids"]) <= confirmed.get(_windows.label(job["window"]), set())]
+            if tuple(job["window"]) not in delegated and (
+                (not job["record_ids"] and (tuple(job["window"]) in acting or _windows.ME in acting))
+                or job["record_ids"] and set(job["record_ids"]) <= confirmed.get(_windows.label(job["window"]), set())
+            )]
     attention.ack(done)
     ids = {job["id"] for job in done}
     wake["claims"][:] = [job for job in wake["claims"] if job["id"] not in ids]
+
+
+def _finalize_line_turn(wake, line_name: str, opening: set | None, windows: set, *, triage_only: bool = False) -> None:
+    """Apply two-stage cursor commits/retargets (`Default 5`) and append turn atoms onto *line_name*."""
+    delegated: dict[tuple, str] = dict(wake.get("delegated_windows") or {})
+    for win, target_line in delegated.items():
+        attention.retarget(
+            wake["claims"],
+            win,
+            target_line,
+            handed_back=bool(wake.get("handed_back_window") and target_line == _line.MAIN),
+        )
+
+    if triage_only and wake.get("output_count") and not wake["cancelled"]:
+        triage_patches: dict[tuple, dict] = wake.get("triage_patches") or {}
+        direct_patches = [patch for win, patch in triage_patches.items() if win not in delegated]
+        if direct_patches:
+            _screen.commit_read(direct_patches)
+            confirmed = {patch["window"]: set(patch["records"]) for patch in direct_patches}
+            done = [
+                job for job in wake["claims"]
+                if tuple(job["window"]) not in delegated and (
+                    not job["record_ids"]
+                    or set(job["record_ids"]) <= confirmed.get(_windows.label(job["window"]), set())
+                )
+            ]
+            attention.ack(done)
+            done_ids = {job["id"] for job in done}
+            wake["claims"][:] = [job for job in wake["claims"] if job["id"] not in done_ids]
+
+    if wake.get("output_count"):
+        direct_windows = windows - set(delegated)
+        if direct_windows:
+            _settle.touch(direct_windows)
+        if opening is not None and not wake.get("handed_back_window"):
+            try:
+                _line.append_turn(
+                    line_name,
+                    wake["view"],
+                    opening=opening,
+                    skip_ids=wake.get("compacted_ids"),
+                    used=wake.get("used"),
+                    windows=direct_windows,
+                    closed_in_run=bool(wake.get("closed_in_run")),
+                )
+            except Exception:
+                _roles._stream.exception(f"追加行动 {wake['view']['ctx']} 进线 {line_name} 失败")
 
 
 def _act(wake, spec, model=None):
     """Run one spec: its references, its note, and the screens of its windows."""
     windows = set(spec["windows"])
     wake["acting"] = windows
-    items = list(spec["items"])
+    on_line = bool(spec.get("line"))
+    line_name = str(spec.get("line_name") or _line.MAIN) if on_line else ""
+    line_obj = _line.ensure(line_name) if on_line else None
+    prefix = _line.prefix_items(line_obj) if on_line else []
+    items = [*prefix, *spec["items"]]
     focus_label, note_label = spec.get("labels") or ("【构造提供的关注情境，供你判断】", "【准备时的观察与联想，供参考】")
     extra = [text for text in (
-        f"{focus_label}\n{spec['focus']}",
+        f"{focus_label}\n{spec['focus']}" if spec.get("focus") else "",
         f"{note_label}\n{spec['note']}" if spec.get("note") else "",
     ) if text]
     items += [{"role": "system", "content": text} for text in extra]
     wake["request_patches"] = []
+    wake["triage_patches"] = {}
+    wake["delegated_windows"] = {}
+    wake["last_screen_query"] = ""
+    wake["line"] = on_line
+    wake["line_name"] = line_name
+    wake["line_prefix_len"] = len(prefix)
+    for transient_key in ("handoffs", "compacted_in_run", "closed_in_run", "compacted_ids", "handed_back_window",
+                          "auto_compact_now", "closing_mode", "closing_start_idx"):
+        wake.pop(transient_key, None)
     draft_ctx = None
+    opening = None
+    triage_only = bool(on_line and spec.get("triage_only"))
 
     def prepare(state):
-        nonlocal draft_ctx
+        nonlocal draft_ctx, opening
         view = state["view"]
         material = []
+        if opening is None:
+            opening = set(view["items"])
+            state["line_opening"] = opening
+            if on_line:
+                view["stats"]["line"] = line_name
+        elif on_line:
+            # §3.1 (3): 轮间插话——运行期间跨线 send 追加进本线 present 的新消息原子立即并入当前轮
+            latest = _line.load(line_name)
+            if latest is not None:
+                known = set(view["items"]) | set(state.get("compacted_ids") or ())
+                interjected = [a for a in latest["present"] if a not in known]
+                if interjected:
+                    _segment.extend(view, interjected, persist=False)
         if draft_ctx != view["ctx"]:
             if state["segment_index"] == 0:
                 view["stats"]["focus"] = spec["focus"]
@@ -345,17 +494,41 @@ def _act(wake, spec, model=None):
             draft_ctx = view["ctx"]
             if text:
                 material.append({"kind": "system", "messages": [{"role": "system", "content": text}]})
-        material.extend(_prepare(wake, view, windows, state["history"]))
+        if triage_only:
+            material.extend(_prepare_triage(wake, view, windows, state["history"]))
+        else:
+            material.extend(_prepare(wake, view, windows, state["history"]))
         return material
 
+    def after_round(state):
+        if on_line and state.get("used", 0) > _chat_root.limit()[1] and not state.get("compacted_in_run"):
+            state["auto_compact_now"] = True
+
+    base_tools = ("meta", "line", *_line.active_modules(line_obj), *spec["tools"]) if on_line else ("meta", *spec["tools"])
+    act_hints = [
+        lambda: _screen.unread_hint(windows),
+        lambda: shell.running_hint(),
+        lambda: wake.get("breadcrumbs", ""),
+    ]
+    if on_line:
+        if spec.get("ephemeral_hint"):
+            act_hints.append(spec["ephemeral_hint"])
+        act_hints.append(lambda: _line.tail_hint(
+            line_name,
+            wake.get("last_screen_query", ""),
+            consume_follow_ups=(line_name == _line.MAIN),
+        ))
+    act_hints.append(_brake_hint)
+
     try:
-        run(items, _construct.DEFAULT_ACT_GOAL, tools=("meta", *spec["tools"]), inherit_tools=False,
-            model=model, kind="main", state=wake, allow_reframe=True, history=spec["history"],
-            prepare=prepare, on_output=_confirm, closing=_construct.closing, closed=_construct.closing_done,
-            hints=[lambda: _screen.unread_hint(windows), lambda: shell.running_hint(),
-                   lambda: wake.get("breadcrumbs", ""), _brake_hint])
+        run(items, spec.get("goal") or _construct.DEFAULT_ACT_GOAL, tools=base_tools,
+            inherit_tools=False, model=model, kind="main", state=wake, allow_reframe=not on_line, history=spec["history"],
+            prepare=prepare, on_output=_confirm, after_round=after_round if on_line else None,
+            closing=_construct.closing, closed=_construct.closing_done, hints=act_hints)
     finally:
-        if wake.get("output_count"):
+        if on_line:
+            _finalize_line_turn(wake, line_name, opening, windows, triage_only=triage_only)
+        elif wake.get("output_count"):
             _settle.touch(windows)
 
 
@@ -504,14 +677,18 @@ def _reflect(wake, model=None, settle=True):
     if runs or not settle:
         counts = {kind: sum(view["stats"].get("kind") == kind for _name, view in runs) for kind in ("main", "construct", "settle")}
         settled = [f"{name}  {view['stats'].get('reason', '')}" for name, view in runs if view["stats"].get("kind") == "settle"]
+        # WHY: 2026-11-19：Gemini 的 OpenAI 兼容接口会把全部 system 消息抽进 systemInstruction，
+        # 若整条反思请求全是 system（没有 user 消息），会报 400 contents is not specified 并中断当晚 roll
+        #（2026-11-18 凌晨实测连续失败两次）。与 settle.py 一样把本次待整理的动态汇总作为 user 消息给出，
+        # 既保证首轮与多轮续调都有合法 user 起点，也不影响前面的笔记/工具静态前缀缓存。
         items = [{"role": "system", "content": "以下是你的笔记：\n" + "\n\n".join(_notes.render(scope) for scope in ("global", "recent"))},
-                 {"role": "system", "content": f"上次反思以来：行动 {counts['main']} 次，构造 {counts['construct']} 次，沉淀 {counts['settle']} 次。\n"
+                 {"role": "system", "content": "策略改动 changes（data/notes/policy/changes.md）：\n" + _tail(_notes.read_policy("changes"), 40)
+                  + "\n给维护者的 proposals（data/notes/policy/proposals.md）：\n" + _tail(_notes.read_policy("proposals"), 20)},
+                 {"role": "user", "content": f"上次反思以来：行动 {counts['main']} 次，构造 {counts['construct']} 次，沉淀 {counts['settle']} 次。\n"
                   "每段经历的沉淀（read_context 读原样，里面有那段聊天原文和你在那里的每次行动）：\n"
                   + ("\n".join(settled[-60:]) or "（没有）")
                   + "\n每次行动之前的构造运行也能用 read_context 按 ctx 读：它准备了什么、后来行动里又召回了什么，"
-                  "可以看出构造漏带了哪类材料。构造的说明在 data/notes/policy/construct.md，沉淀的附加说明在 data/notes/policy/settle.md，都用 write_file 改。"},
-                 {"role": "system", "content": "策略改动 changes（data/notes/policy/changes.md）：\n" + _tail(_notes.read_policy("changes"), 40)
-                  + "\n给维护者的 proposals（data/notes/policy/proposals.md）：\n" + _tail(_notes.read_policy("proposals"), 20)}]
+                  "可以看出构造漏带了哪类材料。构造的说明在 data/notes/policy/construct.md，沉淀的附加说明在 data/notes/policy/settle.md，都用 write_file 改。"}]
         missed = _construct.missed_since(since)
         if missed:
             items.append({"role": "system", "content": missed})
@@ -524,6 +701,8 @@ def _reflect(wake, model=None, settle=True):
     if not wake["cancelled"]:
         data["reflected_at"] = wake["log"]["start"]
         storage.save()
+        # WHY: 夜里沉淀和反思把白天整理进笔记以后，第二天的线从交接重新开（2026-11-10 的参数，可改）。
+        _line.roll(reason="夜里整理之后")
 
 
 def _roll_up(day: str) -> None:

@@ -17,7 +17,7 @@ import json
 
 from mods import chatlog, history, log
 
-from . import actions as _actions, notes as _notes, screen as _screen, segment as _segment, view as _view
+from . import actions as _actions, journal as _journal, notes as _notes, screen as _screen, segment as _segment, view as _view
 
 
 _stream = log.stream("agent")
@@ -274,6 +274,9 @@ def search(keyword: str, window: str = "", days: int = _SEARCH_DAYS) -> str:
     found, total, archived_ids = [], 0, set()
     # 一次只解析一段：只留要列出来的摘要，其余只计数。
     for name, data in _segment.each_archived(oldest, newest_first=True):
+        if data["stats"].get("line"):
+            # WHY: 主线上每次行动都借着整条线，不去掉借来的行，线里一句话会在之后每次行动里各命中一次。
+            data = {**data, "items": [item for item in data["items"] if _journal.get(item)["ctx"] == data["ctx"]]}
         archived_ids.update(_segment.source_ids(data, expand_folds=True))
         count, shown = _matching(_archive_lines(_segment.raw_messages(data, expand_folds=True)), needle, 2)
         if count:

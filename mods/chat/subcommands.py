@@ -109,11 +109,12 @@ at、on、wait、when 响过就从笔记里划掉。她平时用 wake_me 写这�
 #debounce off         关闭防抖（收到消息立即秒回）
 #debounce 3 12        设置等待 3 秒，最多延长至 12 秒
 #debounce reset       重置为默认值（3s / 12s）"""),
-    ("construct [on|off|model [selection]|effort [level]|timeout [秒]|prompt|set <全文>|reset]", """查看或设置构造运行（修改需管理员）。
+    ("construct [on|off|line|model [selection]|effort [level]|timeout [秒]|prompt|set <全文>|reset]", """查看或设置构造运行（修改需管理员）。
 
 每次唤醒、行动之前，先跑一次构造：她自己看黑板 recent、这次的消息和折叠索引，决定这次要做什么、展开哪些材料，写下注意（陌生说法、矛盾、情绪、意外）。关掉或失败时按黑板加这次的消息直接行动。原来的 observer 并在这里。
 #construct                    查看状态、模型、思考等级、超时和说明来源
 #construct on|off             开启或关闭构造运行；关着时每次行动结束写交接，下次醒来按窗口取最近一份直接行动
+#construct line               关掉构造，启用持久线模式（line:main 分诊 + 专注线单跳热连接 + 按需折叠沉淀；兼容别名 fold）
 #construct model [selection]  查看或设置构造运行的模型（留空查看）
 #construct effort [level]     查看或设置思考等级（default/off/none/low/medium/high/max）
 #construct timeout [秒]       查看或设置超时，超时就按黑板加消息直接行动
@@ -130,7 +131,7 @@ def requires_op(value: str) -> bool:
         return False
     if name == "construct":
         first, _, remaining = tail.strip().partition(" ")
-        if first in ("on", "off", "set", "reset"):
+        if first in ("on", "off", "line", "fold", "set", "reset"):
             return True
         if first in ("model", "effort", "timeout") and bool(remaining.strip()):
             return True
@@ -545,7 +546,18 @@ def _mouth_subcommand(tail: str) -> str:
 def _construct_report() -> str:
     cfg = _chat_root._construct.get_config()
     custom = _chat_root._notes.read_policy("construct").strip()
-    return (f"construct: {'开' if cfg.get('on', True) else '关'}\nmodel: {cfg.get('model')}\neffort: {cfg.get('effort')}\n"
+    is_line = _chat_root._construct.line_enabled(cfg)
+    mode = "开" if cfg.get("on", True) else "关，持久线（line）" if is_line else "关，交接"
+    from . import line as _line
+
+    lines = _line.list_lines()
+    if lines:
+        active_n = sum(1 for item in lines if item.get("future"))
+        main_line = _line.load(_line.MAIN)
+        acts = (main_line or {}).get("stats", {}).get("acts", 0)
+        used = (main_line or {}).get("stats", {}).get("used", 0)
+        mode += f"（共 {len(lines)} 条线，活跃 {active_n} 条；主线 {acts} 次行动，约 {used} token）"
+    return (f"construct: {mode}\nmodel: {cfg.get('model')}\neffort: {cfg.get('effort')}\n"
             f"timeout: {cfg.get('timeout')}s\nprompt: {'自定义（' + str(len(custom)) + ' 字）' if custom else '内置'}（data/notes/policy/construct.md）")
 
 
@@ -559,9 +571,15 @@ def _construct_subcommand(raw: str, tail: str) -> str:
     if action in ("on", "off"):
         if arg:
             return f"construct {action} 参数过多"
-        cfg["on"] = action == "on"
+        cfg["on"], cfg["line"], cfg["fold"] = action == "on", False, False
         construct.save_config(cfg)
         return f"construct: {'开' if cfg['on'] else '关'}"
+    if action in ("line", "fold"):
+        if arg:
+            return f"construct {action} 不带参数"
+        cfg["on"], cfg["line"], cfg["fold"] = False, True, False
+        construct.save_config(cfg)
+        return "construct: 关，持久线（line）"
     if action == "model":
         if not arg:
             return f"construct model: {cfg.get('model')}"
@@ -632,7 +650,7 @@ def _status_report(data: dict) -> str:
     deb_mode = "on" if deb_cfg.get("enabled") else "off"
     deb_detail = f"等待 {deb_cfg['idle']:.1f}s，上限 {deb_cfg['max']:.1f}s" if deb_cfg.get("enabled") else "已关闭"
     con_cfg = _chat_root._construct.get_config()
-    con_switch = "on" if con_cfg.get("on", True) else "off"
+    con_switch = "on" if con_cfg.get("on", True) else ("line" if _chat_root._construct.line_enabled(con_cfg) else "off")
     con_custom = "自定义" if _chat_root._notes.read_policy("construct").strip() else "内置"
     unsettled = _chat_root._settle.pending()
     settle_str = ("、".join(sorted(unsettled)) + " 还没沉淀") if unsettled else "都沉淀过了"
@@ -661,7 +679,7 @@ def _status_report(data: dict) -> str:
         f"#limit {max_events} {threshold}（画面 {max_events} 条，反思和沉淀的增长上限 {threshold}）",
         f"#debounce {deb_mode}（防抖延迟：{deb_detail}；改用 #debounce on/off/<等待秒数> [上限秒数]）",
         f"#settle（沉淀：安静 {_chat_root._settle.config()['quiet']}s 或积压 {_chat_root._settle.config()['backlog']} 条；{settle_str}；改用 #settle quiet <秒> / #settle backlog <条> / #settle now）",
-        f"#construct {con_switch}（构造运行；模型: {con_cfg.get('model')}；改用 #construct on/off / #construct model <名称> / #construct effort <等级>）",
+        f"#construct {con_switch}（构造运行；模型: {con_cfg.get('model')}；改用 #construct on/off/line / #construct model <名称> / #construct effort <等级>）",
         f"#reflect（上次反思：{reflect_str}；立即执行：#reflect now / #reflect keep）",
         f"#awaker（闹钟：{awaker_str}；改写：#awaker set <规则>）",
     ]

@@ -932,6 +932,11 @@ class LLMClient:
                         call["type"] = "function"
         # Image conversion is one output message per input message, so the
         # caller's count still lines up with what is about to be sent.
+        # WHY: 2026-11-19：Gemini OpenAI 兼容接口把所有 system 消息抽为 systemInstruction，
+        # 整批全是 system 时会报 400 contents is not specified。只在发出的副本上兜底把最后一条转为 user，
+        # 不改 original_messages 或调用方历史。
+        if messages and all(message.get("role") == "system" for message in messages):
+            messages = [*messages[:-1], {**messages[-1], "role": "user"}]
         console.print_request(selection, messages, logged)
         params = {"model": api_model, "messages": messages, "stream": stream}
         if temperature is not None:

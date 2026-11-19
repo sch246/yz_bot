@@ -623,3 +623,16 @@ def where(words: list[str]) -> dict[str, list[str]]:
             if word.casefold() in folded:
                 found[word].append(scope)
     return found
+
+
+def recall_concerns(text: str, *, exclude_lines=(), most: int = 8) -> dict:
+    """Unified Concern Directory (`§3.2`): exact/BM25/ACT-R recall across notes and persistent lines."""
+    from . import line as _line
+
+    note_hits = mentioned(text)
+    mentioned_scopes = [scope for scope, _word in note_hits]
+    return {
+        "notes_mentioned": note_hits,
+        "notes_similar": similar(text, most=most, exclude=mentioned_scopes),
+        "lines": _line.recall_lines(text, exclude=exclude_lines, most=most),
+    }

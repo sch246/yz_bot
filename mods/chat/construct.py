@@ -24,14 +24,15 @@ import time
 
 from mods import storage, tools as tool_modules, usage
 
-from . import journal, notes as _notes, roles as _roles, screen as _screen, segment as _segment, windows as _windows
+from . import journal, line as _line, notes as _notes, roles as _roles, screen as _screen, segment as _segment, windows as _windows
 
 # WHY: 2026-11-07 维护者：提醒只要占了注意力就是偏向。相近笔记的候选（notes.similar）照算、
 # 照记进 usage 的 recall 日志，但先不挂给构造看，等记录说明她自己翻开的笔记常在候选里再打开；
 # 挂出来以后“被打开”会自己证明自己，就量不出它到底有没有用了。
 SHOW_SIMILAR = False
 
-DEFAULT_CONFIG = {"on": True, "model": "deepseek/deepseek-flash", "effort": "none", "timeout": 45}
+# line/fold 只在 on 关着时起作用：持久线模式（line.py），单跳热连接 + 按需原地折叠沉淀。
+DEFAULT_CONFIG = {"on": True, "line": False, "fold": False, "model": "deepseek/deepseek-flash", "effort": "none", "timeout": 45}
 GOAL = "为接下来的自己提供信息、提醒和洞察；用 construct__assemble 提交一份上下文准备，提交后结束。"
 DEFAULT_ACT_GOAL = "看看这次唤醒和新到的消息，自主决定做什么；不必为了被叫醒而说话。"
 # WHY: 构造运行原本是 observer（没有任何工具）；现在只多给召回和提交规格。发言、写笔记、
@@ -98,6 +99,12 @@ def get_config() -> dict:
 def save_config(config: dict) -> None:
     storage.get("agent", "config")["construct"] = config
     storage.save()
+
+
+def line_enabled(config: dict | None = None) -> bool:
+    """Whether persistent line mode (``#construct line`` or alias ``fold``) is active."""
+    cfg = get_config() if config is None else config
+    return not cfg.get("on", True) and bool(cfg.get("line") or cfg.get("fold"))
 
 
 def policy() -> str:
@@ -184,7 +191,10 @@ def timeline(hours: float = 3, most: int = 40) -> str:
     for row in journal.events(kind="assistant", after=since):
         if row.get("run_kind") not in ("main", "settle"):
             continue
-        message = row["messages"][0]
+        msgs = row.get("messages") or []
+        if not msgs or not isinstance(msgs[0], dict):
+            continue
+        message = msgs[0]
         calls = [_call_line(call) for call in message.get("tool_calls") or []]
         said = str(message.get("content") or "").strip().replace("\n", " ")
         if not calls and not said:
@@ -394,6 +404,8 @@ def build(wake: dict, model: str | None = None) -> list[dict]:
     claimed = list(wake["associated_windows"])
     config = get_config()
     if not config.get("on", True):
+        if line_enabled(config):
+            return build_line_specs(wake)
         return [handoff_spec(wake)]
     wake["recall"] = None
     state = {"associated_windows": set(claimed), "specs": [], "cancelled": False}
@@ -488,6 +500,44 @@ _HANDOFF_TOOLS = re.compile(r"^\s*工具[:：]\s*(.*?)\s*$")
 _HANDOFF_RUN = re.compile(r"^\s*运行[:：]\s*(\S+)\s*$")
 
 
+AUTO_COMPACT_PROMPT = """当前这条线的上下文已超过整理水位（tidy_token）。程序已记下本轮做过的事：
+{done}
+请调用一次 line__compact 把已完成的探索过程原地折叠沉淀（写清 summary；未办完的事省略 future 即自动保留原目标，改目标填新 future，只有彻底办结才显式传 close=True；有长期结论写进 past_updates），写完本轮结束。"""
+
+PROCESS_COMPACT_PROMPT = """当前这条线里累计有 {acts} 轮未收起的工作工具过程（约 {kb}k 字，涉及 ctx：{ctxs}）。
+判断一下这些事是否大致告一段落：
+- 如果还没做完、刚才查出来的原文接下来马上还要接着用：不要调工具，直接简短回一句跳过即可，原文会原样留着；
+- 如果大致做完了，以后只需要知道做过这件事和结论：调用一次 line__compact(summary="用你自己的第一人称话记下做过什么、结论或感受", scope="process")。
+这样只收起冗长的工具过程并保留 read_context 召回指针，前面的历史、聊天画面和你说过的话都不会动（若有跨时间长期认知可顺手写进 past_updates）。"""
+
+LINE_TRIAGE_GOAL = (
+    "作为总控线（line:main）快速分诊外部新到达：先看请求末尾【全局关注目录关联召回】，"
+    "已有同主题线时优先用 line__send(..., window=...) 续接，确属独立新事项再用 line__fork(..., window=...) 派生专注线；"
+    "仅一句话寒暄或无需开线的简单回应才直接开口回复（勿调 line__send 投给自己），不要在 line:main 原地跑多步重型排查。"
+)
+
+LINE_FOCUS_GOAL = (
+    "沿着当前专注线推进未闭环目标或回应来信：若对方追问已偏离本线 future 改聊无关新事，用 line__hand_back 退回 line:main；"
+    "想单独立/改未闭环目标而不折叠对话时调 line__future；当一段探索告一段落需压缩上下文时调 line__compact（不传 future 默认保留原目标，只有事项彻底办结才显式传 close=True 释放窗口）；"
+    "平时正常回复或行动后直接结束，没调 compact 绝不会丢 future。"
+)
+
+
+def done_lines(rows) -> list[str]:
+    """What the program saw her do in these rows, one line per call, closing handoffs excluded."""
+    lines = []
+    for row in rows:
+        if row.get("kind") != "assistant":
+            continue
+        msgs = row.get("messages") or []
+        if not msgs or not isinstance(msgs[0], dict):
+            continue
+        for call in msgs[0].get("tool_calls") or []:
+            if call.get("function", {}).get("name") != "handoff":
+                lines.append(f"{_screen.clock(row['time'])[11:16]} {_call_line(call)}")
+    return lines
+
+
 def handoff_scope(window: tuple) -> str:
     """The note holding one window's handoff; ``:`` in a window label is not allowed in a note name."""
     return "handoff:" + _windows.label(window).replace(":", "-")
@@ -521,7 +571,35 @@ def _usable_tools(names) -> list[str]:
 
 def closing(state: dict) -> str | None:
     """The closing request of an act when handoffs replace the construct run."""
-    if get_config().get("on", True) or not state.get("acting"):
+    config = get_config()
+    if config.get("on", True) or not state.get("acting"):
+        return None
+    if state.get("line"):
+        import mods.chat as chat
+
+        if state.get("compacted_in_run") or state.get("handed_back_window"):
+            return None
+        view = state["view"]
+        # §8.1: 硬水位（tidy_token）触发整线原地整理。
+        # WHY: 无工具调用的纯回复轮不经过 on_results/after_round，这里同时兜底检查 state["used"]，
+        # 避免超水位后只开口回话的轮次一直漏掉自动折叠；hand_back 交还轮不触发本线折叠。
+        over_limit = state.get("auto_compact_now") or state.get("used", 0) > chat.limit()[1]
+        if over_limit:
+            state["closing_mode"] = "hard"
+            own = [row for row in _segment._entries(view) if row["ctx"] == view["ctx"]]
+            return AUTO_COMPACT_PROMPT.format(done="\n".join(done_lines(own)) or "（没有调用工具）")
+        # WHY: 2026-11-19：按累计未收起的工作工具过程水位（PROCESS_FOLD_CHARS）趁热缓存询问局部收束，
+        # 既兜住“上轮重活还没完先跳过、下轮轻活才收尾”的场景，又不打扰纯闲聊和主线瞬时分诊委派。
+        if not state.get("delegated_windows") and state.get("line_name"):
+            proc = _line.pending_process(state["line_name"], view.get("items"))
+            if proc["acts"] >= 1 and proc["chars"] >= _line.PROCESS_FOLD_CHARS:
+                state["closing_mode"] = "process"
+                ctx_list = "、".join(proc["ctxs"][-4:]) or view.get("ctx", "")
+                return PROCESS_COMPACT_PROMPT.format(
+                    acts=proc["acts"],
+                    kb=f"{proc['chars'] / 1000:.1f}",
+                    ctxs=ctx_list,
+                )
         return None
     return HANDOFF_PROMPT
 
@@ -533,6 +611,8 @@ def _store_handoff(state: dict, targets, focus: str, note: str, refs: list[str],
     lines = [focus.strip(), "", note, "", *(f"@{ref}" for ref in refs),
              *([f"工具：{' '.join(tools)}"] if tools else []), f"运行：{state['view']['ctx']}"]
     text = "\n".join(lines).replace("\n\n\n", "\n\n").strip() + "\n"
+    state.setdefault("handoffs", []).append({"windows": [_windows.label(window) for window in targets],
+                                             "focus": focus.strip(), "note": note, "refs": refs, "tools": tools})
     for window in targets:
         # WHY: 每次运行都整份覆写，走 write_file 的 .history 备份会按次数堆文件；旧版本在运行记录里都查得到。
         path = _notes._path(handoff_scope(window))
@@ -557,8 +637,68 @@ def record_handoff(state: dict, window: str, focus: str, note: str = "", refs: s
         if not targets:
             return "这次运行没有负责的窗口；用 window 写给哪个窗口"
     ref_lines = list(dict.fromkeys(line.strip().lstrip("@ ") for line in str(refs).splitlines() if line.strip()))
-    _store_handoff(state, targets, focus, str(note), ref_lines,
-                   _usable_tools(value for value in re.split(r"[\s,，、]+", str(tools)) if value))
+    usable = _usable_tools(value for value in re.split(r"[\s,，、]+", str(tools)) if value)
+    _store_handoff(state, targets, focus, str(note), ref_lines, usable)
+    if state.get("line") and state.get("line_name"):
+        view = state.get("view")
+        current_line = _line.normalize_name(state["line_name"])
+        has_me = _windows.ME in targets
+        ext_target = next((t for t in targets if t != _windows.ME), None)
+        win_label = _windows.label(ext_target) if ext_target is not None else (_windows.label(targets[0]) if targets else "")
+        owner_line = _line.claimed_line_for_window(ext_target) if ext_target is not None else None
+        if state.get("closing_now"):
+            if isinstance(view, dict):
+                folded_before = _line.flush_before_compact(
+                    current_line, view, current_act=state.get("act"), opening=state.get("line_opening")
+                )
+                state.setdefault("compacted_ids", set()).update(folded_before)
+            apply_to_self = (current_line == _line.MAIN and has_me) or (
+                current_line != _line.MAIN and not has_me and owner_line in (None, current_line)
+            )
+            info = _line.compact(
+                current_line,
+                str(note).strip() or focus,
+                future=focus if apply_to_self else None,
+                close=False,
+                window=win_label if (current_line != _line.MAIN and apply_to_self) else "",
+                ctx=view.get("ctx", "") if isinstance(view, dict) else "",
+            )
+            state["compacted_in_run"] = True
+            if apply_to_self:
+                state["closed_in_run"] = bool(info.get("closed"))
+            if not apply_to_self and owner_line and owner_line != current_line:
+                _line.set_future(
+                    owner_line,
+                    focus,
+                    close=False,
+                    window=win_label,
+                    note=str(note).strip(),
+                    sync_handoff=False,
+                )
+        else:
+            # WHY: 2026-11-13 柚子指出线模式里 handoff 顺手 flush+compact 会把未聊完的 present 原文折掉；
+            # 普通轮次调 handoff 只轻量同步对应线的 future 与窗口认领，且主线写外部窗口交接绝不覆盖主线自身 future。
+            sync_line = ""
+            if has_me and ext_target is None:
+                sync_line = _line.MAIN
+            elif owner_line:
+                sync_line = owner_line
+            elif current_line != _line.MAIN and ext_target is not None:
+                acting_set = set(state.get("acting") or ())
+                cur_claimed = (_line.load(current_line) or {}).get("claimed_windows") or ()
+                if not acting_set or ext_target in acting_set or win_label in cur_claimed:
+                    sync_line = current_line
+            if sync_line:
+                info = _line.set_future(
+                    sync_line,
+                    focus,
+                    close=False,
+                    window=win_label if sync_line != _line.MAIN else "",
+                    note=str(note).strip(),
+                    sync_handoff=False,
+                )
+                if sync_line == current_line:
+                    state["closed_in_run"] = bool(info.get("closed"))
     if state.get("closing_now"):
         state["handed_off"] = True
         state["end"] = True  # 同一批并排的调用都会跑完，这批之后收尾结束
@@ -568,20 +708,69 @@ def record_handoff(state: dict, window: str, focus: str, note: str = "", refs: s
 
 def closing_done(state: dict) -> None:
     """A closing request that answered in words still leaves those words for next time."""
-    if state.get("handed_off"):
+    if state.get("line") and state.get("closing_start_idx") is not None:
+        view = state.get("view")
+        if isinstance(view, dict):
+            # WHY: 2026-11-19：线模式收尾询问属于元控制轮（无论模型选择局部收束还是跳过），
+            # 不把收尾提示词和跳过/工具回执追加进 line["present"]，保持业务上下文和前缀干净（原文仍留 journal）。
+            start_idx = int(state["closing_start_idx"])
+            meta_ids = [item for item in (view.get("items") or [])[start_idx:] if isinstance(item, str)]
+            if meta_ids:
+                state.setdefault("compacted_ids", set()).update(meta_ids)
+    if state.get("handed_off") or state.get("compacted_in_run"):
+        return
+    if state.get("line") and state.get("closing_mode") == "process":
+        # 软水位局部过程收束允许模型显式跳过；不强行折掉未完成的原文。
         return
     last = state.get("last") or {}
     text = str(last.get("content") or "").strip()
+    if state.get("line") and state.get("line_name"):
+        if text:
+            view = state.get("view")
+            if isinstance(view, dict):
+                folded_before = _line.flush_before_compact(
+                    state["line_name"],
+                    view,
+                    current_act=None,
+                    opening=state.get("line_opening"),
+                    stop_before_idx=state.get("closing_start_idx"),
+                )
+                compacted = state.setdefault("compacted_ids", set())
+                compacted.update(folded_before)
+                if state.get("act"):
+                    compacted.add(state["act"])
+            # WHY: 2026-11-13 柚子指出自动收尾没调 compact 时若原线无 future，仅折进 past 会丢未办完的事；
+            # 这里 close=False 绝不清空已有 future，若专注线原本尚无 future 则用首行保底立住 future。
+            cur_line = _line.load(state["line_name"])
+            fallback_future = None
+            if (cur_line is None or not cur_line.get("future")) and _line.normalize_name(state["line_name"]) != _line.MAIN:
+                first_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")[:120]
+                if first_line and not _line.is_placeholder_future(first_line):
+                    fallback_future = first_line
+            _line.compact(
+                state["line_name"],
+                text,
+                future=fallback_future,
+                close=False,
+                ctx=view.get("ctx", "") if isinstance(view, dict) else "",
+            )
+            state["compacted_in_run"] = True
+        return
     logging.getLogger(__name__).warning("行动收尾没有调用 handoff，%s", "存下它的话" if text else "这次没有交接")
     if text:
         _store_handoff(state, list(state["acting"]), "（上次没有写交接，这是它结束时说的话）", text, [], [])
 
 
-def handoff_spec(wake: dict) -> dict:
-    """One step without a construct run: the oldest waiting window, its last handoff, an index."""
+def _targets(wake: dict) -> list[tuple]:
     claims = wake["claims"]
     primary = next((tuple(job["window"]) for job in claims if tuple(job["window"]) != _windows.ME), _windows.ME)
-    targets = [primary] + ([_windows.ME] if primary != _windows.ME and _windows.ME in wake["associated_windows"] else [])
+    return [primary] + ([_windows.ME] if primary != _windows.ME and _windows.ME in wake["associated_windows"] else [])
+
+
+def handoff_spec(wake: dict) -> dict:
+    """One step without a construct run: the oldest waiting window, its last handoff, an index."""
+    targets = _targets(wake)
+    primary = targets[0]
     record = read_handoff(primary)
     text, board_refs = blackboard()
     refs = list(dict.fromkeys((["recent"] if text else []) + board_refs + list((record or {}).get("refs") or [])))
@@ -603,6 +792,149 @@ def handoff_spec(wake: dict) -> dict:
             "labels": ("【上次交接：当时在做的事】", "【上次交接：进展与未闭环】") if record else ("【这次醒来】", "【提醒】")}
 
 
+def _line_ephemeral_hint() -> str:
+    """Ephemeral request-tail hint for line runs (Axiom A2: never persisted into ``present``)."""
+    text, _refs = blackboard()
+    parts = ["【笔记目录（要用就 read_file，仅尾部瞬态展示）】\n" + directory(most=50)]
+    if text:
+        parts.append("【黑板 recent】\n" + text)
+    return "\n\n".join(parts)
+
+
+def _seed_line_from_handoff(line_name: str, primary_window: tuple) -> list[str]:
+    """Round-trip seed when switching ``#construct off -> #construct line`` so existing handoff notes carry over."""
+    canonical = _line.normalize_name(line_name)
+    seed_window = _windows.ME if canonical == _line.MAIN else primary_window
+    seed_record = read_handoff(seed_window) if (canonical == _line.MAIN or seed_window != _windows.ME) else None
+    if seed_record:
+        existing = _line.load(canonical)
+        if existing is None or (not existing["present"] and not existing["past"] and not existing["future"]):
+            raw_focus = str(seed_record.get("focus") or "").strip()
+            clean_focus = (
+                ""
+                if (_line.is_placeholder_future(raw_focus) or _line.is_closed_handoff_focus(raw_focus))
+                else raw_focus
+            )
+            seeded = _line.ensure(canonical, future=clean_focus)
+            if seed_record.get("note"):
+                _line.merge_past_bounded(seeded, [{
+                    "key": f"交接-{_windows.label(seed_window)}",
+                    "text": str(seed_record["note"]).strip(),
+                    "atoms": [],
+                    "water": 0,
+                    "peak_quote": "",
+                    "updated": time.time(),
+                }])
+                _line.ensure_past_atom(seeded)
+            if not seeded.get("future") and clean_focus:
+                seeded["future"] = clean_focus
+            _line.save(seeded)
+    tool_record = read_handoff(primary_window) if primary_window != _windows.ME else seed_record
+    return _usable_tools((tool_record or seed_record or {}).get("tools") or [])
+
+
+def build_line_specs(wake: dict) -> list[dict]:
+    """Dual-track inbound routing (`§6.2`): 1-hop hot path to focused lines vs batched cold triage on ``line:main``."""
+    claims = list(wake.get("claims") or [])
+    if not claims:
+        return [line_spec(wake)]
+
+    routed = []
+    for job in claims:
+        win = tuple(job["window"])
+        ev = job.get("event")
+        preview = str(job.get("reason") or "")[:120]
+        target_line, route_kind = _line.route_arrival(win, ev, preview=preview)
+        routed.append((job, target_line, route_kind))
+
+    hot = [(job, target_line, route_kind) for job, target_line, route_kind in routed if route_kind != "cold"]
+    if hot:
+        chosen_line = hot[0][1]
+        selected = [
+            (job, route_kind) for job, target_line, route_kind in routed
+            if target_line == chosen_line
+            or (chosen_line == _line.MAIN and tuple(job["window"]) == _windows.ME and not job.get("record_ids"))
+        ]
+    else:
+        chosen_line = _line.MAIN
+        selected = [(job, route_kind) for job, _target_line, route_kind in routed]
+
+    selected_ids = {job["id"] for job, _rk in selected}
+    deferred = [job for job in claims if job["id"] not in selected_ids]
+    if deferred:
+        wake["deferred"].extend(deferred)
+        wake["claims"] = [job for job in claims if job["id"] in selected_ids]
+
+    targets = list(dict.fromkeys(tuple(job["window"]) for job, _rk in selected)) or [_windows.ME]
+    external = [win for win in targets if win != _windows.ME]
+    primary = external[0] if external else targets[0]
+    extra_tools = _seed_line_from_handoff(chosen_line, primary)
+    triage_only = chosen_line == _line.MAIN and bool(external)
+    goal = (LINE_TRIAGE_GOAL if triage_only
+            else LINE_FOCUS_GOAL if chosen_line != _line.MAIN
+            else DEFAULT_ACT_GOAL)
+    return [{
+        "focus": "",
+        "items": [],
+        "note": "",
+        "windows": targets,
+        "history": 10,
+        "refs": [],
+        "ctx": "",
+        "fallback": "",
+        "tools": extra_tools,
+        "line": True,
+        "line_name": chosen_line,
+        "triage_only": triage_only,
+        "goal": goal,
+        "ephemeral_hint": _line_ephemeral_hint,
+    }]
+
+
+def line_spec(wake: dict, line_name: str = _line.MAIN) -> dict:
+    """Single-step spec for *line_name* without polluting ``items`` with volatile indexes."""
+    targets = _targets(wake)
+    external = [win for win in targets if win != _windows.ME]
+    primary = external[0] if external else targets[0]
+    extra_tools = _seed_line_from_handoff(line_name, primary)
+    triage_only = line_name == _line.MAIN and bool(external)
+    return {
+        "focus": "",
+        "items": [],
+        "note": "",
+        "windows": targets,
+        "history": 10,
+        "refs": [],
+        "ctx": "",
+        "fallback": "",
+        "tools": extra_tools,
+        "line": True,
+        "line_name": line_name,
+        "triage_only": triage_only,
+        "goal": LINE_TRIAGE_GOAL if triage_only else (LINE_FOCUS_GOAL if line_name != _line.MAIN else DEFAULT_ACT_GOAL),
+        "ephemeral_hint": _line_ephemeral_hint,
+    }
+
+
+def fold_text(view: dict, rows, state: dict) -> str:
+    """The fold row that replaces one act's process on the line: what was done, then what she wrote next."""
+    rows = list(rows)
+    times = [row["time"] for row in rows] or [view["started"]]
+    parts = [f"【折叠 {_screen.clock(min(times))[5:16]}–{_screen.clock(max(times))[11:16]}，"
+             f"原过程用 read_context(\"{view['ctx']}\") 读】",
+             "做过的（程序记录）：", *(done_lines(rows) or ["（没有调用工具）"])]
+    handoffs = state.get("handoffs") or []
+    for item in handoffs:
+        parts += ["", f"接下来（写给 {'、'.join(item['windows'])}）：{item['focus']}"]
+        if item["note"]:
+            parts.append(item["note"])
+        if item["refs"]:
+            parts.append("要看的：" + "、".join(item["refs"]))
+    if not handoffs:
+        parts += ["", "（这次没有写接下来的事" + ("，行动被打断了）" if state.get("cancelled") else "）")]
+    return "\n".join(parts)
+
+
 def _submitted(view: dict) -> list[str]:
     """The assemble calls a frozen construct run made, as readable lines."""
     import json
@@ -612,7 +944,10 @@ def _submitted(view: dict) -> list[str]:
         row = journal.get(item)
         if row["kind"] != "assistant":
             continue
-        for call in row["messages"][0].get("tool_calls") or []:
+        msgs = row.get("messages") or []
+        if not msgs or not isinstance(msgs[0], dict):
+            continue
+        for call in msgs[0].get("tool_calls") or []:
             function = call.get("function", {})
             if function.get("name") != "construct__assemble":
                 continue

@@ -49,7 +49,7 @@ from mods.tools import current_binding
 # 这个判断需要拿到调用方传的 back；属性版只把它交给绑定层，函数自己看不到。后台
 # exec_code 也不走 `_tasks` 的那条单队列：timeout=0 可能真的无限等，排进去会把后面的
 # 后台工具永远堵住，所以用独立线程。
-def exec_code(expr: str, code: str, timeout: float = 15, back: str = "wait") -> str:
+def exec_code(expr: str, code: str, timeout: float = 15, back: str = "wait", fg_timeout: float = 0) -> str:
     """现成工具不够用、需要直接跑 Python 或组合连续操作时，在 Bot 的共享环境里先跑 code 再算 expr，返回求值结果和捕获的 print 输出。
 
     可在代码里直接组合多个工具模块与操作（如用 PIL 裁切/放大图片后调用 attach_image 递给自己看，一步完成复合任务）。这不是沙箱，里面的变量跨调用一直留着，读写文件、发消息、改运行状态都会真生效（需要 Bot 有 op 权限）。
@@ -58,7 +58,8 @@ def exec_code(expr: str, code: str, timeout: float = 15, back: str = "wait") -> 
     expr: 最后求值并返回的表达式；只跑 code、不用返回值时传 "None"
     code: 先执行的 Python 代码，可写多行；不用时传空串
     timeout: 最多跑几秒，默认 15；传 0 不限时只允许配 back="wake" 或 "quiet" 放后台
-    back: wait 等跑完直接拿结果；wake 和 quiet 立刻回执，跑完把结果推到 me 窗口（quiet 不叫醒你）
+    back: wait 等跑完直接拿结果（持久线模式下超过 5 秒自动转后台并在完成时唤醒本线）；wake 和 quiet 立刻回执，跑完把结果推到 me 窗口（quiet 不叫醒你）
+    fg_timeout: 前台最多同步等待秒数（>0 时超过即自动转入后台运行；持久线模式下默认 5 秒）
     """
     from mods import context, op, py, watchdog
 
@@ -120,10 +121,26 @@ def exec_code(expr: str, code: str, timeout: float = 15, back: str = "wait") -> 
         printed = buffer.getvalue().rstrip()
         return f"[print输出]\n{printed}\n[结果] {result}" if printed else result
 
+    origin_line = ""
+    try:
+        run_state = current_binding().get("run") or {}
+        if run_state.get("line") and run_state.get("line_name"):
+            origin_line = str(run_state["line_name"])
+    except RuntimeError:
+        pass
+
     if back != "wait":
         from mods.tools import _tasks
 
-        return _tasks.submit("exec_code", contextvars.copy_context(), task, back, detached=True)
+        return _tasks.submit("exec_code", contextvars.copy_context(), task, back, detached=True, origin_line=origin_line)
+
+    from mods.tools import _tasks
+
+    eff_fg = float(fg_timeout) if fg_timeout and float(fg_timeout) > 0 else (
+        _tasks.LINE_FG_SECONDS if origin_line and float(timeout) > _tasks.LINE_FG_SECONDS else 0.0
+    )
+    if eff_fg > 0 and eff_fg < float(timeout):
+        return _tasks.run_with_fg_timeout("exec_code", task, eff_fg, origin_line=origin_line)
     return task()
 
 
@@ -652,10 +669,27 @@ def send(
         return f"未确认：{error}输入框已清空。" + unconfirmed
     except Exception as error:
         if sent:
+            try:
+                run_state = current_binding().get("run") or {}
+                if run_state.get("line_name"):
+                    from mods.chat import line as _line
+
+                    _line.record_outbound(run_state["line_name"], window, sent)
+            except Exception:
+                pass
             boxes.pop(label, None)
             return (f"发送失败（{type(error).__name__}）：{error}。"
                     f"前 {len(sent)} 条已经发出去了，剩下的没发，别再重发前面那些。")
         return f"发送失败（{type(error).__name__}）：{error}。这句话没有发出去。"
+    if sent:
+        try:
+            run_state = current_binding().get("run") or {}
+            if run_state.get("line_name"):
+                from mods.chat import line as _line
+
+                _line.record_outbound(run_state["line_name"], window, sent)
+        except Exception:
+            pass
     boxes.pop(label, None)
     # 让脑子知道实际发出去的是哪句，免得它以为自己说的是草稿。
     said_note = f"（换成你的口气发出：{content}）" if voiced else ""
@@ -698,13 +732,60 @@ def _confirm_file_write(path: str, start: int, count: int) -> str:
 
 def _finish_note_write(path: str, message: str) -> str:
     from pathlib import Path
-    from mods.chat import awaker, notes
+    from mods.chat import awaker, construct, line as _line, notes, windows
 
-    if notes.is_note_path(path) and Path(path).resolve() == (notes.ROOT / "awaker.md").resolve():
-        text = Path(path).read_text(encoding="utf-8") if Path(path).is_file() else ""
+    if not notes.is_note_path(path):
+        return message
+    resolved = Path(path).resolve()
+    if resolved == (notes.ROOT / "awaker.md").resolve():
+        text = resolved.read_text(encoding="utf-8") if resolved.is_file() else ""
         found, skipped = awaker.parse(text if text.strip() else awaker.DEFAULT)
         extra = [f"（awaker：{len(found)} 条规则生效）"] + [f"不认识：{line}" for line in skipped]
         return message + "\n" + "\n".join(extra)
+    if resolved.parent == (notes.ROOT / "handoff").resolve() and resolved.suffix.lower() == ".md":
+        try:
+            if construct.line_enabled() and resolved.is_file():
+                stem = resolved.stem
+                try:
+                    win_tuple = windows.parse(stem)
+                except ValueError:
+                    win_tuple = windows.parse(stem.replace("-", ":", 1))
+                win_label = windows.label(win_tuple)
+                rec = construct.read_handoff(win_tuple)
+                focus = str((rec or {}).get("focus") or "").strip()
+                if focus and not _line.is_placeholder_future(focus) and not _line.is_closed_handoff_focus(focus):
+                    target_line = ""
+                    try:
+                        run_state = current_binding().get("run") or {}
+                    except RuntimeError:
+                        run_state = {}
+                    active_line = _line.normalize_name(run_state["line_name"]) if run_state.get("line") and run_state.get("line_name") else ""
+                    if win_tuple == windows.ME:
+                        target_line = _line.MAIN
+                    else:
+                        owner = _line.claimed_line_for_window(win_tuple)
+                        if owner:
+                            target_line = owner
+                        else:
+                            for item in _line.list_lines():
+                                if item["name"] != _line.MAIN and win_label in (item.get("claimed_windows") or ()):
+                                    target_line = item["name"]
+                                    break
+                        if not target_line and active_line and active_line != _line.MAIN:
+                            acting_wins = {tuple(w) for w in (run_state.get("acting") or ())}
+                            if win_tuple in acting_wins:
+                                target_line = active_line
+                    if target_line:
+                        _line.set_future(
+                            target_line,
+                            focus,
+                            close=False,
+                            window=win_label if target_line != _line.MAIN else "",
+                            sync_handoff=False,
+                        )
+                        return f"{message}\n（已同步至 {target_line} 的 future：「{focus}」）"
+        except Exception:
+            pass
     return message
 
 

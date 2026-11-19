@@ -220,6 +220,7 @@ def _put(window, *, kind, reason="", record_ids=(), author=None, event=None) -> 
         if not identities:
             return False
     elif any(job["window"] == window and job["kind"] == kind and job["reason"] == reason
+             and (job.get("event") or {}).get("_target_line") == (event or {}).get("_target_line")
              and not job["record_ids"] for job in _jobs.values()):
         return False
     key = uuid4().hex
@@ -313,6 +314,29 @@ def release(claimed, *, notify=False) -> None:
             _signal()
         else:
             ready.set()
+
+
+def retarget(claimed, window, target_line: str, *, handed_back: bool = False) -> bool:
+    """Point claimed summons for *window* at *target_line* so releasing them wakes *target_line* next."""
+    target_window = tuple(window)
+    updated = False
+    with _lock:
+        for item in claimed:
+            if tuple(item["window"]) != target_window:
+                continue
+            job = _jobs.get(item["id"])
+            if job is None or job["claim"] != item["claim"]:
+                continue
+            ev = dict(job.get("event") or {})
+            ev["_target_line"] = str(target_line)
+            if handed_back:
+                ev["_handed_back"] = True
+            else:
+                ev.pop("_handed_back", None)
+            job["event"] = ev
+            item["event"] = deepcopy(ev)
+            updated = True
+    return updated
 
 
 def schedule(kind, due, *, window=None, reason="", **state) -> dict:

@@ -26,6 +26,7 @@ from mods import log
 
 
 MODES = ("wait", "wake", "quiet")
+LINE_FG_SECONDS = 5.0
 # 推进 me 窗口的结果最多留多少字：chatlog 会一直存着它。
 MAX_RESULT = 10_000
 
@@ -39,7 +40,7 @@ _lock = threading.Lock()
 _MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*\]\(([^)\s]+)\)")
 
 
-def submit(name: str, scope, run, mode: str, detached: bool = False) -> str:
+def submit(name: str, scope, run, mode: str, detached: bool = False, *, origin_line: str = "") -> str:
     """把 *run*（在 *scope* 这份上下文里跑）排进队列，返回给她看的回执。
 
     *detached* 为真时不排队，直接起一条独立线程；回执不报“前面还有几件”。
@@ -50,7 +51,7 @@ def submit(name: str, scope, run, mode: str, detached: bool = False) -> str:
     if detached:
         threading.Thread(
             target=_run,
-            args=(number, name, scope, run, mode, at),
+            args=(number, name, scope, run, mode, at, origin_line),
             daemon=True,
             name=f"tool-task-{number}",
         ).start()
@@ -58,33 +59,70 @@ def submit(name: str, scope, run, mode: str, detached: bool = False) -> str:
     else:
         with _lock:
             ahead = _pending.qsize() + (_running is not None)
-            _pending.put((number, name, scope, run, mode, at))
+            _pending.put((number, name, scope, run, mode, at, origin_line))
             if _worker is None or not _worker.is_alive():
                 _worker = threading.Thread(target=_work, daemon=True, name="tool-tasks")
                 _worker.start()
         queued = f"前面还有 {ahead} 件，" if ahead else ""
     back = "推到 me 窗口叫醒你" if mode == "wake" else "记进 me 窗口，不叫你，下次醒来看得到"
-    return f"任务 #{number} {name} 收下了（{at}）：在后台{queued}做完了{back}"
+    prefix = f"[已转入后台运行 task_id=#{number}；完成后会自动唤醒本线]\n" if mode == "wake" else ""
+    return f"{prefix}任务 #{number} {name} 收下了（{at}）：在后台{queued}做完了{back}"
+
+
+def run_with_fg_timeout(name: str, task_fn, fg_wait: float, *, origin_line: str = "") -> str:
+    """前台最多等待 *fg_wait* 秒；超时未完不杀任务，自动转入后台并在完成时唤醒源线。"""
+    done = threading.Event()
+    box: dict = {}
+    began = time.time()
+    at = time.strftime("%H:%M:%S")
+    detached_flag = False
+    state_lock = threading.Lock()
+    number_holder: list[int] = []
+
+    def worker() -> None:
+        try:
+            res, ok = str(task_fn()), True
+        except Exception as error:
+            res, ok = f"{type(error).__name__}: {error}", False
+        with state_lock:
+            box["result"] = res
+            box["ok"] = ok
+            was_detached = detached_flag
+            num = number_holder[0] if number_holder else 0
+        done.set()
+        if was_detached:
+            _deliver(num, name, res, ok, at, time.time() - began, "wake", origin_line=origin_line)
+
+    threading.Thread(target=worker, daemon=True, name=f"fg-task-{name}").start()
+    if done.wait(max(0.0, float(fg_wait))):
+        return box["result"]
+
+    with state_lock:
+        if "result" in box:
+            return box["result"]
+        num = next(_numbers)
+        number_holder.append(num)
+        detached_flag = True
+    return (
+        f"[已转入后台运行 task_id=#{num}；完成后会自动唤醒本线]\n"
+        f"任务 #{num} {name} 前台等待 {fg_wait:g}s 未跑完（{at}），已转入后台继续运行。"
+    )
 
 
 def _work() -> None:
     global _running
     while True:
-        number, name, scope, run, mode, at = _pending.get()
+        number, name, scope, run, mode, at, origin_line = _pending.get()
         _running = number
         try:
-            _run(number, name, scope, run, mode, at)
+            _run(number, name, scope, run, mode, at, origin_line)
         finally:
             _running = None
 
 
-def _run(number: int, name: str, scope, run, mode: str, at: str) -> None:
-    began = time.time()
-    try:
-        result, done = str(scope.run(run)), True
-    except Exception as error:
-        result, done = f"{type(error).__name__}: {error}", False
-    seconds = round(time.time() - began, 1)
+def _deliver(number: int, name: str, result: str, done: bool, at: str, elapsed: float, mode: str,
+             *, origin_line: str = "") -> None:
+    seconds = round(elapsed, 1)
     if len(result) > MAX_RESULT:
         result = result[:MAX_RESULT] + f"\n……（后面还有 {len(result) - MAX_RESULT} 字没放进来）"
     state = "做完了" if done else "出错了"
@@ -92,9 +130,25 @@ def _run(number: int, name: str, scope, run, mode: str, at: str) -> None:
     try:
         from mods import chat
 
-        chat.push(chat.windows.ME, "任务", text, wake=f"任务 #{number} {name} {state}" if mode == "wake" else "")
+        wake = f"任务 #{number} {name} {state}" if mode == "wake" else ""
+        if origin_line:
+            from mods.chat import line as _line
+
+            _line.send("system:task", origin_line, text, wake=(mode == "wake"))
+            chat.push(chat.windows.ME, "任务", text, wake="")
+        else:
+            chat.push(chat.windows.ME, "任务", text, wake=wake)
     except Exception:
         _stream.exception("后台任务 #%s %s 的结果没能推进 me 窗口", number, name)
+
+
+def _run(number: int, name: str, scope, run, mode: str, at: str, origin_line: str = "") -> None:
+    began = time.time()
+    try:
+        result, done = str(scope.run(run)), True
+    except Exception as error:
+        result, done = f"{type(error).__name__}: {error}", False
+    _deliver(number, name, result, done, at, time.time() - began, mode, origin_line=origin_line)
 
 
 def _pictures(text: str) -> str:

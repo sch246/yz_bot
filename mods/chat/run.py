@@ -209,13 +209,17 @@ def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
                         writable(dispatch=True)
                         if binding is not None:
                             tool_modules.reconcile(binding)
-                            previous = segment.own_tool_state(view) if own_view else segment.derive(view)["tool_state"]
+                            # WHY: 主线上的行动借来的是线自己的工具宣告，接着它只追加变化；
+                            # 按本次自己的宣告算会每次再发一份完整的，线越走越长（2026-11-10）。
+                            previous = (segment.own_tool_state(view) if own_view and not state.get("line")
+                                        else segment.derive(view)["tool_state"])
                             snapshot = tool_modules.state_snapshot(binding)
                             if snapshot != previous:
                                 text = tool_modules.state_text(binding, previous)
                                 added = append({"kind": "system", "messages": [{"role": "system", "content": text}],
                                                 "tool_state": snapshot})
-                                if previous is None and own_view:
+                                if previous is None and own_view and not (
+                                        state.get("line") and state.get("line_prefix_len", 0) > 0):
                                     # WHY: 2026-11-01 切到无状态后缓存命中从 96% 掉到 80%：这份约 8k token
                                     # 的完整工具宣告跨运行不变，却排在本次的材料和目的之后，每次运行都
                                     # 重新计费。只在第一次请求前挪到最前，之后的请求仍是追加。
@@ -275,7 +279,10 @@ def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
                         if state.get("batch_error") is None:
                             state["log"]["acts"] += len(calls)
                         if state.pop("reported", None) is not None:
-                            view["stats"]["tokens"] = [state["last_usage"], len(segment.render(view))]
+                            rendered_now = segment.render(view)
+                            view["stats"]["tokens"] = [state["last_usage"], len(rendered_now)]
+                            state["used"] = segment.context_size(view["stats"].get("tokens"), rendered_now)
+                            state["log"]["peak"] = max(state["log"].get("peak", 0), state["used"])
                         if on_output is not None and state.get("batch_error") is None:
                             on_output(state)
                         if persist:
@@ -381,6 +388,7 @@ def run(items, goal, *, tools=(), model=None, kind="fork", view=None,
                         # WHY: 同一份工具和前缀再问一次，缓存能接上。DeepSeek 开思考时不接受强制
                         # tool_choice（2026-11-09 实测 400），只能 auto，没调用的由 closed 兜底。
                         # 收尾失败不算这次行动失败：要做的事已经做完了。
+                        state["closing_start_idx"] = len(view["items"])
                         append({"kind": "input", "messages": [{"role": "user", "content": prompt}]})
                         state["end"], state["closing_now"] = False, True
                         try:

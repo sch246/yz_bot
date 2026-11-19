@@ -31,8 +31,9 @@ def run_command(
     timeout: float = 15,
     back: str = "wait",
     max_bytes: int = MAX_OUTPUT_BYTES,
+    fg_timeout: float = 0,
 ) -> str:
-    """在宿主机上执行一条 shell 命令；默认等 15 秒，没跑完转后台。需要管理员权限。
+    """在宿主机上执行一条 shell 命令；默认等 15 秒（持久线模式下前台最多等 5 秒），没跑完转后台并自动唤醒本线。需要管理员权限。
 
     @param
     command: 交给 shell 的完整命令，可以用管道、重定向和通配符
@@ -40,6 +41,7 @@ def run_command(
     timeout: 等多少秒，默认 15；到点没跑完就转后台，不杀它；0 表示立刻转后台
     back: 结果怎么回来：wait 先等 timeout；wake 立刻转后台、跑完推进 me 窗口叫醒你；quiet 转后台但不叫醒
     max_bytes: 返回里最多保留多少字节的已有输出，默认 8192；后台输出文件本身不受此限
+    fg_timeout: 前台等待秒数上限（>0 时覆盖默认等待阈值；持久线模式下默认 5 秒自动转后台）
     """
     if not op.bot_is_op():
         return "权限不足"
@@ -47,8 +49,22 @@ def run_command(
     if not os.path.isdir(workdir):
         return f"工作目录不存在: {workdir}"
     from mods import shell
+    from mods.tools import current_binding
 
-    return shell.run(command, workdir, timeout=timeout, back=back, max_bytes=max_bytes)
+    origin_line = ""
+    try:
+        run_state = current_binding().get("run") or {}
+        if run_state.get("line") and run_state.get("line_name"):
+            origin_line = str(run_state["line_name"])
+    except RuntimeError:
+        pass
+    if fg_timeout and float(fg_timeout) > 0:
+        eff_timeout = float(fg_timeout)
+    elif origin_line and back == "wait" and float(timeout) > shell.LINE_WAIT_SECONDS:
+        eff_timeout = shell.LINE_WAIT_SECONDS
+    else:
+        eff_timeout = timeout
+    return shell.run(command, workdir, timeout=eff_timeout, back=back, max_bytes=max_bytes, origin_line=origin_line)
 
 
 def stop_command(task: str) -> str:

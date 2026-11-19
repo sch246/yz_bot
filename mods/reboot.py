@@ -48,9 +48,8 @@ def resume_chat(event: dict) -> None:
     WHY: 只在"这次重启是 Bot 自己发起的"时候续。人自己重启是想让新代码生效，不该被带上
     一轮聊天；agent 重启是为了接着做没做完的事，断在那里就是把线索丢了。
 
-    WHY: 续话不伪造入站消息——``context.set_current(event)`` + ``chat.chat()`` 正是路由
-    处理一条真消息时做的事，所以续话期间插话、``^C``、``#hint`` 的行为都和正常聊天一致。
-    缺的只是一条本来就不存在的消息（op-toolbox 提案的决定二）。
+    WHY: 续话不伪造入站消息——``chat.resume(event)`` 按原窗口向中心 attention 入队一条
+    无 record_ids 的 reboot 召唤，不依赖已跨进程失效的 ``context.event_arrival``。
 
     WHY: 等 boot 结束再开。on_load 期间排在后面的模块还没加载完，这时候进聊天循环是在
     半成品上跑。
@@ -65,13 +64,10 @@ def resume_chat(event: dict) -> None:
         if chat is None:
             _logger.warning("chat 未加载，无法续话")
             return
-        context.set_current(event)
         try:
-            chat.chat()
+            chat.resume(event)
         except Exception:
             _logger.exception("重启后续话失败")
-        finally:
-            context.clear_current()
 
     threading.Thread(target=worker, name="reboot-resume", daemon=True).start()
 
