@@ -25,7 +25,7 @@
 你说话就像真人发消息一样，直接调用 `send(target, text="你想说的话", wait=...)` 即可一步发出。直接写在模型回复正文里的文字全是你心里的自言自语（外面的人看不见），调用 `send` 才是真正让别人听见你说话的方式。每次发送都要写清窗口名字，比如 `target="g<群号>"`、`target="u<私聊QQ号>"` 或 `bili:<BV号>`（`me` 是写给自己看的窗口）。
 
 - **分段与真人节奏**：QQ 里在正文用空行隔开的几段话，`send` 时会像真人聊天一样，隔一两秒一条、拆成几个气泡依次发出去，并返回消息号（`message_id`）。B 站评论整段发成一条评论，空行就是评论里的分段。CLI 窗口（`dsh:main`、`agy:review`、`codex:code`）把完整输入作为一轮任务，立即返回接收编号，回答稍后回到同一窗口并叫醒你；命令行窗口 `term:名字` 是你自己的长期终端（tmux），整段原样敲进去并回车，输出攒成一批批消息回来，详见工具模块 `term`。
-- **wait 控制后续与自主呼吸**：`send` 的 `wait` 参数决定发完这句之后你是继续活动还是挂着喘气：
+- **wait 控制后续与自主呼吸**：`send` 的 `wait` 参数决定发完这句之后你是继续活动还是挂着喘气（不传时：单独发话默认 `-1` 收工，同批还调了其它工具则默认 `0` 继续）：
   - `wait=0`：不等回复，发完直接跑下一轮，手里还有别的事情接着做；
   - `wait=-1`：发完收工，纯被动等待（相当于原 `final_call=true`），没有超时闹钟；
   - `wait="20m"`（或 `"5m"`、`300` 等）：在当前窗口挂一个超时等待规则（由 awaker 统一调度）。等待期间如果对方（或群里）有人接话，新消息会自动认领并叫醒你；如果超时一直没人回复，awaker 会到点叫醒你，带着你设的 `reason`（例如"不来我就接着读日记"）让你自主接着活动。群聊里还可以传 `who=QQ号` 指定只等某个人接话。等待期间叫醒你的消息要是不用接（比如别人插了一句），那条 wait 在叫醒你时已经用掉了；还想接着等，就调 `wake_me("wait g123:QQ号 10m", 理由)` 重新挂上。
@@ -238,6 +238,17 @@ def search(keyword: str, window: str = "", days: int = 30) -> str:
     """
     from mods import chat
 
+    term = str(keyword or "").strip()
+    if term and not term.isdigit():
+        try:
+            run_state = current_binding().get("run") or {}
+        except RuntimeError:
+            run_state = {}
+        recall = run_state.get("recall") if isinstance(run_state, dict) else None
+        if isinstance(recall, dict):
+            searched = recall.setdefault("searched", [])
+            if term not in searched:
+                searched.append(term)
     return chat.roles.search(keyword, window, days)
 
 
@@ -511,10 +522,20 @@ def _split_turns(text: str) -> list[str]:
     return blocks
 
 
+def _batch_has_other_tools() -> bool:
+    try:
+        run_state = current_binding().get("run") or {}
+    except RuntimeError:
+        return False
+    last = run_state.get("last") if isinstance(run_state, dict) else None
+    calls = last.get("tool_calls") if isinstance(last, dict) else None
+    return any((call.get("function") or {}).get("name") != "send" for call in calls or ())
+
+
 def send(
     target: str,
     text: str = "",
-    wait: int | float | str = -1,
+    wait: int | float | str | None = None,
     reason: str = "",
     who: int | str | None = None,
     force: bool = False,
@@ -527,7 +548,7 @@ def send(
     @param
     target: 要发送的窗口（如 g<群号>、u<私聊号>、bili:<BV号>、me）
     text: 想对这个窗口说的话，支持 CQ 码（at、回复、图片、表情）；直接一步发出。传空串时会发送该窗口输入框草稿
-    wait: 发完后怎么安排后续。传 0 表示不等、发完继续这一轮干手头的活；传 -1 表示结束这轮、纯被动等待；传等待时长（如 "5m"、"20m"、"1h" 或秒数 300）表示在当前窗口挂一个超时等待闹钟，期间有人回复立刻叫醒，到点超时还没人回也会自动叫醒你继续呼吸；若传字符串时带有 force（如 "10m force"）或设置 force=True，开启强制等待闸门（期间绝不打扰，到期汇总提醒叫醒你）
+    wait: 发完后怎么安排后续。留空时，单独发话默认结束这轮（同 -1），同批还调了其它工具则继续这一轮（同 0）。传 0 表示不等、发完继续这一轮干手头的活；传 -1 表示结束这轮、纯被动等待；传等待时长（如 "5m"、"20m"、"1h" 或秒数 300）表示在当前窗口挂一个超时等待闹钟，期间有人回复立刻叫醒，到点超时还没人回也会自动叫醒你继续呼吸；若传字符串时带有 force（如 "10m force"）或设置 force=True，开启强制等待闸门（期间绝不打扰，到期汇总提醒叫醒你）
     reason: 挂超时等待（wait > 0）时写给到时候自己的理由，如"不来我就接着读日记"、"等草籽接话"；留空默认"等回复"
     who: 在群聊窗口中指定只等特定人回复（填 QQ 号，如 123456；传 "any" 等群里任何人）。若不填：在有人跟你说话的轮次里自动默认等刚才跟你说话的人，避免路人插话吞掉等待；在你自己醒来的轮次（闹钟、订阅等无对话人轮次）不填则等待群里任何人回复。命令行窗口（term:名字）里填一段文字，等输出里出现它才算等到（同一批输出里出现才算）
     force: 是否开启强制等待闸门（上限 1 天）。传 True 期间绝不叫醒你，消息正常登记未读，等时间到了将所有积压提醒按窗口归类合并后一次性叫醒你
@@ -567,6 +588,12 @@ def send(
 
     if context.agent_mode():
         current_binding()["run"]["associated_windows"].add(window)
+
+    if wait is None:
+        # WHY: 2026-11-26 现场两次「send("我看看") + host__run_command」漏写 wait，默认 -1 直接结束了这一轮，
+        # 命令结果落进日志她却看不到。未显式传 wait 且同批还有其它工具时默认继续这一轮，让她看完结果再定；
+        # 单独发话（或同批只有 send）仍默认 -1 结束，显式传 wait=-1 照常生效。
+        wait = 0 if _batch_has_other_tools() else -1
 
     wait_mode = "passive"  # "continue" (0), "passive" (-1), "wait" (>0)
     wait_seconds = 0
