@@ -189,6 +189,34 @@ def get(item_id: str) -> dict:
     raise KeyError(item_id)
 
 
+def reader():
+    """A ``get`` for one read-only pass over many rows: rows are shared with the cache, never mutate them.
+
+    WHY: 2026-11-26 search 一次要取几十万行，get 每行都加锁、stat、JSON 克隆，60 天一次搜索卡几分钟，
+    还让写线程在锁上反复排队。这里每个分片只在第一次用到时持锁 _read 一遍（照常修复末尾半行），
+    之后锁外直接查那份索引：_read 发现文件变了会换一份新的 (signature, rows, index)，从不原地改旧的，
+    所以拿到的就是那一刻的快照，之后追加的行这一趟看不到。不克隆，所以调用者只能读。
+    """
+    tables = {}
+
+    def get(item_id: str) -> dict:
+        match = _ID.fullmatch(str(item_id))
+        if match is None:
+            raise ValueError(f"invalid journal id: {item_id}")
+        table = tables.get(match[1])
+        if table is None:
+            with _reading():
+                path = ROOT / (match[1] + ".jsonl")
+                _read(path)
+                cached = _cache.get(path)
+            table = tables[match[1]] = cached[2] if cached is not None else {}
+        if item_id in table:
+            return table[item_id]
+        raise KeyError(item_id)
+
+    return get
+
+
 def _append(kind, *, ctx, messages=(), item_id=None, timestamp=None, **metadata):
     messages = list(messages)
     if not isinstance(ctx, str) or not ctx or not isinstance(kind, str) or not kind:

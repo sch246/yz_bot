@@ -271,14 +271,16 @@ def search(keyword: str, window: str = "", days: int = _SEARCH_DAYS) -> str:
             more = f"，列前 {_NOTE_HITS} 份" if len(found) > _NOTE_HITS else ""
             sections.append(f"## {title}（{len(found)} 份{more}；用 read_file 读全文）\n" + "\n".join(found[:_NOTE_HITS]))
 
-    found, total, archived_ids = [], 0, set()
+    found, total, archived_ids, row_of = [], 0, set(), _journal.reader()
     # 一次只解析一段：只留要列出来的摘要，其余只计数。
     for name, data in _segment.each_archived(oldest, newest_first=True):
         if data["stats"].get("line"):
             # WHY: 主线上每次行动都借着整条线，不去掉借来的行，线里一句话会在之后每次行动里各命中一次。
-            data = {**data, "items": [item for item in data["items"] if _journal.get(item)["ctx"] == data["ctx"]]}
-        archived_ids.update(_segment.source_ids(data, expand_folds=True))
-        count, shown = _matching(_archive_lines(_segment.raw_messages(data, expand_folds=True)), needle, 2)
+            data = {**data, "items": [item for item in data["items"] if row_of(item)["ctx"] == data["ctx"]]}
+        # 即 source_ids + raw_messages(expand_folds=True)，合成一次免得每行取两遍；行与缓存共享，只读。
+        rows = _segment._entries(data, deep=True, get=row_of)
+        archived_ids.update(row["id"] for row in rows)
+        count, shown = _matching(_archive_lines([message for row in rows for message in row["messages"]]), needle, 2)
         if count:
             total += 1
             if len(found) < _SEGMENT_HITS:

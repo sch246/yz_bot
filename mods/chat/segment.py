@@ -72,7 +72,7 @@ def fresh(*, ctx=None, started=None) -> dict:
             "started": stamp, "items": [], "stats": {}}
 
 
-def _validate(view):
+def _validate(view, *, refs=True):
     if not isinstance(view, dict) or set(view) != {"ctx", "started", "items", "stats"}:
         raise ValueError("view must contain ctx, started, items, stats only")
     if not isinstance(view["ctx"], str) or not re.fullmatch(r"[0-9A-Za-z_-]+", view["ctx"]):
@@ -81,7 +81,8 @@ def _validate(view):
         raise ValueError("invalid view items/stats")
     if len(set(view["items"])) != len(view["items"]):
         raise ValueError("duplicate view references")
-    _entries(view, deep=True)
+    if refs:
+        _entries(view, deep=True)
 
 
 def _atomic(path, value):
@@ -136,13 +137,15 @@ def load():
             return restored
 
 
-def _entries(view, *, deep=False):
+def _entries(view, *, deep=False, get=None):
+    get = get or journal.get
+
     def visit(ids, trail):
         found = []
         for item_id in ids:
             if item_id in trail:
                 raise ValueError("cyclic fold references")
-            row = journal.get(item_id)
+            row = get(item_id)
             if deep and row["kind"] == "fold":
                 found.extend(visit(row["covers"], trail | {item_id}))
             else:
@@ -355,7 +358,7 @@ def request_outline(view, messages, schemas, *, head_count, source_refs, attachm
         row = journal.get(item_id)
         source = {"ref": item_id, "ctx": row["ctx"], "kind": row["kind"],
                   **size(projected)}
-        for key in ("scope", "version", "name", "window", "before", "count", "note_sources"):
+        for key in ("scope", "version", "name", "brief", "window", "before", "count", "note_sources"):
             if key in row:
                 source[key] = copy.deepcopy(row[key])
         refs.append(source)
@@ -575,15 +578,15 @@ def derive(view):
     return info
 
 
-def resolve_refs(view, refs, *, brief=False):
+def resolve_refs(view, refs, *, brief: bool | str = False):
     """Resolve newline refs: #wake, n.m, journal id, ctx name, note scope/name,
     ``policy:<name>`` and ``log:<window>[@<before>][*<count>]``.
 
     Invisible folded addresses resolve to the visible containing fold. Exact
     journal ids always mean the original row; a note not present uses its file.
     Unknown refs fail with the failing line rather than silently disappearing.
-    *brief* shortens long whole notes read from file (``notes.render``); only the
-    construct's material for an act asks for it.
+    *brief* shortens long whole notes read from file (``notes.render``):
+    ``True`` for construct's brief, ``"dated"`` for settle's dated-section projection.
 
     WHY: 2026-11-01 维护者的视角是“只有原子，线把原子串起来”：所有种类的原子（日志条目、
     视图、笔记、策略、聊天记录）用同一套写法放上线，黑板、assemble、fork 共用这一处。
@@ -626,7 +629,7 @@ def resolve_refs(view, refs, *, brief=False):
     return result
 
 
-def _note_refs(view, scope, brief=False):
+def _note_refs(view, scope, brief: bool | str = False):
     from . import construct, notes
 
     try:
@@ -636,7 +639,7 @@ def _note_refs(view, scope, brief=False):
     if not text:
         return None
     construct.opened(scope)
-    return _text_ref(view, scope, text)
+    return _text_ref(view, scope, text, brief=brief)
 
 
 def _policy_ref(view, name):
@@ -671,7 +674,7 @@ def _log_ref(view, value):
                                       + (f"，{moment} 之前" if moment else "") + f"，{count} 条】\n{text}"}])]
 
 
-def _text_ref(view, scope, text):
+def _text_ref(view, scope, text, *, brief: bool | str = False):
     version = hashlib.md5(text.encode("utf-8")).hexdigest()
     # Reuse an identical already-recorded source version instead of copying a
     # note each time a fork names it. Referencing alone does not change the view.
@@ -681,7 +684,12 @@ def _text_ref(view, scope, text):
     for row in reversed(journal.events(kind="note", after=time.time() - 7 * 86400)):
         if row.get("scope") == scope and row.get("version") == version:
             return [row["id"]]
-    return [journal.append("note", ctx=view["ctx"], scope=scope, name=scope, version=version,
+    # Compat: archived views/journal rows may omit ``brief`` or store boolean True/False;
+    # new projected rows record ``True`` or ``"dated"`` when shortened.
+    metadata = {"scope": scope, "name": scope, "version": version}
+    if brief:
+        metadata["brief"] = brief
+    return [journal.append("note", ctx=view["ctx"], **metadata,
                            messages=[{"role": "system", "content": text}])]
 
 
@@ -774,7 +782,10 @@ def each_archived(since=0, newest_first=False):
         if since and path.stat().st_mtime < since:
             continue
         view = json.loads(path.read_text(encoding="utf-8"))
-        _validate(view)
+        # WHY: 2026-11-26 search 一次要扫几千份冻结视图，逐份解析全部引用（主线视图带整条线、fold 再展开）
+        # 占了 days=60 那次 4 分钟里的大头。冻结时 _validate 已解析过，journal 只追加，这里只查形状；
+        # 真要读行的调用者自己 journal.get，坏引用照样在那里报错。
+        _validate(view, refs=False)
         if view["stats"].get("ended", 0) > since:
             views.append((path.stem, view))
     yield from sorted(views, key=lambda pair: pair[1]["stats"].get("ended", 0), reverse=newest_first)
