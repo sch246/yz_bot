@@ -609,6 +609,38 @@ def list_active_lines(*, now: float | None = None, ttl: float = CLAIM_TTL_SECS) 
     return active
 
 
+def stale_submerged_futures(days: float = 30, *, now: float | None = None) -> list[dict]:
+    """Read-only list of submerged non-``main`` lines with non-empty ``future`` idle for at least *days* days."""
+    ts = time.time() if now is None else float(now)
+    min_age = max(0.0, float(days)) * 86400.0
+    stale: list[dict] = []
+    for item in list_lines():
+        if item["name"] == MAIN:
+            continue
+        future_text = str(item.get("future") or "").strip()
+        if not future_text:
+            continue
+        prune_expired_claims(item, now=ts, persist=False)
+        if item.get("claimed_windows"):
+            continue
+        stats = item.get("stats") or {}
+        updated_ts = _parse_claim_ts(stats.get("updated_at"), fallback=float(stats.get("updated") or 0.0))
+        if updated_ts <= 0:
+            continue
+        age = ts - updated_ts
+        if age <= BOARD_IDLE_TTL_SECS or age < min_age:
+            continue
+        stale.append({
+            "name": item["name"],
+            "updated": updated_ts,
+            "updated_date": time.strftime("%Y-%m-%d", time.localtime(updated_ts)),
+            "days": int(age // 86400),
+            "future": future_text,
+        })
+    stale.sort(key=lambda entry: entry["updated"])
+    return stale
+
+
 def claimed_line_for_window(
     window: tuple | str,
     *,
@@ -2026,6 +2058,14 @@ def tail_hint(line_name: str, query_text: str = "", *, consume_follow_ups: bool 
 
     recalled = recall_lines(query_text, exclude=[canonical], most=6, now=now)
     if recalled:
+        from .run import current_run
+
+        run = current_run()
+        recall = run.get("recall") if isinstance(run, dict) else None
+        if isinstance(recall, dict):
+            recall.setdefault("exposed_lines", set()).update(
+                r["name"] for r in recalled if r.get("name")
+            )
         rec_lines = []
         for r in recalled:
             detail = f"目标={r['future']}" if r["future"] else "（休眠）"

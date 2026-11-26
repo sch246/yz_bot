@@ -225,6 +225,37 @@ def _screens(windows, count) -> str:
     return "\n\n".join(parts)
 
 
+def init_recall(wake: dict, query: str, mentioned=(), *, windows=None, now: float | None = None) -> dict:
+    """Initialize ``wake['recall']`` and log the corresponding ``wake`` recall event."""
+    ts = time.time() if now is None else float(now)
+    breadcrumbs = list(dict.fromkeys(mentioned))
+    try:
+        close = _notes.similar(query, exclude=breadcrumbs) if query.strip() else []
+    except (OSError, ValueError):
+        logging.getLogger(__name__).exception("similar notes failed")
+        close = []
+    win_list = wake["associated_windows"] if windows is None else windows
+    recall = {
+        "t": round(ts, 3),
+        "mentioned": set(breadcrumbs),
+        "similar": close,
+        "query": query[-_notes._SIMILAR_CHUNK:],
+        "seen": set(),
+        "searched": [],
+        "exposed_lines": set(),
+        "seen_lines": set(),
+    }
+    wake["recall"] = recall
+    usage.log_recall({
+        "t": round(ts, 3),
+        "event": "wake",
+        "windows": sorted(_windows.label(tuple(window)) for window in win_list),
+        "breadcrumbs": breadcrumbs,
+        "similar": close,
+    })
+    return recall
+
+
 def material(wake: dict) -> list[dict]:
     """The construct run's input: policy, folded blackboard, indexes, and this wake."""
     import mods.chat as chat
@@ -242,16 +273,7 @@ def material(wake: dict) -> list[dict]:
     mentioned = [scope for scope, _word in _notes.mentioned(screens)]
     crumbs = ("\n\n画面提到了这些有笔记的东西：" + "、".join(dict.fromkeys(mentioned))) if mentioned else ""
     query = reasons + "\n\n" + screens
-    try:
-        close = _notes.similar(query, exclude=mentioned)
-    except (OSError, ValueError):
-        logging.getLogger(__name__).exception("similar notes failed")
-        close = []
-    wake["recall"] = {"t": round(now, 3), "mentioned": set(mentioned), "similar": close,
-                      "query": query[-_notes._SIMILAR_CHUNK:], "seen": set()}
-    usage.log_recall({"t": round(now, 3), "event": "wake",
-                      "windows": sorted(_windows.label(tuple(window)) for window in wake["associated_windows"]),
-                      "breadcrumbs": list(dict.fromkeys(mentioned)), "similar": close})
+    close = init_recall(wake, query, mentioned, now=now)["similar"]
     # 接在本次消息末尾：这一条每次唤醒都不同，挂在这里不动前面的缓存前缀。
     if close and SHOW_SIMILAR:
         crumbs += ("\n\n和这些消息用词相近的笔记（程序按字面重合排的，不一定相关；要用就写进 refs）："
@@ -305,11 +327,18 @@ def _opened(scope: str) -> None:
            "similar_rank": ranks.index(scope) + 1 if scope in ranks else None}
     if not row["breadcrumb"] and not scope.startswith("diary:"):
         row["terms"] = _notes.shared_terms(recall["query"], scope)
+        searched = [
+            str(word).strip()
+            for word in (recall.get("searched") or ())
+            if str(word).strip() and not str(word).strip().isdigit()
+        ]
+        if searched:
+            row["searched"] = list(dict.fromkeys(searched))
     usage.log_recall(row)
 
 
 def missed_since(since: float, most: int = 15) -> str:
-    """For the night: notes she opened that the breadcrumbs had not pointed at, with the shared words.
+    """For the night: notes she opened that the breadcrumbs had not pointed at, with searched/shared words.
 
     WHY: 2026-11-07 维护者：能保证“需要时一定被想起”的只有自己声明了触发词的笔记——面包屑
     每次都把所有名字和 `别名：` 逐个比一遍，所以可信，只是词写得少。词靠用来长：她翻开了一份
@@ -319,13 +348,15 @@ def missed_since(since: float, most: int = 15) -> str:
     from collections import Counter
 
     listed = {item["scope"] for item in _notes.listing(limit=10**6)}
-    counts, words, where = Counter(), {}, {}
+    counts, words, searched_words, where = Counter(), {}, {}, {}
     for row in usage.read_recall(since):
         scope = row.get("scope")
-        if row.get("event") != "open" or row.get("breadcrumb") or scope not in listed:
+        if (row.get("event") != "open" or row.get("kind") == "line"
+                or row.get("breadcrumb") or scope not in listed):
             continue
         counts[scope] += 1
         words.setdefault(scope, Counter()).update(row.get("terms") or [])
+        searched_words.setdefault(scope, Counter()).update(row.get("searched") or [])
         if row.get("ctx"):
             where.setdefault(scope, []).append(row["ctx"])
     if not counts:
@@ -336,15 +367,20 @@ def missed_since(since: float, most: int = 15) -> str:
         if where.get(scope):
             line += "，最近在 " + "、".join(list(dict.fromkeys(reversed(where[scope])))[:2])
         line += "）"
-        if words[scope]:
-            line += "：" + "、".join(word for word, _n in words[scope].most_common(5))
+        hints = []
+        if searched_words.get(scope):
+            hints.append("当时搜过：" + "、".join(word for word, _n in searched_words[scope].most_common(5)))
+        if words.get(scope):
+            hints.append("共有词：" + "、".join(word for word, _n in words[scope].most_common(5)))
+        if hints:
+            line += "：" + "；".join(hints)
         lines.append(line)
     if len(counts) > most:
         lines.append(f"（还有 {len(counts) - most} 份没列出）")
     return ("上次反思以来，这些笔记你翻开过，但当时画面里的词没有点到它们（面包屑只认笔记名和 `别名：` 行）。"
             "觉得以后该被自动点到的，可以在那份笔记里加一行 `别名：词1、词2`；一个词要是平时到处都会出现，"
-            "加上反而会乱点，就别加。括号里是最近翻开它的运行（read_context 能看当时的情形）；冒号后面是"
-            "当时消息里和这份笔记共有、别处少见的词，可能是名字，也可能只是笔记里引用的原话，只是参考：\n" + "\n".join(lines))
+            "加上反而会乱点，就别加。括号里是最近翻开它的运行（read_context 能看当时的情形）；冒号后面优先列出"
+            "当时打开前你自己 search 过的词（第一参考），以及消息里和这份笔记共有、别处少见的词，只是参考：\n" + "\n".join(lines))
 
 
 def _waited(seconds: float) -> str:
@@ -403,11 +439,11 @@ def build(wake: dict, model: str | None = None) -> list[dict]:
 
     claimed = list(wake["associated_windows"])
     config = get_config()
+    wake["recall"] = None
     if not config.get("on", True):
         if line_enabled(config):
             return build_line_specs(wake)
         return [handoff_spec(wake)]
-    wake["recall"] = None
     state = {"associated_windows": set(claimed), "specs": [], "cancelled": False}
     effort = chat.normalize_reasoning_effort(config.get("effort", "none"))
     labels = sorted(_windows.label(window) for window in claimed)

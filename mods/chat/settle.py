@@ -15,6 +15,9 @@ WHY: 2026-11-01 维护者同意的无状态设计（docs/working/proposals/one-p
 
 from __future__ import annotations
 
+# WHY?: lines-and-memory.md 第 3 步（沉淀合流进线）暂缓实施；当前保留独立 settle 作为笔记唯一写入者，
+# 待观测新版日期小节投影后的稳定度再决定是否并线。
+
 import threading
 import time
 
@@ -198,7 +201,7 @@ def _people(rows: list[dict]) -> list[str]:
     found = []
     for qq in _screen.extract_qqs([row["text"] for row in rows]):
         scope = f"person:{qq}"
-        if qq != bot and scope not in found and _notes.render(scope):
+        if qq != bot and scope not in found and _notes.render(scope, brief="dated"):
             found.append(scope)
         if len(found) >= PEOPLE_MAX:
             break
@@ -230,7 +233,7 @@ def settle(label: str, *, model: str | None = None, stop=None) -> bool:
     items = []
     for scope in dict.fromkeys(scopes):
         try:
-            items.extend(one for one in _segment.resolve_refs(lookup, [scope]) if one not in items)
+            items.extend(one for one in _segment.resolve_refs(lookup, [scope], brief="dated") if one not in items)
         except (ValueError, KeyError):
             pass  # an empty or missing note simply is not shown
     episode = _screen.render(window, rows) if rows else "（这段时间这里没有新的聊天记录）"

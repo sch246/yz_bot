@@ -266,7 +266,19 @@ def drafts() -> str:
     return ("输入框里还没发的字：\n" + "\n".join(boxes)) if boxes else ""
 
 
-def _prepare(wake, view, windows, lead_in=_ACT_LEAD_IN):
+def _update_wake_recall(wake, query: str, hits: list[str]) -> None:
+    if not wake.get("recall"):
+        claim_reasons = "\n".join(str(job.get("reason") or "") for job in wake.get("claims") or () if job.get("reason"))
+        recall_query = (claim_reasons + "\n\n" + query).strip() if query else claim_reasons
+        _construct.init_recall(wake, recall_query, hits)
+        return
+    wake["recall"]["mentioned"].update(hits)
+    if query and query not in (wake["recall"].get("query") or ""):
+        prev = wake["recall"].get("query") or ""
+        wake["recall"]["query"] = ((prev + "\n" + query) if prev else query)[-_notes._SIMILAR_CHUNK:]
+
+
+def _prepare(wake, view, windows, lead_in=_ACT_LEAD_IN, *, init_recall: bool = True):
     attention.flush(windows)
     late = attention.claim()
     # WHY: reflection is control work dispatched after this wake, not a screen
@@ -301,7 +313,9 @@ def _prepare(wake, view, windows, lead_in=_ACT_LEAD_IN):
         wake["last_screen_query"] = screens
     present = set(info["notes"])
     hits = [scope for scope, _word in _notes.mentioned(screens) if scope not in present]
-    if wake.get("recall"):
+    if init_recall:
+        _update_wake_recall(wake, screens, hits)
+    elif wake.get("recall"):
         wake["recall"]["mentioned"].update(hits)
     wake["breadcrumbs"] = "画面提到的这些你有笔记，用 read_file 召回：" + "、".join(dict.fromkeys(hits)) if hits else ""
     return material
@@ -310,11 +324,13 @@ def _prepare(wake, view, windows, lead_in=_ACT_LEAD_IN):
 def _prepare_triage(wake, view, windows, lead_in=_ACT_LEAD_IN):
     """Default 3 (`§10`): ``line:main`` gets a compact arrival header; full ``screen.py`` slice waits for target line."""
     material = []
-    if _windows.ME in windows:
-        material.extend(_prepare(wake, view, {_windows.ME}, lead_in))
     external = sorted((w for w in windows if w != _windows.ME), key=_windows.label)
+    if _windows.ME in windows:
+        material.extend(_prepare(wake, view, {_windows.ME}, lead_in, init_recall=not external))
     if not external:
         return material
+    me_query = wake.get("last_screen_query", "")
+    me_hits = [scope for scope, _word in _notes.mentioned(me_query)] if me_query else []
     attention.flush(external)
     late = attention.claim()
     attention.release([job for job in late if job["kind"] == "reflect"])
@@ -358,13 +374,17 @@ def _prepare_triage(wake, view, windows, lead_in=_ACT_LEAD_IN):
         )
     if cards:
         joined_snippets = "\n".join(snippets)
-        wake["last_screen_query"] = joined_snippets
-        hits = [scope for scope, _word in _notes.mentioned(joined_snippets)]
+        combined_query = f"{me_query}\n\n{joined_snippets}".strip() if me_query else joined_snippets
+        wake["last_screen_query"] = combined_query
+        hits = [scope for scope, _word in _notes.mentioned(combined_query)]
         wake["breadcrumbs"] = "画面提到的这些你有笔记，用 read_file 召回：" + "、".join(dict.fromkeys(hits)) if hits else ""
+        _update_wake_recall(wake, combined_query, hits)
         material.append({
             "kind": "input",
             "messages": [{"role": "user", "content": "\n\n".join(cards)}],
         })
+    else:
+        _update_wake_recall(wake, me_query, me_hits)
     return material
 
 
@@ -612,6 +632,17 @@ pick_up_pending = notify
 # proposals 而不记成自己的缺陷。
 _REFLECT_PROMPT_PATH = Path("data") / "prompts" / "reflect.md"
 _REFLECT_DEFAULT = Path(__file__).with_name("reflect.md")
+_REFLECT_POLICY_HINTS = {
+    True: "那次构造运行准备了什么、行动里又召回了什么。该补笔记补笔记，该调 `data/notes/policy/construct.md` 或 `data/notes/policy/settle.md` 就用 `write_file` 调一两处",
+    False: "当时画面和笔记里缺了什么、行动里又召回了什么。该补笔记（或补 `别名：`）补笔记，该调 `data/notes/policy/settle.md` 就用 `write_file` 调一两处",
+}
+
+
+class _ReflectFunctions:
+    """Expose only ``line__future`` from the ``line`` module during nightly reflection."""
+
+    def __contains__(self, name: object) -> bool:
+        return isinstance(name, str) and (not name.startswith("line__") or name == "line__future")
 
 
 def _reflect_prompt(**values) -> str:
@@ -625,6 +656,7 @@ def _reflect_prompt(**values) -> str:
     她自己会改这个文件，写个 JSON 例子就会冒出成单的花括号，str.format 会因此报错、整晚的
     反思跟着没了；这时退回只替换认得的那几个名字。
     """
+    values.setdefault("policy_eval_hint", _REFLECT_POLICY_HINTS[True])
     try:
         text = _REFLECT_PROMPT_PATH.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -675,8 +707,18 @@ def _reflect(wake, model=None, settle=True):
     runs = [(name, view) for name, view in _segment.each_archived(since)
             if view["stats"].get("kind") in ("main", "construct", "settle")]
     if runs or not settle:
+        construct_on = bool(_construct.get_config().get("on", True))
         counts = {kind: sum(view["stats"].get("kind") == kind for _name, view in runs) for kind in ("main", "construct", "settle")}
         settled = [f"{name}  {view['stats'].get('reason', '')}" for name, view in runs if view["stats"].get("kind") == "settle"]
+        if construct_on:
+            run_summary = f"上次反思以来：行动 {counts['main']} 次，构造 {counts['construct']} 次，沉淀 {counts['settle']} 次。\n"
+            policy_tail = (
+                "\n每次行动之前的构造运行也能用 read_context 按 ctx 读：它准备了什么、后来行动里又召回了什么，"
+                "可以看出构造漏带了哪类材料。构造的说明在 data/notes/policy/construct.md，沉淀的附加说明在 data/notes/policy/settle.md，都用 write_file 改。"
+            )
+        else:
+            run_summary = f"上次反思以来：行动 {counts['main']} 次，沉淀 {counts['settle']} 次。\n"
+            policy_tail = "\n沉淀的附加说明在 data/notes/policy/settle.md，用 write_file 改。"
         # WHY: 2026-11-19：Gemini 的 OpenAI 兼容接口会把全部 system 消息抽进 systemInstruction，
         # 若整条反思请求全是 system（没有 user 消息），会报 400 contents is not specified 并中断当晚 roll
         #（2026-11-18 凌晨实测连续失败两次）。与 settle.py 一样把本次待整理的动态汇总作为 user 消息给出，
@@ -684,19 +726,32 @@ def _reflect(wake, model=None, settle=True):
         items = [{"role": "system", "content": "以下是你的笔记：\n" + "\n\n".join(_notes.render(scope) for scope in ("global", "recent"))},
                  {"role": "system", "content": "策略改动 changes（data/notes/policy/changes.md）：\n" + _tail(_notes.read_policy("changes"), 40)
                   + "\n给维护者的 proposals（data/notes/policy/proposals.md）：\n" + _tail(_notes.read_policy("proposals"), 20)},
-                 {"role": "user", "content": f"上次反思以来：行动 {counts['main']} 次，构造 {counts['construct']} 次，沉淀 {counts['settle']} 次。\n"
-                  "每段经历的沉淀（read_context 读原样，里面有那段聊天原文和你在那里的每次行动）：\n"
+                 {"role": "user", "content": run_summary
+                  + "每段经历的沉淀（read_context 读原样，里面有那段聊天原文和你在那里的每次行动）：\n"
                   + ("\n".join(settled[-60:]) or "（没有）")
-                  + "\n每次行动之前的构造运行也能用 read_context 按 ctx 读：它准备了什么、后来行动里又召回了什么，"
-                  "可以看出构造漏带了哪类材料。构造的说明在 data/notes/policy/construct.md，沉淀的附加说明在 data/notes/policy/settle.md，都用 write_file 改。"}]
+                  + policy_tail}]
         missed = _construct.missed_since(since)
         if missed:
             items.append({"role": "system", "content": missed})
+        stale_lines = _line.stale_submerged_futures(days=30)
+        if stale_lines:
+            stale_text = "\n".join(
+                f"- {item['name']}（最后更新 {item['updated_date']}）："
+                + str(item.get("future") or "").strip().replace("\n", " ")[:80]
+                for item in stale_lines
+            )
+            items.append({
+                "role": "system",
+                "content": "沉水超过 30 天且 `future` 非空的记忆线（仅列事实；如需调整或办结某条，可用 `line__future(name=...)`）：\n"
+                           + stale_text,
+            })
         state = {"associated_windows": wake["associated_windows"]}
         def after(current):
             current["end"] = current["used"] - current["initial"] > _chat_root.limit()[1]
-        run(items, _reflect_prompt(now=_screen.clock(), years_rows=len(_notes.years(9999))),
-            tools=("meta", "memory_system"), model=model, kind="reflect", state=state,
+        reflect_tools = ("meta", "memory_system", "line") if stale_lines else ("meta", "memory_system")
+        run(items, _reflect_prompt(now=_screen.clock(), years_rows=len(_notes.years(9999)),
+                                   policy_eval_hint=_REFLECT_POLICY_HINTS[construct_on]),
+            tools=reflect_tools, functions=_ReflectFunctions(), model=model, kind="reflect", state=state,
             stop=lambda: wake["cancelled"], after_round=after)
     if not wake["cancelled"]:
         data["reflected_at"] = wake["log"]["start"]

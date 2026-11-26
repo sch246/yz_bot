@@ -8,7 +8,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
+import time
 
 from mods.tools import current_binding
 
@@ -22,6 +24,36 @@ def _active_line_and_state() -> tuple[str, dict]:
 
     name = str(state.get("line_name") or _line.MAIN)
     return _line.normalize_name(name), state
+
+
+def _record_line_open(state: dict, target_line: str, tool_name: str) -> None:
+    """Log the first active touch of *target_line* within one wake into ``usage/recall``."""
+    try:
+        recall = state.get("recall") if isinstance(state, dict) else None
+        if not isinstance(recall, dict):
+            return
+        from mods import usage
+        from mods.chat import line as _line
+
+        canonical = _line.normalize_name(target_line)
+        seen_lines = recall.setdefault("seen_lines", set())
+        if canonical in seen_lines:
+            return
+        seen_lines.add(canonical)
+        view = state.get("view") or {}
+        usage.log_recall({
+            "t": round(time.time(), 3),
+            "event": "open",
+            "kind": "line",
+            "wake": recall.get("t"),
+            "ctx": view.get("ctx"),
+            "line": canonical,
+            "tool": tool_name,
+            "exposed": canonical in (recall.get("exposed_lines") or ()),
+        })
+    except Exception:
+        # 只是记账：切线与查看不能因为它失败。
+        logging.getLogger(__name__).exception("line use not recorded")
 
 
 def _default_window_label(state: dict, explicit: str) -> str:
@@ -90,6 +122,7 @@ def fork(
         reuse=reuse,
         wake=not retargeted,
     )
+    _record_line_open(state, child_id, "fork")
     if win_label and parent_name == _line.MAIN:
         _mark_delegated(state, win_label, child_id)
         if not state.get("keep_running"):
@@ -118,6 +151,7 @@ def send(
     win_label = _default_window_label(state, window) if (sender_name == _line.MAIN and target_key != _line.MAIN) else str(window or "").strip()
     retargeted = bool(win_label and sender_name == _line.MAIN and target_key != _line.MAIN and _has_unacked_claim(state, win_label))
     atom_id = _line.send(sender_name, target_key, content, window=win_label, wake=wake and not retargeted)
+    _record_line_open(state, target_key, "send")
     if win_label and sender_name == _line.MAIN and target_key != _line.MAIN:
         _mark_delegated(state, win_label, target_key)
         if not state.get("keep_running"):
@@ -164,10 +198,16 @@ def future(
     """
     from mods.chat import line as _line
 
+    explicit_name = str(name or "").strip()
     active_name, state = _active_line_and_state()
-    target_name = _line.normalize_name(name) if str(name or "").strip() else active_name
+    has_bound_line = bool(state.get("line") and str(state.get("line_name") or "").strip())
+    if not explicit_name and not has_bound_line:
+        return "当前运行未绑定活跃记忆线，不能省略 name（请显式传入非空 name，如 name=\"line:xxx\"）"
+    target_name = _line.normalize_name(explicit_name) if explicit_name else active_name
     if not close and not str(future or "").strip():
         cur = _line.load(target_name)
+        if cur is not None and (explicit_name or target_name != active_name):
+            _record_line_open(state, target_name, "future")
         cur_future = str((cur or {}).get("future") or "")
         wins = "、".join((cur or {}).get("claimed_windows") or []) or "无"
         if cur_future:
@@ -179,7 +219,7 @@ def future(
 
     win_label = (
         str(window or "").strip()
-        if (target_name != active_name or target_name == _line.MAIN)
+        if (not has_bound_line or target_name != active_name or target_name == _line.MAIN)
         else _default_window_label(state, window)
     )
     info = _line.set_future(
@@ -189,7 +229,9 @@ def future(
         window=win_label,
         notify_source=notify_source,
     )
-    if target_name == active_name:
+    if explicit_name or target_name != active_name:
+        _record_line_open(state, target_name, "future")
+    if has_bound_line and target_name == active_name:
         state["closed_in_run"] = bool(info["closed"])
     guard_note = (
         "（未传 close=True，已安全保留原 future 不清空；若确已办结请传 close=True）"
@@ -327,6 +369,10 @@ def inspect(name: str) -> str:
     """
     from mods.chat import line as _line
 
+    canonical = _line.normalize_name(name)
+    if _line.load(canonical) is not None:
+        _active, state = _active_line_and_state()
+        _record_line_open(state, canonical, "inspect")
     return _line.inspect(name)
 
 
@@ -339,7 +385,12 @@ def probe(name: str, question: str) -> str:
     """
     from mods.chat import line as _line
 
-    return _line.probe(name, question)
+    result = _line.probe(name, question)
+    canonical = _line.normalize_name(name)
+    if _line.load(canonical) is not None:
+        _active, state = _active_line_and_state()
+        _record_line_open(state, canonical, "probe")
+    return result
 
 
 __all__ = ["fork", "send", "future", "hand_back", "compact", "inspect", "probe"]

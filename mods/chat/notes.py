@@ -124,6 +124,75 @@ def years(last: int = 8) -> list[str]:
 BRIEF_LIMIT = 8000
 BRIEF_HEAD = 4000
 BRIEF_TAIL = 4000
+DATED_TAIL_MAX_SECTIONS = 5
+DATED_TAIL_MAX_CHARS = 8000
+DATED_HEAD_MAX_CHARS = 16000
+
+_H2 = re.compile(r"^##\s+")
+_EXPERIENCE_H2 = re.compile(r"^##\s+经历\b")
+_KNOWN_H2 = re.compile(r"^##\s+认识\b")
+_DATED_H2 = re.compile(r"^##\s+.*20\d{2}[-/.年]\d{1,2}[-/.月]\d{1,2}")
+
+
+def _dated_brief(scope: str, raw: str, body: str, *, max_head_chars: int | None = None) -> str:
+    """Project a long note that grows by dated ``##`` sections after ``## 经历`` (or ``## 认识``).
+
+    Keeps everything before the first dated section intact, lists line ranges and headings
+    of omitted earlier sections, and appends up to the newest DATED_TAIL_MAX_SECTIONS
+    sections within DATED_TAIL_MAX_CHARS. Returns empty when no dated sections exist or
+    none need omitting (so callers fall back to full text or ``_brief``).
+    """
+    lines = raw.splitlines()
+    anchor_idx = next((i for i, line in enumerate(lines) if _EXPERIENCE_H2.match(line)), None)
+    if anchor_idx is None:
+        anchor_idx = next((i for i, line in enumerate(lines) if _KNOWN_H2.match(line)), None)
+    if anchor_idx is None:
+        return ""
+    first_dated_idx = next(
+        (i for i in range(anchor_idx + 1, len(lines)) if _DATED_H2.match(lines[i])),
+        None,
+    )
+    if first_dated_idx is None:
+        return ""
+    head_text = "\n".join(lines[:first_dated_idx]).strip()
+    if max_head_chars is not None and len(head_text) > max_head_chars:
+        return ""
+    starts = [i for i in range(first_dated_idx, len(lines)) if _H2.match(lines[i])]
+    sections = []
+    for idx, s_start in enumerate(starts):
+        s_end = starts[idx + 1] if idx + 1 < len(starts) else len(lines)
+        sections.append((s_start, s_end, "\n".join(lines[s_start:s_end]).strip()))
+    kept_count = 0
+    used_chars = 0
+    for _s_start, _s_end, sec_text in reversed(sections):
+        added = len(sec_text) + (1 if kept_count else 0)
+        if kept_count >= DATED_TAIL_MAX_SECTIONS or (kept_count > 0 and used_chars + added > DATED_TAIL_MAX_CHARS):
+            break
+        kept_count += 1
+        used_chars += added
+    omitted_count = len(sections) - kept_count
+    if omitted_count <= 0:
+        return ""
+    omitted = sections[:omitted_count]
+    head_end = first_dated_idx
+    tail_start = sections[omitted_count][0]
+    outline = [f"{s_start + 1}–{s_end}: {lines[s_start].strip()}" for s_start, s_end, _sec in omitted]
+    middle = (
+        f"（已省略较早的 {omitted_count} 节，第 {head_end + 1}–{tail_start} 行；"
+        f"要看中间哪段，用 read_file 读 {scope}@L起行-末行，其中的小标题：\n"
+        + "\n".join(outline)
+        + "\n）"
+    )
+    name = custom_name(scope)
+    prefix = f"维护者设定的称呼：{name}\n" if name else ""
+    return (
+        f"## 笔记 {scope}（{_path(scope).as_posix()}，共 {len(lines)} 行、{len(body)} 字；只载入"
+        f"第 1–{head_end} 行和最近 {kept_count} 节（第 {tail_start + 1}–{len(lines)} 行）。要看中间哪段，用 read_file 读 "
+        f"{scope}@L起行-末行）\n{prefix}"
+        + head_text
+        + f"\n{middle}\n"
+        + "\n".join(lines[tail_start:]).strip()
+    )
 
 
 def _brief(scope: str, raw: str, body: str) -> str:
@@ -135,6 +204,13 @@ def _brief(scope: str, raw: str, body: str) -> str:
     从这里开始拆（docs/working/proposals/river-banks-and-voice.md 6.5）：开头通常是概括，
     结尾是最近的经历，中间列出小标题和行号，要哪段用 read_file 的行号写法再读。
     只截构造交给行动的材料；沉淀、反思和 fork 要对照全文改笔记，照旧给全文。
+
+    WHY: 2026-11-22 发现某份长期人物笔记达 9.6 万字（含 60+ 个日期小节），沉淀时整份喂入
+    使单次首轮即超十万 token 并打断前缀缓存。因此新增 ``brief="dated"``（``_dated_brief``）：
+    只在 ``## 经历``（或 ``## 认识``）之后存在带日期的二级标题时按节投影，保留头部原样、
+    被省略各节的行号目录及最近 5 节（上限 8000 字）；普通笔记、``todo``、``diary:``、``recent``
+    无此结构时在 ``dated`` 模式下仍给全文。``brief=True`` 头部不过大（<= 16000 字）时也优先走
+    ``_dated_brief`` 以免把 ``## 经历`` 截进省略号。
     """
     lines = raw.splitlines()
     head_end, used = 0, 0
@@ -160,10 +236,12 @@ def _brief(scope: str, raw: str, body: str) -> str:
             + "\n".join(lines[tail_start:]).strip())
 
 
-def render(scope: str, brief: bool = False) -> str:
+def render(scope: str, brief: bool | str = False) -> str:
     """One note as the model sees it, or empty when there is nothing to show.
 
-    *brief* shortens a whole note longer than BRIEF_LIMIT characters (see ``_brief``).
+    *brief* shortens long notes: ``True`` caps at BRIEF_LIMIT via ``_dated_brief``
+    (when head fits) or ``_brief``; ``"dated"`` applies ``_dated_brief`` only when
+    dated sections exist after ``## 经历``/``## 认识``, leaving other notes whole.
 
     WHY: 2026-10-26 维护者：每一段上下文开头都写明它来自哪个文件，她一眼就能看到改哪里。
     """
@@ -179,8 +257,12 @@ def render(scope: str, brief: bool = False) -> str:
         return f"## 笔记 {scope}（{_path(name).as_posix()}，第 {first}–{last} 行／共 {len(lines)} 行；其余未载入）\n{body}"
     raw = read(scope)
     body = raw.strip()
-    if brief and len(body) > BRIEF_LIMIT:
-        shortened = _brief(scope, raw, body)
+    if brief == "dated":
+        shortened = _dated_brief(scope, raw, body)
+        if shortened:
+            return shortened
+    elif brief and len(body) > BRIEF_LIMIT:
+        shortened = _dated_brief(scope, raw, body, max_head_chars=DATED_HEAD_MAX_CHARS) or _brief(scope, raw, body)
         if shortened:
             return shortened
     name = custom_name(scope)

@@ -178,4 +178,235 @@ def read(days: int = 7) -> list:
     return rows
 
 
-__all__ = ["log_call", "purge", "read", "KEEP_DAYS"]
+def _iter_jsonl_rows(directory: str, since: float | None = None) -> list[dict]:
+    """Read jsonl dict rows under *directory* without creating missing directories."""
+    if not os.path.isdir(directory):
+        return []
+    rows = []
+    first_day = _day(since - 86400) if since is not None else None
+    try:
+        names = sorted(name for name in os.listdir(directory) if name.endswith(".jsonl"))
+    except OSError:
+        return rows
+    for name in names:
+        if first_day is not None and name[:10] < first_day:
+            continue
+        try:
+            with open(os.path.join(directory, name), encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(row, dict):
+                        continue
+                    if since is not None and float(row.get("t") or 0) < since:
+                        continue
+                    rows.append(row)
+        except OSError:
+            continue
+    return rows
+
+
+def _latest_write(directory: str) -> tuple[str | None, float | None]:
+    """Return (YYYY-MM-DD, latest_timestamp) for the newest jsonl file in *directory*."""
+    if not os.path.isdir(directory):
+        return None, None
+    try:
+        names = sorted(
+            name for name in os.listdir(directory)
+            if name.endswith(".jsonl") and len(name) == 16
+        )
+    except OSError:
+        return None, None
+    for name in reversed(names):
+        path = os.path.join(directory, name)
+        latest_t: float | None = None
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(row, dict) and row.get("t") is not None:
+                        try:
+                            val = float(row["t"])
+                        except (TypeError, ValueError):
+                            continue
+                        if latest_t is None or val > latest_t:
+                            latest_t = val
+            if latest_t is None:
+                latest_t = os.path.getmtime(path)
+            return name[:10], latest_t
+        except OSError:
+            continue
+    return None, None
+
+
+def _is_error_row(row: dict) -> tuple[bool, bool]:
+    """Return (is_error, is_400) for explicit error metadata in a request log row."""
+    status = row.get("status_code") if row.get("status_code") is not None else row.get("status")
+    try:
+        status_int = int(status) if status is not None else 0
+    except (TypeError, ValueError):
+        status_int = 0
+    err = row.get("error") or row.get("failure")
+    is_err = bool(err) or status_int >= 400
+    is_400 = status_int == 400 or ("400" in str(err or ""))
+    return is_err, is_400
+
+
+def signals(days: int = 7) -> str:
+    """只读扫描近 *days* 天 ``data/usage/``（含 ``requests/`` 与 ``recall/``），输出四类工程信号。
+
+    仅统计次数、token/字数极值、缓存率与轮数等客观指标，不读取也不输出任何聊天正文或身份标识。
+    """
+    from collections import Counter, defaultdict
+
+    days = max(1, int(days))
+    now = time.time()
+    cutoff = now - days * 86400
+    requests_dir = os.path.join(_root, "requests")
+    recall_dir = os.path.join(_root, "recall")
+
+    # 1. 沉默/断更的数据流 & 各运行 kind 每日调用数
+    stream_lines = []
+    for label, directory in (("usage(主账本)", _root), ("usage/requests", requests_dir), ("usage/recall", recall_dir)):
+        last_day, last_ts = _latest_write(directory)
+        if last_day is None or last_ts is None:
+            stream_lines.append(f"  - {label}: 无写入记录")
+        else:
+            idle_days = max(0.0, (now - last_ts) / 86400)
+            stream_lines.append(f"  - {label}: 最近写入 {last_day}（距今 {idle_days:.1f} 天无新写入）")
+
+    req_rows = _iter_jsonl_rows(requests_dir, since=cutoff)
+    dispatches: dict[tuple[str, int], dict] = {}
+    usages: dict[tuple[str, int], dict] = {}
+    ctx_dispatches: dict[str, list[dict]] = defaultdict(list)
+    daily_kind: dict[str, Counter] = defaultdict(Counter)
+    explicit_errors = 0
+    explicit_400 = 0
+
+    for row in req_rows:
+        is_err, is_400 = _is_error_row(row)
+        if is_err:
+            explicit_errors += 1
+        if is_400:
+            explicit_400 += 1
+        ctx = str(row.get("ctx") or "")
+        n_raw = row.get("n")
+        try:
+            n = int(n_raw) if n_raw is not None else 0
+        except (TypeError, ValueError):
+            n = 0
+        if "messages" in row or ("kind" in row and "usage" not in row):
+            kind = str(row.get("kind") or "unknown")
+            day = _day(float(row.get("t") or now))
+            daily_kind[day][kind] += 1
+            if ctx:
+                dispatches[(ctx, n)] = row
+                ctx_dispatches[ctx].append(row)
+        elif "usage" in row and ctx:
+            usages[(ctx, n)] = row
+
+    daily_lines = []
+    for day in sorted(daily_kind):
+        parts = ", ".join(f"{k}={c}" for k, c in sorted(daily_kind[day].items()))
+        daily_lines.append(f"  - {day}: {parts}")
+    if not daily_lines:
+        daily_lines.append("  - （近期内无 requests 派发记录）")
+
+    # 2. 首轮大请求（同一 ctx 首次派发 prompt tokens 或字符数 >= 100_000）
+    big_threshold = 100_000
+    big_by_kind: Counter = Counter()
+    big_count = 0
+    max_first_prompt = 0
+    max_first_prompt_kind = ""
+    max_first_chars = 0
+    max_first_chars_kind = ""
+
+    for ctx, rows in ctx_dispatches.items():
+        first_row = min(rows, key=lambda r: int(r.get("n") or 0))
+        try:
+            first_n = int(first_row.get("n") or 0)
+        except (TypeError, ValueError):
+            first_n = 0
+        if first_n != 1:
+            continue
+        kind = str(first_row.get("kind") or "unknown")
+        chars = sum(
+            int(m[3]) for m in (first_row.get("messages") or [])
+            if isinstance(m, (list, tuple)) and len(m) >= 4 and m[3] is not None
+        )
+        u_row = usages.get((ctx, first_n))
+        u_data = (u_row.get("usage") or {}) if u_row else {}
+        prompt_tokens = int(u_data.get("prompt_tokens") or 0)
+        if prompt_tokens >= big_threshold or chars >= big_threshold:
+            big_count += 1
+            big_by_kind[kind] += 1
+            if prompt_tokens > max_first_prompt:
+                max_first_prompt = prompt_tokens
+                max_first_prompt_kind = kind
+            if chars > max_first_chars:
+                max_first_chars = chars
+                max_first_chars_kind = kind
+
+    big_kind_text = "，".join(f"{k}={c}" for k, c in big_by_kind.most_common()) if big_by_kind else "无"
+    big_summary = (
+        f"共 {big_count} 次（按 kind：{big_kind_text}）；"
+        f"最大 prompt_tokens={max_first_prompt:,}" + (f"（{max_first_prompt_kind}）" if max_first_prompt_kind else "")
+        + f"，最大 chars={max_first_chars:,}" + (f"（{max_first_chars_kind}）" if max_first_chars_kind else "")
+    )
+
+    # 3. 低缓存命中模型与报错（调用 >= 5 次且命中率 < 5%，以及失败/400 计数）
+    ledger_rows = _iter_jsonl_rows(_root, since=cutoff)
+    model_stats: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0])  # calls, prompt, cached
+    for row in ledger_rows:
+        model = str(row.get("model") or "unknown")
+        model_stats[model][0] += 1
+        model_stats[model][1] += int(row.get("prompt") or 0)
+        model_stats[model][2] += int(row.get("cached") or 0)
+
+    low_cache = []
+    for model, (calls, prompt_sum, cached_sum) in sorted(model_stats.items()):
+        if calls >= 5 and prompt_sum > 0 and (cached_sum / prompt_sum) < 0.05:
+            low_cache.append(f"{model}（{calls} 次，缓存命中 {cached_sum / prompt_sum * 100:.2f}%）")
+    unpaired = sum(
+        1 for key, d_row in dispatches.items()
+        if key not in usages and (now - float(d_row.get("t") or now)) > 60
+    )
+
+    # 4. 单轮高频工具循环（同一 ctx 连续派发 > 8 轮）
+    loop_count = 0
+    loop_max_rounds = 0
+    loop_by_kind: Counter = Counter()
+    for ctx, rows in ctx_dispatches.items():
+        rounds = max([int(r.get("n") or 0) for r in rows] + [len(rows)])
+        if rounds > 8:
+            loop_count += 1
+            loop_by_kind[str(rows[0].get("kind") or "unknown")] += 1
+            if rounds > loop_max_rounds:
+                loop_max_rounds = rounds
+    loop_kind_text = "，".join(f"{k}={c}" for k, c in loop_by_kind.most_common()) if loop_by_kind else "无"
+
+    return "\n".join([
+        f"## usage 工程信号（近 {days} 天）",
+        "1. 数据流写入与每日调用（requests 按 kind）：",
+        *stream_lines,
+        *daily_lines,
+        f"2. 首轮大请求（>= 100,000 prompt tokens 或 chars）：{big_summary}",
+        "3. 低缓存命中模型（>= 5 次且 < 5%）与报错：",
+        f"  - 低缓存模型：{'；'.join(low_cache) if low_cache else '无'}",
+        f"  - 失败/400 记录：显式报错 {explicit_errors} 次（含 400 共 {explicit_400} 次），未回报 usage 派发 {unpaired} 次",
+        f"4. 单轮高频工具循环（同一 ctx > 8 轮）：共 {loop_count} 次运行（按 kind：{loop_kind_text}），最大 {loop_max_rounds} 轮",
+    ])
+
+
+__all__ = ["log_call", "purge", "read", "signals", "KEEP_DAYS"]
